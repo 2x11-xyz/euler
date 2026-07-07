@@ -113,8 +113,8 @@ fn exec_parse_rejects_invalid_shapes() {
             "--auto-approve was provided more than once",
         ),
         (
-            &["exec", "--resume", "events.jsonl", "task"],
-            "exec cannot be used with --replay or --resume",
+            &["exec", "--replay", "events.jsonl", "task"],
+            "exec cannot be used with --replay",
         ),
         (
             &["--max-output-tokens", "32", "exec", "task"],
@@ -154,6 +154,22 @@ fn exec_parse_rejects_invalid_shapes() {
 
         assert_eq!(error.to_string(), *expected);
     }
+}
+
+#[test]
+fn exec_parse_accepts_resume_path() {
+    let exec = unwrap_exec(parse_args_without_env([
+        "exec",
+        "--resume",
+        "events.jsonl",
+        "continue",
+    ]));
+
+    assert_eq!(
+        exec.resume_path.as_deref(),
+        Some(std::path::Path::new("events.jsonl"))
+    );
+    assert_eq!(exec.prompt.as_deref(), Some("continue"));
 }
 
 #[test]

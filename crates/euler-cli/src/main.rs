@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use euler_core::permissions::{DeciderVerdict, PermissionRequest};
 use euler_core::{
     fold_session, read_provenance, read_resume_prefix, resume_session_from_folded_prefix,
-    CompactionTier, ModelTarget, PermissionDecider, ProvenanceWriter, Session,
+    CompactionTier, ModelTarget, PermissionDecider, ProvenanceWriter, Session, SessionConfig,
 };
 use euler_event::EventKind;
 use euler_provider::anthropic::AnthropicProvider;
@@ -22,6 +22,7 @@ use euler_provider::ReasoningEffort;
 use euler_provider::{EchoProvider, ModelProvider, ProviderSet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Read, Write};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -49,7 +50,10 @@ mod theme_catalog;
 mod ui;
 use auth_commands::{logout_args_for_provider, logout_chatgpt, print_auth_status, LogoutArgs};
 use auth_validation::{validate_provider_auth, StoredApiKeyAuth, StoredChatGptAuth};
-use bundled_extensions::{bundled_descriptor_by_id, bundled_extension_by_id};
+use bundled_extensions::{
+    bundled_descriptor_by_id, bundled_extension_by_id, bundled_round_observer,
+    validate_observe_options, ObserveOptions,
+};
 use companion_run::execute_headless_companion_run;
 use extension_cli::{run_extension_command, ExtensionArgs};
 use extension_enablement::{resolve_session_extensions, ExtensionSelection};
@@ -170,10 +174,17 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
+    let observer = bundled_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
+    if let Some((observer_config, _)) = &observer {
+        live_session.config.round_observer = Some(observer_config.clone());
+    }
     bind_diagnostics_for_log(&live_session.log_path);
     let providers = ProviderSet::single_named(run.provider_id.clone(), run.provider);
     let mut session = Session::new_with_providers(live_session.config, providers, CliDecider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
+    if let Some((_, extension)) = observer {
+        session.set_observer_extension(extension);
+    }
     run_stdin_loop(&mut session, live_session.refresh.as_ref())
 }
 
@@ -187,13 +198,20 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
+    let observer = bundled_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
+    if let Some((observer_config, _)) = &observer {
+        live_session.config.round_observer = Some(observer_config.clone());
+    }
     bind_diagnostics_for_log(&live_session.log_path);
     let (decider, channels) = TuiDecider::new();
     let providers = tui_provider_set(run.provider_id.clone(), run.provider, &run.custom_providers);
     let preference_path = model_preference::default_model_preference_path();
     let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
-    let session = Session::new_with_providers(live_session.config, providers, decider)
+    let mut session = Session::new_with_providers(live_session.config, providers, decider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
+    if let Some((_, extension)) = observer {
+        session.set_observer_extension(extension);
+    }
     let mut app = App::enter_with_options(
         session,
         channels,
@@ -202,12 +220,23 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             theme_choice,
             theme_preference_path: preference_path,
             model_catalog: Some(run.model_catalog),
+            extensions: run.extensions.clone(),
+            observe: run.observe.clone(),
         },
     )?;
     app.run()
 }
 
 fn run_exec(log_path: PathBuf, exec: ExecArgs) -> Result<()> {
+    if let Some(path) = exec.resume_path {
+        let prompt = read_exec_prompt(exec.prompt)?;
+        return run_exec_resume(
+            resolve_resume_target(path)?,
+            exec.run,
+            exec.auto_approve,
+            prompt,
+        );
+    }
     let target = invocation_target(&exec.run);
     validate_provider_auth(&target.provider, exec.run.auth_file.as_deref(), || {
         exec.run.provider.validate_auth()
@@ -220,31 +249,86 @@ fn run_exec(log_path: PathBuf, exec: ExecArgs) -> Result<()> {
         exec.run.model.clone(),
         SESSION_ID.to_owned(),
     );
-    config.max_output_tokens = exec.run.max_output_tokens;
-    if exec.run.max_tool_rounds.is_some() {
-        config.max_tool_rounds = exec.run.max_tool_rounds;
-    }
-    if let Some(tier) = exec.run.auto_compaction {
-        config.auto_compaction.tier = tier;
-    }
-    if let Some(budget_bytes) = exec.run.compaction_budget_bytes {
-        config.auto_compaction.budget_bytes = budget_bytes;
-    }
-    if let Some(reasoning_effort) = exec.run.reasoning_effort {
-        config.reasoning_effort = reasoning_effort;
-    }
+    apply_exec_config(&mut config, ExecConfigOverrides::from_run(&exec.run));
     config.extensions_enabled = resolve_session_extensions(&config.root, &exec.run.extensions)?;
+    let observer = bundled_round_observer(&exec.run.observe, &config.extensions_enabled)?;
+    if let Some((observer_config, _)) = &observer {
+        config.round_observer = Some(observer_config.clone());
+    }
     let tier = exec.auto_approve;
     let providers = ProviderSet::single_named(exec.run.provider_id.clone(), exec.run.provider);
     bind_diagnostics_for_log(&log_path);
     let mut session =
         Session::new_with_providers(config, providers, SubagentDecider::new(exec.auto_approve))
             .with_provenance(ProvenanceWriter::new(log_path)?);
+    if let Some((_, extension)) = observer {
+        session.set_observer_extension(extension);
+    }
     SubagentDecider::apply_tier(tier, &mut session);
     let events = session.run_turn(&prompt)?;
     print!("{}", render_line_oriented(&events));
     io::stdout().flush()?;
     Ok(())
+}
+
+fn run_exec_resume(
+    target: ResumeTarget,
+    run: RunArgs,
+    auto_approve: AutoApproveTier,
+    prompt: String,
+) -> Result<()> {
+    let overrides = ExecConfigOverrides::from_run(&run);
+    let mut outcome =
+        resume_cli_session(target, run, SubagentDecider::new(auto_approve), |config| {
+            apply_exec_config(config, overrides);
+        })?;
+    SubagentDecider::apply_tier(auto_approve, &mut outcome.session);
+    let events = outcome.session.run_turn(&prompt)?;
+    if let Some(refresh) = outcome.refresh.as_ref() {
+        if let Err(error) = refresh.refresh() {
+            eprintln!("warning: failed to refresh session metadata: {error}");
+        }
+    }
+    print!("{}", render_line_oriented(&events));
+    io::stdout().flush()?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ExecConfigOverrides {
+    max_output_tokens: Option<u64>,
+    max_tool_rounds: Option<usize>,
+    auto_compaction: Option<CompactionTier>,
+    compaction_budget_bytes: Option<usize>,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl ExecConfigOverrides {
+    fn from_run(run: &RunArgs) -> Self {
+        Self {
+            max_output_tokens: run.max_output_tokens,
+            max_tool_rounds: run.max_tool_rounds,
+            auto_compaction: run.auto_compaction,
+            compaction_budget_bytes: run.compaction_budget_bytes,
+            reasoning_effort: run.reasoning_effort,
+        }
+    }
+}
+
+fn apply_exec_config(config: &mut SessionConfig, overrides: ExecConfigOverrides) {
+    config.max_output_tokens = overrides.max_output_tokens;
+    if overrides.max_tool_rounds.is_some() {
+        config.max_tool_rounds = overrides.max_tool_rounds;
+    }
+    if let Some(tier) = overrides.auto_compaction {
+        config.auto_compaction.tier = tier;
+    }
+    if let Some(budget_bytes) = overrides.compaction_budget_bytes {
+        config.auto_compaction.budget_bytes = budget_bytes;
+    }
+    if let Some(reasoning_effort) = overrides.reasoning_effort {
+        config.reasoning_effort = reasoning_effort;
+    }
 }
 
 fn read_exec_prompt(prompt: Option<String>) -> Result<String> {
@@ -275,6 +359,44 @@ fn session_id_from_events(events: &[euler_event::EventEnvelope]) -> Option<&str>
 }
 
 fn resume_interactive(target: ResumeTarget, run: RunArgs) -> Result<()> {
+    let mut outcome = resume_cli_session(target, run, CliDecider, |_| {})?;
+    eprintln!(
+        "resumed session {}: folded {} events, target {}/{}, recovery closure {}",
+        outcome
+            .session
+            .events()
+            .first()
+            .map(|event| event.session.as_str())
+            .unwrap_or(SESSION_ID),
+        outcome.events_folded,
+        outcome.active_target.provider,
+        outcome.active_target.model,
+        if outcome.recovery_closure_appended {
+            "appended"
+        } else {
+            "not appended"
+        }
+    );
+    run_stdin_loop(&mut outcome.session, outcome.refresh.as_ref())
+}
+
+struct ResumeCliOutcome<D: PermissionDecider> {
+    session: Session<D>,
+    refresh: Option<HomeSessionRefresh>,
+    events_folded: usize,
+    active_target: ModelTarget,
+    recovery_closure_appended: bool,
+}
+
+fn resume_cli_session<D>(
+    target: ResumeTarget,
+    run: RunArgs,
+    decider: D,
+    configure: impl FnOnce(&mut SessionConfig),
+) -> Result<ResumeCliOutcome<D>>
+where
+    D: PermissionDecider,
+{
     let ResumeTarget { log_path, refresh } = target;
     bind_diagnostics_for_log(&log_path);
     let writer = ProvenanceWriter::new(log_path.clone())?;
@@ -285,6 +407,11 @@ fn resume_interactive(target: ResumeTarget, run: RunArgs) -> Result<()> {
     let root = std::env::current_dir()?;
     let mut config = session_config(root, run.provider_id.clone(), run.model.clone(), session_id);
     config.extensions_enabled = resolve_session_extensions(&config.root, &run.extensions)?;
+    configure(&mut config);
+    let observer = bundled_round_observer(&run.observe, &config.extensions_enabled)?;
+    if let Some((observer_config, _)) = &observer {
+        config.round_observer = Some(observer_config.clone());
+    }
     let folded = fold_session(&config, prefix)?;
     let providers = if let Some(original) = &folded.original_target {
         if invocation_target(&run) != *original {
@@ -311,25 +438,18 @@ fn resume_interactive(target: ResumeTarget, run: RunArgs) -> Result<()> {
         ProviderSet::single(run.provider)
     };
 
-    let outcome = resume_session_from_folded_prefix(config, providers, CliDecider, writer, folded)?;
+    let outcome = resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
     let mut session = outcome.session;
-    eprintln!(
-        "resumed session {}: folded {} events, target {}/{}, recovery closure {}",
-        session
-            .events()
-            .first()
-            .map(|event| event.session.as_str())
-            .unwrap_or(SESSION_ID),
-        outcome.events_folded,
-        outcome.active_target.provider,
-        outcome.active_target.model,
-        if outcome.recovery_closure_appended {
-            "appended"
-        } else {
-            "not appended"
-        }
-    );
-    run_stdin_loop(&mut session, refresh.as_ref())
+    if let Some((_, extension)) = observer {
+        session.set_observer_extension(extension);
+    }
+    Ok(ResumeCliOutcome {
+        session,
+        refresh,
+        events_folded: outcome.events_folded,
+        active_target: outcome.active_target,
+        recovery_closure_appended: outcome.recovery_closure_appended,
+    })
 }
 
 fn bind_diagnostics_for_log(log_path: &Path) {
@@ -487,7 +607,7 @@ fn run_live_extension_command(
         return headless_extension_error(format!("unknown extension id: {id}"));
     };
     match session.execute_extension_command(
-        bundled.0,
+        bundled.extension,
         command,
         input,
         command_descriptor.required_capabilities.iter().copied(),
@@ -682,6 +802,7 @@ struct RunArgs {
     compaction_budget_bytes: Option<usize>,
     reasoning_effort: Option<ReasoningEffort>,
     extensions: ExtensionSelection,
+    observe: ObserveOptions,
     linefeed_history_insert: bool,
     linefeed_history_insert_from_cli: bool,
 }
@@ -729,6 +850,7 @@ struct ExecArgs {
     run: RunArgs,
     auto_approve: AutoApproveTier,
     prompt: Option<String>,
+    resume_path: Option<PathBuf>,
 }
 
 fn ensure_no_provider_options(parsed: &RawArgs, context: &str) -> Result<()> {
@@ -913,8 +1035,8 @@ impl Args {
 
 fn validate_replay_resume_conflicts(parsed: &RawArgs) -> Result<()> {
     let replay_or_resume = parsed.replay_path.is_some() || parsed.resume_path.is_some();
-    if parsed.exec && replay_or_resume {
-        return Err(anyhow!("exec cannot be used with --replay or --resume"));
+    if parsed.exec && parsed.replay_path.is_some() {
+        return Err(anyhow!("exec cannot be used with --replay"));
     }
     if parsed.login && replay_or_resume {
         return Err(anyhow!("login cannot be used with --replay or --resume"));
@@ -970,6 +1092,7 @@ struct RawArgs {
     compaction_budget_bytes: Option<usize>,
     reasoning_effort: Option<ReasoningEffort>,
     extensions: ExtensionSelection,
+    observe: ObserveOptions,
     login: bool,
     logout: bool,
     auth_status: bool,
@@ -1037,6 +1160,7 @@ impl RawArgsParser {
                 compaction_budget_bytes: None,
                 reasoning_effort: None,
                 extensions: ExtensionSelection::default(),
+                observe: ObserveOptions::default(),
                 login: false,
                 logout: false,
                 auth_status: false,
@@ -1109,6 +1233,8 @@ impl RawArgsParser {
             "--compaction-budget-bytes" => self.parse_compaction_budget_bytes(args),
             "--reasoning-effort" => self.parse_reasoning_effort(args),
             "--extensions" => self.parse_extensions(args),
+            "--observe" => self.parse_observe(args),
+            "--observe-cadence" => self.parse_observe_cadence(args),
             "--" if self.parsed.exec => {
                 self.parsed.exec_prompt.extend(args.by_ref());
                 Ok(ArgParseFlow::Stop)
@@ -1269,6 +1395,34 @@ impl RawArgsParser {
             args.next()
                 .ok_or_else(|| anyhow!("--auth-file requires a path"))?,
         ));
+        Ok(ArgParseFlow::Continue)
+    }
+
+    fn parse_observe(&mut self, args: &mut impl Iterator<Item = String>) -> Result<ArgParseFlow> {
+        if self.parsed.observe.extension_id.is_some() {
+            return Err(anyhow!("--observe was provided more than once"));
+        }
+        self.parsed.observe.extension_id = Some(
+            args.next()
+                .ok_or_else(|| anyhow!("--observe requires an extension id"))?,
+        );
+        Ok(ArgParseFlow::Continue)
+    }
+
+    fn parse_observe_cadence(
+        &mut self,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<ArgParseFlow> {
+        if self.parsed.observe.cadence_rounds.is_some() {
+            return Err(anyhow!("--observe-cadence was provided more than once"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| anyhow!("--observe-cadence requires a value"))?;
+        self.parsed.observe.cadence_rounds = Some(
+            NonZeroU64::new(parse_positive_u64(&value, "--observe-cadence")?)
+                .expect("positive cadence is non-zero"),
+        );
         Ok(ArgParseFlow::Continue)
     }
 
@@ -1544,6 +1698,8 @@ fn build_run_args(
         Some(model) => model,
         None => default_model_for_provider(&live.provider_id, catalog, custom_providers)?,
     };
+    let observe = parsed.observe.clone().normalized()?;
+    validate_observe_options(&observe)?;
 
     Ok(RunArgs {
         provider_id: live.provider_id,
@@ -1558,6 +1714,7 @@ fn build_run_args(
         compaction_budget_bytes: parsed.compaction_budget_bytes,
         reasoning_effort: parsed.reasoning_effort,
         extensions: parsed.extensions.clone(),
+        observe,
         linefeed_history_insert: parsed.linefeed_history_insert.unwrap_or(parsed.tui),
         linefeed_history_insert_from_cli: parsed.linefeed_history_insert.is_some(),
     })
@@ -1573,6 +1730,7 @@ fn build_exec_args(
         run: build_run_args(parsed, preference, catalog, custom_providers)?,
         auto_approve: parsed.auto_approve.unwrap_or(AutoApproveTier::DEFAULT),
         prompt: (!parsed.exec_prompt.is_empty()).then(|| parsed.exec_prompt.join(" ")),
+        resume_path: parsed.resume_path.clone(),
     })
 }
 

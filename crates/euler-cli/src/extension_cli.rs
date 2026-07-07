@@ -400,7 +400,7 @@ fn run_extension(run: ExtensionRunArgs, stdout: &mut dyn Write) -> Result<()> {
         command: descriptor
             .command(&run.command)
             .expect("validated bundled command must exist"),
-        extension: bundled.0,
+        extension: bundled.extension,
         target: target.log_path.clone(),
         input: run.input,
     })?;

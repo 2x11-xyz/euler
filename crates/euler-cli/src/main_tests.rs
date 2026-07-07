@@ -1681,15 +1681,124 @@ fn provider_options_are_fresh_session_only_for_first_slice() {
     assert_eq!(
         parse_args_error([
             "exec",
-            "--resume",
+            "--replay",
             "events.jsonl",
             "--provider-option",
             "event-script=a.json",
             "prompt",
         ])
         .to_string(),
-        "exec cannot be used with --replay or --resume"
+        "exec cannot be used with --replay"
     );
+}
+
+#[test]
+fn observe_flag_parses_valid_extension_and_default_cadence() {
+    let args = parse_without_env(["--observe", "causal-dag"]);
+
+    assert_eq!(args.observe.extension_id.as_deref(), Some("causal-dag"));
+    assert_eq!(args.observe.cadence_rounds.map(NonZeroU64::get), Some(8));
+}
+
+#[test]
+fn observe_flag_rejects_unknown_extension() {
+    let error = parse_args_error(["--observe", "not-bundled"]);
+
+    // Only observer-capable extensions are suggested, not every bundled id.
+    assert_eq!(
+        error.to_string(),
+        "unknown extension id for --observe: not-bundled; observer-capable extensions: causal-dag"
+    );
+}
+
+#[test]
+fn observe_flag_rejects_observer_incapable_extension() {
+    let error = parse_args_error(["--observe", "session-export"]);
+
+    assert_eq!(
+        error.to_string(),
+        "--observe session-export is not supported: extension session-export declares no observer command pair"
+    );
+}
+
+#[test]
+fn observe_flag_parse_edge_cases() {
+    assert_eq!(
+        parse_args_error(["--observe", "causal-dag", "--observe", "causal-dag"]).to_string(),
+        "--observe was provided more than once"
+    );
+    assert_eq!(
+        parse_args_error([
+            "--observe",
+            "causal-dag",
+            "--observe-cadence",
+            "4",
+            "--observe-cadence",
+            "4",
+        ])
+        .to_string(),
+        "--observe-cadence was provided more than once"
+    );
+    assert_eq!(
+        parse_args_error(["--observe", "causal-dag", "--observe-cadence", "0"]).to_string(),
+        "--observe-cadence requires a positive integer"
+    );
+    assert_eq!(
+        parse_args_error(["--observe-cadence"]).to_string(),
+        "--observe-cadence requires a value"
+    );
+}
+
+#[test]
+fn observe_cadence_requires_observe() {
+    assert_eq!(
+        parse_args_error(["--observe-cadence", "4"]).to_string(),
+        "--observe-cadence requires --observe"
+    );
+}
+
+#[test]
+fn observe_requires_extension_enabled_set() {
+    let run = parse_without_env(["--observe", "causal-dag", "--extensions", "none"]);
+    let root = tempfile::tempdir().expect("root");
+    let enabled = resolve_session_extensions(root.path(), &run.extensions).expect("extensions");
+
+    let error = match bundled_round_observer(&run.observe, &enabled) {
+        Ok(_) => panic!("expected observer disabled"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "--observe causal-dag requires extension causal-dag to be enabled; enable it with --extensions causal-dag or your Euler extension registry/project config"
+    );
+}
+
+#[test]
+fn observer_wiring_uses_bundled_command_pair() {
+    let run = parse_without_env(["--observe", "causal-dag", "--extensions", "causal-dag"]);
+    let root = tempfile::tempdir().expect("root");
+    let enabled = resolve_session_extensions(root.path(), &run.extensions).expect("extensions");
+    let (observer, _) = bundled_round_observer(&run.observe, &enabled)
+        .expect("observer")
+        .expect("configured");
+    let descriptor = bundled_descriptor_by_id("causal-dag")
+        .expect("descriptor")
+        .expect("causal-dag descriptor");
+    let commands = descriptor
+        .observer_commands
+        .expect("causal-dag observer commands");
+    let mut config = session_config(
+        root.path().to_path_buf(),
+        run.provider_id,
+        run.model,
+        "session-id".to_owned(),
+    );
+    config.round_observer = Some(observer);
+    let observer = config.round_observer.expect("observer config");
+
+    assert_eq!(observer.brief_command, commands.brief);
+    assert_eq!(observer.apply_command, commands.apply);
 }
 
 #[test]

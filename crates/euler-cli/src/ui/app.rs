@@ -31,7 +31,10 @@ use super::visual_canvas::{
     TextRole, VisualBlock, VisualBlockRole, VisualCanvasFrame, VisualCanvasSnapshot,
     VisualCanvasState,
 };
-use crate::bundled_extensions::{bundled_descriptor_by_id, bundled_extension_by_id};
+use crate::bundled_extensions::{
+    bundled_descriptor_by_id, bundled_extension_by_id, bundled_round_observer, ObserveOptions,
+};
+use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection};
 use crate::model_preference;
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -107,6 +110,8 @@ pub struct AppOptions {
     pub theme_choice: ThemeChoice,
     pub theme_preference_path: Option<PathBuf>,
     pub model_catalog: Option<MergedModelCatalog>,
+    pub extensions: ExtensionSelection,
+    pub observe: ObserveOptions,
 }
 
 pub struct AppCore {
@@ -138,6 +143,8 @@ pub struct AppCore {
     pending_runs: VecDeque<PendingRunRequest>,
     in_flight_label: Option<String>,
     in_flight_cancellable: bool,
+    extensions: ExtensionSelection,
+    observe: ObserveOptions,
 }
 
 enum AppState {
@@ -501,6 +508,8 @@ impl AppCore {
             theme_choice,
             theme_preference_path,
             model_catalog,
+            extensions,
+            observe,
             ..
         } = options;
         let model_catalog = model_catalog.unwrap_or_else(|| {
@@ -550,6 +559,8 @@ impl AppCore {
             pending_runs: VecDeque::new(),
             in_flight_label: None,
             in_flight_cancellable: false,
+            extensions,
+            observe,
         }
     }
 
@@ -1195,7 +1206,7 @@ impl AppCore {
             id,
             command,
             input,
-            extension: bundled.0,
+            extension: bundled.extension,
             capabilities: command_descriptor.required_capabilities.clone(),
         })
     }
@@ -1389,23 +1400,31 @@ impl AppCore {
             .ok_or_else(|| anyhow!("no session found with id {session_id}"))?;
         let prefix = read_resume_prefix(record.events_path())?;
         let root = std::env::current_dir().unwrap_or_else(|_| session_root_status_path());
-        let seed_config = crate::session_config(
+        let mut seed_config = crate::session_config(
             root.clone(),
             self.status.provider.clone(),
             self.status.model.clone(),
             session_id.to_owned(),
         );
+        seed_config.extensions_enabled =
+            resolve_session_extensions(&seed_config.root, &self.extensions)?;
+        let observer = bundled_round_observer(&self.observe, &seed_config.extensions_enabled)?;
+        if let Some((observer_config, _)) = &observer {
+            seed_config.round_observer = Some(observer_config.clone());
+        }
         let folded = fold_session(&seed_config, prefix)?;
         let original = folded
             .original_target
             .as_ref()
             .unwrap_or(&folded.active_target);
-        let config = crate::session_config(
+        let mut config = crate::session_config(
             root,
             original.provider.clone(),
             original.model.clone(),
             session_id.to_owned(),
         );
+        config.extensions_enabled = seed_config.extensions_enabled;
+        config.round_observer = seed_config.round_observer;
         let providers = crate::resume_provider_set(
             folded
                 .original_target
@@ -1418,9 +1437,13 @@ impl AppCore {
         let (decider, channels) = TuiDecider::new();
         let outcome =
             resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
-        let events = outcome.session.events().to_vec();
+        let mut session = outcome.session;
+        if let Some((_, extension)) = observer {
+            session.set_observer_extension(extension);
+        }
+        let events = session.events().to_vec();
         Ok(TuiResume {
-            session: outcome.session,
+            session,
             channels,
             events,
             active_target: outcome.active_target,

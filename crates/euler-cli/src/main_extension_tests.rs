@@ -1083,7 +1083,7 @@ fn extension_run_on_locked_session_log_fails_without_executing_command() {
         command,
         extension: bundled_extension_by_id("causal-dag")
             .expect("causal-dag extension")
-            .0,
+            .extension,
         target: log.clone(),
         input: json!({}),
     })
