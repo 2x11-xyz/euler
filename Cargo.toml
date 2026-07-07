@@ -44,3 +44,6 @@ warnings = "deny"
 all = "deny"
 too_many_lines = "deny"
 too_many_arguments = "deny"
+
+[profile.release]
+strip = "symbols"
