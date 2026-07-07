@@ -1,0 +1,14 @@
+[package]
+name = "euler-extension-autoresearch"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+euler-event = { path = "../euler-event" }
+euler-agents = { path = "../euler-agents" }
+euler-sdk = { path = "../euler-sdk" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

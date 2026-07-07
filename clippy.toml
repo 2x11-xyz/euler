@@ -1,0 +1,6 @@
+# Complexity thresholds — guardrails, not goals.
+# See AGENTS.md "Code Quality" for intent and ratchet policy.
+# This file is the single source of truth for threshold values.
+too-many-lines-threshold = 80
+too-many-arguments-threshold = 6
+cognitive-complexity-threshold = 20

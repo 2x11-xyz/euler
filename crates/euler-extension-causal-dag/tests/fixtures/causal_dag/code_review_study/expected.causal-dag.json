@@ -1,0 +1,429 @@
+{
+  "schema": "euler.causal_dag.v1",
+  "media_type": "application/vnd.euler.causal-dag.v1+json",
+  "generated_at": "2026-06-29T02:04:00.000Z",
+  "session": {
+    "id": "session-review",
+    "event_range": {
+      "start": "event-review-start",
+      "end": "event-review-report",
+      "complete": true
+    }
+  },
+  "projection": {
+    "extension_id": "causal-dag",
+    "watermark_event_id": "event-review-report",
+    "basis": "bounded_provenance_query",
+    "degraded": false
+  },
+  "forest": {
+    "roots": [
+      "node-review-root"
+    ],
+    "active_root": "node-review-root",
+    "nodes": [
+      {
+        "id": "node-review-finding-a",
+        "root_id": "node-review-root",
+        "kind": "claim",
+        "status": "superseded",
+        "title": "Registry race finding",
+        "summary": "The initial finding was superseded after the lock discipline fix.",
+        "source_refs": [
+          {
+            "id": "src-review-node-finding-a",
+            "kind": "event",
+            "event_id": "event-review-tool",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.87
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The tool result records the superseded finding.",
+          "source_ref_ids": [
+            "src-review-node-finding-a"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-review-finding-b",
+        "root_id": "node-review-root",
+        "kind": "claim",
+        "status": "verified",
+        "title": "Registry tests pass",
+        "summary": "The extension registry tests passed after the fix.",
+        "source_refs": [
+          {
+            "id": "src-review-node-finding-b",
+            "kind": "event",
+            "event_id": "event-review-check",
+            "event_kind": "check.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.95
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The check result verifies the registry slice.",
+          "source_ref_ids": [
+            "src-review-node-finding-b"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-review-root",
+        "root_id": "node-review-root",
+        "kind": "root",
+        "status": "open",
+        "title": "Extension registry review",
+        "summary": "Code review objective for the extension registry slice.",
+        "source_refs": [
+          {
+            "id": "src-review-node-root",
+            "kind": "event",
+            "event_id": "event-review-start",
+            "event_kind": "session.start",
+            "payload_pointer": "/payload/model",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.72
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The session start anchors the review fixture.",
+          "source_ref_ids": [
+            "src-review-node-root"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-review-synthesis",
+        "root_id": "node-review-root",
+        "kind": "synthesis",
+        "status": "verified",
+        "title": "Review accepted after tests",
+        "summary": "The report artifact records accepted review triage after tests passed.",
+        "source_refs": [
+          {
+            "id": "src-review-node-synthesis",
+            "kind": "artifact",
+            "event_id": "event-review-report",
+            "event_kind": "extension.artifact",
+            "payload_pointer": null,
+            "artifact": {
+              "path": "sessions/session-review/extensions/codeswarm-review/artifacts/review-report",
+              "sha256": "sha-review-report",
+              "byte_len": 96
+            },
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.91
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The review report artifact records final triage.",
+          "source_ref_ids": [
+            "src-review-node-synthesis"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-review-work",
+        "root_id": "node-review-root",
+        "kind": "attempt",
+        "status": "open",
+        "title": "Spawned review work",
+        "summary": "The spawned review agent performed the review work.",
+        "source_refs": [
+          {
+            "id": "src-review-node-work",
+            "kind": "event",
+            "event_id": "event-review-spawn",
+            "event_kind": "agent.spawn",
+            "payload_pointer": "/payload/task",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.9
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The agent.spawn event records the review work.",
+          "source_ref_ids": [
+            "src-review-node-work"
+          ]
+        },
+        "metadata": {}
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge-review-finding-a",
+        "from": "node-review-work",
+        "to": "node-review-finding-a",
+        "class": "structural",
+        "kind": "continuation",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-review-edge-finding-a",
+            "kind": "event",
+            "event_id": "event-review-tool",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.87
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The tool result creates the first finding.",
+          "source_ref_ids": [
+            "src-review-edge-finding-a"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-review-finding-b",
+        "from": "node-review-work",
+        "to": "node-review-finding-b",
+        "class": "structural",
+        "kind": "fork",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-review-edge-finding-b",
+            "kind": "event",
+            "event_id": "event-review-check",
+            "event_kind": "check.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.94
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The check result creates the verified finding branch.",
+          "source_ref_ids": [
+            "src-review-edge-finding-b"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-review-refutation",
+        "from": "node-review-finding-b",
+        "to": "node-review-finding-a",
+        "class": "annotation",
+        "kind": "refutation",
+        "canonical_backbone": false,
+        "source_refs": [
+          {
+            "id": "src-review-edge-refutation",
+            "kind": "event",
+            "event_id": "event-review-check",
+            "event_kind": "check.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.86
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The passing test refutes the stale finding.",
+          "source_ref_ids": [
+            "src-review-edge-refutation"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-review-report-use",
+        "from": "node-review-synthesis",
+        "to": "node-review-finding-b",
+        "class": "annotation",
+        "kind": "artifact_use",
+        "canonical_backbone": false,
+        "source_refs": [
+          {
+            "id": "src-review-edge-report-use",
+            "kind": "artifact",
+            "event_id": "event-review-report",
+            "event_kind": "extension.artifact",
+            "payload_pointer": null,
+            "artifact": {
+              "path": "sessions/session-review/extensions/codeswarm-review/artifacts/review-report",
+              "sha256": "sha-review-report",
+              "byte_len": 96
+            },
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.9
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The report artifact supports the accepted finding.",
+          "source_ref_ids": [
+            "src-review-edge-report-use"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-review-root-work",
+        "from": "node-review-root",
+        "to": "node-review-work",
+        "class": "structural",
+        "kind": "decomposition",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-review-edge-root-work",
+            "kind": "event",
+            "event_id": "event-review-spawn",
+            "event_kind": "agent.spawn",
+            "payload_pointer": "/payload/task",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.88
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The spawned agent decomposes the review objective into work.",
+          "source_ref_ids": [
+            "src-review-edge-root-work"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-review-supersedes",
+        "from": "node-review-finding-b",
+        "to": "node-review-finding-a",
+        "class": "annotation",
+        "kind": "supersedes",
+        "canonical_backbone": false,
+        "source_refs": [
+          {
+            "id": "src-review-edge-supersedes",
+            "kind": "event",
+            "event_id": "event-review-tool",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.78
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The tool output says the initial finding was superseded.",
+          "source_ref_ids": [
+            "src-review-edge-supersedes"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-review-verification",
+        "from": "node-review-finding-b",
+        "to": "node-review-synthesis",
+        "class": "structural",
+        "kind": "verification",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-review-edge-verification",
+            "kind": "event",
+            "event_id": "event-review-check",
+            "event_kind": "check.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.93
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The passing test verifies the final synthesis.",
+          "source_ref_ids": [
+            "src-review-edge-verification"
+          ]
+        },
+        "metadata": {}
+      }
+    ]
+  },
+  "diagnostics": {
+    "node_count": 5,
+    "edge_count": 7,
+    "root_count": 1,
+    "leaf_count": 2,
+    "fork_count": 1,
+    "maximum_depth": 3,
+    "branching_ratio": 0.25,
+    "backbone_edge_count": 4,
+    "structural_edge_count": 4,
+    "annotation_edge_count": 3,
+    "sequence_edge_count": 0,
+    "sequence_edge_ratio": 0.0,
+    "source_backed_edge_count": 7,
+    "inferred_edge_count": 0,
+    "missing_source_ref_count": 0,
+    "degraded_chronology": false,
+    "projection_heavy_branching": false,
+    "warnings": []
+  }
+}

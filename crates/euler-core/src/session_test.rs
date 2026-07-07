@@ -1,0 +1,1296 @@
+use super::*;
+use crate::extensions::ExtensionHostError;
+use crate::permissions::ScriptedDecider;
+use crate::provenance::ProvenanceWriterError;
+use crate::read_provenance;
+use euler_provider::{
+    FixtureResponse, ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent,
+    ProviderError, ProviderStream, ScriptedProvider, StopReason, Usage,
+};
+use euler_sdk::{
+    ArtifactWrite, CommandContext, CommandDescriptor, CommandRegistrar, Extension,
+    ExtensionCommand, ExtensionError, ExtensionManifest, HostAgentBudget, HostAgentResult,
+    HostAgentTask, HostApi,
+};
+use serde_json::Map;
+use std::sync::{Arc, Mutex};
+
+#[test]
+fn max_output_tokens_propagates_to_model_request_and_model_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let captured = Arc::new(Mutex::new(None));
+    let provider = CapturingProvider::new(Arc::clone(&captured));
+    let mut config = SessionConfig::new(temp.path());
+    config.provider = "capture".to_owned();
+    config.model = "test-model".to_owned();
+    config.max_output_tokens = Some(42);
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+
+    let events = session.run_turn("hello").expect("turn");
+
+    let request = captured
+        .lock()
+        .expect("captured request lock")
+        .clone()
+        .expect("captured request");
+    assert_eq!(request.max_output_tokens, Some(42));
+    let model_call = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("model.call");
+    assert_eq!(model_call.payload["max_output_tokens"], json!(42));
+}
+
+#[test]
+fn persisted_session_events_never_parent_to_runtime_only_model_delta() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-runtime-parent".to_owned();
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ReasoningThenAssistant {
+        reasoning: "thinking".to_owned(),
+        content: "done".to_owned(),
+    }]);
+    let mut session =
+        Session::new(config, provider, ScriptedDecider::new(Vec::new())).with_provenance(writer);
+
+    session.run_turn("hello").expect("turn");
+
+    let runtime_only_ids = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::MODEL_DELTA)
+        .map(|event| event.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!runtime_only_ids.is_empty());
+    let persisted = read_provenance(&log).expect("persisted events");
+    for event in &persisted {
+        assert!(
+            !event
+                .parent
+                .as_deref()
+                .is_some_and(|parent| runtime_only_ids.contains(parent)),
+            "persisted {} parented to runtime-only id {:?}",
+            event.kind,
+            event.parent
+        );
+    }
+}
+
+#[test]
+fn live_extension_artifacts_publish_to_session_and_log_once_in_order() {
+    let (_temp, log, mut session) = live_session();
+    let start_id = session.events()[0].id.clone();
+    let (mut host, queue) = session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("extension host");
+    host.register_extension(&test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"first artifact".to_vec(), b"second artifact".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    ))
+    .expect("register");
+
+    let output = host
+        .execute_command("write", json!(null))
+        .expect("execute artifacts");
+    assert_eq!(queue.len(), 3);
+    assert_eq!(
+        extension_event_count(session.events()),
+        0,
+        "queued events must not enter the live bus until session publishes them"
+    );
+
+    session
+        .publish_queued_extension_events(&queue)
+        .expect("publish queued extension events");
+
+    let live_artifacts = extension_artifacts(session.events());
+    let live_decisions = extension_permission_decisions(session.events());
+    let durable = read_provenance(&log).expect("durable events");
+    let durable_artifacts = extension_artifacts(&durable);
+    assert_eq!(live_artifacts.len(), 2);
+    assert_eq!(live_decisions.len(), 1);
+    assert_eq!(durable_artifacts.len(), 2);
+    assert_eq!(live_artifacts, durable_artifacts);
+    assert_eq!(
+        extension_event_ids(session.events()),
+        extension_event_ids(&durable)
+    );
+    assert_eq!(live_decisions[0].parent.as_deref(), Some(start_id.as_str()));
+    assert_eq!(live_decisions[0].payload["allowed"], json!(true));
+    assert_eq!(
+        live_artifacts[0].parent.as_deref(),
+        Some(live_decisions[0].id.as_str())
+    );
+    assert_eq!(
+        live_artifacts[1].parent.as_deref(),
+        Some(live_artifacts[0].id.as_str())
+    );
+    assert_eq!(
+        output["records"][0]["persisted_event_id"],
+        json!(live_artifacts[0].id)
+    );
+    assert_eq!(
+        output["records"][1]["persisted_event_id"],
+        json!(live_artifacts[1].id)
+    );
+
+    for (event, expected) in live_artifacts
+        .iter()
+        .zip([b"first artifact".as_slice(), b"second artifact".as_slice()])
+    {
+        let relative = event.payload["path"].as_str().expect("artifact path");
+        let artifact_path = log
+            .parent()
+            .expect("session dir")
+            .parent()
+            .expect("sessions dir")
+            .parent()
+            .expect("home root")
+            .join(relative);
+        assert_eq!(
+            std::fs::read(artifact_path).expect("artifact bytes"),
+            expected
+        );
+        assert_eq!(event.payload["extension_id"], json!("artifact-ext"));
+        assert_eq!(event.payload["byte_len"], json!(expected.len()));
+    }
+
+    let canvas = assemble_canvas(session.events(), &AutoCompactionPolicy::default());
+    assert!(
+        canvas.is_empty(),
+        "extension artifacts must not enter model canvas: {canvas:?}"
+    );
+}
+
+#[test]
+fn live_extension_execute_command_helper_publishes_success() {
+    let (_temp, log, mut session) = live_session();
+    let extension = test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"helper artifact".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    let output = session
+        .execute_extension_command(
+            &extension,
+            "write",
+            json!(null),
+            [Capability::ArtifactWrite],
+        )
+        .expect("execute extension command");
+
+    let live_artifacts = extension_artifacts(session.events());
+    let live_decisions = extension_permission_decisions(session.events());
+    let durable = read_provenance(&log).expect("durable events");
+    assert_eq!(live_artifacts.len(), 1);
+    assert_eq!(live_decisions.len(), 1);
+    assert_eq!(extension_event_count(session.events()), 2);
+    assert_eq!(live_artifacts, extension_artifacts(&durable));
+    assert_eq!(
+        output["records"][0]["persisted_event_id"],
+        json!(live_artifacts[0].id)
+    );
+    assert!(
+        assemble_canvas(session.events(), &AutoCompactionPolicy::default()).is_empty(),
+        "extension helper events must not enter canvas"
+    );
+}
+
+#[test]
+fn live_extension_context_slot_update_enters_next_canvas_and_model_input() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-live");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let captured = Arc::new(Mutex::new(None));
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-live".to_owned();
+    config.agent_id = "agent-live".to_owned();
+    config.provider = "capture".to_owned();
+    config.model = "test-model".to_owned();
+    enable_test_extensions(&mut config, &["slot-ext"]);
+    let mut session = Session::new(
+        config,
+        CapturingProvider::new(Arc::clone(&captured)),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    let extension = test_extension(
+        "slot-ext",
+        vec![Capability::ContextSlot],
+        TestCommandBehavior::Slot {
+            slot: "main",
+            content: "live context",
+        },
+    );
+
+    session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::ContextSlot])
+        .expect("execute context slot command");
+    let canvas = assemble_canvas(session.events(), &AutoCompactionPolicy::default());
+
+    assert_eq!(
+        canvas_prompt(&canvas),
+        "[slot slot-ext:main]\n    live context"
+    );
+    assert!(read_provenance(&log)
+        .expect("durable events")
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CONTEXT_SLOT_UPDATED));
+    match model_input_item(&canvas[0]) {
+        ModelInputItem::Message { role, content } => {
+            assert_eq!(role, ModelRole::User);
+            assert_eq!(content, "[slot slot-ext:main]\n    live context");
+        }
+        item => panic!("unexpected model input item: {item:?}"),
+    }
+    session.run_turn("next").expect("turn after slot update");
+    let durable = read_provenance(&log).expect("durable events");
+    let slot_id = durable
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::CONTEXT_SLOT_UPDATED)
+        .expect("slot event")
+        .id
+        .clone();
+    let snapshot = durable
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .expect("canvas snapshot");
+
+    assert!(snapshot.payload["selected_event_ids"]
+        .as_array()
+        .expect("selected ids")
+        .iter()
+        .any(|id| id.as_str() == Some(slot_id.as_str())));
+    assert!(captured
+        .lock()
+        .expect("captured request lock")
+        .as_ref()
+        .expect("captured request")
+        .input
+        .iter()
+        .any(|item| matches!(item, ModelInputItem::Message { content, .. } if content == "[slot slot-ext:main]\n    live context")));
+}
+
+#[test]
+fn live_extension_agent_records_publish_to_session_and_stay_out_of_canvas() {
+    let (_temp, log, mut session) = live_session();
+    let start_id = session.events()[0].id.clone();
+    let extension = test_extension(
+        "agent-ext",
+        vec![Capability::AgentRecord],
+        TestCommandBehavior::RecordAgent,
+    );
+
+    let output = session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::AgentRecord])
+        .expect("execute extension agent record");
+    let live_agent_events = extension_agent_events(session.events());
+    let live_decisions = extension_permission_decisions(session.events());
+    let durable = read_provenance(&log).expect("durable events");
+    let durable_agent_events = extension_agent_events(&durable);
+
+    assert_eq!(live_decisions.len(), 1);
+    assert_eq!(live_decisions[0].parent.as_deref(), Some(start_id.as_str()));
+    assert_eq!(live_agent_events.len(), 2);
+    assert_eq!(live_agent_events, durable_agent_events);
+    assert_eq!(live_agent_events[0].kind.as_str(), EventKind::AGENT_SPAWN);
+    assert_eq!(live_agent_events[1].kind.as_str(), EventKind::AGENT_RESULT);
+    assert_eq!(
+        live_agent_events[0].parent.as_deref(),
+        Some(live_decisions[0].id.as_str())
+    );
+    assert_eq!(
+        live_agent_events[1].parent.as_deref(),
+        Some(live_agent_events[0].id.as_str())
+    );
+    assert_eq!(output["spawn_event_id"], json!(live_agent_events[0].id));
+    assert_eq!(output["result_event_id"], json!(live_agent_events[1].id));
+    assert_eq!(
+        live_agent_events[0].payload["extension_id"],
+        json!("agent-ext")
+    );
+    assert_eq!(
+        live_agent_events[1].payload["extension_id"],
+        json!("agent-ext")
+    );
+    assert!(
+        assemble_canvas(session.events(), &AutoCompactionPolicy::default()).is_empty(),
+        "extension agent records must not enter model canvas"
+    );
+}
+
+#[test]
+fn live_extension_execute_command_helper_allows_empty_success_queue() {
+    let (_temp, log, mut session) = live_session();
+    let extension = test_extension(
+        "noop-ext",
+        vec![],
+        TestCommandBehavior::Noop(json!({"ok": true})),
+    );
+
+    let output = session
+        .execute_extension_command(&extension, "write", json!(null), [])
+        .expect("execute no-op extension command");
+
+    assert_eq!(output, json!({"ok": true}));
+    assert_eq!(extension_event_count(session.events()), 0);
+    assert_eq!(
+        extension_event_count(&read_provenance(&log).expect("durable events")),
+        0
+    );
+    session
+        .execute_extension_command(
+            &test_extension("noop-ext", vec![], TestCommandBehavior::Noop(json!(null))),
+            "write",
+            json!(null),
+            [],
+        )
+        .expect("pre-execution registration failure does not degrade emission");
+}
+
+#[test]
+fn live_extension_execute_command_helper_uses_fresh_queue_per_call() {
+    let (_temp, log, mut session) = live_session();
+
+    for chunk in [
+        b"first helper run".as_slice(),
+        b"second helper run".as_slice(),
+    ] {
+        let extension = test_extension(
+            "artifact-ext",
+            vec![Capability::ArtifactWrite],
+            TestCommandBehavior::Write {
+                chunks: vec![chunk.to_vec()],
+                after: AfterWrite::Ok,
+            },
+        );
+        session
+            .execute_extension_command(
+                &extension,
+                "write",
+                json!(null),
+                [Capability::ArtifactWrite],
+            )
+            .expect("execute extension command");
+    }
+
+    let live_artifacts = extension_artifacts(session.events());
+    let durable_artifacts = extension_artifacts(&read_provenance(&log).expect("durable events"));
+    assert_eq!(live_artifacts.len(), 2);
+    assert_eq!(live_artifacts, durable_artifacts);
+    assert_ne!(live_artifacts[0].id, live_artifacts[1].id);
+}
+
+#[test]
+fn live_extension_execute_command_helper_publishes_after_error() {
+    let (_temp, log, mut session) = live_session();
+    let extension = test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"artifact before helper error".to_vec()],
+            after: AfterWrite::Error("helper raw error secret"),
+        },
+    );
+
+    let error = session
+        .execute_extension_command(
+            &extension,
+            "write",
+            json!({"secret": "helper input secret"}),
+            [Capability::ArtifactWrite],
+        )
+        .expect_err("command error");
+    assert!(matches!(error, ExtensionExecutionError::CommandFailed));
+    assert!(!error.to_string().contains("helper raw error secret"));
+    assert!(!error.to_string().contains("helper input secret"));
+
+    let durable = read_provenance(&log).expect("durable events");
+    let tail = &durable[durable.len() - 2..];
+    assert_eq!(tail[0].kind.as_str(), EventKind::EXTENSION_ARTIFACT);
+    assert_eq!(tail[1].kind.as_str(), EventKind::ERROR);
+    assert_eq!(
+        tail[1].payload.get("message"),
+        Some(&json!("extension command failed"))
+    );
+    assert_eq!(
+        extension_artifacts(session.events()),
+        extension_artifacts(&durable)
+    );
+    assert_eq!(extension_event_count(session.events()), 3);
+    assert_eq!(extension_permission_decisions(session.events()).len(), 1);
+    assert_eq!(extension_error_count(session.events()), 1);
+    let raw_log = std::fs::read_to_string(&log).expect("raw log");
+    assert!(!raw_log.contains("helper raw error secret"));
+    assert!(!raw_log.contains("helper input secret"));
+}
+
+#[test]
+fn live_extension_execute_command_helper_publishes_after_panic() {
+    let (_temp, log, mut session) = live_session();
+    let extension = test_extension(
+        "panic-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"artifact before helper panic".to_vec()],
+            after: AfterWrite::Panic("helper panic secret"),
+        },
+    );
+
+    let error = session
+        .execute_extension_command(
+            &extension,
+            "write",
+            json!({"secret": "panic input secret"}),
+            [Capability::ArtifactWrite],
+        )
+        .expect_err("command panic");
+    assert!(matches!(error, ExtensionExecutionError::CommandPanicked));
+    assert!(!error.to_string().contains("helper panic secret"));
+    assert!(!error.to_string().contains("panic input secret"));
+
+    let durable = read_provenance(&log).expect("durable events");
+    let tail = &durable[durable.len() - 2..];
+    assert_eq!(tail[0].kind.as_str(), EventKind::EXTENSION_ARTIFACT);
+    assert_eq!(tail[1].kind.as_str(), EventKind::ERROR);
+    assert_eq!(
+        tail[1].payload.get("message"),
+        Some(&json!("extension command panicked"))
+    );
+    assert_eq!(
+        extension_artifacts(session.events()),
+        extension_artifacts(&durable)
+    );
+    assert_eq!(extension_event_count(session.events()), 3);
+    assert_eq!(extension_permission_decisions(session.events()).len(), 1);
+    assert_eq!(extension_error_count(session.events()), 1);
+    let raw_log = std::fs::read_to_string(&log).expect("raw log");
+    assert!(!raw_log.contains("helper panic secret"));
+    assert!(!raw_log.contains("panic input secret"));
+}
+
+#[test]
+fn live_extension_execute_command_helper_maps_undeclared_command_capability_as_registration_failure(
+) {
+    let (_temp, log, mut session) = live_session();
+    let extension = test_extension(
+        "artifact-ext",
+        vec![],
+        TestCommandBehavior::Write {
+            chunks: vec![b"should not persist".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    let error = session
+        .execute_extension_command(&extension, "write", json!(null), [])
+        .expect_err("capability denied");
+
+    assert!(matches!(error, ExtensionExecutionError::RegistrationFailed));
+    let durable = read_provenance(&log).expect("durable events");
+    assert_eq!(extension_artifacts(session.events()).len(), 0);
+    assert_eq!(extension_artifacts(&durable).len(), 0);
+    assert_eq!(extension_error_count(session.events()), 0);
+    assert_eq!(extension_error_count(&durable), 0);
+}
+
+#[test]
+fn live_extension_execute_command_helper_maps_registration_failure() {
+    let (_temp, log, mut session) = live_session();
+    let extension = test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Noop(json!(null)),
+    );
+
+    let error = session
+        .execute_extension_command(
+            &extension,
+            "missing",
+            json!(null),
+            [Capability::ArtifactWrite],
+        )
+        .expect_err("missing command");
+
+    assert!(matches!(error, ExtensionExecutionError::RegistrationFailed));
+    assert_eq!(extension_event_count(session.events()), 0);
+    assert_eq!(
+        extension_event_count(&read_provenance(&log).expect("durable events")),
+        0
+    );
+}
+
+#[test]
+fn live_extension_execute_command_helper_requires_live_writer() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-live".to_owned();
+    enable_test_extensions(&mut config, &["noop-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let extension = test_extension("noop-ext", vec![], TestCommandBehavior::Noop(json!(null)));
+
+    let error = session
+        .execute_extension_command(&extension, "write", json!(null), [])
+        .expect_err("missing writer should fail");
+
+    assert!(matches!(
+        error,
+        ExtensionExecutionError::Session(SessionError::ExtensionEmissionUnavailable)
+    ));
+}
+
+#[test]
+fn live_extension_emission_requires_provenance_writer() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-live".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    let error = match session.extension_host_with_event_queue([Capability::ArtifactWrite]) {
+        Ok(_) => panic!("missing writer should fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::ExtensionEmissionUnavailable));
+}
+
+#[test]
+fn live_extension_publish_rejects_unpersisted_interleaving_events() {
+    let (_temp, _log, mut session) = live_session();
+    let (mut host, queue) = session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("extension host");
+    host.register_extension(&test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"durable but not yet live".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    ))
+    .expect("register");
+
+    host.execute_command("write", json!(null))
+        .expect("execute artifact");
+    session.bus.push(event(
+        EventKind::USER_MESSAGE,
+        object([("content", "interleaving live event".into())]),
+    ));
+
+    let error = session
+        .publish_queued_extension_events(&queue)
+        .expect_err("unpersisted live event should block queue publish");
+    assert!(matches!(error, SessionError::ExtensionEmissionOutOfOrder));
+    assert_eq!(extension_artifacts(session.events()).len(), 0);
+}
+
+#[test]
+fn live_extension_degraded_emission_recovers_after_reload() {
+    let (temp, log, mut session) = live_session();
+    let (mut host, queue) = session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("extension host");
+    host.register_extension(&test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"durable but not yet live".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    ))
+    .expect("register");
+    host.execute_command("write", json!(null))
+        .expect("execute artifact");
+    session.bus.push(event(
+        EventKind::USER_MESSAGE,
+        object([("content", "interleaving live event".into())]),
+    ));
+    let error = session
+        .publish_queued_extension_events(&queue)
+        .expect_err("unpersisted live event should block queue publish");
+    assert!(matches!(error, SessionError::ExtensionEmissionOutOfOrder));
+    let error = match session.extension_host_with_event_queue([Capability::ArtifactWrite]) {
+        Ok(_) => panic!("new hosts are rejected after degraded publication"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::ExtensionEmissionDegraded));
+
+    let durable = read_provenance(&log).expect("durable events before reload");
+    drop(host);
+    drop(queue);
+    drop(session);
+    let writer = ProvenanceWriter::new(&log).expect("reopen writer after dropping session");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-live".to_owned();
+    config.agent_id = "agent-live".to_owned();
+    enable_test_extensions(&mut config, &["after-reload-ext"]);
+    let mut resumed = Session::from_resumed_events(
+        config,
+        ProviderSet::single(ScriptedProvider::new(Vec::new())),
+        ScriptedDecider::new(Vec::new()),
+        durable,
+        ModelTarget::new("fixture", "fixture"),
+        None,
+        None,
+    )
+    .with_provenance(writer);
+
+    resumed
+        .execute_extension_command(
+            &test_extension(
+                "after-reload-ext",
+                vec![Capability::ArtifactWrite],
+                TestCommandBehavior::Write {
+                    chunks: vec![b"after reload".to_vec()],
+                    after: AfterWrite::Ok,
+                },
+            ),
+            "write",
+            json!(null),
+            [Capability::ArtifactWrite],
+        )
+        .expect("reloaded session can run extension command");
+
+    assert_eq!(
+        extension_artifacts(&read_provenance(&log).expect("durable events after reload")).len(),
+        2
+    );
+}
+
+#[test]
+fn live_extension_publish_requires_durable_queue_order() {
+    let (_temp, log, mut session) = live_session();
+    let (mut first_host, first_queue) = session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("first extension host");
+    first_host
+        .register_extension(&test_extension(
+            "first-ext",
+            vec![Capability::ArtifactWrite],
+            TestCommandBehavior::Write {
+                chunks: vec![b"first queue".to_vec()],
+                after: AfterWrite::Ok,
+            },
+        ))
+        .expect("register first");
+    first_host
+        .execute_command("write", json!(null))
+        .expect("execute first");
+
+    let (mut second_host, second_queue) = session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("second extension host");
+    second_host
+        .register_extension(&test_extension(
+            "second-ext",
+            vec![Capability::ArtifactWrite],
+            TestCommandBehavior::Write {
+                chunks: vec![b"second queue".to_vec()],
+                after: AfterWrite::Ok,
+            },
+        ))
+        .expect("register second");
+    second_host
+        .execute_command("write", json!(null))
+        .expect("execute second");
+
+    let error = session
+        .publish_queued_extension_events(&second_queue)
+        .expect_err("second queue cannot publish before first queue");
+    assert!(matches!(error, SessionError::ExtensionEmissionOutOfOrder));
+    assert_eq!(second_queue.len(), 2);
+    let error = match session.extension_host_with_event_queue([Capability::ArtifactWrite]) {
+        Ok(_) => panic!("new hosts are rejected after degraded publication"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::ExtensionEmissionDegraded));
+    assert!(matches!(
+        session
+            .execute_extension_command(
+                &test_extension(
+                    "third-ext",
+                    vec![Capability::ArtifactWrite],
+                    TestCommandBehavior::Write {
+                        chunks: vec![b"must not execute".to_vec()],
+                        after: AfterWrite::Ok,
+                    },
+                ),
+                "write",
+                json!(null),
+                [Capability::ArtifactWrite],
+            )
+            .expect_err("helper is rejected after degraded publication"),
+        ExtensionExecutionError::Session(SessionError::ExtensionEmissionDegraded)
+    ));
+    assert!(matches!(
+        session
+            .execute_extension_command(
+                &test_extension("noop-ext", vec![], TestCommandBehavior::Noop(json!(null))),
+                "write",
+                json!(null),
+                [],
+            )
+            .expect_err("degraded rejection is idempotent"),
+        ExtensionExecutionError::Session(SessionError::ExtensionEmissionDegraded)
+    ));
+
+    session
+        .publish_queued_extension_events(&first_queue)
+        .expect("publish first queue");
+    session
+        .publish_queued_extension_events(&second_queue)
+        .expect("publish second queue");
+    let artifacts = extension_artifacts(session.events());
+    let decisions = extension_permission_decisions(session.events());
+    let durable_artifacts = extension_artifacts(&read_provenance(&log).expect("durable events"));
+    assert_eq!(artifacts.len(), 2);
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(artifacts, durable_artifacts);
+    assert_eq!(artifacts[0].payload["extension_id"], json!("first-ext"));
+    assert_eq!(artifacts[1].payload["extension_id"], json!("second-ext"));
+    assert_eq!(
+        artifacts[0].parent.as_deref(),
+        Some(decisions[0].id.as_str())
+    );
+    assert_eq!(
+        decisions[1].parent.as_deref(),
+        Some(artifacts[0].id.as_str())
+    );
+    assert_eq!(
+        artifacts[1].parent.as_deref(),
+        Some(decisions[1].id.as_str())
+    );
+    let error = match session.extension_host_with_event_queue([Capability::ArtifactWrite]) {
+        Ok(_) => panic!("manual reconciliation does not clear degradation"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::ExtensionEmissionDegraded));
+    assert!(
+        assemble_canvas(session.events(), &AutoCompactionPolicy::default()).is_empty(),
+        "degraded extension emission must not inject extension events into canvas"
+    );
+}
+
+#[test]
+fn live_extension_host_reuses_owning_provenance_writer() {
+    let (_temp, log, mut session) = live_session();
+    let second_writer_error =
+        ProvenanceWriter::new(log.clone()).expect_err("session writer should hold lock");
+    assert!(matches!(
+        second_writer_error,
+        ProvenanceWriterError::SessionLocked { .. }
+    ));
+
+    let (mut host, queue) = session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("extension host");
+    host.register_extension(&test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"uses owning writer".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    ))
+    .expect("register");
+    host.execute_command("write", json!(null))
+        .expect("execute artifact without second writer");
+    session
+        .publish_queued_extension_events(&queue)
+        .expect("publish queued extension events");
+
+    assert_eq!(extension_artifacts(session.events()).len(), 1);
+}
+
+#[test]
+fn live_extension_undeclared_artifact_write_has_no_side_effects() {
+    let (_temp, log, mut session) = live_session();
+    let (mut host, queue) = session
+        .extension_host_with_event_queue([])
+        .expect("extension host");
+    let error = host
+        .register_extension(&test_extension(
+            "artifact-ext",
+            vec![],
+            TestCommandBehavior::Write {
+                chunks: vec![b"should not persist".to_vec()],
+                after: AfterWrite::Ok,
+            },
+        ))
+        .expect_err("undeclared command capability");
+
+    assert!(matches!(
+        error,
+        ExtensionHostError::RegistrationFailed(_, ExtensionError::Message(message))
+            if message.contains("command `write` requires undeclared capability artifact-write")
+    ));
+    assert_eq!(queue.len(), 0);
+    session
+        .publish_queued_extension_events(&queue)
+        .expect("publish queued extension events");
+    assert_eq!(extension_artifacts(session.events()).len(), 0);
+    assert_eq!(extension_error_count(session.events()), 0);
+    assert!(!log
+        .parent()
+        .expect("session dir")
+        .join("extensions")
+        .exists());
+    let durable = read_provenance(&log).expect("durable events");
+    assert_eq!(extension_artifacts(&durable).len(), 0);
+    assert_eq!(extension_error_count(&durable), 0);
+}
+
+#[test]
+fn live_extension_artifact_then_error_persists_partial_artifact_and_sanitized_error() {
+    let (_temp, log, mut session) = live_session();
+    let (mut host, queue) = session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("extension host");
+    host.register_extension(&test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"artifact before error".to_vec()],
+            after: AfterWrite::Error("raw error secret should not persist"),
+        },
+    ))
+    .expect("register");
+
+    assert!(matches!(
+        host.execute_command("write", json!({"secret": "input secret"}))
+            .expect_err("command error"),
+        ExtensionHostError::CommandFailed(_, ExtensionError::Message(_))
+    ));
+    session
+        .publish_queued_extension_events(&queue)
+        .expect("publish queued extension events");
+
+    let durable = read_provenance(&log).expect("durable events");
+    let tail = &durable[durable.len() - 2..];
+    assert_eq!(tail[0].kind.as_str(), EventKind::EXTENSION_ARTIFACT);
+    assert_eq!(tail[1].kind.as_str(), EventKind::ERROR);
+    assert_eq!(tail[1].parent.as_deref(), Some(tail[0].id.as_str()));
+    assert_eq!(
+        tail[1].payload.get("message"),
+        Some(&json!("extension command failed"))
+    );
+    let raw_log = std::fs::read_to_string(&log).expect("raw log");
+    assert!(!raw_log.contains("raw error secret"));
+    assert!(!raw_log.contains("input secret"));
+}
+
+#[test]
+fn live_extension_artifact_then_panic_persists_sanitized_error_and_disables_extension() {
+    let (_temp, log, mut session) = live_session();
+    let (mut host, queue) = session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("extension host");
+    host.register_extension(&test_extension(
+        "panic-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"artifact before panic".to_vec()],
+            after: AfterWrite::Panic("panic payload secret"),
+        },
+    ))
+    .expect("register");
+
+    assert_eq!(
+        host.execute_command("write", json!(null))
+            .expect_err("command panic"),
+        ExtensionHostError::CommandPanic("panic-ext".to_owned(), "write".to_owned())
+    );
+    assert_eq!(
+        host.execute_command("write", json!(null))
+            .expect_err("disabled after panic"),
+        ExtensionHostError::ExtensionDisabled("panic-ext".to_owned())
+    );
+    session
+        .publish_queued_extension_events(&queue)
+        .expect("publish queued extension events");
+
+    let durable = read_provenance(&log).expect("durable events");
+    let tail = &durable[durable.len() - 2..];
+    assert_eq!(tail[0].kind.as_str(), EventKind::EXTENSION_ARTIFACT);
+    assert_eq!(tail[1].kind.as_str(), EventKind::ERROR);
+    assert_eq!(
+        tail[1].payload.get("message"),
+        Some(&json!("extension command panicked"))
+    );
+    assert_eq!(tail[1].payload.get("failure"), Some(&json!("panic")));
+    let raw_log = std::fs::read_to_string(&log).expect("raw log");
+    assert!(!raw_log.contains("panic payload secret"));
+}
+
+#[test]
+fn try_compact_emits_discarded_event_for_invalid_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = SessionConfig::new(temp.path());
+    config.compaction_keep_recent = 1;
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+    for event in [
+        tool_result("split", "old"),
+        event(
+            EventKind::USER_MESSAGE,
+            object([("content", "safe cut".into())]),
+        ),
+        tool_call("split"),
+        tool_result("recent", "recent"),
+    ] {
+        session.bus.push(event);
+    }
+
+    assert!(!session.try_compact(&WorkingStateProjection::default()));
+
+    let discarded = session
+        .events()
+        .last()
+        .expect("discarded event after invalid candidate");
+    assert_eq!(
+        discarded.kind.as_str(),
+        EventKind::CANVAS_CANDIDATE_DISCARDED
+    );
+    assert_eq!(
+        payload_string(discarded, "reason").as_deref(),
+        Some("tool pair spans compaction cut")
+    );
+    assert_eq!(
+        payload_string(discarded, "policy_version").as_deref(),
+        Some("1")
+    );
+}
+
+fn event(kind: &'static str, payload: JsonObject) -> EventEnvelope {
+    EventEnvelope::new("session", "root", None, kind, payload)
+}
+
+fn tool_call(id: &str) -> EventEnvelope {
+    event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", id.into()),
+            ("name", "read_file".into()),
+            ("input", json!({"path": "note.txt"})),
+        ]),
+    )
+}
+
+fn tool_result(id: &str, output: &str) -> EventEnvelope {
+    event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", id.into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+            ("output", output.into()),
+        ]),
+    )
+}
+
+fn live_session() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    Session<ScriptedDecider>,
+) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-live");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-live".to_owned();
+    config.agent_id = "agent-live".to_owned();
+    enable_test_extensions(
+        &mut config,
+        &[
+            "agent-ext",
+            "artifact-ext",
+            "first-ext",
+            "noop-ext",
+            "panic-ext",
+            "second-ext",
+            "third-ext",
+        ],
+    );
+    let session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    (temp, log, session)
+}
+
+fn enable_test_extensions(config: &mut SessionConfig, ids: &[&str]) {
+    config
+        .extensions_enabled
+        .extend(ids.iter().map(|id| (*id).to_owned()));
+}
+
+#[derive(Debug)]
+struct CapturingProvider {
+    request: Arc<Mutex<Option<ModelRequest>>>,
+}
+
+impl CapturingProvider {
+    fn new(request: Arc<Mutex<Option<ModelRequest>>>) -> Self {
+        Self { request }
+    }
+}
+
+impl ModelProvider for CapturingProvider {
+    fn name(&self) -> &'static str {
+        "capture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        *self.request.lock().expect("captured request lock") = Some(request);
+        Ok(Box::new(
+            vec![
+                Ok(ModelStreamEvent::TextDelta("ok".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: Some(0),
+                        reasoning_tokens: Some(0),
+                    }),
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+fn extension_artifacts(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::EXTENSION_ARTIFACT)
+        .cloned()
+        .collect()
+}
+
+fn extension_agent_events(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    events
+        .iter()
+        .filter(|event| {
+            let kind = event.kind.as_str();
+            (kind == EventKind::AGENT_SPAWN || kind == EventKind::AGENT_RESULT)
+                && event.payload.get("source").and_then(Value::as_str) == Some("extension")
+        })
+        .cloned()
+        .collect()
+}
+
+fn extension_permission_decisions(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::PERMISSION_DECISION
+                && event.payload.get("source").and_then(Value::as_str) == Some("extension")
+        })
+        .cloned()
+        .collect()
+}
+
+fn extension_event_count(events: &[EventEnvelope]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::EXTENSION_ARTIFACT
+                || event.payload.get("source").and_then(Value::as_str) == Some("extension")
+        })
+        .count()
+}
+
+fn extension_event_ids(events: &[EventEnvelope]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::EXTENSION_ARTIFACT
+                || event.payload.get("source").and_then(Value::as_str) == Some("extension")
+        })
+        .map(|event| event.id.clone())
+        .collect()
+}
+
+fn extension_error_count(events: &[EventEnvelope]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event.payload.get("source").and_then(Value::as_str) == Some("extension")
+        })
+        .count()
+}
+
+#[derive(Clone)]
+enum TestCommandBehavior {
+    Write {
+        chunks: Vec<Vec<u8>>,
+        after: AfterWrite,
+    },
+    RecordAgent,
+    Slot {
+        slot: &'static str,
+        content: &'static str,
+    },
+    Noop(Value),
+}
+
+#[derive(Clone)]
+enum AfterWrite {
+    Ok,
+    Error(&'static str),
+    Panic(&'static str),
+}
+
+struct TestExtension {
+    id: &'static str,
+    capabilities: Vec<Capability>,
+    behavior: TestCommandBehavior,
+}
+
+fn test_extension(
+    id: &'static str,
+    capabilities: Vec<Capability>,
+    behavior: TestCommandBehavior,
+) -> TestExtension {
+    TestExtension {
+        id,
+        capabilities,
+        behavior,
+    }
+}
+
+impl Extension for TestExtension {
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            id: self.id.to_owned(),
+            version: "0.1.0".to_owned(),
+            display_name: self.id.to_owned(),
+            capabilities: self.capabilities.clone(),
+        }
+    }
+
+    fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        registrar.register_command(
+            "write",
+            Box::new(TestCommand {
+                behavior: self.behavior.clone(),
+            }),
+        );
+        Ok(())
+    }
+}
+
+struct TestCommand {
+    behavior: TestCommandBehavior,
+}
+
+impl ExtensionCommand for TestCommand {
+    fn descriptor(&self) -> CommandDescriptor {
+        let required_capabilities = match &self.behavior {
+            TestCommandBehavior::Write { .. } => vec![Capability::ArtifactWrite],
+            TestCommandBehavior::RecordAgent => vec![Capability::AgentRecord],
+            TestCommandBehavior::Slot { .. } => vec![Capability::ContextSlot],
+            TestCommandBehavior::Noop(_) => Vec::new(),
+        };
+        CommandDescriptor {
+            name: "write".to_owned(),
+            display_name: String::new(),
+            summary: String::new(),
+            required_capabilities,
+            args: Vec::new(),
+            accepts_session_id: false,
+        }
+    }
+
+    fn execute(
+        &self,
+        _context: CommandContext,
+        host: &dyn HostApi,
+    ) -> Result<Value, ExtensionError> {
+        match &self.behavior {
+            TestCommandBehavior::Noop(output) => Ok(output.clone()),
+            TestCommandBehavior::Slot { slot, content } => {
+                host.update_context_slot(slot, content)?;
+                Ok(json!({"ok": true}))
+            }
+            TestCommandBehavior::RecordAgent => {
+                let record = host.record_agent_task_result(
+                    HostAgentTask {
+                        task: "observe live helper".to_owned(),
+                        persona: "observer".to_owned(),
+                        provider: "fixture".to_owned(),
+                        model: "observer-model".to_owned(),
+                        capabilities: Vec::new(),
+                        budget: HostAgentBudget {
+                            max_turns: Some(1),
+                            max_tool_calls: Some(2),
+                            max_tokens: Some(3),
+                        },
+                        result_schema: None,
+                    },
+                    HostAgentResult::success("observer complete", Some("{\"ok\":true}")),
+                )?;
+                Ok(json!({
+                    "child_agent_id": record.child_agent_id,
+                    "spawn_event_id": record.spawn_event_id,
+                    "result_event_id": record.result_event_id,
+                }))
+            }
+            TestCommandBehavior::Write { chunks, after } => {
+                let mut records = Vec::new();
+                for (index, chunk) in chunks.iter().enumerate() {
+                    let mut metadata = Map::new();
+                    metadata.insert("index".to_owned(), json!(index));
+                    let record = host.write_artifact(ArtifactWrite {
+                        display_name: format!("artifact {index}"),
+                        media_type: "text/plain".to_owned(),
+                        bytes: chunk.clone(),
+                        source_event_ids: Vec::new(),
+                        metadata,
+                    })?;
+                    records.push(json!({
+                        "persisted_event_id": record.persisted_event_id,
+                        "relative_path": record.relative_path,
+                        "sha256": record.sha256,
+                        "byte_len": record.byte_len,
+                    }));
+                }
+                match after {
+                    AfterWrite::Ok => Ok(json!({ "records": records })),
+                    AfterWrite::Error(message) => {
+                        Err(ExtensionError::Message((*message).to_owned()))
+                    }
+                    AfterWrite::Panic(message) => panic!("{message}"),
+                }
+            }
+        }
+    }
+}

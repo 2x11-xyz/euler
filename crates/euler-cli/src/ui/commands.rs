@@ -1,0 +1,847 @@
+use super::theme::ThemeChoice;
+use euler_core::{ApprovalMode, ReasoningEffort};
+use euler_sdk::Capability;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandSpec {
+    pub token: &'static str,
+    pub summary: &'static str,
+    pub args: &'static str,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CommandContext {
+    pub model_choices: Vec<ModelChoice>,
+    pub effort_choices: Vec<EffortChoice>,
+    pub theme_choices: Vec<ThemeChoiceItem>,
+    pub resume_items: Vec<ResumeItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelChoice {
+    pub provider: String,
+    pub model: String,
+    pub label: String,
+    pub current: bool,
+}
+
+impl ModelChoice {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let model = model.into();
+        Self {
+            label: format!("{provider}::{model}"),
+            provider,
+            model,
+            current: false,
+        }
+    }
+
+    pub fn with_metadata(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        context_window_tokens: Option<u64>,
+        supports_reasoning: Option<bool>,
+    ) -> Self {
+        let mut choice = Self::new(provider, model);
+        if let Some(suffix) = model_label_suffix(context_window_tokens, supports_reasoning) {
+            choice.label.push_str(" — ");
+            choice.label.push_str(&suffix);
+        }
+        choice
+    }
+
+    pub fn current(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            current: true,
+            ..Self::new(provider, model)
+        }
+    }
+}
+
+fn model_label_suffix(
+    context_window_tokens: Option<u64>,
+    supports_reasoning: Option<bool>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(tokens) = context_window_tokens {
+        parts.push(format!("{} ctx", format_context_tokens(tokens)));
+    }
+    if supports_reasoning == Some(true) {
+        parts.push("reasoning".to_owned());
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn format_context_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        if tokens.is_multiple_of(1_000_000) {
+            format!("{}M", tokens / 1_000_000)
+        } else {
+            format!("{:.2}M", tokens as f64 / 1_000_000.0)
+        }
+    } else if tokens >= 1_000 {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffortChoice {
+    pub effort: ReasoningEffort,
+    pub label: String,
+    pub current: bool,
+}
+
+impl EffortChoice {
+    pub fn new(effort: ReasoningEffort, current: ReasoningEffort) -> Self {
+        let label = match effort {
+            ReasoningEffort::XSmall => "xsmall - fastest/least reasoning",
+            ReasoningEffort::Small => "small - light reasoning",
+            ReasoningEffort::Medium => "medium - balanced default",
+            ReasoningEffort::Large => "large - deeper reasoning",
+            ReasoningEffort::XLarge => "xlarge - maximum reasoning",
+        };
+        Self {
+            effort,
+            label: label.to_owned(),
+            current: effort == current,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThemeChoiceItem {
+    pub choice: ThemeChoice,
+    pub label: String,
+    pub current: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeItem {
+    pub id: String,
+    pub label: String,
+    pub preview: Option<String>,
+    pub status: Option<String>,
+    pub group: Option<String>,
+}
+
+impl ResumeItem {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            preview: None,
+            status: None,
+            group: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandAction {
+    NewSession,
+    SwitchModel {
+        provider: String,
+        model: String,
+    },
+    SetReasoningEffort {
+        effort: ReasoningEffort,
+    },
+    NameSession {
+        name: String,
+    },
+    CompactSession,
+    ExportSession {
+        path: Option<String>,
+    },
+    ExtensionRun {
+        id: String,
+        command: String,
+        input: serde_json::Value,
+    },
+    CompanionRun {
+        input: serde_json::Value,
+    },
+    ShowStatus,
+    Login {
+        provider: String,
+    },
+    Logout {
+        provider: String,
+    },
+    SetTheme {
+        choice: ThemeChoice,
+    },
+    SetPermissionMode {
+        capability: Capability,
+        mode: ApprovalMode,
+    },
+    ResumeSession {
+        session_id: String,
+    },
+    ShowHelp {
+        text: String,
+    },
+    Quit,
+    ScrollViewportToBottom,
+    CopyLastAssistantResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandEffect {
+    Action(CommandAction),
+    OpenPicker(PickerSpec),
+    Message(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PickerSpec {
+    Model(Vec<ModelChoice>),
+    Effort(Vec<EffortChoice>),
+    Theme(Vec<ThemeChoiceItem>),
+    Permissions(Vec<PermissionChoice>),
+    Resume(Vec<ResumeItem>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionChoice {
+    pub capability: Capability,
+    pub mode: ApprovalMode,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedCommand<'a> {
+    pub token: &'a str,
+    pub arg: Option<&'a str>,
+}
+
+const COMMAND_TABLE: &[CommandSpec] = &[
+    CommandSpec {
+        token: "/model",
+        summary: "switch provider/model",
+        args: "[provider::model]",
+    },
+    CommandSpec {
+        token: "/new",
+        summary: "start a fresh session",
+        args: "",
+    },
+    CommandSpec {
+        token: "/effort",
+        summary: "set reasoning effort",
+        args: "[level]",
+    },
+    CommandSpec {
+        token: "/theme",
+        summary: "switch theme",
+        args: "",
+    },
+    CommandSpec {
+        token: "/compact",
+        summary: "compact eligible history",
+        args: "",
+    },
+    CommandSpec {
+        token: "/export",
+        summary: "export this session",
+        args: "[path]",
+    },
+    CommandSpec {
+        token: "/extension",
+        summary: "run an extension command",
+        args: "run <ext>.<cmd> [json-input]",
+    },
+    CommandSpec {
+        token: "/companion",
+        summary: "run a companion task",
+        args: "run <json-agent-task>",
+    },
+    CommandSpec {
+        token: "/status",
+        summary: "show session status",
+        args: "",
+    },
+    CommandSpec {
+        token: "/hotkeys",
+        summary: "show keyboard shortcuts",
+        args: "",
+    },
+    CommandSpec {
+        token: "/login",
+        summary: "show login instructions",
+        args: "[provider]",
+    },
+    CommandSpec {
+        token: "/logout",
+        summary: "show logout instructions",
+        args: "[provider]",
+    },
+    CommandSpec {
+        token: "/name",
+        summary: "name this session",
+        args: "<name>",
+    },
+    CommandSpec {
+        token: "/permissions",
+        summary: "set capability approval mode",
+        args: "",
+    },
+    CommandSpec {
+        token: "/resume",
+        summary: "resume a prior session",
+        args: "",
+    },
+    CommandSpec {
+        token: "/help",
+        summary: "show slash commands",
+        args: "",
+    },
+    CommandSpec {
+        token: "/quit",
+        summary: "quit Euler",
+        args: "",
+    },
+    CommandSpec {
+        token: "/copy",
+        summary: "copy last assistant response",
+        args: "",
+    },
+];
+
+pub fn command_table() -> &'static [CommandSpec] {
+    COMMAND_TABLE
+}
+
+pub fn filter_commands(input: &str) -> Vec<CommandSpec> {
+    let needle = filter_needle(input);
+    command_table()
+        .iter()
+        .copied()
+        .filter(|spec| command_matches(spec, &needle))
+        .collect()
+}
+
+pub fn filter_token(input: &str) -> &str {
+    input.split_whitespace().next().unwrap_or(input)
+}
+
+fn filter_needle(input: &str) -> String {
+    filter_token(input)
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_lowercase()
+}
+
+pub fn parse_command(input: &str) -> Result<ParsedCommand<'_>, String> {
+    let input = input.trim_start();
+    if !input.starts_with('/') {
+        return Err("slash command must start with /".to_owned());
+    }
+    let token_end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let token = normalize_command_token(&input[..token_end]);
+    let arg = input[token_end..].trim_start();
+    Ok(ParsedCommand {
+        token,
+        arg: (!arg.is_empty()).then_some(arg),
+    })
+}
+
+pub fn dispatch_command(input: &str, context: &CommandContext) -> CommandEffect {
+    match parse_command(input) {
+        Ok(parsed) => dispatch_parsed(parsed, context),
+        Err(message) => CommandEffect::Message(message),
+    }
+}
+
+pub fn permission_choices() -> Vec<PermissionChoice> {
+    [
+        Capability::FsRead,
+        Capability::FsWrite,
+        Capability::ShellExec,
+    ]
+    .into_iter()
+    .flat_map(|capability| permission_modes(capability).into_iter())
+    .collect()
+}
+
+pub fn help_text() -> String {
+    command_table()
+        .iter()
+        .map(help_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> CommandEffect {
+    match parsed.token {
+        "/new" => CommandEffect::Action(CommandAction::NewSession),
+        "/model" => model_effect(parsed.arg, context),
+        "/effort" => effort_effect(parsed.arg, context),
+        "/theme" => theme_effect(parsed.arg, context),
+        "/compact" => CommandEffect::Action(CommandAction::CompactSession),
+        "/export" => CommandEffect::Action(CommandAction::ExportSession {
+            path: parsed.arg.map(str::to_owned),
+        }),
+        "/extension" => extension_effect(parsed.arg),
+        "/companion" => companion_effect(parsed.arg),
+        "/status" => CommandEffect::Action(CommandAction::ShowStatus),
+        "/hotkeys" => CommandEffect::Action(CommandAction::ShowHelp {
+            text: hotkeys_text(),
+        }),
+        "/login" => CommandEffect::Action(CommandAction::Login {
+            provider: parsed.arg.unwrap_or("chatgpt").to_owned(),
+        }),
+        "/logout" => CommandEffect::Action(CommandAction::Logout {
+            provider: parsed.arg.unwrap_or("chatgpt").to_owned(),
+        }),
+        "/name" => required_arg(parsed.arg, "usage: /name <name>", |name| {
+            CommandAction::NameSession {
+                name: name.to_owned(),
+            }
+        }),
+        "/permissions" => CommandEffect::OpenPicker(PickerSpec::Permissions(permission_choices())),
+        "/resume" => CommandEffect::OpenPicker(PickerSpec::Resume(context.resume_items.clone())),
+        "/help" => CommandEffect::Action(CommandAction::ShowHelp { text: help_text() }),
+        "/quit" => CommandEffect::Action(CommandAction::Quit),
+        "/copy" => CommandEffect::Action(CommandAction::CopyLastAssistantResponse),
+        token => CommandEffect::Message(format!("unknown command: {token}")),
+    }
+}
+
+fn companion_effect(arg: Option<&str>) -> CommandEffect {
+    let Some(arg) = arg else {
+        return CommandEffect::Message("usage: /companion run <json-agent-task>".to_owned());
+    };
+    let Some(rest) = arg.strip_prefix("run") else {
+        return CommandEffect::Message("usage: /companion run <json-agent-task>".to_owned());
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return CommandEffect::Message("usage: /companion run <json-agent-task>".to_owned());
+    }
+    let json = rest.trim_start();
+    if json.is_empty() {
+        return CommandEffect::Message("usage: /companion run <json-agent-task>".to_owned());
+    }
+    match serde_json::from_str(json) {
+        Ok(input) => CommandEffect::Action(CommandAction::CompanionRun { input }),
+        Err(error) => CommandEffect::Message(format!("companion input must be JSON: {error}")),
+    }
+}
+
+fn extension_effect(arg: Option<&str>) -> CommandEffect {
+    let Some(arg) = arg else {
+        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+    };
+    let Some(rest) = arg.strip_prefix("run") else {
+        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+    }
+    let mut parts = rest.trim_start().splitn(2, char::is_whitespace);
+    let Some(reference) = parts.next().filter(|value| !value.is_empty()) else {
+        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+    };
+    let Some((id, command)) = parse_extension_reference(reference) else {
+        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+    };
+    let input = match parts
+        .next()
+        .map(str::trim_start)
+        .filter(|value| !value.is_empty())
+    {
+        Some(json) => match serde_json::from_str(json) {
+            Ok(value) => value,
+            Err(error) => {
+                return CommandEffect::Message(format!("extension input must be JSON: {error}"));
+            }
+        },
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    CommandEffect::Action(CommandAction::ExtensionRun { id, command, input })
+}
+
+fn parse_extension_reference(reference: &str) -> Option<(String, String)> {
+    let (id, command) = reference.split_once('.')?;
+    if id.is_empty() || command.is_empty() || command.contains('.') {
+        return None;
+    }
+    Some((id.to_owned(), command.to_owned()))
+}
+
+fn model_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
+    let Some(target) = arg else {
+        return CommandEffect::OpenPicker(PickerSpec::Model(context.model_choices.clone()));
+    };
+    match parse_model_target(target) {
+        Some((provider, model)) => {
+            CommandEffect::Action(CommandAction::SwitchModel { provider, model })
+        }
+        None => CommandEffect::Message("usage: /model <provider::model>".to_owned()),
+    }
+}
+
+fn effort_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
+    let Some(level) = arg else {
+        return CommandEffect::OpenPicker(PickerSpec::Effort(context.effort_choices.clone()));
+    };
+    match ReasoningEffort::parse(level) {
+        Some(effort) => CommandEffect::Action(CommandAction::SetReasoningEffort { effort }),
+        None => {
+            CommandEffect::Message("usage: /effort <xsmall|small|medium|large|xlarge>".to_owned())
+        }
+    }
+}
+
+fn theme_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
+    let Some(theme) = arg else {
+        return CommandEffect::OpenPicker(PickerSpec::Theme(context.theme_choices.clone()));
+    };
+    match ThemeChoice::parse(theme) {
+        Some(choice) => CommandEffect::Action(CommandAction::SetTheme { choice }),
+        None => CommandEffect::Message(format!(
+            "usage: /theme <{}>",
+            ThemeChoice::format_canonical_ids("|")
+        )),
+    }
+}
+
+pub fn theme_choices(current: ThemeChoice) -> Vec<ThemeChoiceItem> {
+    ThemeChoice::all()
+        .iter()
+        .map(|profile| ThemeChoiceItem {
+            choice: profile.choice,
+            label: profile.label.to_owned(),
+            current: profile.choice == current,
+        })
+        .collect()
+}
+
+fn required_arg(
+    arg: Option<&str>,
+    usage: &str,
+    action: impl FnOnce(&str) -> CommandAction,
+) -> CommandEffect {
+    match arg {
+        Some(value) => CommandEffect::Action(action(value)),
+        None => CommandEffect::Message(usage.to_owned()),
+    }
+}
+
+fn parse_model_target(target: &str) -> Option<(String, String)> {
+    let (provider, model) = target.split_once("::").or_else(|| target.split_once('/'))?;
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((provider.to_ascii_lowercase(), model.to_owned()))
+}
+
+fn permission_modes(capability: Capability) -> Vec<PermissionChoice> {
+    [
+        ApprovalMode::Ask,
+        ApprovalMode::SessionAllow,
+        ApprovalMode::AlwaysDeny,
+    ]
+    .into_iter()
+    .map(|mode| PermissionChoice {
+        capability,
+        mode,
+        label: format!("{} {}", capability_label(capability), mode_label(mode)),
+    })
+    .collect()
+}
+
+fn command_matches(spec: &CommandSpec, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let token = spec.token.trim_start_matches('/').to_lowercase();
+    token.starts_with(needle) || token.contains(needle)
+}
+
+fn normalize_command_token(token: &str) -> &str {
+    let trimmed = token.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+fn help_line(spec: &CommandSpec) -> String {
+    let args = command_args(spec);
+    let args = if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {args}")
+    };
+    format!("{}{} - {}", spec.token, args, spec.summary)
+}
+
+fn command_args(spec: &CommandSpec) -> String {
+    if spec.token == "/theme" {
+        return format!("[{}]", ThemeChoice::format_canonical_ids("|"));
+    }
+    spec.args.to_owned()
+}
+
+fn hotkeys_text() -> String {
+    [
+        "Enter - send message",
+        "Shift+Enter - insert newline",
+        "Esc - close palette or interrupt active turn",
+        "Ctrl+O - expand/collapse folded blocks",
+        "Ctrl+C twice - quit",
+        "Mouse wheel/PageUp/PageDown - scroll transcript",
+    ]
+    .join("\n")
+}
+
+fn capability_label(capability: Capability) -> &'static str {
+    capability.as_str()
+}
+
+fn mode_label(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Ask => "ask",
+        ApprovalMode::SessionAllow => "session-allow",
+        ApprovalMode::AlwaysDeny => "always-deny",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_command_parsing_routes_baseline_actions() {
+        let context = CommandContext::default();
+
+        assert_eq!(
+            dispatch_command("/model openrouter::glm-5.2", &context),
+            CommandEffect::Action(CommandAction::SwitchModel {
+                provider: "openrouter".to_owned(),
+                model: "glm-5.2".to_owned(),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/model openrouter/openai/gpt-4.1-mini", &context),
+            CommandEffect::Action(CommandAction::SwitchModel {
+                provider: "openrouter".to_owned(),
+                model: "openai/gpt-4.1-mini".to_owned(),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/model OpenRouter::openai/gpt-4.1-mini  ", &context),
+            CommandEffect::Action(CommandAction::SwitchModel {
+                provider: "openrouter".to_owned(),
+                model: "openai/gpt-4.1-mini".to_owned(),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/effort xlarge", &context),
+            CommandEffect::Action(CommandAction::SetReasoningEffort {
+                effort: ReasoningEffort::XLarge,
+            })
+        );
+        assert_eq!(
+            dispatch_command("/name research branch", &context),
+            CommandEffect::Action(CommandAction::NameSession {
+                name: "research branch".to_owned(),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/copy", &context),
+            CommandEffect::Action(CommandAction::CopyLastAssistantResponse)
+        );
+        assert_eq!(
+            dispatch_command("/quit", &context),
+            CommandEffect::Action(CommandAction::Quit)
+        );
+        assert_eq!(
+            dispatch_command("/new", &context),
+            CommandEffect::Action(CommandAction::NewSession)
+        );
+        assert_eq!(
+            dispatch_command("/status", &context),
+            CommandEffect::Action(CommandAction::ShowStatus)
+        );
+        assert_eq!(
+            dispatch_command("/compact", &context),
+            CommandEffect::Action(CommandAction::CompactSession)
+        );
+        assert_eq!(
+            dispatch_command("/export /tmp/euler.json", &context),
+            CommandEffect::Action(CommandAction::ExportSession {
+                path: Some("/tmp/euler.json".to_owned()),
+            })
+        );
+        assert_eq!(
+            dispatch_command(
+                "/extension run session-export.session-export {\"limit\":1}",
+                &context
+            ),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "session-export".to_owned(),
+                command: "session-export".to_owned(),
+                input: serde_json::json!({"limit": 1}),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/extension run causal-dag.catch-up", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "causal-dag".to_owned(),
+                command: "catch-up".to_owned(),
+                input: serde_json::json!({}),
+            })
+        );
+        assert_eq!(
+            dispatch_command(
+                "/companion run {\"task\":\"review\",\"persona\":\"worker\"}",
+                &context
+            ),
+            CommandEffect::Action(CommandAction::CompanionRun {
+                input: serde_json::json!({"task": "review", "persona": "worker"}),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/theme light", &context),
+            CommandEffect::Action(CommandAction::SetTheme {
+                choice: ThemeChoice::GruvboxLight,
+            })
+        );
+        assert_eq!(
+            dispatch_command("/theme dark", &context),
+            CommandEffect::Action(CommandAction::SetTheme {
+                choice: ThemeChoice::GruvboxDark,
+            })
+        );
+        assert_eq!(
+            dispatch_command("/theme gruvbox_dark", &context),
+            CommandEffect::Action(CommandAction::SetTheme {
+                choice: ThemeChoice::GruvboxDark,
+            })
+        );
+        assert_eq!(
+            dispatch_command("/login", &context),
+            CommandEffect::Action(CommandAction::Login {
+                provider: "chatgpt".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn direct_dispatch_uses_visible_token_for_trailing_slash_noise() {
+        let context = CommandContext::default();
+
+        assert_eq!(
+            dispatch_command("/effort// large", &context),
+            CommandEffect::Action(CommandAction::SetReasoningEffort {
+                effort: ReasoningEffort::Large,
+            })
+        );
+    }
+
+    #[test]
+    fn model_without_arg_opens_caller_supplied_picker() {
+        let context = CommandContext {
+            model_choices: vec![ModelChoice::new("fixture", "echo")],
+            ..CommandContext::default()
+        };
+
+        assert_eq!(
+            dispatch_command("/model", &context),
+            CommandEffect::OpenPicker(PickerSpec::Model(vec![ModelChoice::new("fixture", "echo")]))
+        );
+    }
+
+    #[test]
+    fn model_choice_label_includes_known_metadata_without_changing_value_fields() {
+        let choice = ModelChoice::with_metadata("openai", "gpt-5.5", Some(1_050_000), Some(true));
+
+        assert_eq!(choice.provider, "openai");
+        assert_eq!(choice.model, "gpt-5.5");
+        assert_eq!(choice.label, "openai::gpt-5.5 — 1.05M ctx, reasoning");
+
+        let unknown = ModelChoice::with_metadata("custom", "future", None, None);
+        assert_eq!(unknown.label, "custom::future");
+    }
+
+    #[test]
+    fn context_token_labels_keep_non_whole_millions_honest() {
+        assert_eq!(format_context_tokens(200_000), "200K");
+        assert_eq!(format_context_tokens(400_000), "400K");
+        assert_eq!(format_context_tokens(1_000_000), "1M");
+        assert_eq!(format_context_tokens(1_050_000), "1.05M");
+    }
+
+    #[test]
+    fn command_filter_uses_first_token_and_prefix_or_substring() {
+        let model = filter_commands("/mo ignored");
+        let substring = filter_commands("/del");
+
+        assert_eq!(
+            model.iter().map(|spec| spec.token).collect::<Vec<_>>(),
+            vec!["/model"]
+        );
+        assert_eq!(
+            substring.iter().map(|spec| spec.token).collect::<Vec<_>>(),
+            vec!["/model"]
+        );
+    }
+
+    #[test]
+    fn help_text_uses_catalog_theme_usage() {
+        assert!(help_text().contains("/theme [gruvbox-dark|gruvbox-light] - switch theme"));
+        assert!(command_table()
+            .iter()
+            .any(|spec| spec.token == "/theme" && spec.args.is_empty()));
+    }
+
+    #[test]
+    fn invalid_or_incomplete_commands_return_messages() {
+        let context = CommandContext::default();
+
+        assert_eq!(
+            dispatch_command("model fixture/echo", &context),
+            CommandEffect::Message("slash command must start with /".to_owned())
+        );
+        assert_eq!(
+            dispatch_command("/model missing-separator", &context),
+            CommandEffect::Message("usage: /model <provider::model>".to_owned())
+        );
+        assert_eq!(
+            dispatch_command("/effort", &context),
+            CommandEffect::OpenPicker(PickerSpec::Effort(Vec::new()))
+        );
+        assert_eq!(
+            dispatch_command("/effort extra-high", &context),
+            CommandEffect::Message("usage: /effort <xsmall|small|medium|large|xlarge>".to_owned())
+        );
+        assert_eq!(
+            dispatch_command("/theme gruvbox", &context),
+            CommandEffect::Message("usage: /theme <gruvbox-dark|gruvbox-light>".to_owned())
+        );
+        assert_eq!(
+            dispatch_command("/extension", &context),
+            CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned())
+        );
+        assert_eq!(
+            dispatch_command("/extension run causal-dag", &context),
+            CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned())
+        );
+        assert!(matches!(
+            dispatch_command("/extension run causal-dag.catch-up {", &context),
+            CommandEffect::Message(message) if message.starts_with("extension input must be JSON:")
+        ));
+        assert_eq!(
+            dispatch_command("/unknown", &context),
+            CommandEffect::Message("unknown command: /unknown".to_owned())
+        );
+    }
+}

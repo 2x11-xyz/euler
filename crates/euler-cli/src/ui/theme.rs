@@ -1,0 +1,944 @@
+use super::syntax::SyntaxKind;
+use ratatui::style::{Color, Modifier, Style};
+
+pub(crate) use crate::theme_catalog::ThemeChoice;
+
+const GRUVBOX_DARK_BACKGROUND: Color = Color::Rgb(40, 40, 40);
+const GRUVBOX_DARK_FOREGROUND: Color = Color::Rgb(235, 219, 178);
+const GRUVBOX_LIGHT_BACKGROUND: Color = Color::Rgb(251, 241, 199);
+const GRUVBOX_LIGHT_FOREGROUND: Color = Color::Rgb(60, 56, 54);
+pub(crate) const USER_RAIL_COLOR: Color = Color::Rgb(142, 192, 124);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColorLevel {
+    TrueColor,
+    Indexed256,
+    Basic16,
+}
+
+impl ColorLevel {
+    pub const SUPPORTED: [Self; 3] = [Self::TrueColor, Self::Indexed256, Self::Basic16];
+
+    pub fn quantize(self, color: Color) -> Color {
+        match (self, color) {
+            (_, Color::Reset) | (ColorLevel::TrueColor, _) => color,
+            (ColorLevel::Indexed256, Color::Rgb(red, green, blue)) => {
+                Color::Indexed(nearest_xterm_index(red, green, blue))
+            }
+            (ColorLevel::Indexed256, _) => color,
+            (ColorLevel::Basic16, Color::Rgb(red, green, blue)) => {
+                nearest_basic_color(red, green, blue)
+            }
+            (ColorLevel::Basic16, Color::Indexed(index)) => {
+                let (red, green, blue) = xterm_rgb(index);
+                nearest_basic_color(red, green, blue)
+            }
+            (ColorLevel::Basic16, _) => color,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundMode {
+    Transparent,
+    Opaque(Color),
+}
+
+impl BackgroundMode {
+    pub const DEFAULT_DARK_OPAQUE: Self = Self::Opaque(GRUVBOX_DARK_BACKGROUND);
+    // Opaque is the default so terminal cells are painted with the theme color
+    // instead of inheriting a dark emulator background behind a light surface.
+    pub const DEFAULT_DARK_BACKGROUNDS: [Self; 2] =
+        [Self::DEFAULT_DARK_OPAQUE, Self::DEFAULT_DARK_TRANSPARENT];
+    pub const DEFAULT_DARK_TRANSPARENT: Self = Self::Transparent;
+
+    fn resolved(self, fallback: Color) -> Color {
+        match self {
+            Self::Transparent => Color::Reset,
+            Self::Opaque(Color::Reset) => fallback,
+            Self::Opaque(color) => color,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThemeOptions {
+    pub color_level: ColorLevel,
+    pub background: BackgroundMode,
+}
+
+impl ThemeOptions {
+    pub fn default_dark() -> Self {
+        let [color_level, _, _] = ColorLevel::SUPPORTED;
+        let [background, _] = BackgroundMode::DEFAULT_DARK_BACKGROUNDS;
+        Self {
+            color_level,
+            background,
+        }
+    }
+
+    pub fn default_light() -> Self {
+        let [color_level, _, _] = ColorLevel::SUPPORTED;
+        Self {
+            color_level,
+            background: BackgroundMode::Opaque(GRUVBOX_LIGHT_BACKGROUND),
+        }
+    }
+}
+
+impl Default for ThemeOptions {
+    fn default() -> Self {
+        Self::default_dark()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct Theme {
+    pub palette: Palette,
+    pub activity: ActivityTheme,
+    pub banner: BannerTheme,
+    pub composer: ComposerTheme,
+    pub status: StatusTheme,
+    pub transcript: TranscriptTheme,
+    pub scopes: SemanticTheme,
+    pub surfaces: SurfaceThemes,
+    pub color_level: ColorLevel,
+    pub background: BackgroundMode,
+}
+
+#[allow(dead_code)]
+impl Theme {
+    pub fn for_choice(choice: ThemeChoice) -> Self {
+        match choice {
+            ThemeChoice::GruvboxDark => Self::default_dark(),
+            ThemeChoice::GruvboxLight => Self::default_light(),
+        }
+    }
+
+    pub fn default_dark() -> Self {
+        Self::default_dark_with(ThemeOptions::default_dark())
+    }
+
+    pub fn default_light() -> Self {
+        Self::default_light_with(ThemeOptions::default_light())
+    }
+
+    pub fn default_dark_with(options: ThemeOptions) -> Self {
+        let palette = Palette::default_dark_with(options);
+        Self::from_palette(palette, options)
+    }
+
+    pub fn default_light_with(options: ThemeOptions) -> Self {
+        let palette = Palette::default_light_with(options);
+        Self::from_palette(palette, options)
+    }
+
+    fn from_palette(palette: Palette, options: ThemeOptions) -> Self {
+        Self {
+            activity: ActivityTheme::from_palette(&palette),
+            banner: BannerTheme::from_palette(&palette),
+            composer: ComposerTheme::from_palette(&palette),
+            status: StatusTheme::from_palette(&palette),
+            transcript: TranscriptTheme::from_palette(&palette),
+            scopes: SemanticTheme::from_palette(&palette),
+            surfaces: SurfaceThemes::from_palette(&palette),
+            palette,
+            color_level: options.color_level,
+            background: options.background,
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::default_dark()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct Palette {
+    pub foreground: Color,
+    pub background: Color,
+    pub surface: Color,
+    pub surface_high: Color,
+    pub selection: Color,
+    pub added: Color,
+    pub removed: Color,
+    pub changed: Color,
+    pub added_tint: Color,
+    pub removed_tint: Color,
+    pub changed_tint: Color,
+    pub muted: Color,
+    pub warning: Color,
+    pub error: Color,
+    pub code: Color,
+    pub user: Color,
+    pub assistant: Color,
+    pub tool: Color,
+    pub gutter: Color,
+    pub cursor: Color,
+    pub st_state: Color,
+    pub st_model: Color,
+    pub st_cost: Color,
+    pub st_ctx: Color,
+}
+
+#[allow(dead_code)]
+impl Palette {
+    pub fn default_dark() -> Self {
+        Self::default_dark_with(ThemeOptions::default_dark())
+    }
+
+    pub fn default_dark_with(options: ThemeOptions) -> Self {
+        PaletteSeed::default_dark().resolve(options)
+    }
+
+    pub fn default_light() -> Self {
+        Self::default_light_with(ThemeOptions::default_light())
+    }
+
+    pub fn default_light_with(options: ThemeOptions) -> Self {
+        PaletteSeed::default_light().resolve(options)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PaletteSeed {
+    foreground: Color,
+    background: Color,
+    surface: Color,
+    surface_high: Color,
+    selection: Color,
+    added: Color,
+    removed: Color,
+    changed: Color,
+    muted: Color,
+    warning: Color,
+    error: Color,
+    code: Color,
+    user: Color,
+    assistant: Color,
+    tool: Color,
+    gutter: Color,
+    cursor: Color,
+    st_state: Color,
+    st_model: Color,
+    st_cost: Color,
+    st_ctx: Color,
+}
+
+impl PaletteSeed {
+    fn default_dark() -> Self {
+        Self {
+            foreground: GRUVBOX_DARK_FOREGROUND,
+            background: GRUVBOX_DARK_BACKGROUND,
+            surface: Color::Rgb(60, 56, 54),
+            surface_high: Color::Rgb(80, 73, 69),
+            selection: Color::Rgb(102, 92, 84),
+            added: Color::Rgb(184, 187, 38),
+            removed: Color::Rgb(251, 73, 52),
+            changed: Color::Rgb(250, 189, 47),
+            muted: Color::Rgb(168, 153, 132),
+            warning: Color::Rgb(254, 128, 25),
+            error: Color::Rgb(251, 73, 52),
+            code: Color::Rgb(250, 189, 47),
+            user: USER_RAIL_COLOR,
+            assistant: GRUVBOX_DARK_FOREGROUND,
+            tool: Color::Rgb(131, 165, 152),
+            gutter: Color::Rgb(124, 111, 100),
+            cursor: GRUVBOX_DARK_FOREGROUND,
+            st_state: Color::Rgb(131, 165, 152),
+            st_model: GRUVBOX_DARK_FOREGROUND,
+            st_cost: Color::Rgb(250, 189, 47),
+            st_ctx: Color::Rgb(142, 192, 124),
+        }
+    }
+
+    fn default_light() -> Self {
+        Self {
+            foreground: GRUVBOX_LIGHT_FOREGROUND,
+            background: GRUVBOX_LIGHT_BACKGROUND,
+            surface: Color::Rgb(242, 229, 188),
+            surface_high: Color::Rgb(235, 219, 178),
+            selection: Color::Rgb(213, 196, 161),
+            added: Color::Rgb(121, 116, 14),
+            removed: Color::Rgb(157, 0, 6),
+            changed: Color::Rgb(181, 118, 20),
+            muted: Color::Rgb(124, 111, 100),
+            warning: Color::Rgb(175, 58, 3),
+            error: Color::Rgb(157, 0, 6),
+            code: Color::Rgb(175, 58, 3),
+            user: Color::Rgb(66, 123, 88),
+            assistant: GRUVBOX_LIGHT_FOREGROUND,
+            tool: Color::Rgb(7, 102, 120),
+            gutter: Color::Rgb(146, 131, 116),
+            cursor: GRUVBOX_LIGHT_FOREGROUND,
+            st_state: Color::Rgb(7, 102, 120),
+            st_model: GRUVBOX_LIGHT_FOREGROUND,
+            st_cost: Color::Rgb(181, 118, 20),
+            st_ctx: Color::Rgb(66, 123, 88),
+        }
+    }
+
+    fn resolve(self, options: ThemeOptions) -> Palette {
+        let background = options.background.resolved(self.background);
+        let tint_base = self.background;
+        Palette {
+            foreground: self.quantize(self.foreground, options),
+            background: options.color_level.quantize(background),
+            surface: surface_color(background, self.surface, options),
+            surface_high: surface_color(background, self.surface_high, options),
+            selection: self.quantize(self.selection, options),
+            added: self.quantize(self.added, options),
+            removed: self.quantize(self.removed, options),
+            changed: self.quantize(self.changed, options),
+            added_tint: tint(tint_base, self.added, 28, options.color_level),
+            removed_tint: tint(tint_base, self.removed, 28, options.color_level),
+            changed_tint: tint(tint_base, self.changed, 24, options.color_level),
+            muted: self.quantize(self.muted, options),
+            warning: self.quantize(self.warning, options),
+            error: self.quantize(self.error, options),
+            code: self.quantize(self.code, options),
+            user: self.quantize(self.user, options),
+            assistant: self.quantize(self.assistant, options),
+            tool: self.quantize(self.tool, options),
+            gutter: self.quantize(self.gutter, options),
+            cursor: self.quantize(self.cursor, options),
+            st_state: self.quantize(self.st_state, options),
+            st_model: self.quantize(self.st_model, options),
+            st_cost: self.quantize(self.st_cost, options),
+            st_ctx: self.quantize(self.st_ctx, options),
+        }
+    }
+
+    fn quantize(self, color: Color, options: ThemeOptions) -> Color {
+        options.color_level.quantize(color)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct ActivityTheme {
+    pub status: Style,
+    pub header: Style,
+    pub detail: Style,
+    pub gutter: Style,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct BannerTheme {
+    pub wordmark: Style,
+    pub identity: Style,
+}
+
+#[allow(dead_code)]
+impl BannerTheme {
+    fn from_palette(palette: &Palette) -> Self {
+        // Brand rule: letterforms are one tone (theme foreground, no
+        // color inside the letters); the caption line is dim/comment. Rail
+        // colors are brand ANSI slots owned by the banner module, not theme.
+        Self {
+            wordmark: Style::default().fg(palette.foreground),
+            identity: Style::default().fg(palette.muted),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct ComposerTheme {
+    pub rule: Style,
+    pub text: Style,
+    pub overflow: Style,
+    pub token_bar: Style,
+}
+
+#[allow(dead_code)]
+impl ComposerTheme {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            rule: Style::default()
+                .fg(palette.user)
+                .add_modifier(Modifier::BOLD),
+            text: Style::default().fg(palette.foreground),
+            overflow: Style::default()
+                .fg(palette.warning)
+                .add_modifier(Modifier::BOLD),
+            token_bar: Style::default().fg(palette.muted),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct StatusTheme {
+    pub base: Style,
+    pub state: Style,
+    pub model: Style,
+    pub cost: Style,
+    pub ctx: Style,
+}
+
+#[allow(dead_code)]
+impl StatusTheme {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            base: Style::default().fg(palette.foreground),
+            state: Style::default().fg(palette.st_state),
+            model: Style::default().fg(palette.st_model),
+            cost: Style::default().fg(palette.st_cost),
+            ctx: Style::default().fg(palette.st_ctx),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl ActivityTheme {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            status: Style::default().fg(palette.foreground),
+            header: Style::default()
+                .fg(palette.tool)
+                .add_modifier(Modifier::BOLD),
+            detail: Style::default().fg(palette.foreground),
+            gutter: Style::default().fg(palette.gutter),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct TranscriptTheme {
+    pub body: Style,
+    pub user: Style,
+    pub assistant: Style,
+    pub model: Style,
+    pub reasoning: Style,
+    pub tool: Style,
+    pub tool_error: Style,
+    pub permission: Style,
+    pub patch: Style,
+    pub check: Style,
+    pub control: Style,
+    pub gutter: Style,
+    pub muted: Style,
+    pub added: Style,
+    pub removed: Style,
+    pub changed: Style,
+    pub warning: Style,
+    pub error: Style,
+}
+
+#[allow(dead_code)]
+impl TranscriptTheme {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            body: Style::default().fg(palette.foreground),
+            user: Style::default()
+                .fg(palette.user)
+                .add_modifier(Modifier::BOLD),
+            assistant: Style::default().fg(palette.assistant),
+            model: Style::default().fg(palette.muted),
+            reasoning: Style::default().fg(palette.changed),
+            tool: Style::default().fg(palette.tool),
+            tool_error: Style::default()
+                .fg(palette.error)
+                .add_modifier(Modifier::BOLD),
+            permission: Style::default()
+                .fg(palette.warning)
+                .add_modifier(Modifier::BOLD),
+            patch: Style::default().fg(palette.changed),
+            check: Style::default().fg(palette.tool),
+            control: Style::default().fg(palette.muted),
+            gutter: Style::default().fg(palette.gutter),
+            muted: Style::default().fg(palette.muted),
+            added: Style::default().fg(palette.added),
+            removed: Style::default().fg(palette.removed),
+            changed: Style::default().fg(palette.changed),
+            warning: Style::default().fg(palette.warning),
+            error: Style::default()
+                .fg(palette.error)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticTheme {
+    pub markup: MarkupScopes,
+    pub diff: DiffScopes,
+    pub syntax: SyntaxScopes,
+}
+
+impl SemanticTheme {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            markup: MarkupScopes::from_palette(palette),
+            diff: DiffScopes::from_palette(palette),
+            syntax: SyntaxScopes::from_palette(palette),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkupScopes {
+    pub body: Style,
+    pub emphasis: Style,
+    pub strong: Style,
+    pub code: Style,
+    pub link: Style,
+    pub inserted: Style,
+    pub deleted: Style,
+    pub changed: Style,
+}
+
+impl MarkupScopes {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            body: Style::default().fg(palette.foreground),
+            emphasis: Style::default()
+                .fg(palette.foreground)
+                .add_modifier(Modifier::ITALIC),
+            strong: Style::default()
+                .fg(palette.foreground)
+                .add_modifier(Modifier::BOLD),
+            code: Style::default().fg(palette.code),
+            link: Style::default()
+                .fg(palette.tool)
+                .add_modifier(Modifier::UNDERLINED),
+            inserted: Style::default().fg(palette.added),
+            deleted: Style::default().fg(palette.removed),
+            changed: Style::default().fg(palette.changed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffScopes {
+    pub inserted: Style,
+    pub inserted_body: Style,
+    pub deleted: Style,
+    pub deleted_body: Style,
+    pub changed: Style,
+    pub context: Style,
+    pub hunk: Style,
+}
+
+impl DiffScopes {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            inserted: Style::default().fg(palette.added),
+            inserted_body: Style::default().fg(palette.foreground),
+            deleted: Style::default().fg(palette.removed),
+            deleted_body: Style::default().fg(palette.muted),
+            changed: Style::default()
+                .fg(palette.changed)
+                .bg(palette.changed_tint),
+            context: Style::default().fg(palette.muted),
+            hunk: Style::default()
+                .fg(palette.tool)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyntaxScopes {
+    pub plain: Style,
+    pub comment: Style,
+    pub keyword: Style,
+    pub type_name: Style,
+    pub function: Style,
+    pub string: Style,
+    pub number: Style,
+    pub constant: Style,
+    pub variable: Style,
+    pub property: Style,
+    pub operator: Style,
+    pub punctuation: Style,
+    pub macro_name: Style,
+    pub attribute: Style,
+}
+
+impl SyntaxScopes {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            plain: Style::default().fg(palette.foreground),
+            comment: Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::ITALIC),
+            keyword: Style::default().fg(palette.warning),
+            type_name: Style::default().fg(palette.changed),
+            function: Style::default().fg(palette.added),
+            string: Style::default().fg(palette.added),
+            number: Style::default().fg(palette.changed),
+            constant: Style::default().fg(palette.changed),
+            variable: Style::default().fg(palette.foreground),
+            property: Style::default().fg(palette.tool),
+            operator: Style::default().fg(palette.warning),
+            punctuation: Style::default().fg(palette.gutter),
+            macro_name: Style::default().fg(palette.tool),
+            attribute: Style::default().fg(palette.changed),
+        }
+    }
+
+    pub(crate) fn style(&self, kind: SyntaxKind) -> Style {
+        match kind {
+            SyntaxKind::Plain => self.plain,
+            SyntaxKind::Comment => self.comment,
+            SyntaxKind::Keyword => self.keyword,
+            SyntaxKind::TypeName => self.type_name,
+            SyntaxKind::Function => self.function,
+            SyntaxKind::String => self.string,
+            SyntaxKind::Number => self.number,
+            SyntaxKind::Constant => self.constant,
+            SyntaxKind::Variable => self.variable,
+            SyntaxKind::Property => self.property,
+            SyntaxKind::Operator => self.operator,
+            SyntaxKind::Punctuation => self.punctuation,
+            SyntaxKind::Macro => self.macro_name,
+            SyntaxKind::Attribute => self.attribute,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceThemes {
+    pub transcript: SurfacePolish,
+    pub activity: SurfacePolish,
+    pub composer: SurfacePolish,
+    pub banner: SurfacePolish,
+    pub status: SurfacePolish,
+}
+
+impl SurfaceThemes {
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            transcript: SurfacePolish::new(palette, palette.background),
+            activity: SurfacePolish::new(palette, palette.surface),
+            composer: SurfacePolish::new(palette, palette.surface),
+            banner: SurfacePolish::new(palette, palette.background),
+            status: SurfacePolish::new(palette, palette.surface_high),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfacePolish {
+    pub background: Color,
+    pub base: Style,
+    pub border: Style,
+    pub focus: Style,
+    pub selection: Style,
+}
+
+impl SurfacePolish {
+    fn new(palette: &Palette, background: Color) -> Self {
+        Self {
+            background,
+            base: Style::default().fg(palette.foreground).bg(background),
+            border: Style::default().fg(palette.gutter).bg(background),
+            focus: Style::default()
+                .fg(palette.tool)
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+            selection: Style::default()
+                .fg(palette.foreground)
+                .bg(palette.selection),
+        }
+    }
+}
+
+fn surface_color(background: Color, fallback: Color, options: ThemeOptions) -> Color {
+    if background == Color::Reset {
+        Color::Reset
+    } else {
+        options.color_level.quantize(fallback)
+    }
+}
+
+fn tint(base: Color, accent: Color, percent: u8, level: ColorLevel) -> Color {
+    let (base_red, base_green, base_blue) = color_rgb(base);
+    let (accent_red, accent_green, accent_blue) = color_rgb(accent);
+    let red = mix_channel(base_red, accent_red, percent);
+    let green = mix_channel(base_green, accent_green, percent);
+    let blue = mix_channel(base_blue, accent_blue, percent);
+    level.quantize(Color::Rgb(red, green, blue))
+}
+
+fn mix_channel(base: u8, accent: u8, percent: u8) -> u8 {
+    let base = u16::from(base);
+    let accent = u16::from(accent);
+    let percent = u16::from(percent);
+    (((base * (100 - percent)) + (accent * percent)) / 100) as u8
+}
+
+fn color_rgb(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Black => (0, 0, 0),
+        Color::Red => (128, 0, 0),
+        Color::Green => (0, 128, 0),
+        Color::Yellow => (128, 128, 0),
+        Color::Blue => (0, 0, 128),
+        Color::Magenta => (128, 0, 128),
+        Color::Cyan => (0, 128, 128),
+        Color::Gray => (192, 192, 192),
+        Color::DarkGray => (128, 128, 128),
+        Color::LightRed => (255, 0, 0),
+        Color::LightGreen => (0, 255, 0),
+        Color::LightYellow => (255, 255, 0),
+        Color::LightBlue => (0, 0, 255),
+        Color::LightMagenta => (255, 0, 255),
+        Color::LightCyan => (0, 255, 255),
+        Color::White => (255, 255, 255),
+        Color::Indexed(index) => xterm_rgb(index),
+        Color::Rgb(red, green, blue) => (red, green, blue),
+        Color::Reset => (0, 0, 0),
+    }
+}
+
+fn nearest_xterm_index(red: u8, green: u8, blue: u8) -> u8 {
+    let mut best_index = 0;
+    let mut best_distance = u32::MAX;
+    for index in 0..=255 {
+        let (candidate_red, candidate_green, candidate_blue) = xterm_rgb(index);
+        let distance = color_distance(
+            (red, green, blue),
+            (candidate_red, candidate_green, candidate_blue),
+        );
+        if distance < best_distance {
+            best_index = index;
+            best_distance = distance;
+        }
+    }
+    best_index
+}
+
+fn nearest_basic_color(red: u8, green: u8, blue: u8) -> Color {
+    let mut best_color = Color::Black;
+    let mut best_distance = u32::MAX;
+    for color in basic_colors() {
+        let (candidate_red, candidate_green, candidate_blue) = color_rgb(color);
+        let distance = color_distance(
+            (red, green, blue),
+            (candidate_red, candidate_green, candidate_blue),
+        );
+        if distance < best_distance {
+            best_color = color;
+            best_distance = distance;
+        }
+    }
+    best_color
+}
+
+fn color_distance(color: (u8, u8, u8), other: (u8, u8, u8)) -> u32 {
+    let (red, green, blue) = color;
+    let (other_red, other_green, other_blue) = other;
+    let red_delta = i32::from(red) - i32::from(other_red);
+    let green_delta = i32::from(green) - i32::from(other_green);
+    let blue_delta = i32::from(blue) - i32::from(other_blue);
+    (red_delta * red_delta + green_delta * green_delta + blue_delta * blue_delta) as u32
+}
+
+fn basic_colors() -> [Color; 16] {
+    [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ]
+}
+
+fn xterm_rgb(index: u8) -> (u8, u8, u8) {
+    if index < 16 {
+        return color_rgb(basic_colors()[usize::from(index)]);
+    }
+    if index < 232 {
+        return color_cube_rgb(index);
+    }
+    let shade = 8 + ((index - 232) * 10);
+    (shade, shade, shade)
+}
+
+fn color_cube_rgb(index: u8) -> (u8, u8, u8) {
+    let cube_index = index - 16;
+    let red = cube_index / 36;
+    let green = (cube_index % 36) / 6;
+    let blue = cube_index % 6;
+    (cube_channel(red), cube_channel(green), cube_channel(blue))
+}
+
+fn cube_channel(value: u8) -> u8 {
+    if value == 0 {
+        0
+    } else {
+        55 + (value * 40)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_theme_still_builds() {
+        let theme = Theme::default_dark();
+        assert_eq!(theme, Theme::default());
+        assert_eq!(theme.palette.foreground, Color::Rgb(235, 219, 178));
+        assert_eq!(theme.palette.background, GRUVBOX_DARK_BACKGROUND);
+        assert_eq!(theme.palette.surface, Color::Rgb(60, 56, 54));
+        assert_eq!(theme.palette.surface_high, Color::Rgb(80, 73, 69));
+        assert_eq!(theme.palette.cursor, Color::Rgb(235, 219, 178));
+        assert_eq!(theme.transcript.added.fg, Some(theme.palette.added));
+        assert_eq!(theme.color_level, ColorLevel::TrueColor);
+    }
+
+    #[test]
+    fn default_dark_background_order_prefers_opaque() {
+        assert_eq!(
+            BackgroundMode::DEFAULT_DARK_BACKGROUNDS,
+            [
+                BackgroundMode::DEFAULT_DARK_OPAQUE,
+                BackgroundMode::DEFAULT_DARK_TRANSPARENT
+            ]
+        );
+        assert_eq!(
+            ThemeOptions::default_dark().background,
+            BackgroundMode::DEFAULT_DARK_OPAQUE
+        );
+    }
+
+    #[test]
+    fn derived_colors_resolve_once_into_palette() {
+        let theme = Theme::default_dark_with(ThemeOptions {
+            color_level: ColorLevel::TrueColor,
+            background: BackgroundMode::Opaque(Color::Rgb(10, 20, 30)),
+        });
+
+        assert!(matches!(theme.palette.added_tint, Color::Rgb(_, _, _)));
+        assert_eq!(theme.scopes.diff.inserted.bg, None);
+        assert_eq!(theme.scopes.diff.deleted.bg, None);
+        assert_ne!(theme.palette.added_tint, theme.palette.added);
+    }
+
+    #[test]
+    fn transparent_backgrounds_use_reset() {
+        let theme = Theme::default_dark_with(ThemeOptions {
+            color_level: ColorLevel::TrueColor,
+            background: BackgroundMode::Transparent,
+        });
+
+        assert_eq!(theme.palette.background, Color::Reset);
+        assert_eq!(theme.surfaces.transcript.background, Color::Reset);
+        assert_eq!(theme.surfaces.composer.base.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn default_light_theme_uses_opaque_light_background() {
+        let theme = Theme::default_light();
+
+        assert_eq!(
+            theme.background,
+            BackgroundMode::Opaque(GRUVBOX_LIGHT_BACKGROUND)
+        );
+        assert_eq!(theme.palette.background, GRUVBOX_LIGHT_BACKGROUND);
+        assert_eq!(theme.palette.foreground, Color::Rgb(60, 56, 54));
+        assert_eq!(theme.palette.cursor, Color::Rgb(60, 56, 54));
+        assert_eq!(theme.palette.surface, Color::Rgb(242, 229, 188));
+        assert_eq!(theme.palette.code, Color::Rgb(175, 58, 3));
+        assert_eq!(
+            theme.surfaces.transcript.base.bg,
+            Some(GRUVBOX_LIGHT_BACKGROUND)
+        );
+    }
+
+    #[test]
+    fn opaque_backgrounds_are_precomputed_per_surface() {
+        let theme = Theme::default_dark_with(ThemeOptions {
+            color_level: ColorLevel::TrueColor,
+            background: BackgroundMode::Opaque(Color::Rgb(12, 14, 16)),
+        });
+
+        assert_eq!(theme.palette.background, Color::Rgb(12, 14, 16));
+        assert_eq!(
+            theme.surfaces.transcript.base.bg,
+            Some(Color::Rgb(12, 14, 16))
+        );
+        assert!(matches!(
+            theme.surfaces.status.background,
+            Color::Rgb(_, _, _)
+        ));
+    }
+
+    #[test]
+    fn rgb_colors_quantize_to_indexed_or_basic_levels() {
+        let indexed = Theme::default_dark_with(ThemeOptions {
+            color_level: ColorLevel::Indexed256,
+            background: BackgroundMode::Transparent,
+        });
+        let basic = Theme::default_dark_with(ThemeOptions {
+            color_level: ColorLevel::Basic16,
+            background: BackgroundMode::Transparent,
+        });
+
+        assert!(matches!(indexed.palette.foreground, Color::Indexed(_)));
+        assert!(matches!(indexed.palette.added_tint, Color::Indexed(_)));
+        assert!(matches!(
+            basic.palette.foreground,
+            Color::White | Color::Gray
+        ));
+        assert!(!matches!(basic.palette.added, Color::Rgb(_, _, _)));
+    }
+
+    #[test]
+    fn markup_inserted_and_deleted_scopes_are_available() {
+        let theme = Theme::default_dark();
+        assert_eq!(theme.scopes.markup.inserted.fg, Some(theme.palette.added));
+        assert_eq!(theme.scopes.markup.deleted.fg, Some(theme.palette.removed));
+        assert_eq!(theme.scopes.diff.hunk.fg, Some(theme.palette.tool));
+        assert_eq!(theme.scopes.diff.context.fg, Some(theme.palette.muted));
+        assert_eq!(theme.scopes.diff.inserted.fg, Some(theme.palette.added));
+        assert_eq!(theme.scopes.diff.inserted.bg, None);
+        assert_eq!(theme.scopes.diff.deleted.fg, Some(theme.palette.removed));
+        assert_eq!(theme.scopes.diff.deleted.bg, None);
+        assert_eq!(
+            theme.scopes.diff.inserted_body.fg,
+            Some(theme.palette.foreground)
+        );
+        assert_eq!(theme.scopes.diff.inserted_body.bg, None);
+        assert_eq!(theme.scopes.diff.deleted_body.fg, Some(theme.palette.muted));
+        assert_eq!(theme.scopes.diff.deleted_body.bg, None);
+    }
+
+    #[test]
+    fn light_and_dark_diff_marker_styles_are_sign_only() {
+        for theme in [Theme::default_dark(), Theme::default_light()] {
+            assert_eq!(theme.scopes.diff.inserted.fg, Some(theme.palette.added));
+            assert_eq!(theme.scopes.diff.inserted.bg, None);
+            assert_eq!(
+                theme.scopes.diff.inserted_body.fg,
+                Some(theme.palette.foreground)
+            );
+            assert_eq!(theme.scopes.diff.inserted_body.bg, None);
+            assert_eq!(theme.scopes.diff.deleted.fg, Some(theme.palette.removed));
+            assert_eq!(theme.scopes.diff.deleted.bg, None);
+            assert_eq!(theme.scopes.diff.deleted_body.fg, Some(theme.palette.muted));
+            assert_eq!(theme.scopes.diff.deleted_body.bg, None);
+        }
+    }
+}

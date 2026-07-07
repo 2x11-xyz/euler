@@ -1,0 +1,24 @@
+[package]
+name = "euler-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+euler-agents = { path = "../euler-agents" }
+euler-event = { path = "../euler-event" }
+euler-provider = { path = "../euler-provider" }
+euler-sdk = { path = "../euler-sdk" }
+diffy = "0.4"
+fs4.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[lints]
+workspace = true

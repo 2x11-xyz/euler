@@ -1,0 +1,14 @@
+[package]
+name = "euler-extension-maxproof"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+euler-event = { path = "../euler-event" }
+euler-sdk = { path = "../euler-sdk" }
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

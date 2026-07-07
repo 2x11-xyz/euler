@@ -1,0 +1,467 @@
+{
+  "schema": "euler.causal_dag.v1",
+  "media_type": "application/vnd.euler.causal-dag.v1+json",
+  "generated_at": "2026-06-29T00:06:00.000Z",
+  "session": {
+    "id": "session-knuth",
+    "event_range": {
+      "start": "event-knuth-start",
+      "end": "event-knuth-note-artifact",
+      "complete": true
+    }
+  },
+  "projection": {
+    "extension_id": "causal-dag",
+    "watermark_event_id": "event-knuth-note-artifact",
+    "basis": "bounded_provenance_query",
+    "degraded": false
+  },
+  "forest": {
+    "roots": [
+      "node-knuth-root",
+      "node-knuth-secondary-root"
+    ],
+    "active_root": "node-knuth-root",
+    "nodes": [
+      {
+        "id": "node-knuth-deadend",
+        "root_id": "node-knuth-root",
+        "kind": "attempt",
+        "status": "dead_end",
+        "title": "Rejected recurrence branch",
+        "summary": "The left branch failed because the recurrence assumption contradicted the generated table.",
+        "source_refs": [
+          {
+            "id": "src-knuth-node-deadend",
+            "kind": "event",
+            "event_id": "event-knuth-left-tool",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.95
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The tool result explicitly records the failed assumption.",
+          "source_ref_ids": [
+            "src-knuth-node-deadend"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-knuth-repair",
+        "root_id": "node-knuth-root",
+        "kind": "attempt",
+        "status": "success",
+        "title": "Repair with invariant factoring",
+        "summary": "The repair reused the failed recurrence material and switched to invariant factoring.",
+        "source_refs": [
+          {
+            "id": "src-knuth-node-repair",
+            "kind": "event",
+            "event_id": "event-knuth-repair-command",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.93
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The repair command states the new method and reused failure material.",
+          "source_ref_ids": [
+            "src-knuth-node-repair"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-knuth-root",
+        "root_id": "node-knuth-root",
+        "kind": "root",
+        "status": "open",
+        "title": "Knuth-style search",
+        "summary": "Primary search objective for a compact solution path.",
+        "source_refs": [
+          {
+            "id": "src-knuth-node-root",
+            "kind": "event",
+            "event_id": "event-knuth-objective",
+            "event_kind": "user.message",
+            "payload_pointer": "/payload/content",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.98
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The user message defines the search objective.",
+          "source_ref_ids": [
+            "src-knuth-node-root"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-knuth-secondary-root",
+        "root_id": "node-knuth-secondary-root",
+        "kind": "root",
+        "status": "open",
+        "title": "Notation clean-up",
+        "summary": "Related but separate root for notation clean-up.",
+        "source_refs": [
+          {
+            "id": "src-knuth-node-secondary-root",
+            "kind": "event",
+            "event_id": "event-knuth-secondary-objective",
+            "event_kind": "user.message",
+            "payload_pointer": "/payload/content",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.9
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The user message opens a related second root.",
+          "source_ref_ids": [
+            "src-knuth-node-secondary-root"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-knuth-sibling",
+        "root_id": "node-knuth-root",
+        "kind": "attempt",
+        "status": "open",
+        "title": "Sibling invariant branch",
+        "summary": "A sibling branch pursues invariant factoring without becoming a child of the failed attempt.",
+        "source_refs": [
+          {
+            "id": "src-knuth-node-sibling",
+            "kind": "event",
+            "event_id": "event-knuth-sibling-check",
+            "event_kind": "check.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.88
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The check result verifies the sibling branch.",
+          "source_ref_ids": [
+            "src-knuth-node-sibling"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-knuth-verify",
+        "root_id": "node-knuth-root",
+        "kind": "synthesis",
+        "status": "verified",
+        "title": "Verified repair path",
+        "summary": "The repaired branch is verified by the invariant check and note artifact.",
+        "source_refs": [
+          {
+            "id": "src-knuth-node-verify",
+            "kind": "event",
+            "event_id": "event-knuth-sibling-check",
+            "event_kind": "check.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.92
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The check result verifies the final path.",
+          "source_ref_ids": [
+            "src-knuth-node-verify"
+          ]
+        },
+        "metadata": {}
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge-knuth-artifact-use",
+        "from": "node-knuth-repair",
+        "to": "node-knuth-verify",
+        "class": "annotation",
+        "kind": "artifact_use",
+        "canonical_backbone": false,
+        "source_refs": [
+          {
+            "id": "src-knuth-edge-artifact-use",
+            "kind": "artifact",
+            "event_id": "event-knuth-note-artifact",
+            "event_kind": "extension.artifact",
+            "payload_pointer": null,
+            "artifact": {
+              "path": "sessions/session-knuth/extensions/causal-dag/artifacts/knuth-note",
+              "sha256": "sha-knuth-note",
+              "byte_len": 42
+            },
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.9
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The note artifact records the repaired path.",
+          "source_ref_ids": [
+            "src-knuth-edge-artifact-use"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-knuth-cross-root",
+        "from": "node-knuth-secondary-root",
+        "to": "node-knuth-root",
+        "class": "annotation",
+        "kind": "related",
+        "canonical_backbone": false,
+        "source_refs": [
+          {
+            "id": "src-knuth-edge-cross-root",
+            "kind": "event",
+            "event_id": "event-knuth-secondary-objective",
+            "event_kind": "user.message",
+            "payload_pointer": "/payload/content",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.7
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The second root is explicitly related to the primary search.",
+          "source_ref_ids": [
+            "src-knuth-edge-cross-root"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-knuth-fork-left",
+        "from": "node-knuth-root",
+        "to": "node-knuth-deadend",
+        "class": "structural",
+        "kind": "fork",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-knuth-edge-fork-left",
+            "kind": "event",
+            "event_id": "event-knuth-left-tool",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.9
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The failed tool result records the left fork.",
+          "source_ref_ids": [
+            "src-knuth-edge-fork-left"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-knuth-fork-right",
+        "from": "node-knuth-root",
+        "to": "node-knuth-sibling",
+        "class": "structural",
+        "kind": "fork",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-knuth-edge-fork-right",
+            "kind": "event",
+            "event_id": "event-knuth-sibling-check",
+            "event_kind": "check.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.88
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The sibling check records the right fork.",
+          "source_ref_ids": [
+            "src-knuth-edge-fork-right"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-knuth-pivot",
+        "from": "node-knuth-deadend",
+        "to": "node-knuth-sibling",
+        "class": "annotation",
+        "kind": "pivot",
+        "canonical_backbone": false,
+        "source_refs": [
+          {
+            "id": "src-knuth-edge-pivot",
+            "kind": "event",
+            "event_id": "event-knuth-left-tool",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "low",
+          "score": 0.4
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The sibling branch is inspired by the failure but is not a structural child of it.",
+          "source_ref_ids": [
+            "src-knuth-edge-pivot"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-knuth-repair",
+        "from": "node-knuth-deadend",
+        "to": "node-knuth-repair",
+        "class": "structural",
+        "kind": "repair",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-knuth-edge-repair-failure",
+            "kind": "event",
+            "event_id": "event-knuth-left-tool",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          },
+          {
+            "id": "src-knuth-edge-repair-success",
+            "kind": "event",
+            "event_id": "event-knuth-repair-command",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.9
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The edge cites the failed recurrence output and the repair command that reused it.",
+          "source_ref_ids": [
+            "src-knuth-edge-repair-failure",
+            "src-knuth-edge-repair-success"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-knuth-verify",
+        "from": "node-knuth-repair",
+        "to": "node-knuth-verify",
+        "class": "structural",
+        "kind": "verification",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-knuth-edge-verify",
+            "kind": "event",
+            "event_id": "event-knuth-sibling-check",
+            "event_kind": "check.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.9
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The check result verifies the repaired path.",
+          "source_ref_ids": [
+            "src-knuth-edge-verify"
+          ]
+        },
+        "metadata": {}
+      }
+    ]
+  },
+  "diagnostics": {
+    "node_count": 6,
+    "edge_count": 7,
+    "root_count": 2,
+    "leaf_count": 3,
+    "fork_count": 1,
+    "maximum_depth": 3,
+    "branching_ratio": 0.25,
+    "backbone_edge_count": 4,
+    "structural_edge_count": 4,
+    "annotation_edge_count": 3,
+    "sequence_edge_count": 0,
+    "sequence_edge_ratio": 0.0,
+    "source_backed_edge_count": 7,
+    "inferred_edge_count": 0,
+    "missing_source_ref_count": 0,
+    "degraded_chronology": false,
+    "projection_heavy_branching": false,
+    "warnings": []
+  }
+}

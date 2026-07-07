@@ -1,0 +1,17 @@
+[package]
+name = "euler-tools"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+
+[dependencies]
+euler-event = { path = "../euler-event" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+unicode-width = "0.2"
+
+[lints]
+workspace = true

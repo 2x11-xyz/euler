@@ -1,0 +1,3144 @@
+use super::*;
+use crate::ui::patch_approval::PatchPreview;
+use crate::ui::test_backend::VT100Backend;
+use euler_event::{object, EventEnvelope, EventKind};
+use euler_provider::{
+    catalog::MergedModelCatalog, EchoProvider, FixtureResponse, ModelProvider, ModelRequest,
+    ModelStreamEvent, ProviderError, ProviderStream, ScriptedProvider, ScriptedStreamStep,
+    StopReason, ToolCall, Usage,
+};
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    Terminal,
+};
+use serde_json::json;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+mod chrome_tests;
+mod permission_tests;
+
+fn core() -> AppCore {
+    core_with_provider(EchoProvider)
+}
+
+fn core_with_provider(provider: impl ModelProvider + 'static) -> AppCore {
+    core_with_provider_model_at(provider, "echo", ".")
+}
+
+fn core_with_provider_at(
+    provider: impl ModelProvider + 'static,
+    root: impl Into<PathBuf>,
+) -> AppCore {
+    core_with_provider_model_at(provider, "echo", root)
+}
+
+fn core_with_provider_model_at(
+    provider: impl ModelProvider + 'static,
+    model: &str,
+    root: impl Into<PathBuf>,
+) -> AppCore {
+    core_with_provider_model_options_at(provider, model, root, AppOptions::default())
+}
+
+fn core_with_provider_model_options_at(
+    provider: impl ModelProvider + 'static,
+    model: &str,
+    root: impl Into<PathBuf>,
+    options: AppOptions,
+) -> AppCore {
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(root);
+    config.model = model.to_owned();
+    let session = Session::new(config, provider, decider);
+    AppCore::new_with_options(session, channels, options)
+}
+
+fn core_with_fixture_catalog(
+    provider: impl ModelProvider + 'static,
+    model: &str,
+    catalog: MergedModelCatalog,
+) -> AppCore {
+    core_with_provider_model_options_at(
+        provider,
+        model,
+        ".",
+        AppOptions {
+            model_catalog: Some(catalog),
+            ..AppOptions::default()
+        },
+    )
+}
+
+fn fixture_catalog_with_windows(models: &[(&str, u64)]) -> MergedModelCatalog {
+    let descriptors = models
+        .iter()
+        .map(|(id, window)| json!({"id": id, "context_window_tokens": window}))
+        .collect::<Vec<_>>();
+    let (catalog, warnings) = MergedModelCatalog::with_local_json(
+        &json!({"providers": {"fixture": {"models": descriptors}}}).to_string(),
+    );
+    assert!(warnings.is_empty(), "catalog warnings: {warnings:?}");
+    catalog
+}
+
+fn scripted_usage(input_tokens: u64) -> FixtureResponse {
+    FixtureResponse::Stream(vec![ScriptedStreamStep::Event(
+        ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: Some(Usage {
+                input_tokens,
+                output_tokens: 999,
+                cached_tokens: Some(0),
+                reasoning_tokens: Some(500),
+            }),
+        },
+    )])
+}
+
+#[test]
+fn ratatui_to_canvas_preserves_span_styles() {
+    let lines = vec![Line::from(vec![
+        Span::styled(
+            "warn",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" plain"),
+    ])
+    .style(Style::default().bg(Color::Blue))];
+
+    let canvas = ratatui_lines_to_canvas(lines);
+
+    assert_eq!(canvas[0].plain_text(), "warn plain");
+    assert_eq!(canvas[0].spans[0].style.fg, Some(Color::Yellow));
+    assert_eq!(canvas[0].spans[0].style.bg, Some(Color::Blue));
+    assert!(canvas[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert_eq!(canvas[0].spans[1].style.bg, Some(Color::Blue));
+}
+
+struct SlowEchoProvider;
+
+impl ModelProvider for SlowEchoProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        std::thread::sleep(Duration::from_millis(50));
+        EchoProvider.invoke(request)
+    }
+}
+
+struct ChatGptEchoProvider;
+
+impl ModelProvider for ChatGptEchoProvider {
+    fn name(&self) -> &'static str {
+        "chatgpt"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        EchoProvider.invoke(request)
+    }
+}
+
+struct MockEditor {
+    result: EditorResult,
+}
+
+impl ExternalEditorRunner for MockEditor {
+    fn edit(&self, _draft: &str) -> EditorResult {
+        self.result.clone()
+    }
+}
+
+struct CapturingEditor {
+    drafts: Arc<Mutex<Vec<String>>>,
+    result: EditorResult,
+}
+
+impl ExternalEditorRunner for CapturingEditor {
+    fn edit(&self, draft: &str) -> EditorResult {
+        self.drafts
+            .lock()
+            .expect("editor drafts lock")
+            .push(draft.to_owned());
+        self.result.clone()
+    }
+}
+
+#[derive(Clone)]
+struct RecordingClipboard {
+    writes: Arc<Mutex<Vec<String>>>,
+    result: Result<(), String>,
+}
+
+impl ClipboardSink for RecordingClipboard {
+    fn copy(&self, text: &str) -> Result<(), String> {
+        self.writes
+            .lock()
+            .expect("clipboard lock")
+            .push(text.to_owned());
+        self.result.clone()
+    }
+}
+
+fn key(code: KeyCode) -> InputEvent {
+    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> InputEvent {
+    InputEvent::Key(KeyEvent::new(code, modifiers))
+}
+
+fn ctrl_o() -> InputEvent {
+    modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL)
+}
+
+fn type_text(core: &mut AppCore, text: &str) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            core.handle_input(modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+        } else {
+            core.handle_input(key(KeyCode::Char(ch)));
+        }
+    }
+}
+
+fn submit_text_and_wait(core: &mut AppCore, text: &str) {
+    type_text(core, text);
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(core);
+}
+
+fn shell_artifact_with_lines(total: usize) -> TranscriptItem {
+    TranscriptItem::ToolRun {
+        command: "printf lines".to_owned(),
+        ok: true,
+        error: String::new(),
+        output: (1..=total)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        exit_code: Some(0),
+    }
+}
+
+fn patch_artifact_with_lines(total: usize) -> TranscriptItem {
+    TranscriptItem::PatchApplied {
+        path: "src/lib.rs".to_owned(),
+        old: (1..=total)
+            .map(|index| format!("old {index}\n"))
+            .collect::<String>()
+            .into(),
+        new: "new\n".to_owned().into(),
+    }
+}
+
+fn mouse_event(kind: MouseEventKind) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn screen_row(contents: &str, row: u16) -> &str {
+    contents.lines().nth(usize::from(row)).unwrap_or("")
+}
+
+fn fs_write_request() -> PermissionRequest {
+    PermissionRequest {
+        capability: Capability::FsWrite,
+        reason: "tool edit_file".to_owned(),
+    }
+}
+
+fn apply_patch_request() -> PermissionRequest {
+    PermissionRequest {
+        capability: Capability::FsWrite,
+        reason: "tool apply_patch".to_owned(),
+    }
+}
+
+fn patch_modal(preview: PatchPreview) -> Modal {
+    Modal::PatchApproval(PatchApprovalModal {
+        request: fs_write_request(),
+        preview,
+        expanded: false,
+    })
+}
+
+fn diff_preview(old: &str, new: &str) -> PatchPreview {
+    PatchPreview::Diff {
+        path: "note.txt".to_owned(),
+        old: old.to_owned(),
+        new: new.to_owned(),
+    }
+}
+
+#[test]
+fn submit_starts_in_flight_and_rejects_second_submit() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('h')));
+    core.handle_input(key(KeyCode::Enter));
+    assert!(core.turn_in_flight());
+
+    core.handle_input(key(KeyCode::Enter));
+    assert_eq!(core.notice.as_deref(), Some("turn already in progress"));
+}
+
+#[test]
+fn worker_completion_returns_idle() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('h')));
+    core.handle_input(key(KeyCode::Enter));
+
+    for _ in 0..50 {
+        if core.drain_background() && !core.turn_in_flight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(!core.turn_in_flight());
+    assert!(core
+        .transcript
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == euler_event::EventKind::ASSISTANT_MESSAGE));
+}
+
+#[test]
+fn modal_input_replies_allow_deny_and_allow_all() {
+    for (code, reply) in [
+        (KeyCode::Char('1'), PermissionReply::Allow),
+        (KeyCode::Char('y'), PermissionReply::Allow),
+        (KeyCode::Char('3'), PermissionReply::Deny),
+        (KeyCode::Char('n'), PermissionReply::Deny),
+        (KeyCode::Char('2'), PermissionReply::AllowAll),
+        (KeyCode::Char('a'), PermissionReply::AllowAll),
+    ] {
+        let mut core = core();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        core.reply_tx = reply_tx;
+        core.modal = Some(Modal::Permission(PermissionRequest {
+            capability: Capability::FsWrite,
+            reason: "edit".to_owned(),
+        }));
+        core.handle_input(key(code));
+        assert_eq!(reply_rx.recv().expect("reply"), reply);
+    }
+}
+
+#[test]
+fn patch_modal_option_two_uses_existing_session_capability_approval() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    let effect = core.handle_input(key(KeyCode::Char('2')));
+
+    assert_eq!(effect, CoreEffect::Render);
+    assert!(core.modal.is_none());
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::AllowAll);
+}
+
+#[test]
+fn modal_ctrl_c_denies_and_quits() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(PermissionRequest {
+        capability: Capability::FsWrite,
+        reason: "edit".to_owned(),
+    }));
+
+    let effect = core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+    assert_eq!(effect, CoreEffect::Quit);
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
+}
+
+#[test]
+fn patch_modal_ctrl_c_or_d_denies_and_quits() {
+    for code in [
+        KeyCode::Char('c'),
+        KeyCode::Char('C'),
+        KeyCode::Char('d'),
+        KeyCode::Char('D'),
+    ] {
+        let mut core = core();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        core.reply_tx = reply_tx;
+        core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+        let effect = core.handle_input(modified_key(code, KeyModifiers::CONTROL));
+
+        assert_eq!(effect, CoreEffect::Quit);
+        assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
+    }
+}
+
+#[test]
+fn patch_modal_ctrl_shift_c_does_not_deny_or_quit() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    let effect = core.handle_input(modified_key(
+        KeyCode::Char('C'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+
+    assert_eq!(effect, CoreEffect::None);
+    assert!(matches!(core.modal, Some(Modal::PatchApproval(_))));
+    assert!(reply_rx.try_recv().is_err());
+}
+
+#[test]
+fn permission_modal_swallows_scrollback_keys_without_replying() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(PermissionRequest {
+        capability: Capability::FsWrite,
+        reason: "edit".to_owned(),
+    }));
+
+    assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::None);
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Up, KeyModifiers::CONTROL)),
+        CoreEffect::None
+    );
+
+    assert_eq!(core.transcript.scroll_offset(), 0);
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert!(reply_rx.try_recv().is_err());
+}
+
+#[test]
+fn patch_modal_ctrl_x_does_not_launch_editor_or_close_modal() {
+    let mut core = core();
+    let drafts = Arc::new(Mutex::new(Vec::new()));
+    core.editor = Box::new(CapturingEditor {
+        drafts: Arc::clone(&drafts),
+        result: EditorResult::Updated("should not apply".to_owned()),
+    });
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        CoreEffect::None
+    );
+
+    assert!(drafts.lock().expect("editor drafts lock").is_empty());
+    assert!(matches!(core.modal, Some(Modal::PatchApproval(_))));
+}
+
+#[test]
+fn multiline_bracketed_paste_inserts_paste_token_and_waits_for_enter() {
+    let mut core = core();
+    let payload = (1..=11)
+        .map(|line| format!("line{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(
+        core.handle_input(InputEvent::Paste(payload.clone())),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.bottom.composer().render_text(), "[paste #1 +11 lines]");
+    assert_eq!(core.bottom.composer().submit_text(), payload);
+    assert!(!core.turn_in_flight());
+
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert!(core.turn_in_flight());
+    wait_for_idle(&mut core);
+
+    assert!(core.transcript.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::USER_MESSAGE
+            && event
+                .payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                == Some(payload.as_str())
+    }));
+}
+
+#[test]
+fn shift_enter_inserts_newline_without_submitting() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('a')));
+    core.handle_input(modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+    core.handle_input(key(KeyCode::Char('b')));
+
+    assert_eq!(core.bottom.composer().submit_text(), "a\nb");
+    assert!(!core.turn_in_flight());
+}
+
+#[test]
+fn alt_enter_fallback_inserts_newline_without_submitting() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('a')));
+    core.handle_input(modified_key(KeyCode::Enter, KeyModifiers::ALT));
+    core.handle_input(key(KeyCode::Char('b')));
+
+    assert_eq!(core.bottom.composer().submit_text(), "a\nb");
+    assert!(!core.turn_in_flight());
+}
+
+#[test]
+fn composer_history_recalls_oldest_then_down_restores_draft() {
+    let mut core = core();
+    submit_text_and_wait(&mut core, "first");
+    submit_text_and_wait(&mut core, "second");
+    type_text(&mut core, "draft kept");
+
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "second");
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "first");
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "first");
+    core.handle_input(key(KeyCode::Down));
+    assert_eq!(core.bottom.composer().submit_text(), "second");
+    core.handle_input(key(KeyCode::Down));
+    assert_eq!(core.bottom.composer().submit_text(), "draft kept");
+}
+
+#[test]
+fn composer_history_multiline_up_moves_before_recalling() {
+    let mut core = core();
+    submit_text_and_wait(&mut core, "remembered");
+    type_text(&mut core, "line1\nline2");
+
+    core.handle_input(key(KeyCode::Up));
+
+    assert_eq!(core.bottom.composer().submit_text(), "line1\nline2");
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "remembered");
+}
+
+#[test]
+fn composer_history_submitting_recalled_entry_makes_it_newest() {
+    let mut core = core();
+    submit_text_and_wait(&mut core, "alpha");
+    submit_text_and_wait(&mut core, "beta");
+    core.handle_input(key(KeyCode::Up));
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "alpha");
+
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(&mut core);
+    type_text(&mut core, "draft");
+    core.handle_input(key(KeyCode::Up));
+
+    assert_eq!(core.bottom.composer().submit_text(), "alpha");
+}
+
+#[test]
+fn composer_history_uses_visual_rows_for_up_boundary() {
+    let mut core = core();
+    submit_text_and_wait(&mut core, "remembered");
+    type_text(&mut core, "abcdefghij");
+    let _ = core.visual_canvas_frame(7);
+
+    core.handle_input(key(KeyCode::Up));
+
+    assert_eq!(core.bottom.composer().submit_text(), "abcdefghij");
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "remembered");
+}
+
+#[test]
+fn composer_history_edit_detaches_and_submission_filtering_is_honest() {
+    let mut core = core();
+    submit_text_and_wait(&mut core, "one");
+    submit_text_and_wait(&mut core, "one");
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::None);
+    submit_text_and_wait(&mut core, "two");
+
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "two");
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "one");
+    core.handle_input(key(KeyCode::Down));
+    assert_eq!(core.bottom.composer().submit_text(), "two");
+
+    core.handle_input(key(KeyCode::Char('!')));
+    assert_eq!(core.bottom.composer().submit_text(), "two!");
+    core.handle_input(key(KeyCode::Down));
+    assert_eq!(core.bottom.composer().submit_text(), "two!");
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(core.bottom.composer().submit_text(), "two");
+    core.handle_input(key(KeyCode::Down));
+    assert_eq!(core.bottom.composer().submit_text(), "two!");
+}
+
+#[test]
+fn ctrl_c_double_press_quits_when_idle() {
+    let mut core = core();
+    let ctrl_c = modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    assert_eq!(core.handle_input(ctrl_c.clone()), CoreEffect::Render);
+    assert_eq!(core.handle_input(ctrl_c), CoreEffect::Quit);
+}
+
+#[test]
+fn terminal_interrupt_double_press_quits_when_idle() {
+    let mut core = core();
+
+    assert_eq!(core.handle_terminal_interrupt(), CoreEffect::Render);
+    assert_eq!(core.handle_terminal_interrupt(), CoreEffect::Quit);
+}
+
+#[test]
+fn uppercase_ctrl_c_without_shift_arms_quit_and_does_not_copy() {
+    let mut core = core();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    core.clipboard = Box::new(RecordingClipboard {
+        writes: Arc::clone(&writes),
+        result: Ok(()),
+    });
+    core.transcript.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "do not copy".into())]),
+    ));
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('C'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+
+    assert!(writes.lock().expect("clipboard lock").is_empty());
+    assert_eq!(core.notice.as_deref(), Some("press Ctrl+C again to quit"));
+}
+
+#[test]
+fn escape_interrupts_in_flight_turn() {
+    let mut core = core_with_provider(SlowEchoProvider);
+    core.handle_input(key(KeyCode::Char('h')));
+    core.handle_input(key(KeyCode::Enter));
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert!(core.notice.is_none());
+    assert!(core.interrupted_guidance);
+    let AppState::TurnInFlight { interrupt_flag, .. } = &core.state else {
+        panic!("turn should still be in flight");
+    };
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+
+    for _ in 0..50 {
+        if core.drain_background() && !core.turn_in_flight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(core.notice.is_none());
+    assert!(!core.interrupted_guidance);
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("Conversation interrupted"));
+}
+
+#[test]
+fn uppercase_ctrl_c_without_shift_interrupts_in_flight_and_does_not_copy() {
+    let mut core = core();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.clipboard = Box::new(RecordingClipboard {
+        writes: Arc::clone(&writes),
+        result: Ok(()),
+    });
+    core.transcript.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "do not copy".into())]),
+    ));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('C'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+
+    assert!(writes.lock().expect("clipboard lock").is_empty());
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.notice.is_none());
+    assert!(core.interrupted_guidance);
+}
+
+#[test]
+fn repeated_ctrl_c_after_active_turn_interrupt_quits() {
+    let mut core = core();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+    let ctrl_c = modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    assert_eq!(core.handle_input(ctrl_c.clone()), CoreEffect::Render);
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.interrupted_guidance);
+    assert_eq!(core.handle_input(ctrl_c), CoreEffect::Quit);
+}
+
+#[test]
+fn ctrl_d_quits_during_interrupted_active_turn_when_next_draft_is_empty() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.interrupted_guidance = true;
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        CoreEffect::Quit
+    );
+}
+
+#[test]
+fn transcript_review_keys_move_visual_canvas_without_transcript_widget_offset() {
+    let mut core = core();
+
+    assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::Render);
+    assert_eq!(core.visual_scroll_offset(), 8);
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Up, KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert_eq!(core.visual_scroll_offset(), 9);
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Down, KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert_eq!(core.visual_scroll_offset(), 8);
+    assert_eq!(
+        core.handle_input(key(KeyCode::PageDown)),
+        CoreEffect::Render
+    );
+    assert_eq!(core.visual_scroll_offset(), 0);
+
+    assert_eq!(core.transcript.scroll_offset(), 0);
+    assert!(core.transcript.auto_follow());
+}
+
+#[test]
+fn transcript_review_keys_work_while_turn_is_in_flight() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::Render);
+    assert_eq!(core.visual_scroll_offset(), 8);
+    assert_eq!(
+        core.handle_input(key(KeyCode::PageDown)),
+        CoreEffect::Render
+    );
+    assert_eq!(core.visual_scroll_offset(), 0);
+}
+
+#[test]
+fn mouse_wheel_reviews_visual_canvas_while_turn_is_in_flight() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(InputEvent::Mouse(mouse_event(MouseEventKind::ScrollUp))),
+        CoreEffect::Render
+    );
+    assert_eq!(core.visual_scroll_offset(), 3);
+    assert_eq!(
+        core.handle_input(InputEvent::Mouse(mouse_event(MouseEventKind::ScrollDown))),
+        CoreEffect::Render
+    );
+    assert_eq!(core.visual_scroll_offset(), 0);
+}
+
+#[test]
+fn mouse_wheel_does_not_scroll_behind_modal() {
+    let mut core = core();
+    core.modal = Some(Modal::Permission(fs_write_request()));
+
+    assert_eq!(
+        core.handle_input(InputEvent::Mouse(mouse_event(MouseEventKind::ScrollUp))),
+        CoreEffect::None
+    );
+
+    assert_eq!(core.visual_scroll_offset(), 0);
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+}
+
+#[test]
+fn non_wheel_mouse_events_are_not_semantic_ui_input() {
+    let mut core = core();
+
+    assert_eq!(
+        core.handle_input(InputEvent::Mouse(mouse_event(MouseEventKind::Down(
+            crossterm::event::MouseButton::Left
+        )))),
+        CoreEffect::None
+    );
+    assert_eq!(core.visual_scroll_offset(), 0);
+    assert!(core.bottom.composer().submit_text().is_empty());
+}
+
+#[test]
+fn composer_accepts_next_draft_edits_while_turn_is_in_flight() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    for ch in "next".chars() {
+        assert_eq!(
+            core.handle_input(key(KeyCode::Char(ch))),
+            CoreEffect::Render
+        );
+    }
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Enter, KeyModifiers::SHIFT)),
+        CoreEffect::Render
+    );
+    for ch in "draft".chars() {
+        assert_eq!(
+            core.handle_input(key(KeyCode::Char(ch))),
+            CoreEffect::Render
+        );
+    }
+
+    assert_eq!(core.bottom.composer().submit_text(), "next\ndraft");
+    assert!(core.turn_in_flight());
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert_eq!(core.notice.as_deref(), Some("turn already in progress"));
+    assert_eq!(core.bottom.composer().submit_text(), "next\ndraft");
+}
+
+#[test]
+fn active_turn_draft_ignores_command_modified_text_keys() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        CoreEffect::None
+    );
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('x'), KeyModifiers::ALT)),
+        CoreEffect::None
+    );
+    assert_eq!(
+        core.handle_input(modified_key(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.bottom.composer().submit_text(), "A@");
+    assert!(core.turn_in_flight());
+}
+
+#[test]
+fn bracketed_paste_updates_next_draft_while_turn_is_in_flight() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(InputEvent::Paste("pasted\nlines".to_owned())),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.bottom.composer().submit_text(), "pasted\nlines");
+    assert!(core.turn_in_flight());
+}
+
+#[test]
+fn slash_opens_palette_while_turn_is_in_flight_when_next_draft_is_empty() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('/'))),
+        CoreEffect::Render
+    );
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Palette(_)));
+    assert_eq!(core.bottom.composer().submit_text(), "");
+}
+
+#[test]
+fn shifted_slash_opens_palette_while_turn_is_in_flight_when_next_draft_is_empty() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('/'), KeyModifiers::SHIFT)),
+        CoreEffect::Render
+    );
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Palette(_)));
+    assert_eq!(core.bottom.composer().submit_text(), "");
+}
+
+#[test]
+fn control_slash_does_not_open_palette_while_turn_is_in_flight() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('/'), KeyModifiers::CONTROL)),
+        CoreEffect::None
+    );
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_eq!(core.bottom.composer().submit_text(), "");
+}
+
+#[test]
+fn shifted_slash_opens_palette_when_idle_composer_is_empty() {
+    let mut core = core();
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('/'), KeyModifiers::SHIFT)),
+        CoreEffect::Render
+    );
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Palette(_)));
+    assert_eq!(core.bottom.composer().submit_text(), "");
+}
+
+#[test]
+fn control_slash_remains_literal_text_when_idle_composer_is_empty() {
+    let mut core = core();
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('/'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_eq!(core.bottom.composer().submit_text(), "/");
+}
+
+#[test]
+fn slash_edits_next_draft_while_turn_is_in_flight_when_draft_is_not_empty() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.bottom.composer_mut().insert_text("path ");
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('/'))),
+        CoreEffect::Render
+    );
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_eq!(core.bottom.composer().submit_text(), "path /");
+}
+
+#[test]
+fn active_turn_bottom_surface_accepts_palette_input() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('/')));
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('x'))),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        core.handle_input(InputEvent::Paste("pasted".to_owned())),
+        CoreEffect::None
+    );
+
+    let BottomOwner::Palette(palette) = core.bottom.owner() else {
+        panic!("palette should still own input");
+    };
+    assert_eq!(palette.input(), "/x");
+    assert!(core.bottom.composer().submit_text().is_empty());
+}
+
+#[test]
+fn slash_palette_quit_works_while_turn_is_in_flight() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('/'))),
+        CoreEffect::Render
+    );
+    for ch in "quit".chars() {
+        assert_eq!(
+            core.handle_input(key(KeyCode::Char(ch))),
+            CoreEffect::Render
+        );
+    }
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Quit);
+}
+
+#[test]
+fn modal_input_keeps_precedence_while_turn_is_in_flight() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.modal = Some(Modal::Permission(fs_write_request()));
+
+    assert_eq!(core.handle_input(key(KeyCode::Char('x'))), CoreEffect::None);
+    assert_eq!(
+        core.handle_input(InputEvent::Paste("pasted".to_owned())),
+        CoreEffect::None
+    );
+
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert!(core.bottom.composer().submit_text().is_empty());
+}
+
+#[test]
+fn active_turn_interrupt_still_wins_when_bottom_surface_owns_input() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('/')));
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.interrupted_guidance);
+}
+
+#[test]
+fn active_turn_escape_interrupts_when_bottom_surface_owns_input() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('/')));
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.interrupted_guidance);
+}
+
+#[test]
+fn next_draft_survives_active_turn_completion_and_can_submit() {
+    let mut core = core_with_provider(SlowEchoProvider);
+    core.handle_input(key(KeyCode::Char('h')));
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert!(core.turn_in_flight());
+
+    for ch in "next".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    assert_eq!(core.bottom.composer().submit_text(), "next");
+
+    for _ in 0..50 {
+        if core.drain_background() && !core.turn_in_flight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(!core.turn_in_flight());
+    assert_eq!(core.bottom.composer().submit_text(), "next");
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert!(core.turn_in_flight());
+    assert_eq!(core.bottom.composer().submit_text(), "");
+}
+
+#[test]
+fn active_turn_frame_shows_working_state_and_next_draft() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    for ch in "next draft".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+
+    let frame = core.visual_canvas_frame(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("◦ Working"), "frame: {text:?}");
+    assert!(text.contains("▌ next draft"), "frame: {text:?}");
+}
+
+#[test]
+fn active_turn_live_transcript_prefix_is_committable() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "text".into()),
+            ("delta", "line one\nline two\nline three\n".into()),
+        ]),
+    )));
+
+    let frame = core.visual_canvas_frame(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("line one"), "frame: {text:?}");
+    assert!(text.contains("◦ Working"), "frame: {text:?}");
+    assert!(frame.committable_rows > 0);
+    assert!(frame.committable_rows < frame.active_frame_lines.len());
+}
+
+#[test]
+fn active_turn_mutable_live_tail_is_not_committable() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "text".into()),
+            ("delta", "stable prefix\nmutable tail".into()),
+        ]),
+    )));
+
+    let frame = core.visual_canvas_frame(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let stable = text
+        .iter()
+        .position(|line| line.contains("stable prefix"))
+        .expect("stable line should render");
+    let mutable = text
+        .iter()
+        .position(|line| line.contains("mutable tail"))
+        .expect("mutable line should render");
+
+    assert!(stable < frame.committable_rows, "frame: {text:?}");
+    assert!(
+        mutable >= frame.committable_rows,
+        "mutable row crossed commit boundary: {text:?}"
+    );
+}
+
+#[test]
+fn active_turn_open_code_fence_is_visible_but_not_committable() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "text".into()),
+            ("delta", "stable prefix\n```rust\nlet x = 1;\n".into()),
+        ]),
+    )));
+
+    let frame = core.visual_canvas_frame(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let stable = text
+        .iter()
+        .position(|line| line.contains("stable prefix"))
+        .expect("stable line should render");
+    let code = text
+        .iter()
+        .position(|line| line.contains("let x = 1;"))
+        .expect("open fence code should render as live mutable text");
+
+    assert!(stable < frame.committable_rows, "frame: {text:?}");
+    assert!(
+        code >= frame.committable_rows,
+        "open code fence crossed commit boundary: {text:?}"
+    );
+}
+
+#[test]
+fn active_turn_bare_table_partial_row_stays_outside_commit_boundary() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "text".into()),
+            ("delta", "| A | B |\n|---|---|\n| partial | row |".into()),
+        ]),
+    )));
+
+    let frame = core.visual_canvas_frame(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains('A'), "frame: {text:?}");
+    assert!(
+        !text.contains("partial"),
+        "partial row should be held: {text:?}"
+    );
+    assert!(frame.committable_rows > 0);
+    assert!(frame.committable_rows < frame.active_frame_lines.len());
+}
+
+#[test]
+fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
+    let mut core = core();
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+
+    let folded = drain_finalized_visual_text(&mut core, 80);
+    assert!(folded.contains("8 hidden lines"), "folded: {folded:?}");
+    assert!(!folded.contains("line 3"), "folded: {folded:?}");
+
+    assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::Render);
+    assert_eq!(core.visual_scroll_offset(), 8);
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    assert_eq!(core.visual_scroll_offset(), 0);
+    let expanded = drain_finalized_visual_text(&mut core, 80);
+    assert!(!expanded.contains("hidden lines"), "expanded: {expanded:?}");
+    assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
+    assert_eq!(core.bottom.composer().submit_text(), "");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        refolded.contains("8 hidden lines"),
+        "refolded: {refolded:?}"
+    );
+    assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
+}
+
+#[test]
+fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
+    let mut terminal =
+        crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 10), 10).expect("terminal");
+    terminal.set_linefeed_history_insert_enabled(true);
+    let mut core = core();
+    core.push_finalized_visual_item(shell_artifact_with_lines(48));
+
+    terminal
+        .draw_visual_frame(&core.visual_canvas_frame(80))
+        .expect("draw folded");
+    let folded = terminal.backend().screen_contents();
+    assert!(folded.contains("44 hidden lines"), "folded: {folded:?}");
+    assert!(!folded.contains("line 3"), "folded: {folded:?}");
+    let folded_scrollback = terminal.backend().scrollback_rows().join("\n");
+    assert!(
+        folded_scrollback.contains("44 hidden lines"),
+        "folded summary should commit to native scrollback: {folded_scrollback:?}"
+    );
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    terminal.backend_mut().clear_raw_output();
+    terminal
+        .reset_for_history_replay(true)
+        .expect("reset for expanded replay");
+    let reset_raw = terminal.backend().raw_output();
+    assert!(
+        reset_raw
+            .windows(b"\x1b[3J".len())
+            .any(|window| window == b"\x1b[3J"),
+        "replay must purge stale terminal scrollback: {reset_raw:?}"
+    );
+    terminal.backend_mut().clear_raw_output();
+    terminal
+        .draw_visual_frame(&core.visual_canvas_frame(80))
+        .expect("draw expanded");
+    let expanded = terminal.backend().screen_contents();
+    assert!(!expanded.contains("hidden lines"), "expanded: {expanded:?}");
+    assert!(expanded.contains("line 48"), "expanded: {expanded:?}");
+    let expanded_scrollback = terminal.backend().scrollback_rows().join("\n");
+    assert!(
+        expanded_scrollback.contains("line 48"),
+        "expanded replay should commit visible source rows: {expanded_scrollback:?}"
+    );
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    terminal.backend_mut().clear_raw_output();
+    terminal
+        .reset_for_history_replay(true)
+        .expect("reset for refold replay");
+    let reset_raw = terminal.backend().raw_output();
+    assert!(
+        reset_raw
+            .windows(b"\x1b[3J".len())
+            .any(|window| window == b"\x1b[3J"),
+        "refold replay must purge stale terminal scrollback: {reset_raw:?}"
+    );
+    terminal.backend_mut().clear_raw_output();
+    terminal
+        .draw_visual_frame(&core.visual_canvas_frame(80))
+        .expect("draw refolded");
+    let refolded = terminal.backend().screen_contents();
+    assert!(
+        refolded.contains("44 hidden lines"),
+        "refolded: {refolded:?}"
+    );
+    assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
+    let refolded_scrollback = terminal.backend().scrollback_rows().join("\n");
+    assert!(
+        refolded_scrollback.contains("44 hidden lines"),
+        "refold replay should commit folded summary: {refolded_scrollback:?}"
+    );
+}
+
+#[test]
+fn history_replay_clear_uses_theme_background() {
+    let mut terminal =
+        crate::ui::terminal::InlineTerminal::new(VT100Backend::new(30, 4), 3).expect("terminal");
+    terminal
+        .set_theme_colors(
+            Color::Rgb(60, 56, 54),
+            Color::Rgb(251, 241, 199),
+            Color::Rgb(60, 56, 54),
+        )
+        .expect("theme colors");
+    if std::env::var_os("NO_COLOR").is_some() {
+        return;
+    }
+
+    terminal.backend_mut().clear_raw_output();
+    terminal
+        .reset_for_history_replay(true)
+        .expect("reset for history replay");
+    let reset_raw = terminal.backend().raw_output();
+
+    assert!(
+        reset_raw
+            .windows(b"\x1b[48;2;251;241;199m".len())
+            .any(|window| window == b"\x1b[48;2;251;241;199m"),
+        "replay reset must clear with theme background: {reset_raw:?}"
+    );
+}
+
+#[test]
+fn live_file_diff_replaces_prior_patch_preview_for_same_path() {
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::PatchApplied {
+        path: "src/lib.rs".to_owned(),
+        old: None,
+        new: Some("alpha_patch_history\n".to_owned()),
+    });
+    core.push_finalized_visual_item(TranscriptItem::ModelResult("between edits".to_owned()));
+    core.push_finalized_visual_item(TranscriptItem::PatchApplied {
+        path: "src/lib.rs".to_owned(),
+        old: None,
+        new: Some("beta_stale_preview\n".to_owned()),
+    });
+    core.push_finalized_visual_item(TranscriptItem::FileChange {
+        path: "src/lib.rs".to_owned(),
+        action: "add".to_owned(),
+        origin: "apply_patch".to_owned(),
+        before_sha256: None,
+        after_sha256: Some("abc123".to_owned()),
+        before_byte_len: None,
+        after_byte_len: Some(20),
+        diff_redaction: "omitted".to_owned(),
+    });
+    core.push_finalized_visual_item(TranscriptItem::FileDiff {
+        path: "src/lib.rs".to_owned(),
+        action: "add".to_owned(),
+        origin: "apply_patch".to_owned(),
+        diff: Some("@@ -0,0 +1 @@\n+canonical_file_diff\n".to_owned()),
+        truncated: false,
+        truncation: String::new(),
+        omitted_reason: None,
+    });
+
+    let rendered = core
+        .visual_canvas_frame(96)
+        .active_frame_lines
+        .iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("alpha_patch_history"),
+        "rendered: {rendered:?}"
+    );
+    assert!(rendered.contains("between edits"), "rendered: {rendered:?}");
+    assert!(
+        !rendered.contains("beta_stale_preview"),
+        "rendered: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("File added src/lib.rs"),
+        "rendered: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("canonical_file_diff"),
+        "rendered: {rendered:?}"
+    );
+}
+
+#[test]
+fn idle_foldable_shell_artifacts_can_commit_with_replayable_ctrl_o() {
+    let mut core = core();
+    core.push_finalized_visual_item(shell_artifact_with_lines(48));
+    core.push_finalized_visual_item(TranscriptItem::ModelResult("after foldable".to_owned()));
+
+    let folded = core.visual_canvas_frame(80);
+    assert!(folded.committable_rows > 0);
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let expanded = core.visual_canvas_frame(80);
+    assert!(expanded.committable_rows > 0);
+}
+
+#[test]
+fn short_shell_artifacts_allow_following_history_to_commit() {
+    let mut core = core();
+    core.push_finalized_visual_item(shell_artifact_with_lines(4));
+    core.push_finalized_visual_item(TranscriptItem::ModelResult("after short output".to_owned()));
+
+    let frame = core.visual_canvas_frame(80);
+    assert!(frame.committable_rows > 0);
+}
+
+#[test]
+fn active_turn_finalized_shell_artifacts_are_committable_without_live_markdown() {
+    let mut core = core();
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    let frame = core.visual_canvas_frame(80);
+
+    assert!(frame.committable_rows > 0);
+    assert!(frame.committable_rows <= frame.history_rows);
+}
+
+#[test]
+fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
+    let mut core = core();
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "text".into()),
+            ("delta", "mutable assistant tail".into()),
+        ]),
+    )));
+
+    let frame = core.visual_canvas_frame(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let mutable = text
+        .iter()
+        .position(|line| line.contains("mutable assistant tail"))
+        .expect("mutable live text should render");
+
+    assert!(frame.committable_rows > 0);
+    assert!(frame.committable_rows <= frame.history_rows);
+    assert!(
+        mutable >= frame.committable_rows,
+        "mutable live text crossed commit boundary: {text:?}"
+    );
+}
+
+#[test]
+fn ctrl_o_expands_shell_artifacts_without_expanding_patch_cells() {
+    let mut core = core();
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    let patch_line = format!("old {}", TOOL_CALL_MAX_LINES + 10);
+    core.push_finalized_visual_item(patch_artifact_with_lines(TOOL_CALL_MAX_LINES + 14));
+
+    let folded = drain_finalized_visual_text(&mut core, 80);
+    assert!(folded.contains("8 hidden lines"), "folded: {folded:?}");
+    assert!(!folded.contains("bounded patch"), "folded: {folded:?}");
+    assert!(folded.contains(&patch_line), "folded: {folded:?}");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let expanded = drain_finalized_visual_text(&mut core, 80);
+
+    assert!(
+        !expanded.contains("8 hidden lines"),
+        "expanded: {expanded:?}"
+    );
+    assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
+    assert!(
+        !expanded.contains("bounded patch"),
+        "expanded: {expanded:?}"
+    );
+    assert!(expanded.contains(&patch_line), "expanded: {expanded:?}");
+}
+
+#[test]
+fn ctrl_o_without_foldable_artifact_is_noop_and_does_not_edit_composer() {
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::AssistantMessage("plain answer".to_owned()));
+
+    assert_eq!(core.handle_input(ctrl_o()), CoreEffect::None);
+
+    assert_eq!(core.bottom.composer().submit_text(), "");
+    assert!(!drain_finalized_visual_text(&mut core, 80).contains("hidden lines"));
+}
+
+#[test]
+fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
+    let mut modal_core = core();
+    modal_core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    modal_core.modal = Some(Modal::Permission(fs_write_request()));
+
+    assert_eq!(modal_core.handle_input(ctrl_o()), CoreEffect::None);
+    let modal_text = drain_finalized_visual_text(&mut modal_core, 80);
+    assert!(
+        modal_text.contains("8 hidden lines"),
+        "modal_text: {modal_text:?}"
+    );
+    assert!(matches!(modal_core.modal, Some(Modal::Permission(_))));
+
+    let mut palette_core = core();
+    palette_core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    palette_core.handle_input(key(KeyCode::Char('/')));
+
+    assert_eq!(palette_core.handle_input(ctrl_o()), CoreEffect::None);
+    let palette_text = drain_finalized_visual_text(&mut palette_core, 80);
+    assert!(
+        palette_text.contains("8 hidden lines"),
+        "palette_text: {palette_text:?}"
+    );
+    let BottomOwner::Palette(palette) = palette_core.bottom.owner() else {
+        panic!("palette should still own input");
+    };
+    assert_eq!(palette.input(), "/");
+}
+
+#[test]
+fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
+    let mut core = core();
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+
+    let frame = core.visual_canvas_frame(80);
+    assert!(frame.committable_rows > 0);
+    assert!(frame.committable_rows <= frame.history_rows);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("hidden lines"), "text: {text:?}");
+    assert!(text.contains("line 3"), "text: {text:?}");
+    assert!(core.turn_in_flight());
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = core.visual_canvas_frame(80);
+    let refolded_text = refolded
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(refolded.committable_rows > 0);
+    assert!(refolded.committable_rows <= refolded.history_rows);
+    assert!(
+        refolded_text.contains("hidden lines"),
+        "refolded_text: {refolded_text:?}"
+    );
+    assert!(core.turn_in_flight());
+}
+
+#[test]
+fn replay_history_effect_wins_over_render_but_not_quit() {
+    assert_eq!(
+        merge_effects(
+            CoreEffect::ReplayHistoryWithScrollbackPurge,
+            CoreEffect::ReplayHistory
+        ),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    assert_eq!(
+        merge_effects(
+            CoreEffect::Render,
+            CoreEffect::ReplayHistoryWithScrollbackPurge
+        ),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    assert_eq!(
+        merge_effects(CoreEffect::ReplayHistory, CoreEffect::Render),
+        CoreEffect::ReplayHistory
+    );
+    assert_eq!(
+        merge_effects(CoreEffect::Render, CoreEffect::ReplayHistory),
+        CoreEffect::ReplayHistory
+    );
+    assert_eq!(
+        merge_effects(CoreEffect::ReplayHistory, CoreEffect::None),
+        CoreEffect::ReplayHistory
+    );
+    assert_eq!(
+        merge_effects(CoreEffect::TerminalClipboard, CoreEffect::Render),
+        CoreEffect::TerminalClipboard
+    );
+    assert_eq!(
+        merge_effects(CoreEffect::ThemeChanged, CoreEffect::Render),
+        CoreEffect::ThemeChanged
+    );
+    assert_eq!(
+        merge_effects(CoreEffect::TerminalClipboard, CoreEffect::ThemeChanged),
+        CoreEffect::TerminalClipboard
+    );
+    assert_eq!(
+        merge_effects(CoreEffect::ReplayHistory, CoreEffect::TerminalClipboard),
+        CoreEffect::ReplayHistory
+    );
+    assert_eq!(
+        merge_effects(
+            CoreEffect::ReplayHistoryWithScrollbackPurge,
+            CoreEffect::TerminalClipboard
+        ),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    assert_eq!(
+        merge_effects(
+            CoreEffect::Quit,
+            CoreEffect::ReplayHistoryWithScrollbackPurge
+        ),
+        CoreEffect::Quit
+    );
+    assert_eq!(
+        merge_effects(CoreEffect::Quit, CoreEffect::TerminalClipboard),
+        CoreEffect::Quit
+    );
+}
+
+#[test]
+fn external_editor_success_replaces_draft() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('o')));
+    core.handle_input(key(KeyCode::Char('l')));
+    core.handle_input(key(KeyCode::Char('d')));
+    core.editor = Box::new(MockEditor {
+        result: EditorResult::Updated("new\ntext".to_owned()),
+    });
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.bottom.composer().submit_text(), "new\ntext");
+    assert_eq!(core.notice.as_deref(), Some("draft updated from editor"));
+}
+
+#[test]
+fn external_editor_receives_current_composer_draft() {
+    let mut core = core();
+    let drafts = Arc::new(Mutex::new(Vec::new()));
+    core.handle_input(key(KeyCode::Char('d')));
+    core.handle_input(key(KeyCode::Char('r')));
+    core.handle_input(key(KeyCode::Char('a')));
+    core.handle_input(key(KeyCode::Char('f')));
+    core.handle_input(key(KeyCode::Char('t')));
+    core.handle_input(modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+    core.handle_input(key(KeyCode::Char('x')));
+    core.editor = Box::new(CapturingEditor {
+        drafts: Arc::clone(&drafts),
+        result: EditorResult::Updated("edited".to_owned()),
+    });
+
+    core.handle_input(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+
+    assert_eq!(
+        *drafts.lock().expect("editor drafts lock"),
+        vec!["draft\nx"]
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "edited");
+}
+
+#[test]
+fn external_editor_unset_preserves_draft_and_shows_notice() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('k')));
+    core.handle_input(key(KeyCode::Char('e')));
+    core.handle_input(key(KeyCode::Char('p')));
+    core.editor = Box::new(MockEditor {
+        result: EditorResult::Unset,
+    });
+
+    core.handle_input(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+
+    assert_eq!(core.bottom.composer().submit_text(), "kep");
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("EDITOR is not set; draft unchanged")
+    );
+}
+
+#[test]
+fn external_editor_failure_preserves_draft_and_shows_notice() {
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('s')));
+    core.handle_input(key(KeyCode::Char('a')));
+    core.handle_input(key(KeyCode::Char('f')));
+    core.handle_input(key(KeyCode::Char('e')));
+    core.editor = Box::new(MockEditor {
+        result: EditorResult::Failed("editor exited with a non-zero status".to_owned()),
+    });
+
+    core.handle_input(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+
+    assert_eq!(core.bottom.composer().submit_text(), "safe");
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("editor failed: editor exited with a non-zero status; draft unchanged")
+    );
+}
+
+#[test]
+fn name_session_reports_metadata_refresh_failure_after_durable_rename() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    config.agent_id = "tui-test".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(record.events_path()).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    let alternate_home = EulerHome::from_root(temp.path().join(".other-euler")).expect("home");
+    core.session_store = Some(SessionStore::new(alternate_home).expect("alternate store"));
+
+    assert_eq!(
+        core.name_current_session("  honest   name  ".to_owned()),
+        CoreEffect::Render
+    );
+
+    let notice = core.notice.as_deref().expect("notice");
+    assert!(notice.starts_with("session named honest name; metadata refresh failed:"));
+    assert!(notice.contains("session not found"));
+    assert!(!notice.starts_with("session naming failed:"));
+    let events = read_resume_prefix(record.events_path()).expect("events");
+    let rename = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_RENAMED)
+        .expect("rename event");
+    assert_eq!(
+        rename
+            .payload
+            .get("name")
+            .and_then(serde_json::Value::as_str),
+        Some("honest name")
+    );
+}
+
+#[test]
+fn name_session_refreshes_metadata_after_durable_rename() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    config.agent_id = "tui-test".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(record.events_path()).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    core.session_store = Some(store.clone());
+
+    assert_eq!(
+        core.name_current_session("  clean   name  ".to_owned()),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.notice.as_deref(), Some("session named clean name"));
+    let refreshed = store
+        .find_session(record.id())
+        .expect("find session")
+        .expect("session record");
+    assert_eq!(refreshed.name(), Some("clean name"));
+}
+
+#[test]
+fn reasoning_effort_action_updates_status_session_and_events() {
+    let mut core = core();
+
+    assert_eq!(
+        core.set_reasoning_effort(ReasoningEffort::XLarge),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.status.reasoning_effort.as_deref(), Some("xlarge"));
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should be idle");
+    };
+    assert_eq!(session.reasoning_effort(), ReasoningEffort::XLarge);
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::MODEL_EFFORT_CHANGED
+            && event
+                .payload
+                .get("to_effort")
+                .and_then(serde_json::Value::as_str)
+                == Some("xlarge")
+    }));
+}
+
+#[test]
+fn new_session_reuses_target_and_purges_visual_history() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let mut core = core();
+    core.session_store = Some(store.clone());
+    core.transcript.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "old content".into())]),
+    ));
+
+    assert_eq!(
+        core.start_new_session(),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+
+    assert!(core
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.starts_with("new session ")));
+    assert!(!drain_finalized_visual_text(&mut core, 80).contains("old content"));
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should be idle");
+    };
+    assert_eq!(session.active_target().model, "echo");
+    assert!(store
+        .find_session(session.session_id())
+        .expect("find")
+        .is_some());
+    assert_eq!(
+        core.status.session_id.as_deref(),
+        Some(session.session_id())
+    );
+}
+
+#[test]
+fn export_session_writes_current_events_json() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let out = temp.path().join("session.json");
+    let mut core = core();
+
+    assert_eq!(
+        core.export_session(Some(out.display().to_string())),
+        CoreEffect::Render
+    );
+
+    let exported: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out).expect("read export"))
+            .expect("export json");
+    assert_eq!(exported["model"], "echo");
+    assert_eq!(exported["reasoning_effort"], "medium");
+    assert!(exported["events"]
+        .as_array()
+        .is_some_and(|events| !events.is_empty()));
+}
+
+#[test]
+fn export_session_without_path_writes_under_private_home_exports() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let mut core = core();
+    core.session_store = Some(store.clone());
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should be idle");
+    };
+    let expected = store
+        .home()
+        .root()
+        .join("exports")
+        .join(format!("euler-session-{}.json", session.session_id()));
+
+    assert_eq!(core.export_session(None), CoreEffect::Render);
+
+    assert!(expected.is_file());
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("session exported to"));
+    let exported: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&expected).expect("read export"))
+            .expect("export json");
+    assert_eq!(exported["model"], "echo");
+}
+
+#[cfg(unix)]
+#[test]
+fn export_session_creates_private_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let out = temp.path().join("nested").join("session.json");
+    let mut core = core();
+
+    assert_eq!(
+        core.export_session(Some(out.display().to_string())),
+        CoreEffect::Render
+    );
+
+    let mode = std::fs::metadata(out)
+        .expect("export metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn status_reports_session_id_while_turn_is_in_flight() {
+    let mut core = core();
+    let session_id = core.status.session_id.clone().expect("session id");
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(core.show_status(), CoreEffect::Render);
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains(&format!("session: {session_id}")));
+    assert!(text.contains("theme: Gruvbox Dark (gruvbox-dark)"));
+    assert!(!text.contains("session: none"));
+}
+
+#[test]
+fn theme_action_switches_profile_and_context() {
+    let mut core = core();
+
+    assert_eq!(
+        core.set_theme(ThemeChoice::GruvboxLight),
+        CoreEffect::ThemeChanged
+    );
+
+    assert_eq!(core.theme_choice, ThemeChoice::GruvboxLight);
+    assert_ne!(
+        core.theme.palette.foreground,
+        Theme::default_dark().palette.foreground
+    );
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("theme set to gruvbox-light"));
+}
+
+#[test]
+fn theme_options_seed_initial_profile() {
+    let core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            theme_choice: ThemeChoice::GruvboxLight,
+            ..AppOptions::default()
+        },
+    );
+
+    assert_eq!(core.theme_choice, ThemeChoice::GruvboxLight);
+    assert_eq!(
+        core.theme.palette.background,
+        Theme::default_light().palette.background
+    );
+}
+
+#[test]
+fn theme_action_persists_when_preference_path_is_configured() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let preference_path = temp.path().join(".euler").join("preferences.json");
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            theme_preference_path: Some(preference_path.clone()),
+            ..AppOptions::default()
+        },
+    );
+
+    assert_eq!(
+        core.set_theme(ThemeChoice::GruvboxLight),
+        CoreEffect::ThemeChanged
+    );
+
+    let contents = std::fs::read_to_string(preference_path).expect("theme preference");
+    let value: serde_json::Value = serde_json::from_str(&contents).expect("json");
+    assert_eq!(value["theme"], "gruvbox-light");
+}
+
+#[test]
+fn theme_action_reports_preference_save_failure_without_reverting_theme() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let preference_path = temp.path().join("preferences.json");
+    std::fs::write(&preference_path, r#"{"theme":"light","#).expect("write malformed");
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            theme_preference_path: Some(preference_path.clone()),
+            ..AppOptions::default()
+        },
+    );
+
+    assert_eq!(
+        core.set_theme(ThemeChoice::GruvboxLight),
+        CoreEffect::ThemeChanged
+    );
+
+    assert_eq!(core.theme_choice, ThemeChoice::GruvboxLight);
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("preference not saved"));
+    assert_eq!(
+        std::fs::read_to_string(&preference_path).expect("read unchanged"),
+        r#"{"theme":"light","#
+    );
+}
+
+#[test]
+fn resume_picker_reports_empty_state_without_active_turn_language() {
+    let mut core = core();
+    core.state = AppState::Empty;
+
+    assert_eq!(
+        core.resume_session_from_picker("01KW3M3QN4JYHPW1Y82VW9K7K1".to_owned()),
+        CoreEffect::Render
+    );
+
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume needs an active session"));
+}
+
+#[test]
+fn resume_picker_waits_while_turn_is_in_flight() {
+    let mut core = core();
+    let (_worker_tx, worker_rx) = std::sync::mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.resume_session_from_picker("01KW3M3QN4JYHPW1Y82VW9K7K1".to_owned()),
+        CoreEffect::Render
+    );
+
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume waits for the active turn"));
+}
+
+#[test]
+fn accepting_resume_purges_prior_native_scrollback() {
+    let mut core = core();
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(".");
+    config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider);
+    let events = vec![event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "resumed content".into())]),
+    )];
+
+    let effect = core.accept_tui_resume(
+        "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned(),
+        TuiResume {
+            session,
+            channels,
+            events,
+            active_target: ModelTarget::new("fixture", "echo"),
+            display_label: "useful resumed name".to_owned(),
+            recovery_closure_appended: false,
+            warning_count: 0,
+        },
+    );
+
+    assert_eq!(effect, CoreEffect::ReplayHistoryWithScrollbackPurge);
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("resumed session useful resumed name")
+    );
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("resumed content"));
+}
+
+#[test]
+fn copy_key_copies_last_visible_assistant_response() {
+    let mut core = core();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    core.clipboard = Box::new(RecordingClipboard {
+        writes: Arc::clone(&writes),
+        result: Ok(()),
+    });
+    core.transcript.push_event(event(
+        EventKind::MODEL_REASONING,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("fidelity", "raw".into()),
+            ("content", "do not copy".into()),
+        ]),
+    ));
+    core.transcript.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "copy me".into())]),
+    ));
+
+    assert_eq!(
+        core.handle_input(modified_key(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )),
+        CoreEffect::Render
+    );
+
+    assert_eq!(*writes.lock().expect("clipboard lock"), vec!["copy me"]);
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("copied last assistant response")
+    );
+}
+
+#[test]
+fn copy_falls_back_to_terminal_clipboard_effect_after_desktop_failure() {
+    let mut core = core();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    core.clipboard = Box::new(RecordingClipboard {
+        writes: Arc::clone(&writes),
+        result: Err("xclip exited with a non-zero status".to_owned()),
+    });
+    core.transcript.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "copy through terminal".into())]),
+    ));
+
+    let effect = core.handle_input(modified_key(
+        KeyCode::Char('C'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+
+    assert_eq!(effect, CoreEffect::TerminalClipboard);
+    assert_eq!(
+        *writes.lock().expect("clipboard lock"),
+        vec!["copy through terminal"]
+    );
+    assert!(core.notice.is_none());
+    assert_eq!(
+        core.pending_terminal_clipboard.as_deref(),
+        Some("\x1b]52;c;Y29weSB0aHJvdWdoIHRlcm1pbmFs\x07")
+    );
+}
+
+#[test]
+fn shadowed_terminal_clipboard_payload_is_discarded() {
+    let mut core = core();
+    core.pending_terminal_clipboard = Some("\x1b]52;c;Y29weQ==\x07".to_owned());
+
+    core.discard_terminal_clipboard_if_shadowed(CoreEffect::ReplayHistoryWithScrollbackPurge);
+
+    assert!(core.pending_terminal_clipboard.is_none());
+}
+
+#[test]
+fn terminal_clipboard_payload_stays_queued_for_terminal_effect() {
+    let mut core = core();
+    core.pending_terminal_clipboard = Some("\x1b]52;c;Y29weQ==\x07".to_owned());
+
+    core.discard_terminal_clipboard_if_shadowed(CoreEffect::TerminalClipboard);
+
+    assert_eq!(
+        core.pending_terminal_clipboard.as_deref(),
+        Some("\x1b]52;c;Y29weQ==\x07")
+    );
+}
+
+#[test]
+fn ctrl_shift_c_copies_in_flight_without_interrupting() {
+    let mut core = core();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.clipboard = Box::new(RecordingClipboard {
+        writes: Arc::clone(&writes),
+        result: Ok(()),
+    });
+    core.transcript.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "copy in flight".into())]),
+    ));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(
+        core.handle_input(modified_key(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )),
+        CoreEffect::Render
+    );
+
+    assert_eq!(
+        *writes.lock().expect("clipboard lock"),
+        vec!["copy in flight"]
+    );
+    assert!(!interrupt_flag.load(Ordering::SeqCst));
+}
+
+#[test]
+fn copy_without_assistant_response_shows_notice_without_copying() {
+    let mut core = core();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    core.clipboard = Box::new(RecordingClipboard {
+        writes: Arc::clone(&writes),
+        result: Ok(()),
+    });
+
+    core.handle_input(modified_key(
+        KeyCode::Char('C'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+
+    assert!(writes.lock().expect("clipboard lock").is_empty());
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("no assistant response to copy")
+    );
+}
+
+#[test]
+fn copy_slash_command_routes_to_copy_action() {
+    let mut core = core();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    core.clipboard = Box::new(RecordingClipboard {
+        writes: Arc::clone(&writes),
+        result: Ok(()),
+    });
+    core.transcript.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "from slash".into())]),
+    ));
+
+    core.handle_input(key(KeyCode::Char('/')));
+    for ch in "cop".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    core.handle_input(key(KeyCode::Enter));
+
+    assert_eq!(*writes.lock().expect("clipboard lock"), vec!["from slash"]);
+}
+
+#[test]
+fn slash_palette_backspace_corrects_input_before_confirm() {
+    let mut core = core();
+
+    core.handle_input(key(KeyCode::Char('/')));
+    for ch in "effortx".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    core.handle_input(key(KeyCode::Backspace));
+    for ch in " large".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+
+    let BottomOwner::Palette(palette) = core.bottom.owner() else {
+        panic!("palette should own surface");
+    };
+    assert_eq!(palette.input(), "/effort large");
+
+    core.handle_input(key(KeyCode::Enter));
+
+    assert!(
+        drain_finalized_visual_text(&mut core, 80).contains("ui: reasoning effort set to large")
+    );
+}
+
+#[test]
+fn slash_palette_trailing_noise_correction_submits_visible_effort_argument() {
+    let mut core = core();
+
+    core.handle_input(key(KeyCode::Char('/')));
+    for ch in "effort//dddf".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    for _ in 0..4 {
+        core.handle_input(key(KeyCode::Backspace));
+    }
+    for ch in " large".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+
+    let BottomOwner::Palette(palette) = core.bottom.owner() else {
+        panic!("palette should own surface");
+    };
+    assert_eq!(palette.input(), "/effort// large");
+    assert_eq!(palette.selected_token(), Some("/effort"));
+
+    core.handle_input(key(KeyCode::Enter));
+
+    let pending = drain_finalized_visual_text(&mut core, 80);
+    assert!(pending.contains("ui: reasoning effort set to large"));
+    assert!(!pending.contains("unknown command: /effort//"));
+}
+
+#[test]
+fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
+    let mut core = core_with_provider_model_at(ChatGptEchoProvider, "gpt-5.5", ".");
+
+    core.handle_input(key(KeyCode::Char('/')));
+    for ch in "model".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    core.handle_input(key(KeyCode::Enter));
+
+    let BottomOwner::Picker(picker) = core.bottom.owner() else {
+        panic!("model picker should own surface");
+    };
+    let rendered = picker.render_lines(80).join("\n");
+    assert!(rendered.contains("anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
+    assert_eq!(picker.selected_index(), 0);
+
+    core.handle_input(key(KeyCode::Down));
+    let BottomOwner::Picker(picker) = core.bottom.owner() else {
+        panic!("model picker should own surface");
+    };
+    assert_eq!(picker.selected_index(), 1);
+    core.handle_input(key(KeyCode::Up));
+    let BottomOwner::Picker(picker) = core.bottom.owner() else {
+        panic!("model picker should own surface");
+    };
+    assert_eq!(picker.selected_index(), 0);
+
+    for ch in "chatgpt".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    let BottomOwner::Picker(picker) = core.bottom.owner() else {
+        panic!("model picker should own surface");
+    };
+    let rendered = picker.render_lines(80).join("\n");
+    assert!(rendered.contains("chatgpt::gpt-5.5 — 1.05M ctx, reasoning ✓"));
+}
+
+#[test]
+fn model_switch_error_renders_as_ui_notice() {
+    let mut core = core();
+
+    assert_eq!(
+        core.handle_command_action(CommandAction::SwitchModel {
+            provider: "missing".to_owned(),
+            model: "example-model".to_owned(),
+        }),
+        CoreEffect::Render
+    );
+
+    let rendered = drain_finalized_visual_text(&mut core, 200);
+    assert!(rendered.contains("ui: model switch rejected:"));
+    assert!(rendered.contains("missing"));
+}
+
+#[test]
+fn cancel_outcome_clears_transient_live_tail_before_next_turn() {
+    let mut core = core();
+    core.transcript.push_event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "stale".into())]),
+    ));
+
+    core.handle_turn_outcome(TurnOutcome::Cancelled, None);
+    core.transcript.push_event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "fresh\n".into())]),
+    ));
+
+    assert!(core
+        .transcript
+        .items()
+        .contains(&TranscriptItem::AssistantMessage("fresh\n".to_owned())));
+    assert!(!core
+        .transcript
+        .items()
+        .contains(&TranscriptItem::AssistantMessage("stalefresh".to_owned())));
+}
+
+#[test]
+fn activity_live_status_is_gated_by_turn_state() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    core.transcript.push_event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "partial".into())]),
+    ));
+
+    terminal
+        .draw(|frame| core.render(frame))
+        .expect("idle draw");
+    assert!(!terminal.backend().screen_contents().contains("◦ Working"));
+
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    terminal
+        .draw(|frame| core.render(frame))
+        .expect("in-flight draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("◦ Working (0s • esc to interrupt)"));
+    assert!(contents.contains("▌"));
+}
+
+#[test]
+fn interrupted_live_status_replaces_working_affordance() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(core.handle_interrupt(), CoreEffect::Render);
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(
+        contents.contains("■ Conversation interrupted - tell the model what to do differently.")
+    );
+    assert!(!contents.contains("◦ Working"));
+}
+
+#[test]
+fn layout_renders_at_80_by_24_and_after_resize() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    core.handle_input(key(KeyCode::Char('/')));
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("> /"));
+    let areas = layout(
+        Rect::new(0, 0, 80, 24),
+        core.composer_height(),
+        core.notice_height(),
+        core.permission_ask_height(80),
+        core.activity_height(),
+    );
+    let frame_top = areas.bottom.y + areas.bottom.height - core.composer_frame_height(7, 80);
+    assert!(!screen_row(&contents, frame_top).contains('\u{2500}'));
+    assert!(contents.contains("▌"));
+
+    terminal.backend_mut().resize(120, 40);
+    assert!(terminal.draw(|frame| core.render(frame)).is_ok());
+    let resized = terminal.backend().screen_contents();
+    assert!(resized.contains("fixture/echo"));
+    assert!(resized.contains("Context ?% used"));
+}
+
+#[test]
+fn footer_context_is_unknown_before_first_model_result() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core_with_fixture_catalog(
+        EchoProvider,
+        "echo",
+        fixture_catalog_with_windows(&[("echo", 1_000)]),
+    );
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Context ?% used"));
+}
+
+#[test]
+fn scripted_model_result_usage_updates_footer_context_percent() {
+    let provider = ScriptedProvider::new(vec![scripted_usage(123)]);
+    let mut core = core_with_fixture_catalog(
+        provider,
+        "echo",
+        fixture_catalog_with_windows(&[("echo", 1_000)]),
+    );
+    core.status.cwd = PathBuf::from("/tmp/euler");
+
+    core.handle_input(key(KeyCode::Char('e')));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(&mut core);
+
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert_eq!(
+        rendered,
+        "  fixture/echo medium · /euler · Context 12% used"
+    );
+    assert_eq!(core.token_usage.input_tokens, 123);
+    assert_eq!(core.token_usage.output_tokens, 999);
+    assert_eq!(core.token_usage.reasoning_tokens, Some(500));
+}
+
+#[test]
+fn model_switch_resets_footer_context_until_next_result() {
+    let mut core = core_with_fixture_catalog(
+        EchoProvider,
+        "echo",
+        fixture_catalog_with_windows(&[("echo", 1_000), ("other", 2_000)]),
+    );
+    core.status.cwd = PathBuf::from("/tmp/euler");
+
+    core.handle_turn_event(TurnEvent::Event(model_result_usage_event(json!({
+        "input_tokens": 120,
+        "output_tokens": 0
+    }))));
+    assert_eq!(
+        core.canvas_status_snapshot(120).line.plain_text(),
+        "  fixture/echo medium · /euler · Context 12% used"
+    );
+
+    core.status.model = "other".to_owned();
+    core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
+    assert_eq!(
+        core.canvas_status_snapshot(120).line.plain_text(),
+        "  fixture/other medium · /euler · Context ?% used"
+    );
+
+    core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
+        "other",
+        json!({"input_tokens": 250, "output_tokens": 0}),
+    )));
+    assert_eq!(
+        core.canvas_status_snapshot(120).line.plain_text(),
+        "  fixture/other medium · /euler · Context 13% used"
+    );
+}
+
+#[test]
+fn patch_approval_modal_renders_diff_and_prompt() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Would you like to apply this patch?"));
+    assert!(contents.contains("Reason: fs-write: tool edit_file"));
+    assert!(contents.contains("note.txt"));
+    assert!(contents.contains("alpha"));
+    assert!(contents.contains("beta"));
+    assert!(contents.contains("1. Yes, proceed (y)"));
+    assert!(contents.contains("2. Yes, and don't ask again for fs-write this session (a)"));
+    assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
+    assert!(contents.contains("r. Review expanded patch (r)"));
+    assert!(!contents.contains("commands that start"));
+}
+
+#[test]
+fn patch_approval_modal_clears_full_rows_behind_modal() {
+    let mut terminal = Terminal::new(VT100Backend::new(120, 24)).expect("terminal");
+    let mut core = core();
+    core.transcript.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "Model chatg ".repeat(80).into())]),
+    ));
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    for (needle, expected) in [
+        (
+            "Would you like to apply this patch?",
+            "Would you like to apply this patch?",
+        ),
+        (
+            "Reason: fs-write: tool edit_file",
+            "Reason: fs-write: tool edit_file",
+        ),
+        (
+            "r. Review expanded patch (r)",
+            "r. Review expanded patch (r)",
+        ),
+    ] {
+        let line = contents
+            .lines()
+            .find(|line| line.contains(needle))
+            .expect(needle);
+        assert!(line.contains(expected));
+    }
+}
+
+#[test]
+fn patch_review_key_expands_diff_region() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let new = (0..40)
+        .map(|index| format!("line {index:02}\n"))
+        .collect::<String>();
+    core.modal = Some(patch_modal(diff_preview("", &new)));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let normal = terminal.backend().screen_contents();
+    assert!(!normal.contains("line 10"));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('r'))),
+        CoreEffect::Render
+    );
+    terminal
+        .draw(|frame| core.render(frame))
+        .expect("expanded draw");
+
+    let expanded = terminal.backend().screen_contents();
+    assert!(expanded.contains("line 10"));
+    assert!(matches!(
+        core.modal,
+        Some(Modal::PatchApproval(PatchApprovalModal {
+            expanded: true,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn malformed_patch_payload_renders_fallback() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    core.transcript.push_event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-edit".into()),
+            ("name", "edit_file".into()),
+            ("input", json!({})),
+        ]),
+    ));
+    core.modal = Some(core.modal_for_request(fs_write_request()));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    assert!(terminal
+        .backend()
+        .screen_contents()
+        .contains("Patch details are malformed or empty."));
+}
+
+#[test]
+fn apply_patch_payload_renders_patch_preview() {
+    let mut terminal = Terminal::new(VT100Backend::new(96, 24)).expect("terminal");
+    let mut core = core();
+    core.transcript.push_event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-patch".into()),
+            ("name", "apply_patch".into()),
+            (
+                "input",
+                json!({
+                    "patch": "*** Begin Patch\n*** Add File: complex_50.c\n+#include <stdio.h>\n+int main(void){return 0;}\n*** End Patch"
+                }),
+            ),
+        ]),
+    ));
+    core.modal = Some(core.modal_for_request(apply_patch_request()));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+
+    assert!(!contents.contains("Patch details are malformed or empty."));
+    assert!(contents.contains("Patch approval"));
+    assert!(contents.contains("complex_50.c"));
+    assert!(contents.contains("#include <stdio.h>"));
+}
+
+#[test]
+fn large_patch_modal_keeps_diff_bounded() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let new = (0..120)
+        .map(|index| format!("line {index:03}\n"))
+        .collect::<String>();
+    core.modal = Some(patch_modal(diff_preview("", &new)));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("bounded patch"));
+    assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
+    assert!(!contents.contains("line 119"));
+}
+
+#[test]
+fn rejecting_patch_permission_does_not_apply_patch_and_turn_continues() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    std::fs::write(&note, "alpha\n").expect("write note");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-edit".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "note.txt", "old": "alpha", "new": "beta"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut core = core_with_provider_at(provider, temp.path());
+
+    core.handle_input(key(KeyCode::Char('e')));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_patch_diff(&mut core);
+    assert!(matches!(core.modal, Some(Modal::PatchApproval(_))));
+    assert_eq!(
+        std::fs::read_to_string(&note).expect("read note"),
+        "alpha\n"
+    );
+
+    core.handle_input(key(KeyCode::Char('n')));
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        std::fs::read_to_string(&note).expect("read note"),
+        "alpha\n"
+    );
+    assert!(core.transcript.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::PERMISSION_DECISION
+            && event
+                .payload
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                == Some("denied")
+    }));
+    let result = core
+        .transcript
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    assert_eq!(
+        result
+            .payload
+            .get("error")
+            .and_then(serde_json::Value::as_str),
+        Some("permission denied")
+    );
+    assert!(core
+        .transcript
+        .items()
+        .contains(&TranscriptItem::AssistantMessage("done".to_owned())));
+    assert!(!core.transcript.items().iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::AssistantMessage(content)
+                if content.contains("Permission was denied for")
+        )
+    }));
+}
+
+#[test]
+fn allowing_patch_permission_applies_patch_and_turn_continues() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    std::fs::write(&note, "alpha\n").expect("write note");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-edit".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "note.txt", "old": "alpha", "new": "beta"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut core = core_with_provider_at(provider, temp.path());
+
+    core.handle_input(key(KeyCode::Char('e')));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_patch_diff(&mut core);
+    assert!(matches!(
+        &core.modal,
+        Some(Modal::PatchApproval(PatchApprovalModal {
+            preview: PatchPreview::Diff { new, .. },
+            ..
+        })) if new == "beta"
+    ));
+
+    core.handle_input(key(KeyCode::Char('y')));
+    wait_for_idle(&mut core);
+
+    assert_eq!(std::fs::read_to_string(&note).expect("read note"), "beta\n");
+    assert!(core
+        .transcript
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::PATCH_APPLIED));
+    assert!(core
+        .transcript
+        .items()
+        .contains(&TranscriptItem::AssistantMessage("done".to_owned())));
+}
+
+#[test]
+fn allowing_direct_apply_patch_permission_adds_file_and_turn_continues() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let patch = "*** Begin Patch\n*** Add File: complex_50.c\n+#include <stdio.h>\n+int main(void) { return 0; }\n*** End Patch";
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-apply".to_owned(),
+            name: "apply_patch".to_owned(),
+            input: json!({"patch": patch}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut core = core_with_provider_at(provider, temp.path());
+
+    core.handle_input(key(KeyCode::Char('e')));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_patch_diff(&mut core);
+    assert!(matches!(
+        &core.modal,
+        Some(Modal::PatchApproval(PatchApprovalModal {
+            preview: PatchPreview::Diff { path, new, .. },
+            ..
+        })) if path == "complex_50.c" && new.contains("#include <stdio.h>")
+    ));
+
+    core.handle_input(key(KeyCode::Char('y')));
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("complex_50.c")).expect("created file"),
+        "#include <stdio.h>\nint main(void) { return 0; }\n"
+    );
+    assert!(core
+        .transcript
+        .items()
+        .contains(&TranscriptItem::AssistantMessage("done".to_owned())));
+}
+
+#[test]
+fn allowing_direct_apply_patch_permission_updates_file_and_turn_continues() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    std::fs::write(&note, "alpha\nmiddle\nomega\n").expect("write note");
+    let patch = "*** Begin Patch\n*** Update File: note.txt\n@@\n-alpha\n+beta\n@@\n-omega\n+done\n*** End Patch";
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-apply-update".to_owned(),
+            name: "apply_patch".to_owned(),
+            input: json!({"patch": patch}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut core = core_with_provider_at(provider, temp.path());
+
+    core.handle_input(key(KeyCode::Char('e')));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_patch_diff(&mut core);
+    assert!(matches!(
+        &core.modal,
+        Some(Modal::PatchApproval(PatchApprovalModal {
+            preview: PatchPreview::Diff { path, old, new },
+            ..
+        })) if path == "note.txt"
+            && old.contains("alpha")
+            && old.contains("omega")
+            && new.contains("beta")
+            && new.contains("done")
+    ));
+
+    core.handle_input(key(KeyCode::Char('y')));
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        std::fs::read_to_string(&note).expect("updated file"),
+        "beta\nmiddle\ndone\n"
+    );
+    assert!(core
+        .transcript
+        .items()
+        .contains(&TranscriptItem::AssistantMessage("done".to_owned())));
+}
+
+#[test]
+fn allowing_unsupported_direct_apply_patch_does_not_apply_patch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let patch = "*** Begin Patch\n*** Add File: one.txt\n+one\n*** End Patch\n*** Add File: two.txt\n+two\n*** End Patch";
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-apply-unsupported".to_owned(),
+            name: "apply_patch".to_owned(),
+            input: json!({"patch": patch}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut core = core_with_provider_at(provider, temp.path());
+
+    core.handle_input(key(KeyCode::Char('e')));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_patch_modal(&mut core);
+    assert!(matches!(
+        &core.modal,
+        Some(Modal::PatchApproval(PatchApprovalModal {
+            preview: PatchPreview::Fallback(message),
+            ..
+        })) if message.contains("Patch preview unavailable")
+    ));
+
+    core.handle_input(key(KeyCode::Char('y')));
+    wait_for_idle(&mut core);
+
+    assert!(!temp.path().join("one.txt").exists());
+    assert!(!temp.path().join("two.txt").exists());
+    assert!(!core
+        .transcript
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::PATCH_APPLIED));
+    assert!(core.transcript.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::TOOL_RESULT
+            && event.payload.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+    }));
+}
+
+fn event(kind: &'static str, payload: euler_event::JsonObject) -> EventEnvelope {
+    EventEnvelope::new("session", "agent", None, kind, payload)
+}
+
+fn model_result_usage_event(usage: serde_json::Value) -> EventEnvelope {
+    model_result_usage_event_for_model("echo", usage)
+}
+
+fn model_result_usage_event_for_model(model: &str, usage: serde_json::Value) -> EventEnvelope {
+    event(
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", model.into()),
+            ("content", "done".into()),
+            ("tool_calls", json!([])),
+            ("stop_reason", "completed".into()),
+            ("usage", usage),
+        ]),
+    )
+}
+
+fn model_switched_event(from_model: &str, to_model: &str) -> EventEnvelope {
+    event(
+        EventKind::MODEL_SWITCHED,
+        object([
+            ("from_provider", "fixture".into()),
+            ("from_model", from_model.into()),
+            ("to_provider", "fixture".into()),
+            ("to_model", to_model.into()),
+            ("reason", "user".into()),
+        ]),
+    )
+}
+
+fn drain_finalized_visual_text(core: &mut AppCore, width: u16) -> String {
+    core.drain_finalized_visual_lines(width)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn wait_for_patch_diff(core: &mut AppCore) {
+    for _ in 0..100 {
+        core.drain_background();
+        if matches!(
+            core.modal,
+            Some(Modal::PatchApproval(PatchApprovalModal {
+                preview: PatchPreview::Diff { .. },
+                ..
+            }))
+        ) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("patch diff did not appear");
+}
+
+fn wait_for_patch_modal(core: &mut AppCore) {
+    for _ in 0..100 {
+        core.drain_background();
+        if matches!(core.modal, Some(Modal::PatchApproval(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("patch modal did not appear");
+}
+
+fn wait_for_idle(core: &mut AppCore) {
+    for _ in 0..100 {
+        core.drain_background();
+        if !core.turn_in_flight() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("turn did not finish");
+}

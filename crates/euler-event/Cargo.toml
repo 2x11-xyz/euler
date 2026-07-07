@@ -1,0 +1,14 @@
+[package]
+name = "euler-event"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true

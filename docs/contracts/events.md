@@ -1,0 +1,356 @@
+# Session Event Contract
+
+Euler has one canonical session event stream.
+
+The terminal transcript, provenance records, canvas inputs, and extension observations are projections of this stream. Do not create parallel event vocabularies for UI, provenance, tools, or agents.
+
+## Event Envelope
+
+Every session event has:
+
+```json
+{
+  "v": 1,
+  "id": "ulid",
+  "ts": "rfc3339",
+  "session": "session-id",
+  "agent": "agent-id",
+  "parent": "causal-parent-event-id-or-null",
+  "kind": "event.kind",
+  "payload": {},
+  "blobs": {}
+}
+```
+
+Large payloads are stored as content-addressed blobs and referenced from `blobs`.
+
+## Initial Event Kinds
+
+- `user.message`
+- `assistant.message`
+- `assistant.activity`
+- `plan.update`
+- `tool.call`
+- `tool.result`
+- `permission.prompt`
+- `permission.decision`
+- `patch.proposed`
+- `patch.applied`
+- `file.change`
+- `file.diff`
+- `check.started`
+- `check.result`
+- `model.call`
+- `model.result`
+- `model.reasoning`
+- `model.delta` (runtime-only, never persisted; see `docs/contracts/persistence.md`)
+- `model.switched`
+- `model.effort.changed`
+- `context.limit`
+- `context.slot.updated`
+- `canvas.snapshot`
+- `canvas.swap`
+- `canvas.candidate.discarded`
+- `secret.redacted`
+- `extension.artifact`
+- `agent.spawn`
+- `agent.message`
+- `agent.result`
+- `session.start`
+- `session.renamed`
+- `session.summary`
+- `error`
+
+Unknown future event kinds are reader-specific. Inspection readers
+(replay-for-rendering) skip unknown kinds with a warning. Resume readers
+fail safe with a canonical incompatibility error naming the unknown kind,
+because resume appends to the same stream and cannot prove a skipped kind is
+irrelevant to live state. An unchanged envelope `v` does not imply a stream is
+resumable.
+
+## Ratified Payload Fields
+
+Golden tests freeze these fields. Additive optional fields are allowed
+without a version bump; renames/removals/semantic changes bump the
+envelope `v` per `docs/contracts/persistence.md`.
+
+- `user.message`: `content`.
+- `assistant.message`: `content`.
+- `tool.call`: `id`, `name`, `input` (structured JSON).
+- `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
+  success, `error` on failure (optional `output` and `exit_code` may
+  accompany `error` when the tool produced partial output before failing).
+  Optional `recovery_closure: true` marks a resume-time canonical closure for
+  an interrupted tail `tool.call`; it records the resume observation, not the
+  original tool outcome.
+  This payload is the canonical tool-result shape; provider adapters map
+  exactly this shape onto their wire formats.
+- `permission.prompt`: `capability`, `reason`.
+- `permission.decision`: `capability`, `mode`, `allowed`, `decision`.
+- `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
+  `modify`-style edits, `old` and `new` are the requested replacement or patch
+  hunk text, not guaranteed whole-file before/after content. Whole-file
+  identity belongs in `file.change` hashes and byte lengths. These events may
+  still contain raw edit text until the patch-event redaction contract is
+  revised separately.
+- `file.change`: `tool_call_id`, `origin`, `action`, `path`, `old_path`,
+  `before_sha256`, `after_sha256`, `before_byte_len`, `after_byte_len`,
+  `diff_redaction`. This event is metadata-only: `origin` is descriptive edit
+  metadata with known values `edit_file`, `apply_patch`,
+  `run_shell:apply_patch`, and `run_shell`; `action` is `add`, `modify`, or
+  `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
+  `run_shell:apply_patch` means Euler intercepted a strict apply-patch heredoc
+  before shell execution; it does not mean a shell process ran. `run_shell`
+  means Euler observed a bounded net filesystem change around an ordinary shell
+  process under the workspace root. For delete, `after_sha256` is null and
+  `after_byte_len` is `0`.
+  No raw file content, before/after content, or unified diff bytes belong in
+  this payload. This is only a `file.change` payload rule.
+- `file.diff`: `tool_call_id`, `file_change_id`, `path`, `old_path`,
+  `action`, `origin`, `diff`, `truncated`, `truncation`, `omitted_reason`;
+  optional `before_sha256`, `after_sha256`, `before_byte_len`,
+  `after_byte_len`, `line_count`.
+  This is the canonical user-visible code-change artifact for safe edit paths.
+  It is emitted for `edit_file`, `apply_patch`, strict intercepted
+  `run_shell:apply_patch`, and bounded ordinary `run_shell` workspace
+  observations. Emitted actions are `add`, `modify`, and `delete`; `rename`
+  remains reserved event vocabulary. Ordinary shell observations do not parse
+  shell command strings and do not claim arbitrary writes outside the workspace
+  root. They compare bounded pre/post snapshots of regular workspace files,
+  skip symlinks and common build/dependency/cache/local-state directories such
+  as `.git`, `.euler`, and `target`, and emit no shell file-change events if
+  either snapshot is incomplete. Large or binary content can still produce
+  metadata-only file events with `diff=null`. Deletes never include deleted
+  content and use `omitted_reason="delete-content"`.
+  `diff` is a bounded unified diff when safety checks pass and is null when
+  omitted; `truncation` is `none` or `tail`. Generated diffs use zero context
+  lines. `file.diff` may contain raw code diff text and is for transcript /
+  provenance display, not model-canvas input. Large generated diffs are bounded
+  including the truncation marker and must set `truncated=true` with a non-null
+  `omitted_reason`.
+- `model.call`: `provider`, `model`, `canvas_items`,
+  `requested_reasoning_effort`, optional `reasoning_effort`
+- `model.effort.changed`: `from_effort`, `to_effort`, `reason`.
+  (provider-scoped string, emitted and stored verbatim — core does not
+  normalize; examples non-exhaustive: `"low"` | `"medium"` | `"high"`, with
+  some providers extending to `"extra-low"` | `"extra-high"` or numeric
+  knobs; omitted when the provider has no reasoning-effort concept for the
+  target model; persisted, see ADR 0008).
+- `model.result`: `provider`, `model`, `content`, `tool_calls`,
+  `stop_reason`, `usage` (object: `input_tokens`, `output_tokens`,
+  optional `cached_tokens`, `reasoning_tokens`). `tool_calls` (each:
+  `id`, `name`, `input`) is a denormalized record of what the provider
+  returned; the canonical execution truth is the subsequent `tool.call` /
+  `tool.result` events, and replay request-building reads those, never
+  `model.result.tool_calls`.
+- `model.reasoning`: `provider`, `model`, `fidelity`
+  (`raw` | `summary` | `opaque`), `content` (empty for opaque),
+  optional provider-opaque `artifact` (signature/encrypted item,
+  blob-externalized when large).
+- `model.delta`: `kind` (`text` | `reasoning`), `delta`. Runtime-only.
+- `model.switched`: `from_provider`, `from_model`, `to_provider`,
+  `to_model`, `reason`. Provider fields are stable provider ids; model
+  fields are provider-scoped model ids. `reason` is a short non-secret
+  label such as `user`, `config`, or `resume`; free-form explanatory text
+  belongs in transcript/UI surfaces, not this payload. The event records
+  an accepted between-turn next-call switch only. No event is emitted for a
+  no-op same-target request or a failed/rejected switch. Same-target
+  comparison uses exact canonical `(provider id, provider-scoped model id)`
+  strings after caller/provider-selection parsing; aliases are out of
+  scope.
+- `context.limit`: `provider`, `model`, `used_tokens`, `limit_tokens`,
+  `threshold`. A local guardrail, distinct from the provider `max_tokens`
+  stop reason: evaluated at the turn boundary, after a `model.result` and
+  before what would be the next `model.call`. `used_tokens` comes from the
+  latest `model.result.usage`; `limit_tokens` is the model's context
+  window from provider/model configuration; `threshold` is the configured
+  fraction of `limit_tokens` that triggers the stop. Emitted once; the
+  session then stops cleanly (survivability first; automatic compaction follows). If a
+  provider stops with `max_tokens` mid-call, that is recorded in
+  `model.result.stop_reason`; `context.limit` may still follow at the
+  boundary.
+- `context.slot.updated`: `extension_id`, `slot`, `content`. Records a
+  host-mediated extension context slot update. `extension_id` is assigned by the
+  host from the calling extension, `slot` uses the event-feed checkpoint name
+  grammar, and `content` is UTF-8 text capped at 4096 bytes. Control characters
+  other than newline are rejected. Empty `content` deletes the slot. Slot
+  payloads are below the blob externalization threshold and remain inline.
+- `session.start`: `provider`, `model`, optional `root`. `root` is only a
+  filesystem path string derived from `SessionConfig.root`; it is not an
+  arbitrary JSON object or workflow identity token. To emit or compare it,
+  Euler applies one normalization policy: if the configured path is relative,
+  join it to the process current directory when available; then try
+  `std::fs::canonicalize`; if that succeeds, use the resolved path, otherwise
+  use the absolute fallback; finally serialize with `Path::to_string_lossy`
+  because the event stream is JSON. Root matching compares this normalized
+  string form. Non-UTF-8 paths may collapse through lossy conversion; that is
+  accepted for local discovery metadata, not for security identity.
+  Older streams may omit `root`; omission means unknown, not the reader's
+  current directory. The first readable `session.start` is the root authority;
+  later duplicate `session.start` events, if present in malformed histories,
+  do not update root projection. `session.json.root` is an advisory transition
+  fallback only when the event stream is readable and the first `session.start`
+  has no usable `root`; if the event stream is unreadable or corrupt, projected
+  root is unknown even if the sidecar contains a root. `root` is local discovery
+  metadata for grouping and current-directory prioritization, not resume
+  authority and not model-canvas content. It is stored in cleartext, is not
+  redacted or hashed in v0, and can contain user-identifying path components.
+- `session.renamed`: `name`. Records the latest user-visible session name;
+  sidecars and indexes are projections of this event, not naming authority.
+  For sessions created by current new-Euler builds before this event existed,
+  a valid `session.json.name` may be used only as a display fallback when the
+  event stream is readable and contains no `session.renamed`; the next rename
+  writes this canonical event and refreshes the sidecar projection.
+- `canvas.snapshot`: `selected_event_ids`, `counts`.
+- `canvas.swap`: `snapshot_start_id`, `snapshot_end_id`,
+  `frontier_start_id`, `policy_version`, `projection_schema_version`,
+  `projection_blob`, `validation_result`. It records a compacted canvas
+  projection: `snapshot_start_id` is the first event in the compacted range,
+  `snapshot_end_id` is the last event in that range, `frontier_start_id` is
+  the first event kept verbatim after the projection, policy/schema versions
+  name the compaction and projection formats, `projection_blob` carries the
+  projection text or hash reference, and `validation_result` is `pass` or a
+  short validation outcome.
+- `canvas.candidate.discarded`: `reason`, `policy_version`. It records a
+  rejected shadow compaction candidate at the turn boundary; `reason` is a
+  short non-secret validation failure and `policy_version` names the
+  compaction policy that produced the candidate.
+- `error`: `source`, `message`, optional `category` (`auth` |
+  `transport` | `rate_limit` | `rejected` | `stream_truncation` |
+  `internal`) carrying the provider error taxonomy from
+  `docs/contracts/provider.md` when the source is a provider. When
+  `source` is `extension`, optional `extension_id`, `command`, and
+  `failure` (`command_error` | `panic`) fields attribute the host-observed
+  failure. Extension error messages in persisted events are host-generated
+  summaries, not raw extension error text or panic payloads.
+- `extension.artifact`: `extension_id`, `display_name`, `media_type`, `path`,
+  `sha256`, `byte_len`, `source_event_ids`, `metadata`. The artifact bytes are
+  stored outside the event payload under the session-scoped extension artifact
+  directory; this event records only compact metadata and the relative artifact
+  path. `path` is host-derived, not extension-provided.
+- `agent.spawn`: `child_agent_id`, `task`, `persona`, `provider`, `model`,
+  `capabilities`, `budget`, optional `result_schema`. The event is authored by
+  the parent session's envelope `agent`; the child id is payload identity in
+  v0. `capabilities` are canonical capability strings using exact set
+  semantics from `docs/contracts/capabilities.md`. `budget` is bounded metadata
+  in v0, not an escrow or accounting record.
+- `agent.message`: `from_agent_id`, `to_agent_id`, `spawn_event_id`,
+  `queued_ts`, `payload`. This is a parent-drained child-to-parent report from
+  a live current-process background child, not transcript content and not a
+  durable mailbox. The event is authored by the parent session's envelope
+  `agent`; child code supplies only the bounded JSON-object `payload`. Core
+  derives `from_agent_id`, `to_agent_id`, and `spawn_event_id` from the live
+  background handle. `queued_ts` is core-assigned when the report is accepted
+  into volatile runtime memory and is informational; it is not a causal clock
+  and is not guaranteed monotonic or less than the envelope `ts`.
+- `agent.result`: `child_agent_id`, `spawn_event_id`, `ok`, `summary`,
+  optional `output`, optional `error`. The event is authored by the parent
+  session's envelope `agent` and parents the matching `agent.spawn` event.
+  `ok=true` permits `output` and forbids `error`; `ok=false` permits `error`
+  and optional bounded `output`.
+
+## Parentage Rules
+
+`parent` is the causal parent, not merely the previous event:
+
+- `tool.result` parents its `tool.call`.
+- `permission.decision` parents its `permission.prompt` (or the
+  `tool.call` when no prompt was emitted).
+- `patch.proposed` parents its `tool.call`; `patch.applied` parents its
+  `patch.proposed`.
+- Structured `file.change` parents the `patch.applied` event that records the
+  edit it summarizes. Bounded ordinary `run_shell` file observations parent the
+  originating `tool.call`, because there is no canonical patch event for that
+  shell process. The final `tool.result` still parents the original
+  `tool.call`, not the `file.change`.
+- `file.diff` parents the same event as the matching `file.change`. It is a
+  sibling display projection, not the parent of `tool.result`. Its
+  `file_change_id` references the matching `file.change`.
+- `model.result`, `model.reasoning`, and `model.delta` parent their
+  `model.call`.
+- `assistant.message` parents its `model.result`.
+- `model.switched`, `context.limit`, `context.slot.updated`, `canvas.swap`, and
+  `canvas.candidate.discarded` parent the previous persisted event (they are
+  session-level control events).
+- `session.start` has parent null. It is always the session's first
+  persisted event.
+- `extension.artifact` parents the previous persisted event at append time.
+  Source attribution belongs in `source_event_ids`; those ids do not choose the
+  artifact event's parent.
+- `agent.spawn` parents the current parent event in the spawning session,
+  excluding runtime-only `model.delta` events.
+- `agent.message` parents the previous persisted event at parent drain time.
+  Reports accepted before a child result may be drained after `agent.result`;
+  consumers must not infer child liveness or production chronology from this
+  ordering.
+- `agent.result` parents its matching `agent.spawn` event. V0 has no child
+  session event stream to join.
+- `error` parents the `model.call` when the source is a provider failure
+  during that call; otherwise the previous persisted event.
+- Events with no specific causal parent (e.g. `user.message`) parent the
+  previous persisted event in the session, or null at session start.
+- A persisted event must never parent a runtime-only event (e.g.
+  `model.delta`); the persisted stream's DAG must be closed under the
+  persisted stream.
+
+Cardinality and ordering invariants:
+
+- exactly one `session.start` per session, always the first persisted
+  event;
+- exactly one `model.result` per `model.call`;
+- zero or more `model.reasoning` events per `model.call`, emitted in
+  provider order before their `model.result`;
+- `assistant.message` is emitted after its `model.result`, and only for
+  turns that end without tool calls.
+- an accepted `model.switched` is emitted after the previous turn's final
+  persisted event and before the next `user.message` is accepted. A switch
+  after a new `user.message` starts the next turn is rejected. The next
+  accepted `user.message`/`model.call` sequence uses the switch target,
+  and its `model.call` must carry the target `provider` and `model`. A
+  switch event must never be interleaved inside a provider stream,
+  tool-execution round, or already-started user turn.
+- zero or more `canvas.swap` events may appear per session; each marks a
+  compaction boundary and is replay-critical for reconstructing which canvas
+  range was active.
+- zero or more `agent.message` events may appear for a live background spawn
+  while its `BackgroundAgent` handle exists. Queue acceptance is volatile; only
+  drained `agent.message` events are durable and queryable after resume.
+
+Ratification note: M1 wrote `parent` as "previous event". This ratification
+changes that meaning within envelope `v: 1`: payload fields and parentage
+are frozen by golden tests from this point forward, and pre-ratification
+M1-era log files are development artifacts, not supported replay inputs.
+From now on, semantic changes to ratified fields follow the versioning
+rules in `docs/contracts/persistence.md`. The causal DAG extension depends
+on honest parents.
+
+## Projection Rules
+
+- The terminal UI renders a bounded, readable transcript from session events.
+- Provenance stores the append-only event stream plus blob references.
+- Canvas assembly selects and summarizes relevant events; it does not replay raw provenance by default.
+- `file.change` is excluded from model-canvas projection in v0. Future canvas
+  policy may add a bounded derived summary, but raw file-change payloads are
+  not prompt content.
+- `file.diff` is excluded from model-canvas projection in v0.
+- `agent.message` is excluded from transcript/model-canvas projection in v0.
+- Extensions observe events through the SDK, subject to capabilities and result bounds.
+
+## Reasoning
+
+Model reasoning is a first-class session event kind: `model.reasoning`.
+Euler is a research agent; reasoning chains are part of the reproducibility
+record, not disposable scaffolding.
+
+Rules:
+
+- Reasoning is captured at the maximum fidelity the provider exposes: raw
+  thinking blocks, signed/encrypted reasoning items, or summaries. The
+  payload records which fidelity was captured.
+- Providers that expose nothing produce no `model.reasoning` events; core
+  must not require reasoning tokens from providers.
+- Provider-opaque reasoning artifacts (signatures, encrypted items) are
+  preserved verbatim in the payload/blobs so the owning provider adapter can
+  replay them per provider rules.
+- Reasoning events are taint-checked like all other events: resolved secrets
+  never appear in them.

@@ -1,0 +1,100 @@
+//! Core session loop, tool dispatch, permissions, provenance, and canvas assembly.
+#![cfg_attr(test, allow(clippy::too_many_lines))] // unit-test exemption for inline test modules
+
+use euler_event::EventEnvelope;
+
+pub mod apply_patch;
+pub mod auth_storage;
+pub mod canvas;
+pub mod compaction;
+mod diagnostics;
+pub mod extension_registry;
+pub mod extensions;
+pub mod file_diff;
+pub mod home;
+pub mod permissions;
+pub mod provenance;
+pub mod resume;
+pub mod session;
+mod session_name;
+mod session_root;
+pub mod session_store;
+pub mod tools;
+
+pub use apply_patch::{
+    apply_patch_update_chunks, parse_single_file_apply_patch, ApplyPatchChunk, ApplyPatchDocument,
+    ApplyPatchError,
+};
+pub use auth_storage::{
+    AuthError, AuthSource, AuthState, AuthStatus, AuthStorage, Credential, SecretString,
+};
+pub use canvas::{
+    assemble_canvas, assemble_canvas_with_compaction, canvas_bytes, retention_stats,
+    AutoCompactionPolicy, CanvasItem, CanvasRetentionStats, CanvasRole, CompactionTier,
+    DEFAULT_CANVAS_BUDGET_BYTES,
+};
+pub use compaction::{
+    build_compaction_candidate, compact_tool_output, find_safe_boundary, heuristic_projection,
+    is_layer1_eligible, is_safe_boundary, projection_prompt, select_layer1_candidates,
+    should_compact, validate_candidate, CompactionCandidate, WorkingStateProjection,
+    COMPACTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION,
+};
+pub use euler_agents::{AgentBudget, AgentError, AgentResult, AgentTask, SpawnedAgent};
+pub use euler_provider::ReasoningEffort;
+pub use euler_sdk::{
+    load_extension_package, parse_extension_manifest_bytes, valid_extension_identifier,
+    EventWakeError, EventWakePoll, EventWakeRecv, EventWakeRegistration, ExtensionMaterialization,
+    ExtensionPackageError, LinkedExtension, LinkedExtensionStatus, LoadedExtensionPackage,
+    SessionEventWake, StaticCommandDescriptor, StaticExtensionDescriptor, EXTENSION_MANIFEST_FILE,
+    MAX_EVENT_WAKE_RECEIVERS, MAX_EXTENSION_MANIFEST_BYTES,
+};
+pub use extension_registry::{
+    ExtensionAuditEntry, ExtensionAuditError, ExtensionAuditErrorCode, ExtensionAuditErrorReport,
+    ExtensionAuditIssueCode, ExtensionAuditReport, ExtensionEnablement, ExtensionRegistry,
+    ExtensionRegistryError, EXTENSION_AUDIT_SCHEMA_VERSION,
+};
+pub use file_diff::{
+    capture_workspace_snapshot, file_diff_projection, observed_file_change_payload,
+    observed_file_diff_payload, observed_file_diff_projection, FileDiffProjection, FileDiffSource,
+    ObservedFileChange, WorkspaceSnapshot, MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES,
+    MAX_WORKSPACE_SNAPSHOT_FILE_BYTES, MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
+};
+pub use home::{EulerHome, EulerHomeError};
+pub use permissions::{ApprovalMode, DeciderVerdict, PermissionDecider};
+pub use provenance::{
+    query_provenance, read_provenance, ProvenancePage, ProvenanceQuery, ProvenanceQueryError,
+    ProvenanceReadError, ProvenanceWriter, ProvenanceWriterError,
+    DEFAULT_PROVENANCE_QUERY_BLOB_BYTE_LIMIT, DEFAULT_PROVENANCE_QUERY_EVENT_LIMIT,
+    DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT,
+};
+pub use resume::{
+    fold_session, read_resume_prefix, resume_session, resume_session_from_folded_prefix,
+    resume_session_from_prefix, resume_session_from_prefix_with_outcome,
+    resume_session_with_outcome, FoldedSession, ResumeError, ResumeOutcome, ResumeWarning,
+};
+pub use session::{
+    fold_model_target, fold_reasoning_effort, AgentReporter, AgentResultSummary, BackgroundAgent,
+    BackgroundAgentPoll, BackgroundAgentReportDrain, ContextLimitConfig, ExtensionExecutionError,
+    ModelTarget, Session, SessionConfig, SessionError,
+};
+pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};
+pub use tools::{ToolError, ToolRegistry};
+
+#[derive(Default)]
+pub struct EventBus {
+    events: Vec<EventEnvelope>,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, event: EventEnvelope) {
+        self.events.push(event);
+    }
+
+    pub fn events(&self) -> &[EventEnvelope] {
+        &self.events
+    }
+}

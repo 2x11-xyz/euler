@@ -1,0 +1,2260 @@
+//! Session state machine: turn loop, tool dispatch, compaction integration.
+//! Justification for >1000 lines: session.rs owns the main turn lifecycle while focused subsystems are extracted.
+use crate::canvas::{
+    assemble_canvas, assemble_canvas_with_compaction, canvas_bytes, canvas_prompt, retention_stats,
+    AutoCompactionPolicy, CompactionTier,
+};
+use crate::canvas::{render_context_slot, CanvasItem, CanvasRole};
+use crate::compaction::{
+    build_compaction_candidate, heuristic_projection, select_layer1_candidates, should_compact,
+    validate_candidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
+};
+use crate::file_diff::{
+    file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
+};
+use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate, PermissionRequest};
+use crate::provenance::ProvenanceWriter;
+use crate::session_name::{session_renamed_event, validate_session_name_for_write};
+use crate::session_root::session_root_for_event;
+use crate::tools::{PatchEvents, ToolError, ToolRegistry};
+use crate::EventBus;
+use euler_agents::{
+    generated_agent_id, AgentError, AgentReportPayload, AgentResult, AgentTask, SpawnedAgent,
+    REPORT_QUEUE_CAPACITY,
+};
+use euler_event::{now_rfc3339_millis, object, EventEnvelope, EventKind, JsonObject};
+use euler_provider::{
+    ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent, ProviderError,
+    ProviderSet, ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason,
+    ToolCall, Usage,
+};
+use euler_sdk::{Capability, EventWakeError, EventWakeRegistration};
+use round_loop::{
+    EventSink, ModelRoundData, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, TurnState,
+};
+use serde_json::{json, Value};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Once};
+use std::thread;
+use std::time::Instant;
+use thiserror::Error;
+
+mod companion;
+mod extension_bridge;
+mod round_loop;
+pub use companion::AgentResultSummary;
+const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
+const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
+const CONTEXT_LIMIT_MESSAGE: &str =
+    "Session stopped because the context limit threshold was reached.";
+const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
+    "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
+const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. For code and text file adds or updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff.";
+const BACKGROUND_AGENT_PANIC_SUMMARY: &str = "background agent panicked";
+const BACKGROUND_AGENT_PANIC_ERROR: &str = "background-agent-panic";
+const BACKGROUND_AGENT_DISCONNECTED_SUMMARY: &str = "background agent disconnected";
+const BACKGROUND_AGENT_DISCONNECTED_ERROR: &str = "background-agent-disconnected";
+const BACKGROUND_AGENT_LAUNCH_SUMMARY: &str = "background agent failed to start";
+const BACKGROUND_AGENT_LAUNCH_ERROR: &str = "background-agent-launch-failed";
+
+thread_local! {
+    static BACKGROUND_AGENT_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+static BACKGROUND_AGENT_PANIC_HOOK_INSTALLED: Once = Once::new();
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContextLimitConfig {
+    limit_tokens: u64,
+    threshold: f64,
+}
+
+impl ContextLimitConfig {
+    pub fn new(limit_tokens: u64, threshold: f64) -> Option<Self> {
+        if limit_tokens == 0 || !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+            return None;
+        }
+        Some(Self {
+            limit_tokens,
+            threshold,
+        })
+    }
+
+    pub fn limit_tokens(&self) -> u64 {
+        self.limit_tokens
+    }
+
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionConfig {
+    pub session_id: String,
+    pub agent_id: String,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: ReasoningEffort,
+    pub root: PathBuf,
+    /// `None` (default) = unlimited rounds per turn; a turn ends when the
+    /// model finishes, fails, or the user cancels. Set only when a hard
+    /// ceiling is explicitly wanted (e.g. exec --max-tool-rounds).
+    pub max_tool_rounds: Option<usize>,
+    /// Extra attempts after transport-category provider failures on rounds
+    /// with no processed stream events. Default: 2 (backoff 1s then 3s).
+    pub provider_transport_retries: usize,
+    pub provider_transport_retry_backoff_ms: Vec<u64>,
+    /// Canvas retention policy (ADR canvas-retention-and-auto-compaction):
+    /// byte-budget retention with visible stub demotion. There is no
+    /// item-count window; every tool round stays in canvas.
+    pub auto_compaction: AutoCompactionPolicy,
+    pub max_output_tokens: Option<u64>,
+    pub context_limit: Option<ContextLimitConfig>,
+    pub extensions_enabled: BTreeSet<String>,
+    /// Token reserve below the context window that triggers compaction.
+    /// Default: 16384.
+    pub compaction_reserve_tokens: usize,
+    /// Number of recent tool results to keep verbatim after compaction. Default: 4.
+    pub compaction_keep_recent: usize,
+}
+
+impl SessionConfig {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            session_id: "session".to_owned(),
+            agent_id: "root".to_owned(),
+            provider: "fixture".to_owned(),
+            model: "fixture".to_owned(),
+            reasoning_effort: ReasoningEffort::Medium,
+            root: root.into(),
+            max_tool_rounds: None,
+            provider_transport_retries: 2,
+            provider_transport_retry_backoff_ms: vec![1000, 3000],
+            auto_compaction: AutoCompactionPolicy::default(),
+            max_output_tokens: None,
+            context_limit: None,
+            extensions_enabled: BTreeSet::new(),
+            compaction_reserve_tokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
+            compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelTarget {
+    pub provider: String,
+    pub model: String,
+}
+
+impl ModelTarget {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModelUsageSnapshot {
+    pub(crate) used_tokens: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum SessionError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error(transparent)]
+    Tool(#[from] ToolError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("model exceeded maximum tool rounds")]
+    ToolRoundsExceeded,
+    #[error("context budget exhausted under auto-compaction=off: canvas {canvas_bytes} bytes exceeds budget {budget_bytes} bytes")]
+    ContextBudgetExhausted {
+        canvas_bytes: usize,
+        budget_bytes: usize,
+    },
+    #[error("turn cancelled")]
+    Cancelled,
+    #[error("invalid model switch: {0}")]
+    InvalidModelSwitch(String),
+    #[error("invalid model switch event: {0}")]
+    InvalidModelSwitchEvent(String),
+    #[error("invalid session name: {name}")]
+    InvalidSessionName { name: String },
+    #[error(transparent)]
+    EventWake(#[from] EventWakeError),
+    #[error("event wake requires provenance writer")]
+    EventWakeUnavailable,
+    #[error("extension emission requires provenance writer")]
+    ExtensionEmissionUnavailable,
+    #[error("extension emission queue cannot be published after unpersisted session events")]
+    ExtensionEmissionOutOfOrder,
+    #[error("extension emission degraded; reload session")]
+    ExtensionEmissionDegraded,
+    #[error(transparent)]
+    Agent(#[from] AgentError),
+    #[error("invalid companion task: {0}")]
+    InvalidCompanionTask(String),
+    #[error("companion spawn requires provenance writer")]
+    CompanionProvenanceUnavailable,
+}
+
+#[derive(Debug, Error)]
+pub enum ExtensionExecutionError {
+    /// The extension is outside this session's resolved extension set.
+    #[error("extension disabled: {id}")]
+    Disabled { id: String },
+    /// The extension manifest or command registration failed before execution.
+    /// Raw extension error text and panic payloads are not exposed through this
+    /// live-session surface.
+    #[error("extension registration failed")]
+    RegistrationFailed,
+    /// The selected command attempted a capability not granted for this call.
+    #[error("extension capability denied")]
+    CapabilityDenied { capability: Capability },
+    /// The command returned an extension error. Raw extension error text is
+    /// persisted only as a sanitized host-generated extension error event.
+    #[error("extension command failed")]
+    CommandFailed,
+    /// The command panicked. Raw panic payloads are not returned or persisted.
+    #[error("extension command panicked")]
+    CommandPanicked,
+    /// Live-session infrastructure failed while constructing the host or
+    /// publishing already-durable queued extension events into the live bus.
+    #[error(transparent)]
+    Session(#[from] SessionError),
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub enum BackgroundAgentPoll {
+    Pending,
+    Recorded { result_event_id: String },
+    AlreadyRecorded { result_event_id: String },
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub enum BackgroundAgentReportDrain {
+    Empty,
+    Closed,
+    Drained { message_event_id: String },
+}
+
+pub struct AgentReporter {
+    child_agent_id: String,
+    parent_agent_id: String,
+    spawn_event_id: String,
+    report_tx: SyncSender<QueuedAgentReport>,
+    worker_live: Arc<AtomicBool>,
+}
+
+impl AgentReporter {
+    fn new(
+        child_agent_id: String,
+        parent_agent_id: String,
+        spawn_event_id: String,
+        report_tx: SyncSender<QueuedAgentReport>,
+        worker_live: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            child_agent_id,
+            parent_agent_id,
+            spawn_event_id,
+            report_tx,
+            worker_live,
+        }
+    }
+
+    pub fn child_agent_id(&self) -> &str {
+        &self.child_agent_id
+    }
+
+    pub fn parent_agent_id(&self) -> &str {
+        &self.parent_agent_id
+    }
+
+    pub fn spawn_event_id(&self) -> &str {
+        &self.spawn_event_id
+    }
+
+    pub fn report(&self, payload: Value) -> Result<(), AgentError> {
+        if !self.worker_live.load(Ordering::Acquire) {
+            return Err(AgentError::MessageSenderClosed);
+        }
+        let payload = AgentReportPayload::new(payload)?;
+        let report = QueuedAgentReport {
+            from_agent_id: self.child_agent_id.clone(),
+            to_agent_id: self.parent_agent_id.clone(),
+            spawn_event_id: self.spawn_event_id.clone(),
+            queued_ts: now_rfc3339_millis(),
+            payload,
+        };
+        match self.report_tx.try_send(report) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(AgentError::MessageQueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(AgentError::MessageSenderClosed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct QueuedAgentReport {
+    from_agent_id: String,
+    to_agent_id: String,
+    spawn_event_id: String,
+    queued_ts: String,
+    payload: AgentReportPayload,
+}
+
+/// Current-process background child handle.
+///
+/// The handle is the only path for recording the worker's result. Dropping it
+/// before polling completion loses that result in v0.
+#[must_use]
+pub struct BackgroundAgent {
+    spawned: SpawnedAgent,
+    result_rx: Receiver<AgentResult>,
+    pending_result: Option<AgentResult>,
+    recorded_result_event_id: Option<String>,
+    session_id: String,
+    parent_agent_id: String,
+    report_rx: Option<Receiver<QueuedAgentReport>>,
+    pending_report: Option<QueuedAgentReport>,
+}
+
+impl BackgroundAgent {
+    fn new(
+        spawned: SpawnedAgent,
+        result_rx: Receiver<AgentResult>,
+        session_id: String,
+        parent_agent_id: String,
+    ) -> Self {
+        Self {
+            spawned,
+            result_rx,
+            pending_result: None,
+            recorded_result_event_id: None,
+            session_id,
+            parent_agent_id,
+            report_rx: None,
+            pending_report: None,
+        }
+    }
+
+    fn new_with_reporter(
+        spawned: SpawnedAgent,
+        result_rx: Receiver<AgentResult>,
+        session_id: String,
+        parent_agent_id: String,
+        report_rx: Receiver<QueuedAgentReport>,
+    ) -> Self {
+        Self {
+            spawned,
+            result_rx,
+            pending_result: None,
+            recorded_result_event_id: None,
+            session_id,
+            parent_agent_id,
+            report_rx: Some(report_rx),
+            pending_report: None,
+        }
+    }
+
+    pub fn child_agent_id(&self) -> &str {
+        self.spawned.child_agent_id()
+    }
+
+    pub fn spawn_event_id(&self) -> &str {
+        self.spawned.spawn_event_id()
+    }
+
+    pub fn recorded_result_event_id(&self) -> Option<&str> {
+        self.recorded_result_event_id.as_deref()
+    }
+}
+
+pub struct Session<D> {
+    config: SessionConfig,
+    active_target: ModelTarget,
+    providers: ProviderSet,
+    bus: EventBus,
+    permissions: PermissionGate<D>,
+    tools: ToolRegistry,
+    provenance: Option<Arc<ProvenanceWriter>>,
+    persisted_events: usize,
+    extension_emission_degraded: bool, // sticky after queue divergence; reload-only recovery
+    latest_model_usage: Option<ModelUsageSnapshot>,
+    context_limit_emitted: Option<ModelTarget>,
+    open_agent_spawns: BTreeMap<String, String>,
+}
+
+/// Session-side adapter driving the shared [`RoundLoop`]: bundles the
+/// per-turn runtime (event sink, denial state, round counter) with the
+/// session so the loop sees one `RoundLoopIo` surface.
+struct SessionRoundIo<'a, 'sink, F, D>
+where
+    F: FnMut(&EventEnvelope),
+{
+    session: &'a mut Session<D>,
+    sink: &'a mut EventSink<'sink, F>,
+    turn_state: &'a mut TurnState,
+    rounds: &'a mut u64,
+}
+
+impl<F, D> RoundLoopIo for SessionRoundIo<'_, '_, F, D>
+where
+    F: FnMut(&EventEnvelope),
+    D: PermissionDecider,
+{
+    type Complete = ();
+
+    fn session_id(&self) -> &str {
+        &self.session.config.session_id
+    }
+
+    fn target(&self) -> ModelTarget {
+        self.session.active_target.clone()
+    }
+
+    fn prepare_model_request(
+        &mut self,
+        target: &ModelTarget,
+    ) -> Result<(String, ModelRequest), SessionError> {
+        self.session.prepare_model_request(target, self.sink)
+    }
+
+    fn invoke_model(
+        &mut self,
+        target: &ModelTarget,
+        request: ModelRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.session.providers.invoke(&target.provider, request)
+    }
+
+    fn emit_provider_error(
+        &mut self,
+        error: &ProviderError,
+        model_call_id: String,
+    ) -> Result<String, SessionError> {
+        self.session.emit_provider_error(error, model_call_id)
+    }
+
+    fn after_stream_event(
+        &mut self,
+        event: &ModelStreamEvent,
+        model_call_id: &str,
+    ) -> Result<(), SessionError> {
+        self.session
+            .record_stream_event(event, model_call_id, self.sink)
+    }
+
+    fn flush_events(&mut self) {
+        self.sink.flush(self.session.bus.events());
+    }
+
+    fn finish_round(
+        &mut self,
+        target: ModelTarget,
+        model_call_id: String,
+        data: ModelRoundData,
+        cancel_flag: &AtomicBool,
+    ) -> Result<RoundOutcome, SessionError> {
+        let stop_reason = data
+            .stop_reason
+            .as_ref()
+            .expect("validated finished stream");
+        for item in &data.reasoning {
+            self.session
+                .emit_model_reasoning(item, &target, model_call_id.clone())?;
+            self.sink.flush(self.session.bus.events());
+        }
+        let model_result_id = self.session.emit_model_result(
+            &data.content,
+            &data.tool_calls,
+            stop_reason,
+            data.usage.as_ref(),
+            &target,
+            model_call_id,
+        )?;
+        self.sink.flush(self.session.bus.events());
+        self.session.record_latest_usage(data.usage.as_ref());
+        self.session.auto_compact_if_triggered()?;
+        self.sink.flush(self.session.bus.events());
+
+        if self
+            .session
+            .finish_context_limit(&data, &model_result_id, self.sink)?
+        {
+            return Ok(RoundOutcome::Complete(()));
+        }
+        if data.tool_calls.is_empty() {
+            // A truncated/refused round that produced no visible content is
+            // not a completed turn; ending silently here looked like success
+            // while the model had only burned reasoning budget.
+            if data.content.is_empty()
+                && matches!(
+                    stop_reason,
+                    StopReason::MaxTokens | StopReason::Refusal | StopReason::Error
+                )
+            {
+                let error = ProviderError::stream_truncation(format!(
+                    "model stopped ({}) with no content; raise max_output_tokens if reasoning consumed the budget",
+                    stop_reason.as_str()
+                ));
+                self.session.emit_provider_error(&error, model_result_id)?;
+                self.sink.flush(self.session.bus.events());
+                return Err(error.into());
+            }
+            self.session.emit_with_parent(
+                EventKind::ASSISTANT_MESSAGE,
+                object([("content", data.content.into())]),
+                Some(model_result_id),
+            )?;
+            self.sink.flush(self.session.bus.events());
+            return Ok(RoundOutcome::Complete(()));
+        }
+
+        for call in data.tool_calls {
+            self.session.execute_tool_call(
+                call,
+                model_result_id.clone(),
+                self.sink,
+                self.turn_state,
+            )?;
+            self.sink.flush(self.session.bus.events());
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err(SessionError::Cancelled);
+            }
+        }
+        Ok(RoundOutcome::Continue)
+    }
+
+    fn round_completed(&mut self) {
+        *self.rounds += 1;
+    }
+
+    fn round_limit(&mut self) -> Result<(), SessionError> {
+        self.session.emit(
+            EventKind::ASSISTANT_MESSAGE,
+            object([("content", TOOL_ROUNDS_LIMIT_MESSAGE.into())]),
+        )?;
+        self.sink.flush(self.session.bus.events());
+        Ok(())
+    }
+}
+
+impl<D> Session<D> {
+    pub fn new<P>(config: SessionConfig, provider: P, decider: D) -> Self
+    where
+        P: ModelProvider + 'static,
+    {
+        let mut config = config;
+        config.provider = provider.name().to_owned();
+        Self::new_with_providers(config, ProviderSet::single(provider), decider)
+    }
+
+    pub fn new_with_providers(config: SessionConfig, providers: ProviderSet, decider: D) -> Self {
+        let tools = ToolRegistry::new(config.root.clone());
+        let active_target = ModelTarget::new(config.provider.clone(), config.model.clone());
+        let mut bus = EventBus::new();
+        bus.push(EventEnvelope::new(
+            config.session_id.clone(),
+            config.agent_id.clone(),
+            None,
+            EventKind::SESSION_START,
+            object([
+                ("provider", config.provider.clone().into()),
+                ("model", config.model.clone().into()),
+                (
+                    "requested_reasoning_effort",
+                    config.reasoning_effort.as_str().into(),
+                ),
+                (
+                    "extensions_enabled",
+                    config
+                        .extensions_enabled
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                (
+                    "auto_compaction",
+                    json!({
+                        "tier": config.auto_compaction.tier.as_str(),
+                        "budget_bytes": config.auto_compaction.budget_bytes,
+                    }),
+                ),
+                ("root", session_root_for_event(&config.root).into()),
+            ]),
+        ));
+        Self {
+            config,
+            active_target,
+            providers,
+            bus,
+            permissions: PermissionGate::new(decider),
+            tools,
+            provenance: None,
+            persisted_events: 0,
+            extension_emission_degraded: false,
+            latest_model_usage: None,
+            context_limit_emitted: None,
+            open_agent_spawns: BTreeMap::new(),
+        }
+    }
+
+    pub fn into_fresh_session(self, session_id: impl Into<String>, decider: D) -> Self {
+        let active_target = self.active_target;
+        let mut config = self.config;
+        config.session_id = session_id.into();
+        config.provider = active_target.provider;
+        config.model = active_target.model;
+        Self::new_with_providers(config, self.providers, decider)
+    }
+
+    pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
+        self.provenance = Some(Arc::new(provenance));
+        self
+    }
+
+    pub fn open_event_wake(&self) -> Result<EventWakeRegistration, SessionError> {
+        let provenance = self
+            .provenance
+            .as_ref()
+            .ok_or(SessionError::EventWakeUnavailable)?;
+        provenance.open_event_wake().map_err(SessionError::from)
+    }
+
+    pub fn events(&self) -> &[EventEnvelope] {
+        self.bus.events()
+    }
+
+    pub fn extension_enabled(&self, id: &str) -> bool {
+        self.config.extensions_enabled.contains(id)
+    }
+
+    /// Compute the layer-1 compacted canvas for the current session state.
+    /// Does not mutate session state or emit events.
+    /// Returns the compacted canvas items and the set of event IDs that were
+    /// actually compacted in the returned canvas (not just candidates).
+    pub fn compacted_canvas(&self) -> (Vec<CanvasItem>, BTreeSet<String>) {
+        let candidates = select_layer1_candidates(
+            self.bus.events(),
+            self.config.compaction_keep_recent,
+            4, // min_lines
+        );
+        let canvas = assemble_canvas_with_compaction(
+            self.bus.events(),
+            &self.config.auto_compaction,
+            &candidates,
+        );
+        let actually_compacted = canvas
+            .iter()
+            .filter_map(|item| match item {
+                CanvasItem::ToolOutput {
+                    event_id,
+                    compacted: true,
+                    ..
+                } => Some(event_id.clone()),
+                _ => None,
+            })
+            .collect();
+        (canvas, actually_compacted)
+    }
+
+    /// Run one synchronous compaction cycle at a turn boundary.
+    /// Returns true if a swap was emitted, false otherwise.
+    /// Note: persistence failures are currently absorbed as false;
+    /// full error propagation is deferred.
+    pub fn try_compact(&mut self, projection: &WorkingStateProjection) -> bool {
+        let Some(candidate) = build_compaction_candidate(
+            self.bus.events(),
+            projection,
+            self.config.compaction_keep_recent,
+        ) else {
+            return false;
+        };
+
+        match validate_candidate(self.bus.events(), &candidate) {
+            Ok(()) => self.emit_control_event(
+                EventKind::CANVAS_SWAP,
+                object([
+                    ("snapshot_start_id", candidate.snapshot_start_id.into()),
+                    ("snapshot_end_id", candidate.snapshot_end_id.into()),
+                    ("frontier_start_id", candidate.frontier_start_id.into()),
+                    ("policy_version", candidate.policy_version.into()),
+                    (
+                        "projection_schema_version",
+                        PROJECTION_SCHEMA_VERSION.into(),
+                    ),
+                    ("projection_blob", candidate.projection.to_json().into()),
+                    ("validation_result", "pass".into()),
+                ]),
+            ),
+            Err(reason) => {
+                self.emit_control_event(
+                    EventKind::CANVAS_CANDIDATE_DISCARDED,
+                    object([
+                        ("reason", reason.into()),
+                        ("policy_version", candidate.policy_version.into()),
+                    ]),
+                );
+                false
+            }
+        }
+    }
+
+    fn emit_control_event(&mut self, kind: &'static str, payload: JsonObject) -> bool {
+        self.emit_control_event_required(kind, payload).is_ok()
+    }
+
+    fn emit_control_event_required(
+        &mut self,
+        kind: &'static str,
+        payload: JsonObject,
+    ) -> Result<(), SessionError> {
+        self.persist_new_events()?;
+        let parent = self
+            .bus
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.kind.as_str() != EventKind::MODEL_DELTA)
+            .map(|event| event.id.clone());
+        let event = EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            parent,
+            kind,
+            payload,
+        );
+        self.accept_control_event(event)
+    }
+
+    fn accept_control_event(&mut self, event: EventEnvelope) -> Result<(), SessionError> {
+        self.append_before_accept(&event)?;
+        self.bus.push(event);
+        if self.provenance.is_some() {
+            self.persisted_events = self.bus.events().len();
+        }
+        Ok(())
+    }
+
+    fn append_before_accept(&self, event: &EventEnvelope) -> Result<(), SessionError> {
+        if let Some(writer) = &self.provenance {
+            writer.append(std::slice::from_ref(event))?;
+        }
+        Ok(())
+    }
+
+    fn previous_persisted_event_id(&self) -> Option<String> {
+        self.bus
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.kind.as_str() != EventKind::MODEL_DELTA)
+            .map(|event| event.id.clone())
+    }
+
+    fn persist_new_events(&mut self) -> Result<(), SessionError> {
+        if let Some(writer) = &self.provenance {
+            writer.append(&self.bus.events()[self.persisted_events..])?;
+            self.persisted_events = self.bus.events().len();
+        }
+        Ok(())
+    }
+
+    pub fn set_permission_mode(&mut self, capability: Capability, mode: ApprovalMode) {
+        self.permissions.set_mode(capability, mode);
+    }
+
+    pub fn active_target(&self) -> &ModelTarget {
+        &self.active_target
+    }
+
+    pub fn reasoning_effort(&self) -> ReasoningEffort {
+        self.config.reasoning_effort
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.config.session_id
+    }
+
+    pub fn latest_model_usage_used_tokens(&self) -> Option<u64> {
+        self.latest_model_usage
+            .as_ref()
+            .map(|usage| usage.used_tokens)
+    }
+
+    pub fn context_limit_emitted(&self) -> Option<&ModelTarget> {
+        self.context_limit_emitted.as_ref()
+    }
+
+    #[allow(clippy::too_many_arguments)] // ratchet: 7 args, refactor target
+    pub(crate) fn from_resumed_events(
+        config: SessionConfig,
+        providers: ProviderSet,
+        decider: D,
+        events: Vec<EventEnvelope>,
+        active_target: ModelTarget,
+        latest_model_usage_used_tokens: Option<u64>,
+        context_limit_emitted: Option<ModelTarget>,
+    ) -> Self {
+        let tools = ToolRegistry::new(config.root.clone());
+        let persisted_events = events.len();
+        Self {
+            config,
+            active_target,
+            providers,
+            bus: EventBus { events },
+            permissions: PermissionGate::new(decider),
+            tools,
+            provenance: None,
+            persisted_events,
+            extension_emission_degraded: false,
+            latest_model_usage: latest_model_usage_used_tokens
+                .map(|used_tokens| ModelUsageSnapshot { used_tokens }),
+            context_limit_emitted,
+            open_agent_spawns: BTreeMap::new(),
+        }
+    }
+}
+
+impl<D: PermissionDecider> Session<D> {
+    pub fn spawn_background_agent<F>(
+        &mut self,
+        task: AgentTask,
+        parent_capabilities: impl IntoIterator<Item = euler_sdk::Capability>,
+        work: F,
+    ) -> Result<BackgroundAgent, SessionError>
+    where
+        F: FnOnce() -> AgentResult + Send + 'static,
+    {
+        install_background_agent_panic_hook();
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut spawned = self.spawn_agent(task, parent_capabilities)?;
+        let worker = thread::Builder::new()
+            .name("euler-background-agent".to_owned())
+            .spawn(move || {
+                let result = run_background_agent_work(work);
+                let _ = result_tx.send(result);
+            });
+        match worker {
+            Ok(handle) => {
+                // Detach the worker. Completion is observed only through result_rx.
+                drop(handle);
+                Ok(BackgroundAgent::new(
+                    spawned,
+                    result_rx,
+                    self.config.session_id.clone(),
+                    self.config.agent_id.clone(),
+                ))
+            }
+            Err(error) => {
+                self.record_agent_result(
+                    &mut spawned,
+                    fixed_background_agent_failure(
+                        BACKGROUND_AGENT_LAUNCH_SUMMARY,
+                        BACKGROUND_AGENT_LAUNCH_ERROR,
+                    ),
+                )?;
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn spawn_background_agent_with_reporter<F>(
+        &mut self,
+        task: AgentTask,
+        parent_capabilities: impl IntoIterator<Item = euler_sdk::Capability>,
+        work: F,
+    ) -> Result<BackgroundAgent, SessionError>
+    where
+        F: FnOnce(AgentReporter) -> AgentResult + Send + 'static,
+    {
+        install_background_agent_panic_hook();
+        let (result_tx, result_rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::sync_channel(REPORT_QUEUE_CAPACITY);
+        let mut spawned = self.spawn_agent(task, parent_capabilities)?;
+        let session_id = self.config.session_id.clone();
+        let parent_agent_id = self.config.agent_id.clone();
+        let worker_live = Arc::new(AtomicBool::new(true));
+        let reporter = AgentReporter::new(
+            spawned.child_agent_id().to_owned(),
+            parent_agent_id.clone(),
+            spawned.spawn_event_id().to_owned(),
+            report_tx,
+            Arc::clone(&worker_live),
+        );
+        let worker_live_for_worker = Arc::clone(&worker_live);
+        let worker = thread::Builder::new()
+            .name("euler-background-agent".to_owned())
+            .spawn(move || {
+                let result =
+                    run_background_agent_reporter_work(work, reporter, worker_live_for_worker);
+                let _ = result_tx.send(result);
+            });
+        match worker {
+            Ok(handle) => {
+                // Detach the worker. Completion is observed only through result_rx.
+                drop(handle);
+                Ok(BackgroundAgent::new_with_reporter(
+                    spawned,
+                    result_rx,
+                    session_id,
+                    parent_agent_id,
+                    report_rx,
+                ))
+            }
+            Err(error) => {
+                self.record_agent_result(
+                    &mut spawned,
+                    fixed_background_agent_failure(
+                        BACKGROUND_AGENT_LAUNCH_SUMMARY,
+                        BACKGROUND_AGENT_LAUNCH_ERROR,
+                    ),
+                )?;
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn spawn_agent(
+        &mut self,
+        task: AgentTask,
+        parent_capabilities: impl IntoIterator<Item = euler_sdk::Capability>,
+    ) -> Result<SpawnedAgent, SessionError> {
+        euler_agents::validate_capability_subset(
+            parent_capabilities,
+            task.capabilities().iter().copied(),
+        )?;
+        let child_agent_id = generated_agent_id(&self.config.agent_id);
+        let payload = euler_agents::agent_spawn_payload(&task, &child_agent_id);
+        self.persist_new_events()?;
+        let event = EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            self.previous_persisted_event_id(),
+            EventKind::AGENT_SPAWN,
+            payload,
+        );
+        let spawn_event_id = event.id.clone();
+        self.accept_control_event(event)?;
+        self.open_agent_spawns
+            .insert(spawn_event_id.clone(), child_agent_id.clone());
+        Ok(SpawnedAgent::new(child_agent_id, spawn_event_id))
+    }
+
+    pub fn record_agent_result(
+        &mut self,
+        spawned: &mut SpawnedAgent,
+        result: AgentResult,
+    ) -> Result<String, SessionError> {
+        spawned.ensure_result_open()?;
+        let child_agent_id = self
+            .open_agent_spawns
+            .get(spawned.spawn_event_id())
+            .ok_or_else(|| AgentError::UnknownSpawn {
+                spawn_event_id: spawned.spawn_event_id().to_owned(),
+            })?;
+        if child_agent_id != spawned.child_agent_id() {
+            return Err(AgentError::ChildAgentMismatch {
+                spawn_event_id: spawned.spawn_event_id().to_owned(),
+            }
+            .into());
+        }
+        let payload = euler_agents::agent_result_payload(
+            &result,
+            spawned.child_agent_id(),
+            spawned.spawn_event_id(),
+        );
+        self.persist_new_events()?;
+        let event = EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            Some(spawned.spawn_event_id().to_owned()),
+            EventKind::AGENT_RESULT,
+            payload,
+        );
+        let result_event_id = event.id.clone();
+        self.accept_control_event(event)?;
+        self.open_agent_spawns.remove(spawned.spawn_event_id());
+        spawned.mark_result_recorded();
+        Ok(result_event_id)
+    }
+
+    pub fn poll_background_agent(
+        &mut self,
+        background: &mut BackgroundAgent,
+    ) -> Result<BackgroundAgentPoll, SessionError> {
+        self.ensure_background_agent_affinity(background)?;
+        if let Some(result_event_id) = background.recorded_result_event_id.as_ref() {
+            return Ok(BackgroundAgentPoll::AlreadyRecorded {
+                result_event_id: result_event_id.clone(),
+            });
+        }
+        let result = match background.pending_result.take() {
+            Some(result) => result,
+            None => match background.result_rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return Ok(BackgroundAgentPoll::Pending),
+                Err(TryRecvError::Disconnected) => fixed_background_agent_failure(
+                    BACKGROUND_AGENT_DISCONNECTED_SUMMARY,
+                    BACKGROUND_AGENT_DISCONNECTED_ERROR,
+                ),
+            },
+        };
+        let retry_result = result.clone();
+        match self.record_agent_result(&mut background.spawned, result) {
+            Ok(result_event_id) => {
+                background.recorded_result_event_id = Some(result_event_id.clone());
+                Ok(BackgroundAgentPoll::Recorded { result_event_id })
+            }
+            Err(error) => {
+                background.pending_result = Some(retry_result);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn drain_background_agent_report(
+        &mut self,
+        background: &mut BackgroundAgent,
+    ) -> Result<BackgroundAgentReportDrain, SessionError> {
+        self.ensure_background_agent_affinity(background)?;
+        if let Some(report) = background.pending_report.take() {
+            return self.persist_background_agent_report(background, report);
+        }
+        let Some(report_rx) = background.report_rx.as_ref() else {
+            return Ok(BackgroundAgentReportDrain::Closed);
+        };
+        let report = match report_rx.try_recv() {
+            Ok(report) => report,
+            Err(TryRecvError::Empty) => return Ok(BackgroundAgentReportDrain::Empty),
+            Err(TryRecvError::Disconnected) => return Ok(BackgroundAgentReportDrain::Closed),
+        };
+        self.persist_background_agent_report(background, report)
+    }
+
+    fn persist_background_agent_report(
+        &mut self,
+        background: &mut BackgroundAgent,
+        report: QueuedAgentReport,
+    ) -> Result<BackgroundAgentReportDrain, SessionError> {
+        match self.record_agent_message(&report) {
+            Ok(message_event_id) => Ok(BackgroundAgentReportDrain::Drained { message_event_id }),
+            Err(error) => {
+                background.pending_report = Some(report);
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_background_agent_affinity(
+        &self,
+        background: &BackgroundAgent,
+    ) -> Result<(), SessionError> {
+        if background.session_id == self.config.session_id
+            && background.parent_agent_id == self.config.agent_id
+        {
+            Ok(())
+        } else {
+            Err(AgentError::MessageSessionMismatch.into())
+        }
+    }
+
+    fn record_agent_message(&mut self, report: &QueuedAgentReport) -> Result<String, SessionError> {
+        self.persist_new_events()?;
+        let event = EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            self.previous_persisted_event_id(),
+            EventKind::AGENT_MESSAGE,
+            object([
+                ("from_agent_id", report.from_agent_id.clone().into()),
+                ("to_agent_id", report.to_agent_id.clone().into()),
+                ("spawn_event_id", report.spawn_event_id.clone().into()),
+                ("queued_ts", report.queued_ts.clone().into()),
+                ("payload", report.payload.value().clone()),
+            ]),
+        );
+        let message_event_id = event.id.clone();
+        self.accept_control_event(event)?;
+        Ok(message_event_id)
+    }
+
+    pub fn switch_model(
+        &mut self,
+        to_provider: &str,
+        to_model: &str,
+        reason: &str,
+    ) -> Result<bool, SessionError> {
+        let next = ModelTarget::new(to_provider, to_model);
+        if next == self.active_target {
+            return Ok(false);
+        }
+        self.validate_switch(&next, reason)?;
+
+        // A prior failed append can leave accepted in-memory events behind
+        // the persistence cursor. Drain that backlog through the normal
+        // policy path before directly appending the switch event; otherwise
+        // accepting the switch would advance the cursor past unwritten
+        // history.
+        self.persist_new_events()?;
+
+        let previous = self.active_target.clone();
+        let event = EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            self.previous_persisted_event_id(),
+            EventKind::MODEL_SWITCHED,
+            object([
+                ("from_provider", previous.provider.clone().into()),
+                ("from_model", previous.model.clone().into()),
+                ("to_provider", next.provider.clone().into()),
+                ("to_model", next.model.clone().into()),
+                ("reason", reason.to_owned().into()),
+            ]),
+        );
+        self.append_before_accept(&event)?;
+        self.bus.push(event);
+        if self.provenance.is_some() {
+            self.persisted_events = self.bus.events().len();
+        }
+        self.active_target = next;
+        Ok(true)
+    }
+
+    pub fn set_reasoning_effort(
+        &mut self,
+        effort: ReasoningEffort,
+        reason: &str,
+    ) -> Result<bool, SessionError> {
+        if effort == self.config.reasoning_effort {
+            return Ok(false);
+        }
+        validate_effort_change_reason(reason).map_err(SessionError::InvalidModelSwitchEvent)?;
+        self.persist_new_events()?;
+
+        let previous = self.config.reasoning_effort;
+        let event = EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            self.previous_persisted_event_id(),
+            EventKind::MODEL_EFFORT_CHANGED,
+            object([
+                ("from_effort", previous.as_str().into()),
+                ("to_effort", effort.as_str().into()),
+                ("reason", reason.to_owned().into()),
+            ]),
+        );
+        self.append_before_accept(&event)?;
+        self.bus.push(event);
+        if self.provenance.is_some() {
+            self.persisted_events = self.bus.events().len();
+        }
+        self.config.reasoning_effort = effort;
+        Ok(true)
+    }
+
+    pub fn rename_session(&mut self, name: &str) -> Result<String, SessionError> {
+        let normalized = validate_session_name_for_write(name).ok_or_else(|| {
+            SessionError::InvalidSessionName {
+                name: name.to_owned(),
+            }
+        })?;
+        self.persist_new_events()?;
+        let event = session_renamed_event(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            self.previous_persisted_event_id(),
+            normalized.clone(),
+        );
+        self.accept_control_event(event)?;
+        Ok(normalized)
+    }
+
+    pub fn run_turn(&mut self, user_message: &str) -> Result<Vec<EventEnvelope>, SessionError> {
+        self.run_turn_with_sink(user_message, Arc::new(AtomicBool::new(false)), |_| {})
+    }
+
+    pub fn run_turn_with_sink<F>(
+        &mut self,
+        user_message: &str,
+        cancel_flag: Arc<AtomicBool>,
+        mut on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        if self.context_limit_emitted.as_ref() == Some(&self.active_target) {
+            return Ok(Vec::new());
+        }
+        self.auto_compact_if_triggered()?;
+
+        let start = self.bus.events().len();
+        crate::diagnostics::turn_start(&self.config.session_id);
+        let mut sink = EventSink::new(start, &mut on_event);
+        self.emit(
+            EventKind::USER_MESSAGE,
+            object([("content", user_message.into())]),
+        )?;
+        sink.flush(self.bus.events());
+        // Intentionally uses the latest recorded model.result usage
+        // as a coarse conversation-size guard for the active target. It does
+        // not recompute tokens for the switched-to provider/model.
+        if let Some(context_limit_id) = self.emit_context_limit_if_reached()? {
+            sink.flush(self.bus.events());
+            self.context_limit_emitted = Some(self.active_target.clone());
+            self.emit_with_parent(
+                EventKind::ASSISTANT_MESSAGE,
+                object([("content", CONTEXT_LIMIT_MESSAGE.into())]),
+                Some(context_limit_id),
+            )?;
+            sink.flush(self.bus.events());
+            crate::diagnostics::turn_end(&self.config.session_id, 0);
+            return Ok(self.bus.events()[start..].to_vec());
+        }
+
+        self.run_model_rounds(start, &cancel_flag, &mut sink)
+    }
+
+    fn run_model_rounds<F>(
+        &mut self,
+        start: usize,
+        cancel_flag: &AtomicBool,
+        sink: &mut EventSink<'_, F>,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let mut turn_state = TurnState::default();
+        let mut rounds = 0_u64;
+        let max_rounds = self.config.max_tool_rounds;
+        let transport_retries = self.config.provider_transport_retries;
+        let transport_retry_backoff_ms = self.config.provider_transport_retry_backoff_ms.clone();
+        let mut io = SessionRoundIo {
+            session: self,
+            sink,
+            turn_state: &mut turn_state,
+            rounds: &mut rounds,
+        };
+        let result = RoundLoop::new(
+            &mut io,
+            RoundLoopConfig {
+                max_rounds,
+                transport_retries,
+                transport_retry_backoff_ms,
+            },
+        )
+        .run(cancel_flag);
+        crate::diagnostics::turn_end(&self.config.session_id, rounds);
+        result.map(|()| self.bus.events()[start..].to_vec())
+    }
+
+    fn prepare_model_request<F>(
+        &mut self,
+        target: &ModelTarget,
+        sink: &mut EventSink<'_, F>,
+    ) -> Result<(String, ModelRequest), SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let canvas = assemble_canvas(self.bus.events(), &self.config.auto_compaction);
+        if let Some(error) = context_budget_exhausted(self.config.auto_compaction, &canvas) {
+            self.emit(
+                EventKind::ERROR,
+                object([
+                    ("source", "session".into()),
+                    ("message", error.to_string().into()),
+                ]),
+            )?;
+            sink.flush(self.bus.events());
+            return Err(error);
+        }
+        self.emit(
+            EventKind::CANVAS_SNAPSHOT,
+            canvas_snapshot_payload(&canvas, self.config.auto_compaction),
+        )?;
+        sink.flush(self.bus.events());
+
+        let mut model_call = object([
+            ("provider", target.provider.clone().into()),
+            ("model", target.model.clone().into()),
+            ("canvas_items", canvas.len().into()),
+            (
+                "requested_reasoning_effort",
+                self.config.reasoning_effort.as_str().into(),
+            ),
+        ]);
+        if let Some(reasoning_effort) = self
+            .providers
+            .reasoning_effort(&target.provider, &target.model)
+        {
+            model_call.insert("reasoning_effort".to_owned(), reasoning_effort.into());
+        }
+        if let Some(max_output_tokens) = self.config.max_output_tokens {
+            model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
+        }
+        let model_call_id = self.emit(EventKind::MODEL_CALL, model_call)?;
+        sink.flush(self.bus.events());
+
+        let request = ModelRequest {
+            model: target.model.clone(),
+            instructions: SYSTEM_INSTRUCTIONS.to_owned(),
+            input: canvas.iter().map(model_input_item).collect(),
+            tools: self.tools.model_tools(),
+            reasoning_effort: self.config.reasoning_effort,
+            max_output_tokens: self.config.max_output_tokens,
+        }
+        .for_target(&target.provider, &target.model);
+        Ok((model_call_id, request))
+    }
+
+    fn record_stream_event<F>(
+        &mut self,
+        event: &ModelStreamEvent,
+        model_call_id: &str,
+        sink: &mut EventSink<'_, F>,
+    ) -> Result<(), SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        match event {
+            ModelStreamEvent::TextDelta(delta) => {
+                self.emit_model_delta("text", delta.clone(), model_call_id.to_owned())?;
+                sink.flush(self.bus.events());
+            }
+            ModelStreamEvent::ReasoningDelta(delta) => {
+                if !delta.content.is_empty() {
+                    self.emit_model_delta(
+                        "reasoning",
+                        delta.content.clone(),
+                        model_call_id.to_owned(),
+                    )?;
+                    sink.flush(self.bus.events());
+                }
+            }
+            ModelStreamEvent::ToolCall(_) | ModelStreamEvent::Finished { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn finish_context_limit<F>(
+        &mut self,
+        data: &ModelRoundData,
+        model_result_id: &str,
+        sink: &mut EventSink<'_, F>,
+    ) -> Result<bool, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let Some(context_limit_id) = self.emit_context_limit_if_reached()? else {
+            return Ok(false);
+        };
+        sink.flush(self.bus.events());
+        self.context_limit_emitted = Some(self.active_target.clone());
+        if data.tool_calls.is_empty() && !data.content.is_empty() {
+            self.emit_with_parent(
+                EventKind::ASSISTANT_MESSAGE,
+                object([("content", data.content.clone().into())]),
+                Some(model_result_id.to_owned()),
+            )?;
+            sink.flush(self.bus.events());
+        }
+        self.emit_with_parent(
+            EventKind::ASSISTANT_MESSAGE,
+            object([("content", CONTEXT_LIMIT_MESSAGE.into())]),
+            Some(context_limit_id),
+        )?;
+        sink.flush(self.bus.events());
+        Ok(true)
+    }
+
+    fn validate_switch(&self, target: &ModelTarget, reason: &str) -> Result<(), SessionError> {
+        validate_model_target_shape(target).map_err(SessionError::InvalidModelSwitch)?;
+        if !self.providers.contains(&target.provider) {
+            return Err(SessionError::InvalidModelSwitch(format!(
+                "provider is not configured: {}",
+                target.provider
+            )));
+        }
+        if !is_safe_switch_reason(reason) {
+            return Err(SessionError::InvalidModelSwitch(
+                "reason must be a short non-secret label".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_latest_usage(&mut self, usage: Option<&Usage>) {
+        self.latest_model_usage = usage.map(|usage| ModelUsageSnapshot {
+            used_tokens: used_tokens(usage),
+        });
+    }
+
+    fn auto_compact_if_triggered(&mut self) -> Result<bool, SessionError> {
+        // Re-entrancy guard: skip if last non-delta event is already a swap
+        if self
+            .bus
+            .events()
+            .iter()
+            .rev()
+            .find(|e| e.kind.as_str() != EventKind::MODEL_DELTA)
+            .is_some_and(|e| {
+                e.kind.as_str() == EventKind::CANVAS_SWAP
+                    || e.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED
+            })
+        {
+            return Ok(false);
+        }
+        let Some(window) = self.compaction_context_window() else {
+            return Ok(false);
+        };
+        let Some(usage) = &self.latest_model_usage else {
+            return Ok(false);
+        };
+        if !should_compact(
+            usage.used_tokens as usize,
+            window,
+            self.config.compaction_reserve_tokens,
+        ) {
+            return Ok(false);
+        }
+        Ok(self.compact_for_threshold(window))
+    }
+
+    fn compaction_context_window(&self) -> Option<usize> {
+        let window = self.config.context_limit?.limit_tokens() as usize;
+        Some(window)
+    }
+
+    fn compact_for_threshold(&mut self, window: usize) -> bool {
+        let threshold = window.saturating_sub(self.config.compaction_reserve_tokens);
+        let candidates =
+            select_layer1_candidates(self.bus.events(), self.config.compaction_keep_recent, 4);
+        let compacted = assemble_canvas_with_compaction(
+            self.bus.events(),
+            &self.config.auto_compaction,
+            &candidates,
+        );
+        if !candidates.is_empty() && estimated_tokens(&compacted) <= threshold {
+            return self.emit_layer1_swap(&candidates);
+        }
+
+        let projection = heuristic_projection(self.bus.events());
+        self.try_compact(&projection)
+    }
+
+    fn emit_layer1_swap(&mut self, compacted_result_ids: &BTreeSet<String>) -> bool {
+        let Some(first) = self.bus.events().first() else {
+            return false;
+        };
+        // Layer-1-only swap: degenerate null snapshot range (all three IDs
+        // point to the first event). No full-projection compaction; the
+        // swap event just records which tool results were compacted.
+        self.emit_control_event(
+            EventKind::CANVAS_SWAP,
+            object([
+                ("snapshot_start_id", first.id.clone().into()),
+                ("snapshot_end_id", first.id.clone().into()),
+                ("frontier_start_id", first.id.clone().into()),
+                (
+                    "policy_version",
+                    crate::compaction::COMPACTION_POLICY_VERSION.into(),
+                ),
+                (
+                    "projection_schema_version",
+                    PROJECTION_SCHEMA_VERSION.into(),
+                ),
+                ("projection_blob", "".into()),
+                ("validation_result", "layer1-pass".into()),
+                (
+                    "layer1_compacted_event_ids",
+                    compacted_result_ids
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+            ]),
+        )
+    }
+
+    fn emit_context_limit_if_reached(&mut self) -> Result<Option<String>, SessionError> {
+        let Some(limit) = self.config.context_limit else {
+            return Ok(None);
+        };
+        if self.context_limit_emitted.as_ref() == Some(&self.active_target) {
+            return Ok(None);
+        }
+        let Some(usage) = &self.latest_model_usage else {
+            return Ok(None);
+        };
+        let threshold_tokens = (limit.limit_tokens as f64) * limit.threshold;
+        if (usage.used_tokens as f64) < threshold_tokens {
+            return Ok(None);
+        }
+
+        self.emit(
+            EventKind::CONTEXT_LIMIT,
+            object([
+                ("provider", self.active_target.provider.clone().into()),
+                ("model", self.active_target.model.clone().into()),
+                ("used_tokens", usage.used_tokens.into()),
+                ("limit_tokens", limit.limit_tokens.into()),
+                ("threshold", json!(limit.threshold)),
+            ]),
+        )
+        .map(Some)
+    }
+
+    #[allow(clippy::too_many_lines)] // ratchet: 114 lines, refactor target
+    fn execute_tool_call<F>(
+        &mut self,
+        call: ToolCall,
+        model_result_id: String,
+        sink: &mut EventSink<'_, F>,
+        turn_state: &mut TurnState,
+    ) -> Result<(), SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let tool_call_event_id = self.emit_with_parent(
+            EventKind::TOOL_CALL,
+            object([
+                ("id", call.id.clone().into()),
+                ("name", call.name.clone().into()),
+                ("input", call.input.clone()),
+            ]),
+            Some(model_result_id),
+        )?;
+        sink.flush(self.bus.events());
+
+        if let Some(capability) = self
+            .tools
+            .required_capability_for_input(&call.name, &call.input)
+        {
+            if turn_state.denied(capability) {
+                self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
+                return Ok(());
+            }
+            let request = PermissionRequest {
+                capability,
+                reason: self.tools.permission_reason(&call.name, &call.input),
+            };
+            let mode = self.permissions.mode(capability);
+            let prompt_id = if mode == ApprovalMode::Ask {
+                let prompt_id = self.emit(
+                    EventKind::PERMISSION_PROMPT,
+                    object([
+                        ("capability", capability.as_str().into()),
+                        ("reason", request.reason.clone().into()),
+                    ]),
+                )?;
+                sink.flush(self.bus.events());
+                Some(prompt_id)
+            } else {
+                None
+            };
+            let allowed = self.permissions.decide(&request, mode);
+            let mode_label = approval_mode_str(mode);
+            // An Ask that upgraded the gate to SessionAllow was an
+            // AllowSession verdict; record the session scope so resume can
+            // fold the grant (see the session-scope ADR).
+            let session_scoped = mode == ApprovalMode::Ask
+                && self.permissions.mode(capability) == ApprovalMode::SessionAllow;
+            let mut payload = object([
+                ("capability", capability.as_str().into()),
+                ("mode", mode_label.into()),
+                ("allowed", allowed.into()),
+                ("decision", permission_decision_str(allowed).into()),
+            ]);
+            if session_scoped {
+                payload.insert("scope".to_owned(), "session".into());
+            }
+            self.emit_with_parent(
+                EventKind::PERMISSION_DECISION,
+                payload,
+                Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
+            )?;
+            crate::diagnostics::permission_decision(
+                &self.config.session_id,
+                capability.as_str(),
+                mode_label,
+                allowed,
+            );
+            if !allowed {
+                turn_state.record_denial(capability);
+                self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
+                return Ok(());
+            }
+        }
+
+        let tool_name = call.name.clone();
+        let tool_started = Instant::now();
+        match self.tools.execute(&call.name, &call.input) {
+            Ok(execution) => {
+                if let Some(patch) = execution.patch {
+                    let payload = object([
+                        ("path", patch.path.clone().into()),
+                        ("old", patch.before.clone().into()),
+                        ("new", patch.after.clone().into()),
+                    ]);
+                    let patch_proposed_id = self.emit_with_parent(
+                        EventKind::PATCH_PROPOSED,
+                        payload.clone(),
+                        Some(tool_call_event_id.clone()),
+                    )?;
+                    if let Err(error) = self.tools.apply_patch(&patch) {
+                        self.emit_with_parent(
+                            EventKind::TOOL_RESULT,
+                            object([
+                                ("id", call.id.into()),
+                                ("name", execution.name.into()),
+                                ("ok", false.into()),
+                                ("error", error.to_string().into()),
+                            ]),
+                            Some(tool_call_event_id),
+                        )?;
+                        crate::diagnostics::tool_exec_end(
+                            &self.config.session_id,
+                            &tool_name,
+                            elapsed_ms(tool_started),
+                            false,
+                        );
+                        return Ok(());
+                    }
+                    let patch_applied_id = self.emit_with_parent(
+                        EventKind::PATCH_APPLIED,
+                        payload,
+                        Some(patch_proposed_id),
+                    )?;
+                    let file_change_id = self.emit_with_parent(
+                        EventKind::FILE_CHANGE,
+                        file_change_payload(&call.id, &patch),
+                        Some(patch_applied_id.clone()),
+                    )?;
+                    self.emit_with_parent(
+                        EventKind::FILE_DIFF,
+                        file_diff_payload(&call.id, &file_change_id, &patch),
+                        Some(patch_applied_id),
+                    )?;
+                }
+                for change in &execution.file_changes {
+                    let file_change_id = self.emit_with_parent(
+                        EventKind::FILE_CHANGE,
+                        observed_file_change_payload(&call.id, "run_shell", change),
+                        Some(tool_call_event_id.clone()),
+                    )?;
+                    self.emit_with_parent(
+                        EventKind::FILE_DIFF,
+                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change),
+                        Some(tool_call_event_id.clone()),
+                    )?;
+                }
+                let mut payload = object([
+                    ("id", call.id.into()),
+                    ("name", execution.name.into()),
+                    ("ok", true.into()),
+                    ("output", execution.output.into()),
+                ]);
+                if let Some(exit_code) = execution.exit_code {
+                    payload.insert("exit_code".to_owned(), exit_code.into());
+                }
+                self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
+                crate::diagnostics::tool_exec_end(
+                    &self.config.session_id,
+                    &tool_name,
+                    elapsed_ms(tool_started),
+                    true,
+                );
+            }
+            Err(error) => {
+                self.emit_with_parent(
+                    EventKind::TOOL_RESULT,
+                    object([
+                        ("id", call.id.into()),
+                        ("name", call.name.into()),
+                        ("ok", false.into()),
+                        ("error", error.to_string().into()),
+                    ]),
+                    Some(tool_call_event_id),
+                )?;
+                crate::diagnostics::tool_exec_end(
+                    &self.config.session_id,
+                    &tool_name,
+                    elapsed_ms(tool_started),
+                    false,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_permission_denied_tool_result(
+        &mut self,
+        call: ToolCall,
+        tool_call_event_id: String,
+    ) -> Result<String, SessionError> {
+        self.emit_with_parent(
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", call.id.into()),
+                ("name", call.name.into()),
+                ("ok", false.into()),
+                ("error", "permission denied".into()),
+            ]),
+            Some(tool_call_event_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // ratchet: 7 args, refactor target
+    fn emit_model_result(
+        &mut self,
+        content: &str,
+        tool_calls: &[ToolCall],
+        stop_reason: &StopReason,
+        usage: Option<&Usage>,
+        target: &ModelTarget,
+        parent: String,
+    ) -> Result<String, SessionError> {
+        let calls = tool_calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.input,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.emit_with_parent(
+            EventKind::MODEL_RESULT,
+            object([
+                ("provider", target.provider.clone().into()),
+                ("model", target.model.clone().into()),
+                ("content", content.to_owned().into()),
+                ("tool_calls", calls.into()),
+                ("stop_reason", stop_reason.as_str().into()),
+                ("usage", usage_payload(usage)),
+            ]),
+            Some(parent),
+        )
+    }
+
+    fn emit_model_delta(
+        &mut self,
+        kind: &'static str,
+        delta: String,
+        parent: String,
+    ) -> Result<String, SessionError> {
+        self.emit_with_parent(
+            EventKind::MODEL_DELTA,
+            object([("kind", kind.into()), ("delta", delta.into())]),
+            Some(parent),
+        )
+    }
+
+    fn emit_model_reasoning(
+        &mut self,
+        reasoning: &ReasoningChunk,
+        target: &ModelTarget,
+        parent: String,
+    ) -> Result<String, SessionError> {
+        let mut payload = object([
+            ("provider", target.provider.clone().into()),
+            ("model", target.model.clone().into()),
+            ("fidelity", reasoning.fidelity.as_str().into()),
+            ("content", reasoning.content.clone().into()),
+        ]);
+        if let Some(artifact) = &reasoning.artifact {
+            payload.insert("artifact".to_owned(), artifact.clone().into());
+        }
+        self.emit_with_parent(EventKind::MODEL_REASONING, payload, Some(parent))
+    }
+
+    fn emit_provider_error(
+        &mut self,
+        error: &ProviderError,
+        model_call_id: String,
+    ) -> Result<String, SessionError> {
+        let mut payload = object([
+            ("source", "provider".into()),
+            ("message", error.to_string().into()),
+        ]);
+        payload.insert("category".to_owned(), error.category().as_str().into());
+        self.emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))
+    }
+
+    fn emit(&mut self, kind: &'static str, payload: JsonObject) -> Result<String, SessionError> {
+        let parent = self.previous_persisted_event_id();
+        self.emit_with_parent(kind, payload, parent)
+    }
+
+    fn emit_with_parent(
+        &mut self,
+        kind: &'static str,
+        payload: JsonObject,
+        parent: Option<String>,
+    ) -> Result<String, SessionError> {
+        self.bus.push(EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            parent,
+            kind,
+            payload,
+        ));
+        let id = self
+            .bus
+            .events()
+            .last()
+            .expect("event just pushed")
+            .id
+            .clone();
+        self.persist_new_events()?;
+        Ok(id)
+    }
+}
+
+/// Off-tier honest stop (ADR D4): when auto-compaction is disabled and the
+/// assembled canvas exceeds the byte budget, the round boundary fails with
+/// a policy-naming error instead of silently truncating or demoting.
+fn context_budget_exhausted(
+    policy: AutoCompactionPolicy,
+    canvas: &[CanvasItem],
+) -> Option<SessionError> {
+    if policy.tier != CompactionTier::Off {
+        return None;
+    }
+    let canvas_bytes = canvas_bytes(canvas);
+    (canvas_bytes > policy.budget_bytes).then_some(SessionError::ContextBudgetExhausted {
+        canvas_bytes,
+        budget_bytes: policy.budget_bytes,
+    })
+}
+
+fn canvas_snapshot_payload(canvas: &[CanvasItem], policy: AutoCompactionPolicy) -> JsonObject {
+    let selected_event_ids = canvas
+        .iter()
+        .map(|item| item.event_id().to_owned())
+        .collect::<Vec<_>>();
+    let stats = retention_stats(canvas);
+    object([
+        ("selected_event_ids", selected_event_ids.into()),
+        ("counts", canvas_counts(canvas).into()),
+        ("retained_items", stats.retained_items.into()),
+        ("retained_bytes", stats.retained_bytes.into()),
+        ("demoted_items", stats.demoted_items.into()),
+        ("tier", policy.tier.as_str().into()),
+        ("budget_bytes", policy.budget_bytes.into()),
+        // Stubs-tier demotion is best-effort: facts are indestructible, so a
+        // canvas whose facts alone exceed the budget stays over budget and
+        // the round proceeds. Telemetry must say so rather than let the
+        // snapshot look policy-compliant.
+        (
+            "over_budget",
+            (stats.retained_bytes > policy.budget_bytes).into(),
+        ),
+    ])
+}
+
+fn canvas_counts(canvas: &[CanvasItem]) -> JsonObject {
+    object([
+        ("items", canvas.len().into()),
+        (
+            "user",
+            canvas
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        CanvasItem::Message {
+                            role: CanvasRole::User,
+                            ..
+                        }
+                    )
+                })
+                .count()
+                .into(),
+        ),
+        (
+            "assistant",
+            canvas
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        CanvasItem::Message {
+                            role: CanvasRole::Assistant,
+                            ..
+                        }
+                    )
+                })
+                .count()
+                .into(),
+        ),
+        (
+            "reasoning",
+            canvas
+                .iter()
+                .filter(|item| matches!(item, CanvasItem::Reasoning { .. }))
+                .count()
+                .into(),
+        ),
+        (
+            "tool_calls",
+            canvas
+                .iter()
+                .filter(|item| matches!(item, CanvasItem::ToolCall { .. }))
+                .count()
+                .into(),
+        ),
+        (
+            "tool_outputs",
+            canvas
+                .iter()
+                .filter(|item| matches!(item, CanvasItem::ToolOutput { .. }))
+                .count()
+                .into(),
+        ),
+    ])
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn install_background_agent_panic_hook() {
+    BACKGROUND_AGENT_PANIC_HOOK_INSTALLED.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let suppress = BACKGROUND_AGENT_WORKER.with(|flag| flag.get());
+            if !suppress {
+                previous(info);
+            }
+        }));
+    });
+}
+
+fn run_background_agent_work<F>(work: F) -> AgentResult
+where
+    F: FnOnce() -> AgentResult,
+{
+    let _guard = BackgroundAgentWorkerGuard::enter();
+    panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| {
+        fixed_background_agent_failure(BACKGROUND_AGENT_PANIC_SUMMARY, BACKGROUND_AGENT_PANIC_ERROR)
+    })
+}
+
+fn run_background_agent_reporter_work<F>(
+    work: F,
+    reporter: AgentReporter,
+    worker_live: Arc<AtomicBool>,
+) -> AgentResult
+where
+    F: FnOnce(AgentReporter) -> AgentResult,
+{
+    let _live_guard = BackgroundAgentReporterLiveGuard::new(worker_live);
+    let _guard = BackgroundAgentWorkerGuard::enter();
+    panic::catch_unwind(AssertUnwindSafe(|| work(reporter))).unwrap_or_else(|_| {
+        fixed_background_agent_failure(BACKGROUND_AGENT_PANIC_SUMMARY, BACKGROUND_AGENT_PANIC_ERROR)
+    })
+}
+
+struct BackgroundAgentWorkerGuard;
+
+impl BackgroundAgentWorkerGuard {
+    fn enter() -> Self {
+        BACKGROUND_AGENT_WORKER.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+struct BackgroundAgentReporterLiveGuard {
+    worker_live: Arc<AtomicBool>,
+}
+
+impl BackgroundAgentReporterLiveGuard {
+    fn new(worker_live: Arc<AtomicBool>) -> Self {
+        Self { worker_live }
+    }
+}
+
+impl Drop for BackgroundAgentReporterLiveGuard {
+    fn drop(&mut self) {
+        self.worker_live.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for BackgroundAgentWorkerGuard {
+    fn drop(&mut self) {
+        BACKGROUND_AGENT_WORKER.with(|flag| flag.set(false));
+    }
+}
+
+fn fixed_background_agent_failure(summary: &'static str, error: &'static str) -> AgentResult {
+    AgentResult::failure(summary, error, Option::<&str>::None)
+        .expect("fixed background agent failure strings should be valid")
+}
+
+fn push_reasoning_chunk(reasoning: &mut Vec<ReasoningChunk>, chunk: ReasoningChunk) {
+    if chunk.content.is_empty() && chunk.artifact.is_none() {
+        return;
+    }
+    if let Some(last) = reasoning.last_mut().filter(|last| {
+        last.fidelity == chunk.fidelity && last.artifact.is_none() && chunk.artifact.is_none()
+    }) {
+        last.content.push_str(&chunk.content);
+        if chunk.artifact.is_some() {
+            last.artifact = chunk.artifact;
+        }
+    } else {
+        reasoning.push(chunk);
+    }
+}
+fn model_input_item(item: &CanvasItem) -> ModelInputItem {
+    match item {
+        CanvasItem::Message { role, content, .. } => ModelInputItem::Message {
+            role: match role {
+                CanvasRole::User => ModelRole::User,
+                CanvasRole::Assistant => ModelRole::Assistant,
+            },
+            content: content.clone(),
+        },
+        CanvasItem::Projection { content, .. } => ModelInputItem::Message {
+            role: ModelRole::User,
+            content: content.clone(),
+        },
+        CanvasItem::Slot {
+            extension_id,
+            slot,
+            content,
+            ..
+        } => ModelInputItem::Message {
+            role: ModelRole::User,
+            content: render_context_slot(extension_id, slot, content),
+        },
+        CanvasItem::Reasoning {
+            provider,
+            model,
+            fidelity,
+            content,
+            artifact,
+            ..
+        } => ModelInputItem::Reasoning {
+            provider: provider.clone(),
+            model: model.clone(),
+            fidelity: reasoning_fidelity(fidelity),
+            content: content.clone(),
+            artifact: artifact.clone(),
+        },
+        CanvasItem::ToolCall {
+            call_id,
+            name,
+            input,
+            ..
+        } => ModelInputItem::ToolCall {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            arguments: input.clone(),
+        },
+        CanvasItem::ToolOutput {
+            call_id,
+            name,
+            output,
+            ok,
+            error,
+            exit_code,
+            ..
+        } => ModelInputItem::ToolOutput {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            ok: *ok,
+            output: if output.is_empty() {
+                None
+            } else {
+                Some(output.clone())
+            },
+            error: error.clone(),
+            exit_code: *exit_code,
+        },
+    }
+}
+fn reasoning_fidelity(value: &str) -> ReasoningFidelity {
+    match value {
+        "raw" => ReasoningFidelity::Raw,
+        "opaque" => ReasoningFidelity::Opaque,
+        _ => ReasoningFidelity::Summary,
+    }
+}
+fn usage_payload(usage: Option<&Usage>) -> Value {
+    match usage {
+        Some(usage) => {
+            let mut value = object([
+                ("input_tokens", usage.input_tokens.into()),
+                ("output_tokens", usage.output_tokens.into()),
+            ]);
+            if let Some(cached_tokens) = usage.cached_tokens {
+                value.insert("cached_tokens".to_owned(), cached_tokens.into());
+            }
+            if let Some(reasoning_tokens) = usage.reasoning_tokens {
+                value.insert("reasoning_tokens".to_owned(), reasoning_tokens.into());
+            }
+            Value::Object(value)
+        }
+        None => Value::Null,
+    }
+}
+fn used_tokens(usage: &Usage) -> u64 {
+    usage.input_tokens.saturating_add(usage.output_tokens)
+}
+fn estimated_tokens(canvas: &[CanvasItem]) -> usize {
+    canvas_prompt(canvas).split_whitespace().count()
+}
+
+fn file_change_payload(tool_call_id: &str, patch: &PatchEvents) -> JsonObject {
+    object([
+        ("tool_call_id", tool_call_id.to_owned().into()),
+        ("origin", patch.origin.into()),
+        ("action", patch.action.into()),
+        ("path", patch.path.clone().into()),
+        ("old_path", Value::Null),
+        (
+            "before_sha256",
+            patch
+                .before_sha256
+                .as_ref()
+                .map_or(Value::Null, |sha| sha.clone().into()),
+        ),
+        ("after_sha256", patch.after_sha256.clone().into()),
+        ("before_byte_len", patch.before_byte_len.into()),
+        ("after_byte_len", patch.after_byte_len.into()),
+        ("diff_redaction", "omitted".into()),
+    ])
+}
+
+fn file_diff_payload(tool_call_id: &str, file_change_id: &str, patch: &PatchEvents) -> JsonObject {
+    let projection = file_diff_projection(FileDiffSource {
+        path: &patch.path,
+        action: patch.action,
+        before: &patch.before,
+        after: &patch.after,
+    });
+    object([
+        ("tool_call_id", tool_call_id.to_owned().into()),
+        ("file_change_id", file_change_id.to_owned().into()),
+        ("path", patch.path.clone().into()),
+        ("old_path", Value::Null),
+        ("action", patch.action.into()),
+        ("origin", patch.origin.into()),
+        (
+            "diff",
+            projection
+                .diff
+                .map_or(Value::Null, std::convert::Into::into),
+        ),
+        ("truncated", projection.truncated.into()),
+        ("truncation", projection.truncation.into()),
+        (
+            "omitted_reason",
+            projection
+                .omitted_reason
+                .map_or(Value::Null, std::convert::Into::into),
+        ),
+    ])
+}
+
+fn approval_mode_str(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Ask => "ask",
+        ApprovalMode::SessionAllow => "session-allow",
+        ApprovalMode::AlwaysDeny => "always-deny",
+    }
+}
+
+fn permission_decision_str(allowed: bool) -> &'static str {
+    if allowed {
+        "allowed"
+    } else {
+        "denied"
+    }
+}
+
+pub fn fold_model_target(
+    initial: ModelTarget,
+    events: &[EventEnvelope],
+) -> Result<ModelTarget, SessionError> {
+    let mut target = initial;
+    for event in events {
+        if event.kind.as_str() != EventKind::MODEL_SWITCHED {
+            continue;
+        }
+        let to_provider = payload_string(event, "to_provider").ok_or_else(|| {
+            SessionError::InvalidModelSwitchEvent("missing to_provider".to_owned())
+        })?;
+        let to_model = payload_string(event, "to_model")
+            .ok_or_else(|| SessionError::InvalidModelSwitchEvent("missing to_model".to_owned()))?;
+        let next = ModelTarget::new(to_provider, to_model);
+        validate_model_target_shape(&next).map_err(SessionError::InvalidModelSwitchEvent)?;
+        target = next;
+    }
+    Ok(target)
+}
+
+pub fn fold_reasoning_effort(
+    initial: ReasoningEffort,
+    events: &[EventEnvelope],
+) -> Result<ReasoningEffort, SessionError> {
+    let mut effort = initial;
+    for event in events {
+        if event.kind.as_str() != EventKind::MODEL_EFFORT_CHANGED {
+            continue;
+        }
+        let to_effort = payload_string(event, "to_effort")
+            .ok_or_else(|| SessionError::InvalidModelSwitchEvent("missing to_effort".to_owned()))?;
+        effort = ReasoningEffort::parse(&to_effort).ok_or_else(|| {
+            SessionError::InvalidModelSwitchEvent(format!("invalid to_effort: {to_effort}"))
+        })?;
+    }
+    Ok(effort)
+}
+fn payload_string(event: &EventEnvelope, key: &str) -> Option<String> {
+    event.payload.get(key)?.as_str().map(str::to_owned)
+}
+fn validate_effort_change_reason(reason: &str) -> Result<(), String> {
+    if is_safe_switch_reason(reason) {
+        Ok(())
+    } else {
+        Err("reason must be a short non-secret label".to_owned())
+    }
+}
+fn is_safe_switch_reason(reason: &str) -> bool {
+    let len = reason.len();
+    (1..=32).contains(&len)
+        && reason
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+fn validate_model_target_shape(target: &ModelTarget) -> Result<(), String> {
+    if target.provider.trim().is_empty() || target.provider.chars().any(char::is_control) {
+        return Err("provider id must be non-empty printable text".to_owned());
+    }
+    if target.model.trim().is_empty() || target.model.chars().any(char::is_control) {
+        return Err("model id must be non-empty printable text".to_owned());
+    }
+    Ok(())
+}
+#[cfg(test)]
+#[path = "session_test.rs"]
+mod session_test;

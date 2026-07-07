@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "crates/euler-event",
+    "crates/euler-sdk",
+    "crates/euler-agents",
+    "crates/euler-extension-session-export",
+    "crates/euler-extension-causal-dag",
+    "crates/euler-extension-code-swarm",
+    "crates/euler-extension-diagnostics-report",
+    "crates/euler-extension-autoresearch",
+    "crates/euler-extension-maxproof",
+    "crates/euler-core",
+    "crates/euler-provider",
+    "crates/euler-tools",
+    "crates/euler-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+ulid = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+thiserror = "2"
+anyhow = "1"
+tempfile = "3"
+sha2 = "0.10"
+fs4 = "1"
+libc = "0.2"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+url = "2"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+too_many_lines = "deny"
+too_many_arguments = "deny"

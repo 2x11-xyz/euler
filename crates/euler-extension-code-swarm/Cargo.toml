@@ -1,0 +1,17 @@
+[package]
+name = "euler-extension-code-swarm"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+euler-event = { path = "../euler-event" }
+euler-sdk = { path = "../euler-sdk" }
+serde_json.workspace = true
+
+[dev-dependencies]
+euler-agents = { path = "../euler-agents" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,408 @@
+{
+  "schema": "euler.causal_dag.v1",
+  "media_type": "application/vnd.euler.causal-dag.v1+json",
+  "generated_at": "2026-06-29T01:05:00.000Z",
+  "session": {
+    "id": "session-emdash",
+    "event_range": {
+      "start": "event-emdash-start",
+      "end": "event-emdash-summary",
+      "complete": true
+    }
+  },
+  "projection": {
+    "extension_id": "causal-dag",
+    "watermark_event_id": "event-emdash-summary",
+    "basis": "bounded_provenance_query",
+    "degraded": true
+  },
+  "forest": {
+    "roots": [
+      "node-emdash-root"
+    ],
+    "active_root": "node-emdash-root",
+    "nodes": [
+      {
+        "id": "node-emdash-checkpoint",
+        "root_id": "node-emdash-root",
+        "kind": "checkpoint",
+        "status": "open",
+        "title": "Narrow to style priors",
+        "summary": "The projection records a narrowing decision after weak ordering evidence.",
+        "source_refs": [],
+        "confidence": {
+          "level": "low",
+          "score": 0.35
+        },
+        "basis": {
+          "kind": "inferred",
+          "summary": "The checkpoint is inferred from the bounded sequence and marked degraded.",
+          "source_ref_ids": []
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-emdash-claim-a",
+        "root_id": "node-emdash-root",
+        "kind": "claim",
+        "status": "open",
+        "title": "Style prior mechanism",
+        "summary": "Sampled outputs support a style-prior explanation.",
+        "source_refs": [
+          {
+            "id": "src-emdash-node-claim-a",
+            "kind": "event",
+            "event_id": "event-emdash-evidence",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.86
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The evidence tool result states this claim directly.",
+          "source_ref_ids": [
+            "src-emdash-node-claim-a"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-emdash-claim-b",
+        "root_id": "node-emdash-root",
+        "kind": "claim",
+        "status": "inconclusive",
+        "title": "Tokenizer-only mechanism",
+        "summary": "Counterexamples block the tokenizer-only explanation.",
+        "source_refs": [
+          {
+            "id": "src-emdash-node-claim-b",
+            "kind": "event",
+            "event_id": "event-emdash-refutation",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.74
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The counterexample probe blocks this mechanism.",
+          "source_ref_ids": [
+            "src-emdash-node-claim-b"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-emdash-root",
+        "root_id": "node-emdash-root",
+        "kind": "root",
+        "status": "open",
+        "title": "Em-dash mechanism",
+        "summary": "Mechanism analysis for em-dash overuse.",
+        "source_refs": [
+          {
+            "id": "src-emdash-node-root",
+            "kind": "event",
+            "event_id": "event-emdash-question",
+            "event_kind": "user.message",
+            "payload_pointer": "/payload/content",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.96
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The user message defines the mechanism question.",
+          "source_ref_ids": [
+            "src-emdash-node-root"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "node-emdash-synthesis",
+        "root_id": "node-emdash-root",
+        "kind": "synthesis",
+        "status": "inconclusive",
+        "title": "Style-prior explanation preferred",
+        "summary": "The synthesis prefers learned style priors but keeps the result inconclusive.",
+        "source_refs": [
+          {
+            "id": "src-emdash-node-synthesis",
+            "kind": "event",
+            "event_id": "event-emdash-summary",
+            "event_kind": "assistant.message",
+            "payload_pointer": "/payload/content",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.68
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The assistant summary records the preferred explanation.",
+          "source_ref_ids": [
+            "src-emdash-node-synthesis"
+          ]
+        },
+        "metadata": {}
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge-emdash-checkpoint-to-claim-b",
+        "from": "node-emdash-checkpoint",
+        "to": "node-emdash-claim-b",
+        "class": "structural",
+        "kind": "refinement",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-emdash-edge-checkpoint-to-claim-b",
+            "kind": "event",
+            "event_id": "event-emdash-refutation",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.72
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The refutation probe refines the analysis toward a blocked competing claim.",
+          "source_ref_ids": [
+            "src-emdash-edge-checkpoint-to-claim-b"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-emdash-claim-a-to-checkpoint",
+        "from": "node-emdash-claim-a",
+        "to": "node-emdash-checkpoint",
+        "class": "structural",
+        "kind": "continuation",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-emdash-edge-claim-a-to-checkpoint",
+            "kind": "event",
+            "event_id": "event-emdash-evidence",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.7
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The evidence probe supports continuing through a narrowing checkpoint.",
+          "source_ref_ids": [
+            "src-emdash-edge-claim-a-to-checkpoint"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-emdash-claim-b-to-synthesis",
+        "from": "node-emdash-claim-b",
+        "to": "node-emdash-synthesis",
+        "class": "structural",
+        "kind": "integration",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-emdash-edge-claim-b-to-synthesis",
+            "kind": "event",
+            "event_id": "event-emdash-summary",
+            "event_kind": "assistant.message",
+            "payload_pointer": "/payload/content",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.65
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The final summary integrates the competing mechanism evidence.",
+          "source_ref_ids": [
+            "src-emdash-edge-claim-b-to-synthesis"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-emdash-evidence",
+        "from": "node-emdash-claim-a",
+        "to": "node-emdash-synthesis",
+        "class": "annotation",
+        "kind": "evidence",
+        "canonical_backbone": false,
+        "source_refs": [
+          {
+            "id": "src-emdash-edge-evidence",
+            "kind": "event",
+            "event_id": "event-emdash-evidence",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "score": 0.82
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The corpus probe is evidence for the synthesis.",
+          "source_ref_ids": [
+            "src-emdash-edge-evidence"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-emdash-inferred-related",
+        "from": "node-emdash-checkpoint",
+        "to": "node-emdash-synthesis",
+        "class": "annotation",
+        "kind": "related",
+        "canonical_backbone": false,
+        "source_refs": [],
+        "confidence": {
+          "level": "low",
+          "score": 0.2
+        },
+        "basis": {
+          "kind": "inferred",
+          "summary": "The relation is inferred and therefore depends on the degraded projection.",
+          "source_ref_ids": []
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-emdash-refutation",
+        "from": "node-emdash-claim-b",
+        "to": "node-emdash-claim-a",
+        "class": "annotation",
+        "kind": "refutation",
+        "canonical_backbone": false,
+        "source_refs": [
+          {
+            "id": "src-emdash-edge-refutation",
+            "kind": "event",
+            "event_id": "event-emdash-refutation",
+            "event_kind": "tool.result",
+            "payload_pointer": "/payload/output",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "score": 0.7
+        },
+        "basis": {
+          "kind": "direct",
+          "summary": "The counterexample probe refutes the tokenizer-only mechanism.",
+          "source_ref_ids": [
+            "src-emdash-edge-refutation"
+          ]
+        },
+        "metadata": {}
+      },
+      {
+        "id": "edge-emdash-sequence-claim-a",
+        "from": "node-emdash-root",
+        "to": "node-emdash-claim-a",
+        "class": "chronology",
+        "kind": "sequence",
+        "canonical_backbone": true,
+        "source_refs": [
+          {
+            "id": "src-emdash-edge-sequence-claim-a",
+            "kind": "event",
+            "event_id": "event-emdash-question",
+            "event_kind": "user.message",
+            "payload_pointer": "/payload/content",
+            "artifact": null,
+            "blob": null
+          }
+        ],
+        "confidence": {
+          "level": "low",
+          "score": 0.3
+        },
+        "basis": {
+          "kind": "chronology",
+          "summary": "Chronology preserves readable order when causal parentage is weak.",
+          "source_ref_ids": [
+            "src-emdash-edge-sequence-claim-a"
+          ]
+        },
+        "metadata": {}
+      }
+    ]
+  },
+  "diagnostics": {
+    "node_count": 5,
+    "edge_count": 7,
+    "root_count": 1,
+    "leaf_count": 1,
+    "fork_count": 0,
+    "maximum_depth": 4,
+    "branching_ratio": 0.0,
+    "backbone_edge_count": 4,
+    "structural_edge_count": 3,
+    "annotation_edge_count": 3,
+    "sequence_edge_count": 1,
+    "sequence_edge_ratio": 0.14285714285714285,
+    "source_backed_edge_count": 5,
+    "inferred_edge_count": 2,
+    "missing_source_ref_count": 0,
+    "degraded_chronology": true,
+    "projection_heavy_branching": false,
+    "warnings": [
+      {
+        "code": "degraded_chronology",
+        "severity": "warning",
+        "message": "Chronology sequence fallback used for weak ordering.",
+        "node_ids": [],
+        "edge_ids": [
+          "edge-emdash-sequence-claim-a"
+        ],
+        "source_ref_ids": []
+      }
+    ]
+  }
+}
