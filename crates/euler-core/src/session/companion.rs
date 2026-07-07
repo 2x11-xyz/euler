@@ -71,6 +71,16 @@ struct ModelResultRecord<'a> {
 
 impl<D: PermissionDecider> Session<D> {
     pub fn spawn_companion(&mut self, task: AgentTask) -> Result<AgentResultSummary, SessionError> {
+        // External callers have no companion cancellation source today; hand
+        // the loop a flag that never trips.
+        self.spawn_companion_with_cancel(task, &AtomicBool::new(false))
+    }
+
+    pub(crate) fn spawn_companion_with_cancel(
+        &mut self,
+        task: AgentTask,
+        cancel_flag: &AtomicBool,
+    ) -> Result<AgentResultSummary, SessionError> {
         let target = self.resolve_companion_target(&task)?;
         let parent_capabilities = self
             .permissions
@@ -98,7 +108,7 @@ impl<D: PermissionDecider> Session<D> {
                 writer,
                 spawned.child_agent_id().to_owned(),
             );
-            loop_.run()
+            loop_.run(cancel_flag)
         };
         let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
 
@@ -196,16 +206,13 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     /// companions inherit its transport retry (ADR 2026-07-06). max_turns
     /// maps onto the loop's round limit: it counts companion model rounds,
     /// and max_turns = 1 means at most one model round total.
-    fn run(&mut self) -> AgentResult {
+    fn run(&mut self, cancel_flag: &AtomicBool) -> AgentResult {
         let config = RoundLoopConfig {
             max_rounds: self.task.budget().max_turns().map(|max| max as usize),
             transport_retries: self.transport_retries,
             transport_retry_backoff_ms: self.transport_retry_backoff_ms.clone(),
         };
-        // Companions have no cancellation source today; the loop requires a
-        // flag, so hand it one that never trips.
-        let cancel_flag = AtomicBool::new(false);
-        match RoundLoop::new(self, config).run(&cancel_flag) {
+        match RoundLoop::new(self, config).run(cancel_flag) {
             Ok(result) => result,
             Err(error) => companion_failure(error.to_string()),
         }

@@ -28,7 +28,7 @@ use euler_provider::{
     ProviderSet, ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason,
     ToolCall, Usage,
 };
-use euler_sdk::{Capability, EventWakeError, EventWakeRegistration};
+use euler_sdk::{Capability, EventWakeError, EventWakeRegistration, Extension};
 use round_loop::{
     EventSink, ModelRoundData, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, TurnState,
 };
@@ -46,8 +46,10 @@ use thiserror::Error;
 
 mod companion;
 mod extension_bridge;
+mod observer;
 mod round_loop;
 pub use companion::AgentResultSummary;
+pub use observer::RoundObserverConfig;
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
 const CONTEXT_LIMIT_MESSAGE: &str =
@@ -122,6 +124,10 @@ pub struct SessionConfig {
     pub compaction_reserve_tokens: usize,
     /// Number of recent tool results to keep verbatim after compaction. Default: 4.
     pub compaction_keep_recent: usize,
+    /// Round-boundary observer cadence and command pair. `None` (default)
+    /// disables the observer entirely; a configured observer additionally
+    /// requires [`Session::set_observer_extension`].
+    pub round_observer: Option<RoundObserverConfig>,
 }
 
 impl SessionConfig {
@@ -142,6 +148,7 @@ impl SessionConfig {
             extensions_enabled: BTreeSet::new(),
             compaction_reserve_tokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
+            round_observer: None,
         }
     }
 }
@@ -395,6 +402,7 @@ pub struct Session<D> {
     latest_model_usage: Option<ModelUsageSnapshot>,
     context_limit_emitted: Option<ModelTarget>,
     open_agent_spawns: BTreeMap<String, String>,
+    observer_extension: Option<Arc<dyn Extension>>,
 }
 
 /// Session-side adapter driving the shared [`RoundLoop`]: bundles the
@@ -542,6 +550,12 @@ where
         *self.rounds += 1;
     }
 
+    fn round_boundary(&mut self, cancel_flag: &AtomicBool) {
+        self.session
+            .observe_round_boundary(*self.rounds, cancel_flag);
+        self.sink.flush(self.session.bus.events());
+    }
+
     fn round_limit(&mut self) -> Result<(), SessionError> {
         self.session.emit(
             EventKind::ASSISTANT_MESSAGE,
@@ -610,6 +624,7 @@ impl<D> Session<D> {
             latest_model_usage: None,
             context_limit_emitted: None,
             open_agent_spawns: BTreeMap::new(),
+            observer_extension: None,
         }
     }
 
@@ -625,6 +640,12 @@ impl<D> Session<D> {
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
         self.provenance = Some(Arc::new(provenance));
         self
+    }
+
+    /// Wire the extension whose brief/apply commands the configured round
+    /// observer executes; config without extension (or vice versa) is inert.
+    pub fn set_observer_extension(&mut self, extension: Arc<dyn Extension>) {
+        self.observer_extension = Some(extension);
     }
 
     pub fn open_event_wake(&self) -> Result<EventWakeRegistration, SessionError> {
@@ -826,6 +847,7 @@ impl<D> Session<D> {
                 .map(|used_tokens| ModelUsageSnapshot { used_tokens }),
             context_limit_emitted,
             open_agent_spawns: BTreeMap::new(),
+            observer_extension: None,
         }
     }
 }
