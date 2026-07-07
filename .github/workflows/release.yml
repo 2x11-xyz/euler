@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and upload assets for"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p euler-cli --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          name="euler-${version}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/euler" "$name/"
+          cp README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release create "$version" --verify-tag --title "Euler $version" --generate-notes || true
+          gh release upload "$version" euler-*.tar.gz euler-*.tar.gz.sha256 --clobber

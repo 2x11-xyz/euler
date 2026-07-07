@@ -46,6 +46,17 @@ Every node cites the events where it happened.
 
 ## Install
 
+**Prebuilt binaries** (Linux x86_64/aarch64 static, macOS Intel/Apple Silicon) are on the
+[releases page](https://github.com/2x11-xyz/euler/releases). Download, extract, and put
+`euler` on your PATH:
+
+```sh
+tar xzf euler-<version>-<target>.tar.gz
+sudo install -m 755 euler-<version>-<target>/euler /usr/local/bin/euler
+```
+
+**From source:**
+
 ```sh
 git clone https://github.com/2x11-xyz/euler
 cd euler
