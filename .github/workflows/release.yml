@@ -28,7 +28,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            runner: macos-13
+            # Last Intel macOS image on Actions (supported until Aug 2027);
+            # macos-13 was retired 2025-12-04.
+            runner: macos-15-intel
           - target: aarch64-apple-darwin
             runner: macos-latest
     steps:
