@@ -120,6 +120,11 @@ pub(crate) trait RoundLoopIo {
     /// Called once per round that finished without error, whether it
     /// completed the turn or continues into another round.
     fn round_completed(&mut self);
+    /// Called at each mid-turn round boundary: after a completed round that
+    /// continues into another round, never after the turn's final round.
+    /// The default no-op keeps non-driver loops (companions) from observing;
+    /// that default is the round-observer recursion guard.
+    fn round_boundary(&mut self, _cancel_flag: &AtomicBool) {}
     fn round_limit(&mut self) -> Result<Self::Complete, SessionError>;
 }
 
@@ -154,7 +159,10 @@ where
                     self.io.round_completed();
                     return Ok(done);
                 }
-                RoundOutcome::Continue => self.io.round_completed(),
+                RoundOutcome::Continue => {
+                    self.io.round_completed();
+                    self.io.round_boundary(cancel_flag);
+                }
             }
             completed_rounds += 1;
         }

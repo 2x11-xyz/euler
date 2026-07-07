@@ -1,23 +1,80 @@
 use anyhow::{anyhow, Result};
+use euler_core::RoundObserverConfig;
 use euler_extension_autoresearch::AutoresearchExtension;
 use euler_extension_causal_dag::CausalDagExtension;
 use euler_extension_code_swarm::CodeSwarmExtension;
 use euler_extension_diagnostics_report::DiagnosticsReportExtension;
 use euler_extension_maxproof::MaxProofExtension;
 use euler_extension_session_export::SessionExportExtension;
-use euler_sdk::{CommandDescriptor, CommandRegistrar, Extension, ExtensionCommand};
+use euler_sdk::{
+    CommandDescriptor, CommandRegistrar, Extension, ExtensionCommand, ExtensionError,
+    ExtensionManifest,
+};
 use serde::Serialize;
+use std::collections::BTreeSet;
+use std::num::NonZeroU64;
+use std::sync::Arc;
 
-pub(crate) struct BundledExtension(pub(crate) &'static dyn Extension);
+const DEFAULT_OBSERVE_CADENCE_ROUNDS: u64 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObserverCommandPair {
+    pub(crate) brief: &'static str,
+    pub(crate) apply: &'static str,
+}
+
+pub(crate) struct BundledExtension {
+    pub(crate) extension: &'static dyn Extension,
+    pub(crate) observer_commands: Option<ObserverCommandPair>,
+}
+
+impl BundledExtension {
+    const fn new(extension: &'static dyn Extension) -> Self {
+        Self {
+            extension,
+            observer_commands: None,
+        }
+    }
+
+    const fn with_observer(
+        extension: &'static dyn Extension,
+        brief: &'static str,
+        apply: &'static str,
+    ) -> Self {
+        Self {
+            extension,
+            observer_commands: Some(ObserverCommandPair { brief, apply }),
+        }
+    }
+}
 
 pub(crate) static BUNDLED_EXTENSIONS: &[BundledExtension] = &[
-    BundledExtension(&SessionExportExtension),
-    BundledExtension(&CausalDagExtension),
-    BundledExtension(&CodeSwarmExtension),
-    BundledExtension(&DiagnosticsReportExtension),
-    BundledExtension(&AutoresearchExtension),
-    BundledExtension(&MaxProofExtension),
+    BundledExtension::new(&SessionExportExtension),
+    BundledExtension::with_observer(&CausalDagExtension, "observer-brief", "record-observation"),
+    BundledExtension::new(&CodeSwarmExtension),
+    BundledExtension::new(&DiagnosticsReportExtension),
+    BundledExtension::new(&AutoresearchExtension),
+    BundledExtension::new(&MaxProofExtension),
 ];
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ObserveOptions {
+    pub(crate) extension_id: Option<String>,
+    pub(crate) cadence_rounds: Option<NonZeroU64>,
+}
+
+impl ObserveOptions {
+    pub(crate) fn normalized(mut self) -> Result<Self> {
+        match (&self.extension_id, self.cadence_rounds) {
+            (None, Some(_)) => Err(anyhow!("--observe-cadence requires --observe")),
+            (Some(_), None) => {
+                self.cadence_rounds = Some(default_observe_cadence());
+                Ok(self)
+            }
+            _ => Ok(self),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BundledDescriptor {
@@ -28,6 +85,7 @@ pub(crate) struct BundledDescriptor {
     pub(crate) runtime_kind: &'static str,
     pub(crate) capabilities: Vec<euler_sdk::Capability>,
     pub(crate) commands: Vec<CommandDescriptor>,
+    pub(crate) observer_commands: Option<ObserverCommandPair>,
     pub(crate) table_index: usize,
 }
 
@@ -100,7 +158,7 @@ pub(crate) fn bundled_descriptors() -> Result<Vec<BundledDescriptor>> {
 
 pub(crate) fn bundled_descriptor_by_id(id: &str) -> Result<Option<BundledDescriptor>> {
     for (table_index, bundled) in BUNDLED_EXTENSIONS.iter().enumerate() {
-        let manifest = bundled.0.manifest();
+        let manifest = bundled.extension.manifest();
         if manifest.id == id {
             return bundled_descriptor(table_index, bundled).map(Some);
         }
@@ -111,21 +169,113 @@ pub(crate) fn bundled_descriptor_by_id(id: &str) -> Result<Option<BundledDescrip
 pub(crate) fn bundled_extension_by_id(id: &str) -> Option<&'static BundledExtension> {
     BUNDLED_EXTENSIONS
         .iter()
-        .find(|bundled| bundled.0.manifest().id == id)
+        .find(|bundled| bundled.extension.manifest().id == id)
+}
+
+pub(crate) fn validate_observe_options(options: &ObserveOptions) -> Result<()> {
+    let Some(id) = options.extension_id.as_deref() else {
+        return Ok(());
+    };
+    observer_descriptor(id).map(|_| ())
+}
+
+pub(crate) fn bundled_round_observer(
+    options: &ObserveOptions,
+    enabled: &BTreeSet<String>,
+) -> Result<Option<(RoundObserverConfig, Arc<dyn Extension>)>> {
+    let Some(id) = options.extension_id.as_deref() else {
+        return Ok(None);
+    };
+    let (descriptor, commands) = observer_descriptor(id)?;
+    if !enabled.contains(id) {
+        return Err(anyhow!(
+            "--observe {id} requires extension {id} to be enabled; enable it with --extensions {id} or your Euler extension registry/project config"
+        ));
+    }
+    let cadence_rounds = options
+        .cadence_rounds
+        .unwrap_or_else(default_observe_cadence);
+    let extension = bundled_extension_arc(&descriptor.id)?;
+    Ok(Some((
+        RoundObserverConfig {
+            cadence_rounds,
+            brief_command: commands.brief.to_owned(),
+            apply_command: commands.apply.to_owned(),
+        },
+        extension,
+    )))
+}
+
+fn observer_descriptor(id: &str) -> Result<(BundledDescriptor, ObserverCommandPair)> {
+    let descriptor = bundled_descriptor_by_id(id)?.ok_or_else(|| unknown_observe_id_error(id))?;
+    let commands = descriptor.observer_commands.ok_or_else(|| {
+        anyhow!("--observe {id} is not supported: extension {id} declares no observer command pair")
+    })?;
+    if descriptor.command(commands.brief).is_none() {
+        return Err(anyhow!(
+            "bundled extension {id} observer brief command {} is not registered",
+            commands.brief
+        ));
+    }
+    if descriptor.command(commands.apply).is_none() {
+        return Err(anyhow!(
+            "bundled extension {id} observer apply command {} is not registered",
+            commands.apply
+        ));
+    }
+    Ok((descriptor, commands))
+}
+
+fn bundled_extension_arc(id: &str) -> Result<Arc<dyn Extension>> {
+    let bundled = bundled_extension_by_id(id).ok_or_else(|| unknown_observe_id_error(id))?;
+    Ok(Arc::new(StaticExtension(bundled.extension)))
+}
+
+fn unknown_observe_id_error(id: &str) -> anyhow::Error {
+    let valid = bundled_descriptors()
+        .map(|descriptors| {
+            descriptors
+                .into_iter()
+                .filter(|descriptor| descriptor.observer_commands.is_some())
+                .map(|descriptor| descriptor.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|_| "<registry unavailable>".to_owned());
+    anyhow!("unknown extension id for --observe: {id}; observer-capable extensions: {valid}")
+}
+
+fn default_observe_cadence() -> NonZeroU64 {
+    NonZeroU64::new(DEFAULT_OBSERVE_CADENCE_ROUNDS).expect("default observer cadence is non-zero")
+}
+
+struct StaticExtension(&'static dyn Extension);
+
+impl Extension for StaticExtension {
+    fn manifest(&self) -> ExtensionManifest {
+        self.0.manifest()
+    }
+
+    fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        self.0.register(registrar)
+    }
 }
 
 fn bundled_descriptor(
     table_index: usize,
     bundled: &'static BundledExtension,
 ) -> Result<BundledDescriptor> {
-    let manifest = bundled.0.manifest();
+    let manifest = bundled.extension.manifest();
     let mut registrar = DescriptorRegistrar::default();
-    bundled.0.register(&mut registrar).map_err(|error| {
-        anyhow!(
-            "bundled extension {} registration failed: {error:?}",
-            manifest.id
-        )
-    })?;
+    bundled
+        .extension
+        .register(&mut registrar)
+        .map_err(|error| {
+            anyhow!(
+                "bundled extension {} registration failed: {error:?}",
+                manifest.id
+            )
+        })?;
     Ok(BundledDescriptor {
         id: manifest.id,
         display_name: manifest.display_name,
@@ -134,6 +284,7 @@ fn bundled_descriptor(
         runtime_kind: "native-rust",
         capabilities: manifest.capabilities,
         commands: registrar.0,
+        observer_commands: bundled.observer_commands,
         table_index,
     })
 }

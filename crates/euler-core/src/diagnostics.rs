@@ -90,6 +90,23 @@ pub(crate) fn extension_command_end(
     );
 }
 
+pub(crate) fn round_observer_end(
+    session_id: &str,
+    rounds: u64,
+    duration_ms: u64,
+    failed_stage: Option<&'static str>,
+) {
+    tracing::info!(
+        target: TARGET,
+        event = "round_observer_end",
+        session_id,
+        rounds,
+        duration_ms,
+        ok = failed_stage.is_none(),
+        failed_stage
+    );
+}
+
 pub(crate) fn provenance_append_end(session_id: &str, events: u64, bytes: u64, duration_ms: u64) {
     tracing::debug!(
         target: TARGET,

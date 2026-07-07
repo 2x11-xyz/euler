@@ -11,6 +11,8 @@ const SESSION_OPTIONS: &str = "  \
   --model <name>             Model id (default: the provider's default model)
   --provider-option <k=v>    Provider-specific option (repeatable)
   --extensions <ids|none>    Comma-separated extension ids to enable
+  --observe <extension-id>   Run that bundled extension's round observer
+  --observe-cadence <n>      Observer cadence in driver rounds (default: 8)
   --auth-file <path>         Read credentials from <path>
   --provenance <path>        Write the provenance log to <path>
 ";
@@ -127,6 +129,7 @@ fn exec_help() -> String {
 
 Usage: euler exec [OPTIONS] [PROMPT]...
        euler exec [OPTIONS] -- <PROMPT>...
+       euler exec --resume <path-or-id> [OPTIONS] [PROMPT]...
 
 Non-flag arguments are joined into the prompt; after `--` every argument
 is a prompt word, even if it starts with `-`. With no prompt arguments

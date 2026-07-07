@@ -175,7 +175,7 @@ pub(super) fn execute_session_export(export: ProvenanceExportArgs) -> Result<ser
     execute_offline_extension_run(OfflineExtensionRun {
         extension_id: "session-export",
         command,
-        extension: bundled.0,
+        extension: bundled.extension,
         target: export.target,
         input,
     })

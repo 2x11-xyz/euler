@@ -64,7 +64,7 @@ fn exec_help_lists_verified_flags_and_defaults() {
     assert!(text.contains("default: stubs"));
     assert!(text.contains("default: 640000"));
     assert!(text.contains("default: unlimited"));
-    assert!(!text.contains("--resume"), "exec rejects --resume");
+    assert!(text.contains("exec --resume"));
 }
 
 #[test]

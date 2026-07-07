@@ -75,7 +75,7 @@ pub use resume::{
 pub use session::{
     fold_model_target, fold_reasoning_effort, AgentReporter, AgentResultSummary, BackgroundAgent,
     BackgroundAgentPoll, BackgroundAgentReportDrain, ContextLimitConfig, ExtensionExecutionError,
-    ModelTarget, Session, SessionConfig, SessionError,
+    ModelTarget, RoundObserverConfig, Session, SessionConfig, SessionError,
 };
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};
 pub use tools::{ToolError, ToolRegistry};
