@@ -1,7 +1,7 @@
 //! Session state machine: turn loop, tool dispatch, compaction integration.
 //! Justification for >1000 lines: session.rs owns the main turn lifecycle while focused subsystems are extracted.
 use crate::canvas::{
-    assemble_canvas, assemble_canvas_with_compaction, canvas_bytes, canvas_prompt, retention_stats,
+    assemble_canvas, assemble_canvas_with_compaction, canvas_bytes, retention_stats,
     AutoCompactionPolicy, CompactionTier,
 };
 use crate::canvas::{render_context_slot, CanvasItem, CanvasRole};
@@ -86,6 +86,12 @@ impl ContextLimitConfig {
             limit_tokens,
             threshold,
         })
+    }
+
+    /// Catalog-derived window for compaction and usage telemetry. Hard-stop
+    /// threshold is 1.0 so the token-reserve compaction path can fire first.
+    pub fn from_catalog_window(limit_tokens: u64) -> Option<Self> {
+        Self::new(limit_tokens, 1.0)
     }
 
     pub fn limit_tokens(&self) -> u64 {
@@ -612,6 +618,16 @@ impl<D> Session<D> {
                         "budget_bytes": config.auto_compaction.budget_bytes,
                     }),
                 ),
+                (
+                    "context_limit",
+                    match config.context_limit {
+                        Some(limit) => json!({
+                            "limit_tokens": limit.limit_tokens(),
+                            "source": "catalog",
+                        }),
+                        None => Value::Null,
+                    },
+                ),
                 ("root", session_root_for_event(&config.root).into()),
             ]),
         ));
@@ -678,11 +694,8 @@ impl<D> Session<D> {
             self.config.compaction_keep_recent,
             4, // min_lines
         );
-        let canvas = assemble_canvas_with_compaction(
-            self.bus.events(),
-            &self.config.auto_compaction,
-            &candidates,
-        );
+        let policy = self.effective_stub_policy();
+        let canvas = assemble_canvas_with_compaction(self.bus.events(), &policy, &candidates);
         let actually_compacted = canvas
             .iter()
             .filter_map(|item| match item {
@@ -813,6 +826,33 @@ impl<D> Session<D> {
 
     pub fn session_id(&self) -> &str {
         &self.config.session_id
+    }
+
+    pub fn auto_compaction_policy(&self) -> AutoCompactionPolicy {
+        self.config.auto_compaction
+    }
+
+    pub fn context_limit_tokens(&self) -> Option<u64> {
+        self.config.context_limit.map(|limit| limit.limit_tokens())
+    }
+
+    pub fn compaction_reserve_tokens(&self) -> usize {
+        self.config.compaction_reserve_tokens
+    }
+
+    fn effective_stub_policy(&self) -> AutoCompactionPolicy {
+        let mut policy = self.config.auto_compaction;
+        policy.budget_bytes = effective_stub_budget(
+            policy.budget_bytes,
+            self.config
+                .context_limit
+                .map(|limit| limit.limit_tokens() as usize),
+            self.config.compaction_reserve_tokens,
+            self.latest_model_usage
+                .as_ref()
+                .map(|usage| usage.used_tokens as usize),
+        );
+        policy
     }
 
     pub fn latest_model_usage_used_tokens(&self) -> Option<u64> {
@@ -1124,6 +1164,7 @@ impl<D: PermissionDecider> Session<D> {
         to_provider: &str,
         to_model: &str,
         reason: &str,
+        context_limit: Option<ContextLimitConfig>,
     ) -> Result<bool, SessionError> {
         let next = ModelTarget::new(to_provider, to_model);
         if next == self.active_target {
@@ -1158,7 +1199,15 @@ impl<D: PermissionDecider> Session<D> {
             self.persisted_events = self.bus.events().len();
         }
         self.active_target = next;
+        // Compaction/hard-stop windows track the active model, not the launch
+        // model. Unknown catalog windows clear the prior limit rather than
+        // leaving a stale threshold.
+        self.config.context_limit = context_limit;
         Ok(true)
+    }
+
+    pub fn set_context_limit(&mut self, context_limit: Option<ContextLimitConfig>) {
+        self.config.context_limit = context_limit;
     }
 
     pub fn set_reasoning_effort(
@@ -1296,8 +1345,9 @@ impl<D: PermissionDecider> Session<D> {
     where
         F: FnMut(&EventEnvelope),
     {
-        let canvas = assemble_canvas(self.bus.events(), &self.config.auto_compaction);
-        if let Some(error) = context_budget_exhausted(self.config.auto_compaction, &canvas) {
+        let policy = self.effective_stub_policy();
+        let canvas = assemble_canvas(self.bus.events(), &policy);
+        if let Some(error) = context_budget_exhausted(policy, &canvas) {
             self.emit(
                 EventKind::ERROR,
                 object([
@@ -1310,7 +1360,12 @@ impl<D: PermissionDecider> Session<D> {
         }
         self.emit(
             EventKind::CANVAS_SNAPSHOT,
-            canvas_snapshot_payload(&canvas, self.config.auto_compaction),
+            canvas_snapshot_payload(
+                &canvas,
+                policy,
+                self.latest_model_usage.as_ref().map(|u| u.used_tokens),
+                self.config.context_limit.map(|l| l.limit_tokens()),
+            ),
         )?;
         sink.flush(self.bus.events());
 
@@ -1469,11 +1524,8 @@ impl<D: PermissionDecider> Session<D> {
         let threshold = window.saturating_sub(self.config.compaction_reserve_tokens);
         let candidates =
             select_layer1_candidates(self.bus.events(), self.config.compaction_keep_recent, 4);
-        let compacted = assemble_canvas_with_compaction(
-            self.bus.events(),
-            &self.config.auto_compaction,
-            &candidates,
-        );
+        let policy = self.effective_stub_policy();
+        let compacted = assemble_canvas_with_compaction(self.bus.events(), &policy, &candidates);
         if !candidates.is_empty() && estimated_tokens(&compacted) <= threshold {
             return self.emit_layer1_swap(&candidates);
         }
@@ -1629,7 +1681,10 @@ impl<D: PermissionDecider> Session<D> {
 
         let tool_name = call.name.clone();
         let tool_started = Instant::now();
-        match self.tools.execute(&call.name, &call.input) {
+        match self
+            .tools
+            .execute_with_events(&call.name, &call.input, self.bus.events())
+        {
             Ok(execution) => {
                 if let Some(patch) = execution.patch {
                     let payload = object([
@@ -1870,13 +1925,32 @@ fn context_budget_exhausted(
     })
 }
 
-fn canvas_snapshot_payload(canvas: &[CanvasItem], policy: AutoCompactionPolicy) -> JsonObject {
+fn canvas_snapshot_payload(
+    canvas: &[CanvasItem],
+    policy: AutoCompactionPolicy,
+    used_tokens: Option<u64>,
+    limit_tokens: Option<u64>,
+) -> JsonObject {
     let selected_event_ids = canvas
         .iter()
         .map(|item| item.event_id().to_owned())
         .collect::<Vec<_>>();
     let stats = retention_stats(canvas);
-    object([
+    let over_budget = stats.retained_bytes > policy.budget_bytes;
+    let token_pressure = match (used_tokens, limit_tokens) {
+        (Some(used), Some(limit)) if limit > 0 => {
+            // Saturating/widened: provider usage is external input.
+            u128::from(used).saturating_mul(5) > u128::from(limit).saturating_mul(4)
+        }
+        _ => false,
+    };
+    let pressure = match (over_budget, token_pressure) {
+        (true, true) => "both",
+        (true, false) => "byte",
+        (false, true) => "token",
+        (false, false) => "none",
+    };
+    let mut payload = object([
         ("selected_event_ids", selected_event_ids.into()),
         ("counts", canvas_counts(canvas).into()),
         ("retained_items", stats.retained_items.into()),
@@ -1888,11 +1962,16 @@ fn canvas_snapshot_payload(canvas: &[CanvasItem], policy: AutoCompactionPolicy) 
         // canvas whose facts alone exceed the budget stays over budget and
         // the round proceeds. Telemetry must say so rather than let the
         // snapshot look policy-compliant.
-        (
-            "over_budget",
-            (stats.retained_bytes > policy.budget_bytes).into(),
-        ),
-    ])
+        ("over_budget", over_budget.into()),
+        ("pressure", pressure.into()),
+    ]);
+    if let Some(used) = used_tokens {
+        payload.insert("used_tokens".to_owned(), used.into());
+    }
+    if let Some(limit) = limit_tokens {
+        payload.insert("limit_tokens".to_owned(), limit.into());
+    }
+    payload
 }
 
 fn canvas_counts(canvas: &[CanvasItem]) -> JsonObject {
@@ -2146,7 +2225,30 @@ fn used_tokens(usage: &Usage) -> u64 {
     usage.input_tokens.saturating_add(usage.output_tokens)
 }
 fn estimated_tokens(canvas: &[CanvasItem]) -> usize {
-    canvas_prompt(canvas).split_whitespace().count()
+    // Same bytes/4 proxy as DEFAULT_CANVAS_BUDGET_BYTES (no tokenizer dependency).
+    canvas_bytes(canvas).div_ceil(4)
+}
+
+/// Soft token pressure: when usage exceeds 80% of the known window, tighten
+/// the stub budget to the token-proxy headroom so demotion can help before
+/// the provider hard-limits.
+fn effective_stub_budget(
+    configured_budget_bytes: usize,
+    limit_tokens: Option<usize>,
+    reserve_tokens: usize,
+    used_tokens: Option<usize>,
+) -> usize {
+    let Some(limit) = limit_tokens.filter(|limit| *limit > 0) else {
+        return configured_budget_bytes;
+    };
+    let Some(used) = used_tokens else {
+        return configured_budget_bytes;
+    };
+    if used.saturating_mul(5) <= limit.saturating_mul(4) {
+        return configured_budget_bytes;
+    }
+    let token_proxy_budget = limit.saturating_sub(reserve_tokens).saturating_mul(4);
+    configured_budget_bytes.min(token_proxy_budget)
 }
 
 fn file_change_payload(tool_call_id: &str, patch: &PatchEvents) -> JsonObject {

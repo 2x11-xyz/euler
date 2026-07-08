@@ -1103,3 +1103,36 @@ fn run_shell_fast_command_unaffected_by_timeout_default() {
     assert!(execution.output.contains("fast"));
     assert!(!execution.output.contains("timed out"));
 }
+
+#[test]
+fn tool_result_get_rehydrates_session_tool_result_by_event_id() {
+    use euler_event::{object, EventEnvelope, EventKind};
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-1".into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+            ("output", "full file body\nline 2".into()),
+        ]),
+    );
+    let event_id = event.id.clone();
+    let registry = ToolRegistry::new(".");
+    let execution = registry
+        .execute_with_events("tool_result_get", &json!({"event_id": event_id}), &[event])
+        .expect("rehydrate");
+    assert!(execution.output.contains("full file body"));
+    assert!(execution.output.contains("rehydrated read_file"));
+}
+
+#[test]
+fn model_tools_includes_tool_result_get() {
+    let registry = ToolRegistry::new(".");
+    assert!(registry
+        .model_tools()
+        .iter()
+        .any(|tool| tool.name == "tool_result_get"));
+}

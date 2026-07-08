@@ -153,6 +153,7 @@ pub enum CommandAction {
         name: String,
     },
     CompactSession,
+    ShowCompaction,
     ExportSession {
         path: Option<String>,
     },
@@ -242,6 +243,11 @@ const COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec {
         token: "/compact",
         summary: "compact eligible history",
+        args: "",
+    },
+    CommandSpec {
+        token: "/compaction",
+        summary: "show canvas retention status",
         args: "",
     },
     CommandSpec {
@@ -382,6 +388,7 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/effort" => effort_effect(parsed.arg, context),
         "/theme" => theme_effect(parsed.arg, context),
         "/compact" => CommandEffect::Action(CommandAction::CompactSession),
+        "/compaction" => CommandEffect::Action(CommandAction::ShowCompaction),
         "/export" => CommandEffect::Action(CommandAction::ExportSession {
             path: parsed.arg.map(str::to_owned),
         }),

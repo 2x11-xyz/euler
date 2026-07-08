@@ -1138,7 +1138,7 @@ fn tui_provider_set_allows_cross_provider_switch_model() {
     let mut session = Session::new_with_providers(config, providers, CliDecider);
 
     assert!(session
-        .switch_model("openrouter", "openai/gpt-4.1-mini", "user")
+        .switch_model("openrouter", "openai/gpt-4.1-mini", "user", None)
         .expect("cross-provider switch"));
 }
 
@@ -1172,7 +1172,7 @@ fn tui_provider_set_preserves_provider_owned_auth_errors_after_switch() {
     let mut session = Session::new_with_providers(config, providers, CliDecider);
 
     assert!(session
-        .switch_model("local-openai", "qwen", "user")
+        .switch_model("local-openai", "qwen", "user", None)
         .expect("custom switch"));
     let error = session.run_turn("hello").expect_err("missing api key");
     let message = error.to_string();

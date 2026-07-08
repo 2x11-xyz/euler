@@ -298,7 +298,10 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     ) -> Result<(), SessionError> {
         let tool_name = call.name.clone();
         let tool_started = Instant::now();
-        match self.tools.execute(&call.name, &call.input) {
+        match self
+            .tools
+            .execute_with_events(&call.name, &call.input, self.bus.events())
+        {
             Ok(execution) => {
                 if self.record_patch_if_present(&call, &tool_call_event_id, &execution)? {
                     crate::diagnostics::tool_exec_end(
@@ -584,7 +587,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         }
         self.append(
             EventKind::CANVAS_SNAPSHOT,
-            canvas_snapshot_payload(&canvas, self.auto_compaction),
+            canvas_snapshot_payload(&canvas, self.auto_compaction, None, None),
             None,
         )?;
         let mut model_call = object([

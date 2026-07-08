@@ -658,7 +658,7 @@ fn assemble_canvas_with_compaction_marks_eligible_tool_output() {
             assert!(*compacted);
             assert_eq!(
                 output,
-                "⟨compacted⟩\none\ntwo\nthree\n... (4 total lines, re-read to recover)"
+                "⟨compacted⟩\none\ntwo\nthree\n... (4 total lines; prefer tool_result_get with event_id, else re-read to recover)"
             );
         }
         item => panic!("unexpected item: {item:?}"),

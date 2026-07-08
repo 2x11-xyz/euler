@@ -241,7 +241,7 @@ fn live_extension_context_slot_update_enters_next_canvas_and_model_input() {
     let canvas = assemble_canvas(session.events(), &AutoCompactionPolicy::default());
 
     assert_eq!(
-        canvas_prompt(&canvas),
+        crate::canvas::canvas_prompt(&canvas),
         "[slot slot-ext:main]\n    live context"
     );
     assert!(read_provenance(&log)

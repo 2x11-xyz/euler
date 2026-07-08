@@ -309,7 +309,7 @@ pub fn compact_tool_output(output: &str, max_preview_lines: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "⟨compacted⟩\n{preview}\n... ({} total lines, re-read to recover)",
+        "⟨compacted⟩\n{preview}\n... ({} total lines; prefer tool_result_get with event_id, else re-read to recover)",
         lines.len()
     )
 }

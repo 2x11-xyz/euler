@@ -2,6 +2,7 @@ use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
     ApplyPatchDocument, ApplyPatchError, ObservedFileChange,
 };
+use euler_event::{EventEnvelope, EventKind};
 use euler_provider::ToolDefinition;
 use euler_sdk::Capability;
 use serde_json::json;
@@ -80,7 +81,7 @@ impl ToolRegistry {
 
     pub fn required_capability(&self, name: &str) -> Option<Capability> {
         match name {
-            "read_file" | "git_status" | "git_diff" => Some(Capability::FsRead),
+            "read_file" | "git_status" | "git_diff" | "tool_result_get" => Some(Capability::FsRead),
             "edit_file" | "apply_patch" => Some(Capability::FsWrite),
             "run_shell" => Some(Capability::ShellExec),
             _ => None,
@@ -111,80 +112,29 @@ impl ToolRegistry {
             "run_shell" => self.run_shell(input),
             "git_status" => self.git(&["status", "--short"], "git_status"),
             "git_diff" => self.git(&["diff", "--"], "git_diff"),
+            "tool_result_get" => Err(ToolError::InvalidField(
+                "tool_result_get requires session events",
+            )),
             other => Err(ToolError::Unsupported(other.to_owned())),
         }
     }
 
+    pub fn execute_with_events(
+        &self,
+        name: &str,
+        input: &Value,
+        events: &[EventEnvelope],
+    ) -> Result<ToolExecution, ToolError> {
+        if name == "tool_result_get" {
+            return tool_result_get(events, input);
+        }
+        self.execute(name, input)
+    }
+
     pub fn model_tools(&self) -> Vec<ToolDefinition> {
-        vec![
-            ToolDefinition {
-                name: "read_file".to_owned(),
-                description: "Read a UTF-8 file under the workspace root, optionally starting at a 1-indexed line offset for windowed reads. The path must be relative to the workspace root; absolute and parent-traversal paths are rejected.".to_owned(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "offset": {"type": "integer", "minimum": 1},
-                        "max_bytes": {"type": "integer", "minimum": 1},
-                        "max_lines": {"type": "integer", "minimum": 1}
-                    },
-                    "required": ["path"],
-                    "additionalProperties": false
-                }),
-            },
-            ToolDefinition {
-                name: "edit_file".to_owned(),
-                description: "Replace exactly one text occurrence in a UTF-8 file under the workspace root. The path must be relative to the workspace root; absolute and parent-traversal paths are rejected.".to_owned(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "old": {"type": "string"},
-                        "new": {"type": "string"}
-                    },
-                    "required": ["path", "old", "new"],
-                    "additionalProperties": false
-                }),
-            },
-            ToolDefinition {
-                name: "apply_patch".to_owned(),
-                description: "Apply one structured patch envelope to add or update one UTF-8 file under the workspace root. Prefer this over shell commands for code and text edits. File paths inside the patch must be relative to the workspace root; absolute paths (for example /tmp/name.py) and parent-traversal paths are rejected. Updates may contain multiple hunks for the same file. V0 rejects delete, rename, and multi-file patches.".to_owned(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "patch": {"type": "string"}
-                    },
-                    "required": ["patch"],
-                    "additionalProperties": false
-                }),
-            },
-            ToolDefinition {
-                name: "run_shell".to_owned(),
-                description: "Run a shell command in the workspace root. Commands time out \
-after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
-                    .to_owned(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "max_bytes": {"type": "integer", "minimum": 1},
-                        "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS}
-                    },
-                    "required": ["command"],
-                    "additionalProperties": false
-                }),
-            },
-            ToolDefinition {
-                name: "git_status".to_owned(),
-                description: "Return short git status for the workspace.".to_owned(),
-                parameters: empty_parameters(),
-            },
-            ToolDefinition {
-                name: "git_diff".to_owned(),
-                description: "Return git diff for the workspace.".to_owned(),
-                parameters: empty_parameters(),
-            },
-        ]
+        let mut tools = coding_tool_definitions();
+        tools.push(tool_result_get_definition());
+        tools
     }
 
     fn read_file(&self, input: &Value) -> Result<ToolExecution, ToolError> {
@@ -798,6 +748,176 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+fn coding_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "read_file".to_owned(),
+            description: "Read a UTF-8 file under the workspace root, optionally starting at a 1-indexed line offset for windowed reads. The path must be relative to the workspace root; absolute and parent-traversal paths are rejected.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 1},
+                    "max_bytes": {"type": "integer", "minimum": 1},
+                    "max_lines": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "edit_file".to_owned(),
+            description: "Replace exactly one text occurrence in a UTF-8 file under the workspace root. The path must be relative to the workspace root; absolute and parent-traversal paths are rejected.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old": {"type": "string"},
+                    "new": {"type": "string"}
+                },
+                "required": ["path", "old", "new"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "apply_patch".to_owned(),
+            description: "Apply one structured patch envelope to add or update one UTF-8 file under the workspace root. Prefer this over shell commands for code and text edits. File paths inside the patch must be relative to the workspace root; absolute paths (for example /tmp/name.py) and parent-traversal paths are rejected. Updates may contain multiple hunks for the same file. V0 rejects delete, rename, and multi-file patches.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string"}
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "run_shell".to_owned(),
+            description: "Run a shell command in the workspace root. Commands time out \
+after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "max_bytes": {"type": "integer", "minimum": 1},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "git_status".to_owned(),
+            description: "Return short git status for the workspace.".to_owned(),
+            parameters: empty_parameters(),
+        },
+        ToolDefinition {
+            name: "git_diff".to_owned(),
+            description: "Return git diff for the workspace.".to_owned(),
+            parameters: empty_parameters(),
+        },
+    ]
+}
+
+fn tool_result_get_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "tool_result_get".to_owned(),
+        description: "Rehydrate a demoted or compacted tool result from the current session by event_id (required). Use the event id printed in canvas stubs (`event <id>`) instead of re-running the original tool.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string"},
+                "max_bytes": {"type": "integer", "minimum": 1}
+            },
+            "required": ["event_id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn tool_result_get(events: &[EventEnvelope], input: &Value) -> Result<ToolExecution, ToolError> {
+    let max_bytes = input
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(64 * 1024)
+        .max(1);
+    let event = find_tool_result_event(events, input)?;
+    let name = event
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let ok = event
+        .payload
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let content = tool_result_content(event, ok);
+    let body = truncate_rehydrate_body(content, max_bytes);
+    let status = if ok { "ok" } else { "failed" };
+    Ok(ToolExecution {
+        name: "tool_result_get".to_owned(),
+        output: format!("[rehydrated {name} event {} ({status})]\n{body}", event.id),
+        exit_code: None,
+        patch: None,
+        file_changes: Vec::new(),
+    })
+}
+
+fn find_tool_result_event<'a>(
+    events: &'a [EventEnvelope],
+    input: &Value,
+) -> Result<&'a EventEnvelope, ToolError> {
+    // Live bus and resume rehydration keep tool output inline with empty
+    // `blobs`; only event_id is a reliable session-local handle.
+    let event_id = input
+        .get("event_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ToolError::MissingField("event_id"))?;
+    let event = events
+        .iter()
+        .find(|event| event.id == event_id)
+        .ok_or(ToolError::InvalidField("event_id"))?;
+    if event.kind.as_str() != EventKind::TOOL_RESULT {
+        return Err(ToolError::InvalidField("event_id"));
+    }
+    Ok(event)
+}
+
+fn tool_result_content(event: &EventEnvelope, ok: bool) -> &str {
+    if ok {
+        event
+            .payload
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    } else {
+        event
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .or_else(|| event.payload.get("output").and_then(Value::as_str))
+            .unwrap_or("")
+    }
+}
+
+fn truncate_rehydrate_body(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_owned();
+    }
+    let cut = floor_char_boundary(content, max_bytes);
+    format!(
+        "{}\n[truncated: showing {} of {} bytes; call tool_result_get with a larger max_bytes for more]",
+        &content[..cut],
+        cut,
+        content.len()
+    )
 }
 
 #[cfg(test)]

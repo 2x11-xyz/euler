@@ -1030,6 +1030,7 @@ impl AppCore {
             CommandAction::SwitchModel { provider, model } => self.switch_model(provider, model),
             CommandAction::SetReasoningEffort { effort } => self.set_reasoning_effort(effort),
             CommandAction::CompactSession => self.compact_session(),
+            CommandAction::ShowCompaction => self.show_compaction_status(),
             CommandAction::ExportSession { path } => self.export_session(path),
             CommandAction::ExtensionRun { id, command, input } => {
                 self.extension_run(id, command, input)
@@ -1121,6 +1122,33 @@ impl AppCore {
             Ok(false) => self.notice_item(format!("reasoning effort already {}", effort.as_str())),
             Err(error) => self.notice_item(format!("reasoning effort rejected: {error}")),
         }
+    }
+
+    fn show_compaction_status(&mut self) -> CoreEffect {
+        let AppState::Idle { session } = &self.state else {
+            return self.notice_item("compaction status waits for the active turn".to_owned());
+        };
+        let policy = session.auto_compaction_policy();
+        let demoted = self.token_usage.demoted_items;
+        let retained = self
+            .token_usage
+            .canvas_retained_bytes
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        let limit = session
+            .context_limit_tokens()
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let used = session
+            .latest_model_usage_used_tokens()
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "unknown".to_owned());
+        self.notice_item(format!(
+            "compaction tier={} budget_bytes={} retained_bytes={retained} demoted={demoted} limit_tokens={limit} used_tokens={used} reserve={}",
+            policy.tier.as_str(),
+            policy.budget_bytes,
+            session.compaction_reserve_tokens()
+        ))
     }
 
     fn compact_session(&mut self) -> CoreEffect {
@@ -1436,6 +1464,10 @@ impl AppCore {
         );
         config.extensions_enabled = seed_config.extensions_enabled;
         config.round_observer = seed_config.round_observer;
+        // Compaction window follows the active model after fold (post-switch).
+        config.provider = folded.active_target.provider.clone();
+        config.model = folded.active_target.model.clone();
+        crate::session_lifecycle::apply_catalog_context_limit(&mut config, &self.model_catalog);
         let providers = crate::resume_provider_set(
             folded
                 .original_target
@@ -1519,7 +1551,17 @@ impl AppCore {
         let AppState::Idle { session } = &mut self.state else {
             return self.notice_item("model switch waits for the active turn".to_owned());
         };
-        match session.switch_model(&provider, &model, "user") {
+        let context_limit = self
+            .model_catalog
+            .provider(&provider)
+            .and_then(|descriptor| {
+                descriptor
+                    .models()
+                    .find(|entry| entry.id() == model)
+                    .and_then(|entry| entry.context_window_tokens())
+            })
+            .and_then(euler_core::ContextLimitConfig::from_catalog_window);
+        match session.switch_model(&provider, &model, "user", context_limit) {
             Ok(true) => self.accept_model_switch(provider, model, true),
             Ok(false) => self.accept_model_switch(provider, model, false),
             Err(error) => self.notice_item(format!("model switch rejected: {error}")),

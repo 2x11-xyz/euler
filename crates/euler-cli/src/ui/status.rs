@@ -17,6 +17,10 @@ pub struct TokenUsageSnapshot {
     pub output_tokens: u64,
     pub reasoning_tokens: Option<u64>,
     pub context_window_tokens: Option<u64>,
+    pub demoted_items: u64,
+    pub canvas_retained_bytes: Option<u64>,
+    pub canvas_budget_bytes: Option<u64>,
+    pub compaction_tier: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,11 +130,30 @@ impl Widget for StatusWidget<'_> {
 }
 
 pub fn context_segment(snapshot: &TokenUsageSnapshot) -> String {
-    let Some(window) = snapshot.context_window_tokens.filter(|window| *window > 0) else {
-        return "Context ?% used".to_owned();
+    let mut base = match snapshot.context_window_tokens.filter(|window| *window > 0) {
+        Some(window) => {
+            let percent = rounded_context_percent(snapshot.input_tokens, window).min(99);
+            format!("Context {percent}% used")
+        }
+        None => match (snapshot.canvas_retained_bytes, snapshot.canvas_budget_bytes) {
+            (Some(retained), Some(budget)) if budget > 0 => {
+                format!(
+                    "Canvas {}KB/{}KB",
+                    retained.div_ceil(1024),
+                    budget.div_ceil(1024)
+                )
+            }
+            _ => "Context ?% used".to_owned(),
+        },
     };
-    let percent = rounded_context_percent(snapshot.input_tokens, window).min(99);
-    format!("Context {percent}% used")
+    if snapshot.demoted_items > 0 {
+        base.push_str(&format!(" · {} demoted", snapshot.demoted_items));
+        if let Some(tier) = snapshot.compaction_tier.as_deref() {
+            base.push_str(" · ");
+            base.push_str(tier);
+        }
+    }
+    base
 }
 
 fn rounded_context_percent(input_tokens: u64, window: u64) -> u64 {
@@ -376,6 +399,10 @@ mod tests {
             output_tokens: 50_000,
             reasoning_tokens: Some(25_000),
             context_window_tokens: Some(1_000_000),
+            demoted_items: 0,
+            canvas_retained_bytes: None,
+            canvas_budget_bytes: None,
+            compaction_tier: None,
         };
 
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 120);
@@ -500,6 +527,10 @@ mod tests {
             output_tokens: 25,
             reasoning_tokens: None,
             context_window_tokens: None,
+            demoted_items: 0,
+            canvas_retained_bytes: None,
+            canvas_budget_bytes: None,
+            compaction_tier: None,
         };
 
         assert_eq!(context_segment(&snapshot), "Context ?% used");
@@ -512,6 +543,10 @@ mod tests {
             output_tokens: u64::MAX,
             reasoning_tokens: Some(u64::MAX),
             context_window_tokens: Some(1),
+            demoted_items: 0,
+            canvas_retained_bytes: None,
+            canvas_budget_bytes: None,
+            compaction_tier: None,
         };
 
         assert!(context_segment(&snapshot).contains("Context "));
@@ -525,6 +560,10 @@ mod tests {
             output_tokens: 999,
             reasoning_tokens: None,
             context_window_tokens: Some(1_000),
+            demoted_items: 0,
+            canvas_retained_bytes: None,
+            canvas_budget_bytes: None,
+            compaction_tier: None,
         };
 
         assert_eq!(context_segment(&snapshot), "Context 13% used");
@@ -534,8 +573,29 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: None,
             context_window_tokens: Some(1_000),
+            demoted_items: 0,
+            canvas_retained_bytes: None,
+            canvas_budget_bytes: None,
+            compaction_tier: None,
         };
 
         assert_eq!(context_segment(&clamped), "Context 99% used");
+    }
+    #[test]
+    fn demoted_items_append_to_context_segment() {
+        let snapshot = TokenUsageSnapshot {
+            input_tokens: 120_000,
+            output_tokens: 0,
+            reasoning_tokens: None,
+            context_window_tokens: Some(1_000_000),
+            demoted_items: 12,
+            canvas_retained_bytes: Some(600_000),
+            canvas_budget_bytes: Some(640_000),
+            compaction_tier: Some("stubs".to_owned()),
+        };
+        assert_eq!(
+            context_segment(&snapshot),
+            "Context 12% used · 12 demoted · stubs"
+        );
     }
 }
