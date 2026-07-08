@@ -214,7 +214,7 @@ fn resume_items_from_records_at(
         .collect()
 }
 
-fn session_resume_label(record: &SessionRecord) -> String {
+pub(super) fn session_resume_label(record: &SessionRecord) -> String {
     record
         .name()
         .or_else(|| record.title())
@@ -231,17 +231,16 @@ fn resume_detail(record: &SessionRecord) -> String {
 
 fn relative_age(updated_at_ms: u64, now_ms: u64) -> String {
     let elapsed_secs = now_ms.saturating_sub(updated_at_ms) / 1000;
-    let minutes = elapsed_secs.div_ceil(60).max(1);
+    if elapsed_secs < 60 {
+        return "just now".to_owned();
+    }
+    let minutes = elapsed_secs / 60;
     if minutes < 60 {
         return format!("{minutes}m ago");
     }
     let hours = minutes / 60;
-    let remaining_minutes = minutes % 60;
     if hours < 24 {
-        if remaining_minutes == 0 {
-            return format!("{hours}h ago");
-        }
-        return format!("{hours}h {remaining_minutes}m ago");
+        return format!("{hours}h ago");
     }
     format!("{}d ago", hours / 24)
 }
@@ -388,5 +387,15 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(!items.iter().any(|item| item.id == current.id()));
         assert!(items.iter().any(|item| item.id == prior.id()));
+    }
+
+    #[test]
+    fn relative_age_uses_compact_buckets() {
+        assert_eq!(relative_age(1_000, 1_000), "just now");
+        assert_eq!(relative_age(0, 59_000), "just now");
+        assert_eq!(relative_age(0, 60_000), "1m ago");
+        assert_eq!(relative_age(0, 3_600_000), "1h ago");
+        assert_eq!(relative_age(0, 86_400_000), "1d ago");
+        assert_eq!(relative_age(0, 900_000_000), "10d ago");
     }
 }

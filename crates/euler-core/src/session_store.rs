@@ -332,10 +332,12 @@ impl SessionStore {
             .as_ref()
             .and_then(|metadata| metadata.root.as_deref())
             .and_then(session_root_from_str);
+        let sidecar_kind = sidecar.as_ref().and_then(|metadata| metadata.kind);
         let projection = session_projection_from_events_or_sidecar(
             &dir.join("events.jsonl"),
             sidecar_name,
             sidecar_root,
+            sidecar_kind,
         );
         SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projection)
     }
@@ -693,6 +695,7 @@ fn session_projection_from_events_or_sidecar(
     path: &Path,
     sidecar_name: Option<String>,
     sidecar_root: Option<PathBuf>,
+    sidecar_kind: Option<SessionKind>,
 ) -> SessionProjection {
     // `read_resume_prefix` reads the complete accepted prefix. Status depends
     // on seeing the latest terminal status event in that durable prefix.
@@ -711,7 +714,7 @@ fn session_projection_from_events_or_sidecar(
             .or_else(|| sidecar_name.and_then(|name| session_name_for_display(&name))),
         title: title_from_events(&events),
         root: root_from_events(&events).or(sidecar_root),
-        kind: kind_from_events(&events),
+        kind: kind_from_events(&events).or(sidecar_kind),
     }
 }
 

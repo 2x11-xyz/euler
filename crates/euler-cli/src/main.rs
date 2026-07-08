@@ -73,8 +73,8 @@ use session_export::{
 };
 pub(crate) use session_lifecycle::session_config;
 use session_lifecycle::{
-    live_session_config, resolve_resume_target, set_session_kind, HomeSessionRefresh,
-    LiveProvenance, ResumeTarget, SESSION_ID,
+    live_session_config, resolve_resume_target, HomeSessionRefresh, LiveProvenance, ResumeTarget,
+    SESSION_ID,
 };
 use subagent::{AutoApproveTier, SubagentDecider};
 use theme_catalog::ThemeChoice;
@@ -173,7 +173,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let root = std::env::current_dir()?;
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
-    set_session_kind(&mut live_session.config, SessionKind::Interactive);
+    live_session.config.session_kind = SessionKind::Interactive;
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
     let observer = bundled_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
@@ -198,7 +198,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let root = std::env::current_dir()?;
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
-    set_session_kind(&mut live_session.config, SessionKind::Interactive);
+    live_session.config.session_kind = SessionKind::Interactive;
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
     let observer = bundled_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
@@ -256,7 +256,7 @@ fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
         exec.run.model.clone(),
         provenance,
     )?;
-    set_session_kind(&mut live_session.config, SessionKind::NonInteractive);
+    live_session.config.session_kind = SessionKind::NonInteractive;
     apply_exec_config(
         &mut live_session.config,
         ExecConfigOverrides::from_run(&exec.run),

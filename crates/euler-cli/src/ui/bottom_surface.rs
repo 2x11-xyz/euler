@@ -606,10 +606,6 @@ impl ReplacementPicker {
         let mut lines = vec![
             truncate_display("Resume a previous session", usize::from(width)),
             truncate_display(&query, usize::from(width)),
-            truncate_display(
-                "Type: [All] interactive non-interactive    Sort: Updated",
-                usize::from(width),
-            ),
         ];
         lines.extend(
             self.visible_resume_rows(width)
@@ -621,7 +617,7 @@ impl ReplacementPicker {
             lines.push(truncate_display("No matching sessions", usize::from(width)));
         }
         lines.push(truncate_display(
-            &format!("({position}/{filtered_count})"),
+            &format!("({position}/{filtered_count})  newest first"),
             usize::from(width),
         ));
         if let Some(detail) = self.selected_detail() {
@@ -742,8 +738,12 @@ impl ReplacementPicker {
         let filtered_count = self.filtered_indices().len();
         let end = (self.scroll_offset + self.visible_rows).min(filtered_count);
         let visible = end.saturating_sub(self.scroll_offset);
-        let rows = if matches!(self.kind, PickerKind::Model | PickerKind::Resume) {
+        let rows = if self.kind == PickerKind::Model {
             5 + visible
+                + usize::from(filtered_count == 0)
+                + usize::from(self.selected_detail().is_some())
+        } else if self.kind == PickerKind::Resume {
+            4 + visible
                 + usize::from(filtered_count == 0)
                 + usize::from(self.selected_detail().is_some())
         } else {
@@ -1015,10 +1015,10 @@ fn rendered_model_row(selected: bool, item: &PickerItem, width: u16) -> PickerRe
 }
 
 fn rendered_resume_row(selected: bool, item: &PickerItem, width: u16) -> PickerRenderedRow {
-    let marker = if selected { "❯" } else { " " };
-    let age = item.status.as_deref().unwrap_or("");
+    let marker = if selected { "→" } else { " " };
+    let age = truncate_display(item.status.as_deref().unwrap_or(""), 8);
     let kind = item.group.as_deref().unwrap_or("");
-    let prefix = format!("{marker} {age:<10} ");
+    let prefix = format!("{marker} {age:<8} ");
     let suffix = if kind.is_empty() {
         String::new()
     } else {
@@ -1544,6 +1544,8 @@ mod tests {
         assert!(rendered.contains("2026-06-19 research"));
         assert!(rendered.contains("interactive"));
         assert!(rendered.contains("Session: first request"));
+        assert!(rendered.contains("newest first"));
+        assert!(!rendered.contains("Type: [All]"));
 
         surface.move_selection_down();
         let BottomOwner::Picker(picker) = surface.owner() else {

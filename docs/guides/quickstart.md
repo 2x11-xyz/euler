@@ -73,13 +73,13 @@ The full-screen TUI keeps color enabled because color carries interface state.
 Headless `exec` takes one prompt argument, or reads a prompt from stdin. It creates
 an indexed non-interactive home session by default, so the run appears in
 `/resume`. Pass `--provenance` when you want a standalone log at a specific
-path instead of the home session store.
+path instead of the home session store. (Older builds defaulted to
+`./euler-provenance.jsonl` in the cwd.)
 
 ```sh
 euler exec \
   --provider chatgpt \
   --model gpt-5.5 \
-  --provenance ./first-session.jsonl \
   'Read README.md and summarize what Euler is in five bullets.'
 ```
 
@@ -90,7 +90,6 @@ euler exec \
   --provider fixture \
   --model echo \
   --extensions none \
-  --provenance ./fixture-session.jsonl \
   'Say hello without tools.'
 ```
 

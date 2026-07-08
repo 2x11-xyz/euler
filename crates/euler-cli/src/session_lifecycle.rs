@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use euler_core::{EulerHome, SessionConfig, SessionKind, SessionStore};
+use euler_core::{EulerHome, SessionConfig, SessionStore};
 use std::path::PathBuf;
 
 pub(crate) const SESSION_ID: &str = "headless-session";
@@ -109,8 +109,4 @@ pub(crate) fn session_config(
     config.provider = provider;
     config.model = model;
     config
-}
-
-pub(crate) fn set_session_kind(config: &mut SessionConfig, kind: SessionKind) {
-    config.session_kind = kind;
 }

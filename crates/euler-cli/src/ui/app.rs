@@ -93,8 +93,8 @@ mod visual;
 use self::visual::{ratatui_lines_to_canvas, render_finalized_visual_items};
 
 use self::support::{
-    command_context, is_copy_key, merge_effects, read_terminal_event, session_root_status_path,
-    update_token_usage,
+    command_context, is_copy_key, merge_effects, read_terminal_event, session_resume_label,
+    session_root_status_path, update_token_usage,
 };
 
 pub struct App {
@@ -1458,7 +1458,7 @@ impl AppCore {
             channels,
             events,
             active_target: outcome.active_target,
-            display_label: record.display_label().to_owned(),
+            display_label: session_resume_label(&record),
             recovery_closure_appended: outcome.recovery_closure_appended,
             warning_count: outcome.warnings.len(),
         })
@@ -1485,7 +1485,7 @@ impl AppCore {
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         let display = resume.display_label.clone();
-        let mut notice = if display == session_id {
+        let mut notice = if display == "Untitled session" {
             format!("resumed session {session_id}")
         } else {
             format!("resumed session {display}")

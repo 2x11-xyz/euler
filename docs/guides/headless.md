@@ -32,7 +32,9 @@ Flags:
 - `--provenance <path>` writes a standalone append-only JSONL event log at
   `<path>` instead of creating an indexed non-interactive home session. By
   default, `exec` stores runs under `~/.euler/sessions/<session-id>/` so they
-  appear in `/resume`.
+  appear in `/resume`. (Pre-v0.1.2 default was `./euler-provenance.jsonl` in
+  the cwd; scripts that depended on that path should pass `--provenance`
+  explicitly.)
 - `--auto-compaction off|stubs` chooses canvas retention. Default: `stubs`.
 - `--compaction-budget-bytes <n>` sets the rendered-canvas byte budget. Default:
   `640000`.
