@@ -520,7 +520,7 @@ impl AppCore {
         });
         let theme = Theme::for_choice(theme_choice);
         let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
-        status.session_id = Some(session_id);
+        status.session_id = Some(session_id.clone());
         status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
         Self {
             state: AppState::Idle {
@@ -534,6 +534,7 @@ impl AppCore {
                 &target.model,
                 reasoning_effort,
                 theme_choice,
+                Some(&session_id),
             )),
             status,
             model_catalog,
@@ -565,22 +566,26 @@ impl AppCore {
     }
 
     fn rebuild_bottom_surface(&mut self) {
+        let current_session_id = self.status.session_id.as_deref();
         self.bottom.reset_context(command_context(
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
             self.current_reasoning_effort(),
             self.theme_choice,
+            current_session_id,
         ));
     }
 
     fn replace_bottom_surface_for_session(&mut self) {
+        let current_session_id = self.status.session_id.as_deref();
         self.bottom = BottomSurface::new(command_context(
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
             self.current_reasoning_effort(),
             self.theme_choice,
+            current_session_id,
         ));
     }
 
