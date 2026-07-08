@@ -181,7 +181,7 @@ fn persisted_jsonl_canvas_projection_matches_live_for_denied_failed_and_switched
 
     session.run_turn("first").expect("first turn");
     assert!(session
-        .switch_model("other", "model-b", "user")
+        .switch_model("other", "model-b", "user", None)
         .expect("switch"));
     session.run_turn("second").expect("second turn");
 
@@ -311,7 +311,7 @@ fn same_provider_different_model_degrades_reasoning_before_next_request() {
 
     session.run_turn("first").expect("first turn");
     assert!(session
-        .switch_model("anthropic", "claude-b", "user")
+        .switch_model("anthropic", "claude-b", "user", None)
         .expect("switch"));
     session.run_turn("second").expect("second turn");
 

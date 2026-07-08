@@ -1164,6 +1164,7 @@ impl<D: PermissionDecider> Session<D> {
         to_provider: &str,
         to_model: &str,
         reason: &str,
+        context_limit: Option<ContextLimitConfig>,
     ) -> Result<bool, SessionError> {
         let next = ModelTarget::new(to_provider, to_model);
         if next == self.active_target {
@@ -1198,7 +1199,15 @@ impl<D: PermissionDecider> Session<D> {
             self.persisted_events = self.bus.events().len();
         }
         self.active_target = next;
+        // Compaction/hard-stop windows track the active model, not the launch
+        // model. Unknown catalog windows clear the prior limit rather than
+        // leaving a stale threshold.
+        self.config.context_limit = context_limit;
         Ok(true)
+    }
+
+    pub fn set_context_limit(&mut self, context_limit: Option<ContextLimitConfig>) {
+        self.config.context_limit = context_limit;
     }
 
     pub fn set_reasoning_effort(
@@ -1929,7 +1938,10 @@ fn canvas_snapshot_payload(
     let stats = retention_stats(canvas);
     let over_budget = stats.retained_bytes > policy.budget_bytes;
     let token_pressure = match (used_tokens, limit_tokens) {
-        (Some(used), Some(limit)) if limit > 0 => used * 5 > limit * 4,
+        (Some(used), Some(limit)) if limit > 0 => {
+            // Saturating/widened: provider usage is external input.
+            u128::from(used).saturating_mul(5) > u128::from(limit).saturating_mul(4)
+        }
         _ => false,
     };
     let pressure = match (over_budget, token_pressure) {

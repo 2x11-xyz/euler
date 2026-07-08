@@ -6975,14 +6975,18 @@ fn screen_has_ready_composer(screen: &str) -> bool {
         let Some(next) = lines.get(index + 1) else {
             return false;
         };
-        if next.contains("Context") {
+        if status_line_marks_ready_composer(next) {
             return true;
         }
         next.trim().is_empty()
             && lines
                 .get(index + 2)
-                .is_some_and(|after_spacer| after_spacer.contains("Context"))
+                .is_some_and(|after_spacer| status_line_marks_ready_composer(after_spacer))
     })
+}
+
+fn status_line_marks_ready_composer(line: &str) -> bool {
+    line.contains("Context") || line.contains("Canvas ")
 }
 
 impl Drop for PtyHarness {

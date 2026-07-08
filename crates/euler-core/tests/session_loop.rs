@@ -2435,7 +2435,7 @@ fn accepted_model_switch_is_persisted_before_next_user_and_next_call_uses_target
 
     session.run_turn("first turn").expect("first turn");
     assert!(session
-        .switch_model("other", "second-model", "user")
+        .switch_model("other", "second-model", "user", None)
         .expect("switch"));
     session.run_turn("second turn").expect("second turn");
 
@@ -2519,7 +2519,7 @@ fn model_switched_metadata_is_excluded_from_next_provider_request() {
 
     session.run_turn("first").expect("first turn");
     session
-        .switch_model("other", "second-model", "switchmeta")
+        .switch_model("other", "second-model", "switchmeta", None)
         .expect("switch");
     session.run_turn("second").expect("second turn");
 
@@ -2545,7 +2545,7 @@ fn same_target_switch_is_noop_without_event_or_persistence_write() {
         .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
 
     assert!(!session
-        .switch_model("fixture", "echo", "this-reason-is-ignored-for-noop")
+        .switch_model("fixture", "echo", "this-reason-is-ignored-for-noop", None)
         .expect("noop"));
     session.run_turn("hello").expect("turn");
 
@@ -2574,7 +2574,7 @@ fn invalid_switch_reasons_are_rejected() {
         "bad\n",
     ] {
         let error = session
-            .switch_model("other", "next", reason)
+            .switch_model("other", "next", reason, None)
             .expect_err("invalid reason");
         assert!(matches!(error, SessionError::InvalidModelSwitch(_)));
     }
@@ -2606,7 +2606,7 @@ fn failed_switch_validation_leaves_previous_target_active_without_switch_event()
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
     let error = session
-        .switch_model("missing", "next", "user")
+        .switch_model("missing", "next", "user", None)
         .expect_err("validation error");
 
     assert!(matches!(error, SessionError::InvalidModelSwitch(_)));
@@ -2656,7 +2656,7 @@ fn failed_switch_append_leaves_previous_target_active_without_accepted_event() {
         .with_provenance(ProvenanceWriter::new(log).expect("provenance writer"));
 
     let error = session
-        .switch_model("other", "new-model", "user")
+        .switch_model("other", "new-model", "user", None)
         .expect_err("append error");
 
     assert!(matches!(error, SessionError::Io(_)));
@@ -2691,7 +2691,7 @@ fn switch_persists_pending_backlog_before_accepted_switch_event() {
     session = session
         .with_provenance(ProvenanceWriter::new(good_log.clone()).expect("provenance writer"));
     assert!(session
-        .switch_model("other", "next-model", "user")
+        .switch_model("other", "next-model", "user", None)
         .expect("switch"));
 
     let persisted = logged_events(&good_log);
@@ -2829,7 +2829,7 @@ fn cross_provider_switch_drops_opaque_reasoning_artifacts_from_next_request() {
 
     session.run_turn("first").expect("first turn");
     session
-        .switch_model("chatgpt", "gpt-5.5", "user")
+        .switch_model("chatgpt", "gpt-5.5", "user", None)
         .expect("switch");
     session.run_turn("second").expect("second turn");
 
@@ -2890,8 +2890,14 @@ fn context_limit_after_switch_uses_new_target_before_provider_call() {
         .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
 
     session.run_turn("hit limit").expect("first turn");
+    // Callers must supply the new model's window; tests mirror catalog wiring.
     session
-        .switch_model("b", "model-b", "user")
+        .switch_model(
+            "b",
+            "model-b",
+            "user",
+            Some(ContextLimitConfig::new(100, 0.9).expect("valid limit")),
+        )
         .expect("switch");
     session.run_turn("try b").expect("second turn");
 

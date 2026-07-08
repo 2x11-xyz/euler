@@ -198,13 +198,24 @@ envelope `v` per `docs/contracts/persistence.md`.
   Optional `session_kind` is `interactive` or `non-interactive`. It records
   how the session was launched for discovery/resume UI grouping only. Omitted
   means unknown/legacy and must not affect resume authority or canvas content.
+  Optional `context_limit` is either `null` (unknown/legacy window) or an
+  object `{ "limit_tokens": <u64>, "source": "catalog" }` recording the
+  catalog-derived context window used for token-threshold compaction and
+  hard-stop checks. It is telemetry and config projection only; resume
+  authority remains the event stream and active model target. Omitted in older
+  streams means unknown.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,
   a valid `session.json.name` may be used only as a display fallback when the
   event stream is readable and contains no `session.renamed`; the next rename
   writes this canonical event and refreshes the sidecar projection.
-- `canvas.snapshot`: `selected_event_ids`, `counts`.
+- `canvas.snapshot`: `selected_event_ids`, `counts`, retention telemetry
+  `retained_items`, `retained_bytes`, `demoted_items`, `tier`, `budget_bytes`,
+  `over_budget`, and `pressure` (`none`|`byte`|`token`|`both`). Optional
+  `used_tokens` and `limit_tokens` are included when provider usage and a
+  configured context limit are known. Snapshot fields are assembly telemetry
+  for the next model request; they do not rewrite provenance history.
 - `canvas.swap`: `snapshot_start_id`, `snapshot_end_id`,
   `frontier_start_id`, `policy_version`, `projection_schema_version`,
   `projection_blob`, `validation_result`. It records a compacted canvas

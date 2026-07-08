@@ -825,14 +825,14 @@ after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
 fn tool_result_get_definition() -> ToolDefinition {
     ToolDefinition {
         name: "tool_result_get".to_owned(),
-        description: "Rehydrate a demoted or compacted tool result from the current session by event_id (preferred) or blob_hash. Use when a canvas stub shows handle event:… or blob:… instead of re-running the original tool.".to_owned(),
+        description: "Rehydrate a demoted or compacted tool result from the current session by event_id (required). Use the event id printed in canvas stubs (`event <id>`) instead of re-running the original tool.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "event_id": {"type": "string"},
-                "blob_hash": {"type": "string"},
                 "max_bytes": {"type": "integer", "minimum": 1}
             },
+            "required": ["event_id"],
             "additionalProperties": false
         }),
     }
@@ -872,35 +872,18 @@ fn find_tool_result_event<'a>(
     events: &'a [EventEnvelope],
     input: &Value,
 ) -> Result<&'a EventEnvelope, ToolError> {
+    // Live bus and resume rehydration keep tool output inline with empty
+    // `blobs`; only event_id is a reliable session-local handle.
     let event_id = input
         .get("event_id")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let blob_hash = input
-        .get("blob_hash")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let event = if let Some(event_id) = event_id {
-        events
-            .iter()
-            .find(|event| event.id == event_id)
-            .ok_or(ToolError::InvalidField("event_id"))?
-    } else if let Some(blob_hash) = blob_hash {
-        events
-            .iter()
-            .find(|event| {
-                event.kind.as_str() == EventKind::TOOL_RESULT
-                    && event
-                        .blobs
-                        .get("output")
-                        .is_some_and(|hash| hash == blob_hash)
-            })
-            .ok_or(ToolError::InvalidField("blob_hash"))?
-    } else {
-        return Err(ToolError::MissingField("event_id"));
-    };
+        .filter(|value| !value.is_empty())
+        .ok_or(ToolError::MissingField("event_id"))?;
+    let event = events
+        .iter()
+        .find(|event| event.id == event_id)
+        .ok_or(ToolError::InvalidField("event_id"))?;
     if event.kind.as_str() != EventKind::TOOL_RESULT {
         return Err(ToolError::InvalidField("event_id"));
     }

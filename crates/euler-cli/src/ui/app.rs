@@ -1464,6 +1464,10 @@ impl AppCore {
         );
         config.extensions_enabled = seed_config.extensions_enabled;
         config.round_observer = seed_config.round_observer;
+        // Compaction window follows the active model after fold (post-switch).
+        config.provider = folded.active_target.provider.clone();
+        config.model = folded.active_target.model.clone();
+        crate::session_lifecycle::apply_catalog_context_limit(&mut config, &self.model_catalog);
         let providers = crate::resume_provider_set(
             folded
                 .original_target
@@ -1547,7 +1551,17 @@ impl AppCore {
         let AppState::Idle { session } = &mut self.state else {
             return self.notice_item("model switch waits for the active turn".to_owned());
         };
-        match session.switch_model(&provider, &model, "user") {
+        let context_limit = self
+            .model_catalog
+            .provider(&provider)
+            .and_then(|descriptor| {
+                descriptor
+                    .models()
+                    .find(|entry| entry.id() == model)
+                    .and_then(|entry| entry.context_window_tokens())
+            })
+            .and_then(euler_core::ContextLimitConfig::from_catalog_window);
+        match session.switch_model(&provider, &model, "user", context_limit) {
             Ok(true) => self.accept_model_switch(provider, model, true),
             Ok(false) => self.accept_model_switch(provider, model, false),
             Err(error) => self.notice_item(format!("model switch rejected: {error}")),

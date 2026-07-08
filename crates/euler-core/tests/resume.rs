@@ -53,7 +53,7 @@ fn fold_reproduces_live_target_usage_and_context_limit_fields() {
 
     session.run_turn("hit limit").expect("first turn");
     session
-        .switch_model("b", "model-b", "user")
+        .switch_model("b", "model-b", "user", None)
         .expect("switch");
     session
         .set_reasoning_effort(ReasoningEffort::Large, "user")

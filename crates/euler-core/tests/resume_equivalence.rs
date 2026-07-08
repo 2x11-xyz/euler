@@ -852,7 +852,7 @@ fn drive_steps<D: PermissionDecider>(session: &mut Session<D>, steps: &[Step]) {
             }
             Step::Switch { provider, model } => {
                 assert!(session
-                    .switch_model(provider, model, "user")
+                    .switch_model(provider, model, "user", None)
                     .expect("switch model"));
             }
         }

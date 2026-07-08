@@ -463,6 +463,10 @@ where
         )?;
         ProviderSet::single(run.provider)
     };
+    // Limit tracks the active model after fold (may differ from launch if switched).
+    config.provider = folded.active_target.provider.clone();
+    config.model = folded.active_target.model.clone();
+    apply_catalog_context_limit(&mut config, &run.model_catalog);
 
     let outcome = resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
     let mut session = outcome.session;

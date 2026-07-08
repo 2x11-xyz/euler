@@ -28,8 +28,9 @@ the context-engineering principle above.
 | `apply_patch` | FsWrite | Structured single-file patch |
 | `run_shell` | ShellExec | Workspace root; timeout bounds |
 | `git_status` / `git_diff` | FsRead | Short workspace git views |
-| `tool_result_get` | FsRead | Rehydrate a demoted/compacted tool result from the **current session** by `event_id` (preferred) or `blob_hash`; optional `max_bytes`. Session-local only. |
+| `tool_result_get` | FsRead | Rehydrate a demoted/compacted tool result from the **current session** by `event_id` (required); optional `max_bytes`. Session-local only. |
 
-When canvas stubs show `handle event:…` or `blob:…`, prefer `tool_result_get`
-over re-running the original tool if the original inputs are expensive or
-non-idempotent.
+When canvas stubs show `event <id>` (and optional `handle event:…` / `blob:…`
+metadata), prefer `tool_result_get` with that event id over re-running the
+original tool if the original inputs are expensive or non-idempotent. Blob-hash
+lookup is not supported: live and resumed sessions keep content inline.
