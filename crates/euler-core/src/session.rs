@@ -14,6 +14,7 @@ use crate::file_diff::{
 };
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate, PermissionRequest};
 use crate::provenance::ProvenanceWriter;
+use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
 use crate::tools::{PatchEvents, ToolError, ToolRegistry};
@@ -119,6 +120,7 @@ pub struct SessionConfig {
     pub max_output_tokens: Option<u64>,
     pub context_limit: Option<ContextLimitConfig>,
     pub extensions_enabled: BTreeSet<String>,
+    pub session_kind: SessionKind,
     /// Token reserve below the context window that triggers compaction.
     /// Default: 16384.
     pub compaction_reserve_tokens: usize,
@@ -146,6 +148,7 @@ impl SessionConfig {
             max_output_tokens: None,
             context_limit: None,
             extensions_enabled: BTreeSet::new(),
+            session_kind: SessionKind::default(),
             compaction_reserve_tokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
             round_observer: None,
@@ -601,6 +604,7 @@ impl<D> Session<D> {
                         .collect::<Vec<_>>()
                         .into(),
                 ),
+                ("session_kind", config.session_kind.as_str().into()),
                 (
                     "auto_compaction",
                     json!({

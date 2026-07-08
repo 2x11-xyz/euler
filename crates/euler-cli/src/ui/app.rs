@@ -93,8 +93,8 @@ mod visual;
 use self::visual::{ratatui_lines_to_canvas, render_finalized_visual_items};
 
 use self::support::{
-    command_context, is_copy_key, merge_effects, read_terminal_event, session_root_status_path,
-    update_token_usage,
+    command_context, is_copy_key, merge_effects, read_terminal_event, session_resume_label,
+    session_root_status_path, update_token_usage,
 };
 
 pub struct App {
@@ -110,6 +110,7 @@ pub struct AppOptions {
     pub theme_choice: ThemeChoice,
     pub theme_preference_path: Option<PathBuf>,
     pub model_catalog: Option<MergedModelCatalog>,
+    pub session_store: Option<SessionStore>,
     pub extensions: ExtensionSelection,
     pub observe: ObserveOptions,
 }
@@ -122,6 +123,7 @@ pub struct AppCore {
     status: StatusSnapshot,
     model_catalog: MergedModelCatalog,
     session_store: Option<SessionStore>,
+    active_session_home_managed: bool,
     token_usage: TokenUsageSnapshot,
     transcript: TranscriptState,
     visual_canvas: VisualCanvasState,
@@ -508,10 +510,12 @@ impl AppCore {
             theme_choice,
             theme_preference_path,
             model_catalog,
+            session_store,
             extensions,
             observe,
             ..
         } = options;
+        let active_session_home_managed = session_store.is_some();
         let model_catalog = model_catalog.unwrap_or_else(|| {
             crate::model_catalog::load_model_catalog(
                 crate::model_catalog::default_model_catalog_path().as_deref(),
@@ -538,7 +542,8 @@ impl AppCore {
             )),
             status,
             model_catalog,
-            session_store: None,
+            session_store,
+            active_session_home_managed,
             token_usage: TokenUsageSnapshot::default(),
             transcript: TranscriptState::default(),
             visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner]),
@@ -1088,6 +1093,7 @@ impl AppCore {
         self.status.model = active_target.model;
         self.status.session_id = Some(session_id.clone());
         self.status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+        self.active_session_home_managed = true;
         self.replace_bottom_surface_for_session();
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
@@ -1452,7 +1458,7 @@ impl AppCore {
             channels,
             events,
             active_target: outcome.active_target,
-            display_label: record.display_label().to_owned(),
+            display_label: session_resume_label(&record),
             recovery_closure_appended: outcome.recovery_closure_appended,
             warning_count: outcome.warnings.len(),
         })
@@ -1469,6 +1475,7 @@ impl AppCore {
         self.status.model = resume.active_target.model.clone();
         self.status.session_id = Some(session_id.clone());
         self.status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+        self.active_session_home_managed = true;
         self.replace_bottom_surface_for_session();
         self.rebuild_transcript_from_events(&resume.events);
         self.visual_scroll_offset = 0;
@@ -1478,7 +1485,7 @@ impl AppCore {
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         let display = resume.display_label.clone();
-        let mut notice = if display == session_id {
+        let mut notice = if display == "Untitled session" {
             format!("resumed session {session_id}")
         } else {
             format!("resumed session {display}")
@@ -1781,6 +1788,12 @@ impl AppCore {
     }
 
     fn accept_worker_session_or_continue(&mut self, session: Box<Session<TuiDecider>>) {
+        if self.active_session_home_managed {
+            let session_id = session.session_id().to_owned();
+            if let Err(error) = self.refresh_current_session_metadata(&session_id) {
+                self.notice = Some(format!("session metadata refresh failed: {error}"));
+            }
+        }
         if let Some(request) = self.pending_runs.pop_front() {
             match request {
                 PendingRunRequest::Extension(request) => self.spawn_extension_run(request, session),

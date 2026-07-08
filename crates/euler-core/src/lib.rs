@@ -16,6 +16,7 @@ pub mod permissions;
 pub mod provenance;
 pub mod resume;
 pub mod session;
+pub mod session_kind;
 mod session_name;
 mod session_root;
 pub mod session_store;
@@ -77,6 +78,7 @@ pub use session::{
     BackgroundAgentPoll, BackgroundAgentReportDrain, ContextLimitConfig, ExtensionExecutionError,
     ModelTarget, RoundObserverConfig, Session, SessionConfig, SessionError,
 };
+pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};
 pub use tools::{ToolError, ToolRegistry};
 

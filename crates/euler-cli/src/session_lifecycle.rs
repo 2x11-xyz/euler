@@ -18,6 +18,10 @@ pub(crate) struct HomeSessionRefresh {
 }
 
 impl HomeSessionRefresh {
+    pub(crate) fn session_store(&self) -> SessionStore {
+        self.store.clone()
+    }
+
     pub(crate) fn refresh(&self) -> Result<()> {
         self.store.refresh_session_metadata(&self.session_id)?;
         Ok(())

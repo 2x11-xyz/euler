@@ -646,6 +646,72 @@ fn listing_uses_sidecar_name_as_transition_display_fallback_without_rename_event
 }
 
 #[test]
+fn listing_uses_first_user_message_as_title_and_projects_session_kind() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("session_kind", "non-interactive".into()),
+        ]),
+    );
+    let user = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        Some(start.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "  first\nuseful   question  ".into())]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(&[start, user]).expect("append events");
+    drop(writer);
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+
+    assert_eq!(listed.name(), None);
+    assert_eq!(listed.title(), Some("first useful question"));
+    assert_eq!(listed.display_label(), record.id());
+    assert_eq!(listed.kind(), Some(SessionKind::NonInteractive));
+}
+
+#[test]
+fn listing_uses_sidecar_kind_as_transition_fallback_without_event_kind() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let metadata = format!(
+        r#"{{"version":1,"id":"{}","created_at_ms":{},"status":"active","kind":"interactive","events_path":"events.jsonl","blobs_dir":"blobs"}}
+"#,
+        record.id(),
+        record.created_at_ms()
+    );
+    std::fs::write(record.session_json_path(), metadata).expect("write metadata");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(&[start]).expect("append events");
+    drop(writer);
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.kind(), Some(SessionKind::Interactive));
+}
+
+#[test]
 fn listing_does_not_use_sidecar_name_when_events_are_unreadable() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");

@@ -93,16 +93,17 @@ config shape.
 euler
 
 # Headless: one task, full provenance, bounded rounds
+# Default: indexed home session under ~/.euler/sessions/ (shows in /resume).
+# Pass --provenance <path> for a standalone JSONL log instead.
 euler exec --provider openrouter --model anthropic/claude-sonnet-5 \
   --auto-approve trusted-local \
   --max-tool-rounds 100 \
-  --provenance ./session.jsonl \
   "Read BRIEF.md in this directory and carry it out fully."
 ```
 
 Useful exec flags: `--reasoning-effort xsmall..xlarge`,
 `--auto-compaction off|stubs`, `--extensions <list|none>`,
-`--auto-approve read-only|trusted-local`.
+`--auto-approve read-only|trusted-local`, `--provenance <path>`.
 
 In the TUI: `/` lists actions; slash commands cover models, sessions, and
 extensions.

@@ -17,9 +17,10 @@ are queued, not forgotten.
 - **`exec` output is block-buffered when piped.** Progress is not visible on
   stdout until a turn completes. Monitor the provenance JSONL instead; it is
   written continuously.
-- **No session resume for `exec`.** If a headless run dies mid-task
-  (provider outage, kill), it cannot be resumed; the workaround is a fresh
-  run whose prompt points at the on-disk state. Resume is a v0.2 priority.
+- **`exec --resume` exists, but interrupted mid-turn recovery is still thin.**
+  Home-indexed exec runs appear in `/resume` and `exec --resume <id>` can
+  continue a completed prefix; a hard kill mid-tool-round may still need a
+  fresh run whose prompt points at on-disk state.
 - **Hitting `--max-tool-rounds` produces a generic message**, not a summary
   of what was accomplished before the cap.
 - **`run_shell` has no memory limit.** A runaway subprocess can exhaust

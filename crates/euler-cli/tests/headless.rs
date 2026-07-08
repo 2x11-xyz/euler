@@ -5611,7 +5611,7 @@ fn explicit_path_resume_does_not_append_home_session_index_update() {
 }
 
 #[test]
-fn explicit_provenance_and_exec_do_not_append_home_session_index_updates() {
+fn explicit_provenance_stays_unindexed_and_exec_creates_non_interactive_home_session() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
     let work = tempfile::tempdir().expect("work dir");
@@ -5658,13 +5658,29 @@ fn explicit_provenance_and_exec_do_not_append_home_session_index_updates() {
     let exec = command_with_home(exe, &home)
         .current_dir(work.path())
         .arg("exec")
-        .arg("exec unindexed")
+        .arg("exec indexed")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .expect("exec");
     assert!(exec.status.success());
-    assert_eq!(home_index_line_count(home.path()), before);
+    assert_eq!(home_index_line_count(home.path()), before + 2);
+
+    let session_ids = home_session_ids(home.path());
+    assert_eq!(session_ids.len(), 2);
+    let exec_id = session_ids.last().expect("exec session id");
+    let exec_events = read_jsonl(&home_session_log(home.path(), exec_id));
+    let start = exec_events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+        .expect("exec session.start");
+    assert_eq!(
+        start
+            .payload
+            .get("session_kind")
+            .and_then(serde_json::Value::as_str),
+        Some("non-interactive")
+    );
 }
 
 #[test]
@@ -6675,14 +6691,19 @@ fn tui_resume_picker_lists_home_sessions() {
     assert!(tui.wait_for_screen("fixture/echo"));
     tui.write("/resume\r");
     assert!(
+        tui.wait_for_screen("saved for picker"),
+        "resume picker did not list derived title:\n{}",
+        tui.screen_text()
+    );
+    assert!(
         tui.wait_for_screen(&saved_id),
         "resume picker did not list saved id {saved_id}:\n{}",
         tui.screen_text()
     );
     tui.write("\x1b[B\r");
     assert!(
-        tui.wait_for_screen(&format!("resumed session {saved_id}")),
-        "resume selection did not resume saved id {saved_id}:\n{}",
+        tui.wait_for_screen("resumed session saved for picker"),
+        "resume selection did not resume saved title (id {saved_id}):\n{}",
         tui.screen_text()
     );
     assert!(

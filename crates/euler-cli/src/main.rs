@@ -4,6 +4,7 @@ use euler_core::permissions::{DeciderVerdict, PermissionRequest};
 use euler_core::{
     fold_session, read_provenance, read_resume_prefix, resume_session_from_folded_prefix,
     CompactionTier, ModelTarget, PermissionDecider, ProvenanceWriter, Session, SessionConfig,
+    SessionKind,
 };
 use euler_event::EventKind;
 use euler_provider::anthropic::AnthropicProvider;
@@ -113,7 +114,7 @@ fn main() -> Result<()> {
             run_interactive_entry(live_provenance, run, args.default_interactive, args.no_tty)
         }
         Command::Tui(run) => run_tui(live_provenance, run),
-        Command::Exec(exec) => run_exec(args.provenance_path, exec),
+        Command::Exec(exec) => run_exec(live_provenance, exec),
         Command::Resume { path, run } => resume_interactive(resolve_resume_target(path)?, run),
         Command::SessionExport(export) => run_session_export(export),
         Command::Login(login) => login_chatgpt(login),
@@ -172,6 +173,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let root = std::env::current_dir()?;
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
+    live_session.config.session_kind = SessionKind::Interactive;
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
     let observer = bundled_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
@@ -196,6 +198,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let root = std::env::current_dir()?;
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
+    live_session.config.session_kind = SessionKind::Interactive;
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
     let observer = bundled_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
@@ -220,6 +223,10 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             theme_choice,
             theme_preference_path: preference_path,
             model_catalog: Some(run.model_catalog),
+            session_store: live_session
+                .refresh
+                .as_ref()
+                .map(HomeSessionRefresh::session_store),
             extensions: run.extensions.clone(),
             observe: run.observe.clone(),
         },
@@ -227,7 +234,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     app.run()
 }
 
-fn run_exec(log_path: PathBuf, exec: ExecArgs) -> Result<()> {
+fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
     if let Some(path) = exec.resume_path {
         let prompt = read_exec_prompt(exec.prompt)?;
         return run_exec_resume(
@@ -243,29 +250,45 @@ fn run_exec(log_path: PathBuf, exec: ExecArgs) -> Result<()> {
     })?;
     let prompt = read_exec_prompt(exec.prompt)?;
     let root = std::env::current_dir()?;
-    let mut config = session_config(
+    let mut live_session = live_session_config(
         root,
         exec.run.provider_id.clone(),
         exec.run.model.clone(),
-        SESSION_ID.to_owned(),
+        provenance,
+    )?;
+    live_session.config.session_kind = SessionKind::NonInteractive;
+    apply_exec_config(
+        &mut live_session.config,
+        ExecConfigOverrides::from_run(&exec.run),
     );
-    apply_exec_config(&mut config, ExecConfigOverrides::from_run(&exec.run));
-    config.extensions_enabled = resolve_session_extensions(&config.root, &exec.run.extensions)?;
-    let observer = bundled_round_observer(&exec.run.observe, &config.extensions_enabled)?;
+    live_session.config.extensions_enabled =
+        resolve_session_extensions(&live_session.config.root, &exec.run.extensions)?;
+    let observer =
+        bundled_round_observer(&exec.run.observe, &live_session.config.extensions_enabled)?;
     if let Some((observer_config, _)) = &observer {
-        config.round_observer = Some(observer_config.clone());
+        live_session.config.round_observer = Some(observer_config.clone());
     }
     let tier = exec.auto_approve;
     let providers = ProviderSet::single_named(exec.run.provider_id.clone(), exec.run.provider);
-    bind_diagnostics_for_log(&log_path);
-    let mut session =
-        Session::new_with_providers(config, providers, SubagentDecider::new(exec.auto_approve))
-            .with_provenance(ProvenanceWriter::new(log_path)?);
+    let log_path = live_session.log_path.clone();
+    let refresh = live_session.refresh.clone();
+    bind_diagnostics_for_log(&live_session.log_path);
+    let mut session = Session::new_with_providers(
+        live_session.config,
+        providers,
+        SubagentDecider::new(exec.auto_approve),
+    )
+    .with_provenance(ProvenanceWriter::new(log_path)?);
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
     SubagentDecider::apply_tier(tier, &mut session);
     let events = session.run_turn(&prompt)?;
+    if let Some(refresh) = refresh.as_ref() {
+        if let Err(error) = refresh.refresh() {
+            eprintln!("warning: failed to refresh session metadata: {error}");
+        }
+    }
     print!("{}", render_line_oriented(&events));
     io::stdout().flush()?;
     Ok(())
