@@ -327,6 +327,7 @@ mod tests {
         let items =
             resume_items_from_records(store.list_sessions().expect("sessions"), Some(current.id()));
 
+        assert_eq!(items.len(), 1);
         assert!(!items.iter().any(|item| item.id == current.id()));
         assert!(items.iter().any(|item| item.id == prior.id()));
     }
