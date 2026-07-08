@@ -24,6 +24,21 @@ pub(super) fn update_token_usage(
         *tokens = TokenUsageSnapshot::default();
         return;
     }
+    if event.kind.as_str() == EventKind::CANVAS_SNAPSHOT {
+        tokens.demoted_items = event
+            .payload
+            .get("demoted_items")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        tokens.canvas_retained_bytes = event.payload.get("retained_bytes").and_then(Value::as_u64);
+        tokens.canvas_budget_bytes = event.payload.get("budget_bytes").and_then(Value::as_u64);
+        tokens.compaction_tier = event
+            .payload
+            .get("tier")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        return;
+    }
     if event.kind.as_str() != EventKind::MODEL_RESULT {
         return;
     }

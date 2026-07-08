@@ -18,3 +18,18 @@ Evidence: an early dogfood projection-task failure,
 where an agent exhausted its tool budget re-reading a 523-line file that
 `read_file` would only return truncated. Rationale and sources:
 the context-engineering principle above.
+
+## Default coding tools
+
+| Tool | Capability | Notes |
+|---|---|---|
+| `read_file` | FsRead | Relative path; optional line offset / max_bytes / max_lines |
+| `edit_file` | FsWrite | Single exact replacement |
+| `apply_patch` | FsWrite | Structured single-file patch |
+| `run_shell` | ShellExec | Workspace root; timeout bounds |
+| `git_status` / `git_diff` | FsRead | Short workspace git views |
+| `tool_result_get` | FsRead | Rehydrate a demoted/compacted tool result from the **current session** by `event_id` (preferred) or `blob_hash`; optional `max_bytes`. Session-local only. |
+
+When canvas stubs show `handle event:…` or `blob:…`, prefer `tool_result_get`
+over re-running the original tool if the original inputs are expensive or
+non-idempotent.

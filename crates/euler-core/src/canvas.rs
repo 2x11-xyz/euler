@@ -592,7 +592,7 @@ fn demote_item(
     else {
         return false;
     };
-    if *demoted {
+    if *demoted || *compacted {
         return false;
     }
     let content = if *ok {

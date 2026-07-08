@@ -78,7 +78,7 @@ fn compact_tool_output_uses_marker_preview_and_summary() {
 
     assert_eq!(
         compact_tool_output(output, 3),
-        "⟨compacted⟩\none\ntwo\nthree\n... (5 total lines, re-read to recover)"
+        "⟨compacted⟩\none\ntwo\nthree\n... (5 total lines; prefer tool_result_get with this event id, else re-read to recover)"
     );
 }
 

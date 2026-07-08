@@ -25,12 +25,14 @@ provenance-blob retrieval handle. Silent removal of rounds from the canvas is
 forbidden.
 
 Retention is governed by a token budget derived from the model's context
-size, never by fixed item counts. Auto-compaction fires late (threshold on
-context usage), emits an explicit swap event to transcript and provenance,
-and produces structure before prose: artifact index, action ledger, and
-dead-end preservation (attempts and their failure reasons are never compacted
-away). The policy ladder is `off`/`stubs` today, with `structured` and an
-extension-owned `assisted` tier designed to follow.
+size, never by fixed item counts. When the model catalog supplies a context
+window, sessions wire that limit so token-threshold compaction can fire:
+layer-1 first (eligible `read_file` previews), then full projection swap.
+Stub demotion remains the assembly-time byte backstop. Demoted/compacted
+results should be recovered with `tool_result_get` (event/blob handle) rather
+than re-running the original tool when possible. The policy ladder is
+`off`/`stubs` today, with `structured` and an extension-owned `assisted` tier
+designed to follow.
 
 Write-shaped facts (edits, patches, artifact creations) demote last, and
 their stubs always carry the artifact path.

@@ -388,7 +388,10 @@ fn auto_compaction_emits_layer1_swap_and_next_turn_uses_compacted_canvas() {
     assert_eq!(config.compaction_reserve_tokens, 16_384);
     assert_eq!(config.compaction_keep_recent, 4);
     config.context_limit = Some(ContextLimitConfig::new(1000, 1.0).expect("valid limit"));
-    config.compaction_reserve_tokens = 900;
+    // Threshold = window - reserve. Usage is ~951 tokens so reserve 50 forces
+    // compaction; leave enough headroom that layer-1 (bytes/4 estimate) can
+    // satisfy the threshold before falling through to full projection swap.
+    config.compaction_reserve_tokens = 50;
     config.compaction_keep_recent = 1;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 

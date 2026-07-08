@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
-use euler_core::{EulerHome, SessionConfig, SessionStore};
+use euler_core::{ContextLimitConfig, EulerHome, SessionConfig, SessionStore};
+use euler_provider::catalog::MergedModelCatalog;
 use std::path::PathBuf;
 
 pub(crate) const SESSION_ID: &str = "headless-session";
@@ -109,4 +110,21 @@ pub(crate) fn session_config(
     config.provider = provider;
     config.model = model;
     config
+}
+
+pub(crate) fn apply_catalog_context_limit(
+    config: &mut SessionConfig,
+    catalog: &MergedModelCatalog,
+) {
+    if config.context_limit.is_some() {
+        return;
+    }
+    let Some(limit_tokens) = catalog
+        .provider(&config.provider)
+        .and_then(|provider| provider.models().find(|model| model.id() == config.model))
+        .and_then(|model| model.context_window_tokens())
+    else {
+        return;
+    };
+    config.context_limit = ContextLimitConfig::from_catalog_window(limit_tokens);
 }
