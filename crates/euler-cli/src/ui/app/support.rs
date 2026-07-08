@@ -8,7 +8,7 @@ use super::CoreEffect;
 use crate::provider_config_runtime;
 use anyhow::Result;
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind, KeyModifiers};
-use euler_core::{EulerHome, ReasoningEffort, SessionStore};
+use euler_core::{EulerHome, ReasoningEffort, SessionRecord, SessionStore};
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
@@ -56,6 +56,7 @@ pub(super) fn command_context(
     model: &str,
     current_effort: ReasoningEffort,
     current_theme: ThemeChoice,
+    current_session_id: Option<&str>,
 ) -> CommandContext {
     // This is called when the bottom surface is rebuilt for session lifecycle
     // transitions, not during frame rendering or palette filtering.
@@ -66,7 +67,7 @@ pub(super) fn command_context(
         model_choices: model_choices(model_catalog, &provider_config.registry, provider, model),
         effort_choices: effort_choices(current_effort),
         theme_choices: theme_choices(current_theme),
-        resume_items: resume_items_from_home(),
+        resume_items: resume_items_from_home(current_session_id),
     }
 }
 
@@ -163,19 +164,27 @@ fn ensure_current_model_choice(
     choices.push(ModelChoice::current(current_provider, current_model));
 }
 
-fn resume_items_from_home() -> Vec<ResumeItem> {
+fn resume_items_from_home(current_session_id: Option<&str>) -> Vec<ResumeItem> {
     let Ok(home) = EulerHome::resolve() else {
         return Vec::new();
     };
     let Ok(store) = SessionStore::new(home) else {
         return Vec::new();
     };
-    let Ok(mut records) = store.list_sessions() else {
+    let Ok(records) = store.list_sessions() else {
         return Vec::new();
     };
+    resume_items_from_records(records, current_session_id)
+}
+
+fn resume_items_from_records(
+    mut records: Vec<SessionRecord>,
+    current_session_id: Option<&str>,
+) -> Vec<ResumeItem> {
     records.sort_by(|left, right| right.id().cmp(left.id()));
     records
         .into_iter()
+        .filter(|record| Some(record.id()) != current_session_id)
         .take(20)
         .map(|record| {
             let mut item =
@@ -305,5 +314,20 @@ mod tests {
             current[0].label,
             "openrouter::new/model-not-in-local-catalog"
         );
+    }
+
+    #[test]
+    fn resume_items_exclude_current_session() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+        let store = SessionStore::new(home).expect("store");
+        let current = store.create_session().expect("current session");
+        let prior = store.create_session().expect("prior session");
+
+        let items =
+            resume_items_from_records(store.list_sessions().expect("sessions"), Some(current.id()));
+
+        assert!(!items.iter().any(|item| item.id == current.id()));
+        assert!(items.iter().any(|item| item.id == prior.id()));
     }
 }
