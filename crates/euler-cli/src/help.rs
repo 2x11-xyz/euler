@@ -14,7 +14,8 @@ const SESSION_OPTIONS: &str = "  \
   --observe <extension-id>   Run that bundled extension's round observer
   --observe-cadence <n>      Observer cadence in driver rounds (default: 8)
   --auth-file <path>         Read credentials from <path>
-  --provenance <path>        Write the provenance log to <path>
+  --provenance <path>        Write a standalone provenance log to <path>
+                             instead of the home session store
 ";
 
 const HELP_LINE: &str = "  -h, --help                 Show this help\n";

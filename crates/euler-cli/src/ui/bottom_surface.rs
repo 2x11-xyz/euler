@@ -497,6 +497,13 @@ pub struct ReplacementPicker {
 enum PickerKind {
     Generic,
     Model,
+    Resume,
+}
+
+impl PickerKind {
+    fn searchable(self) -> bool {
+        matches!(self, Self::Model | Self::Resume)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -564,6 +571,9 @@ impl ReplacementPicker {
         if self.kind == PickerKind::Model {
             return self.render_model_lines(width);
         }
+        if self.kind == PickerKind::Resume {
+            return self.render_resume_lines(width);
+        }
         let mut lines = vec![truncate_display(
             &format!("{} {}", self.title, self.position_indicator()),
             usize::from(width),
@@ -576,6 +586,49 @@ impl ReplacementPicker {
         );
         lines.push(truncate_display(
             " Enter select  Esc close",
+            usize::from(width),
+        ));
+        lines
+    }
+
+    fn render_resume_lines(&self, width: u16) -> Vec<String> {
+        let filtered_count = self.filtered_indices().len();
+        let position = if filtered_count == 0 {
+            0
+        } else {
+            self.selected + 1
+        };
+        let query = if self.query.is_empty() {
+            "Type to search".to_owned()
+        } else {
+            format!("Search: {}", self.query)
+        };
+        let mut lines = vec![
+            truncate_display("Resume a previous session", usize::from(width)),
+            truncate_display(&query, usize::from(width)),
+            truncate_display(
+                "Type: [All] interactive non-interactive    Sort: Updated",
+                usize::from(width),
+            ),
+        ];
+        lines.extend(
+            self.visible_resume_rows(width)
+                .into_iter()
+                .map(|row| row.text)
+                .collect::<Vec<_>>(),
+        );
+        if filtered_count == 0 {
+            lines.push(truncate_display("No matching sessions", usize::from(width)));
+        }
+        lines.push(truncate_display(
+            &format!("({position}/{filtered_count})"),
+            usize::from(width),
+        ));
+        if let Some(detail) = self.selected_detail() {
+            lines.push(truncate_display(&detail, usize::from(width)));
+        }
+        lines.push(truncate_display(
+            "Enter resume  Esc close",
             usize::from(width),
         ));
         lines
@@ -630,6 +683,17 @@ impl ReplacementPicker {
             .collect()
     }
 
+    fn visible_resume_rows(&self, width: u16) -> Vec<PickerRenderedRow> {
+        self.visible_item_indices()
+            .iter()
+            .enumerate()
+            .map(|(offset, item_index)| {
+                let selected = self.scroll_offset + offset == self.selected;
+                rendered_resume_row(selected, &self.items[*item_index], width)
+            })
+            .collect()
+    }
+
     fn selected_detail(&self) -> Option<String> {
         let item = self.selected_item()?;
         if self.kind == PickerKind::Model {
@@ -639,6 +703,12 @@ impl ReplacementPicker {
                 }
                 _ => None,
             };
+        }
+        if self.kind == PickerKind::Resume {
+            return item
+                .detail
+                .as_ref()
+                .map(|detail| format!("Session: {detail}"));
         }
         item.detail
             .as_ref()
@@ -672,7 +742,7 @@ impl ReplacementPicker {
         let filtered_count = self.filtered_indices().len();
         let end = (self.scroll_offset + self.visible_rows).min(filtered_count);
         let visible = end.saturating_sub(self.scroll_offset);
-        let rows = if self.kind == PickerKind::Model {
+        let rows = if matches!(self.kind, PickerKind::Model | PickerKind::Resume) {
             5 + visible
                 + usize::from(filtered_count == 0)
                 + usize::from(self.selected_detail().is_some())
@@ -700,7 +770,7 @@ impl ReplacementPicker {
     }
 
     fn insert_query_text(&mut self, text: &str) {
-        if self.kind != PickerKind::Model {
+        if !self.kind.searchable() {
             return;
         }
         self.query.push_str(text);
@@ -710,7 +780,7 @@ impl ReplacementPicker {
     }
 
     fn backspace_query(&mut self) {
-        if self.kind != PickerKind::Model {
+        if !self.kind.searchable() {
             return;
         }
         self.query.pop();
@@ -720,7 +790,7 @@ impl ReplacementPicker {
     }
 
     fn clear_query(&mut self) {
-        if self.kind != PickerKind::Model {
+        if !self.kind.searchable() {
             return;
         }
         self.query.clear();
@@ -743,8 +813,16 @@ impl ReplacementPicker {
 
     fn filtered_indices(&self) -> Vec<usize> {
         let query = self.query.trim();
-        if self.kind != PickerKind::Model || query.is_empty() {
+        if !self.kind.searchable() || query.is_empty() {
             return (0..self.items.len()).collect();
+        }
+        if self.kind == PickerKind::Resume {
+            return self
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| resume_item_matches(item, query).then_some(index))
+                .collect();
         }
         self.items
             .iter()
@@ -775,8 +853,8 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             permission_items(choices),
         ),
         PickerSpec::Resume(items) => (
-            PickerKind::Generic,
-            "Resume".to_owned(),
+            PickerKind::Resume,
+            "Resume a previous session".to_owned(),
             resume_items(items),
         ),
     }
@@ -936,6 +1014,37 @@ fn rendered_model_row(selected: bool, item: &PickerItem, width: u16) -> PickerRe
     }
 }
 
+fn rendered_resume_row(selected: bool, item: &PickerItem, width: u16) -> PickerRenderedRow {
+    let marker = if selected { "❯" } else { " " };
+    let age = item.status.as_deref().unwrap_or("");
+    let kind = item.group.as_deref().unwrap_or("");
+    let prefix = format!("{marker} {age:<10} ");
+    let suffix = if kind.is_empty() {
+        String::new()
+    } else {
+        format!(" {kind}")
+    };
+    let width = usize::from(width);
+    let label_width = width
+        .saturating_sub(display_width(&prefix))
+        .saturating_sub(display_width(&suffix))
+        .saturating_sub(1);
+    let label = truncate_display(&item.label, label_width.max(1));
+    let used = display_width(&prefix) + display_width(&label) + display_width(&suffix);
+    let gap = if suffix.is_empty() {
+        0
+    } else {
+        width.saturating_sub(used).max(1)
+    };
+    PickerRenderedRow {
+        selected,
+        text: truncate_display(
+            &format!("{prefix}{label}{}{suffix}", " ".repeat(gap)),
+            width,
+        ),
+    }
+}
+
 fn model_item_matches(item: &PickerItem, query: &str) -> bool {
     let mut text = String::new();
     text.push_str(display_label_search_text(&item.label));
@@ -954,6 +1063,31 @@ fn model_item_matches(item: &PickerItem, query: &str) -> bool {
         text.push_str(provider);
         text.push(' ');
         text.push_str(model);
+    }
+    let haystack = text.to_lowercase();
+    query
+        .split_whitespace()
+        .all(|part| haystack.contains(&part.to_lowercase()))
+}
+
+fn resume_item_matches(item: &PickerItem, query: &str) -> bool {
+    let mut text = String::new();
+    text.push_str(&item.label);
+    text.push(' ');
+    if let Some(detail) = &item.detail {
+        text.push_str(detail);
+        text.push(' ');
+    }
+    if let Some(status) = &item.status {
+        text.push_str(status);
+        text.push(' ');
+    }
+    if let Some(group) = &item.group {
+        text.push_str(group);
+        text.push(' ');
+    }
+    if let CommandAction::ResumeSession { session_id } = &item.action {
+        text.push_str(session_id);
     }
     let haystack = text.to_lowercase();
     query
@@ -1385,9 +1519,9 @@ mod tests {
     #[test]
     fn resume_picker_is_list_mode_with_indicator_and_action() {
         let mut first = ResumeItem::new("s1", "2026-06-19 research");
-        first.status = Some("*".to_owned());
+        first.status = Some("4m ago".to_owned());
         first.preview = Some("first request".to_owned());
-        first.group = Some("today".to_owned());
+        first.group = Some("interactive".to_owned());
         let context = CommandContext {
             resume_items: vec![first, ResumeItem::new("s2", "2026-06-18 coding")],
             ..CommandContext::default()
@@ -1403,13 +1537,50 @@ mod tests {
         };
         assert_eq!(picker.position_indicator(), "(1/2)");
         assert_eq!(picker.visible_rows(80).len(), 1);
-        assert!(picker.visible_rows(80)[0].text.contains("first request"));
+        let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
+        assert!(rendered.contains("Resume a previous session"));
+        assert!(rendered.contains("Type to search"));
+        assert!(rendered.contains("4m ago"));
+        assert!(rendered.contains("2026-06-19 research"));
+        assert!(rendered.contains("interactive"));
+        assert!(rendered.contains("Session: first request"));
 
         surface.move_selection_down();
         let BottomOwner::Picker(picker) = surface.owner() else {
             panic!("picker should still own surface");
         };
         assert_eq!(picker.position_indicator(), "(2/2)");
+        assert_eq!(
+            surface.confirm(),
+            SurfaceEvent::Action(CommandAction::ResumeSession {
+                session_id: "s2".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn resume_picker_searches_title_kind_and_session_detail() {
+        let mut first = ResumeItem::new("s1", "backend cleanup");
+        first.status = Some("2h ago".to_owned());
+        first.group = Some("interactive".to_owned());
+        let mut second = ResumeItem::new("s2", "token budget review");
+        second.preview = Some("01TOKEN  /repo".to_owned());
+        second.group = Some("non-interactive".to_owned());
+        let context = CommandContext {
+            resume_items: vec![first, second],
+            ..CommandContext::default()
+        };
+        let mut surface = BottomSurface::new(context);
+        surface.open_palette();
+        surface.palette_insert("resume");
+        assert_eq!(surface.confirm(), SurfaceEvent::None);
+
+        surface.palette_insert("non token");
+        let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
+
+        assert!(rendered.contains("Search: non token"));
+        assert!(rendered.contains("token budget review"));
+        assert!(!rendered.contains("backend cleanup"));
         assert_eq!(
             surface.confirm(),
             SurfaceEvent::Action(CommandAction::ResumeSession {

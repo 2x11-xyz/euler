@@ -70,9 +70,10 @@ The full-screen TUI keeps color enabled because color carries interface state.
 
 ## First headless run
 
-Headless `exec` takes one prompt argument, or reads a prompt from stdin. It writes
-provenance to `euler-provenance.jsonl` by default; pass `--provenance` when you
-want a named log.
+Headless `exec` takes one prompt argument, or reads a prompt from stdin. It creates
+an indexed non-interactive home session by default, so the run appears in
+`/resume`. Pass `--provenance` when you want a standalone log at a specific
+path instead of the home session store.
 
 ```sh
 euler exec \

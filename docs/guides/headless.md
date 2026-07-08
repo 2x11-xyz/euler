@@ -29,8 +29,10 @@ Flags:
 - `--extensions <ids>` enables a comma-separated list. Use `--extensions none`
   for no extensions.
 - `--max-tool-rounds N` sets a positive hard ceiling. Default is unlimited.
-- `--provenance <path>` chooses the append-only JSONL event log. Default:
-  `./euler-provenance.jsonl`.
+- `--provenance <path>` writes a standalone append-only JSONL event log at
+  `<path>` instead of creating an indexed non-interactive home session. By
+  default, `exec` stores runs under `~/.euler/sessions/<session-id>/` so they
+  appear in `/resume`.
 - `--auto-compaction off|stubs` chooses canvas retention. Default: `stubs`.
 - `--compaction-budget-bytes <n>` sets the rendered-canvas byte budget. Default:
   `640000`.

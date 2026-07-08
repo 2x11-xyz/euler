@@ -4,6 +4,7 @@ use crate::home::{
 };
 use crate::provenance::accepted_prefix_lines;
 use crate::resume::read_resume_prefix;
+use crate::session_kind::SessionKind;
 use crate::session_name::session_name_for_display;
 #[cfg(test)]
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
@@ -21,7 +22,7 @@ use ulid::Ulid;
 const SESSION_METADATA_VERSION: u64 = 1;
 const INDEX_ENTRY_VERSION: u64 = 1;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionStore {
     home: EulerHome,
 }
@@ -351,7 +352,9 @@ pub struct SessionRecord {
     updated_at_ms: u64,
     status: SessionStatus,
     name: Option<String>,
+    title: Option<String>,
     root: Option<PathBuf>,
+    kind: Option<SessionKind>,
 }
 
 impl SessionRecord {
@@ -372,7 +375,9 @@ impl SessionRecord {
             updated_at_ms,
             status: projection.status,
             name: projection.name,
+            title: projection.title,
             root: projection.root,
+            kind: projection.kind,
         }
     }
 
@@ -410,6 +415,14 @@ impl SessionRecord {
 
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn kind(&self) -> Option<SessionKind> {
+        self.kind
     }
 
     pub fn root(&self) -> Option<&Path> {
@@ -473,6 +486,8 @@ struct SessionMetadata {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<SessionKind>,
     events_path: String,
     blobs_dir: String,
 }
@@ -582,6 +597,7 @@ fn write_session_metadata(record: &SessionRecord) -> Result<(), SessionStoreErro
             .root
             .as_ref()
             .map(|root| root.to_string_lossy().into_owned()),
+        kind: record.kind,
         events_path: "events.jsonl".to_owned(),
         blobs_dir: "blobs".to_owned(),
     };
@@ -605,6 +621,7 @@ fn write_session_metadata_replace(record: &SessionRecord) -> Result<(), SessionS
             .root
             .as_ref()
             .map(|root| root.to_string_lossy().into_owned()),
+        kind: record.kind,
         events_path: "events.jsonl".to_owned(),
         blobs_dir: "blobs".to_owned(),
     };
@@ -655,7 +672,9 @@ fn write_json_private_replace<T: Serialize>(
 struct SessionProjection {
     status: SessionStatus,
     name: Option<String>,
+    title: Option<String>,
     root: Option<PathBuf>,
+    kind: Option<SessionKind>,
 }
 
 impl SessionProjection {
@@ -663,7 +682,9 @@ impl SessionProjection {
         Self {
             status: SessionStatus::Active,
             name: None,
+            title: None,
             root: None,
+            kind: None,
         }
     }
 }
@@ -679,14 +700,18 @@ fn session_projection_from_events_or_sidecar(
         return SessionProjection {
             status: SessionStatus::Invalid,
             name: None,
+            title: None,
             root: None,
+            kind: None,
         };
     };
     SessionProjection {
         status: status_from_events(&events),
         name: name_from_events(&events)
             .or_else(|| sidecar_name.and_then(|name| session_name_for_display(&name))),
+        title: title_from_events(&events),
         root: root_from_events(&events).or(sidecar_root),
+        kind: kind_from_events(&events),
     }
 }
 
@@ -727,6 +752,41 @@ fn name_from_events(events: &[euler_event::EventEnvelope]) -> Option<String> {
         .and_then(|event| event.payload.get("name"))
         .and_then(serde_json::Value::as_str)
         .and_then(session_name_for_display)
+}
+
+fn title_from_events(events: &[euler_event::EventEnvelope]) -> Option<String> {
+    events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .and_then(|event| event.payload.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(session_title_for_display)
+}
+
+fn session_title_for_display(content: &str) -> Option<String> {
+    let title = content
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!title.is_empty()).then(|| title.chars().take(160).collect())
+}
+
+fn kind_from_events(events: &[euler_event::EventEnvelope]) -> Option<SessionKind> {
+    events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+        .and_then(|event| event.payload.get("session_kind"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(SessionKind::parse)
 }
 
 fn root_from_events(events: &[euler_event::EventEnvelope]) -> Option<PathBuf> {

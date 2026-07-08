@@ -195,6 +195,9 @@ envelope `v` per `docs/contracts/persistence.md`.
   metadata for grouping and current-directory prioritization, not resume
   authority and not model-canvas content. It is stored in cleartext, is not
   redacted or hashed in v0, and can contain user-identifying path components.
+  Optional `session_kind` is `interactive` or `non-interactive`. It records
+  how the session was launched for discovery/resume UI grouping only. Omitted
+  means unknown/legacy and must not affect resume authority or canvas content.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,

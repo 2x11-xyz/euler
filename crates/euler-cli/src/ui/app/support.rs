@@ -13,6 +13,7 @@ use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) fn update_token_usage(
     tokens: &mut TokenUsageSnapshot,
@@ -178,22 +179,79 @@ fn resume_items_from_home(current_session_id: Option<&str>) -> Vec<ResumeItem> {
 }
 
 fn resume_items_from_records(
-    mut records: Vec<SessionRecord>,
+    records: Vec<SessionRecord>,
     current_session_id: Option<&str>,
 ) -> Vec<ResumeItem> {
-    records.sort_by(|left, right| right.id().cmp(left.id()));
+    resume_items_from_records_at(records, current_session_id, now_unix_ms())
+}
+
+fn resume_items_from_records_at(
+    mut records: Vec<SessionRecord>,
+    current_session_id: Option<&str>,
+    now_ms: u64,
+) -> Vec<ResumeItem> {
+    records.sort_by(|left, right| {
+        right
+            .updated_at_ms()
+            .cmp(&left.updated_at_ms())
+            .then_with(|| right.id().cmp(left.id()))
+    });
     records
         .into_iter()
         .filter(|record| Some(record.id()) != current_session_id)
         .take(20)
         .map(|record| {
-            let mut item =
-                ResumeItem::new(record.id().to_owned(), record.display_label().to_owned());
-            item.status = Some("saved".to_owned());
-            item.preview = Some(record.id().to_owned());
+            let mut item = ResumeItem::new(record.id().to_owned(), session_resume_label(&record));
+            item.status = Some(relative_age(record.updated_at_ms(), now_ms));
+            item.preview = Some(resume_detail(&record));
+            item.group = Some(
+                record
+                    .kind()
+                    .map_or_else(|| "unknown".to_owned(), |kind| kind.as_str().to_owned()),
+            );
             item
         })
         .collect()
+}
+
+fn session_resume_label(record: &SessionRecord) -> String {
+    record
+        .name()
+        .or_else(|| record.title())
+        .map_or_else(|| "Untitled session".to_owned(), str::to_owned)
+}
+
+fn resume_detail(record: &SessionRecord) -> String {
+    let mut parts = vec![record.id().to_owned()];
+    if let Some(root) = record.root() {
+        parts.push(root.display().to_string());
+    }
+    parts.join("  ")
+}
+
+fn relative_age(updated_at_ms: u64, now_ms: u64) -> String {
+    let elapsed_secs = now_ms.saturating_sub(updated_at_ms) / 1000;
+    let minutes = elapsed_secs.div_ceil(60).max(1);
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours < 24 {
+        if remaining_minutes == 0 {
+            return format!("{hours}h ago");
+        }
+        return format!("{hours}h {remaining_minutes}m ago");
+    }
+    format!("{}d ago", hours / 24)
+}
+
+fn now_unix_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    millis.min(u128::from(u64::MAX)) as u64
 }
 
 pub(super) fn session_root_status_path() -> std::path::PathBuf {
