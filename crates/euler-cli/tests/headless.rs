@@ -6691,14 +6691,19 @@ fn tui_resume_picker_lists_home_sessions() {
     assert!(tui.wait_for_screen("fixture/echo"));
     tui.write("/resume\r");
     assert!(
+        tui.wait_for_screen("saved for picker"),
+        "resume picker did not list derived title:\n{}",
+        tui.screen_text()
+    );
+    assert!(
         tui.wait_for_screen(&saved_id),
         "resume picker did not list saved id {saved_id}:\n{}",
         tui.screen_text()
     );
     tui.write("\x1b[B\r");
     assert!(
-        tui.wait_for_screen(&format!("resumed session {saved_id}")),
-        "resume selection did not resume saved id {saved_id}:\n{}",
+        tui.wait_for_screen("resumed session saved for picker"),
+        "resume selection did not resume saved title (id {saved_id}):\n{}",
         tui.screen_text()
     );
     assert!(
