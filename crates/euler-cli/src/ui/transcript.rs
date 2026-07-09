@@ -569,15 +569,22 @@ pub(crate) fn render_items_for_history_with_limit(
     )
 }
 
-pub(crate) fn render_items_for_history_with_expansion(
+/// History render that also reports each item's cumulative end-row offset
+/// (native-scrollback commit boundaries; see terminal.rs).
+pub(crate) fn render_items_for_history_with_offsets(
     items: &[TranscriptItem],
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
     expanded_artifact_keys: &std::collections::HashSet<String>,
-) -> Vec<Line<'static>> {
-    render::render_projected_items_with_expansion(
-        items,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let entries: Vec<_> = items
+        .iter()
+        .cloned()
+        .map(|item| ProjectedEntry { item, timing: None })
+        .collect();
+    render::render_projected_entries_with_expansion_and_offsets(
+        &entries,
         theme,
         width,
         TranscriptRenderLimits::default().with_output_lines(output_limit_lines),

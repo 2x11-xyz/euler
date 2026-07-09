@@ -99,7 +99,7 @@ mod turn_recap;
 mod visual;
 
 #[cfg(test)]
-use self::visual::{ratatui_lines_to_canvas, render_finalized_visual_items};
+use self::visual::ratatui_lines_to_canvas;
 
 use self::support::{
     command_context, is_copy_key, merge_effects, read_terminal_event, session_resume_label,
@@ -436,7 +436,15 @@ impl App {
             }
             UiAction::Resize { .. } => {
                 metrics::record(metrics::Metric::ResizeAction);
-                CoreEffect::ReplayHistoryWithScrollbackPurge
+                // No replay, no scrollback purge: rows already in native
+                // scrollback stay untouched (re-purging duplicated them in
+                // 3J-ignoring terminals and destroyed them in honoring ones —
+                // the P1 audit finding). The canvas re-renders at the new
+                // width and the terminal remaps its committed boundary by
+                // item identity (commit_scrolled_history width branch).
+                self.core.invalidate_history_cache();
+                self.render_frame()?;
+                return Ok(false);
             }
             UiAction::Render(_) => {
                 self.render_frame()?;
@@ -528,6 +536,10 @@ impl App {
         self.terminal
             .set_review_scroll_offset(self.core.visual_scroll_offset());
         self.terminal.draw_visual_frame(&visual_canvas_frame)?;
+        // Committed rows are physically in native scrollback now: freeze the
+        // covered items against merges/removals (visual_canvas boundary).
+        self.core
+            .set_committed_history_items(self.terminal.committed_history_items());
         Ok(())
     }
 
@@ -537,6 +549,7 @@ impl App {
         // frame instead of a visible blank-then-refill sweep; the guard must
         // close even when the replay fails.
         self.terminal.begin_synchronized_update()?;
+        self.core.reset_committed_history_items();
         let replay = self
             .terminal
             .reset_for_history_replay(purge_scrollback)

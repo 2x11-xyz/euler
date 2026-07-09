@@ -268,6 +268,7 @@ where
     last_known_cursor_pos: Position,
     max_active_height: u16,
     committed_active_rows: usize,
+    committed_history_items: usize,
     committed_active_lines: Vec<CanvasLine>,
     committed_active_width: u16,
     pending_stale_rows: Vec<u16>,
@@ -304,6 +305,7 @@ where
             last_known_cursor_pos: Position::ORIGIN,
             max_active_height: max_active_height.max(1),
             committed_active_rows: 0,
+            committed_history_items: 0,
             committed_active_lines: Vec::new(),
             committed_active_width: screen_size.width,
             pending_stale_rows: Vec::new(),
@@ -472,16 +474,44 @@ where
         let width = self.viewport_area.width;
         if self.committed_active_width != width {
             if self.committed_active_rows > 0 && frame.history_rows > 0 {
-                // Native scrollback cannot be reflowed after a terminal resize.
-                // Treat the currently rendered history prefix as already
-                // represented, and only commit rows that become hidden after the
-                // resize point.
-                let shared_prefix = shared_committed_prefix_len(
-                    &self.committed_active_lines,
-                    &frame.active_frame_lines,
-                );
-                let represented_rows = frame.history_rows.max(shared_prefix);
-                self.set_committed_active_rows(frame, represented_rows);
+                // Native scrollback cannot be reflowed after a terminal
+                // resize; the rows already emitted stay as they were. Remap
+                // our accounting to the same *items* re-rendered at the new
+                // width: rows for still-uncommitted items are re-derived and
+                // will commit later exactly once. (Previously this branch
+                // declared the whole rendered history "represented", which
+                // silently dropped never-emitted rows — or, in reflowing
+                // terminals, re-emitted rows that were already visible: the
+                // duplicate-line audit finding, P1.)
+                if frame.history_item_offsets.is_empty() {
+                    // No item accounting available (history not derived from
+                    // finalized items). Fall back to treating the rendered
+                    // prefix as represented — accepts losing never-emitted
+                    // rows rather than re-emitting everything.
+                    let shared_prefix = shared_committed_prefix_len(
+                        &self.committed_active_lines,
+                        &frame.active_frame_lines,
+                    );
+                    let represented_rows = frame.history_rows.max(shared_prefix);
+                    self.set_committed_active_rows(frame, represented_rows);
+                } else {
+                    // Remap the committed boundary by item identity, rendered
+                    // at the new width. Rounding down to the item boundary
+                    // can re-emit the head rows of one partially-committed
+                    // item — bounded, and preferable to losing rows (or, as
+                    // before this fix, re-committing the entire history).
+                    let remapped_rows = if self.committed_history_items == 0 {
+                        0
+                    } else {
+                        frame
+                            .history_item_offsets
+                            .get(self.committed_history_items - 1)
+                            .copied()
+                            .unwrap_or(0)
+                            .min(frame.history_rows)
+                    };
+                    self.set_committed_active_rows(frame, remapped_rows);
+                }
                 self.linefeed_history_insert_suspended_after_resize = true;
             }
             self.committed_active_width = width;
@@ -519,8 +549,20 @@ where
         Ok(start < end)
     }
 
+    /// Whole finalized history items whose rows are committed to native
+    /// scrollback. Fed back to the visual canvas after each draw.
+    pub(crate) fn committed_history_items(&self) -> usize {
+        self.committed_history_items
+    }
+
     fn set_committed_active_rows(&mut self, frame: &VisualCanvasFrame, rows: usize) {
         self.committed_active_rows = rows.min(frame.active_frame_lines.len());
+        // Track how many whole finalized items the committed rows cover; this
+        // is the width-independent identity used for resize remapping and for
+        // the canvas's mutate-above-the-boundary guard.
+        self.committed_history_items = frame
+            .history_item_offsets
+            .partition_point(|end| *end <= self.committed_active_rows);
         self.committed_active_lines = frame
             .active_frame_lines
             .iter()
@@ -613,6 +655,7 @@ where
         self.last_known_cursor_pos = Position::ORIGIN;
         self.cursor_position_authoritative = true;
         self.committed_active_rows = 0;
+        self.committed_history_items = 0;
         self.committed_active_lines.clear();
         self.committed_active_width = screen_size.width;
         self.pending_stale_rows.clear();

@@ -80,7 +80,6 @@ pub(super) fn render_projected_entries(
     render_projected_entries_with_expansion(entries, theme, width, limits, &HashSet::new())
 }
 
-#[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
 pub(super) fn render_projected_entries_with_expansion(
     entries: &[ProjectedEntry],
     theme: &Theme,
@@ -88,7 +87,30 @@ pub(super) fn render_projected_entries_with_expansion(
     limits: TranscriptRenderLimits,
     expanded_artifact_keys: &HashSet<String>,
 ) -> Vec<Line<'static>> {
+    render_projected_entries_with_expansion_and_offsets(
+        entries,
+        theme,
+        width,
+        limits,
+        expanded_artifact_keys,
+    )
+    .0
+}
+
+/// Like `render_projected_entries_with_expansion`, additionally returning the
+/// cumulative end-row offset of each entry. Offsets let the terminal commit
+/// native scrollback at item boundaries so a width change can remap its
+/// committed prefix exactly (no lost rows, no duplicates).
+#[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
+pub(super) fn render_projected_entries_with_expansion_and_offsets(
+    entries: &[ProjectedEntry],
+    theme: &Theme,
+    width: u16,
+    limits: TranscriptRenderLimits,
+    expanded_artifact_keys: &HashSet<String>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
+    let mut item_end_offsets = Vec::with_capacity(entries.len());
     let content_cols = content_width(width);
 
     for (index, entry) in entries.iter().enumerate() {
@@ -570,6 +592,7 @@ pub(super) fn render_projected_entries_with_expansion(
                 append_timing(line, timing, theme, width);
             }
         }
+        item_end_offsets.push(lines.len());
     }
 
     if let Some(footer) = super::turn_footer(entries) {
@@ -581,9 +604,13 @@ pub(super) fn render_projected_entries_with_expansion(
             theme,
             width,
         );
+        // The footer belongs to the last entry's committed region.
+        if let Some(last) = item_end_offsets.last_mut() {
+            *last = lines.len();
+        }
     }
 
-    lines
+    (lines, item_end_offsets)
 }
 
 fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
