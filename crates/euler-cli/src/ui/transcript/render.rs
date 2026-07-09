@@ -71,8 +71,11 @@ pub(super) fn render_projected_entries(
         let first_line = lines.len();
         let item = &entry.item;
         match item {
-            TranscriptItem::Banner => {
-                lines.extend(super::super::banner::styled_lines(theme));
+            TranscriptItem::Banner { session_id } => {
+                lines.extend(super::super::banner::styled_lines_with_session(
+                    theme,
+                    session_id.as_deref(),
+                ));
             }
             TranscriptItem::TurnSeparator => {
                 lines.push(Line::from(Span::styled(

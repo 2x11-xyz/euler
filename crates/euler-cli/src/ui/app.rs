@@ -138,6 +138,9 @@ pub struct AppCore {
     pending_terminal_clipboard: Option<String>,
     interrupted_guidance: bool,
     in_flight_error: Option<String>,
+    /// When true, all foldable tool artifacts render expanded. Slice debt:
+    /// Spec requires nearest-block fold; this remains a global toggle until
+    /// per-item fold targets land.
     tool_artifacts_expanded: bool,
     theme: Theme,
     theme_choice: ThemeChoice,
@@ -551,7 +554,9 @@ impl AppCore {
             active_session_home_managed,
             token_usage: TokenUsageSnapshot::default(),
             transcript: TranscriptState::default(),
-            visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner]),
+            visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner {
+                session_id: Some(session_id.clone()),
+            }]),
             visual_scroll_offset: 0,
             composer_navigation_width: 80,
             last_working_elapsed_secs: None,
@@ -1617,7 +1622,9 @@ impl AppCore {
             transcript.push_event(event.clone());
         }
         transcript.scroll_to_bottom();
-        let mut finalized = vec![TranscriptItem::Banner];
+        let mut finalized = vec![TranscriptItem::Banner {
+            session_id: self.status.session_id.clone(),
+        }];
         finalized.extend(transcript.items());
         self.transcript = transcript;
         self.token_usage = token_usage;
@@ -2192,33 +2199,23 @@ impl AppCore {
             return None;
         }
         if self.interrupted_guidance {
-            return Some(
-                "■ Conversation interrupted - tell the model what to do differently.".to_owned(),
-            );
+            return Some("■ interrupted — tell euler what to do differently".to_owned());
         }
         if self.in_flight_error.is_some() {
-            return Some("■ Turn failed - waiting for cleanup.".to_owned());
+            return Some("■ turn failed — waiting for cleanup".to_owned());
         }
         let AppState::TurnInFlight { started_at, .. } = &self.state else {
             return None;
         };
+        let secs = started_at.elapsed().as_secs();
         let label = self.in_flight_label.as_deref().unwrap_or("turn");
         if !self.is_in_flight_cancellable() {
-            return Some(format!(
-                "◦ Running {label} ({} • not cancellable)",
-                format_live_elapsed(started_at.elapsed())
-            ));
+            return Some(format!("⠧ running {label} · {secs}s · not cancellable"));
         }
         if label == "turn" {
-            return Some(format!(
-                "◦ Working ({} • esc to interrupt)",
-                format_live_elapsed(started_at.elapsed())
-            ));
+            return Some(format!("⠧ working · {secs}s · esc to interrupt"));
         }
-        Some(format!(
-            "◦ Working {label} ({} • esc to interrupt)",
-            format_live_elapsed(started_at.elapsed())
-        ))
+        Some(format!("⠧ working {label} · {secs}s · esc to interrupt"))
     }
 
     fn working_elapsed_seconds(&self) -> Option<u64> {

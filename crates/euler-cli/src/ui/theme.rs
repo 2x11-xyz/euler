@@ -392,6 +392,7 @@ impl BannerTheme {
 pub struct ComposerTheme {
     pub rule: Style,
     pub text: Style,
+    pub placeholder: Style,
     pub overflow: Style,
     pub token_bar: Style,
 }
@@ -400,13 +401,10 @@ pub struct ComposerTheme {
 impl ComposerTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
-            rule: Style::default()
-                .fg(palette.user)
-                .add_modifier(Modifier::BOLD),
-            text: Style::default().fg(palette.foreground),
-            overflow: Style::default()
-                .fg(palette.warning)
-                .add_modifier(Modifier::BOLD),
+            rule: Style::default().fg(palette.user),
+            text: Style::default().fg(palette.user),
+            placeholder: Style::default().fg(palette.muted),
+            overflow: Style::default().fg(palette.warning),
             token_bar: Style::default().fg(palette.muted),
         }
     }

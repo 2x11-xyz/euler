@@ -1,6 +1,6 @@
 pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String {
     match item {
-        super::TranscriptItem::Banner => String::new(),
+        super::TranscriptItem::Banner { .. } => String::new(),
         super::TranscriptItem::TurnSeparator => String::new(),
         super::TranscriptItem::UserMessage(content) => format!("user: {content}\n"),
         super::TranscriptItem::AssistantMessage(content) => format!("assistant: {content}\n"),

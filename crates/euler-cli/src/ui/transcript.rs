@@ -24,7 +24,9 @@ use render::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptItem {
-    Banner,
+    Banner {
+        session_id: Option<String>,
+    },
     TurnSeparator,
     UserMessage(String),
     AssistantMessage(String),

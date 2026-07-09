@@ -382,7 +382,9 @@ fn composer_empty_draft_keeps_single_visible_cursor_row() {
             indicator: None,
             prompt: true,
             text,
-        }] if text.is_empty()
+            ghost: true,
+            ..
+        }] if text == "message euler · / commands"
     ));
 }
 

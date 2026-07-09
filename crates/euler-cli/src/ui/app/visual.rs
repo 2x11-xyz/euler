@@ -335,6 +335,7 @@ fn composer_line_to_canvas(line: ComposerLine) -> CanvasLine {
             indicator,
             prompt,
             text,
+            ghost: _,
         } => {
             let prefix = indicator
                 .map(overflow_indicator_label)

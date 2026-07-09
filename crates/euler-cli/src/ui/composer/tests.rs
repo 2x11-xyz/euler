@@ -28,8 +28,9 @@ mod composer_tests {
             [ComposerLine::Draft {
                 prompt: true,
                 text,
+                ghost: true,
                 ..
-            }] if text.is_empty()
+            }] if text == "message euler · / commands"
         ));
 
         let mut typed = ComposerDraft::new();

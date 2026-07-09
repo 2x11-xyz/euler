@@ -1897,7 +1897,7 @@ mod terminal_tests {
                     CanvasLine::plain("more live transcript"),
                     CanvasLine::plain("▌ draft one"),
                     CanvasLine::plain("▌ draft two"),
-                    CanvasLine::plain("◦ Working (9s • esc to interrupt)"),
+                    CanvasLine::plain("⠧ working (9s • esc to interrupt)"),
                 ],
                 cursor: None,
                 required_height: 5,

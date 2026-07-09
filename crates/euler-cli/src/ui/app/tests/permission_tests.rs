@@ -37,7 +37,7 @@ fn permission_prompt_renders_inline_with_command_body() {
     assert!(contents.contains("▌"));
     assert!(contents.contains("echo · ctx ?%"));
     assert!(!contents.contains("Context ?% used"));
-    assert!(!contents.contains("◦ Working"));
+    assert!(!contents.contains("⠧ working"));
 
     let rows = terminal.backend().screen_rows();
     assert!(
@@ -217,7 +217,7 @@ fn inline_patch_approval_ask_hides_working_status_and_keeps_options_visible() {
     assert!(three < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
     assert!(
-        !rows.iter().any(|row| row.contains("◦ Working")),
+        !rows.iter().any(|row| row.contains("⠧ working")),
         "patch approval should own the live flow, rows: {rows:?}"
     );
 }

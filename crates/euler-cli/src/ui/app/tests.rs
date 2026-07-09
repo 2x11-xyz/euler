@@ -1250,7 +1250,7 @@ fn active_turn_frame_shows_working_state_and_next_draft() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(text.contains("◦ Working"), "frame: {text:?}");
+    assert!(text.contains("⠧ working"), "frame: {text:?}");
     assert!(text.contains("▌ next draft"), "frame: {text:?}");
 }
 
@@ -1280,7 +1280,7 @@ fn active_turn_live_transcript_prefix_is_committable() {
         .join("\n");
 
     assert!(text.contains("line one"), "frame: {text:?}");
-    assert!(text.contains("◦ Working"), "frame: {text:?}");
+    assert!(text.contains("⠧ working"), "frame: {text:?}");
     assert!(frame.committable_rows > 0);
     assert!(frame.committable_rows < frame.active_frame_lines.len());
 }
@@ -2620,7 +2620,7 @@ fn activity_live_status_is_gated_by_turn_state() {
     terminal
         .draw(|frame| core.render(frame))
         .expect("idle draw");
-    assert!(!terminal.backend().screen_contents().contains("◦ Working"));
+    assert!(!terminal.backend().screen_contents().contains("⠧ working"));
 
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -2632,7 +2632,7 @@ fn activity_live_status_is_gated_by_turn_state() {
         .draw(|frame| core.render(frame))
         .expect("in-flight draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("◦ Working (0s • esc to interrupt)"));
+    assert!(contents.contains("⠧ working · 0s · esc to interrupt"));
     assert!(contents.contains("▌"));
 }
 
@@ -2653,10 +2653,8 @@ fn interrupted_live_status_replaces_working_affordance() {
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let contents = terminal.backend().screen_contents();
-    assert!(
-        contents.contains("■ Conversation interrupted - tell the model what to do differently.")
-    );
-    assert!(!contents.contains("◦ Working"));
+    assert!(contents.contains("■ interrupted — tell euler what to do differently"));
+    assert!(!contents.contains("⠧ working"));
 }
 
 #[test]

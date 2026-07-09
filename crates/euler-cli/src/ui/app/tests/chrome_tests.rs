@@ -891,7 +891,7 @@ fn tool_round_limit_finalizes_guidance_without_raw_session_failure() {
         .iter()
         .any(|row| row.contains("run_turn: model exceeded maximum tool rounds")));
     let screen = terminal.backend().screen_contents();
-    assert!(!screen.contains("◦ Working"));
+    assert!(!screen.contains("⠧ working"));
     assert!(!screen.contains("turn failed"));
     assert!(screen.contains("▌"));
 }
@@ -977,8 +977,8 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
 
     let failed_gap = terminal.backend().screen_contents();
     assert!(failed_gap.contains("provider: transport down"));
-    assert!(failed_gap.contains("■ Turn failed - waiting for cleanup."));
-    assert!(!failed_gap.contains("◦ Working"));
+    assert!(failed_gap.contains("■ turn failed — waiting for cleanup"));
+    assert!(!failed_gap.contains("⠧ working"));
     assert!(
         !terminal
             .backend()
@@ -1000,7 +1000,7 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
     assert!(!history.contains("run_turn: transport down"));
     let done = terminal.backend().screen_contents();
     assert!(!done.contains("■ Turn failed"));
-    assert!(!done.contains("◦ Working"));
+    assert!(!done.contains("⠧ working"));
     assert!(done.contains("▌"));
 }
 
@@ -1030,7 +1030,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     )));
     render_compact_frame(&mut terminal, &mut core);
     let before_done = terminal.backend().screen_contents();
-    assert!(before_done.contains("◦ Working"));
+    assert!(before_done.contains("⠧ working"));
     assert!(!before_done.contains("■ Turn failed"));
 
     core.handle_turn_event(TurnEvent::TurnDone {
@@ -1044,7 +1044,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     assert!(history.contains("run_turn: transport down"));
     let done = terminal.backend().screen_contents();
     assert!(!done.contains("■ Turn failed"));
-    assert!(!done.contains("◦ Working"));
+    assert!(!done.contains("⠧ working"));
     assert!(done.contains("▌"));
 }
 
