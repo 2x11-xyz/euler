@@ -15,7 +15,7 @@ pub(super) fn render_help_overlay(frame: &mut Frame<'_>, theme: &Theme) {
 }
 
 pub(super) fn render_patch_modal(frame: &mut Frame<'_>, modal: &PatchApprovalModal, theme: &Theme) {
-    let area = patch_approval::modal_area(frame.area(), modal.expanded);
+    let area = patch_approval::modal_area(frame.area());
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)

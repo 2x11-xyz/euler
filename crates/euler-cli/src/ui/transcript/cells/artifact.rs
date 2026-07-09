@@ -1,4 +1,4 @@
-use crate::ui::text::{display_width, truncate_display};
+use crate::ui::text::{blank_gutter, display_width, truncate_display, GUTTER_WIDTH};
 use crate::ui::theme::Theme;
 use ratatui::{
     style::Style,
@@ -109,12 +109,22 @@ pub(in crate::ui::transcript) fn push_artifact_cell(
     theme: &Theme,
 ) {
     let width = artifact_width(cell.width);
+    let body_width = width.saturating_sub(GUTTER_WIDTH).max(ARTIFACT_MIN_WIDTH);
     let background_style = artifact_background_style(theme);
     let title_style = background_style.patch(cell.style);
-    let title = flat_title_row(width, cell.title, cell.footer);
-    lines.push(Line::from(Span::styled(title, title_style)).style(background_style));
+    let title = flat_title_row(body_width, cell.title, cell.footer);
+    lines.push(
+        Line::from(vec![
+            Span::styled(
+                blank_gutter().to_owned(),
+                background_style.patch(theme.transcript.gutter),
+            ),
+            Span::styled(title, title_style),
+        ])
+        .style(background_style),
+    );
     for row in cell.rows {
-        lines.push(artifact_body_line(width, row, theme));
+        lines.push(artifact_body_line(body_width, row, theme));
     }
 }
 
@@ -192,11 +202,17 @@ fn flat_title_row(width: usize, title: &str, footer: &str) -> String {
 }
 
 fn artifact_body_line(width: usize, row: &Line<'static>, theme: &Theme) -> Line<'static> {
-    let content_width = width.saturating_sub(ARTIFACT_BODY_PADDING);
-    let content = fit_artifact_spans(&row.spans, content_width);
+    let body_width = width.saturating_sub(ARTIFACT_BODY_PADDING);
+    let content = fit_artifact_spans(&row.spans, body_width);
     let content_used = spans_width(&content);
-    let padding = " ".repeat(content_width.saturating_sub(content_used));
-    let mut spans = vec![Span::styled("  ", theme.transcript.muted)];
+    let padding = " ".repeat(body_width.saturating_sub(content_used));
+    let mut spans = vec![
+        Span::styled(
+            blank_gutter().to_owned(),
+            artifact_background_style(theme).patch(theme.transcript.gutter),
+        ),
+        Span::styled("  ", theme.transcript.muted),
+    ];
     spans.extend(content);
     spans.push(Span::styled(padding, theme.transcript.muted));
     Line::from(spans).style(artifact_background_style(theme))

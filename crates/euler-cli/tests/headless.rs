@@ -6712,9 +6712,16 @@ fn tui_resume_picker_lists_home_sessions() {
         tui.screen_text()
     );
     tui.write("after tui resume\r");
+    // Fixture echo concatenates prior turns; the 9-cell ledger gutter can wrap
+    // the long assistant line, so match stable prefixes rather than one span.
     assert!(
-        tui.wait_for_screen("assistant: user: saved for picker user: after tui"),
+        tui.wait_for_screen("assistant: user: saved for picker"),
         "post-resume turn did not render:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.wait_for_screen("after tui"),
+        "post-resume user text did not render:\n{}",
         tui.screen_text()
     );
     tui.quit();

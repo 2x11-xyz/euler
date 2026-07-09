@@ -87,6 +87,18 @@ envelope `v` per `docs/contracts/persistence.md`.
   exactly this shape onto their wire formats.
 - `permission.prompt`: `capability`, `reason`.
 - `permission.decision`: `capability`, `mode`, `allowed`, `decision`.
+  Additive optional fields for scoped grants (see
+  `docs/contracts/capabilities.md`):
+  - `grant_scope`: `once` | `session` | `project` when the decision allowed a
+    grant (or recorded an allow under an existing grant / mode).
+  - `grant_pattern`: non-empty scope pattern string when the grant is patterned;
+    omitted for unscoped grants.
+  - `scope`: legacy resume marker; present as `"session"` only for **unscoped**
+    session grants so resume can fold capability-wide session allows. Patterned
+    session grants use `grant_scope`/`grant_pattern` and do not set this field
+    until resume learns patterned fold.
+  - `instruction`: non-empty deny-with-guidance text when the user denied with
+    instructions; omitted on bare deny and on allows.
 - `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file

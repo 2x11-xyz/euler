@@ -1,5 +1,7 @@
 use crate::ui::patch_diff::{self, PatchDisplay};
-use crate::ui::text::{display_width, wrap_text};
+use crate::ui::text::{
+    blank_gutter, content_width, display_width, tree_gutter_last, wrap_text, GUTTER_WIDTH,
+};
 use crate::ui::theme::Theme;
 use ratatui::text::{Line, Span};
 
@@ -595,12 +597,16 @@ pub(super) fn push_child_rows(
     width: u16,
 ) {
     for (index, row) in rows.iter().enumerate() {
-        let prefix = if index == 0 { "  └ " } else { "    " };
+        let prefix = if index == 0 {
+            tree_gutter_last()
+        } else {
+            blank_gutter()
+        };
         push_wrapped_with_prefix(
             lines,
             CellPrefixes {
                 first: prefix,
-                next: "    ",
+                next: blank_gutter(),
             },
             row,
             style,
@@ -652,12 +658,16 @@ fn push_child_preview_rows(
     width: u16,
 ) {
     for (index, row) in rows.iter().enumerate() {
-        let prefix = if index == 0 { "  └ " } else { "    " };
+        let prefix = if index == 0 {
+            tree_gutter_last()
+        } else {
+            blank_gutter()
+        };
         push_wrapped_with_prefix(
             lines,
             CellPrefixes {
                 first: prefix,
-                next: "    ",
+                next: blank_gutter(),
             },
             row,
             style,
@@ -745,8 +755,20 @@ fn push_wrapped_with_prefix(
     theme: &Theme,
     width: u16,
 ) {
-    let body_width = usize::from(width)
-        .saturating_sub(display_width(prefixes.first).max(display_width(prefixes.next)))
+    let first_is_ledger = display_width(prefixes.first) == GUTTER_WIDTH;
+    let next_is_ledger = display_width(prefixes.next) == GUTTER_WIDTH;
+    let first_content = if first_is_ledger {
+        0
+    } else {
+        display_width(prefixes.first)
+    };
+    let next_content = if next_is_ledger {
+        0
+    } else {
+        display_width(prefixes.next)
+    };
+    let body_width = content_width(width)
+        .saturating_sub(first_content.max(next_content))
         .max(1);
     for (index, segment) in wrap_text(text, body_width).into_iter().enumerate() {
         let prefix = if index == 0 {
@@ -754,10 +776,21 @@ fn push_wrapped_with_prefix(
         } else {
             prefixes.next
         };
-        lines.push(Line::from(vec![
-            Span::styled(prefix.to_owned(), theme.transcript.gutter),
-            Span::styled(segment, style),
-        ]));
+        let is_ledger = if index == 0 {
+            first_is_ledger
+        } else {
+            next_is_ledger
+        };
+        let mut spans = Vec::with_capacity(3);
+        if !is_ledger {
+            spans.push(Span::styled(
+                blank_gutter().to_owned(),
+                theme.transcript.gutter,
+            ));
+        }
+        spans.push(Span::styled(prefix.to_owned(), theme.transcript.gutter));
+        spans.push(Span::styled(segment, style));
+        lines.push(Line::from(spans));
     }
 }
 

@@ -19,10 +19,10 @@ fn permission_prompt_renders_inline_with_command_body() {
             ),
         ]),
     ));
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
@@ -74,10 +74,10 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
             ("input", serde_json::json!({"path": "Cargo.toml"})),
         ]),
     ));
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
@@ -86,10 +86,10 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
     assert!(contents.contains("$ cargo test"));
 
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool edit_file".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::FsWrite,
+        "tool edit_file".to_owned(),
+    )));
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
@@ -102,10 +102,7 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
 fn non_patch_permission_uses_generic_inline_ask() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();
-    let request = PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-    };
+    let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned());
     core.modal = Some(core.modal_for_request(request));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
@@ -122,10 +119,10 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let rows = terminal.backend().screen_rows();
@@ -160,10 +157,10 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
             ("delta", "live transcript should yield\n".into()),
         ]),
     ));
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool edit_file".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::FsWrite,
+        "tool edit_file".to_owned(),
+    )));
 
     render_inline_frame(&mut terminal, &mut core);
 
@@ -233,10 +230,10 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
         ]),
     ));
     core.bottom.composer_mut().insert_text("draft");
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "run command".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "run command".to_owned(),
+    )));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 

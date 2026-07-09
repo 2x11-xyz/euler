@@ -24,7 +24,7 @@ use super::terminal::{self, PendingSignal, TerminalSession};
 use super::theme::{Theme, ThemeChoice};
 #[cfg(test)]
 use super::transcript::transcript_items_widget;
-use super::transcript::{TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
+use super::transcript::{self, TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
 use super::tui_decider::{PermissionChannels, PermissionReply, TuiDecider};
 use super::visual_canvas::{
     BlockCursor, CanvasComposerSnapshot, CanvasLine, CanvasSpan, CanvasStatusSnapshot, FocusOwner,
@@ -55,7 +55,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 #[cfg(test)]
 use ratatui::Frame;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -139,10 +139,12 @@ pub struct AppCore {
     pending_terminal_clipboard: Option<String>,
     interrupted_guidance: bool,
     in_flight_error: Option<String>,
-    /// When true, all foldable tool artifacts render expanded. Slice debt:
-    /// Spec requires nearest-block fold; this remains a global toggle until
-    /// per-item fold targets land.
-    tool_artifacts_expanded: bool,
+    /// Keys of foldable history items currently expanded (`history:{index}`).
+    expanded_artifact_keys: HashSet<String>,
+    /// Last known history viewport as `(top_row, height)` for nearest-block fold.
+    last_history_viewport: (usize, usize),
+    /// Foldable item spans recorded on the last history render: `(key, start, end)`.
+    last_foldable_spans: Vec<(String, usize, usize)>,
     theme: Theme,
     theme_choice: ThemeChoice,
     theme_preference_path: Option<PathBuf>,
@@ -567,7 +569,9 @@ impl AppCore {
             pending_terminal_clipboard: None,
             interrupted_guidance: false,
             in_flight_error: None,
-            tool_artifacts_expanded: false,
+            expanded_artifact_keys: HashSet::new(),
+            last_history_viewport: (0, 24),
+            last_foldable_spans: Vec::new(),
             theme,
             theme_choice,
             theme_preference_path,
@@ -993,7 +997,6 @@ impl AppCore {
             KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.reply_to_modal(PermissionReply::Deny)
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => self.expand_patch_modal(),
             _ if modal_quit_key(&key) => {
                 self.reply_to_modal(PermissionReply::Deny);
                 CoreEffect::Quit
@@ -1034,14 +1037,6 @@ impl AppCore {
             KeyCode::End => self.move_composer_cursor(|draft| draft.move_end()),
             _ => CoreEffect::None,
         }
-    }
-
-    fn expand_patch_modal(&mut self) -> CoreEffect {
-        let Some(Modal::PatchApproval(modal)) = &mut self.modal else {
-            return CoreEffect::None;
-        };
-        modal.expanded = true;
-        CoreEffect::Render
     }
 
     fn handle_submit(&mut self) -> CoreEffect {
@@ -1211,7 +1206,8 @@ impl AppCore {
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
         self.token_usage = TokenUsageSnapshot::default();
-        self.tool_artifacts_expanded = false;
+        self.expanded_artifact_keys.clear();
+        self.last_foldable_spans.clear();
         self.modal = None;
         self.quit_armed = None;
         self.last_working_elapsed_secs = None;
@@ -1828,14 +1824,74 @@ impl AppCore {
         }
         if !self
             .visual_canvas
-            .has_foldable_shell_artifact(TOOL_CALL_MAX_LINES)
+            .has_foldable_artifact(TOOL_CALL_MAX_LINES)
         {
             return CoreEffect::None;
         }
-        self.tool_artifacts_expanded = !self.tool_artifacts_expanded;
+        self.refresh_foldable_spans(self.composer_navigation_width);
+        let Some(key) = self.nearest_foldable_key() else {
+            return CoreEffect::None;
+        };
+        if !self.expanded_artifact_keys.remove(&key) {
+            self.expanded_artifact_keys.insert(key);
+        }
         self.visual_canvas.invalidate_history_cache();
         self.visual_scroll_offset = 0;
         CoreEffect::ReplayHistoryWithScrollbackPurge
+    }
+
+    fn nearest_foldable_key(&self) -> Option<String> {
+        let spans = &self.last_foldable_spans;
+        if spans.is_empty() {
+            return None;
+        }
+        let (top, height) = self.last_history_viewport;
+        let height = height.max(1);
+        let center = top.saturating_add(height / 2);
+        let mut best: Option<(usize, usize, &str)> = None;
+        for (index, (key, start, end)) in spans.iter().enumerate() {
+            let mid = start.saturating_add(end.saturating_sub(*start) / 2);
+            let dist = mid.abs_diff(center);
+            let rank = (dist, spans.len() - 1 - index);
+            match best {
+                Some((best_dist, best_rev, _)) if rank >= (best_dist, best_rev) => {}
+                _ => best = Some((rank.0, rank.1, key.as_str())),
+            }
+        }
+        best.map(|(_, _, key)| key.to_owned())
+    }
+
+    fn refresh_foldable_spans(&mut self, width: u16) {
+        let items = self.visual_canvas.finalized_items().to_vec();
+        let theme = self.theme.clone();
+        let mut row = 0usize;
+        let mut spans = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let key = transcript::artifact_key_for_index(index);
+            let limit = if self.expanded_artifact_keys.contains(&key) {
+                usize::MAX
+            } else {
+                TOOL_CALL_MAX_LINES
+            };
+            let line_count = transcript::render_items_for_history_with_limit(
+                std::slice::from_ref(item),
+                &theme,
+                width,
+                limit,
+            )
+            .len();
+            if item.is_foldable_artifact(TOOL_CALL_MAX_LINES) {
+                let end = row.saturating_add(line_count.saturating_sub(1));
+                spans.push((key, row, end));
+            }
+            row = row.saturating_add(line_count);
+        }
+        let height = self.last_history_viewport.1.max(1);
+        let top = row
+            .saturating_sub(height)
+            .saturating_sub(self.visual_scroll_offset);
+        self.last_history_viewport = (top, height);
+        self.last_foldable_spans = spans;
     }
 
     fn open_external_editor(&mut self) -> CoreEffect {
@@ -1915,7 +1971,6 @@ impl AppCore {
         Modal::PatchApproval(PatchApprovalModal {
             preview: patch_approval::preview_from_events(self.transcript.events()),
             request,
-            expanded: false,
         })
     }
 

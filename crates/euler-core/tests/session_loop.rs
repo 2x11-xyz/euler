@@ -3623,7 +3623,7 @@ impl PermissionDecider for ObservingDecider {
                 .any(|kind| kind == EventKind::PERMISSION_PROMPT),
             "permission prompt must be flushed before the decider returns: {observed:?}"
         );
-        self.verdict
+        self.verdict.clone()
     }
 }
 

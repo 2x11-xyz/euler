@@ -36,9 +36,9 @@ impl AppCore {
         self.composer_navigation_width = width;
         let snapshot = self.visual_canvas_snapshot(width);
         let theme = self.theme.clone();
-        let output_limit_lines = self.tool_output_limit_lines();
+        let expanded = self.expanded_artifact_keys.clone();
         let mut frame = self.visual_canvas.render(snapshot, |items, width| {
-            render_finalized_visual_items(items, &theme, width, output_limit_lines)
+            render_finalized_visual_items(items, &theme, width, TOOL_CALL_MAX_LINES, &expanded)
         });
         // Active turns may commit finalized history and the markdown-stable
         // live transcript prefix. If no live prefix exists, keep the boundary
@@ -47,15 +47,14 @@ impl AppCore {
         if self.turn_in_flight() && self.transcript.live_committed_items().is_empty() {
             frame.committable_rows = frame.committable_rows.min(frame.history_rows);
         }
+        self.refresh_foldable_spans(width);
+        let height = self.last_history_viewport.1.max(1);
+        let top = frame
+            .history_rows
+            .saturating_sub(height)
+            .saturating_sub(self.visual_scroll_offset);
+        self.last_history_viewport = (top, height);
         frame
-    }
-
-    fn tool_output_limit_lines(&self) -> usize {
-        if self.tool_artifacts_expanded {
-            usize::MAX
-        } else {
-            TOOL_CALL_MAX_LINES
-        }
     }
 
     #[cfg(test)]
@@ -262,12 +261,14 @@ pub(super) fn render_finalized_visual_items(
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
+    expanded_artifact_keys: &std::collections::HashSet<String>,
 ) -> Vec<CanvasLine> {
-    let mut lines = ratatui_lines_to_canvas(transcript::render_items_for_history_with_limit(
+    let mut lines = ratatui_lines_to_canvas(transcript::render_items_for_history_with_expansion(
         items,
         theme,
         width,
         output_limit_lines,
+        expanded_artifact_keys,
     ));
     if finalized_batch_needs_trailing_rhythm(items) {
         lines.push(CanvasLine::plain_lossy(""));

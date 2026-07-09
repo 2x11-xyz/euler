@@ -1,4 +1,7 @@
-use super::text::{content_width, display_width, wrap_text, GUTTER_WIDTH};
+use super::text::{
+    blank_gutter, content_width, display_width, tree_gutter_last, tree_gutter_mid, wrap_text,
+    GUTTER_WIDTH,
+};
 use super::theme::Theme;
 use super::transcript::normalized_shell_command;
 use euler_event::{EventEnvelope, EventKind};
@@ -144,7 +147,7 @@ fn render_activity_items(items: &[ActivityItem], theme: &Theme, width: u16) -> V
                 } else {
                     (format!("• {text}"), theme.activity.status)
                 };
-                push_wrapped(&mut lines, "    ", &text, style, theme, width);
+                push_wrapped(&mut lines, blank_gutter(), &text, style, theme, width);
             }
             ActivityItem::ToolGroup { label, details, .. } => {
                 push_tool_group(&mut lines, label, details, theme, width);
@@ -166,7 +169,7 @@ fn push_tool_group(
         for detail in details {
             push_wrapped(
                 lines,
-                "    ",
+                blank_gutter(),
                 &format!("bash $ {detail}"),
                 theme.activity.header,
                 theme,
@@ -182,12 +185,19 @@ fn push_tool_group(
     } else {
         format!("{label} · {steps} steps")
     };
-    push_wrapped(lines, "    ", &header, theme.activity.header, theme, width);
+    push_wrapped(
+        lines,
+        blank_gutter(),
+        &header,
+        theme.activity.header,
+        theme,
+        width,
+    );
     for (index, detail) in details.iter().enumerate() {
         let gutter = if index + 1 == details.len() {
-            "  └ "
+            tree_gutter_last()
         } else {
-            "  ├ "
+            tree_gutter_mid()
         };
         push_wrapped(lines, gutter, detail, theme.activity.detail, theme, width);
     }
@@ -770,19 +780,21 @@ mod tests {
         assert!(contents.contains("explore"));
         assert!(contents.contains("edit"));
         assert!(!contents.contains("• Ran"));
-        assert!(contents.contains("  ├ Read file"));
-        assert!(contents.contains("  └ Git diff"));
-        assert!(contents.contains("  └ Edit file"));
+        assert!(contents.contains("       ├ Read file"));
+        assert!(contents.contains("       └ Git diff"));
+        assert!(contents.contains("       └ Edit file"));
         assert!(!contents.contains("read_file call"));
         assert!(!contents.contains("run_shell completed"));
 
         for line in contents.lines().filter(|line| !line.trim().is_empty()) {
             assert!(
-                line.starts_with("    ") || line.starts_with("  ├ ") || line.starts_with("  └ "),
+                line.starts_with(blank_gutter())
+                    || line.starts_with(tree_gutter_mid())
+                    || line.starts_with(tree_gutter_last()),
                 "unstable activity gutter: {line:?}"
             );
             assert!(
-                !line.starts_with("  └   └ "),
+                !line.contains("└       └"),
                 "nested activity gutter: {line:?}"
             );
         }

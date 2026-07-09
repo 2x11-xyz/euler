@@ -58,10 +58,7 @@ mod tests {
     use std::thread;
 
     fn request() -> PermissionRequest {
-        PermissionRequest {
-            capability: Capability::FsWrite,
-            reason: "edit file".to_owned(),
-        }
+        PermissionRequest::new(Capability::FsWrite, "edit file".to_owned())
     }
 
     #[test]

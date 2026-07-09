@@ -2,12 +2,13 @@
 
 use super::{
     approval_mode_str, canvas_snapshot_payload, context_budget_exhausted, elapsed_ms,
-    file_change_payload, file_diff_payload, model_input_item, permission_decision_str, used_tokens,
-    validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig,
-    RoundLoopIo, RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
+    file_change_payload, file_diff_payload, model_input_item, permission_decision_payload,
+    permission_request_for_tool, used_tokens, validate_model_target_shape, ModelRoundData,
+    ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session, SessionError,
+    TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas, AutoCompactionPolicy};
-use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate, PermissionRequest};
+use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
 use euler_agents::{generated_agent_id, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{
@@ -242,12 +243,15 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
                 return Ok(());
             }
-            let request = PermissionRequest {
+            let request = permission_request_for_tool(
                 capability,
-                reason: self.tools.permission_reason(&call.name, &call.input),
-            };
+                &self.tools.permission_reason(&call.name, &call.input),
+                &call.name,
+                &call.input,
+            );
             let mode = self.permissions.mode(capability);
-            let prompt_id = if mode == ApprovalMode::Ask {
+            let needs_prompt = mode == ApprovalMode::Ask && !self.permissions.is_granted(&request);
+            let prompt_id = if needs_prompt {
                 Some(
                     self.append(
                         EventKind::PERMISSION_PROMPT,
@@ -262,16 +266,12 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             } else {
                 None
             };
-            let allowed = self.permissions.decide(&request, mode);
+            let decision = self.permissions.decide_detailed(&request, mode);
+            let allowed = decision.allowed();
             let mode_label = approval_mode_str(mode);
             self.append(
                 EventKind::PERMISSION_DECISION,
-                object([
-                    ("capability", capability.as_str().into()),
-                    ("mode", mode_label.into()),
-                    ("allowed", allowed.into()),
-                    ("decision", permission_decision_str(allowed).into()),
-                ]),
+                permission_decision_payload(&decision, mode_label, mode),
                 Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
             )?;
             crate::diagnostics::permission_decision(

@@ -244,17 +244,6 @@ fn shell_artifact_with_lines(total: usize) -> TranscriptItem {
     }
 }
 
-fn patch_artifact_with_lines(total: usize) -> TranscriptItem {
-    TranscriptItem::PatchApplied {
-        path: "src/lib.rs".to_owned(),
-        old: (1..=total)
-            .map(|index| format!("old {index}\n"))
-            .collect::<String>()
-            .into(),
-        new: "new\n".to_owned().into(),
-    }
-}
-
 fn mouse_event(kind: MouseEventKind) -> MouseEvent {
     MouseEvent {
         kind,
@@ -269,24 +258,17 @@ fn screen_row(contents: &str, row: u16) -> &str {
 }
 
 fn fs_write_request() -> PermissionRequest {
-    PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool edit_file".to_owned(),
-    }
+    PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned())
 }
 
 fn apply_patch_request() -> PermissionRequest {
-    PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool apply_patch".to_owned(),
-    }
+    PermissionRequest::new(Capability::FsWrite, "tool apply_patch".to_owned())
 }
 
 fn patch_modal(preview: PatchPreview) -> Modal {
     Modal::PatchApproval(PatchApprovalModal {
         request: fs_write_request(),
         preview,
-        expanded: false,
     })
 }
 
@@ -417,10 +399,10 @@ fn modal_input_replies_allow_deny_and_allow_all() {
         let mut core = core();
         let (reply_tx, reply_rx) = mpsc::channel();
         core.reply_tx = reply_tx;
-        core.modal = Some(Modal::Permission(PermissionRequest {
-            capability: Capability::FsWrite,
-            reason: "edit".to_owned(),
-        }));
+        core.modal = Some(Modal::Permission(PermissionRequest::new(
+            Capability::FsWrite,
+            "edit".to_owned(),
+        )));
         core.handle_input(key(code));
         assert_eq!(reply_rx.recv().expect("reply"), reply);
     }
@@ -445,10 +427,10 @@ fn modal_ctrl_c_denies_and_quits() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "edit".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::FsWrite,
+        "edit".to_owned(),
+    )));
 
     let effect = core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
@@ -498,10 +480,10 @@ fn permission_modal_swallows_scrollback_keys_without_replying() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "edit".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::FsWrite,
+        "edit".to_owned(),
+    )));
 
     assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::None);
     assert_eq!(
@@ -1687,15 +1669,14 @@ fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
 }
 
 #[test]
-fn ctrl_o_expands_shell_artifacts_without_expanding_patch_cells() {
+fn ctrl_o_expands_only_nearest_foldable_artifact() {
     let mut core = core();
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
-    core.push_finalized_visual_item(patch_artifact_with_lines(TOOL_CALL_MAX_LINES + 14));
+    core.push_finalized_visual_item(shell_artifact_with_lines(14));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
     assert!(folded.contains("8 more lines"), "folded: {folded:?}");
-    assert!(!folded.contains("bounded patch"), "folded: {folded:?}");
-    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
+    assert!(folded.contains("10 more lines"), "folded: {folded:?}");
 
     assert_eq!(
         core.handle_input(ctrl_o()),
@@ -1703,13 +1684,14 @@ fn ctrl_o_expands_shell_artifacts_without_expanding_patch_cells() {
     );
     let expanded = drain_finalized_visual_text(&mut core, 80);
 
-    assert!(!expanded.contains("8 more lines"), "expanded: {expanded:?}");
-    assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
-    assert!(
-        !expanded.contains("bounded patch"),
-        "expanded: {expanded:?}"
+    // Exactly one foldable expands (nearest to viewport center).
+    let still_folded = usize::from(expanded.contains("8 more lines"))
+        + usize::from(expanded.contains("10 more lines"));
+    assert_eq!(
+        still_folded, 1,
+        "exactly one artifact should remain folded: {expanded:?}"
     );
-    assert!(expanded.contains("ctrl+o expand"), "expanded: {expanded:?}");
+    assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
 }
 
 #[test]
@@ -2820,7 +2802,7 @@ fn patch_approval_modal_clears_full_rows_behind_modal() {
 }
 
 #[test]
-fn patch_review_key_expands_diff_region() {
+fn patch_review_key_no_longer_expands_diff_region() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();
     let new = (0..40)
@@ -2832,22 +2814,20 @@ fn patch_review_key_expands_diff_region() {
     let normal = terminal.backend().screen_contents();
     assert!(!normal.contains("line 10"));
 
-    assert_eq!(
-        core.handle_input(key(KeyCode::Char('r'))),
-        CoreEffect::Render
-    );
+    // `r` is no longer an expand key; nearest-block ctrl+o owns expansion.
+    let _ = core.handle_input(key(KeyCode::Char('r')));
     terminal
         .draw(|frame| core.render(frame))
-        .expect("expanded draw");
+        .expect("draw after r");
 
-    let expanded = terminal.backend().screen_contents();
-    assert!(expanded.contains("line 10"));
+    let after = terminal.backend().screen_contents();
+    assert!(
+        !after.contains("line 10"),
+        "r must not expand patch modal: {after:?}"
+    );
     assert!(matches!(
         core.modal,
-        Some(Modal::PatchApproval(PatchApprovalModal {
-            expanded: true,
-            ..
-        }))
+        Some(Modal::PatchApproval(PatchApprovalModal { .. }))
     ));
 }
 

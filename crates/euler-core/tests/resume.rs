@@ -937,7 +937,7 @@ impl Default for CountingDecider {
 impl PermissionDecider for CountingDecider {
     fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
         self.calls.set(self.calls.get() + 1);
-        self.decision
+        self.decision.clone()
     }
 }
 

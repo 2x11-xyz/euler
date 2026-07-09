@@ -12,7 +12,9 @@ use crate::compaction::{
 use crate::file_diff::{
     file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
 };
-use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate, PermissionRequest};
+use crate::permissions::{
+    ApprovalMode, GrantDecision, PermissionDecider, PermissionGate, PermissionRequest,
+};
 use crate::provenance::ProvenanceWriter;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
@@ -631,12 +633,16 @@ impl<D> Session<D> {
                 ("root", session_root_for_event(&config.root).into()),
             ]),
         ));
+        let mut permissions = PermissionGate::new(decider);
+        // Project grants are best-effort at open: missing file is empty; corrupt
+        // files leave the store unloaded so project writes fail closed.
+        let _ = permissions.load_project_grants(&config.root);
         Self {
             config,
             active_target,
             providers,
             bus,
-            permissions: PermissionGate::new(decider),
+            permissions,
             tools,
             provenance: None,
             persisted_events: 0,
@@ -877,12 +883,14 @@ impl<D> Session<D> {
     ) -> Self {
         let tools = ToolRegistry::new(config.root.clone());
         let persisted_events = events.len();
+        let mut permissions = PermissionGate::new(decider);
+        let _ = permissions.load_project_grants(&config.root);
         Self {
             config,
             active_target,
             providers,
             bus: EventBus { events },
-            permissions: PermissionGate::new(decider),
+            permissions,
             tools,
             provenance: None,
             persisted_events,
@@ -1627,12 +1635,16 @@ impl<D: PermissionDecider> Session<D> {
                 self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
                 return Ok(());
             }
-            let request = PermissionRequest {
+            let request = permission_request_for_tool(
                 capability,
-                reason: self.tools.permission_reason(&call.name, &call.input),
-            };
+                &self.tools.permission_reason(&call.name, &call.input),
+                &call.name,
+                &call.input,
+            );
             let mode = self.permissions.mode(capability);
-            let prompt_id = if mode == ApprovalMode::Ask {
+            // Prompt only when Ask and no matching scoped grant already covers this request.
+            let needs_prompt = mode == ApprovalMode::Ask && !self.permissions.is_granted(&request);
+            let prompt_id = if needs_prompt {
                 let prompt_id = self.emit(
                     EventKind::PERMISSION_PROMPT,
                     object([
@@ -1645,22 +1657,10 @@ impl<D: PermissionDecider> Session<D> {
             } else {
                 None
             };
-            let allowed = self.permissions.decide(&request, mode);
+            let decision = self.permissions.decide_detailed(&request, mode);
+            let allowed = decision.allowed();
             let mode_label = approval_mode_str(mode);
-            // An Ask that upgraded the gate to SessionAllow was an
-            // AllowSession verdict; record the session scope so resume can
-            // fold the grant (see the session-scope ADR).
-            let session_scoped = mode == ApprovalMode::Ask
-                && self.permissions.mode(capability) == ApprovalMode::SessionAllow;
-            let mut payload = object([
-                ("capability", capability.as_str().into()),
-                ("mode", mode_label.into()),
-                ("allowed", allowed.into()),
-                ("decision", permission_decision_str(allowed).into()),
-            ]);
-            if session_scoped {
-                payload.insert("scope".to_owned(), "session".into());
-            }
+            let payload = permission_decision_payload(&decision, mode_label, mode);
             self.emit_with_parent(
                 EventKind::PERMISSION_DECISION,
                 payload,
@@ -2317,6 +2317,69 @@ fn permission_decision_str(allowed: bool) -> &'static str {
     } else {
         "denied"
     }
+}
+
+pub(crate) fn permission_request_for_tool(
+    capability: Capability,
+    reason: &str,
+    tool_name: &str,
+    input: &Value,
+) -> PermissionRequest {
+    let mut request = PermissionRequest::new(capability, reason.to_owned());
+    match tool_name {
+        "run_shell" => {
+            if let Some(command) = input.get("command").and_then(Value::as_str) {
+                request = request.with_command(command);
+            }
+        }
+        "edit_file" | "read_file" | "apply_patch" => {
+            if let Some(path) = input.get("path").and_then(Value::as_str) {
+                request = request.with_path(path);
+            }
+        }
+        _ => {}
+    }
+    request
+}
+
+/// Build a permission.decision payload including optional grant scope fields.
+pub(crate) fn permission_decision_payload(
+    decision: &GrantDecision,
+    mode_label: &str,
+    mode: ApprovalMode,
+) -> JsonObject {
+    let allowed = decision.allowed();
+    let mut payload = object([
+        ("capability", decision.capability.as_str().into()),
+        ("mode", mode_label.into()),
+        ("allowed", allowed.into()),
+        ("decision", permission_decision_str(allowed).into()),
+    ]);
+    if allowed {
+        // grant_scope is additive; keep legacy `scope: "session"` for unscoped
+        // session grants created under Ask so resume continues to fold
+        // capability-wide allows (see resume fold rules).
+        payload.insert(
+            "grant_scope".to_owned(),
+            decision.grant_scope_label().into(),
+        );
+        if let Some(pattern) = decision.grant_pattern() {
+            payload.insert("grant_pattern".to_owned(), pattern.into());
+        }
+        let unscoped_session_grant = mode == ApprovalMode::Ask
+            && matches!(
+                &decision.scope,
+                crate::grants::GrantScope::Session(p) if p.is_unscoped()
+            );
+        if unscoped_session_grant {
+            payload.insert("scope".to_owned(), "session".into());
+        }
+    } else if let Some(instruction) = decision.instruction.as_ref() {
+        if !instruction.is_empty() {
+            payload.insert("instruction".to_owned(), instruction.clone().into());
+        }
+    }
+    payload
 }
 
 pub fn fold_model_target(

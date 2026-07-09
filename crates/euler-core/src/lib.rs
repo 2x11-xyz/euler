@@ -11,6 +11,7 @@ mod diagnostics;
 pub mod extension_registry;
 pub mod extensions;
 pub mod file_diff;
+pub mod grants;
 pub mod home;
 pub mod permissions;
 pub mod provenance;
@@ -60,8 +61,14 @@ pub use file_diff::{
     ObservedFileChange, WorkspaceSnapshot, MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES,
     MAX_WORKSPACE_SNAPSHOT_FILE_BYTES, MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
 };
+pub use grants::{
+    ActiveGrant, GrantScope, ProjectGrantError, ProjectGrantStore, ScopePattern, ScopePatternError,
+    MAX_GRANT_COMMAND_BYTES, MAX_GRANT_INSTRUCTION_BYTES, MAX_SCOPE_PATTERN_BYTES,
+};
 pub use home::{EulerHome, EulerHomeError};
-pub use permissions::{ApprovalMode, DeciderVerdict, PermissionDecider};
+pub use permissions::{
+    ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,
+};
 pub use provenance::{
     query_provenance, read_provenance, ProvenancePage, ProvenanceQuery, ProvenanceQueryError,
     ProvenanceReadError, ProvenanceWriter, ProvenanceWriterError,

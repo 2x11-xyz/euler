@@ -1,4 +1,4 @@
-use super::text::{display_width, GUTTER_WIDTH};
+use super::text::{blank_gutter, display_width, GUTTER_WIDTH};
 use super::theme::Theme;
 use super::{syntax, syntax::DiffBodyKind};
 use diffy::{HunkRange, Line as DiffLine};
@@ -111,7 +111,7 @@ pub(crate) fn render_patch(
     let mut lines = Vec::new();
     push_row(
         &mut lines,
-        "    ",
+        blank_gutter(),
         &format!(
             "* {} ({}): {}",
             display.label,

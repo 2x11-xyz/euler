@@ -9,11 +9,13 @@ use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
 use crate::ui::glyphs::user_line_prefix;
 use crate::ui::markdown;
-use crate::ui::text::{content_width, display_width, wrap_text, GUTTER_WIDTH};
+use crate::ui::text::{
+    blank_gutter, content_width, display_width, hairline_content, timestamp_gutter,
+    tree_gutter_pipe, wrap_text, GUTTER_WIDTH,
+};
 use crate::ui::theme::Theme;
 use ratatui::text::{Line, Span};
-
-const ASSISTANT_PROSE_GUTTER: &str = "  ";
+use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TranscriptRenderLimits {
@@ -37,41 +39,67 @@ impl TranscriptRenderLimits {
         self.output_lines = output_lines;
         self
     }
+
+    fn expanded(mut self) -> Self {
+        self.output_lines = usize::MAX;
+        self.patch_detail_lines = usize::MAX;
+        self
+    }
 }
 
-#[allow(dead_code)]
 pub(super) fn render_projected_items(
     items: &[TranscriptItem],
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
 ) -> Vec<Line<'static>> {
+    render_projected_items_with_expansion(items, theme, width, limits, &HashSet::new())
+}
+
+pub(super) fn render_projected_items_with_expansion(
+    items: &[TranscriptItem],
+    theme: &Theme,
+    width: u16,
+    limits: TranscriptRenderLimits,
+    expanded_artifact_keys: &HashSet<String>,
+) -> Vec<Line<'static>> {
     let entries: Vec<_> = items
         .iter()
         .cloned()
         .map(|item| ProjectedEntry { item, timing: None })
         .collect();
-    render_projected_entries(&entries, theme, width, limits)
+    render_projected_entries_with_expansion(&entries, theme, width, limits, expanded_artifact_keys)
 }
 
-#[allow(dead_code)]
-#[allow(clippy::too_many_lines)] // ratchet: 243 lines, refactor target
 pub(super) fn render_projected_entries(
     entries: &[ProjectedEntry],
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
 ) -> Vec<Line<'static>> {
+    render_projected_entries_with_expansion(entries, theme, width, limits, &HashSet::new())
+}
+
+#[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
+pub(super) fn render_projected_entries_with_expansion(
+    entries: &[ProjectedEntry],
+    theme: &Theme,
+    width: u16,
+    limits: TranscriptRenderLimits,
+    expanded_artifact_keys: &HashSet<String>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let width = width.saturating_sub(GUTTER_WIDTH as u16).max(1);
+    let content_cols = content_width(width);
 
     for (index, entry) in entries.iter().enumerate() {
-        if index > 0 {
-            lines.push(Line::from(""));
-        }
-
         let first_line = lines.len();
         let item = &entry.item;
+        let item_limits = if expanded_artifact_keys.contains(&super::artifact_key_for_index(index))
+        {
+            limits.expanded()
+        } else {
+            limits
+        };
         match item {
             TranscriptItem::Banner { session_id } => {
                 lines.extend(super::super::banner::styled_lines_with_session(
@@ -113,7 +141,7 @@ pub(super) fn render_projected_entries(
             TranscriptItem::ModelCall { provider, model } => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Model {provider}/{model}"),
                     theme.transcript.model,
                     theme,
@@ -123,7 +151,7 @@ pub(super) fn render_projected_entries(
             TranscriptItem::ModelResult(content) => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Model result: {content}"),
                     theme.transcript.model,
                     theme,
@@ -133,7 +161,7 @@ pub(super) fn render_projected_entries(
             TranscriptItem::ModelReasoning { fidelity, content } => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &reasoning_summary(fidelity, content),
                     theme.transcript.reasoning,
                     theme,
@@ -143,7 +171,7 @@ pub(super) fn render_projected_entries(
             TranscriptItem::ToolCall { name } => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Tool {name}"),
                     theme.transcript.tool,
                     theme,
@@ -178,7 +206,7 @@ pub(super) fn render_projected_entries(
                         theme.transcript.muted,
                         theme,
                         width,
-                        limits.output_lines,
+                        item_limits.output_lines,
                     );
                 } else {
                     push_bounded_failure_children(
@@ -187,7 +215,7 @@ pub(super) fn render_projected_entries(
                         theme.transcript.muted,
                         theme,
                         width,
-                        limits.output_lines,
+                        item_limits.output_lines,
                     );
                 }
             }
@@ -209,7 +237,7 @@ pub(super) fn render_projected_entries(
                     },
                     theme,
                     width,
-                    limits.output_lines,
+                    item_limits.output_lines,
                 );
             }
             TranscriptItem::Exploration { summaries } => {
@@ -230,7 +258,7 @@ pub(super) fn render_projected_entries(
                 };
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &text,
                     theme.transcript.permission,
                     theme,
@@ -272,7 +300,7 @@ pub(super) fn render_projected_entries(
                     },
                     theme,
                     width,
-                    limits.patch_detail_lines,
+                    item_limits.patch_detail_lines,
                 );
             }
             TranscriptItem::PatchApplied { path, old, new } => {
@@ -285,7 +313,7 @@ pub(super) fn render_projected_entries(
                     },
                     theme,
                     width,
-                    limits.patch_detail_lines,
+                    item_limits.patch_detail_lines,
                 );
             }
             TranscriptItem::FileChange {
@@ -336,13 +364,13 @@ pub(super) fn render_projected_entries(
                     },
                     theme,
                     width,
-                    limits.output_lines,
+                    item_limits.output_lines,
                 );
             }
             TranscriptItem::CheckStarted { name } => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Check started: {name}"),
                     theme.transcript.check,
                     theme,
@@ -358,7 +386,7 @@ pub(super) fn render_projected_entries(
                 };
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Check {name} {status}"),
                     style,
                     theme,
@@ -369,17 +397,17 @@ pub(super) fn render_projected_entries(
                     output,
                     DetailRender {
                         style: theme.transcript.muted,
-                        gutter: "  | ",
+                        gutter: tree_gutter_pipe(),
                     },
                     theme,
                     width,
-                    limits.output_lines,
+                    item_limits.output_lines,
                 );
             }
             TranscriptItem::SessionSummary(summary) => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Summary: {summary}"),
                     theme.transcript.control,
                     theme,
@@ -395,8 +423,8 @@ pub(super) fn render_projected_entries(
             TranscriptItem::Error { source, message } => {
                 push_wrapped(
                     &mut lines,
-                    "  ! ",
-                    &format!("{source}: {message}"),
+                    blank_gutter(),
+                    &format!("! {source}: {message}"),
                     theme.transcript.error,
                     theme,
                     width,
@@ -404,7 +432,14 @@ pub(super) fn render_projected_entries(
             }
         }
 
-        if let Some(timing) = &entry.timing {
+        if first_line < lines.len() && is_meaningful_ledger_item(item) {
+            let stamp = timestamp_gutter(entry.timing.as_ref().map(|tm| tm.absolute.as_str()));
+            stamp_first_line(&mut lines[first_line], &stamp, theme);
+            if let Some(timing) = &entry.timing {
+                append_timing(&mut lines[first_line], timing, theme, width);
+            }
+            push_hairline(&mut lines, theme, content_cols);
+        } else if let Some(timing) = &entry.timing {
             if let Some(line) = lines.get_mut(first_line) {
                 append_timing(line, timing, theme, width);
             }
@@ -414,7 +449,7 @@ pub(super) fn render_projected_entries(
     if let Some(footer) = super::turn_footer(entries) {
         push_wrapped(
             &mut lines,
-            "    ",
+            blank_gutter(),
             &footer,
             theme.transcript.muted,
             theme,
@@ -425,19 +460,49 @@ pub(super) fn render_projected_entries(
     lines
 }
 
+fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
+    // Live control chrome (permission ask panel, turn separators, worked
+    // banners) is not a ledger event: no timestamp stamp, no hairline.
+    !matches!(
+        item,
+        TranscriptItem::Banner { .. }
+            | TranscriptItem::TurnSeparator
+            | TranscriptItem::WorkedDuration(_)
+            | TranscriptItem::PermissionAsk { .. }
+    )
+}
+
+fn stamp_first_line(line: &mut Line<'static>, stamp: &str, theme: &Theme) {
+    if line
+        .spans
+        .first()
+        .is_some_and(|span| display_width(span.content.as_ref()) == GUTTER_WIDTH)
+    {
+        line.spans[0] = Span::styled(stamp.to_owned(), theme.transcript.gutter);
+        return;
+    }
+    line.spans
+        .insert(0, Span::styled(stamp.to_owned(), theme.transcript.gutter));
+}
+
+fn push_hairline(lines: &mut Vec<Line<'static>>, theme: &Theme, content_cols: usize) {
+    lines.push(Line::from(vec![
+        Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
+        Span::styled(hairline_content(content_cols), theme.transcript.gutter),
+    ]));
+}
+
 fn render_assistant_prose(content: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     // Leave one right-edge cell unused. Exact-width writes can put terminals
     // into auto-wrap state, which makes table rows look clipped or disturbed
     // until a resize forces a different layout.
-    let prose_width = width
-        .saturating_sub(ASSISTANT_PROSE_GUTTER.len() as u16)
-        .saturating_sub(1);
-    markdown::render_agent_markdown(content, theme, prose_width.max(1))
+    let prose_width = content_width(width).saturating_sub(1).max(1);
+    markdown::render_agent_markdown(content, theme, prose_width as u16)
         .into_iter()
         .map(|mut line| {
             let mut spans = Vec::with_capacity(line.spans.len() + 1);
             spans.push(Span::styled(
-                ASSISTANT_PROSE_GUTTER.to_owned(),
+                blank_gutter().to_owned(),
                 theme.transcript.gutter,
             ));
             spans.append(&mut line.spans);
@@ -566,7 +631,6 @@ fn truncate_gist(source: &str, max_chars: usize) -> String {
     out
 }
 
-#[allow(dead_code)]
 fn push_wrapped(
     lines: &mut Vec<Line<'static>>,
     gutter: &'static str,
@@ -575,43 +639,42 @@ fn push_wrapped(
     theme: &Theme,
     width: u16,
 ) {
-    let body_width = usize::from(width)
-        .saturating_sub(display_width(gutter))
-        .max(1);
-
-    for segment in wrap_text(text, body_width) {
+    debug_assert_eq!(display_width(gutter), GUTTER_WIDTH);
+    for segment in wrap_text(text, content_width(width)) {
         push_wrapped_segment(lines, gutter, segment, style, theme);
     }
 }
 
 fn push_wrapped_with_continuation(
     lines: &mut Vec<Line<'static>>,
-    gutters: (&'static str, &'static str),
+    content_prefixes: (&'static str, &'static str),
     text: &str,
     style: ratatui::style::Style,
     theme: &Theme,
     width: u16,
 ) {
-    let (first_gutter, next_gutter) = gutters;
-    let body_width = usize::from(width)
-        .saturating_sub(display_width(first_gutter).max(display_width(next_gutter)))
+    let (first_prefix, next_prefix) = content_prefixes;
+    let body_width = content_width(width)
+        .saturating_sub(display_width(first_prefix).max(display_width(next_prefix)))
         .max(1);
-
     let mut first_segment = true;
     for raw_line in text.split('\n') {
         for segment in wrap_text(raw_line, body_width) {
-            let gutter = if first_segment {
-                first_gutter
+            let prefix = if first_segment {
+                first_prefix
             } else {
-                next_gutter
+                next_prefix
             };
             first_segment = false;
-            push_wrapped_segment(lines, gutter, segment, style, theme);
+            lines.push(Line::from(vec![
+                Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
+                Span::styled(prefix.to_owned(), theme.transcript.gutter),
+                Span::styled(segment, style),
+            ]));
         }
     }
 }
 
-#[allow(dead_code)]
 fn push_wrapped_segment(
     lines: &mut Vec<Line<'static>>,
     gutter: &'static str,
@@ -619,6 +682,7 @@ fn push_wrapped_segment(
     style: ratatui::style::Style,
     theme: &Theme,
 ) {
+    debug_assert_eq!(display_width(gutter), GUTTER_WIDTH);
     lines.push(Line::from(vec![
         Span::styled(gutter.to_owned(), theme.transcript.gutter),
         Span::styled(segment, style),

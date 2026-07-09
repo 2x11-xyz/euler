@@ -240,9 +240,11 @@ fn repeated_finalized_writes_move_banner_up_without_gap_or_clipping() {
     let second = row_containing(&rows, "second generated");
     let prompt = row_containing(&rows, "▌");
     assert!(equation < first, "rows: {rows:?}");
+    // first, hairline, second — Warm Ledger places a dim rule under each block
     assert_eq!(second, first + 2, "rows: {rows:?}");
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
-    assert_eq!(prompt, second + 4, "rows: {rows:?}");
+    // second, hairline, three breathing blanks, prompt
+    assert_eq!(prompt, second + 5, "rows: {rows:?}");
 }
 
 #[test]
@@ -296,10 +298,10 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
         ]),
     )));
     render_compact_frame(&mut terminal, &mut core);
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
     render_compact_frame(&mut terminal, &mut core);
     assert!(terminal
         .backend()
@@ -488,9 +490,15 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
         .collect::<Vec<_>>();
     let user_row = user_lines
         .iter()
-        .position(|line| line == "▌ hi")
+        .position(|line| line.contains("▌ hi"))
         .expect("user row");
-    assert_eq!(user_lines.get(user_row + 1).map(String::as_str), Some(""));
+    // Hairline under the user block is the Warm Ledger rhythm row.
+    assert!(
+        user_lines
+            .get(user_row + 1)
+            .is_some_and(|line| line.contains('─')),
+        "user_lines: {user_lines:?}"
+    );
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::ASSISTANT_MESSAGE,
@@ -503,11 +511,13 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
         .collect::<Vec<_>>();
     let answer_row = answer_lines
         .iter()
-        .position(|line| line == "  Hi! How can I help?")
+        .position(|line| line.contains("Hi! How can I help?"))
         .expect("answer row");
-    assert_eq!(
-        answer_lines.get(answer_row + 1).map(String::as_str),
-        Some("")
+    assert!(
+        answer_lines
+            .get(answer_row + 1)
+            .is_some_and(|line| line.contains('─')),
+        "answer_lines: {answer_lines:?}"
     );
 
     core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(4)));
@@ -526,18 +536,24 @@ fn finalized_wrapped_prompt_uses_continuous_user_rail() {
         &theme,
         28,
         TOOL_CALL_MAX_LINES,
+        &std::collections::HashSet::new(),
     )
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
-    assert_eq!(
-        lines.first().map(String::as_str),
-        Some("▌ alpha beta gamma delta")
+    assert!(
+        lines.iter().any(|line| line.contains("▌ alpha beta gamma")),
+        "lines: {lines:?}"
     );
-    assert_eq!(lines.get(1).map(String::as_str), Some("▌ epsilon"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("▌") && (line.contains("epsilon") || line.contains("delta"))),
+        "lines: {lines:?}"
+    );
     assert_eq!(
-        lines.iter().filter(|line| line.starts_with("▌")).count(),
+        lines.iter().filter(|line| line.contains("▌")).count(),
         2,
         "wrapped prompt should keep a continuous user rail: {lines:?}"
     );
@@ -553,25 +569,26 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         &theme,
         44,
         TOOL_CALL_MAX_LINES,
+        &std::collections::HashSet::new(),
     )
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
     assert!(
-        narrow.iter().any(|line| line == "  Layer: CLI/TUI layer"),
+        narrow
+            .iter()
+            .any(|line| line.trim_start() == "Layer: CLI/TUI layer"),
         "stacked table row missing at narrow width: {narrow:?}"
     );
     assert!(
         narrow
             .iter()
-            .any(|line| line == "  Repo location: euler-cli"),
+            .any(|line| line.trim_start() == "Repo location: euler-cli"),
         "stacked repo row missing at narrow width: {narrow:?}"
     );
     assert!(
-        narrow
-            .iter()
-            .all(|line| !line.contains('━') && !line.contains('─')),
+        narrow.iter().all(|line| !line.contains('━')),
         "narrow multi-column table should not render as a grid: {narrow:?}"
     );
     assert!(
@@ -586,6 +603,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         &theme,
         100,
         TOOL_CALL_MAX_LINES,
+        &std::collections::HashSet::new(),
     )
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
@@ -600,8 +618,10 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         "wide table should render as a grid: {wide:?}"
     );
     assert!(
-        wide.iter()
-            .all(|line| line != "  Layer: CLI/TUI layer" && line != "  Repo location: euler-cli"),
+        wide.iter().all(|line| {
+            let trimmed = line.trim_start();
+            trimmed != "Layer: CLI/TUI layer" && trimmed != "Repo location: euler-cli"
+        }),
         "wide table should not include stacked rows: {wide:?}"
     );
     assert!(
@@ -631,16 +651,17 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
         .map(|row| row.trim_end().to_owned())
         .collect::<Vec<_>>();
     assert!(
-        rows.iter().any(|row| row == "  Layer: CLI/TUI layer"),
+        rows.iter()
+            .any(|row| row.trim_start() == "Layer: CLI/TUI layer"),
         "stacked table row missing after resize: {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row == "  Repo location: euler-cli"),
+        rows.iter()
+            .any(|row| row.trim_start() == "Repo location: euler-cli"),
         "stacked repo row missing after resize: {rows:?}"
     );
     assert!(
-        rows.iter()
-            .all(|row| !row.contains('━') && !row.contains('─')),
+        rows.iter().all(|row| !row.contains('━')),
         "resized multi-column table should not leave grid artifacts: {rows:?}"
     );
     assert_eq!(
@@ -664,13 +685,22 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
+        &std::collections::HashSet::new(),
     )
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
-    assert_eq!(lines.first().map(String::as_str), Some("▌ hi"));
-    assert!(lines.iter().any(|line| line == "  Hi! How can I help?"));
+    assert!(
+        lines.first().is_some_and(|line| line.contains("▌ hi")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Hi! How can I help?")),
+        "lines: {lines:?}"
+    );
     assert!(lines.iter().any(|line| line.contains("Worked for 5s")));
     assert_eq!(lines.last().map(String::as_str), Some(""));
     assert!(
@@ -695,6 +725,7 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
+        &std::collections::HashSet::new(),
     )
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
@@ -728,9 +759,10 @@ fn finalized_tool_output_batch_separates_following_assistant_prose() {
     let rows = terminal.backend().scrollback_rows();
     let tool_last = row_containing(&rows, "last tool output row");
     assert!(rows.iter().any(|row| row.contains("exit 0 · 1 line")));
-    assert_eq!(rows[tool_last + 1].trim(), "", "rows: {rows:?}");
+    // Hairline under the tool block separates it from following assistant prose.
+    assert!(rows[tool_last + 1].contains('─'), "rows: {rows:?}");
     assert!(
-        rows[tool_last + 2].starts_with("  I see 16 em dashes"),
+        rows[tool_last + 2].contains("I see 16 em dashes"),
         "rows: {rows:?}"
     );
 }
@@ -1287,13 +1319,28 @@ fn finalized_visual_output_uses_worked_separator_as_turn_boundary() {
         object([("content", "second".into())]),
     )));
 
-    let second = core
+    let second_lines = core
         .drain_finalized_visual_lines(40)
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
-        .collect::<String>();
-    assert!(!second.contains(&"─".repeat(40)));
-    assert!(second.contains("second"));
+        .collect::<Vec<_>>();
+    let second = second_lines.join("");
+    // Full-frame drain still shows the prior Worked separator as the turn
+    // boundary; the new user row must follow it, and it must not be re-emitted.
+    assert_eq!(
+        second.matches("Worked for").count(),
+        1,
+        "second_lines: {second_lines:?}"
+    );
+    let worked = second_lines
+        .iter()
+        .position(|line| line.contains("Worked for"))
+        .expect("worked separator");
+    let second_user = second_lines
+        .iter()
+        .position(|line| line.contains("second"))
+        .expect("second user");
+    assert!(worked < second_user, "second_lines: {second_lines:?}");
 }
 
 #[test]

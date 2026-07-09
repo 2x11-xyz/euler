@@ -126,15 +126,19 @@ pub enum TranscriptItem {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EventTiming {
-    absolute: String,
+    pub(crate) absolute: String,
     since_previous: Option<String>,
     since_start: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectedEntry {
-    item: TranscriptItem,
-    timing: Option<EventTiming>,
+    pub(crate) item: TranscriptItem,
+    pub(crate) timing: Option<EventTiming>,
+}
+
+pub(crate) fn artifact_key_for_index(index: usize) -> String {
+    format!("history:{index}")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -436,6 +440,22 @@ pub(crate) fn render_items_for_history_with_limit(
         theme,
         width,
         TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+    )
+}
+
+pub(crate) fn render_items_for_history_with_expansion(
+    items: &[TranscriptItem],
+    theme: &Theme,
+    width: u16,
+    output_limit_lines: usize,
+    expanded_artifact_keys: &std::collections::HashSet<String>,
+) -> Vec<Line<'static>> {
+    render::render_projected_items_with_expansion(
+        items,
+        theme,
+        width,
+        TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+        expanded_artifact_keys,
     )
 }
 

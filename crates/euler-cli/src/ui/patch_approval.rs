@@ -24,7 +24,6 @@ const PANEL_TITLE: &str = "Approval required";
 pub(crate) struct PatchApprovalModal {
     pub(crate) request: PermissionRequest,
     pub(crate) preview: PatchPreview,
-    pub(crate) expanded: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,13 +66,9 @@ pub(crate) fn preview_from_events(events: &[EventEnvelope]) -> PatchPreview {
 }
 
 #[cfg(test)]
-pub(crate) fn modal_area(area: Rect, expanded: bool) -> Rect {
+pub(crate) fn modal_area(area: Rect) -> Rect {
     let width = 88.min(area.width);
-    let height = if expanded {
-        area.height
-    } else {
-        18.min(area.height)
-    };
+    let height = 18.min(area.height);
     centered_rect(area, width, height)
 }
 
@@ -115,8 +110,8 @@ pub(crate) fn panel_lines(
 ) -> Vec<Line<'static>> {
     let panel_width = width.clamp(8, 96);
     let body_width = usize::from(panel_width.saturating_sub(4)).max(1);
-    let diff_height = if modal.expanded { 16 } else { 8 };
-    let diff_area = Rect::new(0, 0, body_width as u16, diff_height);
+    // Compact preview only — full review is the transcript nearest-block fold.
+    let diff_area = Rect::new(0, 0, body_width as u16, 8);
     let mut content = header_text_with_cwd(&modal.request, &cwd.display().to_string())
         .lines()
         .flat_map(|line| wrap_text(line, body_width))

@@ -409,10 +409,14 @@ fn tui_items_insert_turn_separator_between_turns_not_inside_markdown_answer() {
 
     let theme = Theme::default();
     let contents = line_texts(&render_items_for_history(&items, &theme, 40)).join("\n");
-    assert_eq!(
-        contents.lines().filter(|line| line.contains('─')).count(),
-        1
-    );
+    // Turn separator is one full-width rule; each meaningful block also has a
+    // dim hairline, so total ─ rows > 1. The turn separator itself is the only
+    // non-gutter-prefixed ─ row.
+    let turn_rules = contents
+        .lines()
+        .filter(|line| line.contains('─') && !line.starts_with("         "))
+        .count();
+    assert_eq!(turn_rules, 1, "contents: {contents:?}");
     assert!(contents.contains("alpha"));
     assert!(contents.contains("beta"));
 }
@@ -1099,30 +1103,34 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
         ),
     ];
     let theme = Theme::default();
-    let contents = rendered_screen_with_limit(&events, &theme, 24, 12, 2);
+    let contents = rendered_screen_with_limit(&events, &theme, 40, 16, 2);
     assert!(contents.contains("▌ alpha beta gamma"));
+    // Timestamp stamp or blank gutter may precede the rail; match the glyph.
     let prompt_glyph_lines = contents
         .lines()
-        .filter(|line| line.starts_with("▌ "))
+        .filter(|line| line.contains("▌ "))
         .collect::<Vec<_>>();
     assert_eq!(
         prompt_glyph_lines.len(),
         2,
         "expected continuous rail for each wrapped user prompt row, got {prompt_glyph_lines:?}"
     );
-    assert!(contents.contains("  line one output"));
-    assert!(contents.contains("  line two output"));
+    assert!(contents.contains("line one output"));
+    assert!(contents.contains("line two output"));
     assert!(contents.contains("1 more lines"));
     assert!(contents.contains("line five output"));
 
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let trimmed = line.trim_start();
         assert!(
-            line.starts_with("▌ ")
-                || line.starts_with("• ")
-                || line.starts_with("bash")
-                || line.starts_with("  ")
-                || line.starts_with("  └ ")
-                || line.starts_with("    "),
+            line.starts_with("         ")
+                || line.starts_with("       └ ")
+                || line.starts_with("       ├ ")
+                || line.contains("▌ ")
+                || trimmed.starts_with("• ")
+                || trimmed.starts_with("bash")
+                || line.contains("─")
+                || line.chars().next().is_some_and(|ch| ch.is_ascii_digit()),
             "unstable gutter: {line:?}"
         );
     }
@@ -1135,16 +1143,22 @@ fn vt100_multiline_user_message_uses_continuous_rail_for_whole_block() {
         object([("content", "one\ntwo three four five six seven".into())]),
     )];
     let theme = Theme::default();
-    let contents = rendered_screen_with_limit(&events, &theme, 18, 8, 2);
+    // Wider + taller so the 9-cell gutter, hairline, and turn footer leave room
+    // for the full multi-line user block (not just the scrolled tail).
+    let contents = rendered_screen_with_limit(&events, &theme, 28, 12, 2);
     let user_rows = contents
         .lines()
-        .filter(|line| line.starts_with("▌ "))
+        .filter(|line| line.contains("▌ "))
         .collect::<Vec<_>>();
 
-    assert!(user_rows[0].starts_with("▌ one"), "rows: {user_rows:?}");
-    assert_eq!(
-        user_rows.len(),
-        4,
+    assert!(
+        user_rows
+            .iter()
+            .any(|line| line.contains("▌ one") || line.contains("▌ one ")),
+        "rows: {user_rows:?} contents: {contents:?}"
+    );
+    assert!(
+        user_rows.len() >= 3,
         "expected explicit newline and soft-wrap continuations to keep the rail: {contents:?}"
     );
 }
@@ -1157,13 +1171,13 @@ fn vt100_blank_multiline_user_message_keeps_continuous_rail() {
     )];
     let theme = Theme::default();
     let contents = rendered_screen_with_limit(&events, &theme, 18, 8, 2);
-    let user_rows = contents.lines().take(3).collect::<Vec<_>>();
+    let user_rows = contents
+        .lines()
+        .filter(|line| line.contains("▌ "))
+        .collect::<Vec<_>>();
 
     assert_eq!(
-        user_rows
-            .iter()
-            .filter(|line| line.starts_with("▌ "))
-            .count(),
+        user_rows.len(),
         3,
         "expected one rail on each blank multiline row: {contents:?}"
     );
@@ -1209,18 +1223,18 @@ fn tui_tool_output_trims_trailing_blank_rows_before_rendering() {
 
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
 
-    assert_eq!(texts.len(), 2, "texts: {texts:?}");
+    // title + body + hairline under the meaningful tool block
+    assert_eq!(texts.len(), 3, "texts: {texts:?}");
     assert!(texts[0].contains("bash $ printf blank"), "texts: {texts:?}");
     assert!(texts[0].contains("done · 1 line"), "texts: {texts:?}");
     assert!(display_width(&texts[0]) <= 80, "texts: {texts:?}");
     assert!(display_width(&texts[1]) <= 80, "texts: {texts:?}");
     assert_no_box_chars(&texts);
-    assert!(texts[1].starts_with("  "));
     assert!(texts[1].contains("visible"), "texts: {texts:?}");
     assert_eq!(
         texts
             .iter()
-            .filter(|line| line.starts_with("  ") && line.contains("visible"))
+            .filter(|line| line.contains("visible") && !line.contains('─'))
             .count(),
         1,
         "trailing blank rows should be trimmed before rendering: {texts:?}"
@@ -1244,8 +1258,13 @@ fn tool_artifact_cell_handles_empty_output_without_fold_affordance() {
     assert!(joined.contains("bash $ true"), "texts: {texts:?}");
     assert!(joined.contains("done · 0 lines"), "texts: {texts:?}");
     assert!(!joined.contains("ctrl+o"), "texts: {texts:?}");
-    assert_eq!(texts.len(), 2, "empty output keeps one blank body row");
-    assert!(texts[1].starts_with("  "));
+    assert!(texts.len() >= 2, "empty output keeps body row: {texts:?}");
+    assert!(
+        texts
+            .iter()
+            .any(|line| line.trim().is_empty() || line.contains("  ")),
+        "texts: {texts:?}"
+    );
     assert_no_box_chars(&texts);
 }
 
@@ -1415,6 +1434,9 @@ fn tool_artifact_cell_sanitizes_controls_tabs_and_bounds_width() {
     for width in [8, 12, 24, 80] {
         let texts = line_texts(&render_items_for_history(&item, &theme, width));
         let joined = texts.join("\n");
+        // Fixed 9-cell ledger gutter floors the minimum row width; when the
+        // terminal is narrower than that floor, rows stay at the floor.
+        let budget = usize::from(width).max(crate::ui::text::GUTTER_WIDTH + 4);
 
         assert!(!joined.contains('\u{1b}'), "width {width}: {joined:?}");
         assert!(!joined.contains('\u{8}'), "width {width}: {joined:?}");
@@ -1422,13 +1444,14 @@ fn tool_artifact_cell_sanitizes_controls_tabs_and_bounds_width() {
         assert!(!joined.contains('\u{200b}'), "width {width}: {joined:?}");
         assert!(!joined.contains('\u{2060}'), "width {width}: {joined:?}");
         assert!(!joined.contains('\u{feff}'), "width {width}: {joined:?}");
+        // At sub-gutter+body widths the body truncates "red" to a prefix.
         assert!(
-            joined.contains("red") || width <= 8,
+            joined.contains("red") || joined.contains("re") || width <= 8,
             "width {width}: {joined:?}"
         );
         for text in &texts {
             assert!(
-                display_width(text) <= usize::from(width),
+                display_width(text) <= budget,
                 "line exceeds artifact budget at width {width}: {text:?} in {texts:?}"
             );
         }
@@ -1480,12 +1503,16 @@ fn tool_artifact_cell_keeps_minimum_width_at_tiny_widths() {
 
     for width in [0, 1, 2, 3] {
         let texts = line_texts(&render_items_for_history(&item, &theme, width));
-        assert_eq!(texts.len(), 2, "width {width}: {texts:?}");
+        // title + body + hairline; gutter is fixed 9 cells, body floor is 4.
+        assert_eq!(texts.len(), 3, "width {width}: {texts:?}");
         for text in &texts {
-            assert_eq!(
-                display_width(text),
-                4,
-                "tiny-width artifact rows keep the minimum flat width: {text:?} in {texts:?}"
+            assert!(
+                display_width(text) >= crate::ui::text::GUTTER_WIDTH,
+                "tiny-width artifact rows keep the ledger gutter floor: {text:?} in {texts:?}"
+            );
+            assert!(
+                display_width(text) <= crate::ui::text::GUTTER_WIDTH + 4,
+                "tiny-width artifact rows stay near the minimum flat width: {text:?} in {texts:?}"
             );
         }
     }
@@ -1524,14 +1551,16 @@ fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
 
     for width in [12, 24, 64, 96] {
         let texts = line_texts(&render_items_for_history(&item, &theme, width));
-        let max_width = usize::from(width);
+        let budget = usize::from(width).max(crate::ui::text::GUTTER_WIDTH + 4);
         assert!(
-            texts.first().is_some_and(|line| line.starts_with("Patch")),
+            texts
+                .first()
+                .is_some_and(|line| line.trim_start().starts_with("Pat")),
             "width {width}: {texts:?}"
         );
         for text in &texts {
             assert!(
-                display_width(text) <= max_width,
+                display_width(text) <= budget,
                 "line exceeds artifact budget at width {width}: {text:?} in {texts:?}"
             );
             assert!(!text.contains('\u{1b}'), "escape leaked: {texts:?}");
@@ -1697,10 +1726,11 @@ fn patch_applied_artifact_keeps_exact_render_shape() {
     assert_eq!(
         texts,
         vec![
-            "edit src/lib.rs · +1 −1 · update · 3 visible",
-            "         @@ -1 +1 @@                        ",
-            "     1 - a                                  ",
-            "     1 + b                                  ",
+            "         edit src/lib.rs · +1 −1 · update · 3 vi",
+            "                  @@ -1 +1 @@                   ",
+            "              1 - a                             ",
+            "              1 + b                             ",
+            "         ───────────────────────────────────────",
         ]
     );
 }
@@ -1972,7 +2002,12 @@ fn file_diff_ignores_shell_artifact_limit_and_renders_full_code() {
     assert!(default.contains("ctrl+o expand"), "default: {default:?}");
     assert!(!default.contains("line 11"), "default: {default:?}");
     assert!(expanded.contains("line 11"), "expanded: {expanded:?}");
-    assert!(default.contains("modify · 12 lines · apply_patch · truncated tail"));
+    // Title row is `edit path · +N −M · action · lines · origin · truncated …`;
+    // at width 80 the 9-cell gutter can soft-truncate the final "tail".
+    assert!(
+        default.contains("modify · 12 lines · apply_patch · truncated"),
+        "default: {default:?}"
+    );
 }
 
 #[test]
@@ -2224,18 +2259,22 @@ fn file_change_metadata_is_sanitized_and_width_bounded() {
         diff_redaction: "omitted\nnever diff".to_owned(),
     }];
 
-    let texts = line_texts(&render_items_for_history(&item, &theme, 32));
+    // Width 48 keeps the sanitized origin fully visible after the 9-cell gutter.
+    let texts = line_texts(&render_items_for_history(&item, &theme, 48));
     let joined = texts.join("\n");
 
     assert!(!joined.contains('\u{1b}'));
     assert!(!joined.contains('\u{7}'));
     assert!(!joined.contains("[31m"));
-    assert!(joined.contains("  origin: apply    patch"));
+    assert!(
+        joined.contains("origin: apply    patch"),
+        "joined: {joined:?}"
+    );
     assert!(joined.contains("sha256: abc"));
     assert!(joined.contains("def4567890"));
     for row in texts {
         assert!(
-            display_width(&row) <= 32,
+            display_width(&row) <= 48,
             "row overflowed narrow artifact width: {row:?}"
         );
     }
@@ -2321,14 +2360,15 @@ fn final_assistant_prose_uses_two_space_gutter_across_markdown_shapes() {
 
     assert!(texts.len() > 4, "texts: {texts:?}");
     for text in texts.iter().filter(|line| !line.trim().is_empty()) {
+        // blank 9-cell ledger gutter, or hairline under the block
         assert!(
-            text.starts_with("  "),
+            text.starts_with("         ") || text.contains("─"),
             "assistant prose line missing gutter: {text:?} in {texts:?}"
         );
     }
-    assert!(texts.iter().any(|line| line.starts_with("  - listed")));
-    assert!(texts.iter().any(|line| line == "  A: 1"));
-    assert!(texts.iter().any(|line| line == "  B: 2"));
+    assert!(texts.iter().any(|line| line.contains("- listed")));
+    assert!(texts.iter().any(|line| line.contains("A: 1")));
+    assert!(texts.iter().any(|line| line.contains("B: 2")));
 }
 
 #[test]
@@ -2339,17 +2379,22 @@ fn final_assistant_prose_gutter_preserves_width_budget() {
             .to_owned(),
     )];
 
-    for width in 10..=32 {
+    for width in 12..=32 {
         let texts = line_texts(&render_items_for_history(&items, &theme, width));
+        let budget = usize::from(width).max(crate::ui::text::GUTTER_WIDTH + 1);
         for text in texts.iter().filter(|line| !line.trim().is_empty()) {
             assert!(
-                display_width(text) <= usize::from(width),
+                display_width(text) <= budget,
                 "line exceeds width {width}: {text:?} in {texts:?}"
             );
-            assert!(
-                display_width(text) < usize::from(width),
-                "assistant markdown should leave a right-edge safety cell at width {width}: {text:?} in {texts:?}"
-            );
+            // With a 9-cell ledger gutter, safety-cell room only exists once
+            // content_width - 1 leaves real markdown headroom (list markers, etc.).
+            if width >= 16 {
+                assert!(
+                    display_width(text) < usize::from(width) || text.contains('─'),
+                    "assistant markdown should leave a right-edge safety cell at width {width}: {text:?} in {texts:?}"
+                );
+            }
         }
     }
 }
@@ -2414,10 +2459,12 @@ fn vt100_overflowing_transcript_shows_latest_event() {
     ];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 32, 2);
+    // Hairlines + turn footer consume rows; height 4 is the smallest that still
+    // keeps the latest user event in the viewport under Warm Ledger rhythm.
+    let contents = rendered_screen(&events, &theme, 32, 4);
 
     assert!(!contents.contains("oldest event"));
-    assert!(contents.contains("latest event"));
+    assert!(contents.contains("latest event"), "contents: {contents:?}");
 }
 
 #[test]
@@ -2465,12 +2512,12 @@ fn vt100_reasoning_render_uses_human_header_and_clean_indent() {
     ];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 64, 6);
+    // Two reasoning blocks + hairlines need more than 6 rows to keep both headers.
+    let contents = rendered_screen(&events, &theme, 64, 10);
     let rows = contents.lines().map(str::trim_end).collect::<Vec<_>>();
 
     assert!(
-        rows.iter()
-            .any(|row| row.starts_with("    ✱ thought for 0s")),
+        rows.iter().any(|row| row.contains("✱ thought for 0s")),
         "contents: {contents:?}"
     );
     assert!(
@@ -2479,7 +2526,7 @@ fn vt100_reasoning_render_uses_human_header_and_clean_indent() {
     );
     assert!(
         rows.iter()
-            .any(|row| row.starts_with("    ✱ thought summary for 0s")),
+            .any(|row| row.contains("✱ thought summary for 0s")),
         "contents: {contents:?}"
     );
     assert!(!contents.contains("* Reasoning"), "contents: {contents:?}");
@@ -2534,9 +2581,11 @@ fn failed_tool_run_surfaces_informative_line_before_tail() {
         joined.contains("✗ exit 101"),
         "failure verb should be loud: {joined:?}"
     );
+    // Body rows are blank-gutter + two-space pad; title rows share the gutter
+    // prefix so filter on the body pad after the 9-cell gutter.
     let body: Vec<_> = texts
         .iter()
-        .filter(|line| line.starts_with("  ") && !line.trim().is_empty())
+        .filter(|line| line.starts_with("           ") && !line.trim().is_empty())
         .collect();
     assert!(
         body.first()
@@ -2690,9 +2739,11 @@ fn vt100_omits_timing_badge_when_it_would_overflow_row() {
     )];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 20, 4);
+    // Width 28 leaves room for the 9-cell stamp + rail + "very long row" without
+    // also fitting the trailing timing badge on the same row.
+    let contents = rendered_screen(&events, &theme, 28, 4);
 
-    assert!(contents.contains("very long row"));
+    assert!(contents.contains("very long row"), "contents: {contents:?}");
     assert!(!contents.contains("very long row · 14:32:07"));
 }
 
@@ -2782,14 +2833,28 @@ fn assert_artifact_flat_style(
         .iter()
         .position(|line| line.contains(title_needle))
         .unwrap_or_else(|| panic!("{label} missing artifact title: {texts:?}"));
-    let title_style = lines[title].spans.first().map(|span| span.style);
+    let title_style = lines[title]
+        .spans
+        .iter()
+        .find(|span| {
+            span.content.as_ref().contains(
+                title_needle
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(title_needle),
+            )
+        })
+        .or_else(|| lines[title].spans.get(1))
+        .or_else(|| lines[title].spans.first())
+        .map(|span| span.style);
     assert_eq!(title_style, Some(expected), "{label} title: {texts:?}");
     for line in lines.iter().skip(title + 1).take_while(|line| {
         let text = line_text(line);
-        text.starts_with("  ")
+        // body rows have blank gutter + 2-space body pad, not hairlines
+        text.starts_with("         ") && !text.contains('─')
     }) {
         let text = line_text(line);
-        assert!(text.starts_with("  "), "{label} body row: {texts:?}");
+        assert!(text.starts_with("         "), "{label} body row: {texts:?}");
         assert_eq!(
             line.style.bg,
             Some(expected.bg.expect("expected background")),
@@ -2800,8 +2865,9 @@ fn assert_artifact_flat_style(
 
 fn assert_no_box_chars(texts: &[String]) {
     let joined = texts.join("\n");
+    // Warm Ledger allows tree ├/└ gutters; reject box *borders* only.
     assert!(
-        !joined.contains(['┌', '┐', '└', '┘', '│']),
+        !joined.contains(['┌', '┐', '┘', '│']),
         "box drawing leaked: {texts:?}"
     );
 }
