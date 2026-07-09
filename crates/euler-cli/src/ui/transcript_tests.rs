@@ -2803,6 +2803,44 @@ fn edit_failure_renders_path_and_cause_inline() {
 }
 
 #[test]
+fn extension_result_renders_foldable_pretty_artifact() {
+    let output = (0..40)
+        .map(|index| format!("  \"row_{index}\": {index},"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let theme = Theme::default();
+    let items = [TranscriptItem::ExtensionResult {
+        reference: "code-swarm.review-brief".to_owned(),
+        ok: true,
+        output,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 100));
+    let joined = texts.join("\n");
+    assert!(
+        joined.contains("extension code-swarm.review-brief ✓"),
+        "texts: {joined}"
+    );
+    assert!(
+        joined.contains("more lines · ctrl+o expand"),
+        "texts: {joined}"
+    );
+    assert!(joined.contains("\"row_0\": 0"), "texts: {joined}");
+    // Folded: the middle rows are hidden.
+    assert!(!joined.contains("\"row_20\": 20"), "texts: {joined}");
+
+    let expanded = line_texts(&render_items_for_history_with_limit(
+        &items,
+        &theme,
+        100,
+        usize::MAX,
+    ));
+    let expanded_joined = expanded.join("\n");
+    assert!(expanded_joined.contains("\"row_20\": 20"));
+    assert!(!expanded_joined.contains("ctrl+o expand"));
+}
+
+#[test]
 fn hairline_uses_dedicated_theme_token_not_gutter() {
     // Warm Ledger separates the hairline tone (#38341f) from the faint
     // timestamp/gutter tone (#5f584a); the hairline row must consume the

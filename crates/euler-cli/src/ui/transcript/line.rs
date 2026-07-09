@@ -68,6 +68,7 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
             line_oriented_check_result(name, *ok)
         }
         super::TranscriptItem::SessionSummary(summary) => format!("session.summary: {summary}\n"),
+        super::TranscriptItem::ExtensionResult { .. } => line_oriented_extension_result(item),
         super::TranscriptItem::Interrupted => "interrupted\n".to_owned(),
         super::TranscriptItem::WorkedDuration(duration) => format!("worked: {duration}\n"),
         super::TranscriptItem::TurnRecap { summary, files } => {
@@ -177,5 +178,15 @@ fn line_oriented_file_diff(path: &str, action: &str, diff: Option<&str>) -> Stri
         "file.diff: {}: {}{suffix}\n",
         super::file_change_action_label(action),
         super::file_change_path_label(path)
+    )
+}
+
+fn line_oriented_extension_result(item: &super::TranscriptItem) -> String {
+    let super::TranscriptItem::ExtensionResult { reference, ok, .. } = item else {
+        return String::new();
+    };
+    format!(
+        "extension.result: {reference} {}\n",
+        if *ok { "ok" } else { "failed" }
     )
 }

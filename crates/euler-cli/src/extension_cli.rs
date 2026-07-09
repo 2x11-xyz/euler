@@ -552,7 +552,9 @@ fn parse_extension_command_reference(reference: &str) -> Result<(String, String)
     Ok((id.to_owned(), command.to_owned()))
 }
 
-fn parse_extension_run_input(
+/// Shared by the CLI argv path and the TUI slash path (`--flag value…` after
+/// an extension token) so both surfaces honor the same ArgSpec contract.
+pub(crate) fn parse_extension_run_input(
     reference: &str,
     descriptor: Option<&CommandDescriptor>,
     args: &mut impl Iterator<Item = String>,

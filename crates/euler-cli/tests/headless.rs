@@ -2914,6 +2914,58 @@ fn extension_cli_enable_run_and_disable_session_export() {
 }
 
 #[test]
+fn extension_cli_code_swarm_report_accepts_injected_session_id() {
+    // Contract: commands declaring `accepts_session_id: true` receive an
+    // injected `session_id` field from the offline runner and must accept it.
+    // Regression for the review-report input allowlist rejecting the
+    // injection (calibration finding E1).
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+
+    let mut seed = command_with_home(exe, &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn seed euler");
+    seed.stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"code swarm seed")
+        .expect("write seed stdin");
+    assert!(seed.wait_with_output().expect("wait seed").status.success());
+    let session_id = only_home_session_id(home.path());
+
+    let enabled = command_with_home(exe, &home)
+        .args(["extension", "enable", "code-swarm"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("extension enable code-swarm");
+    assert!(enabled.status.success());
+
+    let report = command_with_home(exe, &home)
+        .args(["extension", "run", "code-swarm.review-report", &session_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("code swarm report run");
+    // The session has no reviewer results, so the run fails — but it must
+    // fail with the actionable zero-results guidance, proving the injected
+    // session_id passed input validation.
+    assert!(!report.status.success());
+    let stderr = String::from_utf8_lossy(&report.stderr);
+    assert!(
+        stderr.contains("no CodeSwarm reviewer results"),
+        "expected zero-results guidance, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown input field"),
+        "session_id injection must be accepted: {stderr}"
+    );
+}
+
+#[test]
 fn extension_cli_enable_and_run_causal_dag_export() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
