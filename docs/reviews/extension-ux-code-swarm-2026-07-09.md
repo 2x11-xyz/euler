@@ -274,14 +274,63 @@ host, strict unknown-field input rejection, and session-ledger integration.
 The synthesis target is: prototype's *workflow and fan-out semantics* on top
 of the shipped version's *provenance and capability honesty*.
 
-### Revised recommendation
+### Decided direction (Eli, 2026-07-09)
 
-E1–E4 remain valid immediate fixes. For E5/E6, the design conversation now has
-a concrete default: restore G1–G4 semantics in the Rust extension — a
-`review` command that assembles bounded context (G2), fans out to configured
-models (G1, needs either a model-call host capability in the SDK or
-companion briefs with explicit provider/model targets), writes the markdown
-report artifact (G5), and is invocable as one command and eventually as a
-model-facing tool (G4, a `docs/contracts/tools.md` / `multi-agent.md`
-extension). That is a contracts-first change per ADR 0010 — contracts land
-before or with the first honest UI for it.
+E1–E4 remain immediate fixes. For the swarm itself, the design decision is
+made — no open conversation remains on the mechanism:
+
+**The swarm is powered by Euler's multi-agent (companion) framework.** Not by
+extension-side HTTP fan-out. Reviewers are companions: each spawn/result pair
+is provenance, permission scopes apply, results interleave in the ledger as
+companion blocks, and the existing `review-report` pairing logic stays the
+consolidation step.
+
+**The slash command exposes agent-count and model/provider optionality:**
+1–5 reviewer agents (the prototype's cap of 5 survives as a hard limit),
+each with a selectable provider/model target. Sketch, exact flags to be
+settled at implementation:
+
+```
+/code-swarm review --agents 3
+    --models openrouter::z-ai/glm-5.2,anthropic::claude-opus-5,openai::gpt-5.5
+    [--personas correctness,safety,tests]
+    [--prompt "focus…"]
+```
+
+Defaults: agent count from the persona set (3), models default to the
+session's active target (today's inherit behavior), personas assigned
+round-robin when counts differ. `--models` with one entry and `--agents 3`
+means three reviewers on one model; three entries means true cross-model
+disagreement (G1).
+
+**Feasibility, verified in-tree:** the companion runtime already honors
+explicit targets — `AgentTask` carries `provider`/`model`
+(`euler-agents/src/lib.rs:120-155`) and `spawn` inherits only when the field
+is empty (`inherit_if_empty`, `euler-core/src/session/companion.rs:126-127`).
+No runtime change is needed for multi-model companions; the work is the
+command surface and orchestration.
+
+**Open implementation choice (the one remaining decision):** where the
+spawn-N-companions orchestration lives —
+
+- *(a) SDK host capability:* extend `HostApi` with a bounded, capability-gated
+  `spawn_companion` so the extension command runs the whole
+  brief → spawn ×N → collect → report flow itself. Principled (workflow stays
+  out of core/CLI), but it is a `docs/contracts/multi-agent.md` +
+  `capabilities.md` change — contracts land first per ADR 0010.
+- *(b) CLI-layer orchestration:* `/code-swarm` in the TUI calls
+  `review-brief` (with model targets), feeds the briefs through the existing
+  companion machinery, and triggers `review-report` when the last result
+  lands. No SDK change, ships sooner, but encodes workflow in the CLI the way
+  ADR 0010 tries to avoid.
+
+Recommendation: (b) as the shippable first slice behind the `/code-swarm`
+surface, with (a) as the recorded target so the orchestration migrates into
+the extension when the host capability exists. Either way, prerequisites are
+**E2** (slash args must reach extension commands — the flags above are
+impossible today) and `review-brief` accepting model targets (personas ×
+models) so briefs stop hardcoding empty provider/model.
+
+Context assembly (G2) and report rendering (G5/E4) apply unchanged on top of
+whichever orchestration lands: bounded diff/PR/file context with a visible
+skipped-list, and a markdown report artifact instead of transcript JSON.
