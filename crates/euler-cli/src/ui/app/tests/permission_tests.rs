@@ -139,7 +139,7 @@ fn permission_panel_consequences_use_available_write_scope() {
         "contents: {contents:?}"
     );
     assert!(
-        contents.contains("ran-before unknown"),
+        contents.contains("ran-before 0×"),
         "contents: {contents:?}"
     );
 }

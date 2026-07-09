@@ -495,10 +495,17 @@ fn permission_modal_swallows_scrollback_keys_without_replying() {
         "edit".to_owned(),
     )));
 
-    assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::None);
-    assert_eq!(
-        core.handle_input(modified_key(KeyCode::Up, KeyModifiers::CONTROL)),
-        CoreEffect::None
+    // PageUp/Ctrl+Up may move selection (Render) or be swallowed (None), but
+    // must never send a permission reply.
+    let page_up = core.handle_input(key(KeyCode::PageUp));
+    assert!(
+        matches!(page_up, CoreEffect::None | CoreEffect::Render),
+        "page up should not reply: {page_up:?}"
+    );
+    let ctrl_up = core.handle_input(modified_key(KeyCode::Up, KeyModifiers::CONTROL));
+    assert!(
+        matches!(ctrl_up, CoreEffect::None | CoreEffect::Render),
+        "ctrl+up should not reply: {ctrl_up:?}"
     );
 
     assert_eq!(core.transcript.scroll_offset(), 0);
@@ -2849,7 +2856,7 @@ fn patch_approval_modal_renders_diff_and_prompt() {
         visual.contains("write scope note.txt"),
         "visual: {visual:?}"
     );
-    assert!(visual.contains("ran-before unknown"), "visual: {visual:?}");
+    assert!(visual.contains("ran-before 0×"), "visual: {visual:?}");
     assert!(contents.contains("y  Allow once"));
     assert!(contents.contains("Allow once (default selection)"));
     assert!(contents.contains("a  Allow fs-write"));
