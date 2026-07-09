@@ -510,9 +510,9 @@ pub(super) fn render_extension_result(
     width: u16,
 ) {
     let (glyph, title_style) = if render.ok {
-        ("✓", theme.transcript.tool)
+        (glyphs::check(), theme.transcript.tool)
     } else {
-        ("✗", theme.transcript.tool_error)
+        (glyphs::cross(), theme.transcript.tool_error)
     };
     let rows = artifact::artifact_output_rows(render.output, render.limit.max(1));
     let body = artifact::plain_artifact_rows(&rows.rows, theme.transcript.muted);
