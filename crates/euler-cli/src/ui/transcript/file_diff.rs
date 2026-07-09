@@ -51,7 +51,7 @@ pub(super) fn render_file_diff_cell(
 ) {
     let path = file_change_path_label(diff.path);
     let action = file_change_action_label(diff.action);
-    let (mut title, rows, footer) = match diff.diff {
+    let (title, rows, footer) = match diff.diff {
         Some(diff_text) => {
             let rows = file_diff_artifact_rows(diff_text, theme, diff.path, limit);
             (
@@ -69,13 +69,14 @@ pub(super) fn render_file_diff_cell(
             )
         }
     };
-    if let Some(event_id) = diff.checkpoint_event_id {
-        title.push_str(&format!(" · ckpt {event_id}"));
-    }
+    let checkpoint_suffix = diff
+        .checkpoint_event_id
+        .map(|event_id| format!("ckpt {event_id}"));
     push_artifact_cell(
         lines,
         ArtifactCellRender {
             title: &title,
+            title_suffix: checkpoint_suffix.as_deref(),
             rows: &rows,
             footer: &footer,
             style: theme.transcript.patch,

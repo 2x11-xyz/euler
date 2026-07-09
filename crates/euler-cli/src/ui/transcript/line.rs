@@ -98,7 +98,13 @@ fn line_oriented_companion(item: &super::TranscriptItem) -> String {
         return String::new();
     };
     let mut out = match status {
-        super::CompanionStatus::Running => format!("companion: {name} running · {task}\n"),
+        super::CompanionStatus::Running { elapsed } => {
+            let elapsed = elapsed
+                .as_deref()
+                .map(|value| format!(" · {value}"))
+                .unwrap_or_default();
+            format!("companion: {name} running · {task}{elapsed}\n")
+        }
         super::CompanionStatus::Done {
             ok,
             summary,

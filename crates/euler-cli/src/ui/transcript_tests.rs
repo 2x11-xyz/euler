@@ -2665,6 +2665,23 @@ fn vt100_reasoning_render_uses_human_header_and_clean_indent() {
 }
 
 #[test]
+fn vt100_reasoning_gist_truncates_multibyte_on_char_boundary() {
+    let content = "界".repeat(61);
+    let events = vec![event(
+        EventKind::MODEL_REASONING,
+        object([
+            ("fidelity", "raw".into()),
+            ("content", content.clone().into()),
+        ]),
+    )];
+    let contents = rendered_screen(&events, &Theme::default(), 200, 3);
+    let expected = format!("{}…", "界".repeat(60));
+
+    assert!(contents.contains(&expected), "contents: {contents:?}");
+    assert!(!contents.contains(&content), "contents: {contents:?}");
+}
+
+#[test]
 fn vt100_failed_tool_with_exit_code_and_empty_error_has_no_dangling_colon() {
     let events = vec![event(
         EventKind::TOOL_RESULT,
@@ -3027,7 +3044,7 @@ fn projects_agent_spawn_message_result_into_companion_block() {
     spawn.id = "spawn-1".to_owned();
     spawn.ts = "2026-07-09T12:00:00.000Z".to_owned();
 
-    let message = event(
+    let mut message = event(
         EventKind::AGENT_MESSAGE,
         object([
             ("from_agent_id", "agent-child".into()),
@@ -3040,6 +3057,7 @@ fn projects_agent_spawn_message_result_into_companion_block() {
             ),
         ]),
     );
+    message.ts = "2026-07-09T12:00:30.000Z".to_owned();
 
     let mut result = event(
         EventKind::AGENT_RESULT,
@@ -3052,6 +3070,20 @@ fn projects_agent_spawn_message_result_into_companion_block() {
         ]),
     );
     result.ts = "2026-07-09T12:01:04.000Z".to_owned();
+
+    let running_items = project_events(&[spawn.clone(), message.clone()]);
+    assert!(
+        matches!(
+            &running_items[0],
+            TranscriptItem::Companion {
+                status: super::transcript::CompanionStatus::Running {
+                    elapsed: Some(elapsed),
+                },
+                ..
+            } if elapsed == "30s"
+        ),
+        "running items: {running_items:?}"
+    );
 
     let items = project_events(&[spawn, message, result]);
     assert_eq!(items.len(), 1, "items: {items:?}");
@@ -3167,7 +3199,9 @@ fn companion_running_header_and_finding_rows_use_teal_rail() {
         child_agent_id: "agent-child".to_owned(),
         name: "reviewer".to_owned(),
         task: "review the patch".to_owned(),
-        status: super::transcript::CompanionStatus::Running,
+        status: super::transcript::CompanionStatus::Running {
+            elapsed: Some("45s".to_owned()),
+        },
         rows: vec![
             super::transcript::CompanionRow::Report {
                 text: "older progress".to_owned(),
@@ -3185,7 +3219,7 @@ fn companion_running_header_and_finding_rows_use_teal_rail() {
     let lines = render_items_for_history(&[item], &theme, 100);
     let joined = line_texts(&lines).join("\n");
     assert!(
-        joined.contains("◆ reviewer ⠧ · review the patch"),
+        joined.contains("◆ reviewer ⠧ · review the patch · 45s"),
         "joined: {joined:?}"
     );
     assert!(

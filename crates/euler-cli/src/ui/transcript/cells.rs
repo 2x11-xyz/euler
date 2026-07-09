@@ -87,6 +87,7 @@ pub(super) fn render_tool_run(
         lines,
         ArtifactCellRender {
             title: &heading,
+            title_suffix: None,
             rows: &rows,
             footer: &footer,
             style,
@@ -159,6 +160,7 @@ pub(super) fn render_patch_cell(
         lines,
         ArtifactCellRender {
             title: &patch.title,
+            title_suffix: None,
             rows: &body,
             footer: &footer,
             style: theme.transcript.patch,
@@ -176,10 +178,10 @@ pub(super) fn render_file_change_cell(
 ) {
     let path = file_change_path_label(change.path);
     let action = file_change_action_label(change.action);
-    let mut title = format!("File {} {path}", file_change_action_title(&action));
-    if let Some(event_id) = change.checkpoint_event_id {
-        title.push_str(&format!(" · ckpt {event_id}"));
-    }
+    let title = format!("File {} {path}", file_change_action_title(&action));
+    let checkpoint_suffix = change
+        .checkpoint_event_id
+        .map(|event_id| format!("ckpt {event_id}"));
     let mut rows = Vec::new();
     rows.push(metadata_row("action", &action, theme.transcript.muted));
     let origin = sanitize_metadata_text(change.origin);
@@ -215,6 +217,7 @@ pub(super) fn render_file_change_cell(
         lines,
         ArtifactCellRender {
             title: &title,
+            title_suffix: checkpoint_suffix.as_deref(),
             rows: &rows,
             footer: "metadata only",
             style: theme.transcript.patch,
@@ -575,13 +578,14 @@ pub(super) fn render_companion_block(
         companion.name
     };
     match companion.status {
-        super::CompanionStatus::Running => {
+        super::CompanionStatus::Running { elapsed } => {
             render_companion_running(
                 lines,
                 CompanionRunningRender {
                     glyph,
                     name,
                     task: companion.task,
+                    elapsed: elapsed.as_deref().unwrap_or("0s"),
                     rows: companion.rows,
                 },
                 theme,
@@ -616,6 +620,7 @@ struct CompanionRunningRender<'a> {
     glyph: &'a str,
     name: &'a str,
     task: &'a str,
+    elapsed: &'a str,
     rows: &'a [super::CompanionRow],
 }
 
@@ -626,9 +631,12 @@ fn render_companion_running(
     width: u16,
 ) {
     let header = if running.task.is_empty() {
-        format!("{} {} ⠧", running.glyph, running.name)
+        format!("{} {} ⠧ · {}", running.glyph, running.name, running.elapsed)
     } else {
-        format!("{} {} ⠧ · {}", running.glyph, running.name, running.task)
+        format!(
+            "{} {} ⠧ · {} · {}",
+            running.glyph, running.name, running.task, running.elapsed
+        )
     };
     push_companion_rail_line(lines, &header, theme.transcript.companion, theme, width);
     push_companion_rail_line(

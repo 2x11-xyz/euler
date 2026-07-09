@@ -18,6 +18,7 @@ pub(in crate::ui::transcript) struct ArtifactOutputRows {
 
 pub(in crate::ui::transcript) struct ArtifactCellRender<'a> {
     pub(in crate::ui::transcript) title: &'a str,
+    pub(in crate::ui::transcript) title_suffix: Option<&'a str>,
     pub(in crate::ui::transcript) rows: &'a [Line<'static>],
     pub(in crate::ui::transcript) footer: &'a str,
     pub(in crate::ui::transcript) style: Style,
@@ -112,20 +113,52 @@ pub(in crate::ui::transcript) fn push_artifact_cell(
     let body_width = width.saturating_sub(gutter_width()).max(ARTIFACT_MIN_WIDTH);
     let background_style = artifact_background_style(theme);
     let title_style = background_style.patch(cell.style);
-    let title = flat_title_row(body_width, cell.title, cell.footer);
-    lines.push(
-        Line::from(vec![
-            Span::styled(
-                blank_gutter().to_owned(),
-                background_style.patch(theme.transcript.gutter),
-            ),
-            Span::styled(title, title_style),
-        ])
-        .style(background_style),
-    );
+    let suffix_style = background_style.patch(theme.transcript.muted);
+    let mut title_spans = vec![Span::styled(
+        blank_gutter().to_owned(),
+        background_style.patch(theme.transcript.gutter),
+    )];
+    title_spans.extend(flat_title_spans(
+        body_width,
+        cell.title,
+        cell.title_suffix,
+        cell.footer,
+        title_style,
+        suffix_style,
+    ));
+    lines.push(Line::from(title_spans).style(background_style));
     for row in cell.rows {
         lines.push(artifact_body_line(body_width, row, theme));
     }
+}
+
+fn flat_title_spans(
+    width: usize,
+    title: &str,
+    suffix: Option<&str>,
+    footer: &str,
+    title_style: Style,
+    suffix_style: Style,
+) -> Vec<Span<'static>> {
+    let mut parts = Vec::new();
+    push_title_part(&mut parts, sanitize_artifact_text(title), title_style);
+    if let Some(suffix) = suffix {
+        push_title_part(&mut parts, sanitize_artifact_text(suffix), suffix_style);
+    }
+    push_title_part(&mut parts, sanitize_artifact_text(footer), title_style);
+    fit_artifact_spans(&parts, width)
+}
+
+fn push_title_part(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    let content = if spans.is_empty() {
+        text
+    } else {
+        format!(" · {text}")
+    };
+    spans.push(Span::styled(content, style));
 }
 
 fn sanitize_artifact_text(source: &str) -> String {
@@ -186,19 +219,6 @@ fn artifact_background_style(theme: &Theme) -> Style {
 
 fn artifact_width(width: u16) -> usize {
     usize::from(width).max(ARTIFACT_MIN_WIDTH)
-}
-
-fn flat_title_row(width: usize, title: &str, footer: &str) -> String {
-    let title = sanitize_artifact_text(title);
-    let footer = sanitize_artifact_text(footer);
-    let combined = if footer.is_empty() {
-        title
-    } else if title.is_empty() {
-        footer
-    } else {
-        format!("{title} · {footer}")
-    };
-    truncate_display(&combined, width)
 }
 
 fn artifact_body_line(width: usize, row: &Line<'static>, theme: &Theme) -> Line<'static> {
@@ -286,6 +306,7 @@ mod tests {
             &mut lines,
             ArtifactCellRender {
                 title: "title",
+                title_suffix: None,
                 rows: &rows,
                 footer: "footer",
                 style: theme.transcript.tool,
@@ -304,6 +325,33 @@ mod tests {
         assert_eq!(
             lines[1].style.bg,
             Some(theme.surfaces.transcript.background)
+        );
+    }
+
+    #[test]
+    fn artifact_title_suffix_uses_muted_style() {
+        let theme = Theme::default();
+        let mut lines = Vec::new();
+        push_artifact_cell(
+            &mut lines,
+            ArtifactCellRender {
+                title: "File modified src/lib.rs",
+                title_suffix: Some("ckpt e1234"),
+                rows: &[],
+                footer: "metadata only",
+                style: theme.transcript.patch,
+                width: 80,
+            },
+            &theme,
+        );
+        let suffix = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("ckpt e1234"))
+            .expect("checkpoint suffix span");
+        assert_eq!(
+            suffix.style,
+            artifact_background_style(&theme).patch(theme.transcript.muted)
         );
     }
 

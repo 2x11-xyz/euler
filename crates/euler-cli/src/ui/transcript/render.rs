@@ -575,7 +575,10 @@ fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
 }
 
 fn item_renders_inline_timing(item: &TranscriptItem) -> bool {
-    matches!(item, TranscriptItem::Exploration { .. })
+    matches!(
+        item,
+        TranscriptItem::Exploration { .. } | TranscriptItem::Companion { .. }
+    )
 }
 
 fn tool_group_header(label: &str, steps: usize, timing: Option<&EventTiming>) -> String {
@@ -956,16 +959,7 @@ mod tests {
             command: "cargo test".to_owned(),
             ok: true,
             error: String::new(),
-            output: concat!(
-                "line 1\n",
-                "line 2\n",
-                "line 3\n",
-                "line 4\n",
-                "test result: ok. 12 passed; 0 failed\n",
-                "tail 1\n",
-                "tail 2\n",
-            )
-            .to_owned(),
+            output: "line 1\nline 2\nline 3\nline 4\ntest result: ok. 12 passed; 0 failed\ntail 1\ntail 2\n".to_owned(),
             exit_code: Some(0),
         };
 
@@ -978,11 +972,11 @@ mod tests {
         let text = plain_text(&lines);
 
         assert!(
-            text.contains("test result: ok. 12 passed; 0 failed"),
+            text.contains("test result: ok. 12 passed; 0 failed")
+                && text.contains("tail 2")
+                && !text.contains("line 1"),
             "text: {text:?}"
         );
-        assert!(text.contains("tail 2"), "text: {text:?}");
-        assert!(!text.contains("line 1"), "text: {text:?}");
     }
 
     fn plain_text(lines: &[Line<'_>]) -> String {

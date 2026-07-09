@@ -161,7 +161,9 @@ pub enum TranscriptItem {
 /// Running vs completed companion block (from agent.spawn / agent.result).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompanionStatus {
-    Running,
+    Running {
+        elapsed: Option<String>,
+    },
     Done {
         ok: bool,
         summary: String,
@@ -209,6 +211,11 @@ pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
             spawn_times.insert(event.id.clone(), event.ts.clone());
         }
         let item = match event.kind.as_str() {
+            EventKind::AGENT_MESSAGE => {
+                let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
+                project_agent_message(event, spawn_ts)
+                    .or_else(|| project_event_with_checkpoints(event, &checkpoint_ids))
+            }
             EventKind::AGENT_RESULT => {
                 let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
                 project_agent_result(event, spawn_ts)
@@ -502,7 +509,7 @@ fn project_event_with_checkpoints(
             message: payload_string(event, "message").unwrap_or_default(),
         }),
         EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
-        EventKind::AGENT_MESSAGE => project_agent_message(event),
+        EventKind::AGENT_MESSAGE => project_agent_message(event, None),
         EventKind::AGENT_RESULT => project_agent_result(event, None),
         _ => None,
     }
@@ -525,7 +532,7 @@ pub(crate) fn project_latest_event_for_ui(events: &[EventEnvelope]) -> Option<Tr
     for event in earlier {
         let _ = project_tui_event_with_context(event, &mut calls);
     }
-    let spawn_ts = companion_spawn_ts_for_result(latest, earlier);
+    let spawn_ts = companion_spawn_ts_for_event(latest, earlier);
     project_tui_event_with_context_and_spawn_ts(latest, &mut calls, spawn_ts)
 }
 
@@ -640,7 +647,7 @@ fn project_tui_event_with_context_and_spawn_ts(
         }
         EventKind::TOOL_RESULT => project_tui_tool_result(event, calls),
         EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
-        EventKind::AGENT_MESSAGE => project_agent_message(event),
+        EventKind::AGENT_MESSAGE => project_agent_message(event, spawn_ts),
         EventKind::AGENT_RESULT => project_agent_result(event, spawn_ts),
         _ => project_live_event(event),
     }
@@ -789,7 +796,7 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
             activity_text(event).map(TranscriptItem::AssistantActivity)
         }
         EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
-        EventKind::AGENT_MESSAGE => project_agent_message(event),
+        EventKind::AGENT_MESSAGE => project_agent_message(event, None),
         EventKind::AGENT_RESULT => project_agent_result(event, None),
         EventKind::MODEL_CALL
         | EventKind::MODEL_RESULT
@@ -910,8 +917,13 @@ pub(crate) fn merge_companion_item(
             rows.push(row);
         }
     }
-    if matches!(incoming_status, CompanionStatus::Done { .. }) {
-        *status = incoming_status;
+    let still_running = matches!(&*status, CompanionStatus::Running { .. });
+    match incoming_status {
+        done @ CompanionStatus::Done { .. } => *status = done,
+        running @ CompanionStatus::Running { elapsed: Some(_) } if still_running => {
+            *status = running;
+        }
+        _ => {}
     }
     true
 }
@@ -929,24 +941,31 @@ fn project_agent_spawn(event: &EventEnvelope, _spawn_ts: Option<&str>) -> Option
         child_agent_id,
         name,
         task,
-        status: CompanionStatus::Running,
+        status: CompanionStatus::Running { elapsed: None },
         rows: Vec::new(),
     })
 }
 
-fn project_agent_message(event: &EventEnvelope) -> Option<TranscriptItem> {
+fn project_agent_message(event: &EventEnvelope, spawn_ts: Option<&str>) -> Option<TranscriptItem> {
     let spawn_event_id = payload_string(event, "spawn_event_id")?;
     let child_agent_id = payload_string(event, "from_agent_id").unwrap_or_default();
     let payload = event.payload.get("payload")?;
     let row = companion_row_from_report(payload);
+    let elapsed = companion_elapsed(spawn_ts, &event.ts);
     Some(TranscriptItem::Companion {
         spawn_event_id,
         child_agent_id,
         name: String::new(),
         task: String::new(),
-        status: CompanionStatus::Running,
+        status: CompanionStatus::Running { elapsed },
         rows: vec![row],
     })
+}
+
+fn companion_elapsed(spawn_ts: Option<&str>, end_ts: &str) -> Option<String> {
+    let start = parse_event_time(spawn_ts?)?;
+    let end = parse_event_time(end_ts)?;
+    Some(format_elapsed(start, end))
 }
 
 fn project_agent_result(event: &EventEnvelope, spawn_ts: Option<&str>) -> Option<TranscriptItem> {
@@ -960,11 +979,7 @@ fn project_agent_result(event: &EventEnvelope, spawn_ts: Option<&str>) -> Option
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let summary = payload_string(event, "summary").unwrap_or_default();
-    let elapsed = spawn_ts.and_then(|start| {
-        let start = parse_event_time(start)?;
-        let end = parse_event_time(&event.ts)?;
-        Some(format_elapsed(start, end))
-    });
+    let elapsed = companion_elapsed(spawn_ts, &event.ts);
     let mut rows = Vec::new();
     if let Some(output) = payload_string(event, "output").filter(|s| !s.is_empty()) {
         rows.push(CompanionRow::Report { text: output });
@@ -1093,11 +1108,14 @@ fn is_child_agent_id(agent: &str, child_agents: &HashMap<String, String>) -> boo
     child_agents.contains_key(agent)
 }
 
-fn companion_spawn_ts_for_result<'a>(
+fn companion_spawn_ts_for_event<'a>(
     event: &EventEnvelope,
     earlier: &'a [EventEnvelope],
 ) -> Option<&'a str> {
-    if event.kind.as_str() != EventKind::AGENT_RESULT {
+    if !matches!(
+        event.kind.as_str(),
+        EventKind::AGENT_MESSAGE | EventKind::AGENT_RESULT
+    ) {
         return None;
     }
     let spawn_id = payload_string(event, "spawn_event_id").or_else(|| event.parent.clone())?;
@@ -1111,7 +1129,10 @@ fn companion_spawn_ts_lookup<'a>(
     event: &EventEnvelope,
     spawn_times: &'a HashMap<String, String>,
 ) -> Option<&'a str> {
-    if event.kind.as_str() != EventKind::AGENT_RESULT {
+    if !matches!(
+        event.kind.as_str(),
+        EventKind::AGENT_MESSAGE | EventKind::AGENT_RESULT
+    ) {
         return None;
     }
     let spawn_id = payload_string(event, "spawn_event_id").or_else(|| event.parent.clone())?;
@@ -1318,9 +1339,15 @@ fn project_timed_events(events: &[EventEnvelope]) -> Vec<ProjectedEntry> {
     let mut previous = None;
     let mut entries = Vec::new();
     let mut calls = HashMap::new();
+    let mut spawn_times = HashMap::new();
 
     for event in events {
-        if let Some(item) = project_tui_event_with_context(event, &mut calls) {
+        if event.kind.as_str() == EventKind::AGENT_SPAWN {
+            spawn_times.insert(event.id.clone(), event.ts.clone());
+        }
+        let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
+        if let Some(item) = project_tui_event_with_context_and_spawn_ts(event, &mut calls, spawn_ts)
+        {
             let time = parse_event_time(&event.ts);
             let timing = time.map(|current| {
                 let first_time = *first.get_or_insert(current);
