@@ -18,6 +18,8 @@ const REVIEW_REPORT_MEDIA_TYPE: &str = "application/vnd.euler.code-swarm.review.
 const DEFAULT_MAX_TOKENS: u64 = 8192;
 const DEFAULT_REPORT_LIMIT: usize = 128;
 const PERSONA_PREFIX: &str = "code-swarm-";
+/// Hard cap on reviewer agents per swarm (matches the prototype's limit).
+const MAX_SWARM_AGENTS: usize = 5;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodeSwarmExtension;
@@ -61,12 +63,7 @@ impl ExtensionCommand for ReviewBriefCommand {
         _host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let input = ReviewBriefInput::parse(&context.input)?;
-        let briefs = input
-            .charters
-            .iter()
-            .map(|charter| charter_brief(charter, input.max_tokens))
-            .collect::<Vec<_>>();
-        Ok(json!({"schema": REVIEW_BRIEF_SCHEMA, "briefs": briefs}))
+        Ok(json!({"schema": REVIEW_BRIEF_SCHEMA, "briefs": input.briefs()}))
     }
 }
 
@@ -179,9 +176,19 @@ Call out any requirement that cannot be tested honestly against production shape
 Prefer findings that would catch real regressions. Say when existing coverage is sufficient.
 Return a concise plaintext review with: summary, findings, and any blocking recommendation. Do not include markdown tables unless they make the review shorter."#;
 
+/// Explicit reviewer target, parsed from `provider::model`. Empty targets are
+/// expressed by omitting `models` entirely — briefs then inherit the session's
+/// active target (companion `inherit_if_empty` semantics).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelTarget {
+    provider: String,
+    model: String,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct ReviewBriefInput {
     charters: Vec<Charter>,
+    models: Vec<ModelTarget>,
     max_tokens: u64,
 }
 
@@ -193,11 +200,33 @@ impl ReviewBriefInput {
         let object = value
             .as_object()
             .ok_or_else(|| input_error("code-swarm review-brief input must be a JSON object"))?;
-        reject_unknown_fields(object, &["reviewers", "max_tokens"])?;
+        reject_unknown_fields(object, &["reviewers", "models", "max_tokens"])?;
         Ok(Self {
             charters: parse_charters(object.get("reviewers"))?,
+            models: parse_models(object.get("models"))?,
             max_tokens: parse_positive_u64(object, "max_tokens", DEFAULT_MAX_TOKENS)?,
         })
+    }
+
+    /// One brief per agent. With explicit models the selection IS the agent
+    /// count (1–5); charters cycle round-robin across agents. Without models
+    /// the historical behavior stands: one inheriting brief per charter.
+    fn briefs(&self) -> Vec<Value> {
+        if self.models.is_empty() {
+            return self
+                .charters
+                .iter()
+                .map(|charter| charter_brief(charter, None, self.max_tokens))
+                .collect();
+        }
+        self.models
+            .iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let charter = &self.charters[index % self.charters.len()];
+                charter_brief(charter, Some(target), self.max_tokens)
+            })
+            .collect()
     }
 }
 
@@ -205,9 +234,54 @@ impl Default for ReviewBriefInput {
     fn default() -> Self {
         Self {
             charters: CHARTERS.to_vec(),
+            models: Vec::new(),
             max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
+}
+
+fn parse_models(value: Option<&Value>) -> Result<Vec<ModelTarget>, ExtensionError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| input_error("models must be an array of provider::model strings"))?;
+    if values.is_empty() {
+        return Err(input_error("models must not be empty when provided"));
+    }
+    if values.len() > MAX_SWARM_AGENTS {
+        return Err(input_error(format!(
+            "models lists {} targets; the swarm cap is {MAX_SWARM_AGENTS}",
+            values.len()
+        )));
+    }
+    values
+        .iter()
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| input_error("models must be an array of provider::model strings"))?;
+            parse_model_target(text)
+        })
+        .collect()
+}
+
+fn parse_model_target(text: &str) -> Result<ModelTarget, ExtensionError> {
+    let Some((provider, model)) = text.split_once("::") else {
+        return Err(input_error(format!(
+            "model target `{text}` must use provider::model form"
+        )));
+    };
+    if provider.trim().is_empty() || model.trim().is_empty() {
+        return Err(input_error(format!(
+            "model target `{text}` must name both provider and model"
+        )));
+    }
+    Ok(ModelTarget {
+        provider: provider.trim().to_owned(),
+        model: model.trim().to_owned(),
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -225,7 +299,12 @@ impl ReviewReportInput {
         let object = value
             .as_object()
             .ok_or_else(|| input_error("code-swarm review-report input must be a JSON object"))?;
-        reject_unknown_fields(object, &["limit", "scan_limit", "after_event_id"])?;
+        // `session_id` is injected by hosts for commands declaring
+        // `accepts_session_id: true`; accepting it is part of that contract.
+        // The query targets the host-selected session, so the value itself
+        // is informational here.
+        reject_unknown_fields(object, &["limit", "scan_limit", "after_event_id", "session_id"])?;
+        let _ = optional_string(object, "session_id")?;
         Ok(Self {
             limit: parse_positive_usize(object, "limit", DEFAULT_REPORT_LIMIT)?,
             scan_limit: parse_optional_positive_usize(object, "scan_limit")?,
@@ -260,6 +339,8 @@ impl Default for ReviewReportInput {
 #[derive(Debug, Eq, PartialEq)]
 struct ReviewerResult {
     persona: String,
+    provider: String,
+    model: String,
     ok: bool,
     summary: String,
     findings: String,
@@ -270,6 +351,8 @@ impl ReviewerResult {
     fn to_json(&self) -> Value {
         json!({
             "persona": self.persona,
+            "provider": self.provider,
+            "model": self.model,
             "ok": self.ok,
             "summary": self.summary,
             "findings": self.findings,
@@ -282,6 +365,13 @@ fn review_brief_args() -> Vec<ArgSpec> {
         ArgSpec {
             flag: "reviewer".to_owned(),
             input_key: "reviewers".to_owned(),
+            value_kind: ArgValueKind::StringList,
+            required: false,
+            repeatable: true,
+        },
+        ArgSpec {
+            flag: "model".to_owned(),
+            input_key: "models".to_owned(),
             value_kind: ArgValueKind::StringList,
             required: false,
             repeatable: true,
@@ -314,15 +404,18 @@ fn positive_arg(flag: &str, input_key: &str) -> ArgSpec {
     }
 }
 
-fn charter_brief(charter: &Charter, max_tokens: u64) -> Value {
+fn charter_brief(charter: &Charter, target: Option<&ModelTarget>, max_tokens: u64) -> Value {
+    let (provider, model) = target
+        .map(|target| (target.provider.as_str(), target.model.as_str()))
+        .unwrap_or(("", ""));
     json!({
         "task": format!(
             "Review the work visible in this session as the {} reviewer. Companion agents see the session canvas; no event listing is needed. Stay review-only and return concise findings about the current session's work.",
             charter.name
         ),
         "persona": format!("{PERSONA_PREFIX}{}", charter.name),
-        "provider": "",
-        "model": "",
+        "provider": provider,
+        "model": model,
         "system_prompt": charter.system_prompt,
         "capabilities": [],
         "budget": {"max_turns": 1, "max_tool_calls": 0, "max_tokens": max_tokens},
@@ -351,7 +444,16 @@ fn collect_reviewer_results(
     Ok(reviewers)
 }
 
-fn code_swarm_spawns(events: &[EventEnvelope]) -> Result<BTreeMap<String, String>, ExtensionError> {
+#[derive(Clone, Debug)]
+struct SpawnInfo {
+    persona: String,
+    provider: String,
+    model: String,
+}
+
+fn code_swarm_spawns(
+    events: &[EventEnvelope],
+) -> Result<BTreeMap<String, SpawnInfo>, ExtensionError> {
     let mut spawns = BTreeMap::new();
     for event in events
         .iter()
@@ -359,7 +461,18 @@ fn code_swarm_spawns(events: &[EventEnvelope]) -> Result<BTreeMap<String, String
     {
         if let Some(persona) = optional_payload_string(event, "persona")? {
             if persona.starts_with(PERSONA_PREFIX) {
-                spawns.insert(event.id.clone(), persona.to_owned());
+                spawns.insert(
+                    event.id.clone(),
+                    SpawnInfo {
+                        persona: persona.to_owned(),
+                        provider: optional_payload_string(event, "provider")?
+                            .unwrap_or_default()
+                            .to_owned(),
+                        model: optional_payload_string(event, "model")?
+                            .unwrap_or_default()
+                            .to_owned(),
+                    },
+                );
             }
         }
     }
@@ -368,10 +481,10 @@ fn code_swarm_spawns(events: &[EventEnvelope]) -> Result<BTreeMap<String, String
 
 fn reviewer_result(
     event: &EventEnvelope,
-    spawns: &BTreeMap<String, String>,
+    spawns: &BTreeMap<String, SpawnInfo>,
 ) -> Result<Option<ReviewerResult>, ExtensionError> {
     let spawn_event_id = required_payload_string(event, "spawn_event_id")?;
-    let Some(persona) = spawns.get(spawn_event_id) else {
+    let Some(spawn) = spawns.get(spawn_event_id) else {
         return Ok(None);
     };
     if let Some(parent) = &event.parent {
@@ -383,7 +496,9 @@ fn reviewer_result(
         }
     }
     Ok(Some(ReviewerResult {
-        persona: persona.clone(),
+        persona: spawn.persona.clone(),
+        provider: spawn.provider.clone(),
+        model: spawn.model.clone(),
         ok: required_payload_bool(event, "ok")?,
         summary: required_payload_string(event, "summary")?.to_owned(),
         findings: optional_payload_string(event, "output")?
@@ -584,6 +699,97 @@ mod tests {
             .expect("system prompt")
             .contains("coverage honesty"));
         assert_eq!(briefs[0]["budget"]["max_tokens"], json!(123));
+    }
+
+    #[test]
+    fn review_brief_with_models_sets_targets_and_cycles_charters() {
+        let input = json!({"models": [
+            "openrouter::z-ai/glm-5.2",
+            "anthropic::claude-opus-5",
+            "openai::gpt-5.5",
+            "openrouter::z-ai/glm-5.2",
+        ]});
+        let output = ReviewBriefCommand
+            .execute(CommandContext { input }, &MockHost::default())
+            .expect("brief output");
+        let briefs = output["briefs"].as_array().expect("brief array");
+
+        assert_eq!(briefs.len(), 4);
+        assert_eq!(briefs[0]["provider"], json!("openrouter"));
+        assert_eq!(briefs[0]["model"], json!("z-ai/glm-5.2"));
+        assert_eq!(briefs[0]["persona"], json!("code-swarm-correctness"));
+        assert_eq!(briefs[1]["persona"], json!("code-swarm-safety"));
+        assert_eq!(briefs[2]["persona"], json!("code-swarm-tests"));
+        // Fourth agent cycles back to the first charter.
+        assert_eq!(briefs[3]["persona"], json!("code-swarm-correctness"));
+        assert_eq!(briefs[3]["provider"], json!("openrouter"));
+        // Explicit targets must parse as real AgentTask values.
+        for brief in briefs {
+            let task = AgentTask::new(
+                brief["task"].as_str().expect("task"),
+                brief["persona"].as_str().expect("persona"),
+                brief["provider"].as_str().expect("provider"),
+                brief["model"].as_str().expect("model"),
+            )
+            .expect("agent task with explicit target");
+            assert!(!task.provider().is_empty());
+        }
+    }
+
+    #[test]
+    fn review_brief_rejects_bad_model_targets_and_over_cap() {
+        for (input, fragment) in [
+            (json!({"models": []}), "must not be empty"),
+            (json!({"models": ["no-separator"]}), "provider::model"),
+            (json!({"models": ["::model"]}), "both provider and model"),
+            (json!({"models": ["provider::"]}), "both provider and model"),
+            (
+                json!({"models": ["a::b", "a::b", "a::b", "a::b", "a::b", "a::b"]}),
+                "cap is 5",
+            ),
+        ] {
+            let error = ReviewBriefCommand
+                .execute(CommandContext { input }, &MockHost::default())
+                .expect_err("invalid models input");
+            assert!(
+                error.to_string().contains(fragment),
+                "error `{error}` should contain `{fragment}`"
+            );
+        }
+    }
+
+    #[test]
+    fn review_report_accepts_host_injected_session_id() {
+        let (spawn, result) = spawn_and_result("code-swarm-safety", "finding");
+        let host = MockHost::with_events(vec![spawn, result]);
+        let output = ReviewReportCommand
+            .execute(
+                CommandContext {
+                    input: json!({"session_id": "01ABC", "limit": 16}),
+                },
+                &host,
+            )
+            .expect("report accepts injected session_id");
+        assert_eq!(output["reviewer_count"], json!(1));
+    }
+
+    #[test]
+    fn review_report_attributes_provider_and_model_from_spawn() {
+        let (mut spawn, result) = spawn_and_result("code-swarm-tests", "finding");
+        spawn
+            .payload
+            .insert("provider".to_owned(), "openrouter".into());
+        spawn
+            .payload
+            .insert("model".to_owned(), "z-ai/glm-5.2".into());
+        let host = MockHost::with_events(vec![spawn, result]);
+        let _ = ReviewReportCommand
+            .execute(CommandContext { input: json!({}) }, &host)
+            .expect("report output");
+        let writes = host.writes.borrow();
+        let artifact: Value = serde_json::from_slice(&writes[0].bytes).expect("artifact json");
+        assert_eq!(artifact["reviewers"][0]["provider"], json!("openrouter"));
+        assert_eq!(artifact["reviewers"][0]["model"], json!("z-ai/glm-5.2"));
     }
 
     #[test]
