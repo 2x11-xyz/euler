@@ -18,6 +18,33 @@ fixture provider, then `euler extension run …` against the created session).
 Every step of that journey has a defect or a cliff. In practice the flow is
 unusable end-to-end in the TUI today.
 
+> **Implementation status (2026-07-09, this branch):** E1–E4 fixed and the
+> decided `/code-swarm` design implemented, all with tests; full workspace
+> gate green, clippy clean.
+>
+> - **E1 FIXED** — `review-report` accepts injected `session_id`; headless
+>   CLI regression test (`extension_cli_code_swarm_report_accepts_injected_session_id`).
+> - **E2 FIXED** — extension slash args parse (JSON or `--flag` via the
+>   shared ArgSpec parser) or reject with a usage line; never dropped.
+> - **E3 FIXED (v1 posture)** — linked extensions teach the CLI run path
+>   instead of `unknown extension id`. Full in-session linked runs remain
+>   future work.
+> - **E4 FIXED** — extension results render as foldable artifact rows
+>   (pretty JSON, ctrl+o fold), not a minified one-line dump.
+> - **E5/G1/G3 IMPLEMENTED** — `/code-swarm` (⋄ extension surface):
+>   no-arg opens the 1b checklist picker (default 3, min 1 / max 5,
+>   refuse-at-cap, type-to-filter, saved to `preferences.json` +
+>   decision-record line); `review [--personas …] [--prompt …]` runs
+>   brief → one companion per model target → `review-report`, ending in
+>   `✓ code-swarm review complete · N reviewers · artifact <path>`.
+>   `review-brief` gained `models` (provider::model ×1–5, personas cycle)
+>   and `prompt` inputs; the report attributes provider/model per reviewer.
+> - **Still open:** E6 (model-facing tool — needs contracts work), E7/E8
+>   (minor), G2 context assembly (diff/PR modes), true parallel reviewer
+>   execution (v1 runs companions serially through the pending-run queue),
+>   per-project model-set override, SDK picker declaration to generalize
+>   the v1 `/code-swarm` special case.
+
 ---
 
 ## E1 · `review-report` is broken from the CLI — contract mismatch on `session_id` (bug, high)
