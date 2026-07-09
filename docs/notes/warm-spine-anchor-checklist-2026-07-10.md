@@ -113,3 +113,23 @@ finalized re-render shifting by one (stamp/anchor divergence between the
 LiveTranscript block path at app/visual.rs:86-100 and the History path),
 or active_row_count trimming trailing blanks while commit_until counts
 them (visual_canvas.rs active_row_count vs Line::default separator).
+
+
+## Rhythm ownership (window 3 conclusion — read before continuing)
+Current pushed state: 887/890 (3 red: PTY commit-drop + 2 chrome rhythm
+tests asserting the removed trailing-rhythm row).
+Attempted: uniform per-event blank after EVERY item (incl. WorkedDuration)
+— made it worse (blank canyons: the app-visual layer pushes its own Spacer
+blocks between blocks; double ownership).
+DECISION NEEDED next window: make vertical rhythm single-owner.
+Options: (a) renderer owns it — per-event blank stays meaningful-only,
+batch-trailing gap comes from the LAST item too (special-case last entry),
+and delete the app-visual Spacer between History/Live blocks; (b) visual
+layer owns it — remove renderer blanks, spacers everywhere. (a) preserves
+live/finalized identity (the PTY commit-drop's likely root cause) — do (a),
+then re-run tui_pty_transcript_lines_commit_exactly_once, then the 2 chrome
+tests define the correct expectations (one blank between events, one after
+the batch, never two).
+Also remember: worked_separator_degrades_* and repeated_finalized_writes_*
+were the tests distinguishing the attempts — use them as the calibration
+pair.
