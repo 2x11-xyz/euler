@@ -19,6 +19,18 @@ progress separately.
 
 ## ROUND 2 FINDINGS (branch @ `bc52b92`)
 
+> **Ownership split (agreed 2026-07-09):** the review side takes F22/F23/F24 —
+> F22/F23 only reproduce on the macOS/CEST dogfooding host, and F24 is
+> mechanical wiring with no product-behavior decisions. The implementing team
+> keeps **F25/F26/F27**: F27 shares the live-render seam with the F2 scroll-pill
+> wiring, and F25/F26 involve scoping decisions (wire vs re-document) that
+> belong to the owning team's debt list. This keeps reviewer independence for
+> everything that changes product behavior.
+>
+> **F22/F23/F24 status: FIXED** in the commit carrying this note; details
+> appended to each finding below. Full gate after fixes: 1879/1879 passed on
+> stock macOS/CEST environment (no TZ/TMPDIR pinning), clippy clean.
+
 ### F22 · New vt100 timestamp tests are timezone-dependent — gate fails outside UTC
 
 - **Where:** `crates/euler-cli/src/ui/transcript_tests.rs:2831` and siblings —
@@ -40,6 +52,11 @@ progress separately.
   threading (nextest's process-per-test would mask the race).
 - **Accept when:** the three tests pass under `TZ=UTC`, `TZ=Europe/Amsterdam`,
   and `TZ=America/New_York` without changing renderer behavior.
+- **FIXED (review side):** added a `local_hms` test helper that derives the
+  expected stamp through the same `DateTime<Local>` conversion the renderer
+  uses; all literal `HH:MM:SS` assertions (including the overflow-omission
+  test's negative assertion) now go through it. Renderer untouched. Verified
+  under all three TZ values.
 
 ### F23 · Headless extension-link test breaks on macOS tempdir symlink
 
@@ -56,6 +73,12 @@ progress separately.
   (grep the headless suite for other `starts_with(…tempdir…)` assertions and
   fix the pattern once).
 - **Accept when:** the test passes on stock macOS (default `TMPDIR`) and Linux.
+- **FIXED (review side):** canonicalized the expectation side before the
+  prefix comparison. The full-suite run (fail-fast disabled) surfaced one more
+  test with the same defect —
+  `extension_resolution_rejects_unknown_ids_and_malformed_project_file`
+  (two assertions building expected error strings from uncanonicalized
+  tempdir paths) — fixed the same way. Both pass on stock macOS.
 
 **Round-2 gate status:** with `TZ=UTC` and canonicalized `TMPDIR`, the full
 workspace gate is green (1878 passed, 2 skipped) and clippy is clean — no
@@ -93,6 +116,12 @@ de-emphasized (nit: uses `muted`, not the faint token — optional polish).
 - **Accept when:** `push_hairline` and the markdown h1/h2 underline use
   `transcript.hairline`; a render test asserts hairline color ≠ gutter color
   under warm-ledger.
+- **FIXED (review side):** `push_hairline` and the h1/h2 underline now consume
+  `theme.transcript.hairline`; added
+  `hairline_uses_dedicated_theme_token_not_gutter` render test. Table borders
+  and code-language tags deliberately stay on `gutter` — the spec labels those
+  "faint", which is the gutter tone; only event separators and heading
+  underlines are "hairline".
 
 ### F25 · (residual of F3) glyph fallback system unconsumed; `■` missing; plan doc over-claims
 

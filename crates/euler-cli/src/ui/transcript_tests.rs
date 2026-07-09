@@ -15,6 +15,18 @@ use super::transcript::TranscriptState;
 
 const DEFAULT_OUTPUT_LIMIT_LINES: usize = super::transcript::TOOL_CALL_MAX_LINES;
 
+/// Expected gutter stamp for an RFC3339 event timestamp, via the same
+/// local-time conversion the renderer performs. Keeps the vt100 timing
+/// assertions hermetic across host timezones (the renderer intentionally
+/// shows local wall-clock time; see `parse_event_time`).
+fn local_hms(ts: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .expect("test timestamp")
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S")
+        .to_string()
+}
+
 #[test]
 fn projects_supported_events_and_skips_control_events() {
     let events = vec![
@@ -2791,6 +2803,37 @@ fn edit_failure_renders_path_and_cause_inline() {
 }
 
 #[test]
+fn hairline_uses_dedicated_theme_token_not_gutter() {
+    // Warm Ledger separates the hairline tone (#38341f) from the faint
+    // timestamp/gutter tone (#5f584a); the hairline row must consume the
+    // dedicated token so event separators stay darker than timestamps.
+    let theme = Theme::warm_ledger();
+    assert_ne!(theme.palette.hairline, theme.palette.gutter);
+
+    let lines = render_items_for_history(
+        &[TranscriptItem::UserMessage("hairline probe".to_owned())],
+        &theme,
+        80,
+    );
+    let hairline_span_styles: Vec<_> = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .filter(|span| span.content.contains('─'))
+        .map(|span| span.style.fg)
+        .collect();
+    assert!(
+        !hairline_span_styles.is_empty(),
+        "expected a hairline row under the user message"
+    );
+    assert!(
+        hairline_span_styles
+            .iter()
+            .all(|fg| *fg == Some(theme.palette.hairline)),
+        "hairline rows must use palette.hairline, got: {hairline_span_styles:?}"
+    );
+}
+
+#[test]
 fn interrupted_ledger_row_uses_spec_copy() {
     let theme = Theme::default();
     let texts = line_texts(&render_items_for_history(
@@ -2828,9 +2871,11 @@ fn vt100_renders_absolute_time_duration_and_turn_footer() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    assert!(contents.contains("start timing · 14:32:07"));
-    assert!(contents.contains("done timing · +1m 53s · 14:34:00"));
-    assert!(contents.contains("─ 1m 53s · 14:34:00 ─"));
+    let start = local_hms("2026-06-20T14:32:07.000Z");
+    let done = local_hms("2026-06-20T14:34:00.000Z");
+    assert!(contents.contains(&format!("start timing · {start}")));
+    assert!(contents.contains(&format!("done timing · +1m 53s · {done}")));
+    assert!(contents.contains(&format!("─ 1m 53s · {done} ─")));
 }
 
 #[test]
@@ -2853,7 +2898,8 @@ fn vt100_skips_invalid_timestamps_without_breaking_transcript() {
 
     assert!(contents.contains("bad time"));
     assert!(!contents.contains("not-a-time"));
-    assert!(contents.contains("good time · 14:32:07"));
+    let good = local_hms("2026-06-20T14:32:07.000Z");
+    assert!(contents.contains(&format!("good time · {good}")));
 }
 
 #[test]
@@ -2874,8 +2920,9 @@ fn vt100_clamps_out_of_order_timestamp_duration_to_zero() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    assert!(contents.contains("earlier · +0s · 14:32:07"));
-    assert!(contents.contains("─ 0s · 14:32:07 ─"));
+    let earlier = local_hms("2026-06-20T14:32:07.000Z");
+    assert!(contents.contains(&format!("earlier · +0s · {earlier}")));
+    assert!(contents.contains(&format!("─ 0s · {earlier} ─")));
 }
 
 #[test]
@@ -2892,7 +2939,8 @@ fn vt100_omits_timing_badge_when_it_would_overflow_row() {
     let contents = rendered_screen(&events, &theme, 28, 4);
 
     assert!(contents.contains("very long row"), "contents: {contents:?}");
-    assert!(!contents.contains("very long row · 14:32:07"));
+    let stamp = local_hms("2026-06-20T14:32:07.000Z");
+    assert!(!contents.contains(&format!("very long row · {stamp}")));
 }
 
 fn rendered_screen(events: &[EventEnvelope], theme: &Theme, width: u16, height: u16) -> String {

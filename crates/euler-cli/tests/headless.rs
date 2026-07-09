@@ -2073,7 +2073,14 @@ fn extension_resolution_rejects_unknown_ids_and_malformed_project_file() {
 
     let project_home = isolated_home();
     let project_root = tempfile::tempdir().expect("project root");
-    let project_dir = project_root.path().join(".euler");
+    // Canonicalize: the binary reports the project file via its resolved cwd,
+    // and on macOS `TempDir::path()` is the `/var/…` symlink form of
+    // `/private/var/…`.
+    let project_root_path = project_root
+        .path()
+        .canonicalize()
+        .expect("canonical project root");
+    let project_dir = project_root_path.join(".euler");
     fs::create_dir(&project_dir).expect("project euler dir");
     let project_file = project_dir.join("extensions.json");
     fs::write(&project_file, r#"{"enable":["nope"]}"#).expect("project overlay");
@@ -2091,7 +2098,11 @@ fn extension_resolution_rejects_unknown_ids_and_malformed_project_file() {
 
     let malformed_home = isolated_home();
     let malformed_root = tempfile::tempdir().expect("malformed root");
-    let malformed_dir = malformed_root.path().join(".euler");
+    let malformed_root_path = malformed_root
+        .path()
+        .canonicalize()
+        .expect("canonical malformed root");
+    let malformed_dir = malformed_root_path.join(".euler");
     fs::create_dir(&malformed_dir).expect("malformed euler dir");
     let malformed_file = malformed_dir.join("extensions.json");
     fs::write(&malformed_file, "{").expect("malformed overlay");
@@ -5413,10 +5424,17 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
     let info_json: serde_json::Value = serde_json::from_slice(&info.stdout).expect("info json");
     assert_eq!(info_json["source_kind"], "linked");
     assert_eq!(info_json["status"], "needs-review");
+    // Compare against the canonicalized tempdir: the binary canonicalizes
+    // linked paths, and on macOS `TempDir::path()` returns the `/var/…`
+    // symlink form of `/private/var/…`.
+    let canonical_extension_dir = extension_dir
+        .path()
+        .canonicalize()
+        .expect("canonical extension dir");
     assert!(info_json["source_path"]
         .as_str()
         .expect("linked source path")
-        .starts_with(extension_dir.path().to_string_lossy().as_ref()));
+        .starts_with(canonical_extension_dir.to_string_lossy().as_ref()));
     assert_eq!(info_json["requires_review"], serde_json::json!(true));
     assert_eq!(
         info_json["requires_execution_grant"],

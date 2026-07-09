@@ -658,7 +658,7 @@ fn stamp_first_line(line: &mut Line<'static>, stamp: &str, theme: &Theme) {
 }
 
 fn push_hairline(lines: &mut Vec<Line<'static>>, theme: &Theme, content_cols: usize) {
-    let hairline = Span::styled(hairline_content(content_cols), theme.transcript.gutter);
+    let hairline = Span::styled(hairline_content(content_cols), theme.transcript.hairline);
     if blank_gutter().is_empty() {
         lines.push(Line::from(vec![hairline]));
     } else {

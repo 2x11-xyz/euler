@@ -274,7 +274,7 @@ impl<'a> Renderer<'a> {
         if underline {
             self.lines.push(Line::from(Span::styled(
                 "─".repeat(usize::from(self.width).max(1)),
-                self.theme.transcript.gutter,
+                self.theme.transcript.hairline,
             )));
         }
     }
