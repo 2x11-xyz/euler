@@ -4,6 +4,11 @@
 # the euler-old tree; kept verbatim below the original docstring. See
 # docs/reviews/extension-ux-code-swarm-2026-07-09.md ("What it should do")
 # for the gap analysis. Not built, not shipped, review-only by design.
+#
+# SEMANTICS REFERENCE ONLY (per Eli): the replacement lives natively within
+# Euler — Rust extension, euler-provider for model calls, host artifacts,
+# session config. Do not resurrect the Python helper process, the direct
+# OpenRouter HTTP path, /tmp report files, or the .codex-swarm.json sidecar.
 """Repo-local Code Swarm prototype for Codex-driven review.
 
 This is intentionally review-only: it reads local/PR context, calls OpenRouter

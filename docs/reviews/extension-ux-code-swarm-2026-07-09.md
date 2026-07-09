@@ -182,6 +182,16 @@ Eli supplied the pre-Rust prototype this extension descends from; it is
 archived verbatim at `docs/reference/codex-swarm-prototype.py`. Reading it
 reframes E5/E6: the shipped extension is not an unfinished version of the
 prototype — it is a **different concept** that lost the prototype's core value.
+
+**Scope note (per Eli, 2026-07-09):** the prototype is a *semantics*
+reference, not an architecture to replicate. The capability must live
+natively **within Euler** — the Rust extension using `euler-provider` for
+model calls, host `write_artifact` for reports, session/provenance for
+records, and Euler's own config — NOT an external Python process, direct
+OpenRouter HTTP, `/tmp` report files, or a `.codex-swarm.json` sidecar. When
+a G-item below says "port", read it as "port the behavior", never the
+mechanism.
+
 Gaps, in order of importance:
 
 ### G1 · The swarm was multi-MODEL, not multi-persona
