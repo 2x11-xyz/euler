@@ -74,6 +74,8 @@ pub enum TranscriptItem {
         command: Option<String>,
         /// Honest scope prefix for `a`/`p` labels; `None` → unscoped labels.
         scope_prefix: Option<String>,
+        /// Companion persona/name when the ask bubbles from an in-flight companion.
+        companion_name: Option<String>,
     },
     PermissionDecision {
         capability: String,
@@ -126,6 +128,11 @@ pub enum TranscriptItem {
     SessionSummary(String),
     Interrupted,
     WorkedDuration(String),
+    /// Turn-end recap after Worked-for: summary + optional faint file list.
+    TurnRecap {
+        summary: String,
+        files: Option<String>,
+    },
     /// Resume fold boundary: decision record + centered replay divider.
     ResumeBoundary {
         label: String,
@@ -133,10 +140,38 @@ pub enum TranscriptItem {
         warning_count: usize,
         events_replayed: usize,
     },
+    /// Companion sub-ledger block projected from agent.spawn / agent.message /
+    /// agent.result. Presentation only — no core Companion lifecycle types.
+    Companion {
+        spawn_event_id: String,
+        child_agent_id: String,
+        name: String,
+        task: String,
+        status: CompanionStatus,
+        rows: Vec<CompanionRow>,
+    },
     Error {
         source: String,
         message: String,
     },
+}
+
+/// Running vs completed companion block (from agent.spawn / agent.result).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompanionStatus {
+    Running,
+    Done {
+        ok: bool,
+        summary: String,
+        elapsed: Option<String>,
+    },
+}
+
+/// Nested companion row: finding (attention) or bounded report (dim).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompanionRow {
+    Finding { label: String, detail: String },
+    Report { text: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,10 +200,25 @@ enum ToolCallProjection {
 
 pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
     let checkpoint_ids = checkpoint_event_ids(events);
-    events
-        .iter()
-        .filter_map(|event| project_event_with_checkpoints(event, &checkpoint_ids))
-        .collect()
+    let mut spawn_times: HashMap<String, String> = HashMap::new();
+    let mut items = Vec::new();
+    for event in events {
+        if event.kind.as_str() == EventKind::AGENT_SPAWN {
+            spawn_times.insert(event.id.clone(), event.ts.clone());
+        }
+        let item = match event.kind.as_str() {
+            EventKind::AGENT_RESULT => {
+                let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
+                project_agent_result(event, spawn_ts)
+                    .or_else(|| project_event_with_checkpoints(event, &checkpoint_ids))
+            }
+            _ => project_event_with_checkpoints(event, &checkpoint_ids),
+        };
+        if let Some(item) = item {
+            push_tui_item(&mut items, item);
+        }
+    }
+    items
 }
 
 fn checkpoint_event_ids(events: &[EventEnvelope]) -> std::collections::HashSet<String> {
@@ -447,12 +497,20 @@ fn project_event_with_checkpoints(
             source: payload_string(event, "source").unwrap_or_default(),
             message: payload_string(event, "message").unwrap_or_default(),
         }),
+        EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
+        EventKind::AGENT_MESSAGE => project_agent_message(event),
+        EventKind::AGENT_RESULT => project_agent_result(event, None),
         _ => None,
     }
 }
 
 pub(crate) fn project_latest_event_for_ui(events: &[EventEnvelope]) -> Option<TranscriptItem> {
     let (latest, earlier) = events.split_last()?;
+    if is_child_agent_event(latest, earlier) {
+        // Child-agent tool/model events are not a joinable live nested ledger
+        // in v0 presentation; companion block owns spawn/message/result only.
+        return None;
+    }
     if assistant_duplicates_model_result_fallback(latest, earlier) {
         return None;
     }
@@ -463,7 +521,8 @@ pub(crate) fn project_latest_event_for_ui(events: &[EventEnvelope]) -> Option<Tr
     for event in earlier {
         let _ = project_tui_event_with_context(event, &mut calls);
     }
-    project_tui_event_with_context(latest, &mut calls)
+    let spawn_ts = companion_spawn_ts_for_result(latest, earlier);
+    project_tui_event_with_context_and_spawn_ts(latest, &mut calls, spawn_ts)
 }
 
 pub(crate) fn render_items_for_history(
@@ -515,14 +574,32 @@ fn project_tui_items(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
     let mut calls = HashMap::new();
     let mut items = Vec::new();
     let mut user_turns = 0usize;
+    let mut child_agents: HashMap<String, String> = HashMap::new();
+    let mut spawn_times: HashMap<String, String> = HashMap::new();
     for (index, event) in events.iter().enumerate() {
+        if event.kind.as_str() == EventKind::AGENT_SPAWN {
+            if let Some(child) = payload_string(event, "child_agent_id") {
+                child_agents.insert(child, event.id.clone());
+            }
+            spawn_times.insert(event.id.clone(), event.ts.clone());
+        }
+        if is_child_agent_id(&event.agent, &child_agents)
+            && !matches!(
+                event.kind.as_str(),
+                EventKind::AGENT_SPAWN | EventKind::AGENT_MESSAGE | EventKind::AGENT_RESULT
+            )
+        {
+            continue;
+        }
         if let Some(item) = model_result_fallback_item(event) {
             if !model_result_has_matching_assistant_message(events, index, &item) {
                 push_tui_item(&mut items, item);
             }
             continue;
         }
-        if let Some(item) = project_tui_event_with_context(event, &mut calls) {
+        let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
+        if let Some(item) = project_tui_event_with_context_and_spawn_ts(event, &mut calls, spawn_ts)
+        {
             if matches!(item, TranscriptItem::UserMessage(_)) {
                 if user_turns > 0 {
                     items.push(TranscriptItem::TurnSeparator);
@@ -539,6 +616,14 @@ fn project_tui_event_with_context(
     event: &EventEnvelope,
     calls: &mut HashMap<String, ToolCallProjection>,
 ) -> Option<TranscriptItem> {
+    project_tui_event_with_context_and_spawn_ts(event, calls, None)
+}
+
+fn project_tui_event_with_context_and_spawn_ts(
+    event: &EventEnvelope,
+    calls: &mut HashMap<String, ToolCallProjection>,
+    spawn_ts: Option<&str>,
+) -> Option<TranscriptItem> {
     match event.kind.as_str() {
         EventKind::TOOL_CALL => {
             if let Some(projection) = tool_projection_from_call(event) {
@@ -550,6 +635,9 @@ fn project_tui_event_with_context(
             None
         }
         EventKind::TOOL_RESULT => project_tui_tool_result(event, calls),
+        EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
+        EventKind::AGENT_MESSAGE => project_agent_message(event),
+        EventKind::AGENT_RESULT => project_agent_result(event, spawn_ts),
         _ => project_live_event(event),
     }
 }
@@ -613,6 +701,16 @@ fn push_tui_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) {
         }
         items.push(TranscriptItem::Exploration { summaries });
         return;
+    }
+    if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
+        if let Some(existing) = items
+            .iter_mut()
+            .rev()
+            .find(|existing| existing.companion_spawn_event_id() == Some(spawn_event_id.as_str()))
+        {
+            let _ = merge_companion_item(existing, item);
+            return;
+        }
     }
     items.push(item);
 }
@@ -686,6 +784,9 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
         EventKind::ASSISTANT_ACTIVITY => {
             activity_text(event).map(TranscriptItem::AssistantActivity)
         }
+        EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
+        EventKind::AGENT_MESSAGE => project_agent_message(event),
+        EventKind::AGENT_RESULT => project_agent_result(event, None),
         EventKind::MODEL_CALL
         | EventKind::MODEL_RESULT
         | EventKind::TOOL_CALL
@@ -742,13 +843,275 @@ impl TranscriptItem {
             Self::FileDiff {
                 diff: Some(diff), ..
             } => file_diff_is_foldable(diff, output_limit_lines),
+            // Done companions collapse to one line by default; expand shows rows.
+            Self::Companion {
+                status: CompanionStatus::Done { .. },
+                rows,
+                ..
+            } => !rows.is_empty() || output_limit_lines > 0,
             _ => false,
+        }
+    }
+
+    pub(crate) fn companion_spawn_event_id(&self) -> Option<&str> {
+        match self {
+            Self::Companion { spawn_event_id, .. } => Some(spawn_event_id.as_str()),
+            _ => None,
         }
     }
 }
 
+/// Merge a later companion projection into an existing block (same spawn).
+pub(crate) fn merge_companion_item(
+    existing: &mut TranscriptItem,
+    incoming: TranscriptItem,
+) -> bool {
+    let TranscriptItem::Companion {
+        spawn_event_id: incoming_id,
+        status: incoming_status,
+        rows: incoming_rows,
+        name: incoming_name,
+        task: incoming_task,
+        child_agent_id: incoming_child,
+        ..
+    } = incoming
+    else {
+        return false;
+    };
+    let TranscriptItem::Companion {
+        spawn_event_id,
+        child_agent_id,
+        name,
+        task,
+        status,
+        rows,
+    } = existing
+    else {
+        return false;
+    };
+    if *spawn_event_id != incoming_id {
+        return false;
+    }
+    if child_agent_id.is_empty() && !incoming_child.is_empty() {
+        *child_agent_id = incoming_child;
+    }
+    if name.is_empty() && !incoming_name.is_empty() {
+        *name = incoming_name;
+    }
+    if task.is_empty() && !incoming_task.is_empty() {
+        *task = incoming_task;
+    }
+    for row in incoming_rows {
+        if !rows.contains(&row) {
+            rows.push(row);
+        }
+    }
+    if matches!(incoming_status, CompanionStatus::Done { .. }) {
+        *status = incoming_status;
+    }
+    true
+}
+
 fn patch_render_limit() -> usize {
     patch_diff::DIFF_PREVIEW_ROWS.max(patch_diff::NEW_FILE_PREVIEW_ROWS) + 1
+}
+
+fn project_agent_spawn(event: &EventEnvelope, _spawn_ts: Option<&str>) -> Option<TranscriptItem> {
+    let child_agent_id = payload_string(event, "child_agent_id").unwrap_or_default();
+    let task = payload_string(event, "task").unwrap_or_default();
+    let name = companion_display_name(event);
+    Some(TranscriptItem::Companion {
+        spawn_event_id: event.id.clone(),
+        child_agent_id,
+        name,
+        task,
+        status: CompanionStatus::Running,
+        rows: Vec::new(),
+    })
+}
+
+fn project_agent_message(event: &EventEnvelope) -> Option<TranscriptItem> {
+    let spawn_event_id = payload_string(event, "spawn_event_id")?;
+    let child_agent_id = payload_string(event, "from_agent_id").unwrap_or_default();
+    let payload = event.payload.get("payload")?;
+    let row = companion_row_from_report(payload);
+    Some(TranscriptItem::Companion {
+        spawn_event_id,
+        child_agent_id,
+        name: String::new(),
+        task: String::new(),
+        status: CompanionStatus::Running,
+        rows: vec![row],
+    })
+}
+
+fn project_agent_result(event: &EventEnvelope, spawn_ts: Option<&str>) -> Option<TranscriptItem> {
+    let spawn_event_id = payload_string(event, "spawn_event_id")
+        .or_else(|| event.parent.clone())
+        .unwrap_or_default();
+    let child_agent_id = payload_string(event, "child_agent_id").unwrap_or_default();
+    let ok = event
+        .payload
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let summary = payload_string(event, "summary").unwrap_or_default();
+    let elapsed = spawn_ts.and_then(|start| {
+        let start = parse_event_time(start)?;
+        let end = parse_event_time(&event.ts)?;
+        Some(format_elapsed(start, end))
+    });
+    let mut rows = Vec::new();
+    if let Some(output) = payload_string(event, "output").filter(|s| !s.is_empty()) {
+        rows.push(CompanionRow::Report { text: output });
+    }
+    if let Some(error) = payload_string(event, "error").filter(|s| !s.is_empty()) {
+        rows.push(CompanionRow::Report {
+            text: format!("error: {error}"),
+        });
+    }
+    Some(TranscriptItem::Companion {
+        spawn_event_id,
+        child_agent_id,
+        name: String::new(),
+        task: String::new(),
+        status: CompanionStatus::Done {
+            ok,
+            summary,
+            elapsed,
+        },
+        rows,
+    })
+}
+
+fn companion_display_name(event: &EventEnvelope) -> String {
+    payload_string(event, "persona")
+        .filter(|name| !name.is_empty())
+        .or_else(|| payload_string(event, "child_agent_id"))
+        .unwrap_or_else(|| "companion".to_owned())
+}
+
+/// Best-effort: treat report JSON with finding-like keys as finding rows.
+fn companion_row_from_report(payload: &serde_json::Value) -> CompanionRow {
+    let Some(object) = payload.as_object() else {
+        return CompanionRow::Report {
+            text: truncate_companion_text(&payload.to_string(), 160),
+        };
+    };
+    let finding_text = object
+        .get("finding")
+        .or_else(|| object.get("findings"))
+        .or_else(|| object.get("issue"))
+        .or_else(|| object.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(detail) = finding_text {
+        let label = object
+            .get("severity")
+            .or_else(|| object.get("level"))
+            .or_else(|| object.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("finding");
+        return CompanionRow::Finding {
+            label: truncate_companion_text(label, 24),
+            detail: truncate_companion_text(detail, 160),
+        };
+    }
+    let text = companion_report_summary(object);
+    CompanionRow::Report {
+        text: truncate_companion_text(&text, 160),
+    }
+}
+
+fn companion_report_summary(object: &serde_json::Map<String, serde_json::Value>) -> String {
+    const KEYS: &[&str] = &["summary", "message", "status", "progress", "note", "text"];
+    for key in KEYS {
+        if let Some(value) = object.get(*key).and_then(serde_json::Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_owned();
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    for (key, value) in object.iter().take(4) {
+        let rendered = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        if rendered.is_empty() {
+            continue;
+        }
+        parts.push(format!("{key}={rendered}"));
+    }
+    if parts.is_empty() {
+        "{…}".to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn truncate_companion_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn is_child_agent_event(event: &EventEnvelope, earlier: &[EventEnvelope]) -> bool {
+    if matches!(
+        event.kind.as_str(),
+        EventKind::AGENT_SPAWN | EventKind::AGENT_MESSAGE | EventKind::AGENT_RESULT
+    ) {
+        return false;
+    }
+    earlier.iter().any(|prior| {
+        prior.kind.as_str() == EventKind::AGENT_SPAWN
+            && prior
+                .payload
+                .get("child_agent_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(event.agent.as_str())
+    })
+}
+
+fn is_child_agent_id(agent: &str, child_agents: &HashMap<String, String>) -> bool {
+    child_agents.contains_key(agent)
+}
+
+fn companion_spawn_ts_for_result<'a>(
+    event: &EventEnvelope,
+    earlier: &'a [EventEnvelope],
+) -> Option<&'a str> {
+    if event.kind.as_str() != EventKind::AGENT_RESULT {
+        return None;
+    }
+    let spawn_id = payload_string(event, "spawn_event_id").or_else(|| event.parent.clone())?;
+    earlier
+        .iter()
+        .find(|prior| prior.id == spawn_id)
+        .map(|prior| prior.ts.as_str())
+}
+
+fn companion_spawn_ts_lookup<'a>(
+    event: &EventEnvelope,
+    spawn_times: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    if event.kind.as_str() != EventKind::AGENT_RESULT {
+        return None;
+    }
+    let spawn_id = payload_string(event, "spawn_event_id").or_else(|| event.parent.clone())?;
+    spawn_times.get(&spawn_id).map(String::as_str)
 }
 
 fn payload_string(event: &EventEnvelope, key: &str) -> Option<String> {
@@ -1000,6 +1363,19 @@ fn push_projected_entry(
             timing,
         });
         return;
+    }
+    if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
+        if let Some(entry) = entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.item.companion_spawn_event_id() == Some(spawn_event_id.as_str()))
+        {
+            let _ = merge_companion_item(&mut entry.item, item);
+            if timing.is_some() {
+                entry.timing = timing;
+            }
+            return;
+        }
     }
     entries.push(ProjectedEntry { item, timing });
 }

@@ -1,10 +1,10 @@
 use super::cells::{
     edit_failure_status, output_rows_without_trailing_blanks, push_bounded_children,
-    push_bounded_failure_children, push_cell_parent, push_child_rows, render_edit_cell,
-    render_file_change_cell, render_interrupted, render_patch_cell, render_permission_ask,
-    render_permission_decision, render_resume_boundary, render_tool_run, render_worked_duration,
-    tool_failure_status, EditRender, FileChangeRender, PatchRender, PermissionAskView,
-    ResumeBoundaryRender, ToolRunRender,
+    push_bounded_failure_children, push_cell_parent, push_child_rows, render_companion_block,
+    render_edit_cell, render_file_change_cell, render_interrupted, render_patch_cell,
+    render_permission_ask, render_permission_decision, render_resume_boundary, render_tool_run,
+    render_turn_recap, render_worked_duration, tool_failure_status, CompanionRender, EditRender,
+    FileChangeRender, PatchRender, PermissionAskView, ResumeBoundaryRender, ToolRunRender,
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
@@ -271,6 +271,7 @@ pub(super) fn render_projected_entries_with_expansion(
                 reason,
                 command,
                 scope_prefix,
+                companion_name,
             } => {
                 render_permission_ask(
                     &mut lines,
@@ -279,6 +280,7 @@ pub(super) fn render_projected_entries_with_expansion(
                         reason,
                         command: command.as_deref(),
                         scope_prefix: scope_prefix.as_deref(),
+                        companion_name: companion_name.as_deref(),
                     },
                     theme,
                     width,
@@ -444,6 +446,9 @@ pub(super) fn render_projected_entries_with_expansion(
             TranscriptItem::WorkedDuration(duration) => {
                 render_worked_duration(&mut lines, duration, theme, width);
             }
+            TranscriptItem::TurnRecap { summary, files } => {
+                render_turn_recap(&mut lines, summary, files.as_deref(), theme, width);
+            }
             TranscriptItem::ResumeBoundary {
                 label,
                 recovery_closure_appended,
@@ -457,6 +462,29 @@ pub(super) fn render_projected_entries_with_expansion(
                         recovery_closure_appended: *recovery_closure_appended,
                         warning_count: *warning_count,
                         events_replayed: *events_replayed,
+                    },
+                    theme,
+                    width,
+                );
+            }
+            TranscriptItem::Companion {
+                name,
+                task,
+                status,
+                rows,
+                ..
+            } => {
+                let expanded = expanded_artifact_keys
+                    .contains(&super::artifact_key_for_index(index))
+                    || item_limits.output_lines == usize::MAX;
+                render_companion_block(
+                    &mut lines,
+                    CompanionRender {
+                        name,
+                        task,
+                        status,
+                        rows,
+                        expanded,
                     },
                     theme,
                     width,
@@ -510,6 +538,7 @@ fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
         TranscriptItem::Banner { .. }
             | TranscriptItem::TurnSeparator
             | TranscriptItem::WorkedDuration(_)
+            | TranscriptItem::TurnRecap { .. }
             | TranscriptItem::PermissionAsk { .. }
     )
 }

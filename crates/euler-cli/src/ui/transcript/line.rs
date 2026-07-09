@@ -70,9 +70,59 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::SessionSummary(summary) => format!("session.summary: {summary}\n"),
         super::TranscriptItem::Interrupted => "interrupted\n".to_owned(),
         super::TranscriptItem::WorkedDuration(duration) => format!("worked: {duration}\n"),
+        super::TranscriptItem::TurnRecap { summary, files } => {
+            line_oriented_turn_recap(summary, files.as_deref())
+        }
         super::TranscriptItem::ResumeBoundary { .. } => line_oriented_resume_boundary(item),
+        super::TranscriptItem::Companion { .. } => line_oriented_companion(item),
         super::TranscriptItem::Error { source, message } => format!("error: {source}: {message}\n"),
     }
+}
+
+fn line_oriented_turn_recap(summary: &str, files: Option<&str>) -> String {
+    match files {
+        Some(files) => format!("turn.recap: {summary}\nturn.recap.files: {files}\n"),
+        None => format!("turn.recap: {summary}\n"),
+    }
+}
+
+fn line_oriented_companion(item: &super::TranscriptItem) -> String {
+    let super::TranscriptItem::Companion {
+        name,
+        task,
+        status,
+        rows,
+        ..
+    } = item
+    else {
+        return String::new();
+    };
+    let mut out = match status {
+        super::CompanionStatus::Running => format!("companion: {name} running · {task}\n"),
+        super::CompanionStatus::Done {
+            ok,
+            summary,
+            elapsed,
+        } => {
+            let state = if *ok { "done" } else { "failed" };
+            let elapsed = elapsed
+                .as_deref()
+                .map(|value| format!(" {value}"))
+                .unwrap_or_default();
+            format!("companion: {name} {state}{elapsed} · {summary}\n")
+        }
+    };
+    for row in rows {
+        match row {
+            super::CompanionRow::Finding { label, detail } => {
+                out.push_str(&format!("  finding [{label}]: {detail}\n"));
+            }
+            super::CompanionRow::Report { text } => {
+                out.push_str(&format!("  report: {text}\n"));
+            }
+        }
+    }
+    out
 }
 
 fn line_oriented_check_result(name: &str, ok: bool) -> String {

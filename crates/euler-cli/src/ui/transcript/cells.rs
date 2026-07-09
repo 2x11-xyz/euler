@@ -265,6 +265,7 @@ pub(super) struct PermissionAskView<'a> {
     pub(super) reason: &'a str,
     pub(super) command: Option<&'a str>,
     pub(super) scope_prefix: Option<&'a str>,
+    pub(super) companion_name: Option<&'a str>,
 }
 
 pub(super) fn render_permission_ask(
@@ -278,8 +279,15 @@ pub(super) fn render_permission_ask(
         .filter(|command| !command.is_empty())
         .map(|command| format!("command: $ {command}"))
         .unwrap_or_else(|| format!("request: {}", ask.reason));
+    let title = match ask.companion_name.filter(|name| !name.is_empty()) {
+        Some(name) => format!(
+            "Approval required · {} {name}",
+            crate::ui::glyphs::companion_glyph()
+        ),
+        None => "Approval required".to_owned(),
+    };
     let mut rows = vec![
-        "Approval required".to_owned(),
+        title,
         format!("{} · cwd {}", ask.capability, current_cwd_label()),
         preview,
         consequences_row(ask.capability),
@@ -382,6 +390,39 @@ pub(super) fn render_worked_duration(
     lines.push(Line::from(Span::styled(line, theme.transcript.muted)));
 }
 
+pub(super) fn render_turn_recap(
+    lines: &mut Vec<Line<'static>>,
+    summary: &str,
+    files: Option<&str>,
+    theme: &Theme,
+    width: u16,
+) {
+    push_wrapped_with_prefix(
+        lines,
+        CellPrefixes {
+            first: blank_gutter(),
+            next: blank_gutter(),
+        },
+        summary,
+        theme.transcript.muted,
+        theme,
+        width,
+    );
+    if let Some(files) = files.filter(|f| !f.is_empty()) {
+        push_wrapped_with_prefix(
+            lines,
+            CellPrefixes {
+                first: blank_gutter(),
+                next: blank_gutter(),
+            },
+            files,
+            theme.transcript.gutter,
+            theme,
+            width,
+        );
+    }
+}
+
 pub(super) struct ResumeBoundaryRender<'a> {
     pub(super) label: &'a str,
     pub(super) recovery_closure_appended: bool,
@@ -402,6 +443,231 @@ pub(crate) fn resume_boundary_decision_text(
         decision.push_str(&format!(" · {warning_count} warnings"));
     }
     decision
+}
+
+pub(super) struct CompanionRender<'a> {
+    pub(super) name: &'a str,
+    pub(super) task: &'a str,
+    pub(super) status: &'a super::CompanionStatus,
+    pub(super) rows: &'a [super::CompanionRow],
+    pub(super) expanded: bool,
+}
+
+/// Max nested report/finding rows shown while a companion is still running.
+const COMPANION_RUNNING_VISIBLE_ROWS: usize = 2;
+
+pub(super) fn render_companion_block(
+    lines: &mut Vec<Line<'static>>,
+    companion: CompanionRender<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    let glyph = crate::ui::glyphs::companion_glyph();
+    let name = if companion.name.is_empty() {
+        "companion"
+    } else {
+        companion.name
+    };
+    match companion.status {
+        super::CompanionStatus::Running => {
+            render_companion_running(
+                lines,
+                CompanionRunningRender {
+                    glyph,
+                    name,
+                    task: companion.task,
+                    rows: companion.rows,
+                },
+                theme,
+                width,
+            );
+        }
+        super::CompanionStatus::Done {
+            ok,
+            summary,
+            elapsed,
+        } => {
+            render_companion_done(
+                lines,
+                CompanionDoneRender {
+                    glyph,
+                    name,
+                    task: companion.task,
+                    ok: *ok,
+                    summary,
+                    elapsed: elapsed.as_deref().unwrap_or("0s"),
+                    rows: companion.rows,
+                    expanded: companion.expanded,
+                },
+                theme,
+                width,
+            );
+        }
+    }
+}
+
+struct CompanionRunningRender<'a> {
+    glyph: &'a str,
+    name: &'a str,
+    task: &'a str,
+    rows: &'a [super::CompanionRow],
+}
+
+fn render_companion_running(
+    lines: &mut Vec<Line<'static>>,
+    running: CompanionRunningRender<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    let header = if running.task.is_empty() {
+        format!("{} {} ⠧", running.glyph, running.name)
+    } else {
+        format!("{} {} ⠧ · {}", running.glyph, running.name, running.task)
+    };
+    push_companion_rail_line(lines, &header, theme.transcript.companion, theme, width);
+    push_companion_rail_line(
+        lines,
+        "own ledger · own permission scope",
+        theme.transcript.muted,
+        theme,
+        width,
+    );
+    let skip = running
+        .rows
+        .len()
+        .saturating_sub(COMPANION_RUNNING_VISIBLE_ROWS);
+    if skip > 0 {
+        push_companion_rail_line(
+            lines,
+            &format!("… {skip} earlier reports folded"),
+            theme.transcript.muted,
+            theme,
+            width,
+        );
+    }
+    for row in running.rows.iter().skip(skip) {
+        push_companion_row(lines, row, theme, width);
+    }
+}
+
+struct CompanionDoneRender<'a> {
+    glyph: &'a str,
+    name: &'a str,
+    task: &'a str,
+    ok: bool,
+    summary: &'a str,
+    elapsed: &'a str,
+    rows: &'a [super::CompanionRow],
+    expanded: bool,
+}
+
+fn render_companion_done(
+    lines: &mut Vec<Line<'static>>,
+    done: CompanionDoneRender<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    let findings = done
+        .rows
+        .iter()
+        .filter(|row| matches!(row, super::CompanionRow::Finding { .. }))
+        .count();
+    let state = if done.ok { "done" } else { "failed" };
+    let findings_part = if findings > 0 {
+        format!(" · {findings} findings")
+    } else if !done.rows.is_empty() {
+        format!(" · {} reports", done.rows.len())
+    } else {
+        String::new()
+    };
+    if done.expanded {
+        let header = format!(
+            "{} {} · {state} {}{findings_part}",
+            done.glyph, done.name, done.elapsed
+        );
+        push_companion_rail_line(lines, &header, theme.transcript.companion, theme, width);
+        if !done.task.is_empty() {
+            push_companion_rail_line(
+                lines,
+                &format!("task · {}", done.task),
+                theme.transcript.muted,
+                theme,
+                width,
+            );
+        }
+        for row in done.rows {
+            push_companion_row(lines, row, theme, width);
+        }
+        if !done.summary.is_empty() {
+            push_companion_rail_line(
+                lines,
+                &format!("summary · {}", done.summary),
+                theme.transcript.muted,
+                theme,
+                width,
+            );
+        }
+        push_companion_rail_line(
+            lines,
+            "ctrl+o collapse",
+            theme.transcript.muted,
+            theme,
+            width,
+        );
+    } else {
+        let summary_part = if done.summary.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", done.summary)
+        };
+        let line = format!(
+            "{} {} · {state} {}{findings_part}{summary_part} · ctrl+o expand",
+            done.glyph, done.name, done.elapsed
+        );
+        push_companion_rail_line(lines, &line, theme.transcript.companion, theme, width);
+    }
+}
+
+fn push_companion_row(
+    lines: &mut Vec<Line<'static>>,
+    row: &super::CompanionRow,
+    theme: &Theme,
+    width: u16,
+) {
+    match row {
+        super::CompanionRow::Finding { label, detail } => {
+            let text = if detail.is_empty() {
+                format!("finding · {label}")
+            } else {
+                format!("finding · {label}: {detail}")
+            };
+            push_companion_rail_line(lines, &text, theme.transcript.warning, theme, width);
+        }
+        super::CompanionRow::Report { text } => {
+            push_companion_rail_line(lines, text, theme.transcript.muted, theme, width);
+        }
+    }
+}
+
+fn push_companion_rail_line(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    style: ratatui::style::Style,
+    theme: &Theme,
+    width: u16,
+) {
+    let rail = crate::ui::glyphs::companion_rail_prefix();
+    let content_cols = content_width(width)
+        .saturating_sub(display_width(rail))
+        .max(1);
+    for (index, segment) in wrap_text(text, content_cols).into_iter().enumerate() {
+        let prefix = if index == 0 { rail } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
+            Span::styled(prefix.to_owned(), theme.transcript.companion),
+            Span::styled(segment, style),
+        ]));
+    }
 }
 
 pub(super) fn render_resume_boundary(

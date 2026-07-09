@@ -319,6 +319,7 @@ fn finalized_batch_needs_trailing_rhythm(items: &[TranscriptItem]) -> bool {
             TranscriptItem::UserMessage(_)
                 | TranscriptItem::AssistantMessage(_)
                 | TranscriptItem::WorkedDuration(_)
+                | TranscriptItem::TurnRecap { .. }
         )
     )
 }

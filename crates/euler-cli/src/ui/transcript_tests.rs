@@ -3007,3 +3007,323 @@ fn artifact_border_expected_style(theme: &Theme) -> Style {
         .tool
         .bg(theme.surfaces.transcript.background)
 }
+
+#[test]
+fn projects_agent_spawn_message_result_into_companion_block() {
+    let mut spawn = event(
+        EventKind::AGENT_SPAWN,
+        object([
+            ("child_agent_id", "agent-child".into()),
+            ("task", "review the patch".into()),
+            ("persona", "reviewer".into()),
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("capabilities", serde_json::json!([])),
+            ("budget", serde_json::json!({})),
+        ]),
+    );
+    spawn.id = "spawn-1".to_owned();
+    spawn.ts = "2026-07-09T12:00:00.000Z".to_owned();
+
+    let message = event(
+        EventKind::AGENT_MESSAGE,
+        object([
+            ("from_agent_id", "agent-child".into()),
+            ("to_agent_id", "agent".into()),
+            ("spawn_event_id", "spawn-1".into()),
+            ("queued_ts", "2026-07-09T12:00:30.000Z".into()),
+            (
+                "payload",
+                serde_json::json!({"finding": "missing test", "severity": "high"}),
+            ),
+        ]),
+    );
+
+    let mut result = event(
+        EventKind::AGENT_RESULT,
+        object([
+            ("child_agent_id", "agent-child".into()),
+            ("spawn_event_id", "spawn-1".into()),
+            ("ok", true.into()),
+            ("summary", "review complete".into()),
+            ("output", "ship it with a test".into()),
+        ]),
+    );
+    result.ts = "2026-07-09T12:01:04.000Z".to_owned();
+
+    let items = project_events(&[spawn, message, result]);
+    assert_eq!(items.len(), 1, "items: {items:?}");
+    match &items[0] {
+        TranscriptItem::Companion {
+            name,
+            task,
+            status,
+            rows,
+            spawn_event_id,
+            ..
+        } => {
+            assert_eq!(spawn_event_id, "spawn-1");
+            assert_eq!(name, "reviewer");
+            assert_eq!(task, "review the patch");
+            assert!(
+                matches!(
+                    status,
+                    super::transcript::CompanionStatus::Done {
+                        ok: true,
+                        summary,
+                        elapsed: Some(elapsed),
+                    } if summary == "review complete" && elapsed == "1m 04s"
+                ),
+                "status: {status:?}"
+            );
+            assert!(
+                rows.iter().any(|row| matches!(
+                    row,
+                    super::transcript::CompanionRow::Finding { label, detail }
+                        if label == "high" && detail.contains("missing test")
+                )),
+                "rows: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|row| matches!(
+                    row,
+                    super::transcript::CompanionRow::Report { text }
+                        if text.contains("ship it")
+                )),
+                "rows: {rows:?}"
+            );
+        }
+        other => panic!("expected Companion, got {other:?}"),
+    }
+}
+
+#[test]
+fn companion_block_collapses_by_default_and_expands_with_ctrl_o_key() {
+    let item = TranscriptItem::Companion {
+        spawn_event_id: "spawn-1".to_owned(),
+        child_agent_id: "agent-child".to_owned(),
+        name: "reviewer".to_owned(),
+        task: "review".to_owned(),
+        status: super::transcript::CompanionStatus::Done {
+            ok: true,
+            summary: "ok".to_owned(),
+            elapsed: Some("1m 04s".to_owned()),
+        },
+        rows: vec![
+            super::transcript::CompanionRow::Finding {
+                label: "high".to_owned(),
+                detail: "missing test".to_owned(),
+            },
+            super::transcript::CompanionRow::Report {
+                text: "progress=50".to_owned(),
+            },
+        ],
+    };
+    assert!(item.is_foldable_artifact(DEFAULT_OUTPUT_LIMIT_LINES));
+
+    let theme = Theme::default();
+    let collapsed = line_texts(&render_items_for_history(
+        std::slice::from_ref(&item),
+        &theme,
+        100,
+    ))
+    .join("\n");
+    assert!(
+        collapsed.contains("◆ reviewer · done 1m 04s · 1 findings"),
+        "collapsed: {collapsed:?}"
+    );
+    assert!(
+        collapsed.contains("ctrl+o expand"),
+        "collapsed: {collapsed:?}"
+    );
+    assert!(
+        !collapsed.contains("missing test"),
+        "collapsed should hide findings: {collapsed:?}"
+    );
+
+    let mut expanded_keys = std::collections::HashSet::new();
+    expanded_keys.insert(super::transcript::artifact_key_for_index(0));
+    let expanded = line_texts(&super::transcript::render_items_for_history_with_expansion(
+        &[item],
+        &theme,
+        100,
+        DEFAULT_OUTPUT_LIMIT_LINES,
+        &expanded_keys,
+    ))
+    .join("\n");
+    assert!(expanded.contains("missing test"), "expanded: {expanded:?}");
+    assert!(
+        expanded.contains("ctrl+o collapse"),
+        "expanded: {expanded:?}"
+    );
+}
+
+#[test]
+fn companion_running_header_and_finding_rows_use_teal_rail() {
+    let item = TranscriptItem::Companion {
+        spawn_event_id: "spawn-1".to_owned(),
+        child_agent_id: "agent-child".to_owned(),
+        name: "reviewer".to_owned(),
+        task: "review the patch".to_owned(),
+        status: super::transcript::CompanionStatus::Running,
+        rows: vec![
+            super::transcript::CompanionRow::Report {
+                text: "older progress".to_owned(),
+            },
+            super::transcript::CompanionRow::Report {
+                text: "mid progress".to_owned(),
+            },
+            super::transcript::CompanionRow::Finding {
+                label: "high".to_owned(),
+                detail: "race condition".to_owned(),
+            },
+        ],
+    };
+    let theme = Theme::default();
+    let lines = render_items_for_history(&[item], &theme, 100);
+    let joined = line_texts(&lines).join("\n");
+    assert!(
+        joined.contains("◆ reviewer ⠧ · review the patch"),
+        "joined: {joined:?}"
+    );
+    assert!(
+        joined.contains("own ledger · own permission scope"),
+        "joined: {joined:?}"
+    );
+    assert!(
+        joined.contains("… 1 earlier reports folded"),
+        "joined: {joined:?}"
+    );
+    assert!(!joined.contains("older progress"), "joined: {joined:?}");
+    assert!(joined.contains("mid progress"), "joined: {joined:?}");
+    assert!(joined.contains("race condition"), "joined: {joined:?}");
+    assert!(
+        lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.content.contains('\u{258c}') && span.style.fg == theme.transcript.companion.fg
+            })
+        }),
+        "expected teal companion rail: {lines:?}"
+    );
+}
+
+#[test]
+fn child_agent_tool_events_are_suppressed_from_main_ledger() {
+    let mut spawn = event(
+        EventKind::AGENT_SPAWN,
+        object([
+            ("child_agent_id", "agent-child".into()),
+            ("task", "review".into()),
+            ("persona", "reviewer".into()),
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("capabilities", serde_json::json!([])),
+            ("budget", serde_json::json!({})),
+        ]),
+    );
+    spawn.id = "spawn-1".to_owned();
+
+    let mut child_tool = tool_call("call-1", "read_file", serde_json::json!({"path": "a.rs"}));
+    child_tool.agent = "agent-child".to_owned();
+    let mut child_result = event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-1".into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+            ("output", "fn main() {}".into()),
+        ]),
+    );
+    child_result.agent = "agent-child".to_owned();
+
+    let mut result = event(
+        EventKind::AGENT_RESULT,
+        object([
+            ("child_agent_id", "agent-child".into()),
+            ("spawn_event_id", "spawn-1".into()),
+            ("ok", true.into()),
+            ("summary", "done".into()),
+        ]),
+    );
+    result.parent = Some("spawn-1".to_owned());
+
+    let mut state = TranscriptState::default();
+    for event in [spawn, child_tool, child_result, result] {
+        state.push_event(event);
+    }
+    let items = state.items();
+    assert!(
+        items.iter().all(|item| !matches!(
+            item,
+            TranscriptItem::ToolCall { .. }
+                | TranscriptItem::ToolResult { .. }
+                | TranscriptItem::Exploration { .. }
+                | TranscriptItem::ToolRun { .. }
+        )),
+        "child tools leaked: {items:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Companion { .. })),
+        "missing companion: {items:?}"
+    );
+}
+
+#[test]
+fn concurrent_companions_remain_separate_blocks() {
+    let mut spawn_a = event(
+        EventKind::AGENT_SPAWN,
+        object([
+            ("child_agent_id", "child-a".into()),
+            ("task", "task-a".into()),
+            ("persona", "alpha".into()),
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("capabilities", serde_json::json!([])),
+            ("budget", serde_json::json!({})),
+        ]),
+    );
+    spawn_a.id = "spawn-a".to_owned();
+    let mut spawn_b = event(
+        EventKind::AGENT_SPAWN,
+        object([
+            ("child_agent_id", "child-b".into()),
+            ("task", "task-b".into()),
+            ("persona", "beta".into()),
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("capabilities", serde_json::json!([])),
+            ("budget", serde_json::json!({})),
+        ]),
+    );
+    spawn_b.id = "spawn-b".to_owned();
+    let result_a = event(
+        EventKind::AGENT_RESULT,
+        object([
+            ("child_agent_id", "child-a".into()),
+            ("spawn_event_id", "spawn-a".into()),
+            ("ok", true.into()),
+            ("summary", "a done".into()),
+        ]),
+    );
+    let result_b = event(
+        EventKind::AGENT_RESULT,
+        object([
+            ("child_agent_id", "child-b".into()),
+            ("spawn_event_id", "spawn-b".into()),
+            ("ok", true.into()),
+            ("summary", "b done".into()),
+        ]),
+    );
+
+    let items = project_events(&[spawn_a, spawn_b, result_a, result_b]);
+    assert_eq!(items.len(), 2, "items: {items:?}");
+    match (&items[0], &items[1]) {
+        (TranscriptItem::Companion { name: a, .. }, TranscriptItem::Companion { name: b, .. }) => {
+            assert_eq!(a, "alpha");
+            assert_eq!(b, "beta");
+        }
+        other => panic!("expected two companions: {other:?}"),
+    }
+}

@@ -1111,12 +1111,14 @@ fn final_completion_collapses_live_viewport_without_blank_gap() {
     let rows = terminal.backend().screen_rows();
     let final_answer = row_containing(&rows, "final answer");
     let worked = row_containing(&rows, "Worked for 41s");
+    let recap = row_containing(&rows, "0 files · ctx");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
     assert!(final_answer < worked, "rows: {rows:?}");
+    assert!(worked < recap, "recap follows worked-for, rows: {rows:?}");
     assert!(
-        prompt.saturating_sub(worked) <= 4,
-        "final worked row should be adjacent to prompt/status, rows: {rows:?}"
+        prompt.saturating_sub(recap) <= 4,
+        "final recap row should be adjacent to prompt/status, rows: {rows:?}"
     );
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
     assert_eq!(status, prompt + 2, "rows: {rows:?}");
@@ -1846,4 +1848,52 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
             .any(|row| row.contains("exit 0 · 14 lines")),
         "tool footer reappears after first interruption notice: {durable:?}"
     );
+}
+
+#[test]
+fn turn_end_recap_follows_worked_duration_with_files_and_ctx() {
+    let mut core = core();
+    core.drain_finalized_visual_lines(72);
+    core.turn_event_start = 0;
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::FILE_DIFF,
+        object([
+            ("path", "src/lib.rs".into()),
+            ("diff", "--- a\n+++ b\n@@\n-old\n+new\n+extra\n".into()),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "edited".into())]),
+    )));
+    core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(8)));
+    let text = drain_finalized_visual_text(&mut core, 72);
+    assert!(text.contains("Worked for 8s"), "{text}");
+    assert!(text.contains("1 file · +2 −1 · ctx ?%"), "{text}");
+    assert!(text.contains("src/lib.rs"), "{text}");
+}
+
+#[test]
+fn notifications_only_queue_when_unfocused_and_enabled() {
+    let mut core = core();
+    core.queue_notification(super::super::notify::NotifyEvent::TurnDone);
+    assert!(core.take_pending_notification().is_none());
+    core.set_terminal_focused(false);
+    core.queue_notification(super::super::notify::NotifyEvent::TurnDone);
+    assert_eq!(
+        core.take_pending_notification(),
+        Some(super::super::notify::NotifyEvent::TurnDone)
+    );
+    core.notifications_enabled = false;
+    core.queue_notification(super::super::notify::NotifyEvent::Failure);
+    assert!(core.take_pending_notification().is_none());
+}
+
+#[test]
+fn exit_recap_is_bounded_and_copy_ready() {
+    let core = core();
+    let lines = core.exit_recap_lines();
+    assert!(lines.len() <= 5);
+    assert!(lines[1].text().contains("euler --resume"));
+    assert!(lines[2].is_faint());
 }

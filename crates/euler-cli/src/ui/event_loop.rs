@@ -22,6 +22,7 @@ pub enum UiEvent {
     Input(InputEvent),
     RenderRequested(Region, RedrawLevel),
     Resize { width: u16, height: u16 },
+    FocusChanged(bool),
     Signal(TerminalSignal),
     Tick,
 }
@@ -31,6 +32,7 @@ pub enum UiAction {
     InputBatch(Vec<InputEvent>),
     Render(DirtyRegions),
     Resize { width: u16, height: u16 },
+    FocusChanged(bool),
     InterruptCurrentTurn,
     Shutdown,
 }
@@ -66,6 +68,7 @@ pub struct EventLoop {
     dirty: DirtyRegions,
     pending_input: Vec<InputEvent>,
     pending_resize: Option<(u16, u16)>,
+    pending_focus: Option<bool>,
     pending_interrupt: bool,
     pending_shutdown: bool,
 }
@@ -82,6 +85,7 @@ impl EventLoop {
             dirty: DirtyRegions::new(),
             pending_input: Vec::new(),
             pending_resize: None,
+            pending_focus: None,
             pending_interrupt: false,
             pending_shutdown: false,
         }
@@ -97,6 +101,9 @@ impl EventLoop {
             UiEvent::Resize { width, height } => {
                 self.pending_resize = Some((width, height));
                 self.dirty.mark_resize();
+            }
+            UiEvent::FocusChanged(focused) => {
+                self.pending_focus = Some(focused);
             }
             UiEvent::Signal(TerminalSignal::Interrupt) => {
                 self.pending_interrupt = true;
@@ -116,6 +123,7 @@ impl EventLoop {
             self.pending_interrupt = false;
             self.pending_input.clear();
             self.pending_resize = None;
+            self.pending_focus = None;
             let _ = self.dirty.take();
             self.next_frame_at = now + self.frame_interval;
             actions.push(UiAction::Shutdown);
@@ -125,6 +133,10 @@ impl EventLoop {
         if self.pending_interrupt {
             self.pending_interrupt = false;
             actions.push(UiAction::InterruptCurrentTurn);
+        }
+
+        if let Some(focused) = self.pending_focus.take() {
+            actions.push(UiAction::FocusChanged(focused));
         }
 
         if !self.pending_input.is_empty() {
@@ -154,6 +166,7 @@ impl EventLoop {
     pub fn poll_timeout(&self, now: Instant) -> Duration {
         if self.pending_shutdown
             || self.pending_interrupt
+            || self.pending_focus.is_some()
             || !self.pending_input.is_empty()
             || self.pending_resize.is_some()
         {

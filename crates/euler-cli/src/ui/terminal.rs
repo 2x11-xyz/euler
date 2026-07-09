@@ -2,8 +2,8 @@ use anyhow::{anyhow, bail, Result};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute, queue,
     style::{
@@ -232,6 +232,7 @@ fn enable_terminal_session_modes(output: &mut impl Write) -> io::Result<()> {
     execute!(
         output,
         EnableBracketedPaste,
+        EnableFocusChange,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         Hide
     )
@@ -241,6 +242,7 @@ fn restore_terminal_session_modes(output: &mut impl Write) -> io::Result<()> {
     execute!(
         output,
         PopKeyboardEnhancementFlags,
+        DisableFocusChange,
         DisableBracketedPaste,
         Show
     )?;

@@ -468,6 +468,8 @@ pub struct TranscriptTheme {
     pub changed: Style,
     pub warning: Style,
     pub error: Style,
+    /// Read/reference/companion role (teal rail + companion headers).
+    pub companion: Style,
 }
 
 #[allow(dead_code)]
@@ -502,6 +504,8 @@ impl TranscriptTheme {
             error: Style::default()
                 .fg(palette.error)
                 .add_modifier(Modifier::BOLD),
+            // Companion/read role reuses the tool/teal hue (semantic read/reference).
+            companion: Style::default().fg(palette.tool),
         }
     }
 }

@@ -63,6 +63,8 @@ pub(super) fn read_terminal_event() -> Result<Option<UiEvent>> {
         CrosstermEvent::Mouse(mouse) => Some(UiEvent::Input(InputEvent::Mouse(mouse))),
         CrosstermEvent::Paste(text) => Some(UiEvent::Input(InputEvent::Paste(text))),
         CrosstermEvent::Resize(width, height) => Some(UiEvent::Resize { width, height }),
+        CrosstermEvent::FocusGained => Some(UiEvent::FocusChanged(true)),
+        CrosstermEvent::FocusLost => Some(UiEvent::FocusChanged(false)),
         _ => None,
     };
     Ok(event)

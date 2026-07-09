@@ -1,3 +1,4 @@
+use self::notify::{NotifyEvent, STALL_THRESHOLD};
 #[cfg(test)]
 use super::app_layout::{layout, string_lines};
 use super::bottom_surface::{BottomOwner, BottomSurface, SurfaceEvent};
@@ -59,7 +60,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -89,10 +90,12 @@ fn is_slash_command_key(key: &KeyEvent) -> bool {
 #[cfg(test)]
 #[path = "app/chrome_test.rs"]
 mod chrome;
+mod notify;
 #[cfg(test)]
 #[path = "app/render_tests_support_test.rs"]
 mod render_tests_support;
 mod support;
+mod turn_recap;
 mod visual;
 
 #[cfg(test)]
@@ -118,6 +121,8 @@ pub struct AppOptions {
     /// When false, the timestamp gutter column is hidden (content widens).
     /// Defaults to true when unset.
     pub show_timestamp_gutter: Option<bool>,
+    /// When false, OS notifications are suppressed. Defaults to true when unset.
+    pub notifications_enabled: Option<bool>,
     pub model_catalog: Option<MergedModelCatalog>,
     pub session_store: Option<SessionStore>,
     pub extensions: ExtensionSelection,
@@ -164,9 +169,17 @@ pub struct AppCore {
     /// Empty-composer ghost override (deny-with-instruction empty path).
     empty_composer_ghost: Option<&'static str>,
     in_flight_label: Option<String>,
+    /// Persona/name of the in-flight companion run, for approval panel tagging.
+    in_flight_companion_name: Option<String>,
     in_flight_cancellable: bool,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
+    turn_event_start: usize,
+    last_turn_activity_at: Option<Instant>,
+    stall_notified: bool,
+    terminal_focused: bool,
+    notifications_enabled: bool,
+    pending_notifications: VecDeque<NotifyEvent>,
 }
 
 enum AppState {
@@ -317,6 +330,14 @@ impl App {
         if self.core.drain_background() || self.core.mark_working_timer_dirty() {
             self.request_render(RedrawLevel::Full);
         }
+        self.emit_pending_notifications();
+    }
+
+    fn emit_pending_notifications(&mut self) {
+        while let Some(event) = self.core.take_pending_notification() {
+            let sequence = self::notify::notification_sequence(event);
+            let _ = self.terminal.write_terminal_sequence(&sequence);
+        }
     }
 
     fn poll_timeout(&self) -> Duration {
@@ -384,6 +405,10 @@ impl App {
             UiAction::InputBatch(inputs) => self.handle_input_batch(inputs),
             UiAction::InterruptCurrentTurn => self.core.handle_terminal_interrupt(),
             UiAction::Shutdown => return self.shutdown(),
+            UiAction::FocusChanged(focused) => {
+                self.core.set_terminal_focused(focused);
+                CoreEffect::None
+            }
             UiAction::Resize { .. } => {
                 metrics::record(metrics::Metric::ResizeAction);
                 CoreEffect::ReplayHistoryWithScrollbackPurge
@@ -451,11 +476,14 @@ impl App {
     }
 
     fn shutdown(&mut self) -> Result<bool> {
-        if self.core.turn_in_flight() {
+        let hard_exit = self.core.turn_in_flight();
+        if hard_exit {
             self.core.deny_open_modal();
-            // run_turn is synchronous. Hard-exit instead of joining an
-            // in-flight provider call that may not return.
-            terminal::restore_terminal();
+        }
+        let lines = self.core.exit_recap_lines();
+        terminal::restore_terminal();
+        print_exit_recap_lines(&lines);
+        if hard_exit {
             std::process::exit(0);
         }
         Ok(true)
@@ -512,6 +540,86 @@ fn set_terminal_theme_colors(terminal: &mut CrosstermTerminal, core: &AppCore) -
     )
 }
 
+fn print_exit_recap_lines(lines: &[self::turn_recap::ExitRecapLine]) {
+    let stdout_tty = io::stdout().is_terminal();
+    for line in lines {
+        if line.is_faint() && stdout_tty {
+            let _ = writeln!(io::stdout(), "\x1b[2m{}\x1b[0m", line.text());
+        } else {
+            let _ = writeln!(io::stdout(), "{}", line.text());
+        }
+    }
+    let _ = io::stdout().flush();
+}
+
+struct AppCoreBootstrap {
+    session_id: String,
+    theme_choice: ThemeChoice,
+    theme_preference_path: Option<PathBuf>,
+    show_timestamp_gutter: bool,
+    notifications_enabled: bool,
+    model_catalog: MergedModelCatalog,
+    session_store: Option<SessionStore>,
+    extensions: ExtensionSelection,
+    observe: ObserveOptions,
+    active_session_home_managed: bool,
+    theme: Theme,
+    status: StatusSnapshot,
+    initial_context: super::commands::CommandContext,
+}
+
+fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> AppCoreBootstrap {
+    let target = session.active_target().clone();
+    let reasoning_effort = session.reasoning_effort();
+    let session_id = session.session_id().to_owned();
+    let cwd = session_root_status_path();
+    let AppOptions {
+        theme_choice,
+        theme_preference_path,
+        show_timestamp_gutter,
+        notifications_enabled,
+        model_catalog,
+        session_store,
+        extensions,
+        observe,
+        ..
+    } = options;
+    let show_timestamp_gutter = show_timestamp_gutter.unwrap_or(true);
+    let notifications_enabled = notifications_enabled.unwrap_or(true);
+    let active_session_home_managed = session_store.is_some();
+    let model_catalog = model_catalog.unwrap_or_else(|| {
+        crate::model_catalog::load_model_catalog(
+            crate::model_catalog::default_model_catalog_path().as_deref(),
+        )
+        .catalog
+    });
+    let theme = Theme::for_choice(theme_choice);
+    let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
+    status.session_id = Some(session_id.clone());
+    status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+    let initial_context = command_context(
+        &model_catalog,
+        &target.provider,
+        &target.model,
+        empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
+    );
+    AppCoreBootstrap {
+        session_id,
+        theme_choice,
+        theme_preference_path,
+        show_timestamp_gutter,
+        notifications_enabled,
+        model_catalog,
+        session_store,
+        extensions,
+        observe,
+        active_session_home_managed,
+        theme,
+        status,
+        initial_context,
+    }
+}
+
 impl AppCore {
     #[cfg(test)]
     pub fn new(session: Session<TuiDecider>, channels: PermissionChannels) -> Self {
@@ -523,38 +631,22 @@ impl AppCore {
         channels: PermissionChannels,
         options: AppOptions,
     ) -> Self {
-        let target = session.active_target().clone();
-        let reasoning_effort = session.reasoning_effort();
-        let session_id = session.session_id().to_owned();
-        let cwd = session_root_status_path();
-        let AppOptions {
+        let boot = bootstrap_app_core(&session, options);
+        let AppCoreBootstrap {
+            session_id,
             theme_choice,
             theme_preference_path,
             show_timestamp_gutter,
+            notifications_enabled,
             model_catalog,
             session_store,
             extensions,
             observe,
-            ..
-        } = options;
-        let show_timestamp_gutter = show_timestamp_gutter.unwrap_or(true);
-        let active_session_home_managed = session_store.is_some();
-        let model_catalog = model_catalog.unwrap_or_else(|| {
-            crate::model_catalog::load_model_catalog(
-                crate::model_catalog::default_model_catalog_path().as_deref(),
-            )
-            .catalog
-        });
-        let theme = Theme::for_choice(theme_choice);
-        let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
-        status.session_id = Some(session_id.clone());
-        status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
-        let initial_context = command_context(
-            &model_catalog,
-            &target.provider,
-            &target.model,
-            empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
-        );
+            active_session_home_managed,
+            theme,
+            status,
+            initial_context,
+        } = boot;
         Self {
             state: AppState::Idle {
                 session: Box::new(session),
@@ -595,9 +687,16 @@ impl AppCore {
             queue_auto_flush_paused: false,
             empty_composer_ghost: None,
             in_flight_label: None,
+            in_flight_companion_name: None,
             in_flight_cancellable: false,
             extensions,
             observe,
+            turn_event_start: 0,
+            last_turn_activity_at: None,
+            stall_notified: false,
+            terminal_focused: true,
+            notifications_enabled,
+            pending_notifications: VecDeque::new(),
         }
     }
 
@@ -761,7 +860,71 @@ impl AppCore {
             changed = true;
             self.handle_turn_event(event);
         }
+        self.check_stall_notification();
         changed
+    }
+
+    pub fn set_terminal_focused(&mut self, focused: bool) {
+        self.terminal_focused = focused;
+    }
+
+    pub fn take_pending_notification(&mut self) -> Option<NotifyEvent> {
+        self.pending_notifications.pop_front()
+    }
+
+    fn queue_notification(&mut self, event: NotifyEvent) {
+        if !self.notifications_enabled || self.terminal_focused {
+            return;
+        }
+        if self.pending_notifications.back() == Some(&event) {
+            return;
+        }
+        self.pending_notifications.push_back(event);
+    }
+
+    fn note_turn_activity(&mut self) {
+        self.last_turn_activity_at = Some(Instant::now());
+        self.stall_notified = false;
+    }
+
+    fn check_stall_notification(&mut self) {
+        if !self.turn_in_flight() || self.stall_notified {
+            return;
+        }
+        let Some(last) = self.last_turn_activity_at else {
+            return;
+        };
+        if last.elapsed() < STALL_THRESHOLD {
+            return;
+        }
+        self.stall_notified = true;
+        self.queue_notification(NotifyEvent::Stall);
+    }
+
+    fn push_turn_recap(&mut self) {
+        let ctx = self::turn_recap::ctx_percent(
+            self.token_usage.input_tokens,
+            self.token_usage.context_window_tokens,
+        );
+        let recap = self::turn_recap::turn_recap_from_events(
+            self.transcript.events(),
+            self.turn_event_start,
+            ctx,
+        );
+        self.push_finalized_visual_item(TranscriptItem::TurnRecap {
+            summary: recap.summary_line(),
+            files: recap.files_line(),
+        });
+    }
+
+    pub(crate) fn exit_recap_lines(&self) -> Vec<self::turn_recap::ExitRecapLine> {
+        let session_id = self.status.session_id.as_deref().unwrap_or("e????");
+        let events = self.transcript.events();
+        self::turn_recap::exit_recap_lines(
+            session_id,
+            events.len(),
+            self::turn_recap::session_files_changed_count(events),
+        )
     }
 
     pub fn turn_in_flight(&self) -> bool {
@@ -1357,10 +1520,13 @@ impl AppCore {
             started_at: Instant::now(),
         };
         self.in_flight_label = Some("turn".to_owned());
+        self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
+        self.turn_event_start = self.transcript.events().len();
+        self.note_turn_activity();
     }
 
     fn surface_event(&mut self, event: SurfaceEvent) -> CoreEffect {
@@ -1832,6 +1998,7 @@ impl AppCore {
             started_at: Instant::now(),
         };
         self.in_flight_label = Some(label);
+        self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
@@ -1890,6 +2057,7 @@ impl AppCore {
             started_at: Instant::now(),
         };
         self.in_flight_label = Some("companion run".to_owned());
+        self.in_flight_companion_name = Some(request.task.persona().to_owned());
         self.in_flight_cancellable = false;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
@@ -2485,6 +2653,7 @@ impl AppCore {
                 Ok(request) => {
                     self.drain_turn_events();
                     self.modal = Some(self.modal_for_request(request));
+                    self.queue_notification(NotifyEvent::ApprovalNeeded);
                     changed = true;
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -2523,6 +2692,7 @@ impl AppCore {
         match event {
             TurnEvent::Event(event) => {
                 let is_tool_call = event.kind.as_str() == EventKind::TOOL_CALL;
+                self.note_turn_activity();
                 self.record_in_flight_error(&event);
                 self.update_token_usage_from_event(&event);
                 self.transcript.push_event(event);
@@ -2618,6 +2788,7 @@ impl AppCore {
         }
         self.state = AppState::Idle { session };
         self.in_flight_label = None;
+        self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
     }
 
@@ -2722,11 +2893,12 @@ impl AppCore {
     }
 
     fn handle_turn_outcome(&mut self, outcome: TurnOutcome, elapsed: Option<Duration>) {
-        match outcome {
+        let emit_recap = match &outcome {
             TurnOutcome::Complete => {
                 self.interrupted_guidance = false;
                 self.in_flight_error = None;
                 self.notice = None;
+                true
             }
             TurnOutcome::Cancelled => {
                 self.queue_auto_flush_paused = true;
@@ -2735,6 +2907,7 @@ impl AppCore {
                 self.in_flight_error = None;
                 self.push_finalized_visual_item(TranscriptItem::Interrupted);
                 self.notice = None;
+                false
             }
             TurnOutcome::Failed(message) => {
                 self.queue_auto_flush_paused = true;
@@ -2744,17 +2917,28 @@ impl AppCore {
                 if !self.last_event_is_error() {
                     self.push_finalized_visual_item(TranscriptItem::Error {
                         source: "run_turn".to_owned(),
-                        message,
+                        message: message.clone(),
                     });
                 }
                 self.notice = None;
+                true
             }
-        }
+        };
         if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed >= MIN_WORKED_DURATION) {
             self.push_finalized_visual_item(TranscriptItem::WorkedDuration(format_live_elapsed(
                 elapsed,
             )));
         }
+        if emit_recap {
+            self.push_turn_recap();
+        }
+        match outcome {
+            TurnOutcome::Complete => self.queue_notification(NotifyEvent::TurnDone),
+            TurnOutcome::Failed(_) => self.queue_notification(NotifyEvent::Failure),
+            TurnOutcome::Cancelled => {}
+        }
+        self.last_turn_activity_at = None;
+        self.stall_notified = false;
     }
 
     fn last_event_is_error(&self) -> bool {
@@ -2868,6 +3052,7 @@ impl AppCore {
                 .shell_command_for_permission(request)
                 .or_else(|| request.command.clone()),
             scope_prefix: patch_approval::derive_scope_prefix(request),
+            companion_name: self.in_flight_companion_name.clone(),
         })
     }
 

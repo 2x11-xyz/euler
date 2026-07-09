@@ -42,6 +42,15 @@ impl VisualCanvasState {
             self.history_cache = None;
             return;
         }
+        if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
+            if let Some(existing) = self.finalized.iter_mut().rev().find(|existing| {
+                existing.companion_spawn_event_id() == Some(spawn_event_id.as_str())
+            }) {
+                let _ = super::transcript::merge_companion_item(existing, item);
+                self.history_cache = None;
+                return;
+            }
+        }
         if let TranscriptItem::FileDiff { path, .. } = &item {
             if let Some(index) = self.finalized.iter().rposition(
                 |item| matches!(item, TranscriptItem::PatchApplied { path: p, .. } if p == path),

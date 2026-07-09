@@ -214,6 +214,8 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
     let show_timestamp_gutter =
         load_timestamps_preference(preference_path.as_deref()).unwrap_or(true);
+    let notifications_enabled =
+        load_notifications_preference(preference_path.as_deref()).unwrap_or(true);
     let mut session = Session::new_with_providers(live_session.config, providers, decider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
     if let Some((_, extension)) = observer {
@@ -227,6 +229,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             theme_choice,
             theme_preference_path: preference_path,
             show_timestamp_gutter: Some(show_timestamp_gutter),
+            notifications_enabled: Some(notifications_enabled),
             model_catalog: Some(run.model_catalog),
             session_store: live_session
                 .refresh
@@ -2058,6 +2061,18 @@ fn load_timestamps_preference(preference_path: Option<&Path>) -> Option<bool> {
         model_preference::TimestampsPreferenceLoad::Missing => None,
         model_preference::TimestampsPreferenceLoad::Ignored(message) => {
             eprintln!("warning: ignored timestamps preference: {message}");
+            None
+        }
+    }
+}
+
+fn load_notifications_preference(preference_path: Option<&Path>) -> Option<bool> {
+    let path = preference_path?;
+    match model_preference::load_notifications_preference(path) {
+        model_preference::NotificationsPreferenceLoad::Loaded(enabled) => Some(enabled),
+        model_preference::NotificationsPreferenceLoad::Missing => None,
+        model_preference::NotificationsPreferenceLoad::Ignored(message) => {
+            eprintln!("warning: ignored notifications preference: {message}");
             None
         }
     }

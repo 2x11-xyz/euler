@@ -113,6 +113,59 @@ pub fn save_timestamps_preference(path: &Path, show: bool) -> Result<()> {
     write_preference_object(path, payload)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NotificationsPreferenceLoad {
+    Loaded(bool),
+    Missing,
+    Ignored(String),
+}
+
+pub fn load_notifications_preference(path: &Path) -> NotificationsPreferenceLoad {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return NotificationsPreferenceLoad::Missing
+        }
+        Err(error) => {
+            return NotificationsPreferenceLoad::Ignored(format!(
+                "could not read notifications preference: {error}"
+            ));
+        }
+    };
+    notifications_preference_from_json(&contents)
+}
+
+pub fn save_notifications_preference(path: &Path, enabled: bool) -> Result<()> {
+    let mut payload = read_preference_object_for_save(path)?;
+    payload.insert("notifications".to_owned(), Value::Bool(enabled));
+    write_preference_object(path, payload)
+}
+
+fn notifications_preference_from_json(contents: &str) -> NotificationsPreferenceLoad {
+    let value: Value = match serde_json::from_str(contents) {
+        Ok(value) => value,
+        Err(error) => {
+            return NotificationsPreferenceLoad::Ignored(format!(
+                "malformed notifications preference: {error}"
+            ));
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return NotificationsPreferenceLoad::Ignored(
+            "malformed notifications preference: expected object".to_owned(),
+        );
+    };
+    let Some(notifications) = object.get("notifications") else {
+        return NotificationsPreferenceLoad::Missing;
+    };
+    match notifications.as_bool() {
+        Some(enabled) => NotificationsPreferenceLoad::Loaded(enabled),
+        None => NotificationsPreferenceLoad::Ignored(
+            "malformed notifications preference: notifications must be a boolean".to_owned(),
+        ),
+    }
+}
+
 fn timestamps_preference_from_json(contents: &str) -> TimestampsPreferenceLoad {
     let value: Value = match serde_json::from_str(contents) {
         Ok(value) => value,
