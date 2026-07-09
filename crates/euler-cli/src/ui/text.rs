@@ -118,7 +118,6 @@ pub(crate) fn timestamp_gutter(absolute: Option<&str>) -> String {
     }
 }
 
-
 pub(crate) fn new_events_pill_text(new_events: usize) -> Option<String> {
     (new_events > 0).then(|| format!("↓ {new_events} new events"))
 }
@@ -130,10 +129,11 @@ const _: fn(usize) -> Option<String> = new_events_pill_text;
 pub(crate) fn is_ledger_gutter(gutter: &str) -> bool {
     let width = display_width(gutter);
     if timestamp_gutter_shown() {
-        width == TIMESTAMP_GUTTER_WIDTH
+        // Timestamp column + spine cells, or a tree prefix at that width.
+        width == TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
     } else {
-        // Hidden timestamp column: blank (0) or compact tree prefixes.
-        width == 0
+        // Spine-only mode: the 2-cell spine or compact tree prefixes.
+        width == SPINE_WIDTH
             || gutter == TREE_GUTTER_LAST_NARROW
             || gutter == TREE_GUTTER_MID_NARROW
             || gutter == TREE_GUTTER_PIPE_NARROW
@@ -269,7 +269,8 @@ mod tests {
         assert_eq!(content_width(80), 78);
         assert_eq!(tree_gutter_last(), "  └ ");
         assert_eq!(tree_gutter_mid(), "  ├ ");
-        assert!(is_ledger_gutter(""));
+        assert!(is_ledger_gutter(BLANK_SPINE));
+        assert!(!is_ledger_gutter(""));
         assert!(is_ledger_gutter("  └ "));
         assert!(is_ledger_gutter("  ├ "));
 

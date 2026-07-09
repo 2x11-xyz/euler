@@ -12,8 +12,8 @@ use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
 use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
 use crate::ui::text::{
-    blank_gutter, content_width, display_width, gutter_width, is_ledger_gutter,
-    timestamp_gutter, tree_gutter_pipe, wrap_text,
+    blank_gutter, content_width, display_width, gutter_width, is_ledger_gutter, timestamp_gutter,
+    tree_gutter_pipe, wrap_text,
 };
 use crate::ui::theme::Theme;
 use ratatui::style::Style;
@@ -709,18 +709,15 @@ fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)>
         TranscriptItem::ResumeBoundary { .. } => {
             (glyphs::check().to_owned(), theme.transcript.added)
         }
-        TranscriptItem::Companion { .. } => {
-            (glyphs::companion_glyph().to_owned(), theme.transcript.companion)
-        }
+        TranscriptItem::Companion { .. } => (
+            glyphs::companion_glyph().to_owned(),
+            theme.transcript.companion,
+        ),
         TranscriptItem::WorkspaceRestore { .. } => {
             (glyphs::revert().to_owned(), theme.transcript.added)
         }
-        TranscriptItem::Interrupted => {
-            (glyphs::interrupt().to_owned(), theme.transcript.warning)
-        }
-        TranscriptItem::Error { .. } => {
-            (glyphs::cross().to_owned(), theme.transcript.error)
-        }
+        TranscriptItem::Interrupted => (glyphs::interrupt().to_owned(), theme.transcript.warning),
+        TranscriptItem::Error { .. } => (glyphs::cross().to_owned(), theme.transcript.error),
         _ => (glyphs::bullet().to_owned(), theme.transcript.gutter),
     };
     Some(anchor)
@@ -750,10 +747,7 @@ fn stamp_first_line(
     match anchor {
         Some((glyph, style)) => {
             let pad = crate::ui::text::SPINE_WIDTH.saturating_sub(display_width(glyph));
-            spans.push(Span::styled(
-                format!("{glyph}{}", " ".repeat(pad)),
-                *style,
-            ));
+            spans.push(Span::styled(format!("{glyph}{}", " ".repeat(pad)), *style));
         }
         None => spans.push(Span::styled(
             crate::ui::text::BLANK_SPINE.to_owned(),
@@ -762,7 +756,6 @@ fn stamp_first_line(
     }
     line.spans.splice(0..1, spans);
 }
-
 
 fn render_assistant_prose(content: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     // Leave one right-edge cell unused. Exact-width writes can put terminals
