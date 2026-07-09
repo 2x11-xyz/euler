@@ -1551,9 +1551,12 @@ impl AppCore {
             CommandAction::CompactSession => self.compact_session(),
             CommandAction::ShowCompaction => self.show_compaction_status(),
             CommandAction::ExportSession { path } => self.export_session(path),
-            CommandAction::ExtensionRun { id, command, input } => {
-                self.extension_run(id, command, input)
-            }
+            CommandAction::ExtensionRun {
+                id,
+                command,
+                input,
+                raw_args,
+            } => self.extension_run(id, command, input, raw_args),
             CommandAction::CompanionRun { input } => self.companion_run(input),
             CommandAction::ShowStatus => self.show_status(),
             CommandAction::Login { provider } => self.login_guidance(provider),
@@ -1686,6 +1689,7 @@ impl AppCore {
             "causal-dag".to_owned(),
             "export".to_owned(),
             serde_json::Value::Object(serde_json::Map::new()),
+            None,
         )
     }
 
@@ -1923,8 +1927,9 @@ impl AppCore {
         id: String,
         command: String,
         input: serde_json::Value,
+        raw_args: Option<String>,
     ) -> CoreEffect {
-        let request = match self.resolve_extension_run(id, command, input) {
+        let request = match self.resolve_extension_run(id, command, input, raw_args) {
             Ok(request) => request,
             Err(error) => return self.notice_item(format!("extension run failed: {error}")),
         };
@@ -1953,6 +1958,7 @@ impl AppCore {
         id: String,
         command: String,
         input: serde_json::Value,
+        raw_args: Option<String>,
     ) -> Result<ExtensionRunRequest> {
         let descriptor =
             bundled_descriptor_by_id(&id)?.ok_or_else(|| anyhow!("unknown extension id: {id}"))?;
@@ -1961,6 +1967,21 @@ impl AppCore {
             .ok_or_else(|| anyhow!("unknown command for extension {id}: {command}"))?;
         let bundled =
             bundled_extension_by_id(&id).ok_or_else(|| anyhow!("unknown extension id: {id}"))?;
+        let input = match raw_args {
+            None => input,
+            Some(raw) => {
+                // Same ArgSpec contract as `euler extension run` argv parsing.
+                // Whitespace tokenization: flag values with spaces need the
+                // JSON input form instead.
+                let reference = format!("{id}.{command}");
+                let mut args = raw.split_whitespace().map(str::to_owned);
+                crate::extension_cli::parse_extension_run_input(
+                    &reference,
+                    Some(command_descriptor),
+                    &mut args,
+                )?
+            }
+        };
         Ok(ExtensionRunRequest {
             id,
             command,

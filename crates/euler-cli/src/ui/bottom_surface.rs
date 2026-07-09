@@ -493,6 +493,7 @@ impl BottomSurface {
                     id: extension_id.clone(),
                     command: command.clone(),
                     input: serde_json::Value::Object(serde_json::Map::new()),
+                    raw_args: None,
                 });
             }
         }

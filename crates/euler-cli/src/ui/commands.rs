@@ -337,6 +337,10 @@ pub enum CommandAction {
         id: String,
         command: String,
         input: serde_json::Value,
+        /// `--flag value…` text typed after the token; parsed against the
+        /// command's ArgSpec at resolve time (where the descriptor lives).
+        /// Mutually exclusive with a non-empty `input`.
+        raw_args: Option<String>,
     },
     CompanionRun {
         input: serde_json::Value,
@@ -767,11 +771,15 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/diff" => CommandEffect::Action(CommandAction::ShowDiff),
         "/usage" => CommandEffect::Action(CommandAction::ShowUsage),
         "/dag" => CommandEffect::Action(CommandAction::DagExport),
-        token => extension_slash_or_unknown(token, context),
+        token => extension_slash_or_unknown(token, parsed.arg, context),
     }
 }
 
-fn extension_slash_or_unknown(token: &str, context: &CommandContext) -> CommandEffect {
+fn extension_slash_or_unknown(
+    token: &str,
+    arg: Option<&str>,
+    context: &CommandContext,
+) -> CommandEffect {
     if let Some(cmd) = context
         .extension_slash_commands
         .iter()
@@ -780,10 +788,34 @@ fn extension_slash_or_unknown(token: &str, context: &CommandContext) -> CommandE
         if !cmd.enabled {
             return CommandEffect::Message(disabled_extension_teach(&cmd.token, &cmd.extension_id));
         }
+        // Arguments are never dropped: JSON parses here, `--flag` text is
+        // parsed against the ArgSpec at resolve time, anything else is a
+        // usage error.
+        let (input, raw_args) = match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
+            None => (serde_json::Value::Object(serde_json::Map::new()), None),
+            Some(json) if json.starts_with('{') => match serde_json::from_str(json) {
+                Ok(value) => (value, None),
+                Err(error) => {
+                    return CommandEffect::Message(format!(
+                        "{token} input must be JSON: {error}"
+                    ));
+                }
+            },
+            Some(flags) if flags.starts_with("--") => (
+                serde_json::Value::Object(serde_json::Map::new()),
+                Some(flags.to_owned()),
+            ),
+            Some(other) => {
+                return CommandEffect::Message(format!(
+                    "usage: {token} [--flag value…]  or  {token} {{json}}  — got `{other}`"
+                ));
+            }
+        };
         return CommandEffect::Action(CommandAction::ExtensionRun {
             id: cmd.extension_id.clone(),
             command: cmd.command.clone(),
-            input: serde_json::Value::Object(serde_json::Map::new()),
+            input,
+            raw_args,
         });
     }
     CommandEffect::Message(format!("unknown command: {token}"))
@@ -856,20 +888,34 @@ fn extension_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffec
             ));
         }
     }
-    let input = match parts
+    let (input, raw_args) = match parts
         .next()
         .map(str::trim_start)
         .filter(|value| !value.is_empty())
     {
-        Some(json) => match serde_json::from_str(json) {
-            Ok(value) => value,
+        Some(json) if json.starts_with('{') => match serde_json::from_str(json) {
+            Ok(value) => (value, None),
             Err(error) => {
                 return CommandEffect::Message(format!("extension input must be JSON: {error}"));
             }
         },
-        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(flags) if flags.starts_with("--") => (
+            serde_json::Value::Object(serde_json::Map::new()),
+            Some(flags.to_owned()),
+        ),
+        Some(other) => {
+            return CommandEffect::Message(format!(
+                "usage: /extension run <ext>.<cmd> [{{json}} | --flag value…]  — got `{other}`"
+            ));
+        }
+        None => (serde_json::Value::Object(serde_json::Map::new()), None),
     };
-    CommandEffect::Action(CommandAction::ExtensionRun { id, command, input })
+    CommandEffect::Action(CommandAction::ExtensionRun {
+        id,
+        command,
+        input,
+        raw_args,
+    })
 }
 
 fn parse_extension_reference(reference: &str) -> Option<(String, String)> {
@@ -1104,6 +1150,7 @@ mod tests {
                 id: "session-export".to_owned(),
                 command: "session-export".to_owned(),
                 input: serde_json::json!({"limit": 1}),
+                raw_args: None,
             })
         );
         assert_eq!(
@@ -1112,6 +1159,7 @@ mod tests {
                 id: "causal-dag".to_owned(),
                 command: "catch-up".to_owned(),
                 input: serde_json::json!({}),
+                raw_args: None,
             })
         );
         assert_eq!(
@@ -1268,6 +1316,61 @@ mod tests {
         assert!(cmds.iter().any(|c| c.token == "/causal-dag.export"));
         assert!(cmds.iter().any(|c| c.token == "/catch-up"));
         assert!(!cmds.iter().any(|c| c.token == "/export"));
+    }
+
+    #[test]
+    fn extension_slash_arguments_parse_or_reject_never_drop() {
+        let context = CommandContext {
+            extension_slash_commands: vec![ExtensionSlashCommand {
+                token: "/review-brief".to_owned(),
+                summary: "code-swarm · review-brief".to_owned(),
+                extension_id: "code-swarm".to_owned(),
+                command: "review-brief".to_owned(),
+                enabled: true,
+            }],
+            ..CommandContext::default()
+        };
+
+        // JSON argument parses into the input.
+        assert_eq!(
+            dispatch_command("/review-brief {\"reviewers\":[\"tests\"]}", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "code-swarm".to_owned(),
+                command: "review-brief".to_owned(),
+                input: serde_json::json!({"reviewers": ["tests"]}),
+                raw_args: None,
+            })
+        );
+        // Flag arguments travel to resolve-time ArgSpec parsing.
+        assert_eq!(
+            dispatch_command("/review-brief --reviewer tests --model a::b", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "code-swarm".to_owned(),
+                command: "review-brief".to_owned(),
+                input: serde_json::json!({}),
+                raw_args: Some("--reviewer tests --model a::b".to_owned()),
+            })
+        );
+        // Invalid JSON is an error, not a silent default run.
+        assert!(matches!(
+            dispatch_command("/review-brief {broken", &context),
+            CommandEffect::Message(message) if message.contains("must be JSON")
+        ));
+        // Free text is a usage error, not a silent default run.
+        assert!(matches!(
+            dispatch_command("/review-brief tests please", &context),
+            CommandEffect::Message(message) if message.contains("usage:")
+        ));
+        // No argument still dispatches with empty input.
+        assert_eq!(
+            dispatch_command("/review-brief", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "code-swarm".to_owned(),
+                command: "review-brief".to_owned(),
+                input: serde_json::json!({}),
+                raw_args: None,
+            })
+        );
     }
 
     #[test]
