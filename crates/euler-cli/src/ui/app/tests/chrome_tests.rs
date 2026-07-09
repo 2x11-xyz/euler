@@ -591,7 +591,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         "stacked repo row missing at narrow width: {narrow:?}"
     );
     assert!(
-        narrow.iter().all(|line| !line.contains('━')),
+        narrow.iter().all(|line| !line.contains('┼')),
         "narrow multi-column table should not render as a grid: {narrow:?}"
     );
     assert!(
@@ -617,9 +617,10 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         wide.iter().any(|line| line.contains("CLI/TUI layer")),
         "wide grid table row missing: {wide:?}"
     );
-    assert!(
-        wide.iter().any(|line| line.contains('━')),
-        "wide table should render as a grid: {wide:?}"
+    assert_eq!(
+        wide.iter().filter(|line| line.contains('┼')).count(),
+        1,
+        "wide table should render as a grid with exactly one header rule: {wide:?}"
     );
     assert!(
         wide.iter().all(|line| {
@@ -665,7 +666,7 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
         "stacked repo row missing after resize: {rows:?}"
     );
     assert!(
-        rows.iter().all(|row| !row.contains('━')),
+        rows.iter().all(|row| !row.contains('┼')),
         "resized multi-column table should not leave grid artifacts: {rows:?}"
     );
     assert_eq!(

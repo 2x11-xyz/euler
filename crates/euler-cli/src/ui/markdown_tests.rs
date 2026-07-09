@@ -61,8 +61,12 @@ fn renders_pipe_tables_and_unwraps_markdown_fenced_tables() {
     );
     let text = strings(lines);
     assert!(text.iter().any(|line| line.contains("A")));
-    assert!(text.iter().any(|line| line.contains('━')));
-    assert!(text.iter().any(|line| line.contains('─')));
+    assert_eq!(
+        text.iter().filter(|line| line.contains('─')).count(),
+        1,
+        "expected exactly one rule line under the header: {text:?}"
+    );
+    assert!(!text.iter().any(|line| line.contains('━')));
     assert!(text.iter().any(|line| line.contains("2222")));
     assert!(!text.iter().any(|line| line.contains('|')));
     assert!(!text.iter().any(|line| line.contains("```")));
@@ -90,7 +94,7 @@ fn two_column_tables_use_grid_until_width_is_too_narrow() {
     let source = "| Area | Purpose |\n|---|---|\n| CLI | Terminal transcript UX |\n";
 
     let wide = strings(render_agent_markdown(source, &theme, 44));
-    assert!(wide.iter().any(|line| line.contains('━')));
+    assert!(wide.iter().any(|line| line.contains('─')));
     assert!(wide.iter().any(|line| line.contains("CLI")));
 
     let narrow = strings(render_agent_markdown(source, &theme, 43));
@@ -98,7 +102,7 @@ fn two_column_tables_use_grid_until_width_is_too_narrow() {
     assert!(narrow
         .iter()
         .any(|line| line == "Purpose: Terminal transcript UX"));
-    assert!(!narrow.iter().any(|line| line.contains('━')));
+    assert!(!narrow.iter().any(|line| line.contains('─')));
 }
 
 #[test]
@@ -143,8 +147,12 @@ fn multi_column_tables_use_grid_at_wide_widths() {
     assert!(text
         .iter()
         .any(|line| line.contains("Core engine") && line.contains("euler-core")));
-    assert!(text.iter().any(|line| line.contains('━')));
-    assert!(text.iter().any(|line| line.contains('─')));
+    assert_eq!(
+        text.iter().filter(|line| line.contains('─')).count(),
+        1,
+        "expected exactly one rule line under the header: {text:?}"
+    );
+    assert!(!text.iter().any(|line| line.contains('━')));
     assert!(!text.iter().any(|line| line == "Layer: Event substrate"));
     assert!(
         text.iter().all(|line| display_width(line) <= 100),
@@ -162,7 +170,7 @@ fn five_column_tables_grid_only_when_width_is_sufficient() {
     assert!(wide
         .iter()
         .any(|line| line.contains("one") && line.contains("five")));
-    assert!(wide.iter().any(|line| line.contains('━')));
+    assert!(wide.iter().any(|line| line.contains('─')));
     assert!(!wide.iter().any(|line| line == "A: one"));
     assert!(
         wide.iter().all(|line| display_width(line) <= 110),
@@ -172,7 +180,7 @@ fn five_column_tables_grid_only_when_width_is_sufficient() {
     let narrow = strings(render_agent_markdown(source, &theme, 109));
     assert!(narrow.iter().any(|line| line == "A: one"));
     assert!(narrow.iter().any(|line| line == "E: five"));
-    assert!(!narrow.iter().any(|line| line.contains('━')));
+    assert!(!narrow.iter().any(|line| line.contains('─')));
     assert!(
         narrow.iter().all(|line| display_width(line) <= 109),
         "narrow five-column stack overflowed: {narrow:?}"
@@ -235,7 +243,7 @@ fn unwraps_tilde_markdown_fenced_tables() {
     );
     let text = strings(lines);
     assert!(text.iter().any(|line| line.contains("A")));
-    assert!(text.iter().any(|line| line.contains('━')));
+    assert!(text.iter().any(|line| line.contains('─')));
     assert!(!text.iter().any(|line| line.contains('|')));
     assert!(!text.iter().any(|line| line.contains("~~~")));
 }
