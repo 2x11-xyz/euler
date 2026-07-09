@@ -74,3 +74,22 @@ target; SUPERSEDED frame is v1 — do not implement from it.
   col 0). Check PTY tests. THEN steps 4-6 (artifact • + └ result line,
   timestamps opt-in already default-off but /timestamps flip + prefs load
   in main.rs needs check, composer flush-left + F27).
+
+
+## Progress (window 3)
+- A2 COMPLETE: all inline glyphs relocated to the spine anchor (decisions,
+  thinking, interrupt, revert, companion headers, errors, resume boundary).
+- Timestamps default OFF at all layers (text.rs thread-local, app.rs,
+  main.rs). Emoji discouragement in core SYSTEM_INSTRUCTIONS.
+- Adversarial re-baseline round 1 found 4 real bugs (all fixed, ac91041):
+  is_ledger_gutter spine widths; app default (already fixed); companion
+  header rail+glyph duplication; resume boundary missing anchor.
+  92 failures -> 14. Round 2 running (remaining ~13 re-baselines; PTY
+  commit-exactly-once failure to be triaged as possible bug).
+- SSH key for github dropped from agent; push via
+  `git push https://github.com/2x11-xyz/euler.git <branch>` (gh token).
+- REMAINING: A3 └ result-line pairing (hold until re-baseline lands);
+  approval-panel label cleanup (S4); composer flush-left verify + startup
+  hug-bottom (S1); recap placement under Worked divider (S3); §9
+  degradation order re-check (ts gutter drop applies only when opted in);
+  final PTY + workspace gate; merge to feat/warm-ledger-tui.
