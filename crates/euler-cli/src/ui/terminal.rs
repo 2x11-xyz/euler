@@ -354,28 +354,6 @@ where
         if lines.is_empty() {
             return Ok(());
         }
-        if let Some(debug_path) = std::env::var_os("EULER_DEBUG_COMMITS") {
-            use std::io::Write as _;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(debug_path)
-            {
-                let _ = writeln!(
-                    file,
-                    "[emit] {} lines, first=`{}` bridge={allow_bridge}",
-                    lines.len(),
-                    lines
-                        .first()
-                        .map(|line| line
-                            .spans
-                            .iter()
-                            .map(|span| span.text.as_str())
-                            .collect::<String>())
-                        .unwrap_or_default()
-                );
-            }
-        }
         self.autoresize()?;
         // Only the live viewport is mutable. Finalized output is written once
         // after clearing that owned active frame, never by rewriting scrollback.
@@ -492,34 +470,8 @@ where
             0,
             frame.pinned_rows,
         );
-        let mut commit_until = tail_visible.prefix_start.min(frame.committable_rows);
-        // Within the history region, commit only at item boundaries: the
-        // committed prefix then maps to a whole number of items, which is
-        // what makes a width change remappable (below) without losing or
-        // re-emitting rows.
-        if commit_until <= frame.history_rows {
-            commit_until = snap_to_item_boundary(&frame.history_item_offsets, commit_until);
-        }
+        let commit_until = tail_visible.prefix_start.min(frame.committable_rows);
         let width = self.viewport_area.width;
-        if let Some(debug_path) = std::env::var_os("EULER_DEBUG_COMMITS") {
-            use std::io::Write as _;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(debug_path)
-            {
-                let _ = writeln!(
-                    file,
-                    "[commit] width={width} prev_width={} rows={} items={} commit_until={commit_until} history_rows={} committable={} offsets={:?}",
-                    self.committed_active_width,
-                    self.committed_active_rows,
-                    self.committed_history_items,
-                    frame.history_rows,
-                    frame.committable_rows,
-                    frame.history_item_offsets
-                );
-            }
-        }
         if self.committed_active_width != width {
             if self.committed_active_rows > 0 && frame.history_rows > 0 {
                 // Native scrollback cannot be reflowed after a terminal
@@ -531,25 +483,36 @@ where
                 // silently dropped never-emitted rows — or, in reflowing
                 // terminals, re-emitted rows that were already visible: the
                 // duplicate-line audit finding, P1.)
-                let remapped_rows = frame
-                    .history_item_offsets
-                    .get(self.committed_history_items.wrapping_sub(1))
-                    .copied()
-                    .unwrap_or(0)
-                    .min(frame.history_rows);
-                let remapped_rows = if self.committed_history_items == 0 {
-                    0
+                if frame.history_item_offsets.is_empty() {
+                    // No item accounting available (history not derived from
+                    // finalized items). Fall back to treating the rendered
+                    // prefix as represented — accepts losing never-emitted
+                    // rows rather than re-emitting everything.
+                    let shared_prefix = shared_committed_prefix_len(
+                        &self.committed_active_lines,
+                        &frame.active_frame_lines,
+                    );
+                    let represented_rows = frame.history_rows.max(shared_prefix);
+                    self.set_committed_active_rows(frame, represented_rows);
                 } else {
-                    remapped_rows
-                };
-                self.set_committed_active_rows(frame, remapped_rows);
-                self.linefeed_history_insert_suspended_after_resize = true;
-                // Recompute the snap at the new width.
-                commit_until = tail_visible.prefix_start.min(frame.committable_rows);
-                if commit_until <= frame.history_rows {
-                    commit_until =
-                        snap_to_item_boundary(&frame.history_item_offsets, commit_until);
+                    // Remap the committed boundary by item identity, rendered
+                    // at the new width. Rounding down to the item boundary
+                    // can re-emit the head rows of one partially-committed
+                    // item — bounded, and preferable to losing rows (or, as
+                    // before this fix, re-committing the entire history).
+                    let remapped_rows = if self.committed_history_items == 0 {
+                        0
+                    } else {
+                        frame
+                            .history_item_offsets
+                            .get(self.committed_history_items - 1)
+                            .copied()
+                            .unwrap_or(0)
+                            .min(frame.history_rows)
+                    };
+                    self.set_committed_active_rows(frame, remapped_rows);
                 }
+                self.linefeed_history_insert_suspended_after_resize = true;
             }
             self.committed_active_width = width;
         }
@@ -938,17 +901,3 @@ use render::*;
 
 #[cfg(test)]
 mod tests;
-
-/// Largest item-boundary row offset that does not exceed `rows`. With no
-/// offsets (no finalized history) commits stay row-based.
-fn snap_to_item_boundary(item_end_offsets: &[usize], rows: usize) -> usize {
-    if item_end_offsets.is_empty() {
-        return rows;
-    }
-    let items = item_end_offsets.partition_point(|end| *end <= rows);
-    if items == 0 {
-        0
-    } else {
-        item_end_offsets[items - 1]
-    }
-}

@@ -100,3 +100,28 @@ Consequences:
 - After the test models this, expected result: everything exactly once both
   with and without resize. Then: remove EULER_DEBUG_COMMITS + [emit]
   diagnostics, full gate, clippy, push, merge to feat/warm-ledger-tui.
+
+
+## RESOLVED (same day)
+All four PTY tests green, full workspace gate 1899/1899, clippy clean.
+Final shape of the fix:
+1. `UiAction::Resize` no longer purge-replays: canvas cache invalidated +
+   re-render; native scrollback untouched (app.rs).
+2. Item-boundary commit accounting: per-item end-row offsets flow
+   render → visual canvas → `VisualCanvasFrame::history_item_offsets`;
+   the terminal tracks `committed_history_items` and, on width change,
+   remaps its committed-rows boundary via the offsets (rounding down —
+   may re-emit one partial item's head rows, bounded). When offsets are
+   absent (history not item-derived), the previous treat-as-represented
+   fallback applies.
+3. Commits remain row-based (no snapping) so tall items still commit
+   continuously.
+4. Canvas guard: merges/removals (Exploration, Companion, WorkedDuration
+   dedup, FileDiff supersede) no longer touch items at indices below the
+   committed boundary — mutating committed rows shifted all later rows and
+   re-emitted stale content (second duplication mechanism).
+5. Tests: `tui_pty_transcript_lines_commit_exactly_once`,
+   `tui_pty_resize_does_not_duplicate_committed_lines` (PtyHarness gained
+   mid-session `resize()`; final-state reconstruction models the
+   region-top-1 scroll → scrollback push of real terminals by capturing
+   bridge spans from the byte stream).

@@ -55,9 +55,13 @@ impl VisualCanvasState {
             return;
         }
         if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
-            if let Some(existing) = self.finalized[boundary..].iter_mut().rev().find(|existing| {
-                existing.companion_spawn_event_id() == Some(spawn_event_id.as_str())
-            }) {
+            if let Some(existing) = self.finalized[boundary..]
+                .iter_mut()
+                .rev()
+                .find(|existing| {
+                    existing.companion_spawn_event_id() == Some(spawn_event_id.as_str())
+                })
+            {
                 let _ = super::transcript::merge_companion_item(existing, item);
                 self.history_cache = None;
                 return;
@@ -125,7 +129,11 @@ impl VisualCanvasState {
         frame
     }
 
-    fn render_history<R>(&mut self, width: u16, render_finalized: R) -> (Vec<CanvasLine>, Vec<usize>)
+    fn render_history<R>(
+        &mut self,
+        width: u16,
+        render_finalized: R,
+    ) -> (Vec<CanvasLine>, Vec<usize>)
     where
         R: FnOnce(&[TranscriptItem], u16) -> (Vec<CanvasLine>, Vec<usize>),
     {

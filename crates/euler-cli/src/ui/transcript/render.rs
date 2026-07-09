@@ -80,7 +80,6 @@ pub(super) fn render_projected_entries(
     render_projected_entries_with_expansion(entries, theme, width, limits, &HashSet::new())
 }
 
-#[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
 pub(super) fn render_projected_entries_with_expansion(
     entries: &[ProjectedEntry],
     theme: &Theme,
@@ -102,6 +101,7 @@ pub(super) fn render_projected_entries_with_expansion(
 /// cumulative end-row offset of each entry. Offsets let the terminal commit
 /// native scrollback at item boundaries so a width change can remap its
 /// committed prefix exactly (no lost rows, no duplicates).
+#[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
 pub(super) fn render_projected_entries_with_expansion_and_offsets(
     entries: &[ProjectedEntry],
     theme: &Theme,

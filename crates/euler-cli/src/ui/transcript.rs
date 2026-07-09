@@ -569,8 +569,6 @@ pub(crate) fn render_items_for_history_with_limit(
     )
 }
 
-
-
 /// History render that also reports each item's cumulative end-row offset
 /// (native-scrollback commit boundaries; see terminal.rs).
 pub(crate) fn render_items_for_history_with_offsets(

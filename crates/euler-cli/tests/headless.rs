@@ -6694,6 +6694,71 @@ fn pty_final_state_text(output: &[u8], rows: u16, cols: u16) -> String {
     rebuilt.join("\n")
 }
 
+/// Committed rows written through the codex-style bridge contract
+/// (`ESC[1;Nr` … `ESC[r`, one row per `\r\n`). Real terminals push these into
+/// native scrollback when the region top is row 1; the vt100 crate discards
+/// them, so reconstruction captures them straight from the byte stream.
+fn extract_bridge_committed_rows(output: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(output);
+    let mut rows = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find("\u{1b}[1;") {
+        let after = &rest[start..];
+        let Some(region_close) = after.find('r') else {
+            break;
+        };
+        // Confirm this is a scroll-region set: ESC[1;<digits>r
+        // (the needle is ESC [ 1 ; — digits start at byte 4)
+        if region_close <= 4
+            || !after[4..region_close]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        {
+            rest = &rest[start + 4..];
+            continue;
+        }
+        let Some(end) = after.find("\u{1b}[r") else {
+            break;
+        };
+        let span = &after[region_close + 1..end];
+        for line in span.split("\r\n").skip(1) {
+            let plain = strip_ansi(line);
+            if !plain.trim().is_empty() {
+                rows.push(plain);
+            }
+        }
+        rest = &after[end + 3..];
+    }
+    rows
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for control in chars.by_ref() {
+                    if control.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else if chars.peek() == Some(&']') {
+                chars.next();
+                for control in chars.by_ref() {
+                    if control == '\u{7}' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Final-state reconstruction across mid-session resizes: process each byte
 /// segment at its dimensions.
 fn pty_final_state_with_resizes(
@@ -6730,7 +6795,9 @@ fn pty_final_state_with_resizes(
         }
         offset -= 1;
     }
-    rebuilt.join("\n")
+    let mut all_rows = extract_bridge_committed_rows(output);
+    all_rows.push(rebuilt.join("\n"));
+    all_rows.join("\n")
 }
 
 #[test]

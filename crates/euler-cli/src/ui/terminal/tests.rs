@@ -121,7 +121,7 @@ mod terminal_tests {
                 required_height: 1,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -152,7 +152,7 @@ mod terminal_tests {
                 required_height: 1,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -177,7 +177,7 @@ mod terminal_tests {
                 required_height: 1,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -194,7 +194,7 @@ mod terminal_tests {
                 required_height: 1,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -368,7 +368,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 3,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 2,
             })
@@ -484,7 +484,7 @@ mod terminal_tests {
                 required_height: 3,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -500,7 +500,7 @@ mod terminal_tests {
                 required_height: 2,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -626,7 +626,7 @@ mod terminal_tests {
                 required_height: 4,
                 history_rows: 2,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 2,
                 pinned_rows: 0,
             })
@@ -662,7 +662,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 3,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 3,
                 pinned_rows: 0,
             })
@@ -747,7 +747,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 4,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 4,
                 pinned_rows: 0,
             })
@@ -766,7 +766,7 @@ mod terminal_tests {
                 required_height: 4,
                 history_rows: 2,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 2,
                 pinned_rows: 0,
             })
@@ -784,7 +784,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 3,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 3,
                 pinned_rows: 0,
             })
@@ -803,7 +803,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 4,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 4,
                 pinned_rows: 0,
             })
@@ -834,7 +834,7 @@ mod terminal_tests {
                 required_height: 4,
                 history_rows: 2,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 2,
                 pinned_rows: 0,
             })
@@ -854,7 +854,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 2,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -872,7 +872,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 3,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 3,
                 pinned_rows: 0,
             })
@@ -903,7 +903,7 @@ mod terminal_tests {
                 required_height: 2,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -955,7 +955,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 4,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 4,
                 pinned_rows: 0,
             })
@@ -975,7 +975,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 2,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -993,7 +993,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 3,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 3,
                 pinned_rows: 0,
             })
@@ -1031,7 +1031,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 3,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 3,
                 pinned_rows: 0,
             })
@@ -1053,7 +1053,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 1,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 4,
                 pinned_rows: 0,
             })
@@ -1092,7 +1092,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 2,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 2,
                 pinned_rows: 0,
             })
@@ -1121,7 +1121,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 3,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 3,
                 pinned_rows: 0,
             })
@@ -1156,7 +1156,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 2,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 4,
                 pinned_rows: 0,
             })
@@ -1185,7 +1185,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 3,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 4,
                 pinned_rows: 0,
             })
@@ -1219,7 +1219,7 @@ mod terminal_tests {
                 required_height: 4,
                 history_rows: 1,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 1,
                 pinned_rows: 0,
             })
@@ -1256,7 +1256,7 @@ mod terminal_tests {
                 required_height: 2,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1273,7 +1273,7 @@ mod terminal_tests {
                 required_height: 4,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1285,7 +1285,7 @@ mod terminal_tests {
                 required_height: 2,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1324,7 +1324,7 @@ mod terminal_tests {
                 required_height: 4,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1341,7 +1341,7 @@ mod terminal_tests {
                 required_height: 2,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1373,7 +1373,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1393,7 +1393,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1471,7 +1471,7 @@ mod terminal_tests {
                 required_height: 2,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1492,7 +1492,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1649,7 +1649,7 @@ mod terminal_tests {
                 required_height: 8,
                 history_rows: 6,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 6,
                 pinned_rows: 2,
             })
@@ -1700,7 +1700,7 @@ mod terminal_tests {
                 required_height: 8,
                 history_rows: 6,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 6,
                 pinned_rows: 2,
             })
@@ -1742,7 +1742,7 @@ mod terminal_tests {
                 required_height: 8,
                 history_rows: 7,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 7,
                 pinned_rows: 1,
             })
@@ -1777,7 +1777,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 6,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 6,
                 pinned_rows: 0,
             })
@@ -1836,7 +1836,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1862,7 +1862,7 @@ mod terminal_tests {
                 required_height: 10,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: true,
+                prefer_stable_height: true,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1910,7 +1910,7 @@ mod terminal_tests {
                 required_height: 1,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1923,7 +1923,7 @@ mod terminal_tests {
                 required_height: 2,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1952,7 +1952,7 @@ mod terminal_tests {
                 required_height: 5,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -1969,7 +1969,7 @@ mod terminal_tests {
                 required_height: 2,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })
@@ -2013,7 +2013,7 @@ mod terminal_tests {
                 required_height: 6,
                 history_rows: 0,
                 history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
+                prefer_stable_height: false,
                 committable_rows: 0,
                 pinned_rows: 0,
             })

@@ -1,6 +1,6 @@
+use super::super::visual::render_finalized_visual_items_with_offsets;
 use super::*;
 use crate::ui::visual_canvas::CursorTarget;
-use super::super::visual::render_finalized_visual_items_with_offsets;
 
 #[test]
 fn question_mark_help_overlay_is_global_only_for_idle_composer() {
