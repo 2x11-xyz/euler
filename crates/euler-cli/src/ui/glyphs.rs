@@ -17,6 +17,7 @@ pub(crate) struct GlyphSet {
     spinner_frames: &'static [&'static str],
     check: &'static str,
     cross: &'static str,
+    interrupt: &'static str,
     companion: &'static str,
     companion_rail_prefix: &'static str,
     revert: &'static str,
@@ -34,6 +35,7 @@ impl GlyphSet {
         spinner_frames: UNICODE_SPINNER,
         check: "\u{2713}",
         cross: "\u{2717}",
+        interrupt: "\u{25a0}",
         companion: "\u{25c6}",
         companion_rail_prefix: "\u{258c} ",
         revert: "\u{21a9}",
@@ -50,6 +52,7 @@ impl GlyphSet {
         spinner_frames: ASCII_SPINNER,
         check: "ok",
         cross: "x",
+        interrupt: "#",
         companion: "&",
         companion_rail_prefix: "| ",
         revert: "<-",
@@ -92,6 +95,10 @@ impl GlyphSet {
         self.cross
     }
 
+    pub(crate) const fn interrupt(self) -> &'static str {
+        self.interrupt
+    }
+
     pub(crate) const fn companion(self) -> &'static str {
         self.companion
     }
@@ -127,6 +134,7 @@ impl GlyphSet {
             && !self.spinner(0).is_empty()
             && !self.check().is_empty()
             && !self.cross().is_empty()
+            && !self.interrupt().is_empty()
             && !self.companion().is_empty()
             && !self.companion_rail_prefix().is_empty()
             && !self.revert().is_empty()
@@ -139,6 +147,26 @@ impl GlyphSet {
 
 pub(crate) fn glyph_set() -> GlyphSet {
     GlyphSet::current()
+}
+
+pub(crate) fn thinking() -> &'static str {
+    glyph_set().thinking()
+}
+
+pub(crate) fn check() -> &'static str {
+    glyph_set().check()
+}
+
+pub(crate) fn cross() -> &'static str {
+    glyph_set().cross()
+}
+
+pub(crate) fn interrupt() -> &'static str {
+    glyph_set().interrupt()
+}
+
+pub(crate) fn revert() -> &'static str {
+    glyph_set().revert()
 }
 
 pub(crate) fn glyph_capability() -> GlyphCapability {
@@ -267,6 +295,7 @@ mod tests {
         assert_eq!(glyphs.spinner(0), "⠧");
         assert_eq!(glyphs.check(), "✓");
         assert_eq!(glyphs.cross(), "✗");
+        assert_eq!(glyphs.interrupt(), "■");
         assert_eq!(glyphs.companion(), "◆");
         assert_eq!(glyphs.companion_rail_prefix(), "▌ ");
         assert_eq!(glyphs.revert(), "↩");
@@ -289,6 +318,7 @@ mod tests {
         assert_eq!(glyphs.spinner(4), "-");
         assert_eq!(glyphs.check(), "ok");
         assert_eq!(glyphs.cross(), "x");
+        assert_eq!(glyphs.interrupt(), "#");
         assert_eq!(glyphs.companion(), "&");
         assert_eq!(glyphs.companion_rail_prefix(), "| ");
         assert_eq!(glyphs.revert(), "<-");

@@ -1,3 +1,4 @@
+use crate::ui::glyphs;
 use crate::ui::patch_diff::{self, PatchDisplay};
 use crate::ui::text::{
     blank_gutter, content_width, display_width, is_ledger_gutter, tree_gutter_last,
@@ -242,9 +243,9 @@ pub(super) fn render_permission_decision(
     width: u16,
 ) {
     let glyph = if view.allowed == Some(true) {
-        "✓ "
+        glyphs::check()
     } else {
-        "✗ "
+        glyphs::cross()
     };
     let scope_label = match (view.allowed, view.grant_scope) {
         (Some(true), Some("session")) => "allowed for session",
@@ -270,10 +271,11 @@ pub(super) fn render_permission_decision(
     } else {
         format!("Permission decided: {capability} ({decision})")
     };
+    let text = format!("{glyph} {text}");
     push_wrapped_with_prefix(
         lines,
         CellPrefixes {
-            first: glyph,
+            first: blank_gutter(),
             next: "  ",
         },
         &text,
@@ -465,13 +467,17 @@ fn consequences_row(capability: &str, scope_prefix: Option<&str>) -> String {
 }
 
 pub(super) fn render_interrupted(lines: &mut Vec<Line<'static>>, theme: &Theme, width: u16) {
+    let text = format!(
+        "{} interrupted — tell euler what to do differently",
+        glyphs::interrupt()
+    );
     push_wrapped_with_prefix(
         lines,
         CellPrefixes {
-            first: "■ ",
+            first: blank_gutter(),
             next: "  ",
         },
-        "interrupted — tell euler what to do differently",
+        &text,
         theme.transcript.warning,
         theme,
         width,
@@ -544,7 +550,7 @@ pub(crate) fn resume_boundary_decision_text(
     recovery_closure_appended: bool,
     warning_count: usize,
 ) -> String {
-    let mut decision = format!("✓ resumed session {label}");
+    let mut decision = format!("{} resumed session {label}", glyphs::check());
     if recovery_closure_appended {
         decision.push_str(" · recovery closure appended");
     }
@@ -828,11 +834,12 @@ pub(super) fn render_resume_boundary(
 
 pub(super) fn tool_failure_status(exit_code: Option<i64>, error: &str) -> String {
     let cause = error.trim();
+    let cross = glyphs::cross();
     match (exit_code, cause.is_empty()) {
-        (Some(code), true) => format!("✗ exit {code}"),
-        (Some(code), false) => format!("✗ exit {code}: {cause}"),
-        (None, true) => "✗ failed — no cause recorded".to_owned(),
-        (None, false) => format!("✗ {cause}"),
+        (Some(code), true) => format!("{cross} exit {code}"),
+        (Some(code), false) => format!("{cross} exit {code}: {cause}"),
+        (None, true) => format!("{cross} failed — no cause recorded"),
+        (None, false) => format!("{cross} {cause}"),
     }
 }
 
@@ -845,10 +852,11 @@ pub(super) fn edit_failure_status(path: &str, error: &str) -> String {
         cause
     };
     let path = path.trim();
+    let cross = glyphs::cross();
     if path.is_empty() {
-        format!("edit ✗ {cause}")
+        format!("edit {cross} {cause}")
     } else {
-        format!("edit {path} ✗ {cause}")
+        format!("edit {path} {cross} {cause}")
     }
 }
 
@@ -934,12 +942,15 @@ fn diff_redaction_label(diff_redaction: &str) -> String {
 }
 
 fn tool_run_footer(run: ToolRunRender<'_>, total_rows: usize, folded: bool) -> String {
+    let cross = glyphs::cross();
     let status = match (run.exit_code, run.ok) {
         (Some(code), true) => format!("exit {code}"),
-        (Some(code), false) => format!("✗ exit {code}"),
+        (Some(code), false) => format!("{cross} exit {code}"),
         (None, true) => "done".to_owned(),
-        (None, false) if run.error.trim().is_empty() => "✗ failed — no cause recorded".to_owned(),
-        (None, false) => format!("✗ {}", run.error.trim()),
+        (None, false) if run.error.trim().is_empty() => {
+            format!("{cross} failed — no cause recorded")
+        }
+        (None, false) => format!("{cross} {}", run.error.trim()),
     };
     let line_label = if total_rows == 1 {
         "1 line".to_owned()

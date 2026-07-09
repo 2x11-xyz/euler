@@ -331,7 +331,10 @@ slice-complete (Process rules); LOC only at PR.
    `new session eNNNN · resumable with /resume · / for commands`.
 10. Composer states: empty ghost `message euler · / commands`; multiline rail;
     working dim rail + interrupt copy (queue UI may still be later).
-11. Glyph fallbacks wired.
+11. Core ledger glyphs (user-rail, thinking, check/cross, revert,
+    interrupt, companion) route through GlyphSet accessors; remaining
+    tree-glyph/spinner/warning consumers still hardcode Unicode — consumer
+    wiring is debt.
 12. Update tests that assert `┌`.
 
 **Exit:** Startup/active structure matches Spec (banner exact); `/theme`
@@ -588,6 +591,9 @@ Still open (do not invent beyond Spec; tag first blocking slice):
 10. Reduced-motion / no-color: detect vs user setting — **Slice 1 / hardening**.
 11. Notification body privacy limits — **Slice 11**.
 12. Extension manager add/remove/toggle records: current transcript notices must become canonical decision-record ledger events — **Slice 9 debt**.
+13. Full glyph consumer wiring: route remaining tree-glyph, spinner, warning,
+    prompt, and non-ledger notice glyphs through `GlyphSet` accessors before
+    claiming complete ASCII/no-color fallback coverage — **Slice 1 debt / hardening**.
 
 ## Appendix B · GPT-5.5 audit incorporation checklist
 

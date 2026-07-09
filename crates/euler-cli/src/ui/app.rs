@@ -3013,11 +3013,14 @@ impl AppCore {
         ) {
             return None;
         }
+        let interrupt = super::glyphs::interrupt();
         if self.interrupted_guidance {
-            return Some("■ interrupted — tell euler what to do differently".to_owned());
+            return Some(format!(
+                "{interrupt} interrupted — tell euler what to do differently"
+            ));
         }
         if self.in_flight_error.is_some() {
-            return Some("■ turn failed — waiting for cleanup".to_owned());
+            return Some(format!("{interrupt} turn failed — waiting for cleanup"));
         }
         let AppState::TurnInFlight { started_at, .. } = &self.state else {
             return None;

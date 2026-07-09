@@ -9,7 +9,7 @@ use super::cells::{
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
-use crate::ui::glyphs::user_line_prefix;
+use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
 use crate::ui::text::{
     blank_gutter, content_width, display_width, gutter_width, hairline_content, is_ledger_gutter,
@@ -168,7 +168,10 @@ pub(super) fn render_projected_entries_with_expansion(
                     push_wrapped(
                         &mut lines,
                         blank_gutter(),
-                        &format!("✱ {label} for {elapsed} · ctrl+o collapse"),
+                        &format!(
+                            "{} {label} for {elapsed} · ctrl+o collapse",
+                            glyphs::thinking()
+                        ),
                         theme.transcript.reasoning,
                         theme,
                         width,
@@ -417,7 +420,8 @@ pub(super) fn render_projected_entries_with_expansion(
                     &mut lines,
                     blank_gutter(),
                     &format!(
-                        "↩ reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact"
+                        "{} reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact",
+                        glyphs::revert()
                     ),
                     theme.transcript.muted,
                     theme,
@@ -777,7 +781,8 @@ fn push_bounded_detail(
 
 fn reasoning_summary(label: &str, content: &str, elapsed: &str) -> String {
     format!(
-        "✱ {label} for {elapsed} — {} · ctrl+o expand",
+        "{} {label} for {elapsed} — {} · ctrl+o expand",
+        glyphs::thinking(),
         reasoning_gist(content)
     )
 }
