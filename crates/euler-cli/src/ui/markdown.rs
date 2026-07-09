@@ -20,6 +20,8 @@ use std::{borrow::Cow, ops::Range};
 // resize stability for readable native tables only when width is sufficient.
 const MAX_GRID_TABLE_COLUMNS: usize = 5;
 const STACKED_TABLE_COLUMN_WIDTH_THRESHOLD: usize = 22;
+const TABLE_COLUMN_SEPARATOR: &str = " │ ";
+const TABLE_COLUMN_SEPARATOR_WIDTH: usize = 3;
 
 #[derive(Clone, Debug)]
 struct Cell {
@@ -515,7 +517,13 @@ fn render_table(table: TableState, theme: &Theme, width: u16) -> Vec<Line<'stati
         } else if idx > 1 {
             out.push(separator_line(&widths, '─', theme));
         }
-        out.extend(table_row_lines(row, &widths, &table.alignments, theme));
+        out.extend(table_row_lines(
+            row,
+            &widths,
+            &table.alignments,
+            theme,
+            idx == 0,
+        ));
     }
     out
 }
@@ -636,7 +644,7 @@ fn table_widths(rows: &[Vec<Cell>], columns: usize, width: u16) -> Vec<usize> {
             widths[idx] = widths[idx].max(display_width(&cell.plain()));
         }
     }
-    let gap_width = columns.saturating_sub(1) * 2;
+    let gap_width = columns.saturating_sub(1) * TABLE_COLUMN_SEPARATOR_WIDTH;
     let budget = usize::from(width).saturating_sub(gap_width).max(columns);
     shrink_widths(widths, budget)
 }
@@ -655,12 +663,33 @@ fn shrink_widths(mut widths: Vec<usize>, budget: usize) -> Vec<usize> {
 }
 
 fn separator_line(widths: &[usize], marker: char, theme: &Theme) -> Line<'static> {
-    let text = widths
-        .iter()
-        .map(|width| marker.to_string().repeat(*width))
-        .collect::<Vec<_>>()
-        .join("  ");
+    let fill = marker.to_string();
+    let joint = separator_joint(marker);
+    let last = widths.len().saturating_sub(1);
+    let mut text = String::new();
+    for (idx, width) in widths.iter().enumerate() {
+        if idx > 0 {
+            text.push(joint);
+        }
+        text.push_str(&fill.repeat(width + separator_padding_width(idx, last)));
+    }
     Line::from(Span::styled(text, theme.transcript.gutter))
+}
+
+fn separator_joint(marker: char) -> char {
+    if marker == '━' {
+        '╋'
+    } else {
+        '┼'
+    }
+}
+
+fn separator_padding_width(idx: usize, last: usize) -> usize {
+    match (idx == 0, idx == last) {
+        (true, true) => 0,
+        (true, false) | (false, true) => 1,
+        (false, false) => 2,
+    }
 }
 
 fn table_row_lines(
@@ -668,6 +697,7 @@ fn table_row_lines(
     widths: &[usize],
     alignments: &[Alignment],
     theme: &Theme,
+    header: bool,
 ) -> Vec<Line<'static>> {
     let cells = widths
         .iter()
@@ -686,7 +716,7 @@ fn table_row_lines(
         .collect::<Vec<_>>();
     let height = cells.iter().map(Vec::len).max().unwrap_or(1);
     (0..height)
-        .map(|row_idx| table_row_line(row_idx, &cells, widths, alignments, theme))
+        .map(|row_idx| table_row_line(row_idx, &cells, widths, alignments, theme, header))
         .collect()
 }
 
@@ -696,11 +726,16 @@ fn table_row_line(
     widths: &[usize],
     alignments: &[Alignment],
     theme: &Theme,
+    header: bool,
 ) -> Line<'static> {
     let mut spans = Vec::new();
+    let cell_style = table_cell_style(theme, header);
     for (idx, width) in widths.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                TABLE_COLUMN_SEPARATOR.to_owned(),
+                theme.transcript.gutter,
+            ));
         }
         let text = cells
             .get(idx)
@@ -709,10 +744,18 @@ fn table_row_line(
             .unwrap_or_default();
         spans.push(Span::styled(
             align_text(&text, *width, alignments.get(idx).copied()),
-            theme.transcript.assistant,
+            cell_style,
         ));
     }
     Line::from(spans)
+}
+
+fn table_cell_style(theme: &Theme, header: bool) -> Style {
+    if header {
+        theme.transcript.assistant.add_modifier(Modifier::BOLD)
+    } else {
+        theme.transcript.assistant
+    }
 }
 
 fn align_text(text: &str, width: usize, alignment: Option<Alignment>) -> String {
