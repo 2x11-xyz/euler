@@ -245,6 +245,64 @@ fn theme_preference_from_json(contents: &str) -> ThemePreferenceLoad {
     }
 }
 
+/// Saved `/code-swarm` reviewer model set (`provider::model` strings, 1–5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodeSwarmModelsLoad {
+    Loaded(Vec<String>),
+    Missing,
+    Ignored(String),
+}
+
+pub fn load_code_swarm_models_preference(path: &Path) -> CodeSwarmModelsLoad {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return CodeSwarmModelsLoad::Missing,
+        Err(error) => {
+            return CodeSwarmModelsLoad::Ignored(format!(
+                "could not read code-swarm models preference: {error}"
+            ));
+        }
+    };
+    let value: Value = match serde_json::from_str(&contents) {
+        Ok(value) => value,
+        Err(error) => {
+            return CodeSwarmModelsLoad::Ignored(format!(
+                "malformed code-swarm models preference: {error}"
+            ));
+        }
+    };
+    let Some(models) = value.as_object().and_then(|object| object.get("code_swarm_models")) else {
+        return CodeSwarmModelsLoad::Missing;
+    };
+    let Some(entries) = models.as_array() else {
+        return CodeSwarmModelsLoad::Ignored(
+            "malformed code-swarm models preference: expected array".to_owned(),
+        );
+    };
+    let parsed: Vec<String> = entries
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|entry| entry.contains("::"))
+        .map(str::to_owned)
+        .collect();
+    if parsed.is_empty() || parsed.len() != entries.len() || parsed.len() > 5 {
+        return CodeSwarmModelsLoad::Ignored(
+            "malformed code-swarm models preference: expected 1-5 provider::model strings"
+                .to_owned(),
+        );
+    }
+    CodeSwarmModelsLoad::Loaded(parsed)
+}
+
+pub fn save_code_swarm_models_preference(path: &Path, models: &[String]) -> Result<()> {
+    let mut payload = read_preference_object_for_save(path)?;
+    payload.insert(
+        "code_swarm_models".to_owned(),
+        Value::Array(models.iter().cloned().map(Value::String).collect()),
+    );
+    write_preference_object(path, payload)
+}
+
 fn read_preference_object_for_save(path: &Path) -> Result<Map<String, Value>> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,

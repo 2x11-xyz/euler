@@ -20,6 +20,8 @@ pub struct CommandContext {
     pub extension_items: Vec<ExtensionManagerItem>,
     /// Extension slash entries (⋄ annotated in the palette).
     pub extension_slash_commands: Vec<ExtensionSlashCommand>,
+    /// Saved `/code-swarm` reviewer model set (provider::model strings).
+    pub code_swarm_models: Vec<String>,
 }
 
 /// One extension row for the `/extension` manager picker.
@@ -345,6 +347,15 @@ pub enum CommandAction {
     CompanionRun {
         input: serde_json::Value,
     },
+    /// Persist the `/code-swarm` reviewer model set (1-5 provider::model).
+    CodeSwarmSaveModels {
+        models: Vec<String>,
+    },
+    /// Run the reviewer swarm: brief -> spawn companions -> report.
+    CodeSwarmReview {
+        prompt: Option<String>,
+        personas: Option<Vec<String>>,
+    },
     ShowStatus,
     Login {
         provider: String,
@@ -422,6 +433,11 @@ pub enum PickerSpec {
     Resume(Vec<ResumeItem>),
     Rollback(Vec<CheckpointItem>),
     Extensions(Vec<ExtensionManagerItem>),
+    /// `/code-swarm` reviewer-model checklist: selection IS the agent count.
+    CodeSwarmModels {
+        choices: Vec<ModelChoice>,
+        selected: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -628,6 +644,20 @@ pub fn build_extension_slash_commands(
     let mut claimed = core_tokens;
     let mut out = Vec::new();
     for item in items {
+        if item.id == "code-swarm" {
+            // TUI-side surface (picker + orchestration) keyed to this
+            // extension; dispatched by the explicit "/code-swarm" arm, never
+            // by the generic ExtensionRun fallback. v1 special case — see
+            // docs/reviews/extension-ux-code-swarm-2026-07-09.md.
+            claimed.insert("code-swarm".to_owned());
+            out.push(ExtensionSlashCommand {
+                token: "/code-swarm".to_owned(),
+                summary: format!("{} · reviewer swarm", item.id),
+                extension_id: item.id.clone(),
+                command: "swarm".to_owned(),
+                enabled: item.enabled,
+            });
+        }
         for command in &item.commands {
             let short = command.to_lowercase();
             let (token, summary) = if claimed.contains(&short) {
@@ -771,8 +801,77 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/diff" => CommandEffect::Action(CommandAction::ShowDiff),
         "/usage" => CommandEffect::Action(CommandAction::ShowUsage),
         "/dag" => CommandEffect::Action(CommandAction::DagExport),
+        "/code-swarm" => code_swarm_effect(parsed.arg, context),
         token => extension_slash_or_unknown(token, parsed.arg, context),
     }
+}
+
+/// `/code-swarm` — extension-provided surface (teaches when disabled).
+/// No arg: open the reviewer-model checklist picker (selection IS the count).
+/// `review [--personas a,b,c] [--prompt <text…>]`: run the swarm.
+fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
+    const USAGE: &str = "usage: /code-swarm  or  /code-swarm review [--personas correctness,safety,tests] [--prompt <focus…>]";
+    let enabled = context
+        .extension_items
+        .iter()
+        .find(|item| item.id == "code-swarm")
+        .is_some_and(|item| item.enabled);
+    if !enabled {
+        return CommandEffect::Message(disabled_extension_teach("/code-swarm", "code-swarm"));
+    }
+    let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
+        return CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
+            choices: context.model_choices.clone(),
+            selected: context.code_swarm_models.clone(),
+        });
+    };
+    let Some(rest) = arg.strip_prefix("review") else {
+        return CommandEffect::Message(USAGE.to_owned());
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return CommandEffect::Message(USAGE.to_owned());
+    }
+    match parse_code_swarm_review_args(rest.trim_start()) {
+        Ok((prompt, personas)) => {
+            CommandEffect::Action(CommandAction::CodeSwarmReview { prompt, personas })
+        }
+        Err(message) => CommandEffect::Message(format!("{message}\n{USAGE}")),
+    }
+}
+
+/// `--personas a,b,c` and `--prompt <everything after it>`. Prompt must come
+/// last so it can contain spaces without quoting.
+#[allow(clippy::type_complexity)]
+fn parse_code_swarm_review_args(
+    rest: &str,
+) -> Result<(Option<String>, Option<Vec<String>>), String> {
+    let mut prompt = None;
+    let mut personas = None;
+    let mut remaining = rest.trim();
+    while !remaining.is_empty() {
+        if let Some(value) = remaining.strip_prefix("--prompt") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err("--prompt requires text".to_owned());
+            }
+            prompt = Some(value.to_owned());
+            remaining = "";
+        } else if let Some(value) = remaining.strip_prefix("--personas") {
+            let value = value.trim_start();
+            let (list, rest) = match value.split_once(char::is_whitespace) {
+                Some((list, rest)) => (list, rest.trim_start()),
+                None => (value, ""),
+            };
+            if list.is_empty() {
+                return Err("--personas requires a comma-separated list".to_owned());
+            }
+            personas = Some(list.split(',').map(str::trim).map(str::to_owned).collect());
+            remaining = rest;
+        } else {
+            return Err(format!("unknown argument: {remaining}"));
+        }
+    }
+    Ok((prompt, personas))
 }
 
 fn extension_slash_or_unknown(
@@ -1316,6 +1415,91 @@ mod tests {
         assert!(cmds.iter().any(|c| c.token == "/causal-dag.export"));
         assert!(cmds.iter().any(|c| c.token == "/catch-up"));
         assert!(!cmds.iter().any(|c| c.token == "/export"));
+    }
+
+    fn code_swarm_context(enabled: bool) -> CommandContext {
+        CommandContext {
+            model_choices: vec![
+                ModelChoice::new("openrouter", "z-ai/glm-5.2"),
+                ModelChoice::new("anthropic", "claude-opus-5"),
+                ModelChoice::new("openai", "gpt-5.5"),
+                ModelChoice::new("mistral", "large-3"),
+            ],
+            extension_items: vec![ExtensionManagerItem {
+                id: "code-swarm".to_owned(),
+                display_name: "CodeSwarm Review".to_owned(),
+                enabled,
+                bundled: true,
+                materialization: None,
+                version: "0.1.0".to_owned(),
+                commands: vec!["review-brief".to_owned(), "review-report".to_owned()],
+                capabilities: vec![],
+                audit_status: None,
+            }],
+            ..CommandContext::default()
+        }
+    }
+
+    #[test]
+    fn code_swarm_no_arg_opens_model_checklist_picker() {
+        let context = code_swarm_context(true);
+        match dispatch_command("/code-swarm", &context) {
+            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels { choices, selected }) => {
+                assert_eq!(choices.len(), 4);
+                assert!(selected.is_empty());
+            }
+            other => panic!("expected picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_swarm_review_parses_personas_and_trailing_prompt() {
+        let context = code_swarm_context(true);
+        assert_eq!(
+            dispatch_command(
+                "/code-swarm review --personas tests,safety --prompt focus on the retry logic",
+                &context
+            ),
+            CommandEffect::Action(CommandAction::CodeSwarmReview {
+                prompt: Some("focus on the retry logic".to_owned()),
+                personas: Some(vec!["tests".to_owned(), "safety".to_owned()]),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/code-swarm review", &context),
+            CommandEffect::Action(CommandAction::CodeSwarmReview {
+                prompt: None,
+                personas: None,
+            })
+        );
+        assert!(matches!(
+            dispatch_command("/code-swarm review --bogus", &context),
+            CommandEffect::Message(message) if message.contains("usage:")
+        ));
+        assert!(matches!(
+            dispatch_command("/code-swarm bogus", &context),
+            CommandEffect::Message(message) if message.contains("usage:")
+        ));
+    }
+
+    #[test]
+    fn code_swarm_disabled_teaches_and_palette_entry_registers() {
+        let context = code_swarm_context(false);
+        assert_eq!(
+            dispatch_command("/code-swarm", &context),
+            CommandEffect::Message(disabled_extension_teach("/code-swarm", "code-swarm"))
+        );
+
+        let cmds = build_extension_slash_commands(&context.extension_items);
+        let entry = cmds
+            .iter()
+            .find(|cmd| cmd.token == "/code-swarm")
+            .expect("code-swarm palette entry");
+        assert_eq!(entry.extension_id, "code-swarm");
+        assert!(entry.summary.contains("reviewer swarm"));
+        assert!(!entry.enabled);
+        // The command tokens still register alongside the surface token.
+        assert!(cmds.iter().any(|cmd| cmd.token == "/review-brief"));
     }
 
     #[test]

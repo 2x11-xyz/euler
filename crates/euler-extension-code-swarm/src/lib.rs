@@ -189,6 +189,7 @@ struct ModelTarget {
 struct ReviewBriefInput {
     charters: Vec<Charter>,
     models: Vec<ModelTarget>,
+    prompt: Option<String>,
     max_tokens: u64,
 }
 
@@ -200,10 +201,11 @@ impl ReviewBriefInput {
         let object = value
             .as_object()
             .ok_or_else(|| input_error("code-swarm review-brief input must be a JSON object"))?;
-        reject_unknown_fields(object, &["reviewers", "models", "max_tokens"])?;
+        reject_unknown_fields(object, &["reviewers", "models", "prompt", "max_tokens"])?;
         Ok(Self {
             charters: parse_charters(object.get("reviewers"))?,
             models: parse_models(object.get("models"))?,
+            prompt: optional_string(object, "prompt")?.filter(|prompt| !prompt.trim().is_empty()),
             max_tokens: parse_positive_u64(object, "max_tokens", DEFAULT_MAX_TOKENS)?,
         })
     }
@@ -212,11 +214,12 @@ impl ReviewBriefInput {
     /// count (1–5); charters cycle round-robin across agents. Without models
     /// the historical behavior stands: one inheriting brief per charter.
     fn briefs(&self) -> Vec<Value> {
+        let prompt = self.prompt.as_deref();
         if self.models.is_empty() {
             return self
                 .charters
                 .iter()
-                .map(|charter| charter_brief(charter, None, self.max_tokens))
+                .map(|charter| charter_brief(charter, None, prompt, self.max_tokens))
                 .collect();
         }
         self.models
@@ -224,7 +227,7 @@ impl ReviewBriefInput {
             .enumerate()
             .map(|(index, target)| {
                 let charter = &self.charters[index % self.charters.len()];
-                charter_brief(charter, Some(target), self.max_tokens)
+                charter_brief(charter, Some(target), prompt, self.max_tokens)
             })
             .collect()
     }
@@ -235,6 +238,7 @@ impl Default for ReviewBriefInput {
         Self {
             charters: CHARTERS.to_vec(),
             models: Vec::new(),
+            prompt: None,
             max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
@@ -376,6 +380,13 @@ fn review_brief_args() -> Vec<ArgSpec> {
             required: false,
             repeatable: true,
         },
+        ArgSpec {
+            flag: "prompt".to_owned(),
+            input_key: "prompt".to_owned(),
+            value_kind: ArgValueKind::BoundedString { max_bytes: 2000 },
+            required: false,
+            repeatable: false,
+        },
         positive_arg("max-tokens", "max_tokens"),
     ]
 }
@@ -404,15 +415,25 @@ fn positive_arg(flag: &str, input_key: &str) -> ArgSpec {
     }
 }
 
-fn charter_brief(charter: &Charter, target: Option<&ModelTarget>, max_tokens: u64) -> Value {
+fn charter_brief(
+    charter: &Charter,
+    target: Option<&ModelTarget>,
+    prompt: Option<&str>,
+    max_tokens: u64,
+) -> Value {
     let (provider, model) = target
         .map(|target| (target.provider.as_str(), target.model.as_str()))
         .unwrap_or(("", ""));
+    let mut task = format!(
+        "Review the work visible in this session as the {} reviewer. Companion agents see the session canvas; no event listing is needed. Stay review-only and return concise findings about the current session's work.",
+        charter.name
+    );
+    if let Some(prompt) = prompt {
+        task.push_str("\nReview focus: ");
+        task.push_str(prompt);
+    }
     json!({
-        "task": format!(
-            "Review the work visible in this session as the {} reviewer. Companion agents see the session canvas; no event listing is needed. Stay review-only and return concise findings about the current session's work.",
-            charter.name
-        ),
+        "task": task,
         "persona": format!("{PERSONA_PREFIX}{}", charter.name),
         "provider": provider,
         "model": model,

@@ -104,6 +104,10 @@ impl BottomSurface {
         self.set_composer_text(text);
     }
 
+    pub fn context(&self) -> &CommandContext {
+        &self.context
+    }
+
     pub fn reset_context(&mut self, context: CommandContext) {
         self.composer = ComposerDraft::new();
         self.owner = BottomOwner::Composer;
@@ -215,6 +219,36 @@ impl BottomSurface {
             &self.owner,
             BottomOwner::Picker(picker) if picker.kind == PickerKind::Extensions
         )
+    }
+
+    pub fn is_code_swarm_picker(&self) -> bool {
+        matches!(
+            &self.owner,
+            BottomOwner::Picker(picker) if picker.kind == PickerKind::CodeSwarmModels
+        )
+    }
+
+    /// Space in the `/code-swarm` checklist toggles the selected row.
+    /// Checking beyond the cap is refused (the row stays visible and dim in
+    /// the design); unchecking below 1 is allowed — the minimum is enforced
+    /// at save.
+    pub fn code_swarm_toggle(&mut self) -> Option<SurfaceEvent> {
+        let BottomOwner::Picker(picker) = &mut self.owner else {
+            return None;
+        };
+        if picker.kind != PickerKind::CodeSwarmModels {
+            return None;
+        }
+        let checked = picker.items.iter().filter(|item| item.current).count();
+        let index = picker.selected_item_index()?;
+        let item = &mut picker.items[index];
+        if !item.current && checked >= CODE_SWARM_MAX_MODELS {
+            return Some(SurfaceEvent::Message(
+                "at 5/5 further checks are refused — uncheck one to free a slot".to_owned(),
+            ));
+        }
+        item.current = !item.current;
+        Some(SurfaceEvent::None)
     }
 
     /// Handle manager-only keys: space toggle, a add, x remove. Enter uses confirm.
@@ -511,6 +545,20 @@ impl BottomSurface {
     }
 
     fn confirm_picker(&mut self, picker: ReplacementPicker) -> SurfaceEvent {
+        // Code-swarm checklist: Enter saves the whole checked set.
+        if picker.kind == PickerKind::CodeSwarmModels {
+            let models: Vec<String> = picker
+                .items
+                .iter()
+                .filter(|item| item.current)
+                .filter_map(|item| item.provider_tag.clone())
+                .collect();
+            if models.is_empty() {
+                self.owner = BottomOwner::Picker(picker);
+                return SurfaceEvent::Message("select at least 1 model (min 1 · max 5)".to_owned());
+            }
+            return self.apply_action(CommandAction::CodeSwarmSaveModels { models });
+        }
         // Extension manager: Enter shows details.
         if picker.kind == PickerKind::Extensions {
             return match picker.selected_extension_item() {
@@ -949,11 +997,12 @@ enum PickerKind {
     Model,
     Resume,
     Extensions,
+    CodeSwarmModels,
 }
 
 impl PickerKind {
     fn searchable(self) -> bool {
-        matches!(self, Self::Model | Self::Resume)
+        matches!(self, Self::Model | Self::Resume | Self::CodeSwarmModels)
     }
 }
 
@@ -1049,6 +1098,9 @@ impl ReplacementPicker {
         if self.kind == PickerKind::Extensions {
             return self.render_extension_lines(width);
         }
+        if self.kind == PickerKind::CodeSwarmModels {
+            return self.render_code_swarm_lines(width);
+        }
         let mut lines = vec![truncate_display(
             &format!("{} {}", self.title, self.position_indicator()),
             usize::from(width),
@@ -1061,6 +1113,43 @@ impl ReplacementPicker {
         );
         lines.push(truncate_display(
             " Enter select  Esc close",
+            usize::from(width),
+        ));
+        lines
+    }
+
+    fn render_code_swarm_lines(&self, width: u16) -> Vec<String> {
+        let checked = self.items.iter().filter(|item| item.current).count();
+        let mut lines = vec![truncate_display(
+            &format!(
+                "{}  ·  {checked} selected · 1–5  {}",
+                self.title,
+                self.position_indicator()
+            ),
+            usize::from(width),
+        )];
+        if !self.query.is_empty() {
+            lines.push(truncate_display(
+                &format!(
+                    " / {}  ·  {} shown · esc clears filter",
+                    self.query,
+                    self.filtered_indices().len()
+                ),
+                usize::from(width),
+            ));
+        }
+        for (offset, item_index) in self.visible_item_indices().iter().enumerate() {
+            let selected = self.scroll_offset + offset == self.selected;
+            let item = &self.items[*item_index];
+            let marker = if selected { "›" } else { " " };
+            let checkbox = if item.current { "[x]" } else { "[ ]" };
+            lines.push(truncate_display(
+                &format!("{marker} {checkbox} {}", item.label),
+                usize::from(width),
+            ));
+        }
+        lines.push(truncate_display(
+            &format!(" swarm runs {checked} models in parallel · space toggle · ⏎ save · esc cancel · min 1 · max 5"),
             usize::from(width),
         ));
         lines
@@ -1351,6 +1440,10 @@ impl ReplacementPicker {
         self.items.get(index)
     }
 
+    fn selected_item_index(&self) -> Option<usize> {
+        self.filtered_indices().get(self.selected).copied()
+    }
+
     fn visible_item_indices(&self) -> Vec<usize> {
         let indices = self.filtered_indices();
         let start = self.scroll_offset.min(indices.len());
@@ -1414,8 +1507,45 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             "Extensions".to_owned(),
             extension_manager_items(items),
         ),
+        PickerSpec::CodeSwarmModels { choices, selected } => (
+            PickerKind::CodeSwarmModels,
+            "/code-swarm · reviewer models".to_owned(),
+            code_swarm_model_items(choices, &selected),
+        ),
     }
 }
+
+/// Checklist rows for the `/code-swarm` picker. `current` is the checked
+/// state; with no saved selection the first three catalog entries are
+/// pre-checked (the design's default of 3).
+fn code_swarm_model_items(choices: Vec<ModelChoice>, selected: &[String]) -> Vec<PickerItem> {
+    choices
+        .into_iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            let target = format!("{}::{}", choice.provider, choice.model);
+            let checked = if selected.is_empty() {
+                index < CODE_SWARM_MAX_MODELS.min(3)
+            } else {
+                selected.iter().any(|entry| entry == &target)
+            };
+            PickerItem {
+                label: choice.label,
+                detail: None,
+                status: None,
+                group: None,
+                provider_tag: Some(target),
+                current: checked,
+                // Placeholder: confirm_picker collects the checked set and
+                // dispatches one CodeSwarmSaveModels for the whole picker.
+                action: CommandAction::CodeSwarmSaveModels { models: vec![] },
+            }
+        })
+        .collect()
+}
+
+/// Swarm cap (mirrors the extension's MAX_SWARM_AGENTS).
+const CODE_SWARM_MAX_MODELS: usize = 5;
 
 fn extension_manager_items(items: Vec<ExtensionManagerItem>) -> Vec<PickerItem> {
     items
@@ -1834,6 +1964,97 @@ mod tests {
     };
     use crate::ui::theme::ThemeChoice;
     use euler_core::{ApprovalMode, ReasoningEffort};
+
+    fn code_swarm_picker_surface(selected: Vec<String>) -> BottomSurface {
+        let mut surface = BottomSurface::new(CommandContext::default());
+        let choices = vec![
+            ModelChoice::new("openrouter", "z-ai/glm-5.2"),
+            ModelChoice::new("anthropic", "claude-opus-5"),
+            ModelChoice::new("openai", "gpt-5.5"),
+            ModelChoice::new("mistral", "large-3"),
+            ModelChoice::new("google", "gemini-3-pro"),
+            ModelChoice::new("fixture", "echo"),
+        ];
+        surface.open_picker(PickerSpec::CodeSwarmModels { choices, selected });
+        surface
+    }
+
+    fn code_swarm_checked(surface: &BottomSurface) -> usize {
+        let BottomOwner::Picker(picker) = surface.owner() else {
+            panic!("picker should own surface");
+        };
+        picker.items.iter().filter(|item| item.current).count()
+    }
+
+    #[test]
+    fn code_swarm_picker_defaults_to_first_three_checked() {
+        let surface = code_swarm_picker_surface(Vec::new());
+        assert_eq!(code_swarm_checked(&surface), 3);
+        let lines = {
+            let BottomOwner::Picker(picker) = surface.owner() else {
+                panic!("picker should own surface");
+            };
+            picker.render_lines(120).join("\n")
+        };
+        assert!(lines.contains("3 selected · 1–5"), "lines: {lines}");
+        assert!(lines.contains("[x] openrouter::z-ai/glm-5.2"), "lines: {lines}");
+        assert!(lines.contains("[ ] mistral::large-3"), "lines: {lines}");
+        assert!(lines.contains("min 1 · max 5"), "lines: {lines}");
+    }
+
+    #[test]
+    fn code_swarm_picker_restores_saved_selection() {
+        let surface = code_swarm_picker_surface(vec![
+            "openai::gpt-5.5".to_owned(),
+            "google::gemini-3-pro".to_owned(),
+        ]);
+        assert_eq!(code_swarm_checked(&surface), 2);
+    }
+
+    #[test]
+    fn code_swarm_toggle_enforces_cap_and_confirm_enforces_min() {
+        let mut surface = code_swarm_picker_surface(Vec::new());
+        // Check rows 4 and 5 (3 defaults + 2 = cap).
+        surface.move_selection_down();
+        surface.move_selection_down();
+        surface.move_selection_down();
+        assert_eq!(surface.code_swarm_toggle(), Some(SurfaceEvent::None));
+        surface.move_selection_down();
+        assert_eq!(surface.code_swarm_toggle(), Some(SurfaceEvent::None));
+        assert_eq!(code_swarm_checked(&surface), 5);
+        // Sixth check is refused.
+        surface.move_selection_down();
+        assert!(matches!(
+            surface.code_swarm_toggle(),
+            Some(SurfaceEvent::Message(message)) if message.contains("5/5")
+        ));
+        assert_eq!(code_swarm_checked(&surface), 5);
+
+        // Save collects exactly the checked set.
+        match surface.confirm() {
+            SurfaceEvent::Action(CommandAction::CodeSwarmSaveModels { models }) => {
+                assert_eq!(models.len(), 5);
+                assert!(models.contains(&"mistral::large-3".to_owned()));
+                assert!(!models.contains(&"fixture::echo".to_owned()));
+            }
+            other => panic!("expected save action, got {other:?}"),
+        }
+
+        // Unchecking everything and saving is refused (min 1).
+        let mut empty = code_swarm_picker_surface(vec!["fixture::echo".to_owned()]);
+        // fixture::echo is the last row; move there and uncheck it.
+        for _ in 0..5 {
+            empty.move_selection_down();
+        }
+        assert_eq!(empty.code_swarm_toggle(), Some(SurfaceEvent::None));
+        assert_eq!(code_swarm_checked(&empty), 0);
+        assert!(matches!(
+            empty.confirm(),
+            SurfaceEvent::Message(message) if message.contains("at least 1")
+        ));
+        // Picker stays open for correction.
+        assert!(matches!(empty.owner(), BottomOwner::Picker(_)));
+    }
 
     #[test]
     fn palette_opens_filters_navigates_autocompletes_confirms_and_cancels() {
