@@ -122,6 +122,29 @@ fn non_patch_permission_uses_generic_inline_ask() {
 }
 
 #[test]
+fn permission_panel_consequences_use_available_write_scope() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned())
+            .with_path("src/main.rs"),
+    ));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Edit file?"), "contents: {contents:?}");
+    assert!(
+        contents.contains("write scope src"),
+        "contents: {contents:?}"
+    );
+    assert!(
+        contents.contains("ran-before unknown"),
+        "contents: {contents:?}"
+    );
+}
+
+#[test]
 fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
     let mut terminal = Terminal::new(VT100Backend::new(58, 12)).expect("terminal");
     let mut core = core();
@@ -291,36 +314,39 @@ fn empty_deny_sets_denied_composer_ghost() {
 }
 
 #[test]
-fn permission_hotkeys_wait_until_instruction_draft_is_empty() {
-    let instruction = "wait — use cargo clean instead";
-    let mut core_with_instruction = core();
+fn typed_permission_instruction_does_not_fire_hotkeys() {
+    let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
-    core_with_instruction.reply_tx = reply_tx;
-    core_with_instruction.modal = Some(Modal::Permission(PermissionRequest::new(
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
         Capability::ShellExec,
         "tool run_shell".to_owned(),
     )));
 
-    for ch in instruction.chars() {
-        assert_eq!(
-            core_with_instruction.handle_input(key(KeyCode::Char(ch))),
-            CoreEffect::Render
-        );
+    for code in [
+        KeyCode::Char('w'),
+        KeyCode::Char('a'),
+        KeyCode::Char('i'),
+        KeyCode::Char('t'),
+        KeyCode::Char('y'),
+        KeyCode::Backspace,
+    ] {
+        assert_eq!(core.handle_input(key(code)), CoreEffect::Render);
     }
     assert!(matches!(
-        reply_rx.recv_timeout(Duration::from_millis(20)),
+        reply_rx.recv_timeout(Duration::from_millis(100)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
 
-    assert_eq!(
-        core_with_instruction.handle_input(key(KeyCode::Esc)),
-        CoreEffect::Render
-    );
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
     assert_eq!(
         reply_rx.recv().expect("reply"),
-        PermissionReply::DenyWithInstruction(instruction.into())
+        PermissionReply::DenyWithInstruction("wait".into())
     );
+}
 
+#[test]
+fn empty_permission_instruction_keeps_y_hotkey() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
