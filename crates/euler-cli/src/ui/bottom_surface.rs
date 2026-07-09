@@ -1,7 +1,7 @@
 use super::commands::{
-    dispatch_command, filter_commands, CheckpointItem, CommandAction, CommandContext,
-    CommandEffect, CommandSpec, EffortChoice, ModelChoice, PermissionChoice, PickerSpec,
-    ResumeItem, ThemeChoiceItem,
+    dispatch_command, filter_palette_entries, CheckpointItem, CommandAction, CommandContext,
+    CommandEffect, EffortChoice, ExtensionManagerItem, ModelChoice, PaletteEntry, PaletteEntryKind,
+    PermissionChoice, PickerSpec, ResumeItem, ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
 use super::search::TranscriptSearch;
@@ -37,6 +37,31 @@ pub enum BottomOwner {
     Picker(ReplacementPicker),
     Search(TranscriptSearch),
     Mention(MentionPicker),
+    /// Free-text path entry for extension add (`a` in the manager).
+    TextPrompt(TextPrompt),
+    /// One-line confirm for extension remove (`x` in the manager).
+    ConfirmPrompt(ConfirmPrompt),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextPrompt {
+    title: String,
+    input: String,
+    cursor: usize,
+    kind: TextPromptKind,
+    saved_draft: ComposerDraft,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextPromptKind {
+    ExtensionAddPath,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfirmPrompt {
+    message: String,
+    action: CommandAction,
+    saved_draft: ComposerDraft,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,6 +145,8 @@ impl BottomSurface {
             BottomOwner::Palette(palette) => Some(palette.render_lines(width)),
             BottomOwner::Picker(picker) => Some(picker.render_lines(width)),
             BottomOwner::Mention(mention) => Some(mention.render_lines(width)),
+            BottomOwner::TextPrompt(prompt) => Some(prompt.render_lines(width)),
+            BottomOwner::ConfirmPrompt(prompt) => Some(prompt.render_lines(width)),
             BottomOwner::Search(_) | BottomOwner::Composer => None,
         }
     }
@@ -129,6 +156,8 @@ impl BottomSurface {
             BottomOwner::Palette(palette) => palette.line_count(),
             BottomOwner::Picker(picker) => picker.line_count(),
             BottomOwner::Mention(mention) => mention.line_count(),
+            BottomOwner::TextPrompt(prompt) => prompt.line_count(),
+            BottomOwner::ConfirmPrompt(prompt) => prompt.line_count(),
             BottomOwner::Search(_) | BottomOwner::Composer => 0,
         }
     }
@@ -140,7 +169,11 @@ impl BottomSurface {
         match &self.owner {
             BottomOwner::Palette(palette) => Some(palette.cursor_target(width)),
             BottomOwner::Mention(mention) => Some(mention.cursor_target(width)),
-            BottomOwner::Picker(_) | BottomOwner::Search(_) | BottomOwner::Composer => None,
+            BottomOwner::TextPrompt(prompt) => Some(prompt.cursor_target(width)),
+            BottomOwner::Picker(_)
+            | BottomOwner::Search(_)
+            | BottomOwner::Composer
+            | BottomOwner::ConfirmPrompt(_) => None,
         }
     }
 
@@ -167,7 +200,67 @@ impl BottomSurface {
 
     pub fn open_palette(&mut self) {
         let saved_draft = self.composer.clone();
-        self.owner = BottomOwner::Palette(CommandPalette::new(saved_draft));
+        // Snapshot full palette (core + extension slash) for local filtering.
+        let entries = filter_palette_entries("/", &self.context);
+        self.owner = BottomOwner::Palette(CommandPalette::new(saved_draft, entries));
+    }
+
+    pub fn open_extension_manager(&mut self) {
+        let items = self.context.extension_items.clone();
+        self.open_picker(PickerSpec::Extensions(items));
+    }
+
+    pub fn is_extension_manager(&self) -> bool {
+        matches!(
+            &self.owner,
+            BottomOwner::Picker(picker) if picker.kind == PickerKind::Extensions
+        )
+    }
+
+    /// Handle manager-only keys: space toggle, a add, x remove. Enter uses confirm.
+    pub fn extension_manager_key(&mut self, ch: char) -> Option<SurfaceEvent> {
+        let (item, saved_draft) = {
+            let BottomOwner::Picker(picker) = &self.owner else {
+                return None;
+            };
+            if picker.kind != PickerKind::Extensions {
+                return None;
+            }
+            let item = picker.selected_extension_item()?;
+            (item, picker.saved_draft.clone())
+        };
+        match ch {
+            ' ' => {
+                let enable = !item.enabled;
+                let action = CommandAction::ExtensionToggle {
+                    id: item.id,
+                    enable,
+                };
+                Some(self.apply_action(action))
+            }
+            'a' | 'A' => {
+                self.owner = BottomOwner::TextPrompt(TextPrompt::new(
+                    TextPromptKind::ExtensionAddPath,
+                    "path to local extension package",
+                    saved_draft,
+                ));
+                Some(SurfaceEvent::None)
+            }
+            'x' | 'X' => {
+                if item.bundled {
+                    return Some(SurfaceEvent::Message(
+                        "bundled extensions can be toggled but not removed".to_owned(),
+                    ));
+                }
+                self.owner = BottomOwner::ConfirmPrompt(ConfirmPrompt {
+                    message: format!("remove extension {}?  Enter confirm  Esc cancel", item.id),
+                    action: CommandAction::ExtensionRemove { id: item.id },
+                    saved_draft,
+                });
+                Some(SurfaceEvent::None)
+            }
+            _ => None,
+        }
     }
 
     pub fn open_search(&mut self) {
@@ -188,30 +281,42 @@ impl BottomSurface {
     pub fn palette_insert(&mut self, text: &str) {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.insert_text(text),
-            BottomOwner::Picker(picker) => picker.insert_query_text(text),
+            BottomOwner::Picker(picker) => {
+                picker.clear_resume_preview();
+                picker.insert_query_text(text);
+            }
             BottomOwner::Mention(mention) => mention.insert_text(text),
             BottomOwner::Search(search) => search.insert_text(text),
-            BottomOwner::Composer => {}
+            BottomOwner::TextPrompt(prompt) => prompt.insert_text(text),
+            BottomOwner::Composer | BottomOwner::ConfirmPrompt(_) => {}
         }
     }
 
     pub fn palette_backspace(&mut self) {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.backspace(),
-            BottomOwner::Picker(picker) => picker.backspace_query(),
+            BottomOwner::Picker(picker) => {
+                picker.clear_resume_preview();
+                picker.backspace_query();
+            }
             BottomOwner::Mention(mention) => mention.backspace(),
             BottomOwner::Search(search) => search.backspace(),
-            BottomOwner::Composer => {}
+            BottomOwner::TextPrompt(prompt) => prompt.backspace(),
+            BottomOwner::Composer | BottomOwner::ConfirmPrompt(_) => {}
         }
     }
 
     pub fn palette_delete(&mut self) {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.delete(),
-            BottomOwner::Picker(picker) => picker.clear_query(),
+            BottomOwner::Picker(picker) => {
+                picker.clear_resume_preview();
+                picker.clear_query();
+            }
             BottomOwner::Mention(mention) => mention.delete(),
             BottomOwner::Search(search) => search.delete(),
-            BottomOwner::Composer => {}
+            BottomOwner::TextPrompt(prompt) => prompt.delete(),
+            BottomOwner::Composer | BottomOwner::ConfirmPrompt(_) => {}
         }
     }
 
@@ -220,7 +325,8 @@ impl BottomSurface {
             BottomOwner::Palette(palette) => palette.move_left(),
             BottomOwner::Mention(mention) => mention.move_left(),
             BottomOwner::Search(search) => search.move_left(),
-            BottomOwner::Picker(_) | BottomOwner::Composer => {}
+            BottomOwner::TextPrompt(prompt) => prompt.move_left(),
+            BottomOwner::Picker(_) | BottomOwner::Composer | BottomOwner::ConfirmPrompt(_) => {}
         }
     }
 
@@ -229,7 +335,8 @@ impl BottomSurface {
             BottomOwner::Palette(palette) => palette.move_right(),
             BottomOwner::Mention(mention) => mention.move_right(),
             BottomOwner::Search(search) => search.move_right(),
-            BottomOwner::Picker(_) | BottomOwner::Composer => {}
+            BottomOwner::TextPrompt(prompt) => prompt.move_right(),
+            BottomOwner::Picker(_) | BottomOwner::Composer | BottomOwner::ConfirmPrompt(_) => {}
         }
     }
 
@@ -238,7 +345,8 @@ impl BottomSurface {
             BottomOwner::Palette(palette) => palette.move_home(),
             BottomOwner::Mention(mention) => mention.move_home(),
             BottomOwner::Search(search) => search.move_home(),
-            BottomOwner::Picker(_) | BottomOwner::Composer => {}
+            BottomOwner::TextPrompt(prompt) => prompt.move_home(),
+            BottomOwner::Picker(_) | BottomOwner::Composer | BottomOwner::ConfirmPrompt(_) => {}
         }
     }
 
@@ -247,25 +355,51 @@ impl BottomSurface {
             BottomOwner::Palette(palette) => palette.move_end(),
             BottomOwner::Mention(mention) => mention.move_end(),
             BottomOwner::Search(search) => search.move_end(),
-            BottomOwner::Picker(_) | BottomOwner::Composer => {}
+            BottomOwner::TextPrompt(prompt) => prompt.move_end(),
+            BottomOwner::Picker(_) | BottomOwner::Composer | BottomOwner::ConfirmPrompt(_) => {}
         }
     }
 
     pub fn move_selection_down(&mut self) {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.move_down(),
-            BottomOwner::Picker(picker) => picker.move_down(),
+            BottomOwner::Picker(picker) => {
+                picker.clear_resume_preview();
+                picker.move_down();
+            }
             BottomOwner::Mention(mention) => mention.move_down(),
-            BottomOwner::Search(_) | BottomOwner::Composer => {}
+            BottomOwner::Search(_)
+            | BottomOwner::Composer
+            | BottomOwner::TextPrompt(_)
+            | BottomOwner::ConfirmPrompt(_) => {}
         }
     }
 
     pub fn move_selection_up(&mut self) {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.move_up(),
-            BottomOwner::Picker(picker) => picker.move_up(),
+            BottomOwner::Picker(picker) => {
+                picker.clear_resume_preview();
+                picker.move_up();
+            }
             BottomOwner::Mention(mention) => mention.move_up(),
-            BottomOwner::Search(_) | BottomOwner::Composer => {}
+            BottomOwner::Search(_)
+            | BottomOwner::Composer
+            | BottomOwner::TextPrompt(_)
+            | BottomOwner::ConfirmPrompt(_) => {}
+        }
+    }
+
+    pub fn resume_picker_selected_session_id(&self) -> Option<String> {
+        match &self.owner {
+            BottomOwner::Picker(picker) => picker.resume_selected_session_id(),
+            _ => None,
+        }
+    }
+
+    pub fn set_resume_ledger_preview(&mut self, lines: Vec<String>) {
+        if let BottomOwner::Picker(picker) = &mut self.owner {
+            picker.set_resume_preview(lines);
         }
     }
 
@@ -288,6 +422,8 @@ impl BottomSurface {
             BottomOwner::Palette(palette) => self.composer = palette.saved_draft,
             BottomOwner::Picker(picker) => self.composer = picker.saved_draft,
             BottomOwner::Mention(mention) => self.composer = mention.saved_draft,
+            BottomOwner::TextPrompt(prompt) => self.composer = prompt.saved_draft,
+            BottomOwner::ConfirmPrompt(prompt) => self.composer = prompt.saved_draft,
             BottomOwner::Search(_) => {
                 return SurfaceEvent::Action(CommandAction::ScrollViewportToBottom);
             }
@@ -301,6 +437,8 @@ impl BottomSurface {
             BottomOwner::Palette(palette) => self.confirm_palette(palette),
             BottomOwner::Picker(picker) => self.confirm_picker(picker),
             BottomOwner::Mention(mention) => self.confirm_mention(mention),
+            BottomOwner::TextPrompt(prompt) => self.confirm_text_prompt(prompt),
+            BottomOwner::ConfirmPrompt(prompt) => self.apply_action(prompt.action),
             BottomOwner::Search(search) => {
                 // Search Enter is handled by the app (next/prev match) without
                 // leaving search mode; restore owner if confirm was called.
@@ -308,6 +446,21 @@ impl BottomSurface {
                 SurfaceEvent::None
             }
             BottomOwner::Composer => SurfaceEvent::None,
+        }
+    }
+
+    fn confirm_text_prompt(&mut self, prompt: TextPrompt) -> SurfaceEvent {
+        match prompt.kind {
+            TextPromptKind::ExtensionAddPath => {
+                let path = prompt.input.trim().to_owned();
+                if path.is_empty() {
+                    self.composer = prompt.saved_draft;
+                    return SurfaceEvent::Message(
+                        "usage: path to local extension package".to_owned(),
+                    );
+                }
+                self.apply_action(CommandAction::ExtensionAdd { path })
+            }
         }
     }
 
@@ -322,6 +475,27 @@ impl BottomSurface {
     }
 
     fn confirm_palette(&mut self, palette: CommandPalette) -> SurfaceEvent {
+        if let Some(entry) = palette.selected_entry() {
+            if let PaletteEntryKind::Extension {
+                extension_id,
+                command,
+                enabled,
+            } = &entry.kind
+            {
+                if !enabled {
+                    self.composer = palette.saved_draft;
+                    return SurfaceEvent::Message(super::commands::disabled_extension_teach(
+                        &entry.token,
+                        extension_id,
+                    ));
+                }
+                return self.apply_action(CommandAction::ExtensionRun {
+                    id: extension_id.clone(),
+                    command: command.clone(),
+                    input: serde_json::Value::Object(serde_json::Map::new()),
+                });
+            }
+        }
         match dispatch_command(&palette.confirmation_input(), &self.context) {
             CommandEffect::Action(action) => self.apply_action(action),
             CommandEffect::Message(message) => {
@@ -336,6 +510,16 @@ impl BottomSurface {
     }
 
     fn confirm_picker(&mut self, picker: ReplacementPicker) -> SurfaceEvent {
+        // Extension manager: Enter shows details.
+        if picker.kind == PickerKind::Extensions {
+            return match picker.selected_extension_item() {
+                Some(item) => self.apply_action(CommandAction::ExtensionDetails { id: item.id }),
+                None => {
+                    self.owner = BottomOwner::Picker(picker);
+                    SurfaceEvent::None
+                }
+            };
+        }
         match picker.selected_action() {
             Some(action) => self.apply_action(action.clone()),
             None => {
@@ -562,15 +746,18 @@ pub struct CommandPalette {
     cursor: usize,
     selected: usize,
     saved_draft: ComposerDraft,
+    /// Full core + extension list captured when the palette opened.
+    entries: Vec<PaletteEntry>,
 }
 
 impl CommandPalette {
-    fn new(saved_draft: ComposerDraft) -> Self {
+    fn new(saved_draft: ComposerDraft, entries: Vec<PaletteEntry>) -> Self {
         Self {
             input: "/".to_owned(),
             cursor: 1,
             selected: 0,
             saved_draft,
+            entries,
         }
     }
 
@@ -582,12 +769,23 @@ impl CommandPalette {
         self.cursor
     }
 
-    pub fn matches(&self) -> Vec<CommandSpec> {
-        filter_commands(&self.input)
+    pub fn matches(&self) -> Vec<PaletteEntry> {
+        let needle = palette_filter_needle(&self.input);
+        self.entries
+            .iter()
+            .filter(|entry| palette_entry_matches(entry, &needle))
+            .cloned()
+            .collect()
     }
 
-    pub fn selected_token(&self) -> Option<&'static str> {
-        self.matches().get(self.selected).map(|spec| spec.token)
+    pub fn selected_token(&self) -> Option<String> {
+        self.matches()
+            .get(self.selected)
+            .map(|entry| entry.token.clone())
+    }
+
+    pub fn selected_entry(&self) -> Option<PaletteEntry> {
+        self.matches().get(self.selected).cloned()
     }
 
     pub fn render_lines(&self, width: u16) -> Vec<String> {
@@ -598,14 +796,16 @@ impl CommandPalette {
         let matches = self.matches();
         let match_count = matches.len();
         let start = self.selected.saturating_sub(3);
-        lines.extend(
-            matches
-                .into_iter()
-                .enumerate()
-                .skip(start)
-                .take(4)
-                .map(|(index, spec)| palette_line(index == self.selected, spec, width)),
-        );
+        let unfiltered = palette_filter_needle(&self.input).is_empty();
+        let mut shown_extensions_header = false;
+        for (index, entry) in matches.into_iter().enumerate().skip(start).take(4) {
+            if unfiltered && entry.is_extension() && !shown_extensions_header {
+                // EXTENSIONS group header (not selectable; does not count as a match row).
+                lines.push(truncate_display("EXTENSIONS", usize::from(width)));
+                shown_extensions_header = true;
+            }
+            lines.push(palette_entry_line(index == self.selected, &entry, width));
+        }
         lines.push(truncate_display(
             &format!(
                 "({}/{match_count})  Enter select  Tab complete  Esc close",
@@ -689,7 +889,7 @@ impl CommandPalette {
         let Some(token) = self.selected_token() else {
             return;
         };
-        self.input = replace_command_token(&self.input, token);
+        self.input = replace_command_token(&self.input, &token);
         self.move_end();
         self.clamp_selection();
     }
@@ -706,14 +906,24 @@ impl CommandPalette {
     fn confirmation_input(&self) -> String {
         self.selected_token().map_or_else(
             || self.input.clone(),
-            |token| replace_command_token(&self.input, token),
+            |token| replace_command_token(&self.input, &token),
         )
     }
 
     fn line_count(&self) -> u16 {
-        let matches = self.matches().len();
+        let matches = self.matches();
+        let match_count = matches.len();
         let start = self.selected.saturating_sub(3);
-        let rows = 2 + matches.saturating_sub(start).min(4);
+        let unfiltered = palette_filter_needle(&self.input).is_empty();
+        let header = usize::from(
+            unfiltered
+                && matches
+                    .iter()
+                    .skip(start)
+                    .take(4)
+                    .any(PaletteEntry::is_extension),
+        );
+        let rows = 2 + match_count.saturating_sub(start).min(4) + header;
         u16::try_from(rows).unwrap_or(u16::MAX)
     }
 }
@@ -728,6 +938,8 @@ pub struct ReplacementPicker {
     scroll_offset: usize,
     visible_rows: usize,
     saved_draft: ComposerDraft,
+    /// Read-only ledger-tail lines for the selected resume row (`ctrl+o`).
+    resume_preview: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -735,6 +947,7 @@ enum PickerKind {
     Generic,
     Model,
     Resume,
+    Extensions,
 }
 
 impl PickerKind {
@@ -772,9 +985,30 @@ impl ReplacementPicker {
             scroll_offset: 0,
             visible_rows: visible_rows.max(1),
             saved_draft,
+            resume_preview: None,
         };
         picker.ensure_selected_visible();
         picker
+    }
+
+    pub fn resume_selected_session_id(&self) -> Option<String> {
+        if self.kind != PickerKind::Resume {
+            return None;
+        }
+        match &self.selected_item()?.action {
+            CommandAction::ResumeSession { session_id } => Some(session_id.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn set_resume_preview(&mut self, lines: Vec<String>) {
+        if self.kind == PickerKind::Resume {
+            self.resume_preview = Some(lines);
+        }
+    }
+
+    pub fn clear_resume_preview(&mut self) {
+        self.resume_preview = None;
     }
 
     pub fn title(&self) -> &str {
@@ -811,6 +1045,9 @@ impl ReplacementPicker {
         if self.kind == PickerKind::Resume {
             return self.render_resume_lines(width);
         }
+        if self.kind == PickerKind::Extensions {
+            return self.render_extension_lines(width);
+        }
         let mut lines = vec![truncate_display(
             &format!("{} {}", self.title, self.position_indicator()),
             usize::from(width),
@@ -826,6 +1063,45 @@ impl ReplacementPicker {
             usize::from(width),
         ));
         lines
+    }
+
+    fn render_extension_lines(&self, width: u16) -> Vec<String> {
+        let mut lines = vec![truncate_display(
+            &format!("Extensions {}", self.position_indicator()),
+            usize::from(width),
+        )];
+        lines.extend(
+            self.visible_rows(width)
+                .into_iter()
+                .map(|row| row.text)
+                .collect::<Vec<_>>(),
+        );
+        lines.push(truncate_display(
+            " space toggle  a add  x remove  Enter details  Esc close",
+            usize::from(width),
+        ));
+        lines
+    }
+
+    fn selected_extension_item(&self) -> Option<ExtensionManagerItem> {
+        if self.kind != PickerKind::Extensions {
+            return None;
+        }
+        let item = self.selected_item()?;
+        let CommandAction::ExtensionDetails { id } = &item.action else {
+            return None;
+        };
+        Some(ExtensionManagerItem {
+            id: id.clone(),
+            display_name: item.label.clone(),
+            enabled: item.current,
+            bundled: item.group.as_deref() == Some("bundled"),
+            materialization: item.status.clone(),
+            version: String::new(),
+            commands: Vec::new(),
+            capabilities: Vec::new(),
+            audit_status: None,
+        })
     }
 
     fn render_resume_lines(&self, width: u16) -> Vec<String> {
@@ -857,11 +1133,17 @@ impl ReplacementPicker {
             &format!("({position}/{filtered_count})  newest first"),
             usize::from(width),
         ));
-        if let Some(detail) = self.selected_detail() {
-            lines.push(truncate_display(&detail, usize::from(width)));
+        if let Some(preview) = &self.resume_preview {
+            lines.push(truncate_display(
+                "── ledger tail (read-only) ──",
+                usize::from(width),
+            ));
+            for line in preview {
+                lines.push(truncate_display(line, usize::from(width)));
+            }
         }
         lines.push(truncate_display(
-            "Enter resume  Esc close",
+            "Enter resume  ctrl+o preview  Esc close",
             usize::from(width),
         ));
         lines
@@ -917,14 +1199,38 @@ impl ReplacementPicker {
     }
 
     fn visible_resume_rows(&self, width: u16) -> Vec<PickerRenderedRow> {
-        self.visible_item_indices()
-            .iter()
-            .enumerate()
-            .map(|(offset, item_index)| {
-                let selected = self.scroll_offset + offset == self.selected;
-                rendered_resume_row(selected, &self.items[*item_index], width)
-            })
-            .collect()
+        let filtered = self.filtered_indices();
+        let mut rows = Vec::new();
+        let mut previous_group: Option<&str> = None;
+        // Group header for the first visible row needs the group of the prior
+        // filtered item so a mid-list window still shows a header when needed.
+        if self.scroll_offset > 0 {
+            if let Some(prior) = filtered.get(self.scroll_offset - 1) {
+                previous_group = self.items[*prior].group.as_deref();
+            }
+        }
+        for (offset, item_index) in self.visible_item_indices().into_iter().enumerate() {
+            let item = &self.items[item_index];
+            let group = item.group.as_deref();
+            if group.is_some() && group != previous_group {
+                rows.push(PickerRenderedRow {
+                    selected: false,
+                    text: truncate_display(group.unwrap_or(""), usize::from(width)),
+                });
+            }
+            previous_group = group;
+            let selected = self.scroll_offset + offset == self.selected;
+            rows.push(rendered_resume_row(selected, item, width));
+            if selected {
+                if let Some(preview) = item.detail.as_deref() {
+                    rows.push(PickerRenderedRow {
+                        selected: false,
+                        text: truncate_display(&format!("  {preview}"), usize::from(width)),
+                    });
+                }
+            }
+        }
+        rows
     }
 
     fn selected_detail(&self) -> Option<String> {
@@ -938,10 +1244,8 @@ impl ReplacementPicker {
             };
         }
         if self.kind == PickerKind::Resume {
-            return item
-                .detail
-                .as_ref()
-                .map(|detail| format!("Session: {detail}"));
+            // Resume preview lives under the selected row, not a footer detail.
+            return None;
         }
         item.detail
             .as_ref()
@@ -980,9 +1284,14 @@ impl ReplacementPicker {
                 + usize::from(filtered_count == 0)
                 + usize::from(self.selected_detail().is_some())
         } else if self.kind == PickerKind::Resume {
-            4 + visible
-                + usize::from(filtered_count == 0)
-                + usize::from(self.selected_detail().is_some())
+            // Width only affects truncation, not row count of list structure.
+            let list_rows = self.visible_resume_rows(u16::MAX).len();
+            let preview_rows = self
+                .resume_preview
+                .as_ref()
+                .map_or(0, |lines| 1 + lines.len());
+            // title + search + position + action + optional empty + list + ledger preview
+            4 + list_rows + usize::from(filtered_count == 0) + preview_rows
         } else {
             2 + visible
         };
@@ -1099,7 +1408,38 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             "Rollback workspace checkpoint".to_owned(),
             rollback_items(items),
         ),
+        PickerSpec::Extensions(items) => (
+            PickerKind::Extensions,
+            "Extensions".to_owned(),
+            extension_manager_items(items),
+        ),
     }
+}
+
+fn extension_manager_items(items: Vec<ExtensionManagerItem>) -> Vec<PickerItem> {
+    items
+        .into_iter()
+        .map(|item| {
+            let label = item.label();
+            let group = if item.bundled {
+                Some("bundled".to_owned())
+            } else {
+                None
+            };
+            let status = item.materialization.clone();
+            let id = item.id.clone();
+            let enabled = item.enabled;
+            PickerItem {
+                label,
+                detail: Some(id.clone()),
+                status,
+                group,
+                provider_tag: None,
+                current: enabled,
+                action: CommandAction::ExtensionDetails { id },
+            }
+        })
+        .collect()
 }
 
 fn model_items(choices: Vec<ModelChoice>) -> Vec<PickerItem> {
@@ -1253,12 +1593,122 @@ fn resume_items(items: Vec<ResumeItem>) -> Vec<PickerItem> {
         .collect()
 }
 
-fn palette_line(selected: bool, spec: CommandSpec, width: u16) -> String {
+fn palette_entry_line(selected: bool, entry: &PaletteEntry, width: u16) -> String {
     let marker = if selected { ">" } else { " " };
-    truncate_display(
-        &format!("{marker} {} {}", spec.token, spec.summary),
-        usize::from(width),
-    )
+    let line = if entry.is_extension() {
+        // Faint teal ⋄ precedes extension tokens (color applied by themed render path
+        // when available; plain text keeps the glyph for no-color).
+        format!("{marker} ⋄ {}  {}", entry.token, entry.summary)
+    } else {
+        format!("{marker} {} {}", entry.token, entry.summary)
+    };
+    truncate_display(&line, usize::from(width))
+}
+
+fn palette_filter_needle(input: &str) -> String {
+    input
+        .split_whitespace()
+        .next()
+        .unwrap_or(input)
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_lowercase()
+}
+
+fn palette_entry_matches(entry: &PaletteEntry, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let token = entry.token.trim_start_matches('/').to_lowercase();
+    token.starts_with(needle) || token.contains(needle)
+}
+
+impl TextPrompt {
+    fn new(kind: TextPromptKind, title: impl Into<String>, saved_draft: ComposerDraft) -> Self {
+        Self {
+            title: title.into(),
+            input: String::new(),
+            cursor: 0,
+            kind,
+            saved_draft,
+        }
+    }
+
+    fn render_lines(&self, width: u16) -> Vec<String> {
+        vec![
+            truncate_display(&self.title, usize::from(width)),
+            truncate_display(
+                &format!("{PALETTE_QUERY_PREFIX}{}", self.input),
+                usize::from(width),
+            ),
+            truncate_display("Enter submit  Esc cancel", usize::from(width)),
+        ]
+    }
+
+    fn line_count(&self) -> u16 {
+        3
+    }
+
+    fn cursor_target(&self, width: u16) -> (u16, u16) {
+        let input_prefix = self.input.chars().take(self.cursor).collect::<String>();
+        let raw_column = display_width(PALETTE_QUERY_PREFIX) + display_width(&input_prefix);
+        let max_column = usize::from(width.saturating_sub(1));
+        (
+            1,
+            u16::try_from(raw_column.min(max_column)).unwrap_or(u16::MAX),
+        )
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        let byte_index = byte_index_for_char_offset(&self.input, self.cursor);
+        self.input.insert_str(byte_index, text);
+        self.cursor += text.chars().count();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = byte_index_for_char_offset(&self.input, self.cursor);
+        self.cursor -= 1;
+        let start = byte_index_for_char_offset(&self.input, self.cursor);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.input.chars().count() {
+            return;
+        }
+        let start = byte_index_for_char_offset(&self.input, self.cursor);
+        let end = byte_index_for_char_offset(&self.input, self.cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.input.chars().count());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+}
+
+impl ConfirmPrompt {
+    fn render_lines(&self, width: u16) -> Vec<String> {
+        vec![truncate_display(&self.message, usize::from(width))]
+    }
+
+    fn line_count(&self) -> u16 {
+        1
+    }
 }
 
 fn rendered_picker_row(selected: bool, item: &PickerItem, width: u16) -> PickerRenderedRow {
@@ -1296,32 +1746,22 @@ fn rendered_model_row(selected: bool, item: &PickerItem, width: u16) -> PickerRe
 
 fn rendered_resume_row(selected: bool, item: &PickerItem, width: u16) -> PickerRenderedRow {
     let marker = if selected { "→" } else { " " };
-    let age = truncate_display(item.status.as_deref().unwrap_or(""), 8);
-    let kind = item.group.as_deref().unwrap_or("");
-    let prefix = format!("{marker} {age:<8} ");
-    let suffix = if kind.is_empty() {
-        String::new()
-    } else {
-        format!(" {kind}")
-    };
+    let age = item.status.as_deref().unwrap_or("");
     let width = usize::from(width);
-    let label_width = width
+    let prefix = format!("{marker} ");
+    let age_width = display_width(age);
+    let label_budget = width
         .saturating_sub(display_width(&prefix))
-        .saturating_sub(display_width(&suffix))
+        .saturating_sub(age_width)
         .saturating_sub(1);
-    let label = truncate_display(&item.label, label_width.max(1));
-    let used = display_width(&prefix) + display_width(&label) + display_width(&suffix);
-    let gap = if suffix.is_empty() {
-        0
-    } else {
-        width.saturating_sub(used).max(1)
-    };
+    let label = truncate_display(&item.label, label_budget.max(1));
+    let used = display_width(&prefix) + display_width(&label) + age_width;
+    let gap = width
+        .saturating_sub(used)
+        .max(if age.is_empty() { 0 } else { 1 });
     PickerRenderedRow {
         selected,
-        text: truncate_display(
-            &format!("{prefix}{label}{}{suffix}", " ".repeat(gap)),
-            width,
-        ),
+        text: truncate_display(&format!("{prefix}{label}{}{age}", " ".repeat(gap)), width),
     }
 }
 
@@ -1351,19 +1791,13 @@ fn model_item_matches(item: &PickerItem, query: &str) -> bool {
 }
 
 fn resume_item_matches(item: &PickerItem, query: &str) -> bool {
+    // Spec §5.10: type-to-filter matches label, id, and root path only.
     let mut text = String::new();
     text.push_str(&item.label);
     text.push(' ');
     if let Some(detail) = &item.detail {
+        // detail is "id  root" from resume_detail.
         text.push_str(detail);
-        text.push(' ');
-    }
-    if let Some(status) = &item.status {
-        text.push_str(status);
-        text.push(' ');
-    }
-    if let Some(group) = &item.group {
-        text.push_str(group);
         text.push(' ');
     }
     if let CommandAction::ResumeSession { session_id } = &item.action {
@@ -1409,7 +1843,7 @@ mod tests {
         let BottomOwner::Palette(palette) = surface.owner() else {
             panic!("palette should own surface");
         };
-        assert_eq!(palette.selected_token(), Some("/model"));
+        assert_eq!(palette.selected_token(), Some("/model".to_owned()));
 
         surface.move_selection_down();
         surface.move_selection_up();
@@ -1450,7 +1884,7 @@ mod tests {
             panic!("palette should still own surface");
         };
         assert_eq!(palette.input(), "/eff");
-        assert_eq!(palette.selected_token(), Some("/effort"));
+        assert_eq!(palette.selected_token(), Some("/effort".to_owned()));
     }
 
     #[test]
@@ -1468,7 +1902,7 @@ mod tests {
         };
         assert_eq!(palette.input(), "/effort");
         assert_eq!(palette.cursor(), 4);
-        assert_eq!(palette.selected_token(), Some("/effort"));
+        assert_eq!(palette.selected_token(), Some("/effort".to_owned()));
 
         surface.palette_move_home();
         surface.palette_backspace();
@@ -1808,8 +2242,8 @@ mod tests {
     fn resume_picker_is_list_mode_with_indicator_and_action() {
         let mut first = ResumeItem::new("s1", "2026-06-19 research");
         first.status = Some("4m ago".to_owned());
-        first.preview = Some("first request".to_owned());
-        first.group = Some("interactive".to_owned());
+        first.preview = Some("s1  /repo".to_owned());
+        first.group = Some("tui".to_owned());
         let context = CommandContext {
             resume_items: vec![first, ResumeItem::new("s2", "2026-06-18 coding")],
             ..CommandContext::default()
@@ -1830,9 +2264,12 @@ mod tests {
         assert!(rendered.contains("Type to search"));
         assert!(rendered.contains("4m ago"));
         assert!(rendered.contains("2026-06-19 research"));
-        assert!(rendered.contains("interactive"));
-        assert!(rendered.contains("Session: first request"));
+        assert!(rendered.contains("tui"));
+        // Selected-row preview (id + root), not a footer "Session:" detail.
+        assert!(rendered.contains("s1  /repo"));
+        assert!(!rendered.contains("Session:"));
         assert!(rendered.contains("newest first"));
+        assert!(rendered.contains("ctrl+o preview"));
         assert!(!rendered.contains("Type: [All]"));
 
         surface.move_selection_down();
@@ -1849,13 +2286,13 @@ mod tests {
     }
 
     #[test]
-    fn resume_picker_searches_title_kind_and_session_detail() {
+    fn resume_picker_searches_label_id_and_root_path() {
         let mut first = ResumeItem::new("s1", "backend cleanup");
         first.status = Some("2h ago".to_owned());
-        first.group = Some("interactive".to_owned());
+        first.group = Some("tui".to_owned());
         let mut second = ResumeItem::new("s2", "token budget review");
         second.preview = Some("01TOKEN  /repo".to_owned());
-        second.group = Some("non-interactive".to_owned());
+        second.group = Some("exec".to_owned());
         let context = CommandContext {
             resume_items: vec![first, second],
             ..CommandContext::default()
@@ -1865,10 +2302,11 @@ mod tests {
         surface.palette_insert("resume");
         assert_eq!(surface.confirm(), SurfaceEvent::None);
 
-        surface.palette_insert("non token");
+        // Filter is label/id/root only — group label "exec" is not a match key.
+        surface.palette_insert("token /repo");
         let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
 
-        assert!(rendered.contains("Search: non token"));
+        assert!(rendered.contains("Search: token /repo"));
         assert!(rendered.contains("token budget review"));
         assert!(!rendered.contains("backend cleanup"));
         assert_eq!(
@@ -1877,6 +2315,34 @@ mod tests {
                 session_id: "s2".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn resume_picker_accepts_ledger_tail_preview() {
+        let mut first = ResumeItem::new("s1", "preview me");
+        first.status = Some("just now".to_owned());
+        first.group = Some("tui".to_owned());
+        let context = CommandContext {
+            resume_items: vec![first],
+            ..CommandContext::default()
+        };
+        let mut surface = BottomSurface::new(context);
+        surface.open_palette();
+        surface.palette_insert("resume");
+        assert_eq!(surface.confirm(), SurfaceEvent::None);
+        assert_eq!(
+            surface.resume_picker_selected_session_id().as_deref(),
+            Some("s1")
+        );
+
+        surface.set_resume_ledger_preview(vec![
+            "user: hello".to_owned(),
+            "assistant: world".to_owned(),
+        ]);
+        let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
+        assert!(rendered.contains("ledger tail (read-only)"));
+        assert!(rendered.contains("user: hello"));
+        assert!(rendered.contains("assistant: world"));
     }
 
     #[test]

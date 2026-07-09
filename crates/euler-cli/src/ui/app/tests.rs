@@ -2264,6 +2264,7 @@ fn resume_picker_reports_empty_state_without_active_turn_language() {
 #[test]
 fn resume_picker_waits_while_turn_is_in_flight() {
     let mut core = core();
+    core.bottom.composer_mut().insert_text("keep this draft");
     let (_worker_tx, worker_rx) = std::sync::mpsc::channel();
     core.state = AppState::TurnInFlight {
         worker_rx,
@@ -2276,7 +2277,21 @@ fn resume_picker_waits_while_turn_is_in_flight() {
         CoreEffect::Render
     );
 
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume waits for the active turn"));
+    // Spec §5.10: faint notice above composer; input preserved (not a transcript error).
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("resume waits for the active turn")
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "keep this draft");
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        text.contains("resume waits for the active turn"),
+        "notice must render above composer: {text}"
+    );
+    assert!(
+        !text.contains("! ui: resume waits"),
+        "must not be a transcript error row: {text}"
+    );
 }
 
 #[test]
@@ -2302,15 +2317,60 @@ fn accepting_resume_purges_prior_native_scrollback() {
             display_label: "useful resumed name".to_owned(),
             recovery_closure_appended: false,
             warning_count: 0,
+            events_replayed: 1,
         },
     );
 
     assert_eq!(effect, CoreEffect::ReplayHistoryWithScrollbackPurge);
-    assert_eq!(
-        core.notice.as_deref(),
-        Some("resumed session useful resumed name")
+    assert!(core.notice.is_none());
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("resumed content"), "text: {text}");
+    assert!(
+        text.contains("✓ resumed session useful resumed name"),
+        "text: {text}"
     );
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("resumed content"));
+    assert!(
+        text.contains("1 events replayed · model context folded to stubs"),
+        "text: {text}"
+    );
+}
+
+#[test]
+fn accepting_resume_boundary_includes_recovery_and_warnings() {
+    let mut core = core();
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(".");
+    config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider);
+
+    let effect = core.accept_tui_resume(
+        "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned(),
+        TuiResume {
+            session,
+            channels,
+            events: Vec::new(),
+            active_target: ModelTarget::new("fixture", "echo"),
+            display_label: "broken tail".to_owned(),
+            recovery_closure_appended: true,
+            warning_count: 2,
+            events_replayed: 7,
+        },
+    );
+
+    assert_eq!(effect, CoreEffect::ReplayHistoryWithScrollbackPurge);
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        text.contains("✓ resumed session broken tail"),
+        "text: {text}"
+    );
+    assert!(text.contains("recovery closure appended"), "text: {text}");
+    assert!(text.contains("warnings"), "text: {text}");
+    assert!(text.contains("· 2"), "text: {text}");
+    assert!(
+        text.contains("7 events replayed · model context folded to stubs"),
+        "text: {text}"
+    );
 }
 
 #[test]
@@ -2525,7 +2585,7 @@ fn slash_palette_trailing_noise_correction_submits_visible_effort_argument() {
         panic!("palette should own surface");
     };
     assert_eq!(palette.input(), "/effort// large");
-    assert_eq!(palette.selected_token(), Some("/effort"));
+    assert_eq!(palette.selected_token(), Some("/effort".to_owned()));
 
     core.handle_input(key(KeyCode::Enter));
 

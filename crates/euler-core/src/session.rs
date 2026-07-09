@@ -707,6 +707,22 @@ impl<D> Session<D> {
         self.config.extensions_enabled.contains(id)
     }
 
+    /// Session-local enablement set (resolved at launch, mutable via TUI manager).
+    pub fn extensions_enabled(&self) -> &BTreeSet<String> {
+        &self.config.extensions_enabled
+    }
+
+    /// Enable or disable an extension for the remainder of this live session.
+    /// Does not persist to the user registry — callers own registry writes.
+    pub fn set_extension_enabled(&mut self, id: impl Into<String>, enabled: bool) {
+        let id = id.into();
+        if enabled {
+            self.config.extensions_enabled.insert(id);
+        } else {
+            self.config.extensions_enabled.remove(&id);
+        }
+    }
+
     /// Compute the layer-1 compacted canvas for the current session state.
     /// Does not mutate session state or emit events.
     /// Returns the compacted canvas items and the set of event IDs that were

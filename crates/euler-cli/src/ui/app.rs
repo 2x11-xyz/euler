@@ -32,7 +32,8 @@ use super::visual_canvas::{
     VisualCanvasState,
 };
 use crate::bundled_extensions::{
-    bundled_descriptor_by_id, bundled_extension_by_id, bundled_round_observer, ObserveOptions,
+    bundled_descriptor_by_id, bundled_descriptors, bundled_extension_by_id, bundled_round_observer,
+    ObserveOptions,
 };
 use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection};
 use crate::model_preference;
@@ -40,9 +41,10 @@ use anyhow::{anyhow, Result};
 use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use euler_core::permissions::PermissionRequest;
 use euler_core::{
-    fold_session, heuristic_projection, read_resume_prefix, resume_session_from_folded_prefix,
-    AgentResult, AgentTask, ApprovalMode, EulerHome, GrantSource, ModelTarget, ProvenanceWriter,
-    ReasoningEffort, ScopePattern, Session, SessionStore,
+    fold_session, heuristic_projection, load_extension_package, read_resume_prefix,
+    resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, EulerHome,
+    ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
+    ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -207,6 +209,7 @@ struct TuiResume {
     display_label: String,
     recovery_closure_appended: bool,
     warning_count: usize,
+    events_replayed: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -546,23 +549,19 @@ impl AppCore {
         let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
         status.session_id = Some(session_id.clone());
         status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+        let initial_context = command_context(
+            &model_catalog,
+            &target.provider,
+            &target.model,
+            empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
+        );
         Self {
             state: AppState::Idle {
                 session: Box::new(session),
             },
             permission_rx: channels.request_rx,
             reply_tx: channels.reply_tx,
-            bottom: BottomSurface::new(command_context(
-                &model_catalog,
-                &target.provider,
-                &target.model,
-                CommandContextParts {
-                    current_effort: reasoning_effort,
-                    current_theme: theme_choice,
-                    current_session_id: Some(session_id.clone()),
-                    checkpoint_items: Vec::new(),
-                },
-            )),
+            bottom: BottomSurface::new(initial_context),
             status,
             model_catalog,
             session_store,
@@ -603,11 +602,14 @@ impl AppCore {
     }
 
     fn rebuild_bottom_surface(&mut self) {
+        let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
             current_theme: self.theme_choice,
             current_session_id: self.status.session_id.clone(),
             checkpoint_items: self.current_checkpoint_items(),
+            extension_items,
+            extension_slash_commands,
         };
         self.bottom.reset_context(command_context(
             &self.model_catalog,
@@ -618,11 +620,14 @@ impl AppCore {
     }
 
     fn replace_bottom_surface_for_session(&mut self) {
+        let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
             current_theme: self.theme_choice,
             current_session_id: self.status.session_id.clone(),
             checkpoint_items: self.current_checkpoint_items(),
+            extension_items,
+            extension_slash_commands,
         };
         self.bottom = BottomSurface::new(command_context(
             &self.model_catalog,
@@ -648,6 +653,21 @@ impl AppCore {
                 )
             })
             .collect()
+    }
+
+    fn current_extension_context(
+        &self,
+    ) -> (
+        Vec<crate::ui::commands::ExtensionManagerItem>,
+        Vec<crate::ui::commands::ExtensionSlashCommand>,
+    ) {
+        let session_enabled = match &self.state {
+            AppState::Idle { session } => Some(session.extensions_enabled().clone()),
+            _ => None,
+        };
+        let items = list_extension_manager_items(session_enabled.as_ref());
+        let slash = crate::ui::commands::build_extension_slash_commands(&items);
+        (items, slash)
     }
 
     fn current_reasoning_effort(&self) -> ReasoningEffort {
@@ -757,6 +777,9 @@ impl AppCore {
             return CoreEffect::None;
         }
         if is_artifact_toggle_key(&key) {
+            if self.bottom.resume_picker_selected_session_id().is_some() {
+                return self.preview_resume_ledger_tail();
+            }
             return self.toggle_tool_artifact_expansion();
         }
         if let Some(effect) = self.handle_visual_scroll_key(&key) {
@@ -896,6 +919,13 @@ impl AppCore {
             KeyCode::Up => {
                 self.bottom.move_selection_up();
                 CoreEffect::Render
+            }
+            KeyCode::Char(ch) if self.bottom.is_extension_manager() => {
+                if let Some(event) = self.bottom.extension_manager_key(ch) {
+                    return self.surface_event(event);
+                }
+                // Manager is not type-to-filter; ignore other chars.
+                CoreEffect::None
             }
             KeyCode::Char(ch) => {
                 self.bottom.palette_insert(&ch.to_string());
@@ -1382,6 +1412,14 @@ impl AppCore {
             CommandAction::CopyLastAssistantResponse => self.copy_last_assistant_response(),
             CommandAction::NameSession { name } => self.name_current_session(name),
             CommandAction::ToggleTimestamps => self.toggle_timestamps(),
+            CommandAction::ShowDiff => self.show_session_diff(),
+            CommandAction::ShowUsage => self.show_session_usage(),
+            CommandAction::DagExport => self.dag_export(),
+            CommandAction::OpenExtensionManager => self.open_extension_manager(),
+            CommandAction::ExtensionToggle { id, enable } => self.toggle_extension(id, enable),
+            CommandAction::ExtensionDetails { id } => self.show_extension_details(id),
+            CommandAction::ExtensionRemove { id } => self.remove_extension(id),
+            CommandAction::ExtensionAdd { path } => self.add_extension(path),
         }
     }
 
@@ -1409,6 +1447,137 @@ impl AppCore {
             "timestamps hidden".to_owned()
         };
         self.notice_item(message)
+    }
+
+    fn show_session_diff(&mut self) -> CoreEffect {
+        let AppState::Idle { session } = &self.state else {
+            return self.notice_item("diff waits for the active turn".to_owned());
+        };
+        let diffs = session_attributed_diffs(session.events());
+        if diffs.is_empty() {
+            return self.summary_item("no session-attributed file changes yet".to_owned());
+        }
+        let mut header = format!("session diff · {} file(s)", diffs.len());
+        let mut total_added = 0usize;
+        let mut total_removed = 0usize;
+        for diff in &diffs {
+            let (a, r) = count_diff_lines(diff.diff.as_deref().unwrap_or(""));
+            total_added += a;
+            total_removed += r;
+        }
+        header.push_str(&format!(" · +{total_added} −{total_removed}"));
+        self.push_finalized_visual_item(TranscriptItem::SessionSummary(header));
+        for diff in diffs {
+            self.push_finalized_visual_item(TranscriptItem::FileDiff {
+                path: diff.path,
+                action: diff.action,
+                origin: "session".to_owned(),
+                diff: diff.diff,
+                truncated: diff.truncated,
+                truncation: diff.truncation,
+                omitted_reason: diff.omitted_reason,
+                checkpoint_event_id: None,
+            });
+        }
+        CoreEffect::Render
+    }
+
+    fn show_session_usage(&mut self) -> CoreEffect {
+        let AppState::Idle { session } = &self.state else {
+            // Fall back to live snapshot when a turn is in flight.
+            let text = format_usage_from_snapshot(&self.token_usage, &self.status);
+            return self.summary_item(text);
+        };
+        let text = format_session_usage(session.events(), &self.status, &self.token_usage);
+        self.summary_item(text)
+    }
+
+    fn dag_export(&mut self) -> CoreEffect {
+        let enabled = match &self.state {
+            AppState::Idle { session } => session.extension_enabled("causal-dag"),
+            _ => {
+                // Check registry/session context when not idle.
+                self.current_extension_context()
+                    .0
+                    .iter()
+                    .find(|item| item.id == "causal-dag")
+                    .is_some_and(|item| item.enabled)
+            }
+        };
+        if !enabled {
+            return self.notice_item(crate::ui::commands::disabled_extension_teach(
+                "/dag",
+                "causal-dag",
+            ));
+        }
+        self.extension_run(
+            "causal-dag".to_owned(),
+            "export".to_owned(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        )
+    }
+
+    fn open_extension_manager(&mut self) -> CoreEffect {
+        self.rebuild_bottom_surface();
+        self.bottom.open_extension_manager();
+        CoreEffect::Render
+    }
+
+    fn toggle_extension(&mut self, id: String, enable: bool) -> CoreEffect {
+        match set_extension_enabled(&id, enable) {
+            Ok(()) => {
+                if let AppState::Idle { session } = &mut self.state {
+                    session.set_extension_enabled(&id, enable);
+                }
+                self.rebuild_bottom_surface();
+                let verb = if enable { "enabled" } else { "disabled" };
+                // Decision-record line in the ledger.
+                self.push_notice_item(format!("✓ extension {verb}: {id}"));
+                self.bottom.open_extension_manager();
+                CoreEffect::Render
+            }
+            Err(error) => self.notice_item(format!("extension toggle failed: {error}")),
+        }
+    }
+
+    fn show_extension_details(&mut self, id: String) -> CoreEffect {
+        let (items, _) = self.current_extension_context();
+        match items.into_iter().find(|item| item.id == id) {
+            Some(item) => self.summary_item(item.details_text()),
+            None => self.notice_item(format!("unknown extension: {id}")),
+        }
+    }
+
+    fn remove_extension(&mut self, id: String) -> CoreEffect {
+        match remove_linked_extension(&id) {
+            Ok(message) => {
+                if let AppState::Idle { session } = &mut self.state {
+                    session.set_extension_enabled(&id, false);
+                }
+                self.rebuild_bottom_surface();
+                self.push_notice_item(format!("✓ extension removed: {id} · {message}"));
+                CoreEffect::Render
+            }
+            Err(error) => self.notice_item(format!("extension remove failed: {error}")),
+        }
+    }
+
+    fn add_extension(&mut self, path: String) -> CoreEffect {
+        match add_local_extension(std::path::Path::new(&path)) {
+            Ok(report) => {
+                if let AppState::Idle { session } = &mut self.state {
+                    session.set_extension_enabled(&report.id, true);
+                }
+                self.rebuild_bottom_surface();
+                self.push_notice_item(format!(
+                    "✓ extension installed · {} · enabled for session",
+                    report.id
+                ));
+                self.summary_item(report.steps_text());
+                CoreEffect::Render
+            }
+            Err(error) => self.notice_item(format!("extension add failed: {error}")),
+        }
     }
 
     fn rollback_workspace_checkpoint(&mut self, event_id: String) -> CoreEffect {
@@ -1795,7 +1964,9 @@ impl AppCore {
         let current_session_id = match &self.state {
             AppState::Idle { session } => session.session_id().to_owned(),
             AppState::TurnInFlight { .. } => {
-                return self.notice_item("resume waits for the active turn".to_owned());
+                // Faint line above composer; composer/queue input stays intact.
+                self.notice = Some("resume waits for the active turn".to_owned());
+                return CoreEffect::Render;
             }
             AppState::Empty => {
                 return self.notice_item("resume needs an active session".to_owned())
@@ -1809,6 +1980,47 @@ impl AppCore {
             Ok(resume) => self.accept_tui_resume(session_id, resume),
             Err(error) => self.notice_item(format!("resume failed: {error}")),
         }
+    }
+
+    fn preview_resume_ledger_tail(&mut self) -> CoreEffect {
+        let Some(session_id) = self.bottom.resume_picker_selected_session_id() else {
+            return CoreEffect::None;
+        };
+        match self.load_resume_ledger_tail_preview(&session_id) {
+            Ok(lines) => {
+                self.bottom.set_resume_ledger_preview(lines);
+                CoreEffect::Render
+            }
+            Err(error) => {
+                self.notice = Some(format!("preview failed: {error}"));
+                CoreEffect::Render
+            }
+        }
+    }
+
+    fn load_resume_ledger_tail_preview(&mut self, session_id: &str) -> Result<Vec<String>> {
+        const PREVIEW_TAIL_LINES: usize = 16;
+        let record = self
+            .session_store()?
+            .find_session(session_id)?
+            .ok_or_else(|| anyhow!("no session found with id {session_id}"))?;
+        let events = read_resume_prefix(record.events_path())?;
+        let items = transcript::project_events(&events);
+        let width = self.composer_navigation_width.max(40);
+        let rendered = crate::ui::text::with_timestamp_gutter(self.show_timestamp_gutter, || {
+            transcript::render_items_for_history(&items, &self.theme, width)
+        });
+        let lines: Vec<String> = rendered
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let start = lines.len().saturating_sub(PREVIEW_TAIL_LINES);
+        Ok(lines[start..].to_vec())
     }
 
     fn build_tui_resume(&mut self, session_id: &str) -> Result<TuiResume> {
@@ -1864,6 +2076,7 @@ impl AppCore {
             session.set_observer_extension(extension);
         }
         let events = session.events().to_vec();
+        let events_replayed = outcome.events_folded;
         Ok(TuiResume {
             session,
             channels,
@@ -1872,6 +2085,7 @@ impl AppCore {
             display_label: session_resume_label(&record),
             recovery_closure_appended: outcome.recovery_closure_appended,
             warning_count: outcome.warnings.len(),
+            events_replayed,
         })
     }
 
@@ -1888,7 +2102,21 @@ impl AppCore {
         self.status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
         self.active_session_home_managed = true;
         self.replace_bottom_surface_for_session();
+        // Rebuild first so token_usage reflects the resumed event stream under
+        // the post-fold active model window (footer ctx% = model budget).
         self.rebuild_transcript_from_events(&resume.events);
+        self.token_usage.context_window_tokens = self.active_context_window_tokens();
+        let label = if resume.display_label == "Untitled session" {
+            session_id.clone()
+        } else {
+            resume.display_label.clone()
+        };
+        self.push_finalized_visual_item(TranscriptItem::ResumeBoundary {
+            label,
+            recovery_closure_appended: resume.recovery_closure_appended,
+            warning_count: resume.warning_count,
+            events_replayed: resume.events_replayed,
+        });
         self.visual_scroll_offset = 0;
         self.modal = None;
         self.quit_armed = None;
@@ -1896,19 +2124,7 @@ impl AppCore {
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         self.clear_queued_inputs();
-        let display = resume.display_label.clone();
-        let mut notice = if display == "Untitled session" {
-            format!("resumed session {session_id}")
-        } else {
-            format!("resumed session {display}")
-        };
-        if resume.recovery_closure_appended {
-            notice.push_str("; recovery closure appended");
-        }
-        if resume.warning_count > 0 {
-            notice.push_str(&format!("; {} warning(s)", resume.warning_count));
-        }
-        self.notice = Some(notice);
+        self.notice = None;
         CoreEffect::ReplayHistoryWithScrollbackPurge
     }
 
@@ -2699,6 +2915,373 @@ impl AppCore {
 fn resolve_session_store() -> Result<SessionStore> {
     let home = EulerHome::resolve()?;
     Ok(SessionStore::new(home)?)
+}
+
+fn empty_command_context_parts(
+    current_effort: ReasoningEffort,
+    current_theme: ThemeChoice,
+    current_session_id: Option<String>,
+) -> CommandContextParts {
+    CommandContextParts {
+        current_effort,
+        current_theme,
+        current_session_id,
+        checkpoint_items: Vec::new(),
+        extension_items: Vec::new(),
+        extension_slash_commands: Vec::new(),
+    }
+}
+
+struct SessionDiffEntry {
+    path: String,
+    action: String,
+    diff: Option<String>,
+    truncated: bool,
+    truncation: String,
+    omitted_reason: Option<String>,
+}
+
+/// Latest `file.diff` per path for files this session touched (not full WT).
+fn session_attributed_diffs(events: &[EventEnvelope]) -> Vec<SessionDiffEntry> {
+    use std::collections::BTreeMap;
+    let mut latest: BTreeMap<String, SessionDiffEntry> = BTreeMap::new();
+    for event in events {
+        if event.kind.as_str() != EventKind::FILE_DIFF {
+            continue;
+        }
+        let path = event
+            .payload
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if path.is_empty() {
+            continue;
+        }
+        let action = event
+            .payload
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("modify")
+            .to_owned();
+        let diff = event
+            .payload
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let truncated = event
+            .payload
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let truncation = event
+            .payload
+            .get("truncation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let omitted_reason = event
+            .payload
+            .get("omitted_reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        latest.insert(
+            path.clone(),
+            SessionDiffEntry {
+                path,
+                action,
+                diff,
+                truncated,
+                truncation,
+                omitted_reason,
+            },
+        );
+    }
+    latest.into_values().collect()
+}
+
+fn count_diff_lines(diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+fn format_usage_from_snapshot(tokens: &TokenUsageSnapshot, status: &StatusSnapshot) -> String {
+    let mut lines = vec![
+        format!("usage · {}::{}", status.provider, status.model),
+        format!("  input:     {} tokens", tokens.input_tokens),
+        format!("  output:    {} tokens", tokens.output_tokens),
+    ];
+    if let Some(reasoning) = tokens.reasoning_tokens {
+        lines.push(format!("  reasoning: {reasoning} tokens"));
+    }
+    lines.push("  cost:      (catalog prices unavailable — tokens only)".to_owned());
+    lines.join("\n")
+}
+
+fn format_session_usage(
+    events: &[EventEnvelope],
+    status: &StatusSnapshot,
+    live: &TokenUsageSnapshot,
+) -> String {
+    use std::collections::BTreeMap;
+    #[derive(Default)]
+    struct Bucket {
+        input: u64,
+        output: u64,
+        reasoning: u64,
+        calls: u64,
+    }
+    let mut by_model: BTreeMap<(String, String), Bucket> = BTreeMap::new();
+    for event in events {
+        if event.kind.as_str() != EventKind::MODEL_RESULT {
+            continue;
+        }
+        let provider = event
+            .payload
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let model = event
+            .payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let usage = event.payload.get("usage").and_then(|v| v.as_object());
+        let input = usage
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output = usage
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let reasoning = usage
+            .and_then(|u| u.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let bucket = by_model.entry((provider, model)).or_default();
+        bucket.input += input;
+        bucket.output += output;
+        bucket.reasoning += reasoning;
+        bucket.calls += 1;
+    }
+    if by_model.is_empty() {
+        return format_usage_from_snapshot(live, status);
+    }
+    let mut lines = vec!["usage · session totals (no catalog prices)".to_owned()];
+    for ((provider, model), bucket) in by_model {
+        lines.push(format!("{provider}::{model} · {} call(s)", bucket.calls));
+        lines.push(format!("  input:     {} tokens", bucket.input));
+        lines.push(format!("  output:    {} tokens", bucket.output));
+        if bucket.reasoning > 0 {
+            lines.push(format!("  reasoning: {} tokens", bucket.reasoning));
+        }
+    }
+    lines.join("\n")
+}
+
+fn list_extension_manager_items(
+    session_enabled: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<crate::ui::commands::ExtensionManagerItem> {
+    let Ok(home) = EulerHome::resolve() else {
+        return Vec::new();
+    };
+    let registry = ExtensionRegistry::open_read_only(home);
+    let enablement = registry.enablement_states().unwrap_or_default();
+    let audit_by_id = audit_status_by_id(&registry);
+    let mut items = bundled_manager_items(session_enabled, &enablement, &audit_by_id);
+    append_linked_manager_items(
+        &mut items,
+        &registry,
+        session_enabled,
+        &enablement,
+        &audit_by_id,
+    );
+    items
+}
+
+fn audit_status_by_id(registry: &ExtensionRegistry) -> std::collections::BTreeMap<String, String> {
+    registry
+        .audit()
+        .ok()
+        .map(|report| {
+            report
+                .entries
+                .into_iter()
+                .map(|entry| (entry.id, format!("{:?}", entry.issue_code).to_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extension_is_enabled(
+    id: &str,
+    session_enabled: Option<&std::collections::BTreeSet<String>>,
+    enablement: &std::collections::BTreeMap<String, ExtensionEnablement>,
+) -> bool {
+    let registry_enabled = enablement
+        .get(id)
+        .copied()
+        .unwrap_or(ExtensionEnablement::Disabled)
+        .is_enabled();
+    session_enabled
+        .map(|set| set.contains(id))
+        .unwrap_or(registry_enabled)
+}
+
+fn bundled_manager_items(
+    session_enabled: Option<&std::collections::BTreeSet<String>>,
+    enablement: &std::collections::BTreeMap<String, ExtensionEnablement>,
+    audit_by_id: &std::collections::BTreeMap<String, String>,
+) -> Vec<crate::ui::commands::ExtensionManagerItem> {
+    let Ok(descriptors) = bundled_descriptors() else {
+        return Vec::new();
+    };
+    descriptors
+        .into_iter()
+        .map(|descriptor| crate::ui::commands::ExtensionManagerItem {
+            id: descriptor.id.clone(),
+            display_name: descriptor.display_name.clone(),
+            enabled: extension_is_enabled(&descriptor.id, session_enabled, enablement),
+            bundled: true,
+            materialization: None,
+            version: descriptor.version.clone(),
+            commands: descriptor.commands.iter().map(|c| c.name.clone()).collect(),
+            capabilities: descriptor
+                .capabilities
+                .iter()
+                .map(|c| c.as_str().to_owned())
+                .collect(),
+            audit_status: audit_by_id.get(&descriptor.id).cloned(),
+        })
+        .collect()
+}
+
+fn append_linked_manager_items(
+    items: &mut Vec<crate::ui::commands::ExtensionManagerItem>,
+    registry: &ExtensionRegistry,
+    session_enabled: Option<&std::collections::BTreeSet<String>>,
+    enablement: &std::collections::BTreeMap<String, ExtensionEnablement>,
+    audit_by_id: &std::collections::BTreeMap<String, String>,
+) {
+    let Ok(linked) = registry.linked_extensions() else {
+        return;
+    };
+    for link in linked {
+        if items.iter().any(|item| item.id == link.id) {
+            continue;
+        }
+        items.push(crate::ui::commands::ExtensionManagerItem {
+            id: link.id.clone(),
+            display_name: link.descriptor.display_name.clone(),
+            enabled: extension_is_enabled(&link.id, session_enabled, enablement),
+            bundled: false,
+            materialization: Some(link.materialization.as_str().to_owned()),
+            version: link.descriptor.version.clone(),
+            commands: link
+                .descriptor
+                .commands
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            capabilities: link.descriptor.capabilities.clone(),
+            audit_status: audit_by_id.get(&link.id).cloned(),
+        });
+    }
+}
+
+fn set_extension_enabled(id: &str, enable: bool) -> Result<()> {
+    let registry = ExtensionRegistry::new(EulerHome::resolve()?)?;
+    if enable {
+        registry.enable(id)?;
+    } else {
+        registry.disable(id)?;
+    }
+    Ok(())
+}
+
+fn remove_linked_extension(id: &str) -> Result<String> {
+    let registry = ExtensionRegistry::new(EulerHome::resolve()?)?;
+    if let Some(linked) = registry.linked_extension(id)? {
+        match linked.materialization {
+            ExtensionMaterialization::Installed => {
+                registry.uninstall_installed(id)?;
+                Ok("uninstalled".to_owned())
+            }
+            ExtensionMaterialization::Linked => {
+                registry.unlink(id)?;
+                Ok("unlinked".to_owned())
+            }
+        }
+    } else {
+        Err(anyhow!("extension {id} is not linked or installed"))
+    }
+}
+
+struct ExtensionAddReport {
+    id: String,
+    steps: Vec<String>,
+}
+
+impl ExtensionAddReport {
+    fn steps_text(&self) -> String {
+        self.steps.join("\n")
+    }
+}
+
+fn add_local_extension(path: &Path) -> Result<ExtensionAddReport> {
+    let mut steps = Vec::new();
+    let package = load_extension_package(path)?;
+    let id = package.descriptor.id.clone();
+    steps.push(format!(
+        "validate · ok · {id} v{}",
+        package.descriptor.version
+    ));
+    let registry = ExtensionRegistry::new(EulerHome::resolve()?)?;
+    let linked = registry.link_package(package.clone())?;
+    steps.push(format!(
+        "link · {} · {}",
+        linked.materialization.as_str(),
+        linked.source_path.display()
+    ));
+    let installed = registry.install_package(package)?;
+    steps.push(format!(
+        "install · {} · {}",
+        installed.materialization.as_str(),
+        installed.source_path.display()
+    ));
+    match registry.audit() {
+        Ok(report) => {
+            let warnings: Vec<_> = report
+                .entries
+                .iter()
+                .filter(|entry| entry.id == id)
+                .filter(|entry| {
+                    !matches!(entry.issue_code, euler_core::ExtensionAuditIssueCode::Ok)
+                })
+                .map(|entry| format!("audit · {} · {:?}", entry.id, entry.issue_code))
+                .collect();
+            if warnings.is_empty() {
+                steps.push("audit · ok".to_owned());
+            } else {
+                steps.extend(warnings);
+            }
+        }
+        Err(error) => steps.push(format!("audit · unavailable: {error}")),
+    }
+    registry.enable(&id)?;
+    steps.push("enable · ok".to_owned());
+    Ok(ExtensionAddReport { id, steps })
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

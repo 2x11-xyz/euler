@@ -126,6 +126,13 @@ pub enum TranscriptItem {
     SessionSummary(String),
     Interrupted,
     WorkedDuration(String),
+    /// Resume fold boundary: decision record + centered replay divider.
+    ResumeBoundary {
+        label: String,
+        recovery_closure_appended: bool,
+        warning_count: usize,
+        events_replayed: usize,
+    },
     Error {
         source: String,
         message: String,

@@ -1,7 +1,8 @@
 pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String {
     match item {
-        super::TranscriptItem::Banner { .. } => String::new(),
-        super::TranscriptItem::TurnSeparator => String::new(),
+        super::TranscriptItem::Banner { .. } | super::TranscriptItem::TurnSeparator => {
+            String::new()
+        }
         super::TranscriptItem::UserMessage(content) => format!("user: {content}\n"),
         super::TranscriptItem::AssistantMessage(content) => format!("assistant: {content}\n"),
         super::TranscriptItem::AssistantActivity(content) => {
@@ -24,9 +25,7 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
             ok: false,
             error,
             ..
-        } => {
-            format!("tool.result: {name} failed: {error}\n")
-        }
+        } => format!("tool.result: {name} failed: {error}\n"),
         super::TranscriptItem::ToolRun {
             command, ok: true, ..
         } => format!("tool.result: run_shell ok: {command}\n"),
@@ -66,17 +65,42 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         } => format!("workspace.restore: {path} → ckpt {checkpoint_event_id}\n"),
         super::TranscriptItem::CheckStarted { name } => format!("check.started: {name}\n"),
         super::TranscriptItem::CheckResult { name, ok, .. } => {
-            if *ok {
-                format!("check.result: {name} ok\n")
-            } else {
-                format!("check.result: {name} failed\n")
-            }
+            line_oriented_check_result(name, *ok)
         }
         super::TranscriptItem::SessionSummary(summary) => format!("session.summary: {summary}\n"),
         super::TranscriptItem::Interrupted => "interrupted\n".to_owned(),
         super::TranscriptItem::WorkedDuration(duration) => format!("worked: {duration}\n"),
+        super::TranscriptItem::ResumeBoundary { .. } => line_oriented_resume_boundary(item),
         super::TranscriptItem::Error { source, message } => format!("error: {source}: {message}\n"),
     }
+}
+
+fn line_oriented_check_result(name: &str, ok: bool) -> String {
+    if ok {
+        format!("check.result: {name} ok\n")
+    } else {
+        format!("check.result: {name} failed\n")
+    }
+}
+
+fn line_oriented_resume_boundary(item: &super::TranscriptItem) -> String {
+    let super::TranscriptItem::ResumeBoundary {
+        label,
+        recovery_closure_appended,
+        warning_count,
+        events_replayed,
+    } = item
+    else {
+        return String::new();
+    };
+    let decision = super::cells::resume_boundary_decision_text(
+        label,
+        *recovery_closure_appended,
+        *warning_count,
+    );
+    format!(
+        "{decision}\n──── {events_replayed} events replayed · model context folded to stubs ────\n"
+    )
 }
 
 fn line_oriented_patch(label: &str, path: &str, old: Option<&str>, new: Option<&str>) -> String {

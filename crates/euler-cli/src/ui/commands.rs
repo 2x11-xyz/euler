@@ -16,6 +16,127 @@ pub struct CommandContext {
     pub theme_choices: Vec<ThemeChoiceItem>,
     pub resume_items: Vec<ResumeItem>,
     pub checkpoint_items: Vec<CheckpointItem>,
+    /// Bundled + linked extensions for the `/extension` manager and palette.
+    pub extension_items: Vec<ExtensionManagerItem>,
+    /// Extension slash entries (⋄ annotated in the palette).
+    pub extension_slash_commands: Vec<ExtensionSlashCommand>,
+}
+
+/// One extension row for the `/extension` manager picker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionManagerItem {
+    pub id: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub bundled: bool,
+    pub materialization: Option<String>,
+    pub version: String,
+    pub commands: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub audit_status: Option<String>,
+}
+
+impl ExtensionManagerItem {
+    pub fn label(&self) -> String {
+        let mark = if self.enabled { "●" } else { "○" };
+        let kind = if self.bundled {
+            "bundled"
+        } else {
+            self.materialization.as_deref().unwrap_or("linked")
+        };
+        format!("{mark} {}  ({kind})", self.id)
+    }
+
+    pub fn details_text(&self) -> String {
+        let mut lines = vec![
+            format!("{}  v{}", self.display_name, self.version),
+            format!("id: {}", self.id),
+            format!(
+                "state: {}",
+                if self.enabled { "enabled" } else { "disabled" }
+            ),
+            format!(
+                "source: {}",
+                if self.bundled {
+                    "bundled".to_owned()
+                } else {
+                    self.materialization
+                        .clone()
+                        .unwrap_or_else(|| "linked".to_owned())
+                }
+            ),
+        ];
+        if !self.commands.is_empty() {
+            lines.push(format!("commands: {}", self.commands.join(", ")));
+        }
+        if !self.capabilities.is_empty() {
+            lines.push(format!("capabilities: {}", self.capabilities.join(", ")));
+        }
+        if let Some(audit) = &self.audit_status {
+            lines.push(format!("audit: {audit}"));
+        }
+        if self.bundled {
+            lines.push("bundled extensions can be toggled but not removed".to_owned());
+        }
+        lines.join("\n")
+    }
+}
+
+/// Extension-provided slash command surfaced in the palette under EXTENSIONS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionSlashCommand {
+    pub token: String,
+    pub summary: String,
+    pub extension_id: String,
+    pub command: String,
+    pub enabled: bool,
+}
+
+/// Palette row: core static command or extension-sourced entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaletteEntry {
+    pub token: String,
+    pub summary: String,
+    pub args: String,
+    pub kind: PaletteEntryKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaletteEntryKind {
+    Core,
+    Extension {
+        extension_id: String,
+        command: String,
+        enabled: bool,
+    },
+}
+
+impl PaletteEntry {
+    pub fn from_core(spec: CommandSpec) -> Self {
+        Self {
+            token: spec.token.to_owned(),
+            summary: spec.summary.to_owned(),
+            args: command_args(&spec),
+            kind: PaletteEntryKind::Core,
+        }
+    }
+
+    pub fn from_extension(cmd: &ExtensionSlashCommand) -> Self {
+        Self {
+            token: cmd.token.clone(),
+            summary: cmd.summary.clone(),
+            args: String::new(),
+            kind: PaletteEntryKind::Extension {
+                extension_id: cmd.extension_id.clone(),
+                command: cmd.command.clone(),
+                enabled: cmd.enabled,
+            },
+        }
+    }
+
+    pub fn is_extension(&self) -> bool {
+        matches!(self.kind, PaletteEntryKind::Extension { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -254,6 +375,31 @@ pub enum CommandAction {
     ScrollViewportToBottom,
     CopyLastAssistantResponse,
     ToggleTimestamps,
+    /// Session-attributed aggregate diff (files this session touched).
+    ShowDiff,
+    /// Token breakdown for the session (costs only when catalog prices exist).
+    ShowUsage,
+    /// Dispatch to `causal-dag.export` (teach when extension disabled).
+    DagExport,
+    /// Open the extensions manager picker.
+    OpenExtensionManager,
+    /// Toggle extension enablement (registry + live session set).
+    ExtensionToggle {
+        id: String,
+        enable: bool,
+    },
+    /// Show extension details in the transcript.
+    ExtensionDetails {
+        id: String,
+    },
+    /// Remove a non-bundled extension (unlink/uninstall).
+    ExtensionRemove {
+        id: String,
+    },
+    /// Validate → link → install → audit → enable a local package path.
+    ExtensionAdd {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,6 +417,7 @@ pub enum PickerSpec {
     Permissions(Vec<PermissionChoice>),
     Resume(Vec<ResumeItem>),
     Rollback(Vec<CheckpointItem>),
+    Extensions(Vec<ExtensionManagerItem>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -340,8 +487,23 @@ const COMMAND_TABLE: &[CommandSpec] = &[
     },
     CommandSpec {
         token: "/extension",
-        summary: "run an extension command",
-        args: "run <ext>.<cmd> [json-input]",
+        summary: "manage extensions or run a command",
+        args: "[run <ext>.<cmd> [json-input]]",
+    },
+    CommandSpec {
+        token: "/diff",
+        summary: "session file changes (aggregate diff)",
+        args: "",
+    },
+    CommandSpec {
+        token: "/usage",
+        summary: "token usage for this session",
+        args: "",
+    },
+    CommandSpec {
+        token: "/dag",
+        summary: "export causal DAG for this session",
+        args: "",
     },
     CommandSpec {
         token: "/companion",
@@ -421,6 +583,68 @@ pub fn filter_commands(input: &str) -> Vec<CommandSpec> {
         .copied()
         .filter(|spec| command_matches(spec, &needle))
         .collect()
+}
+
+/// Core + extension palette entries, filtered by the first token of `input`.
+/// Unfiltered lists put extension rows after core under an EXTENSIONS group
+/// (rendered by the palette, not as a selectable entry).
+pub fn filter_palette_entries(input: &str, context: &CommandContext) -> Vec<PaletteEntry> {
+    let needle = filter_needle(input);
+    let mut entries: Vec<PaletteEntry> = command_table()
+        .iter()
+        .copied()
+        .filter(|spec| command_matches(spec, &needle))
+        .map(PaletteEntry::from_core)
+        .collect();
+    for cmd in &context.extension_slash_commands {
+        if palette_token_matches(&cmd.token, &needle) {
+            entries.push(PaletteEntry::from_extension(cmd));
+        }
+    }
+    entries
+}
+
+fn palette_token_matches(token: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let token = token.trim_start_matches('/').to_lowercase();
+    token.starts_with(needle) || token.contains(needle)
+}
+
+/// Build extension slash entries: short token when free, else `/<ext>.<cmd>`.
+/// Core always wins collisions.
+pub fn build_extension_slash_commands(
+    items: &[ExtensionManagerItem],
+) -> Vec<ExtensionSlashCommand> {
+    let core_tokens: std::collections::BTreeSet<String> = command_table()
+        .iter()
+        .map(|spec| spec.token.trim_start_matches('/').to_lowercase())
+        .collect();
+    let mut claimed = core_tokens;
+    let mut out = Vec::new();
+    for item in items {
+        for command in &item.commands {
+            let short = command.to_lowercase();
+            let (token, summary) = if claimed.contains(&short) {
+                (
+                    format!("/{}.{}", item.id, command),
+                    format!("{} · {}", item.id, command),
+                )
+            } else {
+                claimed.insert(short);
+                (format!("/{command}"), format!("{} · {}", item.id, command))
+            };
+            out.push(ExtensionSlashCommand {
+                token,
+                summary,
+                extension_id: item.id.clone(),
+                command: command.clone(),
+                enabled: item.enabled,
+            });
+        }
+    }
+    out
 }
 
 pub fn filter_token(input: &str) -> &str {
@@ -516,7 +740,7 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/export" => CommandEffect::Action(CommandAction::ExportSession {
             path: parsed.arg.map(str::to_owned),
         }),
-        "/extension" => extension_effect(parsed.arg),
+        "/extension" => extension_effect(parsed.arg, context),
         "/companion" => companion_effect(parsed.arg),
         "/status" => CommandEffect::Action(CommandAction::ShowStatus),
         "/hotkeys" => CommandEffect::Action(CommandAction::ShowHelp {
@@ -540,8 +764,34 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/quit" => CommandEffect::Action(CommandAction::Quit),
         "/copy" => CommandEffect::Action(CommandAction::CopyLastAssistantResponse),
         "/timestamps" => CommandEffect::Action(CommandAction::ToggleTimestamps),
-        token => CommandEffect::Message(format!("unknown command: {token}")),
+        "/diff" => CommandEffect::Action(CommandAction::ShowDiff),
+        "/usage" => CommandEffect::Action(CommandAction::ShowUsage),
+        "/dag" => CommandEffect::Action(CommandAction::DagExport),
+        token => extension_slash_or_unknown(token, context),
     }
+}
+
+fn extension_slash_or_unknown(token: &str, context: &CommandContext) -> CommandEffect {
+    if let Some(cmd) = context
+        .extension_slash_commands
+        .iter()
+        .find(|cmd| cmd.token == token)
+    {
+        if !cmd.enabled {
+            return CommandEffect::Message(disabled_extension_teach(&cmd.token, &cmd.extension_id));
+        }
+        return CommandEffect::Action(CommandAction::ExtensionRun {
+            id: cmd.extension_id.clone(),
+            command: cmd.command.clone(),
+            input: serde_json::Value::Object(serde_json::Map::new()),
+        });
+    }
+    CommandEffect::Message(format!("unknown command: {token}"))
+}
+
+/// Faint teach line when an extension-backed command is invoked while disabled.
+pub fn disabled_extension_teach(token: &str, extension_id: &str) -> String {
+    format!("{token} — provided by {extension_id} (disabled) · /extension to enable")
 }
 
 fn rollback_effect(context: &CommandContext) -> CommandEffect {
@@ -573,23 +823,39 @@ fn companion_effect(arg: Option<&str>) -> CommandEffect {
     }
 }
 
-fn extension_effect(arg: Option<&str>) -> CommandEffect {
+fn extension_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
     let Some(arg) = arg else {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Action(CommandAction::OpenExtensionManager);
     };
     let Some(rest) = arg.strip_prefix("run") else {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Message(
+            "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned(),
+        );
     };
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Message(
+            "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned(),
+        );
     }
     let mut parts = rest.trim_start().splitn(2, char::is_whitespace);
     let Some(reference) = parts.next().filter(|value| !value.is_empty()) else {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Message(
+            "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned(),
+        );
     };
     let Some((id, command)) = parse_extension_reference(reference) else {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Message(
+            "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned(),
+        );
     };
+    if let Some(item) = context.extension_items.iter().find(|item| item.id == id) {
+        if !item.enabled {
+            return CommandEffect::Message(disabled_extension_teach(
+                &format!("/{id}.{command}"),
+                &id,
+            ));
+        }
+    }
     let input = match parts
         .next()
         .map(str::trim_start)
@@ -976,6 +1242,50 @@ mod tests {
         assert!(command_table()
             .iter()
             .any(|spec| spec.token == "/theme" && spec.args.is_empty()));
+        assert!(command_table().iter().any(|spec| spec.token == "/diff"));
+        assert!(command_table().iter().any(|spec| spec.token == "/usage"));
+        assert!(command_table().iter().any(|spec| spec.token == "/dag"));
+        assert!(command_table().iter().any(|spec| spec.token == "/rollback"));
+        assert!(command_table()
+            .iter()
+            .any(|spec| spec.token == "/timestamps"));
+    }
+
+    #[test]
+    fn extension_slash_collisions_prefer_core_token_and_qualified_extension() {
+        let items = vec![ExtensionManagerItem {
+            id: "causal-dag".to_owned(),
+            display_name: "Causal DAG".to_owned(),
+            enabled: true,
+            bundled: true,
+            materialization: None,
+            version: "0.1.0".to_owned(),
+            commands: vec!["export".to_owned(), "catch-up".to_owned()],
+            capabilities: vec![],
+            audit_status: None,
+        }];
+        let cmds = build_extension_slash_commands(&items);
+        assert!(cmds.iter().any(|c| c.token == "/causal-dag.export"));
+        assert!(cmds.iter().any(|c| c.token == "/catch-up"));
+        assert!(!cmds.iter().any(|c| c.token == "/export"));
+    }
+
+    #[test]
+    fn disabled_extension_slash_teaches_instead_of_unknown() {
+        let context = CommandContext {
+            extension_slash_commands: vec![ExtensionSlashCommand {
+                token: "/catch-up".to_owned(),
+                summary: "causal-dag · catch-up".to_owned(),
+                extension_id: "causal-dag".to_owned(),
+                command: "catch-up".to_owned(),
+                enabled: false,
+            }],
+            ..CommandContext::default()
+        };
+        assert_eq!(
+            dispatch_command("/catch-up", &context),
+            CommandEffect::Message(disabled_extension_teach("/catch-up", "causal-dag"))
+        );
     }
 
     #[test]
@@ -1007,11 +1317,25 @@ mod tests {
         );
         assert_eq!(
             dispatch_command("/extension", &context),
-            CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned())
+            CommandEffect::Action(CommandAction::OpenExtensionManager)
         );
         assert_eq!(
             dispatch_command("/extension run causal-dag", &context),
-            CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned())
+            CommandEffect::Message(
+                "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned()
+            )
+        );
+        assert_eq!(
+            dispatch_command("/diff", &context),
+            CommandEffect::Action(CommandAction::ShowDiff)
+        );
+        assert_eq!(
+            dispatch_command("/usage", &context),
+            CommandEffect::Action(CommandAction::ShowUsage)
+        );
+        assert_eq!(
+            dispatch_command("/dag", &context),
+            CommandEffect::Action(CommandAction::DagExport)
         );
         assert!(matches!(
             dispatch_command("/extension run causal-dag.catch-up {", &context),

@@ -2519,6 +2519,33 @@ fn worked_separator_degrades_to_single_bare_label_at_narrow_widths() {
 }
 
 #[test]
+fn resume_boundary_renders_decision_record_and_centered_divider() {
+    let theme = Theme::default();
+    let item = [TranscriptItem::ResumeBoundary {
+        label: "research".to_owned(),
+        recovery_closure_appended: true,
+        warning_count: 1,
+        events_replayed: 12,
+    }];
+    let texts = line_texts(&render_items_for_history(&item, &theme, 72));
+    let joined = texts.join("\n");
+    assert!(
+        joined.contains("✓ resumed session research"),
+        "joined: {joined}"
+    );
+    assert!(
+        joined.contains("recovery closure appended"),
+        "joined: {joined}"
+    );
+    assert!(joined.contains("warnings"), "joined: {joined}");
+    assert!(
+        joined.contains("12 events replayed · model context folded to stubs"),
+        "joined: {joined}"
+    );
+    assert!(joined.contains('─'), "joined: {joined}");
+}
+
+#[test]
 fn tui_long_tool_output_ignores_trailing_blanks_in_head_tail_preview() {
     let output = (1..=12)
         .map(|index| format!("line {index}"))

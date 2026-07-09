@@ -382,6 +382,70 @@ pub(super) fn render_worked_duration(
     lines.push(Line::from(Span::styled(line, theme.transcript.muted)));
 }
 
+pub(super) struct ResumeBoundaryRender<'a> {
+    pub(super) label: &'a str,
+    pub(super) recovery_closure_appended: bool,
+    pub(super) warning_count: usize,
+    pub(super) events_replayed: usize,
+}
+
+pub(crate) fn resume_boundary_decision_text(
+    label: &str,
+    recovery_closure_appended: bool,
+    warning_count: usize,
+) -> String {
+    let mut decision = format!("✓ resumed session {label}");
+    if recovery_closure_appended {
+        decision.push_str(" · recovery closure appended");
+    }
+    if warning_count > 0 {
+        decision.push_str(&format!(" · {warning_count} warnings"));
+    }
+    decision
+}
+
+pub(super) fn render_resume_boundary(
+    lines: &mut Vec<Line<'static>>,
+    boundary: ResumeBoundaryRender<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    let decision = resume_boundary_decision_text(
+        boundary.label,
+        boundary.recovery_closure_appended,
+        boundary.warning_count,
+    );
+    push_wrapped_with_prefix(
+        lines,
+        CellPrefixes {
+            first: "",
+            next: "  ",
+        },
+        &decision,
+        theme.transcript.permission,
+        theme,
+        width,
+    );
+
+    let core = format!(
+        "{} events replayed · model context folded to stubs",
+        boundary.events_replayed
+    );
+    let text = format!(" {core} ");
+    let text_width = display_width(&text);
+    let width = usize::from(width).max(1);
+    let min_rule = 4usize;
+    let divider = if width <= text_width + min_rule * 2 {
+        format!("────{text}────")
+    } else {
+        let remaining = width - text_width;
+        let left = remaining / 2;
+        let right = remaining - left;
+        format!("{}{}{}", "─".repeat(left), text, "─".repeat(right))
+    };
+    lines.push(Line::from(Span::styled(divider, theme.transcript.muted)));
+}
+
 pub(super) fn tool_failure_status(exit_code: Option<i64>, error: &str) -> String {
     let cause = error.trim();
     match (exit_code, cause.is_empty()) {

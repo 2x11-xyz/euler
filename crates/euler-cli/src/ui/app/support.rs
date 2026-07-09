@@ -73,6 +73,8 @@ pub(super) struct CommandContextParts {
     pub current_theme: ThemeChoice,
     pub current_session_id: Option<String>,
     pub checkpoint_items: Vec<CheckpointItem>,
+    pub extension_items: Vec<super::super::commands::ExtensionManagerItem>,
+    pub extension_slash_commands: Vec<super::super::commands::ExtensionSlashCommand>,
 }
 
 pub(super) fn command_context(
@@ -92,6 +94,8 @@ pub(super) fn command_context(
         theme_choices: theme_choices(parts.current_theme),
         resume_items: resume_items_from_home(parts.current_session_id.as_deref()),
         checkpoint_items: parts.checkpoint_items,
+        extension_items: parts.extension_items,
+        extension_slash_commands: parts.extension_slash_commands,
     }
 }
 
@@ -227,11 +231,12 @@ fn resume_items_from_records_at(
             let mut item = ResumeItem::new(record.id().to_owned(), session_resume_label(&record));
             item.status = Some(relative_age(record.updated_at_ms(), now_ms));
             item.preview = Some(resume_detail(&record));
-            item.group = Some(
-                record
-                    .kind()
-                    .map_or_else(|| "unknown".to_owned(), |kind| kind.as_str().to_owned()),
-            );
+            // Spec §5.10 launch-kind group headers: interactive → tui, non-interactive → exec.
+            item.group = Some(match record.kind() {
+                Some(euler_core::SessionKind::Interactive) => "tui".to_owned(),
+                Some(euler_core::SessionKind::NonInteractive) => "exec".to_owned(),
+                None => "unknown".to_owned(),
+            });
             item
         })
         .collect()

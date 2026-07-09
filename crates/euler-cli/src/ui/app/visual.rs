@@ -272,7 +272,9 @@ impl AppCore {
             BottomOwner::Palette(_)
             | BottomOwner::Picker(_)
             | BottomOwner::Mention(_)
-            | BottomOwner::Search(_) => FocusOwner::BottomSurface,
+            | BottomOwner::Search(_)
+            | BottomOwner::TextPrompt(_)
+            | BottomOwner::ConfirmPrompt(_) => FocusOwner::BottomSurface,
         }
     }
 }

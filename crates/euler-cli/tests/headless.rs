@@ -6707,6 +6707,11 @@ fn tui_resume_picker_lists_home_sessions() {
         tui.screen_text()
     );
     assert!(
+        tui.wait_for_screen("events replayed · model context folded to stubs"),
+        "resume boundary divider missing:\n{}",
+        tui.screen_text()
+    );
+    assert!(
         tui.wait_for_screen("user: saved for picker"),
         "resumed transcript was not rendered:\n{}",
         tui.screen_text()
