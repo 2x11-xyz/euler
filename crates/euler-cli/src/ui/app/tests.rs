@@ -2838,6 +2838,18 @@ fn patch_approval_modal_renders_diff_and_prompt() {
     assert!(contents.contains("note.txt"));
     assert!(contents.contains("alpha"));
     assert!(contents.contains("beta"));
+    let visual = core
+        .visual_canvas_frame(80)
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        visual.contains("write scope note.txt"),
+        "visual: {visual:?}"
+    );
+    assert!(visual.contains("ran-before unknown"), "visual: {visual:?}");
     assert!(contents.contains("y  Allow once"));
     assert!(contents.contains("Allow once (default selection)"));
     assert!(contents.contains("a  Allow fs-write"));

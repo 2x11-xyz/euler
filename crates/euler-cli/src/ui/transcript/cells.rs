@@ -367,7 +367,7 @@ pub(super) fn render_permission_ask(
             current_cwd_label()
         )),
         PermissionPanelRow::body(preview),
-        PermissionPanelRow::metadata(consequences_row(ask.capability)),
+        PermissionPanelRow::metadata(consequences_row(ask.capability, ask.scope_prefix)),
     ];
     rows.extend(
         crate::ui::patch_approval::approval_option_lines(ask.capability, ask.scope_prefix)
@@ -443,14 +443,21 @@ fn current_cwd_label() -> String {
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
-fn consequences_row(capability: &str) -> String {
+fn consequences_row(capability: &str, scope_prefix: Option<&str>) -> String {
+    let write_scope = if capability == "fs-write" {
+        scope_prefix
+            .filter(|prefix| !prefix.trim().is_empty())
+            .unwrap_or("unknown")
+    } else {
+        "unknown"
+    };
     let network = if capability == "network" {
         "requested"
     } else {
         "unknown"
     };
     format!(
-        "consequences: write scope unknown · network {network} · duration unknown · ran-before unknown"
+        "consequences: write scope {write_scope} · network {network} · duration unknown · ran-before unknown"
     )
 }
 
