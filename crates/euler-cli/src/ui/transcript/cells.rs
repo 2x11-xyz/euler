@@ -454,8 +454,29 @@ fn permission_panel_row_style(
 
 fn current_cwd_label() -> String {
     std::env::current_dir()
-        .map(|path| path.display().to_string())
+        .map(|path| compact_cwd_label(&path.display().to_string()))
         .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+/// Bounded cwd for the approval panel corner: keep the path tail so the row
+/// wraps identically regardless of how deep the workspace lives (§9 keeps
+/// the consequences row to a predictable width; also test hermeticity —
+/// panels must render the same row count from any checkout location).
+fn compact_cwd_label(path: &str) -> String {
+    const MAX_CWD_CHARS: usize = 24;
+    let chars = path.chars().count();
+    if chars <= MAX_CWD_CHARS {
+        return path.to_owned();
+    }
+    let tail: String = path
+        .chars()
+        .rev()
+        .take(MAX_CWD_CHARS - 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{tail}")
 }
 
 fn consequences_row(capability: &str, scope_prefix: Option<&str>, prior_count: usize) -> String {

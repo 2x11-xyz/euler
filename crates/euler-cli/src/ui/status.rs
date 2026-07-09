@@ -19,11 +19,19 @@ const SEGMENT_GAP: &str = " · ";
 /// no-session fallbacks) are returned unchanged. The full id always belongs
 /// in `/status` output and in copy-ready resume commands.
 pub fn short_session_id(id: &str) -> String {
-    if id.len() <= 5 {
+    if id.chars().count() <= 5 {
         return id.to_owned();
     }
-    let tail_start = id.len().saturating_sub(4);
-    format!("e{}", id[tail_start..].to_lowercase())
+    // char-based tail: a malformed (non-ASCII) id must not panic the TUI.
+    let tail: String = id
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("e{}", tail.to_lowercase())
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
