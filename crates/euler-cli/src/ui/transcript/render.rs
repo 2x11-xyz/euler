@@ -11,7 +11,6 @@ use crate::ui::markdown;
 use crate::ui::text::{content_width, display_width, wrap_text, GUTTER_WIDTH};
 use crate::ui::theme::Theme;
 use ratatui::text::{Line, Span};
-use std::collections::HashSet;
 
 const ASSISTANT_PROSE_GUTTER: &str = "  ";
 
@@ -37,12 +36,6 @@ impl TranscriptRenderLimits {
         self.output_lines = output_lines;
         self
     }
-
-    fn expanded(mut self) -> Self {
-        self.output_lines = usize::MAX;
-        self.patch_detail_lines = usize::MAX;
-        self
-    }
 }
 
 #[allow(dead_code)]
@@ -61,23 +54,12 @@ pub(super) fn render_projected_items(
 }
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_lines)] // ratchet: 243 lines, refactor target
 pub(super) fn render_projected_entries(
     entries: &[ProjectedEntry],
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
-) -> Vec<Line<'static>> {
-    render_projected_entries_with_expansion(entries, theme, width, limits, &HashSet::new())
-}
-
-#[allow(dead_code)]
-#[allow(clippy::too_many_lines)] // ratchet: 243 lines, refactor target
-pub(super) fn render_projected_entries_with_expansion(
-    entries: &[ProjectedEntry],
-    theme: &Theme,
-    width: u16,
-    limits: TranscriptRenderLimits,
-    expanded_artifact_keys: &HashSet<String>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let width = width.saturating_sub(GUTTER_WIDTH as u16).max(1);
@@ -89,12 +71,6 @@ pub(super) fn render_projected_entries_with_expansion(
 
         let first_line = lines.len();
         let item = &entry.item;
-        let item_limits = if expanded_artifact_keys.contains(&super::artifact_key_for_index(index))
-        {
-            limits.expanded()
-        } else {
-            limits
-        };
         match item {
             TranscriptItem::Banner { session_id } => {
                 lines.extend(super::super::banner::styled_lines_with_session(
@@ -201,7 +177,7 @@ pub(super) fn render_projected_entries_with_expansion(
                     theme.transcript.muted,
                     theme,
                     width,
-                    item_limits.output_lines,
+                    limits.output_lines,
                 );
             }
             TranscriptItem::ToolRun {
@@ -222,7 +198,7 @@ pub(super) fn render_projected_entries_with_expansion(
                     },
                     theme,
                     width,
-                    item_limits.output_lines,
+                    limits.output_lines,
                 );
             }
             TranscriptItem::Exploration { summaries } => {
@@ -285,7 +261,7 @@ pub(super) fn render_projected_entries_with_expansion(
                     },
                     theme,
                     width,
-                    item_limits.patch_detail_lines,
+                    limits.patch_detail_lines,
                 );
             }
             TranscriptItem::PatchApplied { path, old, new } => {
@@ -298,7 +274,7 @@ pub(super) fn render_projected_entries_with_expansion(
                     },
                     theme,
                     width,
-                    item_limits.patch_detail_lines,
+                    limits.patch_detail_lines,
                 );
             }
             TranscriptItem::FileChange {
@@ -349,7 +325,7 @@ pub(super) fn render_projected_entries_with_expansion(
                     },
                     theme,
                     width,
-                    item_limits.output_lines,
+                    limits.output_lines,
                 );
             }
             TranscriptItem::CheckStarted { name } => {
@@ -386,7 +362,7 @@ pub(super) fn render_projected_entries_with_expansion(
                     },
                     theme,
                     width,
-                    item_limits.output_lines,
+                    limits.output_lines,
                 );
             }
             TranscriptItem::SessionSummary(summary) => {
