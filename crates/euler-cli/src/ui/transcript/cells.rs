@@ -242,11 +242,9 @@ pub(super) fn render_permission_decision(
     theme: &Theme,
     width: u16,
 ) {
-    let glyph = if view.allowed == Some(true) {
-        glyphs::check()
-    } else {
-        glyphs::cross()
-    };
+    // v2 (§0): the ✓/✗ lives in the spine anchor (green/red); the record
+    // text is dim — gold means pending attention, never a settled decision
+    // (§3). No redundant "({decision})" suffix (audit S3).
     let scope_label = match (view.allowed, view.grant_scope) {
         (Some(true), Some("session")) => "allowed for session",
         (Some(true), Some("project")) => "allowed for project",
@@ -259,27 +257,26 @@ pub(super) fn render_permission_decision(
     let capability = view.capability;
     let decision = view.decision;
     let text = if view.allowed == Some(true) && !scope_label.is_empty() && !capability.is_empty() {
-        format!("{scope_label} · {capability} ({decision})")
+        format!("{scope_label} · {capability}")
     } else if view.allowed == Some(false) && inst.is_some() && !capability.is_empty() {
         format!("denied · {capability} — \"{}\"", inst.unwrap_or_default())
     } else if view.allowed == Some(false) && decision.contains("cancel") {
-        format!("Permission canceled: {capability} ({decision})")
+        format!("permission canceled · {capability}")
     } else if view.allowed == Some(false) && !capability.is_empty() {
-        format!("denied · {capability} ({decision})")
+        format!("denied · {capability}")
     } else if capability.is_empty() {
-        format!("Permission decided: {decision}")
+        format!("permission decided · {decision}")
     } else {
-        format!("Permission decided: {capability} ({decision})")
+        format!("permission decided · {capability}")
     };
-    let text = format!("{glyph} {text}");
     push_wrapped_with_prefix(
         lines,
         CellPrefixes {
             first: blank_gutter(),
-            next: "  ",
+            next: blank_gutter(),
         },
         &text,
-        theme.transcript.permission,
+        theme.transcript.muted,
         theme,
         width,
     );
@@ -498,15 +495,13 @@ fn consequences_row(capability: &str, scope_prefix: Option<&str>, prior_count: u
 }
 
 pub(super) fn render_interrupted(lines: &mut Vec<Line<'static>>, theme: &Theme, width: u16) {
-    let text = format!(
-        "{} interrupted — tell euler what to do differently",
-        glyphs::interrupt()
-    );
+    // The ■ lives in the spine anchor (§1).
+    let text = "interrupted — tell euler what to do differently".to_owned();
     push_wrapped_with_prefix(
         lines,
         CellPrefixes {
             first: blank_gutter(),
-            next: "  ",
+            next: blank_gutter(),
         },
         &text,
         theme.transcript.warning,
@@ -617,7 +612,8 @@ pub(crate) fn resume_boundary_decision_text(
     recovery_closure_appended: bool,
     warning_count: usize,
 ) -> String {
-    let mut decision = format!("{} resumed session {label}", glyphs::check());
+    // The ✓ lives in the spine anchor (§1).
+    let mut decision = format!("resumed session {label}");
     if recovery_closure_appended {
         decision.push_str(" · recovery closure appended");
     }
@@ -644,7 +640,8 @@ pub(super) fn render_companion_block(
     theme: &Theme,
     width: u16,
 ) {
-    let glyph = crate::ui::glyphs::companion_glyph();
+    // The ◆ lives in the spine anchor (§1); block rows keep the teal rail.
+    let glyph = "";
     let name = if companion.name.is_empty() {
         "companion"
     } else {
@@ -704,7 +701,7 @@ fn render_companion_running(
     width: u16,
 ) {
     let header = if running.task.is_empty() {
-        format!("{} {} ⠧ · {}", running.glyph, running.name, running.elapsed)
+        format!("{}{} ⠧ · {}", running.glyph, running.name, running.elapsed)
     } else {
         format!(
             "{} {} ⠧ · {} · {}",

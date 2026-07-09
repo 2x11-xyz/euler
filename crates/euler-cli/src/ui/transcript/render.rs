@@ -190,10 +190,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     push_wrapped(
                         &mut lines,
                         blank_gutter(),
-                        &format!(
-                            "{} {label} for {elapsed} · ctrl+o collapse",
-                            glyphs::thinking()
-                        ),
+                        &format!("{label} for {elapsed} · ctrl+o collapse"),
                         theme.transcript.reasoning,
                         theme,
                         width,
@@ -446,8 +443,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     &mut lines,
                     blank_gutter(),
                     &format!(
-                        "{} reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact",
-                        glyphs::revert()
+                        "reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact"
                     ),
                     theme.transcript.muted,
                     theme,
@@ -570,7 +566,8 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 push_wrapped(
                     &mut lines,
                     blank_gutter(),
-                    &format!("! {source}: {message}"),
+                    // The ✗ lives in the spine anchor (§1).
+                    &format!("{source}: {message}"),
                     theme.transcript.error,
                     theme,
                     width,
@@ -693,7 +690,6 @@ fn aligned_exploration_row(verb: &str, detail: &str, verb_width: usize) -> Strin
 /// keeps the blank spine (user messages carry the ▌ rail instead; separators
 /// have no anchor).
 fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)> {
-    use crate::ui::glyphs;
     let anchor = match item {
         TranscriptItem::UserMessage(_)
         | TranscriptItem::Banner { .. }
@@ -875,9 +871,9 @@ fn push_bounded_detail(
 }
 
 fn reasoning_summary(label: &str, content: &str, elapsed: &str) -> String {
+    // The ✱ lives in the spine anchor (§1).
     format!(
-        "{} {label} for {elapsed} — {} · ctrl+o expand",
-        glyphs::thinking(),
+        "{label} for {elapsed} — {} · ctrl+o expand",
         reasoning_gist(content)
     )
 }
