@@ -93,3 +93,23 @@ target; SUPERSEDED frame is v1 — do not implement from it.
   hug-bottom (S1); recap placement under Worked divider (S3); §9
   degradation order re-check (ts gutter drop applies only when opted in);
   final PTY + workspace gate; merge to feat/warm-ledger-tui.
+
+
+## Open bug (the ONE remaining failure): spine-mode one-row commit drop
+Test: tui_pty_transcript_lines_commit_exactly_once (headless.rs). Agent
+bisect: passes @7f4393e, fails from 6246c3c (timestamps default off) —
+latent spine-mode bug, previously masked by the 11-col gutter.
+Evidence: banner block + user message bridge-committed (7 rows); Paragraph
+1's FIRST physical row is in neither bridge rows nor vt100 scrollback;
+its wrap-continuations onward are intact. Exactly one row is overwritten
+uncommitted at the first commit boundary after the user message.
+Rhythm-row removal (this commit) did NOT fix it.
+Debug plan: re-add the EULER_DEBUG_COMMITS file logging to terminal.rs
+([commit] rows/items/commit_until/offsets + [emit] first-row text; see
+git log for the earlier diagnostic shapes), run the failing test, and
+compare committed_active_rows against where Paragraph 1's first row sits
+in frame.active_frame_lines. Suspects: live_committed prefix rows vs
+finalized re-render shifting by one (stamp/anchor divergence between the
+LiveTranscript block path at app/visual.rs:86-100 and the History path),
+or active_row_count trimming trailing blanks while commit_until counts
+them (visual_canvas.rs active_row_count vs Line::default separator).

@@ -322,35 +322,20 @@ pub(super) fn render_finalized_visual_items_with_offsets(
     output_limit_lines: usize,
     expanded_artifact_keys: &std::collections::HashSet<String>,
 ) -> (Vec<CanvasLine>, Vec<usize>) {
-    let (lines, mut item_end_offsets) = transcript::render_items_for_history_with_offsets(
+    let (lines, item_end_offsets) = transcript::render_items_for_history_with_offsets(
         items,
         theme,
         width,
         output_limit_lines,
         expanded_artifact_keys,
     );
-    let mut lines = ratatui_lines_to_canvas(lines);
-    if finalized_batch_needs_trailing_rhythm(items) {
-        lines.push(CanvasLine::plain_lossy(""));
-        // The rhythm row belongs to the last item's committed region.
-        if let Some(last) = item_end_offsets.last_mut() {
-            *last += 1;
-        }
-    }
-    (lines, item_end_offsets)
+    // v2: the renderer already separates every event with one blank line —
+    // the old trailing-rhythm row would double it AND desync the live vs
+    // finalized row layouts (the live prefix never carried the rhythm row,
+    // so committed-row accounting slipped by one at the finalization seam).
+    (ratatui_lines_to_canvas(lines), item_end_offsets)
 }
 
-fn finalized_batch_needs_trailing_rhythm(items: &[TranscriptItem]) -> bool {
-    matches!(
-        items.last(),
-        Some(
-            TranscriptItem::UserMessage(_)
-                | TranscriptItem::AssistantMessage(_)
-                | TranscriptItem::WorkedDuration(_)
-                | TranscriptItem::TurnRecap { .. }
-        )
-    )
-}
 
 pub(super) fn ratatui_lines_to_canvas(lines: Vec<Line<'static>>) -> Vec<CanvasLine> {
     lines
