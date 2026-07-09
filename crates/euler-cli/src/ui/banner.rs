@@ -11,6 +11,7 @@
 //! per-span styled lines (`styled_lines`). Both are assembled from the same
 //! row source so they cannot drift.
 
+use super::status::short_session_id;
 use super::theme::Theme;
 use ratatui::{
     buffer::Buffer,
@@ -119,7 +120,10 @@ pub fn render_with_session(session_id: Option<&str>) -> Vec<String> {
 }
 
 pub fn session_help_line(session_id: Option<&str>) -> String {
-    let id = session_id.filter(|id| !id.is_empty()).unwrap_or("e0000");
+    let id = session_id
+        .filter(|id| !id.is_empty())
+        .map(short_session_id)
+        .unwrap_or_else(|| "e0000".to_owned());
     format!("new session {id} · resumable with /resume · / for commands")
 }
 
@@ -276,10 +280,17 @@ mod tests {
             session_help_line(Some("e1234")),
             "new session e1234 · resumable with /resume · / for commands"
         );
+        assert_eq!(
+            session_help_line(Some("01KX488KQ6DXYPYGB0FK7GFD4T")),
+            "new session efd4t · resumable with /resume · / for commands"
+        );
         assert!(render(80).join("\n").contains("new session e0000"));
         assert!(render_with_session(Some("e1234"))
             .join("\n")
             .contains("new session e1234"));
+        assert!(render_with_session(Some("01KX488KQ6DXYPYGB0FK7GFD4T"))
+            .join("\n")
+            .contains("new session efd4t"));
     }
 
     #[test]
