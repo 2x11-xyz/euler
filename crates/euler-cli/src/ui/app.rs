@@ -1654,6 +1654,7 @@ impl AppCore {
     }
 
     fn show_session_usage(&mut self) -> CoreEffect {
+        // Cost display is deferred until provider price catalogs exist.
         let AppState::Idle { session } = &self.state else {
             // Fall back to live snapshot when a turn is in flight.
             let text = format_usage_from_snapshot(&self.token_usage, &self.status);

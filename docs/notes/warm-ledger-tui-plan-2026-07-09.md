@@ -587,6 +587,7 @@ Still open (do not invent beyond Spec; tag first blocking slice):
 9. Ctrl+x `$EDITOR`: always local trusted vs permission-gated — **hardening**.
 10. Reduced-motion / no-color: detect vs user setting — **Slice 1 / hardening**.
 11. Notification body privacy limits — **Slice 11**.
+12. Extension manager add/remove/toggle records: current transcript notices must become canonical decision-record ledger events — **Slice 9 debt**.
 
 ## Appendix B · GPT-5.5 audit incorporation checklist
 

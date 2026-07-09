@@ -18,6 +18,7 @@ pub(crate) const NEW_FILE_PREVIEW_ROWS: usize = 5;
 /// Compact Codex-style diff row: `{number:>width} {sign} {source}`. One
 /// right-aligned line-number column (old number for deletions, new number
 /// for insertions and context), a colored sign, then the source text.
+/// Deliberate spec deviation for usability: deletion rows cite old-file lines.
 pub(crate) fn compact_diff_row(
     number: usize,
     number_width: usize,

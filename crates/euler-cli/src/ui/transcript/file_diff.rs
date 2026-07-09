@@ -150,6 +150,7 @@ const MIN_LINE_NUMBER_WIDTH: usize = crate::ui::patch_diff::MIN_LINE_NUMBER_WIDT
 
 /// One relevant line number per row, Codex convention: the old-file number
 /// for deletions, the new-file number for insertions and context.
+/// Deliberate spec deviation for usability: deletion rows cite old-file lines.
 fn diff_row_line_number(row: &FileDiffRow) -> Option<usize> {
     match row.kind {
         FileDiffLineKind::Delete => row.old_line,
