@@ -63,6 +63,75 @@ logic regressions found; F22/F23 are test-hermeticity defects only. The
 "1879 tests green" completion claim holds on Linux/UTC but not on the
 dogfooding host.
 
+## ROUND 2 · F1–F21 fix verification (branch @ `bc52b92`)
+
+**Verified fixed, close them:** F1 (keystroke acceptance test),
+F5 (real elapsed from event timestamps + working ctrl+o expand),
+F6 (thresholds + 69/70/85 boundary test), F7 (header counts/elapsed, true
+├/└ tree, dead `activity.rs` deleted with nothing live lost), F9 (per-seed
+tints, warm-ledger 12/12/10 — lands ≈`#343424`/`#38291d`, slightly above the
+spec estimates but genuinely subtle; accepted), F10 (file_diff path now uses
+`patch_diff::hunk_symbol`), F12 (│ separators + bold header), F13 (comments
+faint italic), F14 (5-row cap effective + test), F17, F19 (deliberate-decision
+comments), F20 (char-safe + multibyte test), F21 (pre-existing conformance
+confirmed). F2 is honest as scoped: formatter + tests landed, un-wired status
+documented at `text.rs:120`. F15/F16 debt comments/plan-line landed. F18
+de-emphasized (nit: uses `muted`, not the faint token — optional polish).
+
+**Residual findings — new numbers, fix or document:**
+
+### F24 · (residual of F8) `hairline` token is dead — hairlines still render gutter
+
+- Palette/seeds/tests for `hairline`/`composer_rule`/`user_rail`/`queued_rail`
+  all landed (`theme.rs:180-183,331-334,983-986`) and composer/queued rails
+  genuinely consume their tokens. But `theme.transcript.hairline`
+  (`theme.rs:553`) has **zero consumers**: `push_hairline` still styles with
+  `transcript.gutter` (`transcript/render.rs:661`), and markdown
+  heading-underlines/rules also use `gutter` (`markdown.rs:243,277,594,676`).
+  The visual flattening F8 flagged (hairlines same color as timestamps) is
+  unchanged.
+- **Accept when:** `push_hairline` and the markdown h1/h2 underline use
+  `transcript.hairline`; a render test asserts hairline color ≠ gutter color
+  under warm-ledger.
+
+### F25 · (residual of F3) glyph fallback system unconsumed; `■` missing; plan doc over-claims
+
+- The `GlyphSet` system + env detection are solid and tested
+  (`glyphs.rs:30-60,156-189,216-299`). But: (a) `■` interrupt is absent from
+  the table and used raw (`app.rs:3017,3020`, `cells.rs:471`); (b) the ~9 new
+  accessors (`thinking/spinner/check/cross/tree_mid/tree_last/prompt/warning/revert`)
+  have **zero consumers** — render sites still hardcode `✱` (`render.rs:171,780`),
+  `⠧` (`app.rs:3028-3033`, `cells.rs:634,637`), `↩` (`render.rs:420`),
+  `├└` (`text.rs:9-14`), `✓✗` (`cells.rs:245,247,832-851,939-942`); (c) the
+  plan doc asserts "Glyph fallbacks wired" (`warm-ledger-tui-plan:334`), which
+  is false — ASCII mode currently degrades only the user rail and companion
+  glyph.
+- **Accept when:** either render sites route through the accessors (add `■`
+  to the table), or the plan-doc line is corrected to name the actual state
+  and the consumer wiring is an explicit debt entry.
+
+### F26 · (residual of F11) `ran-before` still hardcoded; arrow-select debt silent
+
+- Titles ("Run command?"/"Edit file?"), deny naming, and panel hierarchy all
+  landed. But `consequences_row` still emits literal
+  `duration unknown · ran-before unknown` (`cells.rs:449-464`) — no session
+  history lookup, though grant/decision state exists to derive it. And there
+  is still no ↑↓ selection ("Allow once" carries a static `selected:true`,
+  `patch_approval.rs:289-290`); neither gap is recorded as debt anywhere
+  post-fix.
+- **Accept when:** `ran-before N×` is derived from this session's decision
+  history (other fields may stay `unknown`), and arrow-select is either
+  implemented or added to the debt list.
+
+### F27 · (residual of F4) shell running state remains unbuilt and unlisted
+
+- Done-state correctly reuses `most_informative_line` + duration. The spec §4
+  running state (gold spinner + elapsed + 2-line replacing tail +
+  esc/ctrl+o hints) still does not exist — `ToolRun` has no running variant
+  (`render.rs:246-252`). The round-1 completion table marked F4 "Done".
+- **Accept when:** running state ships, or it appears on the acknowledged-debt
+  list with the F2 scroll-pill wiring (they will share the live-render seam).
+
 ---
 
 ## BLOCKER
