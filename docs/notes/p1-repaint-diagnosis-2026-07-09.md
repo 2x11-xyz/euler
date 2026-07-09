@@ -77,3 +77,26 @@ committed-scrollback boundary by finalized-item identity:
   EULER_DEBUG_COMMITS file logging (emitted row ranges + text of first row)
   to answer (a)-(c); then fix, run tui_pty_* + full gate, remove
   diagnostics, clippy, push.
+
+## Final piece: bridge emission semantics
+`try_write_finalized_lines_with_bridge` emits via the codex-style contract
+(history_insert.rs): scroll region `ESC[1;Nr`, cursor to region bottom, one
+`\r\n` + row per line, `ESC[r]` reset. Real terminals (iTerm2, Terminal.app,
+kitty) push lines scrolled off a region whose top is row 1 into native
+scrollback — that is the whole point of the contract. The `vt100` Rust crate
+does NOT model this (region scrolls are discarded), so the PTY test's
+reconstruction under-reports committed lines that went through the bridge.
+
+Consequences:
+- Eli's P1 duplicates: caused by resize→purge-replay re-committing — FIXED
+  on this branch (UiAction::Resize no longer replays; item-boundary remap).
+- The regression test needs a reconstruction that models region-top-1 scroll
+  → scrollback push. Plan: process output incrementally; when about to feed
+  bytes that scroll a region rooted at row 1 (track current region from
+  CSI r), snapshot the screen's top row into a synthetic scrollback vec.
+  Alternatively (simpler): between the `ESC[1;Nr` and `ESC[r` markers of a
+  bridge span, capture the N written rows directly from the byte stream —
+  the bridge writes exactly the committed rows, in order.
+- After the test models this, expected result: everything exactly once both
+  with and without resize. Then: remove EULER_DEBUG_COMMITS + [emit]
+  diagnostics, full gate, clippy, push, merge to feat/warm-ledger-tui.

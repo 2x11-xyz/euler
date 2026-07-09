@@ -354,6 +354,28 @@ where
         if lines.is_empty() {
             return Ok(());
         }
+        if let Some(debug_path) = std::env::var_os("EULER_DEBUG_COMMITS") {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(debug_path)
+            {
+                let _ = writeln!(
+                    file,
+                    "[emit] {} lines, first=`{}` bridge={allow_bridge}",
+                    lines.len(),
+                    lines
+                        .first()
+                        .map(|line| line
+                            .spans
+                            .iter()
+                            .map(|span| span.text.as_str())
+                            .collect::<String>())
+                        .unwrap_or_default()
+                );
+            }
+        }
         self.autoresize()?;
         // Only the live viewport is mutable. Finalized output is written once
         // after clearing that owned active frame, never by rewriting scrollback.
