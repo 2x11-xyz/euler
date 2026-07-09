@@ -5,8 +5,8 @@ use super::commands::CommandAction;
 #[cfg(test)]
 use super::composer::composer_widget;
 use super::composer::{
-    cursor_position, desired_height_for_width, render_lines as composer_render_lines, ComposerLine,
-    ComposerRenderOptions, ComposerSnapshot, OverflowIndicator,
+    cursor_position_for_snapshot, desired_height_for_width, render_lines as composer_render_lines,
+    ComposerLine, ComposerRenderOptions, ComposerSnapshot, OverflowIndicator, QueuedComposerLine,
 };
 use super::dirty::{RedrawLevel, Region};
 use super::event_loop::{
@@ -83,8 +83,10 @@ fn is_slash_command_key(key: &KeyEvent) -> bool {
 }
 
 #[cfg(test)]
+#[path = "app/chrome_test.rs"]
 mod chrome;
 #[cfg(test)]
+#[path = "app/render_tests_support_test.rs"]
 mod render_tests_support;
 mod support;
 mod visual;
@@ -143,6 +145,9 @@ pub struct AppCore {
     editor: Box<dyn ExternalEditorRunner>,
     clipboard: Box<dyn ClipboardSink>,
     pending_runs: VecDeque<PendingRunRequest>,
+    queued_inputs: VecDeque<String>,
+    queued_selection: Option<usize>,
+    queue_auto_flush_paused: bool,
     in_flight_label: Option<String>,
     in_flight_cancellable: bool,
     extensions: ExtensionSelection,
@@ -563,6 +568,9 @@ impl AppCore {
             editor: Box::<SystemExternalEditor>::default(),
             clipboard: Box::<SystemClipboard>::default(),
             pending_runs: VecDeque::new(),
+            queued_inputs: VecDeque::new(),
+            queued_selection: None,
+            queue_auto_flush_paused: false,
             in_flight_label: None,
             in_flight_cancellable: false,
             extensions,
@@ -602,6 +610,30 @@ impl AppCore {
             .unwrap_or_default()
     }
 
+    fn composer_snapshot(&self) -> ComposerSnapshot<'_> {
+        ComposerSnapshot::new(self.bottom.composer()).with_queued(self.queued_composer_lines())
+    }
+
+    fn queued_composer_lines(&self) -> Vec<QueuedComposerLine> {
+        let total = self.queued_inputs.len();
+        let selected = self.selected_queue_index();
+        self.queued_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, text)| QueuedComposerLine {
+                position: index + 1,
+                total,
+                text: text.clone(),
+                selected: Some(index) == selected,
+            })
+            .collect()
+    }
+
+    fn selected_queue_index(&self) -> Option<usize> {
+        let len = self.queued_inputs.len();
+        (len > 0).then(|| self.queued_selection.unwrap_or(len - 1).min(len - 1))
+    }
+
     pub fn handle_input(&mut self, input: InputEvent) -> CoreEffect {
         if matches!(self.modal, Some(Modal::Help)) {
             return self.handle_help_input(input);
@@ -622,6 +654,7 @@ impl AppCore {
                 if self.is_in_flight_cancellable() {
                     interrupt_flag.store(true, Ordering::SeqCst);
                     self.interrupted_guidance = true;
+                    self.queue_auto_flush_paused = true;
                 } else {
                     // The interrupt is dropped, not deferred: extension
                     // commands do not observe the flag yet. Say so.
@@ -712,13 +745,18 @@ impl AppCore {
                     CoreEffect::None
                 }
             }
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.unqueue_selected_input()
+            }
             _ if !matches!(self.bottom.owner(), BottomOwner::Composer) => {
                 self.handle_surface_key(key)
             }
             KeyCode::Enter if enter_key_intent(&key) == Some(EnterKeyIntent::InsertNewline) => {
                 self.edit_composer_text(|draft| draft.insert_newline())
             }
-            KeyCode::Enter => self.turn_already_in_progress_notice(),
+            KeyCode::Enter => self.queue_composer_input(),
             _ if is_slash_command_key(&key) && self.bottom.composer().submit_text().is_empty() => {
                 self.bottom.open_palette();
                 CoreEffect::Render
@@ -728,9 +766,11 @@ impl AppCore {
             }
             KeyCode::Backspace => self.edit_composer_text(|draft| draft.backspace()),
             KeyCode::Delete => self.edit_composer_text(|draft| draft.delete()),
+            KeyCode::Left if self.can_move_queued_selection() => self.move_queued_selection(-1),
+            KeyCode::Right if self.can_move_queued_selection() => self.move_queued_selection(1),
             KeyCode::Left => self.move_composer_cursor(|draft| draft.move_left()),
             KeyCode::Right => self.move_composer_cursor(|draft| draft.move_right()),
-            KeyCode::Up => self.move_composer_up_or_history(),
+            KeyCode::Up => self.recall_selected_queued_input(),
             KeyCode::Down => self.move_composer_down_or_history(),
             KeyCode::Home => self.move_composer_cursor(|draft| draft.move_home()),
             KeyCode::End => self.move_composer_cursor(|draft| draft.move_end()),
@@ -832,6 +872,8 @@ impl AppCore {
             KeyCode::Char(ch) => self.edit_composer_text(|draft| draft.insert_char(ch)),
             KeyCode::Backspace => self.edit_composer_text(|draft| draft.backspace()),
             KeyCode::Delete => self.edit_composer_text(|draft| draft.delete()),
+            KeyCode::Left if self.can_move_queued_selection() => self.move_queued_selection(-1),
+            KeyCode::Right if self.can_move_queued_selection() => self.move_queued_selection(1),
             KeyCode::Left => self.move_composer_cursor(|draft| draft.move_left()),
             KeyCode::Right => self.move_composer_cursor(|draft| draft.move_right()),
             KeyCode::Up => self.move_composer_up_or_history(),
@@ -863,6 +905,11 @@ impl AppCore {
                 .submit_text()
                 .is_empty()
                 .then_some(CoreEffect::Quit),
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(self.unqueue_selected_input())
+            }
             KeyCode::Esc => Some(CoreEffect::None),
             _ => None,
         }
@@ -963,15 +1010,43 @@ impl AppCore {
     fn handle_submit(&mut self) -> CoreEffect {
         let prompt = self.bottom.composer().submit_text();
         if prompt.trim().is_empty() {
-            return CoreEffect::None;
+            return self.continue_queued_input();
         }
         let AppState::Idle { .. } = self.state else {
-            return self.turn_already_in_progress_notice();
+            return self.queue_composer_input();
         };
         self.visual_scroll_offset = 0;
+        self.queue_auto_flush_paused = false;
         self.bottom.record_submission(&prompt);
         let session = self.take_idle_session();
         self.rebuild_bottom_surface();
+        self.spawn_turn(prompt, session);
+        CoreEffect::Render
+    }
+
+    fn queue_composer_input(&mut self) -> CoreEffect {
+        let prompt = self.bottom.composer().submit_text();
+        if prompt.trim().is_empty() {
+            return CoreEffect::None;
+        }
+        self.queued_inputs.push_back(prompt);
+        self.queued_selection = self.queued_inputs.len().checked_sub(1);
+        self.bottom.replace_composer_text("");
+        self.notice = None;
+        CoreEffect::Render
+    }
+
+    fn continue_queued_input(&mut self) -> CoreEffect {
+        let AppState::Idle { .. } = self.state else {
+            return CoreEffect::None;
+        };
+        let Some(prompt) = self.pop_next_queued_input() else {
+            return CoreEffect::None;
+        };
+        self.queue_auto_flush_paused = false;
+        self.visual_scroll_offset = 0;
+        self.bottom.record_submission(&prompt);
+        let session = self.take_idle_session();
         self.spawn_turn(prompt, session);
         CoreEffect::Render
     }
@@ -1105,6 +1180,7 @@ impl AppCore {
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
+        self.clear_queued_inputs();
         self.notice = Some(format!("new session {session_id}"));
         CoreEffect::ReplayHistoryWithScrollbackPurge
     }
@@ -1516,6 +1592,7 @@ impl AppCore {
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
+        self.clear_queued_inputs();
         let display = resume.display_label.clone();
         let mut notice = if display == "Untitled session" {
             format!("resumed session {session_id}")
@@ -1646,9 +1723,59 @@ impl AppCore {
         CoreEffect::Render
     }
 
-    fn turn_already_in_progress_notice(&mut self) -> CoreEffect {
-        self.notice = Some("turn already in progress".to_owned());
+    fn recall_selected_queued_input(&mut self) -> CoreEffect {
+        let Some(index) = self.selected_queue_index() else {
+            return self.move_composer_up_or_history();
+        };
+        if !self.bottom.composer().submit_text().is_empty() {
+            return self.move_composer_up_or_history();
+        }
+        let Some(text) = self.queued_inputs.remove(index) else {
+            return CoreEffect::None;
+        };
+        self.bottom.replace_composer_text(&text);
+        self.normalize_queue_selection();
         CoreEffect::Render
+    }
+
+    fn unqueue_selected_input(&mut self) -> CoreEffect {
+        let Some(index) = self.selected_queue_index() else {
+            return CoreEffect::None;
+        };
+        self.queued_inputs.remove(index);
+        self.normalize_queue_selection();
+        CoreEffect::Render
+    }
+
+    fn can_move_queued_selection(&self) -> bool {
+        self.bottom.composer().submit_text().is_empty() && self.queued_inputs.len() > 1
+    }
+
+    fn move_queued_selection(&mut self, delta: isize) -> CoreEffect {
+        let Some(index) = self.selected_queue_index() else {
+            return CoreEffect::None;
+        };
+        let last = self.queued_inputs.len() - 1;
+        self.queued_selection = Some(index.saturating_add_signed(delta).min(last));
+        CoreEffect::Render
+    }
+
+    fn pop_next_queued_input(&mut self) -> Option<String> {
+        let prompt = self.queued_inputs.pop_front();
+        self.normalize_queue_selection();
+        prompt
+    }
+
+    fn normalize_queue_selection(&mut self) {
+        self.queued_selection = self
+            .selected_queue_index()
+            .or_else(|| self.queued_inputs.len().checked_sub(1));
+    }
+
+    fn clear_queued_inputs(&mut self) {
+        self.queued_inputs.clear();
+        self.queued_selection = None;
+        self.queue_auto_flush_paused = false;
     }
 
     fn edit_palette(&mut self, edit: impl FnOnce(&mut BottomSurface)) -> CoreEffect {
@@ -1774,9 +1901,10 @@ impl AppCore {
             }
             TurnEvent::TurnDone { outcome, session } => {
                 let elapsed = self.working_elapsed();
+                let auto_flush = outcome == TurnOutcome::Complete;
                 self.last_working_elapsed_secs = None;
                 self.handle_turn_outcome(outcome, elapsed);
-                self.accept_worker_session_or_continue(session);
+                self.accept_worker_session_or_continue(session, auto_flush);
             }
             TurnEvent::ExtensionDone {
                 request,
@@ -1791,8 +1919,9 @@ impl AppCore {
                     self.queue_finalized_visual_output_for_latest_event();
                 }
                 self.last_working_elapsed_secs = None;
+                let auto_flush = matches!(&outcome, ExtensionOutcome::Complete(_));
                 self.handle_extension_outcome(&request, outcome, elapsed);
-                self.accept_worker_session_or_continue(session);
+                self.accept_worker_session_or_continue(session, auto_flush);
             }
             TurnEvent::CompanionDone {
                 request,
@@ -1807,8 +1936,9 @@ impl AppCore {
                     self.queue_finalized_visual_output_for_latest_event();
                 }
                 self.last_working_elapsed_secs = None;
+                let auto_flush = matches!(&outcome, CompanionOutcome::Complete(_));
                 self.handle_companion_outcome(&request, outcome, elapsed);
-                self.accept_worker_session_or_continue(session);
+                self.accept_worker_session_or_continue(session, auto_flush);
             }
         }
     }
@@ -1829,7 +1959,11 @@ impl AppCore {
             .and_then(|model| model.context_window_tokens())
     }
 
-    fn accept_worker_session_or_continue(&mut self, session: Box<Session<TuiDecider>>) {
+    fn accept_worker_session_or_continue(
+        &mut self,
+        session: Box<Session<TuiDecider>>,
+        auto_flush: bool,
+    ) {
         if self.active_session_home_managed {
             let session_id = session.session_id().to_owned();
             if let Err(error) = self.refresh_current_session_metadata(&session_id) {
@@ -1841,11 +1975,18 @@ impl AppCore {
                 PendingRunRequest::Extension(request) => self.spawn_extension_run(request, session),
                 PendingRunRequest::Companion(request) => self.spawn_companion_run(request, session),
             }
-        } else {
-            self.state = AppState::Idle { session };
-            self.in_flight_label = None;
-            self.in_flight_cancellable = false;
+            return;
         }
+        if auto_flush && !self.queue_auto_flush_paused {
+            if let Some(prompt) = self.pop_next_queued_input() {
+                self.bottom.record_submission(&prompt);
+                self.spawn_turn(prompt, session);
+                return;
+            }
+        }
+        self.state = AppState::Idle { session };
+        self.in_flight_label = None;
+        self.in_flight_cancellable = false;
     }
 
     fn handle_extension_outcome(
@@ -1956,6 +2097,7 @@ impl AppCore {
                 self.notice = None;
             }
             TurnOutcome::Cancelled => {
+                self.queue_auto_flush_paused = true;
                 self.transcript.clear_transient_live_tail();
                 self.interrupted_guidance = false;
                 self.in_flight_error = None;
@@ -1963,6 +2105,7 @@ impl AppCore {
                 self.notice = None;
             }
             TurnOutcome::Failed(message) => {
+                self.queue_auto_flush_paused = true;
                 self.interrupted_guidance = false;
                 self.in_flight_error = None;
                 self.transcript.clear_transient_live_tail();

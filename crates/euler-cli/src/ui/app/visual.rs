@@ -231,14 +231,14 @@ impl AppCore {
         if self.in_flight_error.is_some() {
             return CanvasComposerSnapshot::new("", vec![CanvasLine::plain_lossy("  ")], None);
         }
-        let snapshot = ComposerSnapshot::new(self.bottom.composer());
+        let snapshot = self.composer_snapshot();
         let options = ComposerRenderOptions::default();
         let height = usize::from(desired_height_for_width(&snapshot, &options, width));
         let lines = composer_render_lines(&snapshot, &options, width, height)
             .into_iter()
             .map(composer_line_to_canvas)
             .collect();
-        let position = cursor_position(self.bottom.composer(), width, &options, height);
+        let position = cursor_position_for_snapshot(&snapshot, width, &options, height);
         let cursor = position.visible_row.map(|row| BlockCursor {
             row: u16::try_from(row).unwrap_or(u16::MAX),
             column: u16::try_from(position.column).unwrap_or(u16::MAX),
@@ -322,6 +322,15 @@ pub(super) fn ratatui_lines_to_canvas(lines: Vec<Line<'static>>) -> Vec<CanvasLi
 
 fn composer_line_to_canvas(line: ComposerLine) -> CanvasLine {
     match line {
+        ComposerLine::Queued(line) => CanvasLine {
+            spans: vec![
+                CanvasSpan::new_lossy(
+                    format!("▌ {}/{} ", line.position, line.total),
+                    TextRole::Status,
+                ),
+                CanvasSpan::new_lossy(line.text.replace('\n', " ↵ "), TextRole::Plain),
+            ],
+        },
         ComposerLine::Draft {
             indicator,
             prompt,

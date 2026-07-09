@@ -217,6 +217,20 @@ fn submit_text_and_wait(core: &mut AppCore, text: &str) {
     wait_for_idle(core);
 }
 
+fn submit_without_wait(core: &mut AppCore, text: &str) {
+    type_text(core, text);
+    core.handle_input(key(KeyCode::Enter));
+}
+
+fn user_messages(core: &AppCore) -> Vec<String> {
+    core.transcript
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .filter_map(|event| event.payload.get("content")?.as_str().map(str::to_owned))
+        .collect()
+}
+
 fn shell_artifact_with_lines(total: usize) -> TranscriptItem {
     TranscriptItem::ToolRun {
         command: "printf lines".to_owned(),
@@ -285,14 +299,88 @@ fn diff_preview(old: &str, new: &str) -> PatchPreview {
 }
 
 #[test]
-fn submit_starts_in_flight_and_rejects_second_submit() {
+fn submit_starts_in_flight_and_second_submit_queues() {
     let mut core = core();
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
     assert!(core.turn_in_flight());
 
+    core.handle_input(key(KeyCode::Char('q')));
     core.handle_input(key(KeyCode::Enter));
-    assert_eq!(core.notice.as_deref(), Some("turn already in progress"));
+
+    assert!(core.notice.is_none());
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["q"]
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "");
+}
+
+#[test]
+fn queued_inputs_auto_flush_fifo_after_normal_completion() {
+    let mut core = core_with_provider(SlowEchoProvider);
+    submit_without_wait(&mut core, "first");
+    submit_without_wait(&mut core, "second");
+    submit_without_wait(&mut core, "third");
+
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["first", "second", "third"]);
+    assert!(core.queued_inputs.is_empty());
+}
+
+#[test]
+fn interrupt_keeps_queue_until_user_continues() {
+    let mut core = core_with_provider(SlowEchoProvider);
+    submit_without_wait(&mut core, "first");
+    submit_without_wait(&mut core, "queued");
+
+    core.handle_input(key(KeyCode::Esc));
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["queued"]
+    );
+    assert_eq!(user_messages(&core), ["first"]);
+
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["first", "queued"]);
+}
+
+#[test]
+fn queued_input_recall_and_unqueue_use_selected_or_last() {
+    let mut core = core_with_provider(SlowEchoProvider);
+    submit_without_wait(&mut core, "active");
+    submit_without_wait(&mut core, "one");
+    submit_without_wait(&mut core, "two");
+
+    assert_eq!(core.handle_input(key(KeyCode::Up)), CoreEffect::Render);
+    assert_eq!(core.bottom.composer().submit_text(), "two");
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["one"]
+    );
+
+    core.handle_input(key(KeyCode::Enter));
+    type_text(&mut core, "three");
+    core.handle_input(key(KeyCode::Enter));
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["one", "two", "three"]
+    );
+
+    core.handle_input(key(KeyCode::Left));
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["one", "three"]
+    );
 }
 
 #[test]
@@ -841,8 +929,12 @@ fn composer_accepts_next_draft_edits_while_turn_is_in_flight() {
     assert_eq!(core.bottom.composer().submit_text(), "next\ndraft");
     assert!(core.turn_in_flight());
     assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
-    assert_eq!(core.notice.as_deref(), Some("turn already in progress"));
-    assert_eq!(core.bottom.composer().submit_text(), "next\ndraft");
+    assert!(core.notice.is_none());
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["next\ndraft"]
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "");
 }
 
 #[test]

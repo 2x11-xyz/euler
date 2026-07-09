@@ -1,4 +1,4 @@
-use super::super::theme::Theme;
+use super::super::{text::truncate_display, theme::Theme};
 use super::*;
 use crate::ui::glyphs::user_line_prefix;
 use ratatui::{
@@ -10,16 +10,29 @@ use ratatui::{
 
 pub struct ComposerSnapshot<'a> {
     pub draft: &'a ComposerDraft,
-    pub show_token_deets: bool,
+    pub queued: Vec<QueuedComposerLine>,
 }
 
 impl<'a> ComposerSnapshot<'a> {
     pub fn new(draft: &'a ComposerDraft) -> Self {
         Self {
             draft,
-            show_token_deets: true,
+            queued: Vec::new(),
         }
     }
+
+    pub fn with_queued(mut self, queued: Vec<QueuedComposerLine>) -> Self {
+        self.queued = queued;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedComposerLine {
+    pub position: usize,
+    pub total: usize,
+    pub text: String,
+    pub selected: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,24 +61,40 @@ pub fn cursor_position(
     options: &ComposerRenderOptions,
     area_height: usize,
 ) -> ComposerCursorPosition {
+    cursor_position_with_offset(draft, width, options, area_height, 0)
+}
+
+pub fn cursor_position_for_snapshot(
+    snapshot: &ComposerSnapshot<'_>,
+    width: u16,
+    options: &ComposerRenderOptions,
+    area_height: usize,
+) -> ComposerCursorPosition {
+    let queue_rows = visible_queue_len(snapshot, area_height);
+    cursor_position_with_offset(snapshot.draft, width, options, area_height, queue_rows)
+}
+
+fn cursor_position_with_offset(
+    draft: &ComposerDraft,
+    width: u16,
+    options: &ComposerRenderOptions,
+    area_height: usize,
+    row_offset: usize,
+) -> ComposerCursorPosition {
     let units = draft.render_units();
     let lines = line_ranges(&units);
     let logical_line = current_line_index(&lines, draft.cursor);
     let rows = visual_rows(draft, width);
     let row_index = visual_cursor_row_index(&rows, draft.cursor);
-    let visible_row = visible_cursor_row(draft, width, options, area_height, row_index);
-    let column = rendered_cursor_column(draft, width, options, area_height, &rows, row_index);
+    let draft_height = area_height.saturating_sub(row_offset);
+    let visible_row = visible_cursor_row(draft, width, options, draft_height, row_index)
+        .map(|row| row + row_offset);
+    let column = rendered_cursor_column(draft, width, options, draft_height, &rows, row_index);
     ComposerCursorPosition {
         logical_line,
         column,
         visible_row,
     }
-}
-
-pub fn desired_height(snapshot: &ComposerSnapshot<'_>, options: &ComposerRenderOptions) -> u16 {
-    let line_count = logical_lines(snapshot.draft).len().max(1);
-    let visible = line_count.min(options.max_visible_lines.max(1));
-    u16::try_from(visible).unwrap_or(u16::MAX)
 }
 
 pub fn desired_height_for_width(
@@ -75,7 +104,7 @@ pub fn desired_height_for_width(
 ) -> u16 {
     let line_count = visual_rows(snapshot.draft, width).len().max(1);
     let visible = line_count.min(options.max_visible_lines.max(1));
-    u16::try_from(visible).unwrap_or(u16::MAX)
+    u16::try_from(snapshot.queued.len().saturating_add(visible)).unwrap_or(u16::MAX)
 }
 
 pub fn composer_widget<'a>(
@@ -123,17 +152,35 @@ pub fn render_lines(
     if area_height == 0 {
         return Vec::new();
     }
-    let visible_height = visible_height(snapshot, options, width, area_height);
-    visible_draft_lines(snapshot.draft, width, visible_height, true)
+    let queue_len = visible_queue_len(snapshot, area_height);
+    let start = snapshot.queued.len().saturating_sub(queue_len);
+    let mut lines = snapshot.queued[start..]
+        .iter()
+        .cloned()
+        .map(ComposerLine::Queued)
+        .collect::<Vec<_>>();
+    let draft_height = visible_height(snapshot, options, width, area_height - queue_len);
+    lines.extend(visible_draft_lines(
+        snapshot.draft,
+        width,
+        draft_height,
+        true,
+    ));
+    lines
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComposerLine {
+    Queued(QueuedComposerLine),
     Draft {
         indicator: Option<OverflowIndicator>,
         prompt: bool,
         text: String,
     },
+}
+
+fn visible_queue_len(snapshot: &ComposerSnapshot<'_>, area_height: usize) -> usize {
+    snapshot.queued.len().min(area_height.saturating_sub(1))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -551,6 +598,7 @@ impl OverflowIndicator {
 
 fn render_line(line: ComposerLine, x: u16, y: u16, width: u16, buf: &mut Buffer, theme: &Theme) {
     let spans = match line {
+        ComposerLine::Queued(line) => queued_spans(line, width, theme),
         ComposerLine::Draft {
             indicator,
             prompt,
@@ -558,6 +606,20 @@ fn render_line(line: ComposerLine, x: u16, y: u16, width: u16, buf: &mut Buffer,
         } => draft_spans(indicator, prompt, text, theme),
     };
     Line::from(spans).render(Rect::new(x, y, width, 1), buf);
+}
+
+fn queued_spans(line: QueuedComposerLine, width: u16, theme: &Theme) -> Vec<Span<'static>> {
+    let marker = if line.selected { "•" } else { " " };
+    let prefix = format!("▌ {marker}{}/{} ", line.position, line.total);
+    let prefix_width = display_width(&prefix);
+    let text = line.text.replace('\n', " ↵ ");
+    vec![
+        Span::styled(prefix, theme.composer.token_bar),
+        Span::styled(
+            truncate_display(&text, usize::from(width).saturating_sub(prefix_width)),
+            theme.composer.text,
+        ),
+    ]
 }
 
 fn draft_spans(

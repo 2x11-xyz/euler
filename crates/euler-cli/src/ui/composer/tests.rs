@@ -20,7 +20,7 @@ mod composer_tests {
 
         let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 48, 1);
         assert_eq!(
-            desired_height(&snapshot, &ComposerRenderOptions::default()),
+            desired_height_for_width(&snapshot, &ComposerRenderOptions::default(), 80),
             1
         );
         assert!(matches!(
@@ -35,7 +35,10 @@ mod composer_tests {
         let mut typed = ComposerDraft::new();
         typed.insert_text("hello");
         let typed = ComposerSnapshot::new(&typed);
-        assert_eq!(desired_height(&typed, &ComposerRenderOptions::default()), 1);
+        assert_eq!(
+            desired_height_for_width(&typed, &ComposerRenderOptions::default(), 80),
+            1
+        );
         assert!(matches!(
             render_lines(&typed, &ComposerRenderOptions::default(), 48, 1).as_slice(),
             [ComposerLine::Draft {
@@ -48,7 +51,10 @@ mod composer_tests {
         let mut paste = ComposerDraft::new();
         paste.insert_bracketed_paste(&"x".repeat(LARGE_PASTE_CHAR_LIMIT + 1));
         let paste = ComposerSnapshot::new(&paste);
-        assert_eq!(desired_height(&paste, &ComposerRenderOptions::default()), 1);
+        assert_eq!(
+            desired_height_for_width(&paste, &ComposerRenderOptions::default(), 80),
+            1
+        );
         assert!(matches!(
             render_lines(&paste, &ComposerRenderOptions::default(), 48, 1).as_slice(),
             [ComposerLine::Draft { text, .. }] if text.starts_with("[paste #1 ")
@@ -72,7 +78,7 @@ mod composer_tests {
             [ComposerLine::Draft { text: one, .. }, ComposerLine::Draft { text: two, .. }]
                 if one == "two" && two == "three"
         ));
-        assert_eq!(desired_height(&snapshot, &options), 3);
+        assert_eq!(desired_height_for_width(&snapshot, &options, 80), 3);
         assert!(matches!(
             render_lines(&snapshot, &options, 20, 3).as_slice(),
             [
@@ -220,7 +226,7 @@ mod composer_tests {
         let composer = ComposerSnapshot::new(&draft);
         let status = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
         let theme = Theme::default();
-        let height = desired_height(&composer, &options);
+        let height = desired_height_for_width(&composer, &options, 80);
 
         let contents = rendered_composer_and_status(
             &composer,

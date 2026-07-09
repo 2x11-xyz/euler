@@ -28,6 +28,7 @@ pub(crate) mod syntax;
 #[allow(dead_code)]
 pub mod terminal;
 #[cfg(test)]
+#[path = "test_backend_test.rs"]
 pub mod test_backend;
 pub(crate) mod text;
 pub mod theme;
