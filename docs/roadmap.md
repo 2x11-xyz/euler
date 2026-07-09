@@ -4,13 +4,21 @@ Directions, not commitments. Ordered roughly by intent; no dates.
 
 ## Near term (v0.2)
 
+- **Warm Ledger TUI.** Core CLI transcript layout/interaction system (ADR 0010,
+  `docs/contracts/ui.md`, plan `docs/notes/warm-ledger-tui-plan-2026-07-09.md`).
+  Docs/contracts first; then multi-slice implementation on a long-lived branch
+  for user dogfood before PR. Sequence (scheduled, not opportunistic): ledger
+  foundation + themes → diff renderer → thinking/markdown → live composer/queue
+  → scoped approvals → failures → workspace checkpoints → search/@/timestamps →
+  slash/extension surfaces → resume polish → recaps/notify → companion
+  sub-ledger (after multi-agent projection contract). Themes stay swappable
+  profiles. Core/extension boundary unchanged: DAG and rich viz stay extension-
+  owned; `/dag` is dispatch only.
 - **Out-of-process extensions.** The extension SDK's second lane: extensions
   as separate processes over a stdio JSON-RPC transport, in any language.
   v0.1.0 ships native Rust extension crates only.
 - **Headless session resume.** `exec --resume`: continue an interrupted run
   from its provenance log instead of re-exploring from scratch.
-- **TUI layout rework.** Top-anchored active surface, correct re-anchoring
-  and full repaint on terminal resize.
 - **Honest cap summaries.** When a session hits its round limit, report what
   was done and where it stopped, not a canned line.
 - **Causal-DAG ergonomics.** Friendlier paging for long logs, non-mutating

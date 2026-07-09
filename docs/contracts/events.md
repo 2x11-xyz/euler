@@ -366,5 +366,10 @@ Rules:
 - Provider-opaque reasoning artifacts (signatures, encrypted items) are
   preserved verbatim in the payload/blobs so the owning provider adapter can
   replay them per provider rules.
+- **Storage ≠ display ≠ canvas.** Provenance may retain maximum fidelity.
+  Core UI renders only adapter-classified user-displayable, taint-safe
+  content (see `docs/contracts/ui.md` and ADR 0007). Opaque/encrypted
+  artifacts are never rendered as transcript prose by core. Canvas inclusion
+  is separate (ADR 0002 / `canvas.md`).
 - Reasoning events are taint-checked like all other events: resolved secrets
   never appear in them.
