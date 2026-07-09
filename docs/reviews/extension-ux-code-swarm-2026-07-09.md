@@ -285,23 +285,46 @@ is provenance, permission scopes apply, results interleave in the ledger as
 companion blocks, and the existing `review-report` pairing logic stays the
 consolidation step.
 
-**The slash command exposes agent-count and model/provider optionality:**
-1–5 reviewer agents (the prototype's cap of 5 survives as a hard limit),
-each with a selectable provider/model target. Sketch, exact flags to be
-settled at implementation:
+**The slash command exposes agent-count and model/provider optionality,
+per the "Code Swarm TUI Submenu" design, option 1b** (design project
+`16e99352-4da5-4d4b-9d62-9d70947db690`, `Code Swarm TUI Submenu.dc.html`):
 
-```
-/code-swarm review --agents 3
-    --models openrouter::z-ai/glm-5.2,anthropic::claude-opus-5,openai::gpt-5.5
-    [--personas correctness,safety,tests]
-    [--prompt "focus…"]
-```
-
-Defaults: agent count from the persona set (3), models default to the
-session's active target (today's inherit behavior), personas assigned
-round-robin when counts differ. `--models` with one entry and `--agents 3`
-means three reviewers on one model; three entries means true cross-model
-disagreement (G1).
+- `/code-swarm` (no args) opens a checklist picker where **selection IS the
+  count**: bordered block titled `/code-swarm · reviewer models`, corner
+  badge `N selected · 1–5`, rows as `[x] provider/model` with a faint
+  context-size column, type-to-filter with match highlight and
+  `k/n shown · esc clears filter`, select-bg cursor row.
+- Constraints live in the picker: **min 1, max 5**; at 5/5 further checks
+  are refused (row stays visible, dimmed). Default selection: 3 models.
+- Keys: `space` toggle · `↑↓` move · `⏎` save · `esc` cancel.
+- Saving emits a decision-record line — `✓ code-swarm → N models · saved as
+  euler default` — and persists: applies to this session and becomes the
+  user default for future sessions. **Adaptation per the scope note:** the
+  mock's `.codex-swarm.json` per-project override becomes Euler-native
+  project config (the `.euler/` overlay), not a sidecar file.
+- `/code-swarm review [--prompt "focus…"] [--personas correctness,safety,tests]`
+  runs the swarm with the saved model set. Personas assigned round-robin
+  across agents when counts differ. One model selected three times is legal
+  (three reviewers, one model); distinct models give true cross-model
+  disagreement (G1).
+- **It is an extension slash command, not a core command** (Eli,
+  2026-07-09, referencing the Warm Ledger board): registered through the
+  extension slash mechanism — ⋄-annotated, grouped under the EXTENSIONS
+  palette header, `code-swarm · …` source in the summary column, the
+  disabled-teach line when the extension is off, `/code-swarm.<cmd>` on
+  collision. Not a `/dag`-style core shortcut.
+- **Chrome reconciliation:** the 1b mock draws a ratatui-style border, but
+  the Warm Ledger contract (`docs/contracts/ui.md`) reserves borders for
+  approval panels only, and spec text wins over mockups. The picker adopts
+  1b's content model (checklist-is-the-count, corner badge, filter,
+  refuse-at-5, min-1) inside the shared borderless picker pattern used by
+  /model and /rollback.
+- **v1 wiring note:** pickers are TUI chrome and extension commands are
+  JSON-in/JSON-out, so the no-arg → picker behavior needs the TUI to know
+  this command opens a surface. v1 keys that on the code-swarm extension id
+  (documented debt: an SDK descriptor field for "arg-less form opens a
+  picker" generalizes it — same family as extension-provided pickers for
+  other extensions).
 
 **Feasibility, verified in-tree:** the companion runtime already honors
 explicit targets — `AgentTask` carries `provider`/`model`
