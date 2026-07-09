@@ -579,9 +579,11 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     .collect::<Vec<_>>();
 
     assert!(
+        // The v2 anchor spine puts a `•` on the row's first visual line;
+        // wrapped stacked-row continuations keep the plain two-space pad.
         narrow
             .iter()
-            .any(|line| line.trim_start() == "Layer: CLI/TUI layer"),
+            .any(|line| line.trim_start() == "• Layer: CLI/TUI layer"),
         "stacked table row missing at narrow width: {narrow:?}"
     );
     assert!(
@@ -739,7 +741,10 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
     .collect::<Vec<_>>();
 
     assert!(lines.iter().any(|line| line.contains("bash $ ls -la")));
-    assert_ne!(lines.last().map(String::as_str), Some(""));
+    // v2 (§1): hairlines are gone; every event — including the last one — is
+    // followed by exactly one blank line instead. A trailing blank row is
+    // expected now, not a leftover "prompt/answer rhythm" hairline.
+    assert_eq!(lines.last().map(String::as_str), Some(""));
 }
 
 #[test]
