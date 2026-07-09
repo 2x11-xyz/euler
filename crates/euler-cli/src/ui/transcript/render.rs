@@ -94,8 +94,8 @@ pub(super) fn render_projected_entries_with_expansion(
     for (index, entry) in entries.iter().enumerate() {
         let first_line = lines.len();
         let item = &entry.item;
-        let item_limits = if expanded_artifact_keys.contains(&super::artifact_key_for_index(index))
-        {
+        let item_expanded = expanded_artifact_keys.contains(&super::artifact_key_for_index(index));
+        let item_limits = if item_expanded {
             limits.expanded()
         } else {
             limits
@@ -159,14 +159,38 @@ pub(super) fn render_projected_entries_with_expansion(
                 );
             }
             TranscriptItem::ModelReasoning { fidelity, content } => {
-                push_wrapped(
-                    &mut lines,
-                    blank_gutter(),
-                    &reasoning_summary(fidelity, content),
-                    theme.transcript.reasoning,
-                    theme,
-                    width,
-                );
+                let elapsed = reasoning_elapsed(entries, index);
+                let label = match fidelity.as_str() {
+                    "summary" => "thought summary",
+                    _ => "thought",
+                };
+                if item_expanded {
+                    push_wrapped(
+                        &mut lines,
+                        blank_gutter(),
+                        &format!("✱ {label} for {elapsed} · ctrl+o collapse"),
+                        theme.transcript.reasoning,
+                        theme,
+                        width,
+                    );
+                    push_wrapped(
+                        &mut lines,
+                        tree_gutter_pipe(),
+                        content,
+                        theme.transcript.reasoning,
+                        theme,
+                        width,
+                    );
+                } else {
+                    push_wrapped(
+                        &mut lines,
+                        blank_gutter(),
+                        &reasoning_summary(label, content, &elapsed),
+                        theme.transcript.reasoning,
+                        theme,
+                        width,
+                    );
+                }
             }
             TranscriptItem::ToolCall { name } => {
                 push_wrapped(
@@ -481,9 +505,7 @@ pub(super) fn render_projected_entries_with_expansion(
                 rows,
                 ..
             } => {
-                let expanded = expanded_artifact_keys
-                    .contains(&super::artifact_key_for_index(index))
-                    || item_limits.output_lines == usize::MAX;
+                let expanded = item_expanded || item_limits.output_lines == usize::MAX;
                 render_companion_block(
                     &mut lines,
                     CompanionRender {
@@ -750,14 +772,59 @@ fn push_bounded_detail(
     }
 }
 
-fn reasoning_summary(fidelity: &str, content: &str) -> String {
-    let gist = reasoning_gist(content);
-    let label = if fidelity == "summary" {
-        "thought summary"
-    } else {
-        "thought"
-    };
-    format!("✱ {label} for 0s — {gist} · ctrl+o expand")
+fn reasoning_summary(label: &str, content: &str, elapsed: &str) -> String {
+    format!(
+        "✱ {label} for {elapsed} — {} · ctrl+o expand",
+        reasoning_gist(content)
+    )
+}
+
+fn reasoning_elapsed(entries: &[ProjectedEntry], index: usize) -> String {
+    let start = entries.get(..index).and_then(|prior| {
+        prior.iter().rev().find_map(|entry| match &entry.item {
+            TranscriptItem::ModelCall { .. } => entry.timing.as_ref(),
+            _ => None,
+        })
+    });
+    let end = entries
+        .get(index)
+        .and_then(|entry| entry.timing.as_ref())
+        .or_else(|| {
+            entries
+                .get(index + 1..)?
+                .iter()
+                .take_while(|entry| !matches!(entry.item, TranscriptItem::ModelCall { .. }))
+                .find_map(|entry| match &entry.item {
+                    TranscriptItem::ModelResult(_) => entry.timing.as_ref(),
+                    _ => None,
+                })
+        });
+    if let (Some(start), Some(end)) = (start, end) {
+        if let (Some(start), Some(end)) = (
+            parse_clock_seconds(&start.absolute),
+            parse_clock_seconds(&end.absolute),
+        ) {
+            return super::format_duration((end - start).rem_euclid(24 * 60 * 60));
+        }
+    }
+    end.and_then(|timing| {
+        timing
+            .since_previous
+            .as_deref()
+            .or(timing.since_start.as_deref())
+            .filter(|elapsed| !elapsed.is_empty())
+            .map(ToOwned::to_owned)
+    })
+    .unwrap_or_else(|| "0s".to_owned())
+}
+
+fn parse_clock_seconds(clock: &str) -> Option<i64> {
+    let mut parts = clock.split(':');
+    let hours = parts.next()?.parse::<i64>().ok()?;
+    let minutes = parts.next()?.parse::<i64>().ok()?;
+    let seconds = parts.next()?.parse::<i64>().ok()?;
+    (parts.next().is_none() && hours < 24 && minutes < 60 && seconds < 60)
+        .then_some(hours * 3600 + minutes * 60 + seconds)
 }
 
 fn reasoning_gist(content: &str) -> String {
