@@ -53,3 +53,24 @@ target; SUPERSEDED frame is v1 — do not implement from it.
 - Audit items riding on the spine: decision-record color/wording (S3),
   explore tree alignment polish (verify post-spine), recap placement under
   the Worked divider (S3 recap item).
+
+
+## Progress (window 2)
+- DONE steps 1-3 core: text.rs spine layer (SPINE_WIDTH=2, BLANK_SPINE,
+  gutter default OFF, tree gutters indent at content column, ts gutter =
+  9 cells returned separately), glyphs.rs bullet accessor (with consumer),
+  render.rs spine_anchor(item)->glyph+style + stamp_first_line rewritten
+  (ts + 2-cell anchor spliced into first-row prefix), per-event hairlines
+  replaced by one blank Line, push_hairline/hairline_content deleted.
+- NEXT (A2): cells still render their own leading glyphs -> double-glyph
+  rows. Strip inline glyph prefixes from: render_permission_decision (✓/✗),
+  reasoning collapsed/expanded lines (✱), render_interrupted (■),
+  workspace-restore row (↩), companion header (◆), error rows (!/✗),
+  resume boundary (✓) — the spine anchor now carries the glyph; text starts
+  dim at the content column. Decision records: drop "({decision})" suffix
+  (audit S3), text dim not gold.
+- THEN: re-baseline the 88 failing euler-cli tests (layout assertions:
+  9-space indents gone, hairline expectations -> blank lines, anchors at
+  col 0). Check PTY tests. THEN steps 4-6 (artifact • + └ result line,
+  timestamps opt-in already default-off but /timestamps flip + prefs load
+  in main.rs needs check, composer flush-left + F27).

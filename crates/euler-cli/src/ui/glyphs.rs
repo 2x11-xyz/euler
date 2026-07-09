@@ -14,6 +14,8 @@ pub(crate) struct GlyphSet {
     user_rail: &'static str,
     user_rail_prefix: &'static str,
     thinking: &'static str,
+    /// Default anchor for the v2 spine (prose, tools).
+    bullet: &'static str,
     spinner_frames: &'static [&'static str],
     check: &'static str,
     cross: &'static str,
@@ -32,6 +34,7 @@ impl GlyphSet {
         user_rail: "\u{258c}",
         user_rail_prefix: "\u{258c} ",
         thinking: "\u{2731}",
+        bullet: "\u{2022}",
         spinner_frames: UNICODE_SPINNER,
         check: "\u{2713}",
         cross: "\u{2717}",
@@ -49,6 +52,7 @@ impl GlyphSet {
         user_rail: "|",
         user_rail_prefix: "| ",
         thinking: "*",
+        bullet: ".",
         spinner_frames: ASCII_SPINNER,
         check: "ok",
         cross: "x",
@@ -81,6 +85,10 @@ impl GlyphSet {
 
     pub(crate) const fn thinking(self) -> &'static str {
         self.thinking
+    }
+
+    pub(crate) const fn bullet(self) -> &'static str {
+        self.bullet
     }
 
     pub(crate) fn spinner(self, frame: usize) -> &'static str {
@@ -131,6 +139,7 @@ impl GlyphSet {
         !self.user_rail().is_empty()
             && !self.user_rail_prefix().is_empty()
             && !self.thinking().is_empty()
+            && !self.bullet().is_empty()
             && !self.spinner(0).is_empty()
             && !self.check().is_empty()
             && !self.cross().is_empty()
@@ -147,6 +156,10 @@ impl GlyphSet {
 
 pub(crate) fn glyph_set() -> GlyphSet {
     GlyphSet::current()
+}
+
+pub(crate) fn bullet() -> &'static str {
+    glyph_set().bullet()
 }
 
 pub(crate) fn thinking() -> &'static str {
