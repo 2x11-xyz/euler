@@ -17,6 +17,22 @@ use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry}
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Looks up the context window size (in tokens) for the given provider/model
+/// pair from the model catalog, if known. Used both mid-turn (via
+/// `update_token_usage`) and at session-start points so a fresh session shows
+/// `ctx 0%` instead of the `?` unknown fallback whenever the model's context
+/// window is known.
+pub(super) fn context_window_tokens_for(
+    model_catalog: &MergedModelCatalog,
+    provider: &str,
+    model: &str,
+) -> Option<u64> {
+    model_catalog
+        .provider(provider)
+        .and_then(|descriptor| descriptor.models().find(|entry| entry.id() == model))
+        .and_then(|entry| entry.context_window_tokens())
+}
+
 pub(super) fn update_token_usage(
     tokens: &mut TokenUsageSnapshot,
     event: &EventEnvelope,
@@ -289,6 +305,27 @@ pub(super) fn session_root_status_path() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
+/// Detects the current git branch by reading `.git/HEAD` directly (no git2
+/// dependency, no subprocess). Returns the branch name for `ref:
+/// refs/heads/<name>`, the first 7 hex chars of the commit for a detached
+/// HEAD, or `None` if there is no readable `.git/HEAD`.
+pub(super) fn detect_git_branch(workspace_root: &std::path::Path) -> Option<String> {
+    let head_path = workspace_root.join(".git").join("HEAD");
+    let contents = std::fs::read_to_string(head_path).ok()?;
+    let contents = contents.trim();
+    if let Some(branch_ref) = contents.strip_prefix("ref: refs/heads/") {
+        if branch_ref.is_empty() {
+            return None;
+        }
+        return Some(branch_ref.to_owned());
+    }
+    let is_hex = !contents.is_empty() && contents.chars().all(|c| c.is_ascii_hexdigit());
+    if is_hex {
+        return Some(contents.chars().take(7).collect());
+    }
+    None
+}
+
 pub(super) fn merge_effects(left: CoreEffect, right: CoreEffect) -> CoreEffect {
     match (left, right) {
         (CoreEffect::Quit, _) | (_, CoreEffect::Quit) => CoreEffect::Quit,
@@ -429,5 +466,53 @@ mod tests {
         assert_eq!(relative_age(0, 3_600_000), "1h ago");
         assert_eq!(relative_age(0, 86_400_000), "1d ago");
         assert_eq!(relative_age(0, 900_000_000), "10d ago");
+    }
+
+    #[test]
+    fn detect_git_branch_reads_branch_ref() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir .git");
+        std::fs::write(
+            git_dir.join("HEAD"),
+            "ref: refs/heads/feat/warm-ledger-tui\n",
+        )
+        .expect("write HEAD");
+
+        assert_eq!(
+            detect_git_branch(temp.path()),
+            Some("feat/warm-ledger-tui".to_owned())
+        );
+    }
+
+    #[test]
+    fn detect_git_branch_reads_short_hash_when_detached() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir .git");
+        std::fs::write(
+            git_dir.join("HEAD"),
+            "1234567890abcdef1234567890abcdef12345678\n",
+        )
+        .expect("write HEAD");
+
+        assert_eq!(detect_git_branch(temp.path()), Some("1234567".to_owned()));
+    }
+
+    #[test]
+    fn detect_git_branch_returns_none_without_git_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        assert_eq!(detect_git_branch(temp.path()), None);
+    }
+
+    #[test]
+    fn detect_git_branch_returns_none_for_malformed_head() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir .git");
+        std::fs::write(git_dir.join("HEAD"), "not a valid head\n").expect("write HEAD");
+
+        assert_eq!(detect_git_branch(temp.path()), None);
     }
 }

@@ -2756,7 +2756,7 @@ fn layout_renders_at_80_by_24_and_after_resize() {
 }
 
 #[test]
-fn footer_context_is_unknown_before_first_model_result() {
+fn footer_context_is_zero_percent_at_fresh_session_with_known_window() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core_with_fixture_catalog(
         EchoProvider,
@@ -2767,8 +2767,21 @@ fn footer_context_is_unknown_before_first_model_result() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("ctx ?%"));
+    assert!(contents.contains("ctx 0%"));
+    assert!(!contents.contains("ctx ?%"));
     assert!(!contents.contains("Context ?% used"));
+}
+
+#[test]
+fn footer_context_is_unknown_when_model_window_is_unknown() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core =
+        core_with_fixture_catalog(EchoProvider, "echo", fixture_catalog_with_windows(&[]));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("ctx ?%"));
 }
 
 #[test]
@@ -2788,7 +2801,7 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
     assert_eq!(
         rendered,
-        "  ⏎ send · / commands · ctrl+o expand · /euler · esion · echo · ctx 12% · ?"
+        "  ⏎ send · / commands · ctrl+o expand · euler · esion · echo · ctx 12% · ?"
     );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
@@ -2810,14 +2823,14 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · /euler · esion · echo · ctx 12% · ?"
+        "  ⏎ send · / commands · ctrl+o expand · euler · esion · echo · ctx 12% · ?"
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · /euler · esion · other · ctx ?% · ?"
+        "  ⏎ send · / commands · ctrl+o expand · euler · esion · other · ctx ?% · ?"
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -2826,7 +2839,7 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · /euler · esion · other · ctx 13% · ?"
+        "  ⏎ send · / commands · ctrl+o expand · euler · esion · other · ctx 13% · ?"
     );
 }
 
