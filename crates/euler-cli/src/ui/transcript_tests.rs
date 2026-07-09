@@ -2476,9 +2476,11 @@ fn final_assistant_prose_uses_two_space_gutter_across_markdown_shapes() {
 
     assert!(texts.len() > 4, "texts: {texts:?}");
     for text in texts.iter().filter(|line| !line.trim().is_empty()) {
-        // blank 9-cell ledger gutter, or hairline under the block
+        // v2 (§1/§2): the event's first row carries the `•` anchor spine;
+        // continuation rows keep the plain two-space pad. Hairlines are
+        // gone — no dedicated separator alternative to check for anymore.
         assert!(
-            text.starts_with("         ") || text.contains("─"),
+            text.starts_with("• ") || text.starts_with("  "),
             "assistant prose line missing gutter: {text:?} in {texts:?}"
         );
     }
@@ -2842,14 +2844,18 @@ fn extension_result_renders_foldable_pretty_artifact() {
 
 #[test]
 fn hairline_uses_dedicated_theme_token_not_gutter() {
-    // Warm Ledger separates the hairline tone (#38341f) from the faint
-    // timestamp/gutter tone (#5f584a); the hairline row must consume the
-    // dedicated token so event separators stay darker than timestamps.
+    // v2 (§1/§3): per-event hairlines are gone — one blank line separates
+    // events instead. The only rules left in the flow are turn dividers and
+    // the markdown h1/h2 underline (§4), which still consume the dedicated
+    // hairline token so they stay darker than the faint timestamp/gutter
+    // tone (#5f584a vs #38341f) rather than reusing it.
     let theme = Theme::warm_ledger();
     assert_ne!(theme.palette.hairline, theme.palette.gutter);
 
     let lines = render_items_for_history(
-        &[TranscriptItem::UserMessage("hairline probe".to_owned())],
+        &[TranscriptItem::AssistantMessage(
+            "# Heading\n\nbody text".to_owned(),
+        )],
         &theme,
         80,
     );
@@ -2861,13 +2867,13 @@ fn hairline_uses_dedicated_theme_token_not_gutter() {
         .collect();
     assert!(
         !hairline_span_styles.is_empty(),
-        "expected a hairline row under the user message"
+        "expected an h1 underline row under the markdown heading: {lines:?}"
     );
     assert!(
         hairline_span_styles
             .iter()
             .all(|fg| *fg == Some(theme.palette.hairline)),
-        "hairline rows must use palette.hairline, got: {hairline_span_styles:?}"
+        "h1 underline rows must use palette.hairline, got: {hairline_span_styles:?}"
     );
 }
 

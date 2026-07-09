@@ -230,30 +230,57 @@ mod tests {
         assert_eq!(truncate_display("ab\u{754c}cd", 4), "ab\u{754c}");
     }
 
+    // v2 (§0/§1): timestamps are opt-in; the 2-cell anchor spine is the
+    // default ledger prefix. `/timestamps` widens the column by 9 cells
+    // beside the spine — it does not replace it.
     #[test]
-    fn timestamp_gutter_is_nine_cells() {
-        assert_eq!(display_width(&timestamp_gutter(Some("14:32:07"))), 9);
-        assert_eq!(timestamp_gutter(Some("14:32:07")), "14:32:07 ");
-        assert_eq!(display_width(blank_gutter()), 9);
-        assert_eq!(display_width(tree_gutter_last()), 9);
-        assert_eq!(display_width(tree_gutter_mid()), 9);
-        assert_eq!(display_width(tree_gutter_pipe()), 9);
-        assert_eq!(timestamp_gutter(None), blank_gutter());
+    fn timestamp_gutter_opt_in_adds_nine_cells_beside_the_spine() {
+        with_timestamp_gutter(true, || {
+            assert_eq!(display_width(&timestamp_gutter(Some("14:32:07"))), 9);
+            assert_eq!(timestamp_gutter(Some("14:32:07")), "14:32:07 ");
+            assert_eq!(gutter_width(), TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH);
+            assert_eq!(
+                display_width(blank_gutter()),
+                TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
+            );
+            assert_eq!(
+                display_width(tree_gutter_last()),
+                TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
+            );
+            assert_eq!(
+                display_width(tree_gutter_mid()),
+                TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
+            );
+            assert_eq!(
+                display_width(tree_gutter_pipe()),
+                TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
+            );
+            assert_eq!(timestamp_gutter(None), " ".repeat(TIMESTAMP_GUTTER_WIDTH));
+        });
+        // Restored to the default (hidden) gutter once the closure returns.
+        assert_eq!(gutter_width(), SPINE_WIDTH);
     }
 
     #[test]
-    fn hidden_timestamp_gutter_widens_content() {
-        with_timestamp_gutter(false, || {
-            assert_eq!(gutter_width(), 0);
-            assert_eq!(blank_gutter(), "");
-            assert_eq!(timestamp_gutter(Some("14:32:07")), "");
-            assert_eq!(content_width(80), 80);
-            assert_eq!(tree_gutter_last(), "└ ");
-            assert!(is_ledger_gutter(""));
-            assert!(is_ledger_gutter("└ "));
+    fn default_gutter_is_the_two_cell_anchor_spine() {
+        assert_eq!(gutter_width(), SPINE_WIDTH);
+        assert_eq!(blank_gutter(), BLANK_SPINE);
+        assert_eq!(timestamp_gutter(Some("14:32:07")), "");
+        assert_eq!(content_width(80), 78);
+        assert_eq!(tree_gutter_last(), "  └ ");
+        assert_eq!(tree_gutter_mid(), "  ├ ");
+        assert!(is_ledger_gutter(""));
+        assert!(is_ledger_gutter("  └ "));
+        assert!(is_ledger_gutter("  ├ "));
+
+        with_timestamp_gutter(true, || {
+            assert_eq!(
+                content_width(80),
+                80 - (TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH)
+            );
         });
-        assert_eq!(gutter_width(), TIMESTAMP_GUTTER_WIDTH);
-        assert_eq!(content_width(80), 71);
+        // Unaffected by a closure that has already returned.
+        assert_eq!(content_width(80), 78);
     }
 
     #[test]
