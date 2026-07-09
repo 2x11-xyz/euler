@@ -436,7 +436,15 @@ impl App {
             }
             UiAction::Resize { .. } => {
                 metrics::record(metrics::Metric::ResizeAction);
-                CoreEffect::ReplayHistoryWithScrollbackPurge
+                // No replay, no scrollback purge: rows already in native
+                // scrollback stay untouched (re-purging duplicated them in
+                // 3J-ignoring terminals and destroyed them in honoring ones —
+                // the P1 audit finding). The canvas re-renders at the new
+                // width and the terminal remaps its committed boundary by
+                // item identity (commit_scrolled_history width branch).
+                self.core.invalidate_history_cache();
+                self.render_frame()?;
+                return Ok(false);
             }
             UiAction::Render(_) => {
                 self.render_frame()?;

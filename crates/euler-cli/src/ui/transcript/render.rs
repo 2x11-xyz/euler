@@ -592,6 +592,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 append_timing(line, timing, theme, width);
             }
         }
+        item_end_offsets.push(lines.len());
     }
 
     if let Some(footer) = super::turn_footer(entries) {
@@ -603,7 +604,10 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             theme,
             width,
         );
-        item_end_offsets.push(lines.len());
+        // The footer belongs to the last entry's committed region.
+        if let Some(last) = item_end_offsets.last_mut() {
+            *last = lines.len();
+        }
     }
 
     (lines, item_end_offsets)

@@ -51,3 +51,29 @@ committed-scrollback boundary by finalized-item identity:
   PtyHarness gained `resize()` + resize-aware `screen_text()`;
   `pty_final_state_with_resizes` reconstructs scrollback+screen across
   resizes.
+
+## Iteration state (end of first window)
+- Offsets plumbing FIXED (the per-entry push had landed inside the
+  turn_footer branch; now at loop tail, footer bumps last offset). Verified
+  live: `offsets=[9, 11, 29, 31]` etc.
+- Resize no longer replays (UiAction::Resize arm in app.rs now invalidates
+  the canvas cache + render_frame; commit accounting survives the resize —
+  verified: `width=100 prev_width=80 rows=12 items=2` in the debug log).
+- Test STILL fails, new signature: banner/orientation + P1/P2 absent from
+  the vt100 reconstruction even though the debug log shows rows=12 (banner +
+  user) as committed *accounting*. Open question: were those 12 rows ever
+  PHYSICALLY emitted as linefeed history inserts at width 80, or did
+  committed_active_rows advance without emission? Suspects:
+  (a) rows 0->12 jump happens with no logged emission between the last
+      width=80 line (commit_until=0) and the width=100 line — find where;
+  (b) `linefeed_history_insert_suspended_after_resize` or
+      `linefeed_history_insert_enabled` gating write_finalized_lines...;
+  (c) the emission may write into a scroll region (CSI r), which vt100 (and
+      real terminals) do NOT push to scrollback — check
+      write_finalized_lines_with_bridge_policy and whether commits reset the
+      scroll region first (the no-resize test passes, so plain commits do
+      reach scrollback — compare the two paths).
+- NEXT: instrument write_finalized_lines_with_bridge_policy with the same
+  EULER_DEBUG_COMMITS file logging (emitted row ranges + text of first row)
+  to answer (a)-(c); then fix, run tui_pty_* + full gate, remove
+  diagnostics, clippy, push.

@@ -31,6 +31,10 @@ impl AppCore {
         self.visual_canvas.reset_committed_items();
     }
 
+    pub(crate) fn invalidate_history_cache(&mut self) {
+        self.visual_canvas.invalidate_history_cache();
+    }
+
     pub(super) fn visual_scroll_offset(&self) -> usize {
         self.visual_scroll_offset
     }
