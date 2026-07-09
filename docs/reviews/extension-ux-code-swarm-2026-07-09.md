@@ -173,3 +173,105 @@ unusable end-to-end in the TUI today.
 4. **E3** — decide the linked-extension posture, then implement or teach.
 5. **E5/E6** — one design conversation (who orchestrates swarms?), then either
    the cheap bridge (a) or the SDK capability (b).
+
+---
+
+## What it should do — the codex-swarm prototype (added after Eli provided it)
+
+Eli supplied the pre-Rust prototype this extension descends from; it is
+archived verbatim at `docs/reference/codex-swarm-prototype.py`. Reading it
+reframes E5/E6: the shipped extension is not an unfinished version of the
+prototype — it is a **different concept** that lost the prototype's core value.
+Gaps, in order of importance:
+
+### G1 · The swarm was multi-MODEL, not multi-persona
+
+The prototype fans the **same review context out to N different models in
+parallel** (`DEFAULT_MODELS = claude-fable-5, glm-5.2, gpt-5.4` via
+OpenRouter; hard cap of 5; `run_swarm` with a thread pool) and presents their
+independent takes side by side. Cross-model disagreement is the product. The
+shipped extension inverts this: three persona prompts (correctness / safety /
+tests) on **one inherited provider/model** (`"provider": "", "model": ""` in
+every brief). Personas are cheap to vary; model diversity is what caught
+different bug classes. Note the brief shape already carries `provider`/`model`
+fields — the companion mechanism could express the real swarm today if
+`review-brief` accepted model targets (e.g. `--models a,b,c`, personas ×
+models) and the runtime honored non-empty targets.
+
+### G2 · Context assembly was built in, with honest budgets
+
+The prototype assembles the review context itself: `plan` (prompt only),
+`review-code --files …`, `review-diff [--staged | --base REF]` (drives
+`git diff`), `review-pr [--pr N | --current]` (drives `gh pr view/diff`,
+optional full files and comments) — all under explicit byte budgets
+(`max_file_bytes`, `max_total_bytes`, per-source truncation) with every
+omission **reported in a `skipped` list** that survives into the final report.
+The shipped extension assembles nothing: companions "see the session canvas",
+so anything not already in the session (a diff vs a base branch, a PR, files
+never opened) is unreviewable. The skipped-list discipline is very Euler
+(degradation is visible, never silent) and should carry over regardless of
+mechanism.
+
+### G3 · One-shot UX
+
+`codex-swarm.py review-diff --base main --prompt "check the retry logic"` →
+one markdown report, stdout or `--out`, `--dry-run` to preview the exact
+context without spending tokens, `--json` for structured output, config file
+(`.codex-swarm.json`) for defaults, exit code reflects whether any reviewer
+succeeded. Compare the shipped journey at the top of this document. The
+target UX for the Rust extension should be one command:
+`/code-swarm review-diff --base main` (or `/extension run code-swarm.review …`)
+→ spawn → collect → report, no manual JSON at any step.
+
+### G4 · The prototype answers E6: the swarm was a model-facing TOOL
+
+The prototype's `helper` mode speaks a host ABI (JSONL over stdio,
+`HOST_ABI_VERSION 1`) and registers an SDK snapshot exposing `swarm_review`
+as a **tool** — params (`prompt`, `mode`, `files`, `base`, `staged`, `pr`,
+`current`, bounded `context`), limits (`timeout_ms`, `max_output_bytes`,
+`max_artifact_bytes`, `max_artifacts: 1`, `max_host_calls: 0`), and a declared
+markdown `report` artifact — plus a `/code-swarm` slash command surface. So
+the original design intent was: **the agent (or user) invokes the swarm as a
+bounded tool call**; orchestration lives inside the extension, not in the
+human. E6's open question has a documented prior answer. (The snapshot also
+declares a sidebar pane — that part is explicitly a non-goal under ADR 0010
+and `ui.md`; drop it, keep the tool.)
+
+### G5 · The report was a readable artifact with per-reviewer provenance
+
+`format_markdown` produces a per-model report with latency, token count, and
+`finish_reason` — flagging truncated reviewers ("output may be incomplete"),
+listing failed models with their errors, and leading with the skipped-context
+list. Written to a file with tight path discipline (must be directly under
+/tmp, no symlinks, `O_EXCL`, mode 0600) and returned as a declared artifact
+path. This reinforces E4: the Rust version's minified-JSON transcript dump is
+a regression from a prototype that already knew the answer (markdown artifact
++ path + bounded inline content).
+
+### G6 · Guardrails worth porting verbatim
+
+Review-only enforced in every system prompt; ≤5 models per swarm; per-model
+timeout; artifact byte caps; deterministic `fake_results` gated behind
+`test_mode`; a no-network self-test that exercises the full protocol including
+the unsafe-path cases. The Rust extension kept the review-only spirit but
+lost the resource caps that matter once real fan-out exists.
+
+### Where the shipped version is genuinely ahead
+
+Provenance-first report pairing (`generated_from` event ids, artifact written
+through the host with source events), capability declarations checked by the
+host, strict unknown-field input rejection, and session-ledger integration.
+The synthesis target is: prototype's *workflow and fan-out semantics* on top
+of the shipped version's *provenance and capability honesty*.
+
+### Revised recommendation
+
+E1–E4 remain valid immediate fixes. For E5/E6, the design conversation now has
+a concrete default: restore G1–G4 semantics in the Rust extension — a
+`review` command that assembles bounded context (G2), fans out to configured
+models (G1, needs either a model-call host capability in the SDK or
+companion briefs with explicit provider/model targets), writes the markdown
+report artifact (G5), and is invocable as one command and eventually as a
+model-facing tool (G4, a `docs/contracts/tools.md` / `multi-agent.md`
+extension). That is a contracts-first change per ADR 0010 — contracts land
+before or with the first honest UI for it.
