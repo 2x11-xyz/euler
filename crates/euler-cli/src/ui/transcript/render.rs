@@ -4,7 +4,8 @@ use super::cells::{
     render_edit_cell, render_file_change_cell, render_interrupted, render_patch_cell,
     render_permission_ask, render_permission_decision, render_resume_boundary, render_tool_run,
     render_turn_recap, render_worked_duration, tool_failure_status, CompanionRender, EditRender,
-    FileChangeRender, PatchRender, PermissionAskView, ResumeBoundaryRender, ToolRunRender,
+    FileChangeRender, PatchRender, PermissionAskView, PermissionDecisionView, ResumeBoundaryRender,
+    ToolRunRender,
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
@@ -290,9 +291,20 @@ pub(super) fn render_projected_entries_with_expansion(
                 capability,
                 decision,
                 allowed,
+                grant_scope,
+                instruction,
             } => {
                 render_permission_decision(
-                    &mut lines, capability, decision, *allowed, theme, width,
+                    &mut lines,
+                    PermissionDecisionView {
+                        capability,
+                        decision,
+                        allowed: *allowed,
+                        grant_scope: grant_scope.as_deref(),
+                        instruction: instruction.as_deref(),
+                    },
+                    theme,
+                    width,
                 );
             }
             TranscriptItem::PatchProposed { path, old, new } => {

@@ -223,29 +223,48 @@ pub(super) fn render_file_change_cell(
     );
 }
 
+pub(super) struct PermissionDecisionView<'a> {
+    pub(super) capability: &'a str,
+    pub(super) decision: &'a str,
+    pub(super) allowed: Option<bool>,
+    pub(super) grant_scope: Option<&'a str>,
+    pub(super) instruction: Option<&'a str>,
+}
+
 pub(super) fn render_permission_decision(
     lines: &mut Vec<Line<'static>>,
-    capability: &str,
-    decision: &str,
-    allowed: Option<bool>,
+    view: PermissionDecisionView<'_>,
     theme: &Theme,
     width: u16,
 ) {
-    let glyph = if allowed == Some(true) {
+    let glyph = if view.allowed == Some(true) {
         "✓ "
     } else {
         "✗ "
     };
-    let state = match allowed {
-        Some(true) => "approved",
-        Some(false) if decision.contains("cancel") => "canceled",
-        Some(false) => "denied",
-        None => "decided",
+    let scope_label = match (view.allowed, view.grant_scope) {
+        (Some(true), Some("session")) => "allowed for session",
+        (Some(true), Some("project")) => "allowed for project",
+        (Some(true), _) => "allowed once",
+        _ => "",
     };
-    let text = if capability.is_empty() {
-        format!("Permission {state}: {decision}")
+    let inst = view
+        .instruction
+        .filter(|instruction| !instruction.is_empty());
+    let capability = view.capability;
+    let decision = view.decision;
+    let text = if view.allowed == Some(true) && !scope_label.is_empty() && !capability.is_empty() {
+        format!("{scope_label} · {capability} ({decision})")
+    } else if view.allowed == Some(false) && inst.is_some() && !capability.is_empty() {
+        format!("denied · {capability} — \"{}\"", inst.unwrap_or_default())
+    } else if view.allowed == Some(false) && decision.contains("cancel") {
+        format!("Permission canceled: {capability} ({decision})")
+    } else if view.allowed == Some(false) && !capability.is_empty() {
+        format!("denied · {capability} ({decision})")
+    } else if capability.is_empty() {
+        format!("Permission decided: {decision}")
     } else {
-        format!("Permission {state}: {capability} ({decision})")
+        format!("Permission decided: {capability} ({decision})")
     };
     push_wrapped_with_prefix(
         lines,

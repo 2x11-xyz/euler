@@ -343,7 +343,7 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     let rows = terminal.backend().scrollback_rows();
     assert!(!rows.iter().any(|row| row.contains("Approval required")));
     assert!(!rows.iter().any(|row| row.contains("y  Allow once")));
-    let decision = row_containing(&rows, "✓ Permission approved: shell-exec (allowed)");
+    let decision = row_containing(&rows, "✓ allowed once · shell-exec");
     let tool = row_containing(&rows, "bash $ cargo check");
     let blank_rows_between = rows[decision + 1..tool]
         .iter()

@@ -1173,10 +1173,10 @@ impl AppCore {
     }
 
     fn search_haystack_lines(&self) -> Vec<String> {
-        // Plain text of committed history rows only — search is read-only and
-        // must not expand folds or reproject with different limits.
+        // Plain text of finalized ledger history rows — the same set the
+        // visual canvas projects. Not live streaming markdown only.
         let width = self.composer_navigation_width.max(40);
-        let items = self.transcript.live_committed_items();
+        let items = self.visual_canvas.finalized_items().to_vec();
         let lines = crate::ui::text::with_timestamp_gutter(self.show_timestamp_gutter, || {
             transcript::render_items_for_history(&items, &self.theme, width)
         });

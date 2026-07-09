@@ -469,10 +469,10 @@ fn tui_history_suppresses_routine_allow_permission_rows() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    assert!(!contents.contains("Permission approved: fs-read"));
-    assert!(!contents.contains("Permission approved: artifact-write"));
-    assert!(contents.contains("✗ Permission denied: shell-exec (denied)"));
-    assert!(contents.contains("✗ Permission denied: network (denied)"));
+    assert!(!contents.contains("allowed once · fs-read"));
+    assert!(!contents.contains("allowed once · artifact-write"));
+    assert!(contents.contains("✗ denied · shell-exec (denied)"));
+    assert!(contents.contains("✗ denied · network (denied)"));
 }
 
 #[test]
@@ -499,7 +499,7 @@ fn tui_permission_decisions_render_approved_and_canceled_notices() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    assert!(contents.contains("✓ Permission approved: shell-exec (allowed)"));
+    assert!(contents.contains("✓ allowed once · shell-exec"));
     assert!(contents.contains("✗ Permission canceled: fs-write (canceled)"));
 }
 
@@ -1064,6 +1064,8 @@ fn projects_slice2_events_without_opaque_reasoning_artifacts() {
                 capability: "shell-exec".to_owned(),
                 decision: "session-deny".to_owned(),
                 allowed: Some(false),
+                grant_scope: None,
+                instruction: None,
             },
             TranscriptItem::CheckStarted {
                 name: "cargo test".to_owned(),

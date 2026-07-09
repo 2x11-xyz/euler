@@ -81,6 +81,8 @@ pub enum TranscriptItem {
         capability: String,
         decision: String,
         allowed: Option<bool>,
+        grant_scope: Option<String>,
+        instruction: Option<String>,
     },
     PatchProposed {
         path: String,
@@ -469,6 +471,8 @@ fn project_event_with_checkpoints(
                 .payload
                 .get("allowed")
                 .and_then(serde_json::Value::as_bool),
+            grant_scope: payload_string(event, "grant_scope"),
+            instruction: payload_string(event, "instruction"),
         }),
         EventKind::PATCH_PROPOSED => Some(project_patch(event, true)),
         EventKind::PATCH_APPLIED => Some(project_patch(event, false)),

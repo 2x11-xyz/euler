@@ -11,8 +11,9 @@ pub struct TuiDecider {
 /// UI → decider reply for an approval panel decision.
 ///
 /// Scope strings are opaque patterns already derived by the UI. Empty means
-/// unscoped (whole capability). Invalid patterns fall back to unscoped at the
-/// boundary so the gate never receives a rejected `ScopePattern`.
+/// unscoped (whole capability) and is only honest when the panel labeled
+/// whole-capability. Invalid (control/oversize) patterns must **not** broaden
+/// to unscoped — they fall back to allow-once at the decider boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PermissionReply {
     AllowOnce,
@@ -52,20 +53,19 @@ impl PermissionDecider for TuiDecider {
         }
         match self.reply_rx.recv().unwrap_or(PermissionReply::Deny) {
             PermissionReply::AllowOnce => DeciderVerdict::Allow,
-            PermissionReply::AllowSessionScope(pattern) => {
-                DeciderVerdict::AllowScoped(GrantScope::Session(scope_pattern(pattern)))
-            }
-            PermissionReply::AllowProjectScope(pattern) => {
-                DeciderVerdict::AllowScoped(GrantScope::Project(scope_pattern(pattern)))
-            }
+            PermissionReply::AllowSessionScope(pattern) => match ScopePattern::new(pattern) {
+                Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::Session(pattern)),
+                // Invalid pattern never broadens to whole-capability; allow once.
+                Err(_) => DeciderVerdict::Allow,
+            },
+            PermissionReply::AllowProjectScope(pattern) => match ScopePattern::new(pattern) {
+                Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::Project(pattern)),
+                Err(_) => DeciderVerdict::Allow,
+            },
             PermissionReply::Deny => DeciderVerdict::Deny,
             PermissionReply::DenyWithInstruction(text) => DeciderVerdict::DenyWithInstruction(text),
         }
     }
-}
-
-fn scope_pattern(raw: String) -> ScopePattern {
-    ScopePattern::new(raw).unwrap_or_else(|_| ScopePattern::unscoped())
 }
 
 #[cfg(test)]
@@ -156,5 +156,33 @@ mod tests {
         drop(channels.reply_tx);
 
         assert_eq!(handle.join().expect("join"), DeciderVerdict::Deny);
+    }
+
+    #[test]
+    fn control_bearing_or_oversize_scope_does_not_become_session_wide_grant() {
+        let (mut decider, channels) = TuiDecider::new();
+        let handle = thread::spawn(move || {
+            let control = decider.decide(&request());
+            let oversize = decider.decide(&request());
+            (control, oversize)
+        });
+
+        let _ = channels.request_rx.recv().expect("request");
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowSessionScope("cargo\u{0001}".into()))
+            .expect("reply");
+        let _ = channels.request_rx.recv().expect("request");
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowProjectScope(
+                "x".repeat(euler_core::MAX_SCOPE_PATTERN_BYTES + 1),
+            ))
+            .expect("reply");
+
+        let (control, oversize) = handle.join().expect("join");
+        // Allow once — never AllowScoped(Session/Project unscoped).
+        assert_eq!(control, DeciderVerdict::Allow);
+        assert_eq!(oversize, DeciderVerdict::Allow);
     }
 }
