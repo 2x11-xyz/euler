@@ -293,7 +293,7 @@ fn cwd_segment(snapshot: &StatusSnapshot) -> String {
     snapshot
         .cwd
         .file_name()
-        .map(|name| format!("/{}", name.to_string_lossy()))
+        .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_owned())
 }
 
@@ -429,7 +429,8 @@ mod tests {
 
         let full = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 120);
         assert!(full.contains("⏎ send · / commands · ctrl+o expand"));
-        assert!(full.contains("/repo"));
+        assert!(full.contains("repo"));
+        assert!(!full.contains("/repo"));
         assert!(full.contains("e???? · z-ai/glm-5.2 · ctx ?% · main"));
         assert!(!full.contains("openrouter/z-ai/glm-5.2"));
         assert!(!full.contains("extra-high"));
@@ -450,7 +451,7 @@ mod tests {
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 80);
         assert_eq!(
             rendered,
-            "  ⏎ send · / commands · ctrl+o expand · /repo · e???? · echo · ctx ?% · ?"
+            "  ⏎ send · / commands · ctrl+o expand · repo · e???? · echo · ctx ?% · ?"
         );
     }
 
@@ -477,7 +478,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "  ⏎ send · / commands · ctrl+o expand · /euler · e???? · fable-5 · ctx 12% · ?"
+            "  ⏎ send · / commands · ctrl+o expand · euler · e???? · fable-5 · ctx 12% · ?"
         );
         assert_eq!(snapshot.model, "claude-fable-5");
     }
@@ -493,6 +494,20 @@ mod tests {
             rendered,
             "  ⏎ send · / commands · ctrl+o expand · / · e???? · echo · ctx ?% · ?"
         );
+    }
+
+    #[test]
+    fn cwd_segment_has_no_leading_slash() {
+        let snapshot = StatusSnapshot::new(
+            "anthropic",
+            "claude-fable-5",
+            PathBuf::from("/home/user/projects/euler"),
+        );
+
+        let segment = cwd_segment(&snapshot);
+
+        assert_eq!(segment, "euler");
+        assert!(!segment.starts_with('/'));
     }
 
     #[test]
@@ -530,7 +545,7 @@ mod tests {
             .any(|span| span.content == " · ?" && span.style == theme.status.model));
         assert!(spans
             .iter()
-            .any(|span| span.content.contains("/repo") && span.style == theme.status.state));
+            .any(|span| span.content.contains("repo") && span.style == theme.status.state));
         assert!(spans
             .iter()
             .any(|span| span.content == " · " && span.style == theme.status.base));

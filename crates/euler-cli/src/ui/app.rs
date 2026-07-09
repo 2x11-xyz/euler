@@ -102,8 +102,9 @@ mod visual;
 use self::visual::ratatui_lines_to_canvas;
 
 use self::support::{
-    command_context, is_copy_key, merge_effects, read_terminal_event, session_resume_label,
-    session_root_status_path, update_token_usage, CommandContextParts,
+    command_context, context_window_tokens_for, detect_git_branch, is_copy_key, merge_effects,
+    read_terminal_event, session_resume_label, session_root_status_path, update_token_usage,
+    CommandContextParts,
 };
 
 pub struct App {
@@ -603,6 +604,7 @@ struct AppCoreBootstrap {
     active_session_home_managed: bool,
     theme: Theme,
     status: StatusSnapshot,
+    initial_token_usage: TokenUsageSnapshot,
     initial_context: super::commands::CommandContext,
 }
 
@@ -635,6 +637,15 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
     let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
     status.session_id = Some(session_id.clone());
     status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+    status.git_branch = detect_git_branch(&status.cwd);
+    let initial_token_usage = TokenUsageSnapshot {
+        context_window_tokens: context_window_tokens_for(
+            &model_catalog,
+            &target.provider,
+            &target.model,
+        ),
+        ..TokenUsageSnapshot::default()
+    };
     let initial_context = command_context(
         &model_catalog,
         &target.provider,
@@ -654,6 +665,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         active_session_home_managed,
         theme,
         status,
+        initial_token_usage,
         initial_context,
     }
 }
@@ -683,6 +695,7 @@ impl AppCore {
             active_session_home_managed,
             theme,
             status,
+            initial_token_usage,
             initial_context,
         } = boot;
         Self {
@@ -696,7 +709,7 @@ impl AppCore {
             model_catalog,
             session_store,
             active_session_home_managed,
-            token_usage: TokenUsageSnapshot::default(),
+            token_usage: initial_token_usage,
             transcript: TranscriptState::default(),
             visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner {
                 session_id: Some(session_id.clone()),
@@ -1901,11 +1914,12 @@ impl AppCore {
         self.status.model = active_target.model;
         self.status.session_id = Some(session_id.clone());
         self.status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+        self.status.git_branch = detect_git_branch(&self.status.cwd);
         self.active_session_home_managed = true;
         self.replace_bottom_surface_for_session();
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
-        self.token_usage = TokenUsageSnapshot::default();
+        self.token_usage.context_window_tokens = self.active_context_window_tokens();
         self.expanded_artifact_keys.clear();
         self.last_foldable_spans.clear();
         self.modal = None;
@@ -2584,6 +2598,7 @@ impl AppCore {
         self.status.model = resume.active_target.model.clone();
         self.status.session_id = Some(session_id.clone());
         self.status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+        self.status.git_branch = detect_git_branch(&self.status.cwd);
         self.active_session_home_managed = true;
         self.replace_bottom_surface_for_session();
         // Rebuild first so token_usage reflects the resumed event stream under
@@ -2659,7 +2674,10 @@ impl AppCore {
         self.status.provider = provider.clone();
         self.status.model = model.clone();
         if switched {
-            self.token_usage = TokenUsageSnapshot::default();
+            self.token_usage = TokenUsageSnapshot {
+                context_window_tokens: self.active_context_window_tokens(),
+                ..TokenUsageSnapshot::default()
+            };
         }
         self.rebuild_bottom_surface();
         match model_preference::save_model_preference_to_default(&provider, &model) {
@@ -3023,6 +3041,7 @@ impl AppCore {
                 let auto_flush = outcome == TurnOutcome::Complete;
                 self.last_working_elapsed_secs = None;
                 self.handle_turn_outcome(outcome, elapsed);
+                self.status.git_branch = detect_git_branch(&self.status.cwd);
                 self.accept_worker_session_or_continue(session, auto_flush);
             }
             TurnEvent::ExtensionDone {
@@ -3068,14 +3087,11 @@ impl AppCore {
     }
 
     fn active_context_window_tokens(&self) -> Option<u64> {
-        self.model_catalog
-            .provider(&self.status.provider)
-            .and_then(|provider| {
-                provider
-                    .models()
-                    .find(|model| model.id() == self.status.model)
-            })
-            .and_then(|model| model.context_window_tokens())
+        context_window_tokens_for(
+            &self.model_catalog,
+            &self.status.provider,
+            &self.status.model,
+        )
     }
 
     fn accept_worker_session_or_continue(
