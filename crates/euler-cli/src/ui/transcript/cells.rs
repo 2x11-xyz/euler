@@ -290,6 +290,8 @@ pub(super) struct PermissionAskView<'a> {
     pub(super) reason: &'a str,
     pub(super) command: Option<&'a str>,
     pub(super) scope_prefix: Option<&'a str>,
+    pub(super) prior_count: usize,
+    pub(super) selected_option: crate::ui::patch_approval::ApprovalOption,
     pub(super) companion_name: Option<&'a str>,
 }
 
@@ -372,20 +374,28 @@ pub(super) fn render_permission_ask(
             current_cwd_label()
         )),
         PermissionPanelRow::body(preview),
-        PermissionPanelRow::metadata(consequences_row(ask.capability, ask.scope_prefix)),
+        PermissionPanelRow::metadata(consequences_row(
+            ask.capability,
+            ask.scope_prefix,
+            ask.prior_count,
+        )),
     ];
     rows.extend(
-        crate::ui::patch_approval::approval_option_lines(ask.capability, ask.scope_prefix)
-            .into_iter()
-            .map(|line| {
-                if line.selected {
-                    PermissionPanelRow::selected(line.text)
-                } else if line.hint {
-                    PermissionPanelRow::hint(line.text)
-                } else {
-                    PermissionPanelRow::body(line.text)
-                }
-            }),
+        crate::ui::patch_approval::approval_option_lines(
+            ask.capability,
+            ask.scope_prefix,
+            ask.selected_option,
+        )
+        .into_iter()
+        .map(|line| {
+            if line.selected {
+                PermissionPanelRow::selected(line.text)
+            } else if line.hint {
+                PermissionPanelRow::hint(line.text)
+            } else {
+                PermissionPanelRow::body(line.text)
+            }
+        }),
     );
     push_bordered_permission_panel(lines, &rows, theme, width);
 }
@@ -448,7 +458,7 @@ fn current_cwd_label() -> String {
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
-fn consequences_row(capability: &str, scope_prefix: Option<&str>) -> String {
+fn consequences_row(capability: &str, scope_prefix: Option<&str>, prior_count: usize) -> String {
     let write_scope = if capability == "fs-write" {
         scope_prefix
             .filter(|prefix| !prefix.trim().is_empty())
@@ -462,7 +472,7 @@ fn consequences_row(capability: &str, scope_prefix: Option<&str>) -> String {
         "unknown"
     };
     format!(
-        "consequences: write scope {write_scope} · network {network} · duration unknown · ran-before unknown"
+        "consequences: write scope {write_scope} · network {network} · duration unknown · ran-before {prior_count}×"
     )
 }
 

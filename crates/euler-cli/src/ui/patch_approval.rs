@@ -37,6 +37,35 @@ pub(crate) struct ApprovalOptionLine {
     pub(crate) hint: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ApprovalOption {
+    #[default]
+    AllowOnce,
+    AllowSession,
+    AllowProject,
+    Deny,
+}
+
+impl ApprovalOption {
+    pub(crate) fn previous(self) -> Self {
+        match self {
+            Self::AllowOnce => Self::AllowOnce,
+            Self::AllowSession => Self::AllowOnce,
+            Self::AllowProject => Self::AllowSession,
+            Self::Deny => Self::AllowProject,
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::AllowOnce => Self::AllowSession,
+            Self::AllowSession => Self::AllowProject,
+            Self::AllowProject => Self::Deny,
+            Self::Deny => Self::Deny,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PanelRowStyle {
     Title,
@@ -170,6 +199,8 @@ pub(crate) fn panel_lines(
     cwd: &Path,
     theme: &Theme,
     width: u16,
+    prior_count: usize,
+    selected_option: ApprovalOption,
 ) -> Vec<Line<'static>> {
     let panel_width = width.clamp(8, 96);
     let body_width = usize::from(panel_width.saturating_sub(4)).max(1);
@@ -198,11 +229,15 @@ pub(crate) fn panel_lines(
                 PanelRow::body(text)
             }),
     );
-    content.push(PanelRow::metadata(consequences_row(&modal.preview)));
+    content.push(PanelRow::metadata(consequences_row(
+        &modal.preview,
+        prior_count,
+    )));
     content.extend(
         approval_option_lines(
             modal.request.capability.as_str(),
             derive_scope_prefix(&modal.request).as_deref(),
+            selected_option,
         )
         .into_iter()
         .map(panel_row_for_option),
@@ -210,9 +245,9 @@ pub(crate) fn panel_lines(
     bordered_panel(content, panel_width, theme)
 }
 
-pub(crate) fn consequences_row(preview: &PatchPreview) -> String {
+pub(crate) fn consequences_row(preview: &PatchPreview, prior_count: usize) -> String {
     format!(
-        "consequences: write scope {} · network unknown · duration unknown · ran-before unknown",
+        "consequences: write scope {} · network unknown · duration unknown · ran-before {prior_count}×",
         write_scope(preview)
     )
 }
@@ -262,7 +297,7 @@ pub(crate) fn options_text(request: &PermissionRequest) -> String {
 /// Honest option labels: never show a prefix the gate will not grant.
 #[cfg(test)]
 pub(crate) fn approval_options_text(capability: &str, scope_prefix: Option<&str>) -> String {
-    approval_option_lines(capability, scope_prefix)
+    approval_option_lines(capability, scope_prefix, ApprovalOption::AllowOnce)
         .into_iter()
         .map(|line| line.text)
         .collect::<Vec<_>>()
@@ -273,44 +308,51 @@ pub(crate) fn approval_options_text(capability: &str, scope_prefix: Option<&str>
 pub(crate) fn approval_option_lines(
     capability: &str,
     scope_prefix: Option<&str>,
+    selected: ApprovalOption,
 ) -> Vec<ApprovalOptionLine> {
-    let (session_line, project_line) = match scope_prefix.filter(|p| !p.is_empty()) {
+    let (session_label, project_label) = match scope_prefix.filter(|p| !p.is_empty()) {
         Some(prefix) => (
-            format!("  a  Allow {prefix} * for this session"),
-            format!("  p  Allow {prefix} * in this project"),
+            format!("a  Allow {prefix} * for this session"),
+            format!("p  Allow {prefix} * in this project"),
         ),
         None => (
-            format!("  a  Allow {capability} for this session"),
-            format!("  p  Allow {capability} in this project"),
+            format!("a  Allow {capability} for this session"),
+            format!("p  Allow {capability} in this project"),
         ),
     };
     vec![
-        ApprovalOptionLine {
-            text: "› y  Allow once (default selection)".to_owned(),
-            selected: true,
-            hint: false,
-        },
-        ApprovalOptionLine {
-            text: session_line,
-            selected: false,
-            hint: false,
-        },
-        ApprovalOptionLine {
-            text: project_line,
-            selected: false,
-            hint: false,
-        },
-        ApprovalOptionLine {
-            text: "  n/esc  Deny with instructions".to_owned(),
-            selected: false,
-            hint: false,
-        },
+        approval_option_line(
+            "y  Allow once (default selection)",
+            selected,
+            ApprovalOption::AllowOnce,
+        ),
+        approval_option_line(&session_label, selected, ApprovalOption::AllowSession),
+        approval_option_line(&project_label, selected, ApprovalOption::AllowProject),
+        approval_option_line(
+            "n/esc  Deny with instructions",
+            selected,
+            ApprovalOption::Deny,
+        ),
         ApprovalOptionLine {
             text: "hint: every decision is logged".to_owned(),
             selected: false,
             hint: true,
         },
     ]
+}
+
+fn approval_option_line(
+    label: &str,
+    selected: ApprovalOption,
+    option: ApprovalOption,
+) -> ApprovalOptionLine {
+    let selected = selected == option;
+    let marker = if selected { '›' } else { ' ' };
+    ApprovalOptionLine {
+        text: format!("{marker} {label}"),
+        selected,
+        hint: false,
+    }
 }
 
 fn panel_row_for_option(line: ApprovalOptionLine) -> PanelRow {
