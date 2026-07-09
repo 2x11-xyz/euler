@@ -493,12 +493,17 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
         .iter()
         .position(|line| line.contains("▌ hi"))
         .expect("user row");
-    // Hairline under the user block is the Warm Ledger rhythm row.
+    // v2 (§1): the rhythm row under the user block is one blank line —
+    // per-event hairlines are gone.
     assert!(
         user_lines
             .get(user_row + 1)
-            .is_some_and(|line| line.contains('─')),
+            .is_some_and(|line| line.trim().is_empty()),
         "user_lines: {user_lines:?}"
+    );
+    assert!(
+        !user_lines.iter().any(|line| line.contains('─')),
+        "no hairline should follow the user block: {user_lines:?}"
     );
 
     core.handle_turn_event(TurnEvent::Event(event(
@@ -517,7 +522,7 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
     assert!(
         answer_lines
             .get(answer_row + 1)
-            .is_some_and(|line| line.contains('─')),
+            .is_some_and(|line| line.trim().is_empty()),
         "answer_lines: {answer_lines:?}"
     );
 
@@ -658,8 +663,9 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
         .map(|row| row.trim_end().to_owned())
         .collect::<Vec<_>>();
     assert!(
+        // The v2 anchor spine puts a `•` on the row's first visual line.
         rows.iter()
-            .any(|row| row.trim_start() == "Layer: CLI/TUI layer"),
+            .any(|row| row.trim_start() == "• Layer: CLI/TUI layer"),
         "stacked table row missing after resize: {rows:?}"
     );
     assert!(
@@ -771,8 +777,9 @@ fn finalized_tool_output_batch_separates_following_assistant_prose() {
     let rows = terminal.backend().scrollback_rows();
     let tool_last = row_containing(&rows, "last tool output row");
     assert!(rows.iter().any(|row| row.contains("exit 0 · 1 line")));
-    // Hairline under the tool block separates it from following assistant prose.
-    assert!(rows[tool_last + 1].contains('─'), "rows: {rows:?}");
+    // v2 (§1): one blank line under the tool block separates it from the
+    // following assistant prose — no hairline.
+    assert!(rows[tool_last + 1].trim().is_empty(), "rows: {rows:?}");
     assert!(
         rows[tool_last + 2].contains("I see 16 em dashes"),
         "rows: {rows:?}"
