@@ -9,6 +9,60 @@ Findings are numbered F1–F21, ordered by severity. Each carries an acceptance
 check. Do not "fix" anything in the **Verified conformant** section at the
 bottom — it is listed to prevent regression churn.
 
+**Round 2 (same day, branch @ `bc52b92`):** F1 re-verified fixed — the
+draft-empty hotkey guard plus the key-by-key acceptance test
+(`typed_permission_instruction_does_not_fire_hotkeys`) meet the acceptance
+criterion exactly. Round-2 findings F22–F23 below; F2–F14 fix verification in
+progress separately.
+
+---
+
+## ROUND 2 FINDINGS (branch @ `bc52b92`)
+
+### F22 · New vt100 timestamp tests are timezone-dependent — gate fails outside UTC
+
+- **Where:** `crates/euler-cli/src/ui/transcript_tests.rs:2831` and siblings —
+  `vt100_renders_absolute_time_duration_and_turn_footer`,
+  `vt100_clamps_out_of_order_timestamp_duration_to_zero`,
+  `vt100_skips_invalid_timestamps_without_breaking_transcript`
+- **Current:** the tests feed RFC3339 UTC timestamps (`2026-06-20T14:32:07.000Z`)
+  and assert the rendered wall-clock literal (`start timing · 14:32:07`). The
+  renderer converts to local time — `parse_event_time` maps to
+  `DateTime<Local>` (`transcript.rs:1414-1418`), which is correct product
+  behavior for a ledger. The tests therefore pass only when the host TZ is UTC.
+  On a macOS host in CEST all three fail; `cargo nextest run --workspace` is
+  red on the dogfooding machine.
+- **Do not "fix" by changing the renderer to UTC** — local wall-clock in the
+  gutter is the intended behavior. Fix the tests: compute the expected string
+  through the same `Local` conversion the code uses, or inject a fixed offset
+  into the projection for tests. Avoid `std::env::set_var("TZ", …)` inside
+  tests — it is process-global and racy under `cargo test`'s in-process
+  threading (nextest's process-per-test would mask the race).
+- **Accept when:** the three tests pass under `TZ=UTC`, `TZ=Europe/Amsterdam`,
+  and `TZ=America/New_York` without changing renderer behavior.
+
+### F23 · Headless extension-link test breaks on macOS tempdir symlink
+
+- **Where:** `crates/euler-cli/tests/headless.rs:5416`
+  (`extension_cli_links_reloads_unlinks_and_blocks_local_runtime`)
+- **Current:** asserts `info_json["source_path"]` starts with
+  `extension_dir.path()`. The binary canonicalizes paths (see
+  `euler-core/src/home.rs:134`), so on macOS the stored path is
+  `/private/var/folders/…` while `TempDir::path()` reports the
+  `/var/folders/…` symlink form — the prefix check fails. Passes with
+  `TMPDIR` pre-canonicalized, confirming no product bug.
+- **Fix:** canonicalize the expectation side:
+  `extension_dir.path().canonicalize()` before the `starts_with` comparison
+  (grep the headless suite for other `starts_with(…tempdir…)` assertions and
+  fix the pattern once).
+- **Accept when:** the test passes on stock macOS (default `TMPDIR`) and Linux.
+
+**Round-2 gate status:** with `TZ=UTC` and canonicalized `TMPDIR`, the full
+workspace gate is green (1878 passed, 2 skipped) and clippy is clean — no
+logic regressions found; F22/F23 are test-hermeticity defects only. The
+"1879 tests green" completion claim holds on Linux/UTC but not on the
+dogfooding host.
+
 ---
 
 ## BLOCKER
