@@ -394,6 +394,13 @@ Dedicated so approval and transcript share one path.
 - Interrupt + two-step quit copy with resume reassurance.
 - Wire reduced-motion / scroll pill if not complete.
 
+**Residual (Slice 6 implementer, 2026-07-09):** Provider in-flight retry is
+transport-only in `euler-core` (`diagnostics::transport_retry` / round-loop
+backoff). No session event or UI signal is published for attempt/backoff, so
+the gold in-place `⚠ provider · retry n/m` line cannot be surfaced honestly
+without inventing telemetry. Leave until core emits a UI-safe retry progress
+event (or the CLI otherwise receives attempt state).
+
 ### Slice 7 — Workspace checkpoints + `/rollback`
 
 - Core pre-image store (edit/write); secret/binary policy.

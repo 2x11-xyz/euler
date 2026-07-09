@@ -51,6 +51,8 @@ pub enum TranscriptItem {
         error: String,
         output: String,
         exit_code: Option<i64>,
+        /// Path from the matching tool call, when known (edit/apply failures).
+        path: Option<String>,
     },
     ToolRun {
         command: String,
@@ -139,6 +141,7 @@ pub(crate) struct ProjectedEntry {
 enum ToolCallProjection {
     Exploration(String),
     Run { command: String },
+    Edit { path: String },
 }
 
 pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
@@ -358,6 +361,7 @@ fn project_event(event: &EventEnvelope) -> Option<TranscriptItem> {
                 .payload
                 .get("exit_code")
                 .and_then(serde_json::Value::as_i64),
+            path: None,
         }),
         EventKind::PERMISSION_PROMPT => Some(TranscriptItem::PermissionPrompt {
             capability: payload_string(event, "capability").unwrap_or_default(),
@@ -507,6 +511,24 @@ fn project_tui_tool_result(
                 summaries: vec![summary],
             });
         }
+    }
+    if !ok && matches!(name.as_str(), "edit_file" | "apply_patch" | "apply-patch") {
+        let path =
+            tool_projection_for_result(event, calls).and_then(|projection| match projection {
+                ToolCallProjection::Edit { path } => Some(path.clone()),
+                _ => None,
+            });
+        return Some(TranscriptItem::ToolResult {
+            name,
+            ok: false,
+            error: payload_string(event, "error").unwrap_or_default(),
+            output: payload_string(event, "output").unwrap_or_default(),
+            exit_code: event
+                .payload
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64),
+            path,
+        });
     }
     project_event(event)
 }
@@ -731,7 +753,14 @@ fn tool_projection_from_call(event: &EventEnvelope) -> Option<ToolCallProjection
                 .map(normalized_shell_command)
                 .unwrap_or_default(),
         }),
-        "edit_file" => None,
+        "edit_file" | "apply_patch" | "apply-patch" => {
+            let path = input
+                .and_then(|input| input.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            Some(ToolCallProjection::Edit { path })
+        }
         _ => exploration_summary_from_call(&name, input).map(ToolCallProjection::Exploration),
     }
 }

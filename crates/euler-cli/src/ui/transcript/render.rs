@@ -1,8 +1,9 @@
 use super::cells::{
-    output_rows_without_trailing_blanks, push_bounded_children, push_cell_parent, push_child_rows,
-    render_edit_cell, render_file_change_cell, render_interrupted, render_patch_cell,
-    render_permission_ask, render_permission_decision, render_tool_run, render_worked_duration,
-    tool_failure_status, EditRender, FileChangeRender, PatchRender, ToolRunRender,
+    edit_failure_status, output_rows_without_trailing_blanks, push_bounded_children,
+    push_bounded_failure_children, push_cell_parent, push_child_rows, render_edit_cell,
+    render_file_change_cell, render_interrupted, render_patch_cell, render_permission_ask,
+    render_permission_decision, render_tool_run, render_worked_duration, tool_failure_status,
+    EditRender, FileChangeRender, PatchRender, ToolRunRender,
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
@@ -155,30 +156,40 @@ pub(super) fn render_projected_entries(
                 error,
                 output,
                 exit_code,
+                path,
             } => {
-                let label = tool_result_label(name);
-                let (status, style) = if *ok {
-                    (String::new(), theme.transcript.tool)
-                } else {
+                let (heading, style) = if *ok {
+                    (tool_result_label(name), theme.transcript.tool)
+                } else if matches!(name.as_str(), "edit_file" | "apply_patch" | "apply-patch") {
                     (
-                        tool_failure_status(*exit_code, error),
+                        edit_failure_status(path.as_deref().unwrap_or(""), error),
                         theme.transcript.tool_error,
                     )
-                };
-                let heading = if status.is_empty() {
-                    label
                 } else {
-                    format!("{label} {status}")
+                    let label = tool_result_label(name);
+                    let status = tool_failure_status(*exit_code, error);
+                    (format!("{label} {status}"), theme.transcript.tool_error)
                 };
                 push_cell_parent(&mut lines, &heading, style, theme, width);
-                push_bounded_children(
-                    &mut lines,
-                    output,
-                    theme.transcript.muted,
-                    theme,
-                    width,
-                    limits.output_lines,
-                );
+                if *ok {
+                    push_bounded_children(
+                        &mut lines,
+                        output,
+                        theme.transcript.muted,
+                        theme,
+                        width,
+                        limits.output_lines,
+                    );
+                } else {
+                    push_bounded_failure_children(
+                        &mut lines,
+                        output,
+                        theme.transcript.muted,
+                        theme,
+                        width,
+                        limits.output_lines,
+                    );
+                }
             }
             TranscriptItem::ToolRun {
                 command,

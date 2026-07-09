@@ -759,7 +759,7 @@ fn tui_failed_read_tool_keeps_diagnostic_output_visible() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    assert!(contents.contains("explore failed: No such file or directory"));
+    assert!(contents.contains("explore ✗ No such file or directory"));
     assert!(contents.contains("os error detail"));
 }
 
@@ -1050,6 +1050,7 @@ fn projects_slice2_events_without_opaque_reasoning_artifacts() {
                 error: "failed".to_owned(),
                 output: "partial output".to_owned(),
                 exit_code: Some(1),
+                path: None,
             },
             TranscriptItem::PermissionPrompt {
                 capability: "shell-exec".to_owned(),
@@ -1503,11 +1504,12 @@ fn tool_artifact_cell_reports_failure_without_exit_code() {
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
+    assert!(texts.contains("✗ permission denied"), "texts: {texts:?}");
+    assert!(texts.contains("0 lines"), "texts: {texts:?}");
     assert!(
-        texts.contains("failed: permission denied"),
+        !texts.contains("failed: permission denied"),
         "texts: {texts:?}"
     );
-    assert!(texts.contains("0 lines"), "texts: {texts:?}");
 }
 
 #[test]
@@ -2500,8 +2502,115 @@ fn vt100_failed_tool_with_exit_code_and_empty_error_has_no_dangling_colon() {
     let contents = rendered_screen(&events, &theme, 48, 4);
 
     assert!(contents.contains("bash"));
-    assert!(contents.contains("exit 2 · 0 lines"));
+    assert!(contents.contains("✗ exit 2 · 0 lines"));
     assert!(!contents.contains("exit 2:"));
+}
+
+#[test]
+fn failed_tool_run_surfaces_informative_line_before_tail() {
+    let theme = Theme::default();
+    let output = (1..=12)
+        .map(|index| {
+            if index == 5 {
+                "error[E0425]: cannot find value `x`".to_owned()
+            } else {
+                format!("line {index}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let item = [TranscriptItem::ToolRun {
+        command: "cargo test".to_owned(),
+        ok: false,
+        error: String::new(),
+        output,
+        exit_code: Some(101),
+    }];
+
+    let texts = line_texts(&render_items_for_history(&item, &theme, 80));
+    let joined = texts.join("\n");
+
+    assert!(
+        joined.contains("✗ exit 101"),
+        "failure verb should be loud: {joined:?}"
+    );
+    let body: Vec<_> = texts
+        .iter()
+        .filter(|line| line.starts_with("  ") && !line.trim().is_empty())
+        .collect();
+    assert!(
+        body.first()
+            .is_some_and(|line| line.contains("error[E0425]: cannot find value `x`")),
+        "first surfaced body line should be the informative match: {texts:?}"
+    );
+    assert!(
+        joined.contains("more lines · ctrl+o expand"),
+        "fold marker should remain: {joined:?}"
+    );
+    assert!(
+        joined.contains("line 11") && joined.contains("line 12"),
+        "summary tail should remain: {joined:?}"
+    );
+}
+
+#[test]
+fn edit_failure_renders_path_and_cause_inline() {
+    let events = vec![
+        tool_call(
+            "edit-1",
+            "edit_file",
+            serde_json::json!({
+                "path": "retry.rs",
+                "old": "a",
+                "new": "b"
+            }),
+        ),
+        event(
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", "edit-1".into()),
+                ("name", "edit_file".into()),
+                ("ok", false.into()),
+                (
+                    "error",
+                    "hunk 2/3 did not apply — file changed on disk since read".into(),
+                ),
+            ]),
+        ),
+    ];
+    let theme = Theme::default();
+    let contents = rendered_screen(&events, &theme, 96, 6);
+
+    assert!(
+        contents
+            .contains("edit retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"),
+        "contents: {contents:?}"
+    );
+    assert!(!contents.contains("edit failed"), "contents: {contents:?}");
+    assert!(
+        !contents.contains("edit retry.rs failed"),
+        "contents: {contents:?}"
+    );
+}
+
+#[test]
+fn interrupted_ledger_row_uses_spec_copy() {
+    let theme = Theme::default();
+    let texts = line_texts(&render_items_for_history(
+        &[TranscriptItem::Interrupted],
+        &theme,
+        80,
+    ));
+    let joined = texts.join("\n");
+    assert!(
+        joined.contains("interrupted — tell euler what to do differently"),
+        "texts: {texts:?}"
+    );
+    assert!(
+        !joined.contains("Conversation interrupted"),
+        "texts: {texts:?}"
+    );
+    assert!(!joined.contains("tell the model"), "texts: {texts:?}");
 }
 
 #[test]

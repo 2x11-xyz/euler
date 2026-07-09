@@ -680,6 +680,10 @@ fn ctrl_c_double_press_quits_when_idle() {
     let ctrl_c = modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
     assert_eq!(core.handle_input(ctrl_c.clone()), CoreEffect::Render);
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("ctrl+c again to quit · session saved, /resume restores")
+    );
     assert_eq!(core.handle_input(ctrl_c), CoreEffect::Quit);
 }
 
@@ -710,7 +714,10 @@ fn uppercase_ctrl_c_without_shift_arms_quit_and_does_not_copy() {
     );
 
     assert!(writes.lock().expect("clipboard lock").is_empty());
-    assert_eq!(core.notice.as_deref(), Some("press Ctrl+C again to quit"));
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("ctrl+c again to quit · session saved, /resume restores")
+    );
 }
 
 #[test]
@@ -735,7 +742,8 @@ fn escape_interrupts_in_flight_turn() {
     }
     assert!(core.notice.is_none());
     assert!(!core.interrupted_guidance);
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("Conversation interrupted"));
+    assert!(drain_finalized_visual_text(&mut core, 80)
+        .contains("interrupted — tell euler what to do differently"));
 }
 
 #[test]

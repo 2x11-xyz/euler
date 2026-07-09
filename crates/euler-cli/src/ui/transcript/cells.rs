@@ -11,7 +11,7 @@ mod shell;
 
 pub(super) use artifact::{
     artifact_output_rows, metadata_row, normalized_output_rows, plain_artifact_rows,
-    push_artifact_cell, sanitize_metadata_text, ArtifactCellRender,
+    push_artifact_cell, sanitize_metadata_text, ArtifactCellRender, ArtifactOutputRows,
 };
 
 pub(crate) use shell::normalized_shell_command;
@@ -72,7 +72,11 @@ pub(super) fn render_tool_run(
     } else {
         theme.transcript.tool_error
     };
-    let output = artifact_output_rows(run.output, limit);
+    let output = if run.ok {
+        artifact_output_rows(run.output, limit)
+    } else {
+        failure_output_rows(run.output, limit)
+    };
     let rows = plain_artifact_rows(&output.rows, theme.transcript.muted);
     let footer = tool_run_footer(run, output.total_rows, output.folded);
     push_artifact_cell(
@@ -337,8 +341,8 @@ pub(super) fn render_interrupted(lines: &mut Vec<Line<'static>>, theme: &Theme, 
             first: "■ ",
             next: "  ",
         },
-        "Conversation interrupted - tell the model what to do differently.",
-        theme.transcript.control,
+        "interrupted — tell euler what to do differently",
+        theme.transcript.warning,
         theme,
         width,
     );
@@ -366,12 +370,45 @@ pub(super) fn render_worked_duration(
 }
 
 pub(super) fn tool_failure_status(exit_code: Option<i64>, error: &str) -> String {
-    match (exit_code, error.is_empty()) {
-        (Some(code), true) => format!("failed with exit code {code}"),
-        (Some(code), false) => format!("failed with exit code {code}: {error}"),
-        (None, true) => "failed".to_owned(),
-        (None, false) => format!("failed: {error}"),
+    let cause = error.trim();
+    match (exit_code, cause.is_empty()) {
+        (Some(code), true) => format!("✗ exit {code}"),
+        (Some(code), false) => format!("✗ exit {code}: {cause}"),
+        (None, true) => "✗ failed — no cause recorded".to_owned(),
+        (None, false) => format!("✗ {cause}"),
     }
+}
+
+/// Edit/patch failure verb line: path + cause, never bare "failed".
+pub(super) fn edit_failure_status(path: &str, error: &str) -> String {
+    let cause = error.trim();
+    let cause = if cause.is_empty() {
+        "no cause recorded"
+    } else {
+        cause
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        format!("edit ✗ {cause}")
+    } else {
+        format!("edit {path} ✗ {cause}")
+    }
+}
+
+/// First output line worth surfacing on failure (error markers), if any.
+pub(super) fn most_informative_line(output: &str) -> Option<&str> {
+    output_rows_without_trailing_blanks(output)
+        .into_iter()
+        .find(|line| is_informative_failure_line(line))
+}
+
+fn is_informative_failure_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error[")
+        || lower.contains("error:")
+        || lower.contains("failed")
+        || lower.contains("panicked")
+        || lower.contains("fatal")
 }
 
 pub(super) fn tool_output_is_foldable(detail: &str, limit: usize) -> bool {
@@ -440,10 +477,11 @@ fn diff_redaction_label(diff_redaction: &str) -> String {
 
 fn tool_run_footer(run: ToolRunRender<'_>, total_rows: usize, folded: bool) -> String {
     let status = match (run.exit_code, run.ok) {
-        (Some(code), _) => format!("exit {code}"),
+        (Some(code), true) => format!("exit {code}"),
+        (Some(code), false) => format!("✗ exit {code}"),
         (None, true) => "done".to_owned(),
-        (None, false) if run.error.trim().is_empty() => "failed".to_owned(),
-        (None, false) => format!("failed: {}", run.error.trim()),
+        (None, false) if run.error.trim().is_empty() => "✗ failed — no cause recorded".to_owned(),
+        (None, false) => format!("✗ {}", run.error.trim()),
     };
     let line_label = if total_rows == 1 {
         "1 line".to_owned()
@@ -455,6 +493,61 @@ fn tool_run_footer(run: ToolRunRender<'_>, total_rows: usize, folded: bool) -> S
     } else {
         format!("{status} · {line_label}")
     }
+}
+
+fn failure_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
+    let rows = normalized_output_rows(detail);
+    let total_rows = rows.len();
+    if total_rows == 0 {
+        return ArtifactOutputRows {
+            rows: vec![String::new()],
+            total_rows,
+            folded: false,
+        };
+    }
+    if total_rows <= limit {
+        return ArtifactOutputRows {
+            rows: promote_informative_row(rows),
+            total_rows,
+            folded: false,
+        };
+    }
+
+    let informative = rows
+        .iter()
+        .find(|row| is_informative_failure_line(row))
+        .cloned();
+    let tail_n = OUTPUT_PREVIEW_TAIL_LINES.min(total_rows);
+    let mut tail = rows[total_rows.saturating_sub(tail_n)..].to_vec();
+    let mut preview = Vec::new();
+    if let Some(line) = informative {
+        // Keep the informative match as the first surfaced row even when it
+        // already lives in the tail window.
+        tail.retain(|row| row != &line);
+        preview.push(line);
+    }
+    let hidden = total_rows.saturating_sub(preview.len() + tail.len());
+    if hidden > 0 {
+        preview.push(format!("… {hidden} more lines · ctrl+o expand"));
+    }
+    preview.extend(tail);
+    ArtifactOutputRows {
+        rows: preview,
+        total_rows,
+        folded: true,
+    }
+}
+
+fn promote_informative_row(mut rows: Vec<String>) -> Vec<String> {
+    let Some(index) = rows.iter().position(|row| is_informative_failure_line(row)) else {
+        return rows;
+    };
+    if index == 0 {
+        return rows;
+    }
+    let line = rows.remove(index);
+    rows.insert(0, line);
+    rows
 }
 
 fn diffstat(old: Option<&str>, new: Option<&str>) -> Option<(usize, usize)> {
@@ -525,7 +618,40 @@ pub(super) fn push_bounded_children(
     width: u16,
     limit: usize,
 ) {
-    for (index, row) in bounded_preview_rows(detail, limit).iter().enumerate() {
+    push_child_preview_rows(
+        lines,
+        &bounded_preview_rows(detail, limit),
+        style,
+        theme,
+        width,
+    );
+}
+
+pub(super) fn push_bounded_failure_children(
+    lines: &mut Vec<Line<'static>>,
+    detail: &str,
+    style: ratatui::style::Style,
+    theme: &Theme,
+    width: u16,
+    limit: usize,
+) {
+    push_child_preview_rows(
+        lines,
+        &bounded_failure_preview_rows(detail, limit),
+        style,
+        theme,
+        width,
+    );
+}
+
+fn push_child_preview_rows(
+    lines: &mut Vec<Line<'static>>,
+    rows: &[String],
+    style: ratatui::style::Style,
+    theme: &Theme,
+    width: u16,
+) {
+    for (index, row) in rows.iter().enumerate() {
         let prefix = if index == 0 { "  └ " } else { "    " };
         push_wrapped_with_prefix(
             lines,
@@ -569,6 +695,40 @@ fn bounded_preview_rows(detail: &str, limit: usize) -> Vec<String> {
     preview
 }
 
+fn bounded_failure_preview_rows(detail: &str, limit: usize) -> Vec<String> {
+    if detail.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let rows = output_rows_without_trailing_blanks(detail);
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    if rows.len() <= limit {
+        return promote_informative_row(rows.into_iter().map(str::to_owned).collect());
+    }
+    let informative = most_informative_line(detail).map(str::to_owned);
+    let tail_n = OUTPUT_PREVIEW_TAIL_LINES.min(rows.len());
+    let mut tail = rows[rows.len().saturating_sub(tail_n)..]
+        .iter()
+        .map(|row| (*row).to_owned())
+        .collect::<Vec<_>>();
+    let mut preview = Vec::new();
+    if let Some(line) = informative {
+        if !tail.iter().any(|row| row == &line) {
+            preview.push(line);
+        } else {
+            tail.retain(|row| row != &line);
+            preview.push(line);
+        }
+    }
+    let hidden = rows.len().saturating_sub(preview.len() + tail.len());
+    if hidden > 0 {
+        preview.push(format!("… +{hidden} lines omitted"));
+    }
+    preview.extend(tail);
+    preview
+}
+
 pub(super) fn output_rows_without_trailing_blanks(detail: &str) -> Vec<&str> {
     let mut rows = detail.lines().collect::<Vec<_>>();
     while rows.last().is_some_and(|row| row.trim().is_empty()) {
@@ -598,5 +758,74 @@ fn push_wrapped_with_prefix(
             Span::styled(prefix.to_owned(), theme.transcript.gutter),
             Span::styled(segment, style),
         ]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn most_informative_line_prefers_error_marker_over_later_noise() {
+        let output =
+            "compiling foo\nerror[E0308]: mismatched types\nnote: expected i32\n    Finished\n";
+        assert_eq!(
+            most_informative_line(output),
+            Some("error[E0308]: mismatched types")
+        );
+    }
+
+    #[test]
+    fn most_informative_line_matches_failed_panicked_and_fatal() {
+        assert_eq!(
+            most_informative_line("ok\nFAILED tests::broken\ntail"),
+            Some("FAILED tests::broken")
+        );
+        assert_eq!(
+            most_informative_line("start\nthread panicked at 'boom'\nend"),
+            Some("thread panicked at 'boom'")
+        );
+        assert_eq!(
+            most_informative_line("warn\nfatal: repository not found"),
+            Some("fatal: repository not found")
+        );
+    }
+
+    #[test]
+    fn most_informative_line_returns_none_without_markers() {
+        assert_eq!(most_informative_line("line one\nline two\n"), None);
+    }
+
+    #[test]
+    fn edit_failure_status_never_bare_failed() {
+        assert_eq!(
+            edit_failure_status(
+                "retry.rs",
+                "hunk 2/3 did not apply — file changed on disk since read"
+            ),
+            "edit retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"
+        );
+        assert_eq!(edit_failure_status("", ""), "edit ✗ no cause recorded");
+        assert_eq!(
+            edit_failure_status(
+                "lib.rs",
+                "replacement text matched 0 times; expected exactly one"
+            ),
+            "edit lib.rs ✗ replacement text matched 0 times; expected exactly one"
+        );
+    }
+
+    #[test]
+    fn tool_failure_status_uses_exit_glyph_and_never_bare_failed() {
+        assert_eq!(tool_failure_status(Some(2), ""), "✗ exit 2");
+        assert_eq!(tool_failure_status(Some(1), "boom"), "✗ exit 1: boom");
+        assert_eq!(
+            tool_failure_status(None, ""),
+            "✗ failed — no cause recorded"
+        );
+        assert_eq!(
+            tool_failure_status(None, "permission denied"),
+            "✗ permission denied"
+        );
     }
 }

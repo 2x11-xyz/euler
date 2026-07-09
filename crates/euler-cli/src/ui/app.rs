@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
-const QUIT_ARM_NOTICE: &str = "press Ctrl+C again to quit";
+const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
 

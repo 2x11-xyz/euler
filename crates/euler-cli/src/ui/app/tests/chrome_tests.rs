@@ -119,10 +119,9 @@ fn ctrl_c_quit_notice_uses_reserved_transient_row_without_growing_frame() {
         before.active_frame_lines.len()
     );
     assert!(
-        after
-            .active_frame_lines
-            .iter()
-            .any(|line| line.plain_text() == "press Ctrl+C again to quit"),
+        after.active_frame_lines.iter().any(|line| {
+            line.plain_text() == "ctrl+c again to quit · session saved, /resume restores"
+        }),
         "lines: {:?}",
         after
             .active_frame_lines
@@ -137,10 +136,9 @@ fn ctrl_c_quit_notice_uses_reserved_transient_row_without_growing_frame() {
     );
     let palette = core.visual_canvas_frame(80);
     assert!(
-        !palette
-            .active_frame_lines
-            .iter()
-            .any(|line| line.plain_text() == "press Ctrl+C again to quit"),
+        !palette.active_frame_lines.iter().any(|line| {
+            line.plain_text() == "ctrl+c again to quit · session saved, /resume restores"
+        }),
         "lines: {:?}",
         palette
             .active_frame_lines
@@ -936,7 +934,7 @@ fn permission_denial_returns_failed_tool_result_not_interruption() {
         .iter()
         .any(|row| row.contains("Permission was denied for shell-exec")));
     let screen = terminal.backend().screen_contents();
-    assert!(!screen.contains("Conversation interrupted"));
+    assert!(!screen.contains("interrupted — tell euler what to do differently"));
     assert!(screen.contains("▌"));
 }
 
@@ -1748,7 +1746,9 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
         "finalized projection duplicated tool block: {finalized}"
     );
     assert_eq!(
-        finalized.matches("Conversation interrupted").count(),
+        finalized
+            .matches("interrupted — tell euler what to do differently")
+            .count(),
         2,
         "two interruptions were finalized: {finalized}"
     );
@@ -1774,7 +1774,7 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
     );
     let interrupted_count = durable
         .iter()
-        .filter(|row| row.contains("Conversation interrupted"))
+        .filter(|row| row.contains("interrupted — tell euler what to do differently"))
         .count();
     assert_eq!(
         interrupted_count, 2,
@@ -1783,7 +1783,7 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
     // The tool block must not repeat between the two notices.
     let first_notice = durable
         .iter()
-        .position(|row| row.contains("Conversation interrupted"))
+        .position(|row| row.contains("interrupted — tell euler what to do differently"))
         .expect("first notice");
     assert!(
         !durable[first_notice..]

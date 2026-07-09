@@ -6844,7 +6844,7 @@ impl PtyHarness {
         );
         self.write("\x03");
         assert!(
-            self.wait_for_screen("press Ctrl+C again to quit"),
+            self.wait_for_screen("ctrl+c again to quit · session saved, /resume restores"),
             "TUI did not arm quit notice:\n{}",
             self.screen_text()
         );
