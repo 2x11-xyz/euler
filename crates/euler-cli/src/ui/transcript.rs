@@ -1,10 +1,10 @@
 use super::patch_diff;
 use super::theme::Theme;
 use crate::ui::markdown_stream::MarkdownStreamCollector;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 use euler_event::{EventEnvelope, EventKind};
 use ratatui::{buffer::Buffer, layout::Rect, text::Line, widgets::Widget};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[allow(dead_code)]
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 10;
@@ -15,6 +15,7 @@ mod line;
 mod render;
 pub(crate) use cells::normalized_shell_command;
 use cells::{file_change_action_label, file_change_path_label, tool_output_is_foldable};
+use file_diff::file_diff_is_foldable;
 use line::render_line_oriented_item;
 #[cfg(test)]
 use render::bottom_aligned_with_offset;
@@ -122,16 +123,31 @@ pub enum TranscriptItem {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct EventTiming {
+pub(crate) struct EventTiming {
     absolute: String,
     since_previous: Option<String>,
     since_start: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ProjectedEntry {
+pub(crate) struct ProjectedEntry {
     item: TranscriptItem,
     timing: Option<EventTiming>,
+}
+
+#[allow(dead_code)] // scaffolding for timestamp/fold expansion wiring
+impl ProjectedEntry {
+    pub(crate) fn untimed(item: TranscriptItem) -> Self {
+        Self { item, timing: None }
+    }
+
+    pub(crate) fn banner(session_id: Option<String>) -> Self {
+        Self::untimed(TranscriptItem::Banner { session_id })
+    }
+
+    pub(crate) fn item(&self) -> &TranscriptItem {
+        &self.item
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,6 +209,17 @@ impl TranscriptState {
             items.push(TranscriptItem::AssistantMessage(self.live_tail.clone()));
         }
         items
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn entries(&self) -> Vec<ProjectedEntry> {
+        let mut entries = project_timed_events(&self.events);
+        if !self.live_tail.is_empty() {
+            entries.push(ProjectedEntry::untimed(TranscriptItem::AssistantMessage(
+                self.live_tail.clone(),
+            )));
+        }
+        entries
     }
 
     #[cfg(test)]
@@ -412,6 +439,22 @@ pub(crate) fn project_latest_event_for_ui(events: &[EventEnvelope]) -> Option<Tr
     project_tui_event_with_context(latest, &mut calls)
 }
 
+#[allow(dead_code)]
+pub(crate) fn project_latest_entry_for_ui(events: &[EventEnvelope]) -> Option<ProjectedEntry> {
+    let latest = events.last()?;
+    let mut entries = project_timed_events(events);
+    let entry = entries.pop()?;
+    let latest_time = parse_event_time(&latest.ts).map(|time| EventTiming {
+        absolute: time.format("%H:%M:%S").to_string(),
+        since_previous: None,
+        since_start: None,
+    });
+    Some(ProjectedEntry {
+        item: entry.item,
+        timing: entry.timing.or(latest_time),
+    })
+}
+
 pub(crate) fn render_items_for_history(
     items: &[TranscriptItem],
     theme: &Theme,
@@ -431,6 +474,23 @@ pub(crate) fn render_items_for_history_with_limit(
         theme,
         width,
         TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn render_entries_for_history_with_expansion(
+    entries: &[ProjectedEntry],
+    theme: &Theme,
+    width: u16,
+    output_limit_lines: usize,
+    expanded_artifact_keys: &HashSet<String>,
+) -> Vec<Line<'static>> {
+    render::render_projected_entries_with_expansion(
+        entries,
+        theme,
+        width,
+        TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+        expanded_artifact_keys,
     )
 }
 
@@ -636,12 +696,35 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
 }
 
 impl TranscriptItem {
-    pub(crate) fn is_foldable_shell_artifact(&self, output_limit_lines: usize) -> bool {
-        matches!(
-            self,
-            Self::ToolRun { output, .. } if tool_output_is_foldable(output, output_limit_lines)
-        )
+    pub(crate) fn is_foldable_artifact(&self, output_limit_lines: usize) -> bool {
+        match self {
+            Self::ToolRun { output, .. }
+            | Self::ToolResult { output, .. }
+            | Self::CheckResult { output, .. } => {
+                tool_output_is_foldable(output, output_limit_lines)
+            }
+            Self::PatchProposed { path, old, new } | Self::PatchApplied { path, old, new } => {
+                patch_diff::patch_is_foldable(
+                    path,
+                    old.as_deref(),
+                    new.as_deref(),
+                    patch_render_limit(),
+                )
+            }
+            Self::FileDiff {
+                diff: Some(diff), ..
+            } => file_diff_is_foldable(diff, output_limit_lines),
+            _ => false,
+        }
     }
+}
+
+pub(crate) fn artifact_key_for_index(index: usize) -> String {
+    format!("history:{index}")
+}
+
+fn patch_render_limit() -> usize {
+    patch_diff::DIFF_PREVIEW_ROWS.max(patch_diff::NEW_FILE_PREVIEW_ROWS) + 1
 }
 
 fn payload_string(event: &EventEnvelope, key: &str) -> Option<String> {
@@ -877,13 +960,13 @@ fn push_projected_entry(
     entries.push(ProjectedEntry { item, timing });
 }
 
-fn parse_event_time(ts: &str) -> Option<DateTime<Utc>> {
+fn parse_event_time(ts: &str) -> Option<DateTime<Local>> {
     DateTime::parse_from_rfc3339(ts)
         .ok()
-        .map(|time| time.with_timezone(&Utc))
+        .map(|time| time.with_timezone(&Local))
 }
 
-fn format_elapsed(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+fn format_elapsed(start: DateTime<Local>, end: DateTime<Local>) -> String {
     let seconds = end.signed_duration_since(start).num_seconds().max(0);
     format_duration(seconds)
 }

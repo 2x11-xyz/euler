@@ -59,9 +59,13 @@ impl VisualCanvasState {
     }
 
     pub fn has_foldable_shell_artifact(&self, output_limit_lines: usize) -> bool {
+        self.has_foldable_artifact(output_limit_lines)
+    }
+
+    pub fn has_foldable_artifact(&self, output_limit_lines: usize) -> bool {
         self.finalized
             .iter()
-            .any(|item| item.is_foldable_shell_artifact(output_limit_lines))
+            .any(|item| item.is_foldable_artifact(output_limit_lines))
     }
 
     pub fn invalidate_history_cache(&mut self) {

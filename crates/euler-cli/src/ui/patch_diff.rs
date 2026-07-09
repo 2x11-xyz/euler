@@ -163,6 +163,23 @@ pub(crate) fn render_patch(
     lines
 }
 
+pub(crate) fn patch_is_foldable(
+    path: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+    limit: usize,
+) -> bool {
+    let patch = diffy::create_patch(old.unwrap_or_default(), new.unwrap_or_default());
+    patch_rows(
+        &patch,
+        path,
+        old.unwrap_or_default(),
+        new.unwrap_or_default(),
+    )
+    .len()
+        > limit
+}
+
 fn bounded_rows(rows: Vec<DiffRow>, limit: usize) -> Vec<DiffRow> {
     if limit == 0 {
         return Vec::new();

@@ -1,4 +1,5 @@
 use super::patch_diff::{self, PatchDisplay};
+use super::text::{display_width, wrap_text};
 use super::theme::Theme;
 use euler_core::permissions::PermissionRequest;
 use euler_core::{parse_single_file_apply_patch, ApplyPatchDocument};
@@ -7,13 +8,17 @@ use euler_sdk::Capability;
 use ratatui::layout::Rect;
 #[cfg(test)]
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
+use std::path::Path;
 
+#[cfg(test)]
 pub(crate) const PROMPT_TEXT: &str = "\
-1. Yes, proceed (y)
-2. Yes, and don't ask again for fs-write this session (a)
-3. No, and tell euler what to do differently (esc)
-r. Review expanded patch (r)";
+y  Allow once
+a  AllowSession — session-level capability allow
+n/esc  Deny
+hint: every decision is logged";
+
+const PANEL_TITLE: &str = "Approval required";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PatchApprovalModal {
@@ -89,11 +94,63 @@ pub(crate) fn modal_chunks(area: Rect) -> PatchModalAreas {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn header_text(request: &PermissionRequest) -> String {
+    header_text_with_cwd(request, "unknown")
+}
+
+pub(crate) fn header_text_with_cwd(request: &PermissionRequest, cwd: &str) -> String {
     format!(
-        "Would you like to apply this patch?\n\nReason: {}: {}",
+        "{PANEL_TITLE}\n{} · cwd {cwd}\n{}",
         request.capability.as_str(),
         request.reason
+    )
+}
+
+pub(crate) fn panel_lines(
+    modal: &PatchApprovalModal,
+    cwd: &Path,
+    theme: &Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let panel_width = width.clamp(8, 96);
+    let body_width = usize::from(panel_width.saturating_sub(4)).max(1);
+    let diff_height = if modal.expanded { 16 } else { 8 };
+    let diff_area = Rect::new(0, 0, body_width as u16, diff_height);
+    let mut content = header_text_with_cwd(&modal.request, &cwd.display().to_string())
+        .lines()
+        .flat_map(|line| wrap_text(line, body_width))
+        .collect::<Vec<_>>();
+    content.extend(
+        rows(&modal.preview, theme, diff_area)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            }),
+    );
+    content.push(consequences_row(&modal.preview));
+    content.extend(
+        options_text(&modal.request.capability)
+            .lines()
+            .map(str::to_owned),
+    );
+    bordered_panel(content, panel_width, theme)
+}
+
+pub(crate) fn consequences_row(preview: &PatchPreview) -> String {
+    format!(
+        "consequences: write scope {} · network unknown · duration unknown · ran-before unknown",
+        write_scope(preview)
+    )
+}
+
+pub(crate) fn options_text(capability: &Capability) -> String {
+    format!(
+        "y  Allow once\na  AllowSession — session-level capability allow ({})\nn/esc  Deny\nhint: every decision is logged",
+        capability.as_str()
     )
 }
 
@@ -156,6 +213,43 @@ fn preview_from_tool_event(event: &EventEnvelope) -> PatchPreview {
 
 fn fallback(message: &str) -> PatchPreview {
     PatchPreview::Fallback(message.to_owned())
+}
+
+fn write_scope(preview: &PatchPreview) -> String {
+    match preview {
+        PatchPreview::Diff { path, .. } if !path.trim().is_empty() => path.clone(),
+        PatchPreview::Diff { .. } | PatchPreview::Fallback(_) => "unknown".to_owned(),
+    }
+}
+
+fn bordered_panel(content: Vec<String>, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let width = usize::from(width).max(4);
+    let inner_width = width.saturating_sub(4).max(1);
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(width.saturating_sub(2))),
+        theme.transcript.permission,
+    )));
+    for row in content {
+        for segment in wrap_text(&row, inner_width) {
+            lines.push(bordered_body_line(&segment, inner_width, theme));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
+        theme.transcript.permission,
+    )));
+    lines
+}
+
+fn bordered_body_line(text: &str, inner_width: usize, theme: &Theme) -> Line<'static> {
+    let padding = inner_width.saturating_sub(display_width(text));
+    Line::from(vec![
+        Span::styled("│ ", theme.transcript.permission),
+        Span::styled(text.to_owned(), theme.transcript.permission),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(" │", theme.transcript.permission),
+    ])
 }
 
 #[cfg(test)]

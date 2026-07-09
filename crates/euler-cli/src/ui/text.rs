@@ -1,5 +1,7 @@
 use unicode_width::UnicodeWidthChar;
 
+// Indent/rail gutter for nested rows. Warm Ledger also wants a 9-char
+// timestamp column on meaningful events (separate debt; do not overload this).
 pub(crate) const GUTTER_WIDTH: usize = 4;
 
 pub(crate) fn content_width(width: u16) -> usize {

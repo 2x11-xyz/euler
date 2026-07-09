@@ -81,6 +81,11 @@ pub(super) fn render_file_diff_cell(
     );
 }
 
+pub(super) fn file_diff_is_foldable(diff: &str, limit: usize) -> bool {
+    let row_count = parse_unified_diff(diff).rows.len();
+    row_count > preview_cap(row_count, limit)
+}
+
 fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str, limit: usize) -> FileDiffRows {
     let parsed = parse_unified_diff(diff);
     let total_rows = parsed.rows.len();
@@ -115,7 +120,7 @@ fn bounded_preview_rows(rows: Vec<FileDiffRow>, limit: usize) -> Vec<FileDiffRow
     if limit == 0 {
         return Vec::new();
     }
-    let cap = limit.min(crate::ui::patch_diff::DIFF_PREVIEW_ROWS + 1);
+    let cap = preview_cap(rows.len(), limit);
     if rows.len() <= cap {
         return rows;
     }
@@ -126,6 +131,14 @@ fn bounded_preview_rows(rows: Vec<FileDiffRow>, limit: usize) -> Vec<FileDiffRow
         "… {omitted} more lines · ctrl+o expand"
     )));
     out
+}
+
+fn preview_cap(row_count: usize, limit: usize) -> usize {
+    if limit == usize::MAX {
+        row_count
+    } else {
+        limit.min(crate::ui::patch_diff::DIFF_PREVIEW_ROWS + 1)
+    }
 }
 
 const MIN_LINE_NUMBER_WIDTH: usize = crate::ui::patch_diff::MIN_LINE_NUMBER_WIDTH;

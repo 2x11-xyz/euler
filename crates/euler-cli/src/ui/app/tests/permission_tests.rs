@@ -27,12 +27,13 @@ fn permission_prompt_renders_inline_with_command_body() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to run the following command?"));
-    assert!(contents.contains("Reason: shell-exec: tool run_shell"));
+    assert!(contents.contains("Approval required"));
+    assert!(contents.contains("shell-exec · cwd"));
     assert!(contents.contains("$ cargo test"));
-    assert!(contents.contains("1. Yes, proceed (y)"));
-    assert!(contents.contains("2. Yes, and don't ask again for shell-exec this session (a)"));
-    assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
+    assert!(contents.contains("y  Allow once"));
+    assert!(contents.contains("a  AllowSession — session-level capability allow (shell-exec)"));
+    assert!(contents.contains("n/esc  Deny"));
+    assert!(contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
     assert!(contents.contains("▌"));
     assert!(contents.contains("echo · ctx ?%"));
@@ -41,13 +42,12 @@ fn permission_prompt_renders_inline_with_command_body() {
 
     let rows = terminal.backend().screen_rows();
     assert!(
-        rows[row_containing(&rows, "Would you like to run the following command?")]
-            .starts_with("  "),
-        "permission question should use content gutter: {rows:?}"
+        rows[row_containing(&rows, "Approval required")].starts_with("│ "),
+        "permission question should use bordered approval panel: {rows:?}"
     );
     assert!(
-        rows[row_containing(&rows, "1. Yes, proceed (y)")].starts_with("  "),
-        "permission options should use content gutter: {rows:?}"
+        rows[row_containing(&rows, "y  Allow once")].starts_with("│ "),
+        "permission options should use bordered approval panel: {rows:?}"
     );
 }
 
@@ -82,7 +82,7 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to run the following command?"));
+    assert!(contents.contains("Approval required"));
     assert!(contents.contains("$ cargo test"));
 
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
@@ -93,9 +93,9 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Reason: fs-write: tool edit_file"));
+    assert!(contents.contains("fs-write · cwd"));
     assert!(!contents.contains("$ cargo test"));
-    assert!(!contents.contains("Would you like to run the following command?"));
+    assert!(contents.contains("Approval required"));
 }
 
 #[test]
@@ -111,8 +111,8 @@ fn non_patch_permission_uses_generic_inline_ask() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to allow this request?"));
-    assert!(contents.contains("2. Yes, and don't ask again for shell-exec this session (a)"));
+    assert!(contents.contains("Approval required"));
+    assert!(contents.contains("a  AllowSession — session-level capability allow (shell-exec)"));
     assert!(!contents.contains("Patch approval required"));
 }
 
@@ -129,17 +129,14 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let rows = terminal.backend().screen_rows();
-    assert!(
-        rows[row_containing(&rows, "Would you like to allow this request?")].starts_with("  "),
-        "permission prompt should align with transcript content gutter: {rows:?}"
-    );
-    let one = row_containing(&rows, "1. Yes, proceed (y)");
-    let two = row_containing(&rows, "2. Yes, and don't ask again");
-    let three = row_containing(&rows, "3. No, and tell euler");
+    let one = row_containing(&rows, "y  Allow once");
+    let two = row_containing(&rows, "a  AllowSession");
+    let three = row_containing(&rows, "n/esc  Deny");
+    let hint = row_containing(&rows, "hint: every decision is logged");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
     assert!(one < two && two < three, "rows: {rows:?}");
-    assert!(three < prompt, "rows: {rows:?}");
+    assert!(three < hint && hint < prompt, "rows: {rows:?}");
     assert_eq!(
         status,
         prompt + 1,
@@ -171,14 +168,12 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
     render_inline_frame(&mut terminal, &mut core);
 
     let rows = terminal.backend().screen_rows();
-    let one = row_containing(&rows, "1. Yes, proceed (y)");
-    let two = row_containing(&rows, "2. Yes, and don't ask again");
-    let three = row_containing(&rows, "3. No, and tell euler");
+    let three = row_containing(&rows, "n/esc  Deny");
+    let hint = row_containing(&rows, "hint: every decision is logged");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
     assert_eq!(terminal.viewport_area().height, 8);
-    assert!(one < two && two < three, "rows: {rows:?}");
-    assert!(three < prompt, "rows: {rows:?}");
+    assert!(three < hint && hint < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
     assert!(
         !rows.iter().any(|row| row.contains("lower priority notice")),
@@ -208,9 +203,9 @@ fn inline_patch_approval_ask_hides_working_status_and_keeps_options_visible() {
     render_inline_frame(&mut terminal, &mut core);
 
     let rows = terminal.backend().screen_rows();
-    let one = row_containing(&rows, "1. Yes, proceed (y)");
-    let two = row_containing(&rows, "2. Yes, and don't ask again");
-    let three = row_containing(&rows, "3. No, and tell euler");
+    let one = row_containing(&rows, "y  Allow once");
+    let two = row_containing(&rows, "a  AllowSession");
+    let three = row_containing(&rows, "n/esc  Deny");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
     assert!(one < two && two < three, "rows: {rows:?}");
@@ -246,14 +241,14 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like"));
+    assert!(contents.contains("Approval required"));
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
     assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
     terminal.draw(|frame| core.render(frame)).expect("redraw");
 
     let restored = terminal.backend().screen_contents();
-    assert!(!restored.contains("Would you like"));
+    assert!(!restored.contains("Approval required"));
     assert!(restored.contains("underlying transcript"));
     assert!(restored.contains("▌ draft"));
     assert!(restored.contains("echo · ctx ?%"));

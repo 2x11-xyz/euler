@@ -48,6 +48,7 @@ use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
 use euler_sdk::{Capability, Extension};
 use ratatui::backend::CrosstermBackend;
+#[cfg(test)]
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 #[cfg(test)]
@@ -944,7 +945,7 @@ impl AppCore {
 
     fn handle_modal_input(&mut self, input: InputEvent) -> CoreEffect {
         let InputEvent::Key(key) = input else {
-            return CoreEffect::None;
+            return self.handle_modal_composer_input(input);
         };
         if matches!(self.modal, Some(Modal::PatchApproval(_))) {
             return self.handle_patch_modal_key(key);
@@ -963,7 +964,7 @@ impl AppCore {
             KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
                 self.reply_to_modal(PermissionReply::AllowAll)
             }
-            _ => CoreEffect::None,
+            _ => self.handle_modal_composer_key(key),
         }
     }
 
@@ -1000,6 +1001,37 @@ impl AppCore {
             KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
                 self.reply_to_modal(PermissionReply::AllowAll)
             }
+            _ => self.handle_modal_composer_key(key),
+        }
+    }
+
+    fn handle_modal_composer_input(&mut self, input: InputEvent) -> CoreEffect {
+        match input {
+            InputEvent::Paste(text) => {
+                self.bottom.edit_composer(|draft| {
+                    let _ = draft.insert_bracketed_paste(&text);
+                });
+                CoreEffect::Render
+            }
+            InputEvent::Key(key) => self.handle_modal_composer_key(key),
+            InputEvent::Mouse(_) => CoreEffect::None,
+        }
+    }
+
+    fn handle_modal_composer_key(&mut self, key: KeyEvent) -> CoreEffect {
+        match key.code {
+            KeyCode::Enter if enter_key_intent(&key) == Some(EnterKeyIntent::InsertNewline) => {
+                self.edit_composer_text(|draft| draft.insert_newline())
+            }
+            KeyCode::Char(ch) if text_entry_modifiers(key.modifiers) => {
+                self.edit_composer_text(|draft| draft.insert_char(ch))
+            }
+            KeyCode::Backspace => self.edit_composer_text(|draft| draft.backspace()),
+            KeyCode::Delete => self.edit_composer_text(|draft| draft.delete()),
+            KeyCode::Left => self.move_composer_cursor(|draft| draft.move_left()),
+            KeyCode::Right => self.move_composer_cursor(|draft| draft.move_right()),
+            KeyCode::Home => self.move_composer_cursor(|draft| draft.move_home()),
+            KeyCode::End => self.move_composer_cursor(|draft| draft.move_end()),
             _ => CoreEffect::None,
         }
     }

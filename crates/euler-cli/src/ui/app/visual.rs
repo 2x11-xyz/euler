@@ -135,25 +135,12 @@ impl AppCore {
         modal: &PatchApprovalModal,
         width: u16,
     ) -> Vec<CanvasLine> {
-        let diff_height = if modal.expanded { 16 } else { 8 };
-        let diff_area = Rect::new(0, 0, width, diff_height);
-        let mut lines = patch_approval::header_text(&modal.request)
-            .lines()
-            .map(CanvasLine::plain_lossy)
-            .collect::<Vec<_>>();
-        lines.push(CanvasLine::plain_lossy(""));
-        lines.extend(ratatui_lines_to_canvas(patch_approval::rows(
-            &modal.preview,
+        ratatui_lines_to_canvas(patch_approval::panel_lines(
+            modal,
+            &self.status.cwd,
             &self.theme,
-            diff_area,
-        )));
-        lines.push(CanvasLine::plain_lossy(""));
-        lines.extend(
-            patch_approval::PROMPT_TEXT
-                .lines()
-                .map(CanvasLine::plain_lossy),
-        );
-        lines
+            width,
+        ))
     }
 
     fn push_visual_permission_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) {

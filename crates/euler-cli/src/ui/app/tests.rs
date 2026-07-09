@@ -1154,14 +1154,17 @@ fn modal_input_keeps_precedence_while_turn_is_in_flight() {
     };
     core.modal = Some(Modal::Permission(fs_write_request()));
 
-    assert_eq!(core.handle_input(key(KeyCode::Char('x'))), CoreEffect::None);
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('x'))),
+        CoreEffect::Render
+    );
     assert_eq!(
         core.handle_input(InputEvent::Paste("pasted".to_owned())),
-        CoreEffect::None
+        CoreEffect::Render
     );
 
     assert!(matches!(core.modal, Some(Modal::Permission(_))));
-    assert!(core.bottom.composer().submit_text().is_empty());
+    assert_eq!(core.bottom.composer().submit_text(), "xpasted");
 }
 
 #[test]
@@ -2767,15 +2770,15 @@ fn patch_approval_modal_renders_diff_and_prompt() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to apply this patch?"));
-    assert!(contents.contains("Reason: fs-write: tool edit_file"));
+    assert!(contents.contains("Approval required"));
+    assert!(contents.contains("fs-write · cwd"));
     assert!(contents.contains("note.txt"));
     assert!(contents.contains("alpha"));
     assert!(contents.contains("beta"));
-    assert!(contents.contains("1. Yes, proceed (y)"));
-    assert!(contents.contains("2. Yes, and don't ask again for fs-write this session (a)"));
-    assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
-    assert!(contents.contains("r. Review expanded patch (r)"));
+    assert!(contents.contains("y  Allow once"));
+    assert!(contents.contains("a  AllowSession"));
+    assert!(contents.contains("n/esc  Deny"));
+    assert!(contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
 }
 
@@ -2793,17 +2796,11 @@ fn patch_approval_modal_clears_full_rows_behind_modal() {
 
     let contents = terminal.backend().screen_contents();
     for (needle, expected) in [
+        ("Approval required", "Approval required"),
+        ("fs-write · cwd", "fs-write · cwd"),
         (
-            "Would you like to apply this patch?",
-            "Would you like to apply this patch?",
-        ),
-        (
-            "Reason: fs-write: tool edit_file",
-            "Reason: fs-write: tool edit_file",
-        ),
-        (
-            "r. Review expanded patch (r)",
-            "r. Review expanded patch (r)",
+            "hint: every decision is logged",
+            "hint: every decision is logged",
         ),
     ] {
         let line = contents
@@ -2909,7 +2906,7 @@ fn large_patch_modal_keeps_diff_bounded() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("ctrl+o expand"));
-    assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
+    assert!(contents.contains("n/esc  Deny"));
     assert!(!contents.contains("line 119"));
 }
 

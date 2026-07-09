@@ -222,7 +222,7 @@ pub(super) fn render_permission_decision(
     width: u16,
 ) {
     let glyph = if allowed == Some(true) {
-        "✔ "
+        "✓ "
     } else {
         "✗ "
     };
@@ -258,43 +258,76 @@ pub(super) fn render_permission_ask(
     theme: &Theme,
     width: u16,
 ) {
-    let question = if command.is_some() {
-        "Would you like to run the following command?"
-    } else {
-        "Would you like to allow this request?"
-    };
-    push_permission_ask_line(lines, question, theme, width);
-    push_permission_ask_line(
-        lines,
-        &format!("Reason: {capability}: {reason}"),
-        theme,
-        width,
-    );
-    if let Some(command) = command.filter(|command| !command.is_empty()) {
-        push_permission_ask_line(lines, &format!("$ {command}"), theme, width);
-    }
-    lines.push(Line::from(""));
-    for option in [
-        "1. Yes, proceed (y)".to_owned(),
-        format!("2. Yes, and don't ask again for {capability} this session (a)"),
-        "3. No, and tell euler what to do differently (esc)".to_owned(),
-    ] {
-        push_permission_ask_line(lines, &option, theme, width);
-    }
+    let preview = command
+        .filter(|command| !command.is_empty())
+        .map(|command| format!("command: $ {command}"))
+        .unwrap_or_else(|| format!("request: {reason}"));
+    let rows = [
+        "Approval required".to_owned(),
+        format!("{capability} · cwd {}", current_cwd_label()),
+        preview,
+        consequences_row(capability),
+        "y  Allow once".to_owned(),
+        format!("a  AllowSession — session-level capability allow ({capability})"),
+        "n/esc  Deny".to_owned(),
+        "hint: every decision is logged".to_owned(),
+    ];
+    push_bordered_permission_panel(lines, &rows, theme, width);
 }
 
-fn push_permission_ask_line(lines: &mut Vec<Line<'static>>, text: &str, theme: &Theme, width: u16) {
-    push_wrapped_with_prefix(
-        lines,
-        CellPrefixes {
-            first: "  ",
-            next: "  ",
-        },
-        text,
+fn push_bordered_permission_panel(
+    lines: &mut Vec<Line<'static>>,
+    rows: &[String],
+    theme: &Theme,
+    width: u16,
+) {
+    let panel_width = usize::from(width.clamp(8, 96));
+    let inner_width = panel_width.saturating_sub(4).max(1);
+    lines.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(panel_width.saturating_sub(2))),
         theme.transcript.permission,
-        theme,
-        width,
-    );
+    )));
+    for row in rows {
+        for segment in wrap_text(row, inner_width) {
+            push_permission_panel_row(lines, &segment, inner_width, theme);
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(panel_width.saturating_sub(2))),
+        theme.transcript.permission,
+    )));
+}
+
+fn push_permission_panel_row(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    inner_width: usize,
+    theme: &Theme,
+) {
+    let padding = inner_width.saturating_sub(display_width(text));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", theme.transcript.permission),
+        Span::styled(text.to_owned(), theme.transcript.permission),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(" │", theme.transcript.permission),
+    ]));
+}
+
+fn current_cwd_label() -> String {
+    std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+fn consequences_row(capability: &str) -> String {
+    let network = if capability == "network" {
+        "requested"
+    } else {
+        "unknown"
+    };
+    format!(
+        "consequences: write scope unknown · network {network} · duration unknown · ran-before unknown"
+    )
 }
 
 pub(super) fn render_interrupted(lines: &mut Vec<Line<'static>>, theme: &Theme, width: u16) {

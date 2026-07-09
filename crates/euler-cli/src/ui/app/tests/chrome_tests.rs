@@ -306,7 +306,7 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     assert!(terminal
         .backend()
         .screen_contents()
-        .contains("Would you like to run the following command?"));
+        .contains("Approval required"));
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('y'))),
@@ -341,11 +341,9 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     );
 
     let rows = terminal.backend().scrollback_rows();
-    assert!(!rows
-        .iter()
-        .any(|row| row.contains("Would you like to run the following command?")));
-    assert!(!rows.iter().any(|row| row.contains("1. Yes, proceed")));
-    let decision = row_containing(&rows, "✔ Permission approved: shell-exec (allowed)");
+    assert!(!rows.iter().any(|row| row.contains("Approval required")));
+    assert!(!rows.iter().any(|row| row.contains("y  Allow once")));
+    let decision = row_containing(&rows, "✓ Permission approved: shell-exec (allowed)");
     let tool = row_containing(&rows, "bash $ cargo check");
     let blank_rows_between = rows[decision + 1..tool]
         .iter()
@@ -1600,7 +1598,7 @@ fn patch_approval_hides_completed_read_file_activity() {
         .draw(|frame| core.render(frame))
         .expect("patch approval draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to apply this patch?"));
+    assert!(contents.contains("Approval required"));
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("read_file completed"));
     assert!(!contents.contains("raw transcript source"));
@@ -1618,17 +1616,21 @@ fn patch_approval_remains_visible_and_active_when_question_mark_is_pressed() {
     assert!(terminal
         .backend()
         .screen_contents()
-        .contains("Would you like to apply this patch?"));
+        .contains("Approval required"));
 
-    assert_eq!(core.handle_input(key(KeyCode::Char('?'))), CoreEffect::None);
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('?'))),
+        CoreEffect::Render
+    );
     assert!(matches!(core.modal, Some(Modal::PatchApproval(_))));
+    assert_eq!(core.bottom.composer().submit_text(), "?");
 
     terminal
         .draw(|frame| core.render(frame))
         .expect("draw after");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to apply this patch?"));
-    assert!(contents.contains("r. Review expanded patch (r)"));
+    assert!(contents.contains("Approval required"));
+    assert!(contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("Euler keys"));
 }
 
