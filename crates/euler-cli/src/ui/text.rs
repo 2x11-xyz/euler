@@ -113,6 +113,13 @@ pub(crate) fn hairline_content(content_cols: usize) -> String {
     "─".repeat(content_cols.max(1))
 }
 
+pub(crate) fn new_events_pill_text(new_events: usize) -> Option<String> {
+    (new_events > 0).then(|| format!("↓ {new_events} new events"))
+}
+
+// F2 only adds the formatter; app.rs scroll-state wiring is the follow-up.
+const _: fn(usize) -> Option<String> = new_events_pill_text;
+
 /// True when `gutter` is a valid ledger prefix for the current gutter mode.
 pub(crate) fn is_ledger_gutter(gutter: &str) -> bool {
     let width = display_width(gutter);
@@ -241,5 +248,15 @@ mod tests {
         });
         assert_eq!(gutter_width(), TIMESTAMP_GUTTER_WIDTH);
         assert_eq!(content_width(80), 71);
+    }
+
+    #[test]
+    fn new_events_pill_is_absent_when_no_events_arrived() {
+        assert_eq!(new_events_pill_text(0), None);
+    }
+
+    #[test]
+    fn new_events_pill_formats_arrived_event_count() {
+        assert_eq!(new_events_pill_text(3), Some("↓ 3 new events".to_owned()));
     }
 }
