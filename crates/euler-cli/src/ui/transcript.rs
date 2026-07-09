@@ -127,6 +127,12 @@ pub enum TranscriptItem {
         ok: bool,
         output: String,
     },
+    /// Extension command output as a foldable ledger artifact (pretty JSON).
+    ExtensionResult {
+        reference: String,
+        ok: bool,
+        output: String,
+    },
     SessionSummary(String),
     Interrupted,
     WorkedDuration(String),

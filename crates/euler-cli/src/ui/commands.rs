@@ -895,9 +895,7 @@ fn extension_slash_or_unknown(
             Some(json) if json.starts_with('{') => match serde_json::from_str(json) {
                 Ok(value) => (value, None),
                 Err(error) => {
-                    return CommandEffect::Message(format!(
-                        "{token} input must be JSON: {error}"
-                    ));
+                    return CommandEffect::Message(format!("{token} input must be JSON: {error}"));
                 }
             },
             Some(flags) if flags.starts_with("--") => (

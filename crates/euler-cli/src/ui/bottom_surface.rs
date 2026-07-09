@@ -1997,7 +1997,10 @@ mod tests {
             picker.render_lines(120).join("\n")
         };
         assert!(lines.contains("3 selected · 1–5"), "lines: {lines}");
-        assert!(lines.contains("[x] openrouter::z-ai/glm-5.2"), "lines: {lines}");
+        assert!(
+            lines.contains("[x] openrouter::z-ai/glm-5.2"),
+            "lines: {lines}"
+        );
         assert!(lines.contains("[ ] mistral::large-3"), "lines: {lines}");
         assert!(lines.contains("min 1 · max 5"), "lines: {lines}");
     }

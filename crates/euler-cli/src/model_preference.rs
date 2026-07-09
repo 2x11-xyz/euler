@@ -271,7 +271,10 @@ pub fn load_code_swarm_models_preference(path: &Path) -> CodeSwarmModelsLoad {
             ));
         }
     };
-    let Some(models) = value.as_object().and_then(|object| object.get("code_swarm_models")) else {
+    let Some(models) = value
+        .as_object()
+        .and_then(|object| object.get("code_swarm_models"))
+    else {
         return CodeSwarmModelsLoad::Missing;
     };
     let Some(entries) = models.as_array() else {

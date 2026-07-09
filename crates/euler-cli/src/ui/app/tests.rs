@@ -3452,7 +3452,10 @@ mod code_swarm_tests {
         assert!(core.pending_runs.is_empty());
 
         core.code_swarm_on_companion_done();
-        assert_eq!(core.code_swarm_run, Some(CodeSwarmRun::Reporting { total: 2 }));
+        assert_eq!(
+            core.code_swarm_run,
+            Some(CodeSwarmRun::Reporting { total: 2 })
+        );
         assert_eq!(core.pending_runs.len(), 1);
         match core.pending_runs.front().expect("report request") {
             PendingRunRequest::Extension(request) => {

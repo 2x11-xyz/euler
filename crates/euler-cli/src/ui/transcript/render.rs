@@ -1,11 +1,11 @@
 use super::cells::{
     edit_failure_status, output_rows_without_trailing_blanks, push_bounded_children,
     push_bounded_failure_children, push_cell_parent, push_child_rows, render_companion_block,
-    render_edit_cell, render_file_change_cell, render_interrupted, render_patch_cell,
-    render_permission_ask, render_permission_decision, render_resume_boundary, render_tool_run,
-    render_turn_recap, render_worked_duration, tool_failure_status, CompanionRender, EditRender,
-    FileChangeRender, PatchRender, PermissionAskView, PermissionDecisionView, ResumeBoundaryRender,
-    ToolRunRender,
+    render_edit_cell, render_extension_result, render_file_change_cell, render_interrupted,
+    render_patch_cell, render_permission_ask, render_permission_decision, render_resume_boundary,
+    render_tool_run, render_turn_recap, render_worked_duration, tool_failure_status,
+    CompanionRender, EditRender, ExtensionResultRender, FileChangeRender, PatchRender,
+    PermissionAskView, PermissionDecisionView, ResumeBoundaryRender, ToolRunRender,
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
@@ -459,6 +459,23 @@ pub(super) fn render_projected_entries_with_expansion(
                     theme,
                     width,
                     item_limits.output_lines,
+                );
+            }
+            TranscriptItem::ExtensionResult {
+                reference,
+                ok,
+                output,
+            } => {
+                render_extension_result(
+                    &mut lines,
+                    ExtensionResultRender {
+                        reference,
+                        ok: *ok,
+                        output,
+                        limit: item_limits.output_lines,
+                    },
+                    theme,
+                    width,
                 );
             }
             TranscriptItem::SessionSummary(summary) => {

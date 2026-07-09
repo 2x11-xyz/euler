@@ -478,6 +478,42 @@ pub(super) fn render_interrupted(lines: &mut Vec<Line<'static>>, theme: &Theme, 
     );
 }
 
+pub(super) struct ExtensionResultRender<'a> {
+    pub(super) reference: &'a str,
+    pub(super) ok: bool,
+    pub(super) output: &'a str,
+    pub(super) limit: usize,
+}
+
+/// Extension command output as a flat foldable artifact row: colored verb
+/// header + pretty-printed payload as dim tail lines (§4 ledger vocabulary).
+pub(super) fn render_extension_result(
+    lines: &mut Vec<Line<'static>>,
+    render: ExtensionResultRender<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    let (glyph, title_style) = if render.ok {
+        ("✓", theme.transcript.tool)
+    } else {
+        ("✗", theme.transcript.tool_error)
+    };
+    let rows = artifact::artifact_output_rows(render.output, render.limit.max(1));
+    let body = artifact::plain_artifact_rows(&rows.rows, theme.transcript.muted);
+    artifact::push_artifact_cell(
+        lines,
+        artifact::ArtifactCellRender {
+            title: &format!("extension {} {glyph}", render.reference),
+            title_suffix: None,
+            rows: &body,
+            footer: "",
+            style: title_style,
+            width,
+        },
+        theme,
+    );
+}
+
 pub(super) fn render_worked_duration(
     lines: &mut Vec<Line<'static>>,
     duration: &str,

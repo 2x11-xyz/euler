@@ -2055,10 +2055,8 @@ impl AppCore {
     /// Advance the swarm after review-brief completes: queue one companion
     /// per brief; the pending-run queue drains them serially.
     fn code_swarm_on_brief_complete(&mut self, output: &serde_json::Value) {
-        let briefs: Vec<serde_json::Value> = output["briefs"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let briefs: Vec<serde_json::Value> =
+            output["briefs"].as_array().cloned().unwrap_or_default();
         if briefs.is_empty() {
             self.code_swarm_run = None;
             let _ = self.notice_item("code-swarm: review-brief returned no briefs".to_owned());
@@ -2073,8 +2071,8 @@ impl AppCore {
                     queued += 1;
                 }
                 Err(error) => {
-                    let _ = self
-                        .notice_item(format!("code-swarm: skipping malformed brief: {error}"));
+                    let _ =
+                        self.notice_item(format!("code-swarm: skipping malformed brief: {error}"));
                 }
             }
         }
@@ -2092,8 +2090,7 @@ impl AppCore {
     /// Advance the swarm after each reviewer companion completes; queue the
     /// consolidation report when the last one lands.
     fn code_swarm_on_companion_done(&mut self) {
-        let Some(CodeSwarmRun::Reviewing { remaining, total }) = self.code_swarm_run.clone()
-        else {
+        let Some(CodeSwarmRun::Reviewing { remaining, total }) = self.code_swarm_run.clone() else {
             return;
         };
         let remaining = remaining.saturating_sub(1);
@@ -2124,7 +2121,11 @@ impl AppCore {
         }
     }
 
-    fn code_swarm_on_report_complete(&mut self, outcome_ok: bool, output: Option<&serde_json::Value>) {
+    fn code_swarm_on_report_complete(
+        &mut self,
+        outcome_ok: bool,
+        output: Option<&serde_json::Value>,
+    ) {
         let Some(CodeSwarmRun::Reporting { total }) = self.code_swarm_run.clone() else {
             return;
         };
@@ -2184,8 +2185,25 @@ impl AppCore {
         input: serde_json::Value,
         raw_args: Option<String>,
     ) -> Result<ExtensionRunRequest> {
-        let descriptor =
-            bundled_descriptor_by_id(&id)?.ok_or_else(|| anyhow!("unknown extension id: {id}"))?;
+        let descriptor = bundled_descriptor_by_id(&id)?.ok_or_else(|| {
+            // Linked/installed extensions are manageable but not yet runnable
+            // in-session: teach the CLI path instead of "unknown id"
+            // (calibration finding E3).
+            if self
+                .bottom
+                .context()
+                .extension_items
+                .iter()
+                .any(|item| item.id == id && !item.bundled)
+            {
+                anyhow!(
+                    "{id} is a linked extension — in-session runs are not supported yet; \
+                     use `euler extension run {id}.{command} <session>` from the CLI"
+                )
+            } else {
+                anyhow!("unknown extension id: {id}")
+            }
+        })?;
         let command_descriptor = descriptor
             .command(&command)
             .ok_or_else(|| anyhow!("unknown command for extension {id}: {command}"))?;
@@ -3056,12 +3074,15 @@ impl AppCore {
         }
         match outcome {
             ExtensionOutcome::Complete(output) => {
+                // Foldable artifact row with pretty JSON, not a one-line dump
+                // (calibration finding E4).
                 let rendered =
-                    serde_json::to_string(&output).unwrap_or_else(|_| "null".to_owned());
-                self.push_finalized_visual_item(TranscriptItem::SessionSummary(format!(
-                    "extension {}.{} result: {rendered}",
-                    request.id, request.command
-                )));
+                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "null".to_owned());
+                self.push_finalized_visual_item(TranscriptItem::ExtensionResult {
+                    reference: format!("{}.{}", request.id, request.command),
+                    ok: true,
+                    output: rendered,
+                });
                 self.notice = Some(format!(
                     "extension {}.{} complete",
                     request.id, request.command
