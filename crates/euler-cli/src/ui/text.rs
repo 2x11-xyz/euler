@@ -3,9 +3,6 @@ use unicode_width::UnicodeWidthChar;
 
 /// Fixed Warm Ledger timestamp column: `HH:MM:SS` + trailing space (9 cells).
 pub(crate) const TIMESTAMP_GUTTER_WIDTH: usize = 9;
-/// Alias so existing `debug_assert_eq!(display_width(gutter), GUTTER_WIDTH)` sites stay valid
-/// when the timestamp gutter is shown (the default).
-pub(crate) const GUTTER_WIDTH: usize = TIMESTAMP_GUTTER_WIDTH;
 
 const BLANK_GUTTER: &str = "         "; // 9 spaces
                                         // 7 spaces + glyph + space = 9 (box-drawing glyphs are width 1)

@@ -213,22 +213,7 @@ fn identity_segment(snapshot: &StatusSnapshot, tokens: &TokenUsageSnapshot) -> S
         .unwrap_or("e????");
     let model = compact_model_label(&snapshot.provider, &snapshot.model);
     let model = if model.is_empty() { "?" } else { model };
-    let ctx = match tokens.context_window_tokens.filter(|window| *window > 0) {
-        Some(window) => format!(
-            "ctx {}%",
-            rounded_context_percent(tokens.input_tokens, window).min(99)
-        ),
-        None => match (tokens.canvas_retained_bytes, tokens.canvas_budget_bytes) {
-            (Some(retained), Some(budget)) if budget > 0 => {
-                format!(
-                    "canvas {}KB/{}KB",
-                    retained.div_ceil(1024),
-                    budget.div_ceil(1024)
-                )
-            }
-            _ => "ctx ?%".to_owned(),
-        },
-    };
+    let ctx = identity_context_label(tokens);
     let branch = snapshot
         .git_branch
         .as_deref()
@@ -239,6 +224,66 @@ fn identity_segment(snapshot: &StatusSnapshot, tokens: &TokenUsageSnapshot) -> S
         right.push_str(&format!(" · {} demoted", tokens.demoted_items));
     }
     right
+}
+
+fn identity_context_label(tokens: &TokenUsageSnapshot) -> String {
+    match identity_context_percent(tokens) {
+        Some(percent) => format!("ctx {percent}%"),
+        None => match (tokens.canvas_retained_bytes, tokens.canvas_budget_bytes) {
+            (Some(retained), Some(budget)) if budget > 0 => {
+                format!(
+                    "canvas {}KB/{}KB",
+                    retained.div_ceil(1024),
+                    budget.div_ceil(1024)
+                )
+            }
+            _ => "ctx ?%".to_owned(),
+        },
+    }
+}
+
+fn identity_context_percent(tokens: &TokenUsageSnapshot) -> Option<u64> {
+    tokens
+        .context_window_tokens
+        .filter(|window| *window > 0)
+        .map(|window| rounded_context_percent(tokens.input_tokens, window).min(99))
+}
+
+fn identity_context_style(tokens: &TokenUsageSnapshot, theme: &Theme) -> Style {
+    match identity_context_percent(tokens) {
+        Some(percent) if percent >= 85 => Style::default().fg(theme.palette.error),
+        Some(percent) if percent >= 70 => theme.status.cost,
+        _ => theme.status.model,
+    }
+}
+
+fn identity_segment_spans(
+    snapshot: &StatusSnapshot,
+    tokens: &TokenUsageSnapshot,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let session = snapshot
+        .session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or("e????");
+    let model = compact_model_label(&snapshot.provider, &snapshot.model);
+    let model = if model.is_empty() { "?" } else { model };
+    let ctx = identity_context_label(tokens);
+    let branch = snapshot
+        .git_branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or("?");
+    let mut suffix = format!(" · {branch}");
+    if tokens.demoted_items > 0 {
+        suffix.push_str(&format!(" · {} demoted", tokens.demoted_items));
+    }
+    vec![
+        Span::styled(format!("{session} · {model} · "), theme.status.model),
+        Span::styled(ctx, identity_context_style(tokens, theme)),
+        Span::styled(suffix, theme.status.model),
+    ]
 }
 
 fn cwd_segment(snapshot: &StatusSnapshot) -> String {
@@ -288,10 +333,7 @@ fn status_line_spans(
         status_left_segment(snapshot, &turn),
         theme.status.state,
     )];
-    let right = vec![Span::styled(
-        identity_segment(snapshot, tokens),
-        theme.status.model,
-    )];
+    let right = identity_segment_spans(snapshot, tokens, theme);
     let indent = Span::styled(status_indent(width), theme.status.base);
     let body_width = status_body_width(width, display_width(indent.content.as_ref()));
     let mut spans = vec![indent];
@@ -479,8 +521,13 @@ mod tests {
 
         assert!(spans
             .iter()
-            .any(|span| span.content.contains("e???? · echo · ctx ?% · ?")
-                && span.style == theme.status.model));
+            .any(|span| span.content == "e???? · echo · " && span.style == theme.status.model));
+        assert!(spans
+            .iter()
+            .any(|span| span.content == "ctx ?%" && span.style == theme.status.model));
+        assert!(spans
+            .iter()
+            .any(|span| span.content == " · ?" && span.style == theme.status.model));
         assert!(spans
             .iter()
             .any(|span| span.content.contains("/repo") && span.style == theme.status.state));
@@ -491,6 +538,38 @@ mod tests {
         assert_eq!(theme.status.model.fg, Some(theme.palette.st_model));
         assert_eq!(theme.status.cost.fg, Some(theme.palette.st_cost));
         assert_eq!(theme.status.ctx.fg, Some(theme.palette.st_ctx));
+    }
+
+    #[test]
+    fn statusline_ctx_percent_uses_attention_and_failure_thresholds() {
+        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
+        let theme = Theme::default();
+
+        assert_eq!(ctx_span_style(&snapshot, &theme, 69), theme.status.model);
+        assert_eq!(ctx_span_style(&snapshot, &theme, 70), theme.status.cost);
+        assert_eq!(
+            ctx_span_style(&snapshot, &theme, 85),
+            Style::default().fg(theme.palette.error)
+        );
+    }
+
+    fn ctx_span_style(snapshot: &StatusSnapshot, theme: &Theme, percent: u64) -> Style {
+        let tokens = TokenUsageSnapshot {
+            input_tokens: percent,
+            output_tokens: 0,
+            reasoning_tokens: None,
+            context_window_tokens: Some(100),
+            demoted_items: 0,
+            canvas_retained_bytes: None,
+            canvas_budget_bytes: None,
+            compaction_tier: None,
+        };
+        let label = format!("ctx {percent}%");
+        status_line_spans(snapshot, &tokens, TurnStatus::Idle, theme, 120)
+            .into_iter()
+            .find(|span| span.content == label)
+            .unwrap_or_else(|| panic!("missing ctx span {label}"))
+            .style
     }
 
     #[test]

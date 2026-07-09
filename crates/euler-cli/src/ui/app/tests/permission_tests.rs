@@ -27,13 +27,16 @@ fn permission_prompt_renders_inline_with_command_body() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Run command?"));
     assert!(contents.contains("Approval required"));
     assert!(contents.contains("shell-exec · cwd"));
     assert!(contents.contains("$ cargo test"));
     assert!(contents.contains("y  Allow once"));
+    assert!(contents.contains("Allow once (default selection)"));
     assert!(contents.contains("a  Allow shell-exec for this session"));
     assert!(contents.contains("p  Allow shell-exec in this project"));
     assert!(contents.contains("n/esc  Deny"));
+    assert!(contents.contains("Deny with instructions"));
     assert!(contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
     assert!(contents.contains("▌"));
@@ -83,6 +86,7 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Run command?"));
     assert!(contents.contains("Approval required"));
     assert!(contents.contains("$ cargo test"));
 
@@ -94,6 +98,7 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Edit file?"));
     assert!(contents.contains("fs-write · cwd"));
     assert!(!contents.contains("$ cargo test"));
     assert!(contents.contains("Approval required"));
@@ -109,6 +114,7 @@ fn non_patch_permission_uses_generic_inline_ask() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Run command?"));
     assert!(contents.contains("Approval required"));
     assert!(contents.contains("a  Allow shell-exec for this session"));
     assert!(contents.contains("p  Allow shell-exec in this project"));
@@ -242,6 +248,7 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Run command?"));
     assert!(contents.contains("Approval required"));
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
@@ -281,6 +288,52 @@ fn empty_deny_sets_denied_composer_ghost() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("denied — tell euler what to do instead"));
+}
+
+#[test]
+fn permission_hotkeys_wait_until_instruction_draft_is_empty() {
+    let instruction = "wait — use cargo clean instead";
+    let mut core_with_instruction = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core_with_instruction.reply_tx = reply_tx;
+    core_with_instruction.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
+
+    for ch in instruction.chars() {
+        assert_eq!(
+            core_with_instruction.handle_input(key(KeyCode::Char(ch))),
+            CoreEffect::Render
+        );
+    }
+    assert!(matches!(
+        reply_rx.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    assert_eq!(
+        core_with_instruction.handle_input(key(KeyCode::Esc)),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::DenyWithInstruction(instruction.into())
+    );
+
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('y'))),
+        CoreEffect::Render
+    );
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::AllowOnce);
 }
 
 #[test]

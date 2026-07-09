@@ -29,9 +29,7 @@ impl Default for TranscriptRenderLimits {
     fn default() -> Self {
         Self {
             output_lines: TOOL_CALL_MAX_LINES,
-            patch_detail_lines: super::super::patch_diff::DIFF_PREVIEW_ROWS
-                .max(super::super::patch_diff::NEW_FILE_PREVIEW_ROWS)
-                + 1,
+            patch_detail_lines: super::super::patch_diff::DIFF_PREVIEW_ROWS + 1,
         }
     }
 }
@@ -243,14 +241,11 @@ pub(super) fn render_projected_entries_with_expansion(
                 );
             }
             TranscriptItem::Exploration { summaries } => {
-                push_cell_parent(&mut lines, "explore", theme.transcript.tool, theme, width);
-                push_child_rows(
-                    &mut lines,
-                    &super::coalesced_exploration_summaries(summaries),
-                    theme.transcript.muted,
-                    theme,
-                    width,
-                );
+                let rows =
+                    exploration_detail_rows(&super::coalesced_exploration_summaries(summaries));
+                let header = tool_group_header("explore", rows.len(), entry.timing.as_ref());
+                push_cell_parent(&mut lines, &header, theme.transcript.tool, theme, width);
+                push_child_rows(&mut lines, &rows, theme.transcript.muted, theme, width);
             }
             TranscriptItem::PermissionPrompt { capability, reason } => {
                 let text = if reason.is_empty() {
@@ -518,7 +513,9 @@ pub(super) fn render_projected_entries_with_expansion(
             let stamp = timestamp_gutter(entry.timing.as_ref().map(|tm| tm.absolute.as_str()));
             stamp_first_line(&mut lines[first_line], &stamp, theme);
             if let Some(timing) = &entry.timing {
-                append_timing(&mut lines[first_line], timing, theme, width);
+                if !item_renders_inline_timing(item) {
+                    append_timing(&mut lines[first_line], timing, theme, width);
+                }
             }
             push_hairline(&mut lines, theme, content_cols);
         } else if let Some(timing) = &entry.timing {
@@ -553,6 +550,64 @@ fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
             | TranscriptItem::TurnRecap { .. }
             | TranscriptItem::PermissionAsk { .. }
     )
+}
+
+fn item_renders_inline_timing(item: &TranscriptItem) -> bool {
+    matches!(item, TranscriptItem::Exploration { .. })
+}
+
+fn tool_group_header(label: &str, steps: usize, timing: Option<&EventTiming>) -> String {
+    let mut parts = vec![label.to_owned(), step_count_label(steps)];
+    if let Some(elapsed) = timing.and_then(|timing| timing.since_previous.as_deref()) {
+        parts.push(elapsed.to_owned());
+    }
+    parts.join(" · ")
+}
+
+fn step_count_label(steps: usize) -> String {
+    if steps == 1 {
+        "1 step".to_owned()
+    } else {
+        format!("{steps} steps")
+    }
+}
+
+fn exploration_detail_rows(rows: &[String]) -> Vec<String> {
+    let parsed = rows
+        .iter()
+        .map(|row| split_exploration_row(row))
+        .collect::<Vec<_>>();
+    let verb_width = parsed
+        .iter()
+        .map(|(verb, _)| verb.chars().count())
+        .max()
+        .unwrap_or(0);
+    parsed
+        .into_iter()
+        .map(|(verb, detail)| aligned_exploration_row(&verb, &detail, verb_width))
+        .collect()
+}
+
+fn split_exploration_row(row: &str) -> (String, String) {
+    for (prefix, verb) in [
+        ("Read ", "Read"),
+        ("Git ", "Git"),
+        ("List ", "List"),
+        ("Search ", "Search"),
+    ] {
+        if let Some(detail) = row.strip_prefix(prefix) {
+            return (verb.to_owned(), detail.to_owned());
+        }
+    }
+    ("Tool".to_owned(), row.to_owned())
+}
+
+fn aligned_exploration_row(verb: &str, detail: &str, verb_width: usize) -> String {
+    if detail.is_empty() {
+        verb.to_owned()
+    } else {
+        format!("{verb:<width$} {detail}", width = verb_width)
+    }
 }
 
 fn stamp_first_line(line: &mut Line<'static>, stamp: &str, theme: &Theme) {
@@ -793,5 +848,86 @@ fn push_wrapped_segment(
             Span::styled(gutter.to_owned(), theme.transcript.gutter),
             Span::styled(segment, style),
         ]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exploration_group_header_carries_steps_elapsed_and_tree_children() {
+        let entries = vec![ProjectedEntry {
+            item: TranscriptItem::Exploration {
+                summaries: vec!["Read Cargo.toml".to_owned(), "Git diff".to_owned()],
+            },
+            timing: Some(EventTiming {
+                absolute: "12:00:06".to_owned(),
+                since_previous: Some("6s".to_owned()),
+                since_start: Some("6s".to_owned()),
+            }),
+        }];
+
+        let lines = render_projected_entries(
+            &entries,
+            &Theme::default(),
+            80,
+            TranscriptRenderLimits::default(),
+        );
+        let text = plain_text(&lines);
+
+        assert!(text.contains("explore · 2 steps · 6s"), "text: {text:?}");
+        assert!(text.contains("├ Read Cargo.toml"), "text: {text:?}");
+        assert!(text.contains("└ Git  diff"), "text: {text:?}");
+        assert!(!text.contains("└ Read Cargo.toml"), "text: {text:?}");
+        assert!(!text.contains("├ Git  diff"), "text: {text:?}");
+    }
+
+    #[test]
+    fn successful_shell_output_promotes_informative_result_line() {
+        let item = TranscriptItem::ToolRun {
+            command: "cargo test".to_owned(),
+            ok: true,
+            error: String::new(),
+            output: concat!(
+                "line 1\n",
+                "line 2\n",
+                "line 3\n",
+                "line 4\n",
+                "test result: ok. 12 passed; 0 failed\n",
+                "tail 1\n",
+                "tail 2\n",
+            )
+            .to_owned(),
+            exit_code: Some(0),
+        };
+
+        let lines = render_projected_items(
+            &[item],
+            &Theme::default(),
+            96,
+            TranscriptRenderLimits::default().with_output_lines(4),
+        );
+        let text = plain_text(&lines);
+
+        assert!(
+            text.contains("test result: ok. 12 passed; 0 failed"),
+            "text: {text:?}"
+        );
+        assert!(text.contains("tail 2"), "text: {text:?}");
+        assert!(!text.contains("line 1"), "text: {text:?}");
+    }
+
+    fn plain_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

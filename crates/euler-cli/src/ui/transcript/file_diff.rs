@@ -91,7 +91,7 @@ pub(super) fn file_diff_is_foldable(diff: &str, limit: usize) -> bool {
 }
 
 fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str, limit: usize) -> FileDiffRows {
-    let parsed = parse_unified_diff(diff);
+    let parsed = parse_unified_diff_for_path(diff, Some(path));
     let total_rows = parsed.rows.len();
     if total_rows == 0 {
         return FileDiffRows {
@@ -211,6 +211,10 @@ enum FileDiffLineKind {
 }
 
 fn parse_unified_diff(diff: &str) -> ParsedFileDiff {
+    parse_unified_diff_for_path(diff, None)
+}
+
+fn parse_unified_diff_for_path(diff: &str, path: Option<&str>) -> ParsedFileDiff {
     let rows = normalized_output_rows(diff);
     let mut parsed = ParsedFileDiff {
         rows: Vec::new(),
@@ -225,18 +229,18 @@ fn parse_unified_diff(diff: &str) -> ParsedFileDiff {
         if is_unified_file_header(&row) {
             continue;
         }
-        if let Some((old_start, new_start, header)) = parse_hunk_header(&row) {
+        if let Some(header) = parse_hunk_header(&row) {
             if saw_hunk && !parsed.rows.is_empty() {
                 parsed.rows.push(muted_diff_row("⋮".to_owned()));
             }
             saw_hunk = true;
-            old_line = old_start.max(1);
-            new_line = new_start.max(1);
+            old_line = header.old_start.max(1);
+            new_line = header.new_start.max(1);
             parsed.rows.push(FileDiffRow {
                 kind: FileDiffLineKind::Hunk,
                 old_line: None,
                 new_line: None,
-                body: header,
+                body: header.raw,
             });
             continue;
         }
@@ -248,8 +252,87 @@ fn parse_unified_diff(diff: &str) -> ParsedFileDiff {
         }
         parsed.push_source_row(row, &mut old_line, &mut new_line, saw_hunk);
     }
+    if let Some(path) = path {
+        resolve_hunk_headers(&mut parsed.rows, path);
+    }
     parsed.compact_context();
     parsed
+}
+
+struct ParsedHunkHeader {
+    old_start: usize,
+    new_start: usize,
+    function_context: Option<String>,
+    raw: String,
+}
+
+fn resolve_hunk_headers(rows: &mut [FileDiffRow], path: &str) {
+    let replacements = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| matches!(row.kind, FileDiffLineKind::Hunk))
+        .filter_map(|(index, row)| resolved_hunk_header(rows, index, path, &row.body))
+        .collect::<Vec<_>>();
+    for (index, header) in replacements {
+        rows[index].body = header;
+    }
+}
+
+fn resolved_hunk_header(
+    rows: &[FileDiffRow],
+    hunk_index: usize,
+    path: &str,
+    raw_header: &str,
+) -> Option<(usize, String)> {
+    let header = parse_hunk_header(raw_header)?;
+    let next_hunk = rows
+        .iter()
+        .enumerate()
+        .skip(hunk_index + 1)
+        .find(|(_, row)| matches!(row.kind, FileDiffLineKind::Hunk))
+        .map_or(rows.len(), |(index, _)| index);
+    let sources = hunk_sources(&rows[hunk_index + 1..next_hunk]);
+    let symbol = crate::ui::patch_diff::hunk_symbol(
+        path,
+        &sources.old,
+        &sources.new,
+        sources.old_lookup_line,
+        sources.new_lookup_line,
+        header.function_context.as_deref(),
+    )?;
+    Some((
+        hunk_index,
+        format!("@@ {symbol} · line {} @@", header.new_start),
+    ))
+}
+
+struct HunkSources {
+    old: String,
+    new: String,
+    old_lookup_line: usize,
+    new_lookup_line: usize,
+}
+
+fn hunk_sources(rows: &[FileDiffRow]) -> HunkSources {
+    let mut old_rows = Vec::new();
+    let mut new_rows = Vec::new();
+    for row in rows {
+        match row.kind {
+            FileDiffLineKind::Context => {
+                old_rows.push(row.body.as_str());
+                new_rows.push(row.body.as_str());
+            }
+            FileDiffLineKind::Delete => old_rows.push(row.body.as_str()),
+            FileDiffLineKind::Insert => new_rows.push(row.body.as_str()),
+            FileDiffLineKind::Hunk | FileDiffLineKind::Muted => {}
+        }
+    }
+    HunkSources {
+        old: old_rows.join("\n"),
+        new: new_rows.join("\n"),
+        old_lookup_line: old_rows.len().max(1),
+        new_lookup_line: new_rows.len().max(1),
+    }
 }
 
 fn muted_diff_row(body: String) -> FileDiffRow {
@@ -367,16 +450,23 @@ fn is_unified_file_header(row: &str) -> bool {
     row.starts_with("--- ") || row.starts_with("+++ ")
 }
 
-fn parse_hunk_header(row: &str) -> Option<(usize, usize, String)> {
+fn parse_hunk_header(row: &str) -> Option<ParsedHunkHeader> {
     let row = row.strip_prefix("@@ ")?;
     let mut parts = row.split_whitespace();
     let old_range = parts.next()?.strip_prefix('-')?;
     let new_range = parts.next()?.strip_prefix('+')?;
-    Some((
-        parse_range_start(old_range)?,
-        parse_range_start(new_range)?,
-        format!("@@ {row}"),
-    ))
+    Some(ParsedHunkHeader {
+        old_start: parse_range_start(old_range)?,
+        new_start: parse_range_start(new_range)?,
+        function_context: hunk_function_context(row),
+        raw: format!("@@ {row}"),
+    })
+}
+
+fn hunk_function_context(row: &str) -> Option<String> {
+    let marker = row.find("@@")?;
+    let context = row[marker + 2..].trim();
+    (!context.is_empty()).then(|| context.to_owned())
 }
 
 fn parse_range_start(range: &str) -> Option<usize> {
@@ -710,6 +800,42 @@ mod tests {
                 .all(|text| crate::ui::text::display_width(text) <= 28),
             "texts: {texts:?}"
         );
+    }
+
+    #[test]
+    fn file_diff_hunk_header_uses_symbol_from_hunk_body() {
+        let theme = Theme::default();
+        let mut lines = Vec::new();
+        render_file_diff_cell(
+            &mut lines,
+            FileDiffRender {
+                path: "src/lib.rs",
+                action: "modify",
+                origin: "apply_patch",
+                diff: Some(concat!(
+                    "--- a/src/lib.rs\n",
+                    "+++ b/src/lib.rs\n",
+                    "@@ -10,2 +10,3 @@\n",
+                    " fn calibrate() {\n",
+                    "+    assert!(true);\n",
+                    " }\n",
+                )),
+                truncated: false,
+                truncation: "none",
+                omitted_reason: None,
+                checkpoint_event_id: None,
+            },
+            &theme,
+            96,
+            10,
+        );
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            text.contains("@@ calibrate() · line 10 @@"),
+            "text: {text:?}"
+        );
+        assert!(!text.contains("@@ -10,2 +10,3 @@"), "text: {text:?}");
     }
 
     fn line_text(line: &Line<'_>) -> String {

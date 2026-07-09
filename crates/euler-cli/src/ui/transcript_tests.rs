@@ -1438,7 +1438,7 @@ fn tool_artifact_cell_sanitizes_controls_tabs_and_bounds_width() {
         let joined = texts.join("\n");
         // Fixed 9-cell ledger gutter floors the minimum row width; when the
         // terminal is narrower than that floor, rows stay at the floor.
-        let budget = usize::from(width).max(crate::ui::text::GUTTER_WIDTH + 4);
+        let budget = usize::from(width).max(crate::ui::text::TIMESTAMP_GUTTER_WIDTH + 4);
 
         assert!(!joined.contains('\u{1b}'), "width {width}: {joined:?}");
         assert!(!joined.contains('\u{8}'), "width {width}: {joined:?}");
@@ -1509,11 +1509,11 @@ fn tool_artifact_cell_keeps_minimum_width_at_tiny_widths() {
         assert_eq!(texts.len(), 3, "width {width}: {texts:?}");
         for text in &texts {
             assert!(
-                display_width(text) >= crate::ui::text::GUTTER_WIDTH,
+                display_width(text) >= crate::ui::text::TIMESTAMP_GUTTER_WIDTH,
                 "tiny-width artifact rows keep the ledger gutter floor: {text:?} in {texts:?}"
             );
             assert!(
-                display_width(text) <= crate::ui::text::GUTTER_WIDTH + 4,
+                display_width(text) <= crate::ui::text::TIMESTAMP_GUTTER_WIDTH + 4,
                 "tiny-width artifact rows stay near the minimum flat width: {text:?} in {texts:?}"
             );
         }
@@ -1553,7 +1553,7 @@ fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
 
     for width in [12, 24, 64, 96] {
         let texts = line_texts(&render_items_for_history(&item, &theme, width));
-        let budget = usize::from(width).max(crate::ui::text::GUTTER_WIDTH + 4);
+        let budget = usize::from(width).max(crate::ui::text::TIMESTAMP_GUTTER_WIDTH + 4);
         assert!(
             texts
                 .first()
@@ -2485,7 +2485,7 @@ fn final_assistant_prose_gutter_preserves_width_budget() {
 
     for width in 12..=32 {
         let texts = line_texts(&render_items_for_history(&items, &theme, width));
-        let budget = usize::from(width).max(crate::ui::text::GUTTER_WIDTH + 1);
+        let budget = usize::from(width).max(crate::ui::text::TIMESTAMP_GUTTER_WIDTH + 1);
         for text in texts.iter().filter(|line| !line.trim().is_empty()) {
             assert!(
                 display_width(text) <= budget,

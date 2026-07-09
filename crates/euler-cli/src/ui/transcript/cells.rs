@@ -1,6 +1,7 @@
 use crate::ui::patch_diff::{self, PatchDisplay};
 use crate::ui::text::{
-    blank_gutter, content_width, display_width, is_ledger_gutter, tree_gutter_last, wrap_text,
+    blank_gutter, content_width, display_width, is_ledger_gutter, tree_gutter_last,
+    tree_gutter_mid, wrap_text,
 };
 use crate::ui::theme::Theme;
 use ratatui::text::{Line, Span};
@@ -76,9 +77,9 @@ pub(super) fn render_tool_run(
         theme.transcript.tool_error
     };
     let output = if run.ok {
-        artifact_output_rows(run.output, limit)
+        tool_run_output_rows(run.output, limit)
     } else {
-        failure_output_rows(run.output, limit)
+        informative_output_rows(run.output, limit)
     };
     let rows = plain_artifact_rows(&output.rows, theme.transcript.muted);
     let footer = tool_run_footer(run, output.total_rows, output.folded);
@@ -287,6 +288,58 @@ pub(super) struct PermissionAskView<'a> {
     pub(super) companion_name: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PermissionPanelRowStyle {
+    Title,
+    Metadata,
+    Body,
+    Selected,
+    Hint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PermissionPanelRow {
+    text: String,
+    style: PermissionPanelRowStyle,
+}
+
+impl PermissionPanelRow {
+    fn title(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PermissionPanelRowStyle::Title,
+        }
+    }
+
+    fn metadata(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PermissionPanelRowStyle::Metadata,
+        }
+    }
+
+    fn body(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PermissionPanelRowStyle::Body,
+        }
+    }
+
+    fn selected(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PermissionPanelRowStyle::Selected,
+        }
+    }
+
+    fn hint(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PermissionPanelRowStyle::Hint,
+        }
+    }
+}
+
 pub(super) fn render_permission_ask(
     lines: &mut Vec<Line<'static>>,
     ask: PermissionAskView<'_>,
@@ -300,28 +353,41 @@ pub(super) fn render_permission_ask(
         .unwrap_or_else(|| format!("request: {}", ask.reason));
     let title = match ask.companion_name.filter(|name| !name.is_empty()) {
         Some(name) => format!(
-            "Approval required · {} {name}",
+            "{} · {} {name}",
+            crate::ui::patch_approval::approval_title(ask.capability),
             crate::ui::glyphs::companion_glyph()
         ),
-        None => "Approval required".to_owned(),
+        None => crate::ui::patch_approval::approval_title(ask.capability).to_owned(),
     };
     let mut rows = vec![
-        title,
-        format!("{} · cwd {}", ask.capability, current_cwd_label()),
-        preview,
-        consequences_row(ask.capability),
+        PermissionPanelRow::title(title),
+        PermissionPanelRow::metadata(format!(
+            "Approval required · {} · cwd {}",
+            ask.capability,
+            current_cwd_label()
+        )),
+        PermissionPanelRow::body(preview),
+        PermissionPanelRow::metadata(consequences_row(ask.capability)),
     ];
     rows.extend(
-        crate::ui::patch_approval::approval_options_text(ask.capability, ask.scope_prefix)
-            .lines()
-            .map(str::to_owned),
+        crate::ui::patch_approval::approval_option_lines(ask.capability, ask.scope_prefix)
+            .into_iter()
+            .map(|line| {
+                if line.selected {
+                    PermissionPanelRow::selected(line.text)
+                } else if line.hint {
+                    PermissionPanelRow::hint(line.text)
+                } else {
+                    PermissionPanelRow::body(line.text)
+                }
+            }),
     );
     push_bordered_permission_panel(lines, &rows, theme, width);
 }
 
 fn push_bordered_permission_panel(
     lines: &mut Vec<Line<'static>>,
-    rows: &[String],
+    rows: &[PermissionPanelRow],
     theme: &Theme,
     width: u16,
 ) {
@@ -332,8 +398,8 @@ fn push_bordered_permission_panel(
         theme.transcript.permission,
     )));
     for row in rows {
-        for segment in wrap_text(row, inner_width) {
-            push_permission_panel_row(lines, &segment, inner_width, theme);
+        for segment in wrap_text(&row.text, inner_width) {
+            push_permission_panel_row(lines, &segment, inner_width, row.style, theme);
         }
     }
     lines.push(Line::from(Span::styled(
@@ -346,15 +412,29 @@ fn push_permission_panel_row(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     inner_width: usize,
+    style: PermissionPanelRowStyle,
     theme: &Theme,
 ) {
     let padding = inner_width.saturating_sub(display_width(text));
+    let content_style = permission_panel_row_style(style, theme);
     lines.push(Line::from(vec![
         Span::styled("│ ", theme.transcript.permission),
-        Span::styled(text.to_owned(), theme.transcript.permission),
-        Span::raw(" ".repeat(padding)),
+        Span::styled(text.to_owned(), content_style),
+        Span::styled(" ".repeat(padding), content_style),
         Span::styled(" │", theme.transcript.permission),
     ]));
+}
+
+fn permission_panel_row_style(
+    style: PermissionPanelRowStyle,
+    theme: &Theme,
+) -> ratatui::style::Style {
+    match style {
+        PermissionPanelRowStyle::Title => theme.transcript.permission,
+        PermissionPanelRowStyle::Metadata | PermissionPanelRowStyle::Hint => theme.transcript.muted,
+        PermissionPanelRowStyle::Body => theme.transcript.body,
+        PermissionPanelRowStyle::Selected => theme.surfaces.transcript.selection,
+    }
 }
 
 fn current_cwd_label() -> String {
@@ -757,17 +837,18 @@ pub(super) fn edit_failure_status(path: &str, error: &str) -> String {
     }
 }
 
-/// First output line worth surfacing on failure (error markers), if any.
+/// First output line worth surfacing from a completed command, if any.
 pub(super) fn most_informative_line(output: &str) -> Option<&str> {
     output_rows_without_trailing_blanks(output)
         .into_iter()
-        .find(|line| is_informative_failure_line(line))
+        .find(|line| is_informative_line(line))
 }
 
-fn is_informative_failure_line(line: &str) -> bool {
+fn is_informative_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("error[")
         || lower.contains("error:")
+        || lower.contains("test result:")
         || lower.contains("failed")
         || lower.contains("panicked")
         || lower.contains("fatal")
@@ -857,7 +938,15 @@ fn tool_run_footer(run: ToolRunRender<'_>, total_rows: usize, folded: bool) -> S
     }
 }
 
-fn failure_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
+fn tool_run_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
+    if most_informative_line(detail).is_some() {
+        informative_output_rows(detail, limit)
+    } else {
+        artifact_output_rows(detail, limit)
+    }
+}
+
+fn informative_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
     let rows = normalized_output_rows(detail);
     let total_rows = rows.len();
     if total_rows == 0 {
@@ -875,10 +964,7 @@ fn failure_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
         };
     }
 
-    let informative = rows
-        .iter()
-        .find(|row| is_informative_failure_line(row))
-        .cloned();
+    let informative = rows.iter().find(|row| is_informative_line(row)).cloned();
     let tail_n = OUTPUT_PREVIEW_TAIL_LINES.min(total_rows);
     let mut tail = rows[total_rows.saturating_sub(tail_n)..].to_vec();
     let mut preview = Vec::new();
@@ -901,7 +987,7 @@ fn failure_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
 }
 
 fn promote_informative_row(mut rows: Vec<String>) -> Vec<String> {
-    let Some(index) = rows.iter().position(|row| is_informative_failure_line(row)) else {
+    let Some(index) = rows.iter().position(|row| is_informative_line(row)) else {
         return rows;
     };
     if index == 0 {
@@ -957,10 +1043,10 @@ pub(super) fn push_child_rows(
     width: u16,
 ) {
     for (index, row) in rows.iter().enumerate() {
-        let prefix = if index == 0 {
+        let prefix = if index + 1 == rows.len() {
             tree_gutter_last()
         } else {
-            blank_gutter()
+            tree_gutter_mid()
         };
         push_wrapped_with_prefix(
             lines,
@@ -1018,10 +1104,10 @@ fn push_child_preview_rows(
     width: u16,
 ) {
     for (index, row) in rows.iter().enumerate() {
-        let prefix = if index == 0 {
+        let prefix = if index + 1 == rows.len() {
             tree_gutter_last()
         } else {
-            blank_gutter()
+            tree_gutter_mid()
         };
         push_wrapped_with_prefix(
             lines,

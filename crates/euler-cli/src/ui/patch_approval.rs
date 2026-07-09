@@ -6,13 +6,13 @@ use euler_core::permissions::PermissionRequest;
 use euler_core::{parse_single_file_apply_patch, ApplyPatchDocument};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::Capability;
-use ratatui::layout::Rect;
 #[cfg(test)]
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::{Line, Span};
+use ratatui::{layout::Rect, style::Style};
 use std::path::Path;
 
-const PANEL_TITLE: &str = "Approval required";
+const LEGACY_APPROVAL_LABEL: &str = "Approval required";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PatchApprovalModal {
@@ -28,6 +28,65 @@ pub(crate) enum PatchPreview {
         new: String,
     },
     Fallback(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ApprovalOptionLine {
+    pub(crate) text: String,
+    pub(crate) selected: bool,
+    pub(crate) hint: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PanelRowStyle {
+    Title,
+    Metadata,
+    Body,
+    Selected,
+    Hint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PanelRow {
+    text: String,
+    style: PanelRowStyle,
+}
+
+impl PanelRow {
+    fn title(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PanelRowStyle::Title,
+        }
+    }
+
+    fn metadata(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PanelRowStyle::Metadata,
+        }
+    }
+
+    fn body(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PanelRowStyle::Body,
+        }
+    }
+
+    fn selected(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PanelRowStyle::Selected,
+        }
+    }
+
+    fn hint(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: PanelRowStyle::Hint,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -88,12 +147,22 @@ pub(crate) fn header_text(request: &PermissionRequest) -> String {
     header_text_with_cwd(request, "unknown")
 }
 
+#[cfg(test)]
 pub(crate) fn header_text_with_cwd(request: &PermissionRequest, cwd: &str) -> String {
     format!(
-        "{PANEL_TITLE}\n{} · cwd {cwd}\n{}",
+        "{}\n{LEGACY_APPROVAL_LABEL} · {} · cwd {cwd}\n{}",
+        approval_title(request.capability.as_str()),
         request.capability.as_str(),
         request.reason
     )
+}
+
+pub(crate) fn approval_title(capability: &str) -> &'static str {
+    match capability {
+        "shell-exec" => "Run command?",
+        "fs-write" => "Edit file?",
+        _ => LEGACY_APPROVAL_LABEL,
+    }
 }
 
 pub(crate) fn panel_lines(
@@ -108,22 +177,36 @@ pub(crate) fn panel_lines(
     // Keep this short enough that y/a/p/n + hint remain visible in a normal
     // 24-row frame with composer + status.
     let diff_area = Rect::new(0, 0, body_width as u16, 5);
-    let mut content = header_text_with_cwd(&modal.request, &cwd.display().to_string())
-        .lines()
-        .flat_map(|line| wrap_text(line, body_width))
-        .collect::<Vec<_>>();
+    let mut content = vec![
+        PanelRow::title(approval_title(modal.request.capability.as_str())),
+        PanelRow::metadata(format!(
+            "{LEGACY_APPROVAL_LABEL} · {} · cwd {}",
+            modal.request.capability.as_str(),
+            cwd.display()
+        )),
+        PanelRow::body(modal.request.reason.clone()),
+    ];
     content.extend(
         rows(&modal.preview, theme, diff_area)
             .into_iter()
             .map(|line| {
-                line.spans
+                let text = line
+                    .spans
                     .into_iter()
                     .map(|span| span.content.into_owned())
-                    .collect::<String>()
+                    .collect::<String>();
+                PanelRow::body(text)
             }),
     );
-    content.push(consequences_row(&modal.preview));
-    content.extend(options_text(&modal.request).lines().map(str::to_owned));
+    content.push(PanelRow::metadata(consequences_row(&modal.preview)));
+    content.extend(
+        approval_option_lines(
+            modal.request.capability.as_str(),
+            derive_scope_prefix(&modal.request).as_deref(),
+        )
+        .into_iter()
+        .map(panel_row_for_option),
+    );
     bordered_panel(content, panel_width, theme)
 }
 
@@ -168,6 +251,7 @@ pub(crate) fn derive_edit_prefix(path: &Path) -> Option<String> {
     Some(first)
 }
 
+#[cfg(test)]
 pub(crate) fn options_text(request: &PermissionRequest) -> String {
     approval_options_text(
         request.capability.as_str(),
@@ -176,20 +260,67 @@ pub(crate) fn options_text(request: &PermissionRequest) -> String {
 }
 
 /// Honest option labels: never show a prefix the gate will not grant.
+#[cfg(test)]
 pub(crate) fn approval_options_text(capability: &str, scope_prefix: Option<&str>) -> String {
+    approval_option_lines(capability, scope_prefix)
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Honest option labels: never show a prefix the gate will not grant.
+pub(crate) fn approval_option_lines(
+    capability: &str,
+    scope_prefix: Option<&str>,
+) -> Vec<ApprovalOptionLine> {
     let (session_line, project_line) = match scope_prefix.filter(|p| !p.is_empty()) {
         Some(prefix) => (
-            format!("a  Allow {prefix} * for this session"),
-            format!("p  Allow {prefix} * in this project"),
+            format!("  a  Allow {prefix} * for this session"),
+            format!("  p  Allow {prefix} * in this project"),
         ),
         None => (
-            format!("a  Allow {capability} for this session"),
-            format!("p  Allow {capability} in this project"),
+            format!("  a  Allow {capability} for this session"),
+            format!("  p  Allow {capability} in this project"),
         ),
     };
-    format!(
-        "y  Allow once\n{session_line}\n{project_line}\nn/esc  Deny\nhint: every decision is logged"
-    )
+    vec![
+        ApprovalOptionLine {
+            text: "› y  Allow once (default selection)".to_owned(),
+            selected: true,
+            hint: false,
+        },
+        ApprovalOptionLine {
+            text: session_line,
+            selected: false,
+            hint: false,
+        },
+        ApprovalOptionLine {
+            text: project_line,
+            selected: false,
+            hint: false,
+        },
+        ApprovalOptionLine {
+            text: "  n/esc  Deny with instructions".to_owned(),
+            selected: false,
+            hint: false,
+        },
+        ApprovalOptionLine {
+            text: "hint: every decision is logged".to_owned(),
+            selected: false,
+            hint: true,
+        },
+    ]
+}
+
+fn panel_row_for_option(line: ApprovalOptionLine) -> PanelRow {
+    if line.selected {
+        PanelRow::selected(line.text)
+    } else if line.hint {
+        PanelRow::hint(line.text)
+    } else {
+        PanelRow::body(line.text)
+    }
 }
 
 pub(crate) fn rows(preview: &PatchPreview, theme: &Theme, area: Rect) -> Vec<Line<'static>> {
@@ -260,7 +391,7 @@ fn write_scope(preview: &PatchPreview) -> String {
     }
 }
 
-fn bordered_panel(content: Vec<String>, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+fn bordered_panel(content: Vec<PanelRow>, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let width = usize::from(width).max(4);
     let inner_width = width.saturating_sub(4).max(1);
     let mut lines = Vec::new();
@@ -269,8 +400,8 @@ fn bordered_panel(content: Vec<String>, width: u16, theme: &Theme) -> Vec<Line<'
         theme.transcript.permission,
     )));
     for row in content {
-        for segment in wrap_text(&row, inner_width) {
-            lines.push(bordered_body_line(&segment, inner_width, theme));
+        for segment in wrap_text(&row.text, inner_width) {
+            lines.push(bordered_body_line(&segment, inner_width, theme, row.style));
         }
     }
     lines.push(Line::from(Span::styled(
@@ -280,14 +411,29 @@ fn bordered_panel(content: Vec<String>, width: u16, theme: &Theme) -> Vec<Line<'
     lines
 }
 
-fn bordered_body_line(text: &str, inner_width: usize, theme: &Theme) -> Line<'static> {
+fn bordered_body_line(
+    text: &str,
+    inner_width: usize,
+    theme: &Theme,
+    style: PanelRowStyle,
+) -> Line<'static> {
     let padding = inner_width.saturating_sub(display_width(text));
+    let body_style = panel_row_style(style, theme);
     Line::from(vec![
         Span::styled("│ ", theme.transcript.permission),
-        Span::styled(text.to_owned(), theme.transcript.permission),
-        Span::raw(" ".repeat(padding)),
+        Span::styled(text.to_owned(), body_style),
+        Span::styled(" ".repeat(padding), body_style),
         Span::styled(" │", theme.transcript.permission),
     ])
+}
+
+fn panel_row_style(style: PanelRowStyle, theme: &Theme) -> Style {
+    match style {
+        PanelRowStyle::Title => theme.transcript.permission,
+        PanelRowStyle::Metadata | PanelRowStyle::Hint => theme.transcript.muted,
+        PanelRowStyle::Body => theme.transcript.body,
+        PanelRowStyle::Selected => theme.surfaces.transcript.selection,
+    }
 }
 
 #[cfg(test)]

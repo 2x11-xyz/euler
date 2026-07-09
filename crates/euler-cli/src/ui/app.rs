@@ -1361,19 +1361,24 @@ impl AppCore {
     }
 
     fn handle_approval_modal_key(&mut self, key: KeyEvent) -> CoreEffect {
+        // Hotkeys fire only when the composer draft is empty. Once the user
+        // starts typing a denial instruction, y/a/p/n insert text; only Esc
+        // (deny with the typed instruction) or a quit chord decide.
+        let draft_empty = self.bottom.composer().submit_text().is_empty();
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Char('y') | KeyCode::Char('Y') if draft_empty => {
                 self.reply_to_modal(PermissionReply::AllowOnce)
             }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
+            KeyCode::Char('a') | KeyCode::Char('A') if draft_empty => {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
             }
-            KeyCode::Char('p') | KeyCode::Char('P') => {
+            KeyCode::Char('p') | KeyCode::Char('P') if draft_empty => {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.reply_deny_from_modal(),
+            KeyCode::Char('n') | KeyCode::Char('N') if draft_empty => self.reply_deny_from_modal(),
+            KeyCode::Esc => self.reply_deny_from_modal(),
             _ if modal_quit_key(&key) => {
                 // Quit path: bare deny only — do not queue a follow-up turn.
                 self.reply_to_modal(PermissionReply::Deny);

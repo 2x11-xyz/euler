@@ -10,7 +10,9 @@ use ratatui::{
 const CONTEXT_EDGE_LINES: usize = 2;
 
 pub(crate) const MIN_LINE_NUMBER_WIDTH: usize = 4;
+/// Unified-diff rows shown before an edit folds; the artifact title is separate.
 pub(crate) const DIFF_PREVIEW_ROWS: usize = 6;
+/// Add/write cells are denser than modifications and fold after five diff rows.
 pub(crate) const NEW_FILE_PREVIEW_ROWS: usize = 5;
 
 /// Compact Codex-style diff row: `{number:>width} {sign} {source}`. One
@@ -130,6 +132,7 @@ pub(crate) fn render_patch(
         display.old.unwrap_or_default(),
         display.new.unwrap_or_default(),
     );
+    let row_limit = preview_limit(display.old, display.new, limit);
     let mut rows = bounded_rows(
         patch_rows(
             &patch,
@@ -137,7 +140,7 @@ pub(crate) fn render_patch(
             display.old.unwrap_or_default(),
             display.new.unwrap_or_default(),
         ),
-        limit,
+        row_limit,
     );
     if rows.is_empty() {
         rows.push(DiffRow::new("no line changes".to_owned(), RowKind::Muted));
@@ -170,6 +173,7 @@ pub(crate) fn patch_is_foldable(
     limit: usize,
 ) -> bool {
     let patch = diffy::create_patch(old.unwrap_or_default(), new.unwrap_or_default());
+    let row_limit = preview_limit(old, new, limit);
     patch_rows(
         &patch,
         path,
@@ -177,7 +181,15 @@ pub(crate) fn patch_is_foldable(
         new.unwrap_or_default(),
     )
     .len()
-        > limit
+        > row_limit
+}
+
+fn preview_limit(old: Option<&str>, new: Option<&str>, limit: usize) -> usize {
+    if limit == usize::MAX || action(old, new) != "add" {
+        limit
+    } else {
+        limit.min(NEW_FILE_PREVIEW_ROWS)
+    }
 }
 
 fn bounded_rows(rows: Vec<DiffRow>, limit: usize) -> Vec<DiffRow> {
@@ -230,15 +242,35 @@ fn hunk_header(
     new_range: HunkRange,
     function_context: Option<&str>,
 ) -> String {
-    if let Some(context) = function_context.filter(|context| !context.trim().is_empty()) {
-        return format!("@@ {} · line {} @@", context.trim(), new_range.start());
-    }
-    if let Some(symbol) = syntax::enclosing_symbol(path, new, new_range.start())
-        .or_else(|| syntax::enclosing_symbol(path, old, old_range.start()))
-    {
+    if let Some(symbol) = hunk_symbol(
+        path,
+        old,
+        new,
+        old_range.start(),
+        new_range.start(),
+        function_context,
+    ) {
         return format!("@@ {symbol} · line {} @@", new_range.start());
     }
     format!("@@ -{old_range} +{new_range} @@")
+}
+
+pub(crate) fn hunk_symbol(
+    path: &str,
+    old: &str,
+    new: &str,
+    old_line: usize,
+    new_line: usize,
+    function_context: Option<&str>,
+) -> Option<String> {
+    function_context
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            syntax::enclosing_symbol(path, new, new_line)
+                .or_else(|| syntax::enclosing_symbol(path, old, old_line))
+        })
 }
 
 fn hunk_rows(
@@ -795,6 +827,31 @@ mod tests {
         assert!(text.contains("@@"), "hunk header missing: {text:?}");
         assert!(text.contains("   1 - let value_0 = 0;"));
         assert!(!syntax::source_pair_within_budget(Some(&old), Some(&new)));
+    }
+
+    #[test]
+    fn new_file_patch_uses_five_row_preview_cap() {
+        let theme = Theme::default();
+        let new = (0..8)
+            .map(|index| format!("line {index}\n"))
+            .collect::<String>();
+
+        let rows = render_patch(
+            PatchDisplay {
+                label: "Patch applied",
+                path: "src/lib.rs",
+                old: Some(""),
+                new: Some(&new),
+            },
+            &theme,
+            96,
+            20,
+        );
+        let text = plain_text(&rows);
+
+        assert_eq!(rows.len(), 6);
+        assert!(text.contains("ctrl+o expand"), "text: {text:?}");
+        assert!(!text.contains("line 7"), "text: {text:?}");
     }
 
     fn find_plain_row<'a>(lines: &'a [UiLine<'_>], needle: &str) -> Option<&'a UiLine<'a>> {

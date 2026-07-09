@@ -2832,15 +2832,18 @@ fn patch_approval_modal_renders_diff_and_prompt() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Edit file?"));
     assert!(contents.contains("Approval required"));
     assert!(contents.contains("fs-write · cwd"));
     assert!(contents.contains("note.txt"));
     assert!(contents.contains("alpha"));
     assert!(contents.contains("beta"));
     assert!(contents.contains("y  Allow once"));
+    assert!(contents.contains("Allow once (default selection)"));
     assert!(contents.contains("a  Allow fs-write"));
     assert!(contents.contains("p  Allow fs-write"));
     assert!(contents.contains("n/esc  Deny"));
+    assert!(contents.contains("Deny with instructions"));
     assert!(contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
 }
@@ -2859,6 +2862,7 @@ fn patch_approval_modal_clears_full_rows_behind_modal() {
 
     let contents = terminal.backend().screen_contents();
     for (needle, expected) in [
+        ("Edit file?", "Edit file?"),
         ("Approval required", "Approval required"),
         ("fs-write · cwd", "fs-write · cwd"),
         (
