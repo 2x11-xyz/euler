@@ -31,20 +31,20 @@ pub enum ActivityItem {
 pub fn tool_flavor(name: &str) -> ToolFlavor {
     match name {
         "read_file" | "git_status" | "git_diff" => ToolFlavor {
-            flavor: "read",
-            label: "Explored",
+            flavor: "explore",
+            label: "explore",
         },
         "edit_file" => ToolFlavor {
             flavor: "edit",
-            label: "Edited",
+            label: "edit",
         },
         "run_shell" => ToolFlavor {
-            flavor: "command",
-            label: "Ran",
+            flavor: "bash",
+            label: "bash",
         },
         _ => ToolFlavor {
             flavor: "tool",
-            label: "Used tools",
+            label: "tool",
         },
     }
 }
@@ -139,14 +139,12 @@ fn render_activity_items(items: &[ActivityItem], theme: &Theme, width: u16) -> V
 
         match item {
             ActivityItem::Status(text) => {
-                push_wrapped(
-                    &mut lines,
-                    "    ",
-                    &format!("• {text}"),
-                    theme.activity.status,
-                    theme,
-                    width,
-                );
+                let (text, style) = if text.starts_with('✱') {
+                    (text.clone(), theme.transcript.reasoning)
+                } else {
+                    (format!("• {text}"), theme.activity.status)
+                };
+                push_wrapped(&mut lines, "    ", &text, style, theme, width);
             }
             ActivityItem::ToolGroup { label, details, .. } => {
                 push_tool_group(&mut lines, label, details, theme, width);
@@ -164,12 +162,12 @@ fn push_tool_group(
     theme: &Theme,
     width: u16,
 ) {
-    if label == "Ran" {
+    if label == "bash" {
         for detail in details {
             push_wrapped(
                 lines,
                 "    ",
-                &format!("• Ran {detail}"),
+                &format!("bash $ {detail}"),
                 theme.activity.header,
                 theme,
                 width,
@@ -178,16 +176,19 @@ fn push_tool_group(
         return;
     }
 
-    push_wrapped(
-        lines,
-        "    ",
-        &format!("• {label}"),
-        theme.activity.header,
-        theme,
-        width,
-    );
+    let steps = details.len();
+    let header = if steps == 0 {
+        label.to_owned()
+    } else {
+        format!("{label} · {steps} steps")
+    };
+    push_wrapped(lines, "    ", &header, theme.activity.header, theme, width);
     for (index, detail) in details.iter().enumerate() {
-        let gutter = if index == 0 { "  └ " } else { "    " };
+        let gutter = if index + 1 == details.len() {
+            "  └ "
+        } else {
+            "  ├ "
+        };
         push_wrapped(lines, gutter, detail, theme.activity.detail, theme, width);
     }
 }
@@ -224,7 +225,7 @@ fn live_status(events: &[EventEnvelope]) -> Option<String> {
     match event.kind.as_str() {
         EventKind::MODEL_CALL => Some("Contacting model".to_owned()),
         EventKind::MODEL_DELTA => match payload_string(event, "kind").as_deref() {
-            Some("reasoning") => Some("Thinking".to_owned()),
+            Some("reasoning") => Some("✱ thinking · 0s · esc interrupt".to_owned()),
             Some("text") => Some("Streaming response".to_owned()),
             _ => None,
         },
@@ -426,43 +427,43 @@ mod tests {
         assert_eq!(
             tool_flavor("read_file"),
             ToolFlavor {
-                flavor: "read",
-                label: "Explored"
+                flavor: "explore",
+                label: "explore"
             }
         );
         assert_eq!(
             tool_flavor("git_status"),
             ToolFlavor {
-                flavor: "read",
-                label: "Explored"
+                flavor: "explore",
+                label: "explore"
             }
         );
         assert_eq!(
             tool_flavor("git_diff"),
             ToolFlavor {
-                flavor: "read",
-                label: "Explored"
+                flavor: "explore",
+                label: "explore"
             }
         );
         assert_eq!(
             tool_flavor("edit_file"),
             ToolFlavor {
                 flavor: "edit",
-                label: "Edited"
+                label: "edit"
             }
         );
         assert_eq!(
             tool_flavor("run_shell"),
             ToolFlavor {
-                flavor: "command",
-                label: "Ran"
+                flavor: "bash",
+                label: "bash"
             }
         );
         assert_eq!(
             tool_flavor("something_else"),
             ToolFlavor {
                 flavor: "tool",
-                label: "Used tools"
+                label: "tool"
             }
         );
     }
@@ -521,23 +522,23 @@ mod tests {
             project_activity(&events),
             vec![
                 ActivityItem::ToolGroup {
-                    flavor: "read",
-                    label: "Explored",
+                    flavor: "explore",
+                    label: "explore",
                     details: vec!["Git status".to_owned(), "Read file".to_owned()],
                 },
                 ActivityItem::ToolGroup {
                     flavor: "edit",
-                    label: "Edited",
+                    label: "edit",
                     details: vec!["Edit file".to_owned()],
                 },
                 ActivityItem::ToolGroup {
-                    flavor: "command",
-                    label: "Ran",
+                    flavor: "bash",
+                    label: "bash",
                     details: vec!["Run command".to_owned()],
                 },
                 ActivityItem::ToolGroup {
                     flavor: "tool",
-                    label: "Used tools",
+                    label: "tool",
                     details: vec!["Use custom_tool".to_owned()],
                 },
             ]
@@ -565,8 +566,8 @@ mod tests {
             project_activity(&events),
             vec![
                 ActivityItem::ToolGroup {
-                    flavor: "read",
-                    label: "Explored",
+                    flavor: "explore",
+                    label: "explore",
                     details: vec!["Read README.md".to_owned()],
                 },
                 ActivityItem::Status("Checking the result".to_owned()),
@@ -633,8 +634,8 @@ mod tests {
         assert_eq!(
             project_activity(&events),
             vec![ActivityItem::ToolGroup {
-                flavor: "read",
-                label: "Explored",
+                flavor: "explore",
+                label: "explore",
                 details: vec!["Read one.md".to_owned(), "Read two.md".to_owned()],
             }]
         );
@@ -670,8 +671,8 @@ mod tests {
             vec![
                 ActivityItem::Status("Checking the result".to_owned()),
                 ActivityItem::ToolGroup {
-                    flavor: "command",
-                    label: "Ran",
+                    flavor: "bash",
+                    label: "bash",
                     details: vec!["run_shell failed".to_owned()],
                 },
             ]
@@ -693,8 +694,8 @@ mod tests {
         assert_eq!(
             project_activity(&events),
             vec![ActivityItem::ToolGroup {
-                flavor: "read",
-                label: "Explored",
+                flavor: "explore",
+                label: "explore",
                 details: vec!["Read file".to_owned()],
             }]
         );
@@ -710,8 +711,8 @@ mod tests {
         assert_eq!(
             project_activity(&events),
             vec![ActivityItem::ToolGroup {
-                flavor: "command",
-                label: "Ran",
+                flavor: "bash",
+                label: "bash",
                 details: vec!["run_shell failed".to_owned()],
             }]
         );
@@ -766,18 +767,18 @@ mod tests {
 
         let contents = rendered_screen(&events, &theme, 48, 12);
 
-        assert!(contents.contains("• Explored"));
-        assert!(contents.contains("• Edited"));
+        assert!(contents.contains("explore"));
+        assert!(contents.contains("edit"));
         assert!(!contents.contains("• Ran"));
-        assert!(contents.contains("  └ Read file"));
-        assert!(contents.contains("    Git diff"));
+        assert!(contents.contains("  ├ Read file"));
+        assert!(contents.contains("  └ Git diff"));
         assert!(contents.contains("  └ Edit file"));
         assert!(!contents.contains("read_file call"));
         assert!(!contents.contains("run_shell completed"));
 
         for line in contents.lines().filter(|line| !line.trim().is_empty()) {
             assert!(
-                line.starts_with("    ") || line.starts_with("  └ "),
+                line.starts_with("    ") || line.starts_with("  ├ ") || line.starts_with("  └ "),
                 "unstable activity gutter: {line:?}"
             );
             assert!(

@@ -47,7 +47,7 @@ fn projects_path_only_patch_event_as_unknown_without_fake_diff() {
 }
 
 #[test]
-fn vt100_renders_patch_diff_with_line_numbers_without_frontend_folding() {
+fn vt100_renders_patch_diff_with_line_numbers_and_bounded_preview() {
     let old = "a\nb\nc\n".to_owned();
     let new = format!(
         "a\nbeta\nc\n{}",
@@ -67,13 +67,14 @@ fn vt100_renders_patch_diff_with_line_numbers_without_frontend_folding() {
 
     let contents = rendered_screen(&events, &theme, 80, 32);
 
-    assert!(contents.contains("┌─ Edited src/lib.rs"));
-    assert!(!contents.contains("@@"), "raw hunk header leaked");
-    assert!(contents.contains("│    2 - b"));
-    assert!(contents.contains("│    2 + beta"));
+    assert!(contents.contains("edit src/lib.rs"));
+    assert!(contents.contains("@@"), "hunk header missing");
+    assert!(contents.contains("     2 - b"));
+    assert!(contents.contains("     2 + beta"));
     assert!(!contents.contains("bounded patch"));
-    assert!(contents.contains("extra 14"));
-    assert!(contents.contains("└─ update · "));
+    assert!(contents.contains("ctrl+o expand"));
+    assert!(!contents.contains("extra 14"));
+    assert!(contents.contains(""));
     assert!(!contents.contains("• Edited"));
 }
 
@@ -91,8 +92,8 @@ fn vt100_renders_patch_diff_width_bounded_when_narrow() {
 
     let contents = rendered_screen(&events, &theme, 36, 10);
 
-    assert!(contents.contains("│    1 - fn old_"));
-    assert!(contents.contains("│    1 + pub fn"));
+    assert!(contents.contains("     1 - fn old_"));
+    assert!(contents.contains("     1 + pub fn"));
     for row in contents.lines() {
         assert!(
             display_width(row) <= 36,

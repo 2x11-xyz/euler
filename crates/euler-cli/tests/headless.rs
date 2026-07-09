@@ -6576,7 +6576,7 @@ fn tui_pty_submit_fixture_turn_and_quit() {
     );
 
     assert!(
-        tui.wait_for_screen("fixture/echo"),
+        tui.wait_for_screen("echo · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -6596,7 +6596,7 @@ fn tui_pty_without_provenance_writes_home_session_store() {
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
 
     assert!(
-        tui.wait_for_screen("fixture/echo"),
+        tui.wait_for_screen("echo · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -6620,7 +6620,7 @@ fn tui_name_session_updates_resume_picker_label() {
     let home = isolated_home();
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
     assert!(
-        tui.wait_for_screen("fixture/echo"),
+        tui.wait_for_screen("echo · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -6649,7 +6649,7 @@ fn tui_name_session_updates_resume_picker_label() {
     );
 
     let mut resumed = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
-    assert!(resumed.wait_for_screen("fixture/echo"));
+    assert!(resumed.wait_for_screen("echo · ctx"));
     resumed.write("/resume\r");
     assert!(
         resumed.wait_for_screen("dogfood session"),
@@ -6688,7 +6688,7 @@ fn tui_resume_picker_lists_home_sessions() {
     let saved_id = only_home_session_id(home.path());
 
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
-    assert!(tui.wait_for_screen("fixture/echo"));
+    assert!(tui.wait_for_screen("echo · ctx"));
     tui.write("/resume\r");
     assert!(
         tui.wait_for_screen("saved for picker"),
@@ -6986,7 +6986,7 @@ fn screen_has_ready_composer(screen: &str) -> bool {
 }
 
 fn status_line_marks_ready_composer(line: &str) -> bool {
-    line.contains("Context") || line.contains("Canvas ")
+    line.contains("ctx ") || line.contains("canvas ")
 }
 
 impl Drop for PtyHarness {

@@ -804,7 +804,10 @@ mod tests {
 
     #[test]
     fn help_text_uses_catalog_theme_usage() {
-        assert!(help_text().contains("/theme [gruvbox-dark|gruvbox-light] - switch theme"));
+        assert!(help_text().contains(&format!(
+            "/theme [{}] - switch theme",
+            ThemeChoice::format_canonical_ids("|")
+        )));
         assert!(command_table()
             .iter()
             .any(|spec| spec.token == "/theme" && spec.args.is_empty()));
@@ -832,7 +835,10 @@ mod tests {
         );
         assert_eq!(
             dispatch_command("/theme gruvbox", &context),
-            CommandEffect::Message("usage: /theme <gruvbox-dark|gruvbox-light>".to_owned())
+            CommandEffect::Message(format!(
+                "usage: /theme <{}>",
+                ThemeChoice::format_canonical_ids("|")
+            ))
         );
         assert_eq!(
             dispatch_command("/extension", &context),

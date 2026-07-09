@@ -75,8 +75,9 @@ fn empty_composer_prompt_has_breathing_room_above_statusline() {
     assert_eq!(areas.notice.height, 0);
     assert!(screen_row(&contents, areas.bottom.y).starts_with("▌ "));
     let status = screen_row(&contents, areas.status.y);
-    assert!(status.starts_with("  fixture/echo medium · "));
-    assert!(status.contains(" · Context ?% used"));
+    assert!(status.starts_with("  ⏎ send · / commands · ctrl+o expand"));
+    assert!(status.contains(" · echo · ctx ?% · "));
+    assert!(!status.contains("Context ?% used"));
 }
 
 #[test]
@@ -90,7 +91,7 @@ fn startup_history_sits_immediately_above_prompt_status_in_compact_viewport() {
     let rows = terminal.backend().screen_rows();
     let equation = row_containing(&rows, "e^(iπ) + 1 = 0");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
+    let status = row_containing(&rows, "echo · ctx");
     assert_eq!(status, prompt + 2, "rows: {rows:?}");
     assert!(rows[prompt + 1].trim().is_empty(), "rows: {rows:?}");
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
@@ -171,7 +172,7 @@ fn transient_notice_composer_and_status_are_separated_by_blank_rows() {
         .expect("prompt row");
     let status = lines
         .iter()
-        .position(|line| line.contains("fixture/echo"))
+        .position(|line| line.contains("echo · ctx"))
         .expect("status row");
 
     assert_eq!(prompt, notice + 2, "lines: {lines:?}");
@@ -203,7 +204,7 @@ fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() 
         .expect("prompt row");
     let status = lines
         .iter()
-        .position(|line| line.contains("fixture/echo"))
+        .position(|line| line.contains("echo · ctx"))
         .expect("status row");
     let slash = lines
         .iter()
@@ -345,7 +346,7 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
         .any(|row| row.contains("Would you like to run the following command?")));
     assert!(!rows.iter().any(|row| row.contains("1. Yes, proceed")));
     let decision = row_containing(&rows, "✔ Permission approved: shell-exec (allowed)");
-    let tool = row_containing(&rows, "Ran cargo check");
+    let tool = row_containing(&rows, "bash $ cargo check");
     let blank_rows_between = rows[decision + 1..tool]
         .iter()
         .filter(|row| row.trim().is_empty())
@@ -414,7 +415,7 @@ fn scrollback_preserves_banner_user_tool_and_final_after_many_insertions() {
         &[
             "e^(iπ) + 1 = 0",
             "▌ inspect",
-            "• Explored",
+            "explore",
             "Read AGENTS.md",
             "final prose",
             "filler 11",
@@ -703,7 +704,7 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
-    assert!(lines.iter().any(|line| line.contains("Ran ls -la")));
+    assert!(lines.iter().any(|line| line.contains("bash $ ls -la")));
     assert_ne!(lines.last().map(String::as_str), Some(""));
 }
 
@@ -730,10 +731,10 @@ fn finalized_tool_output_batch_separates_following_assistant_prose() {
 
     let rows = terminal.backend().scrollback_rows();
     let tool_last = row_containing(&rows, "last tool output row");
-    assert!(rows[tool_last + 1].contains("exit 0 · 1 line"));
-    assert_eq!(rows[tool_last + 2].trim(), "", "rows: {rows:?}");
+    assert!(rows.iter().any(|row| row.contains("exit 0 · 1 line")));
+    assert_eq!(rows[tool_last + 1].trim(), "", "rows: {rows:?}");
     assert!(
-        rows[tool_last + 3].starts_with("  I see 16 em dashes"),
+        rows[tool_last + 2].starts_with("  I see 16 em dashes"),
         "rows: {rows:?}"
     );
 }
@@ -822,7 +823,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let before_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &before_final,
-        &["• Explored", "Read Cargo.toml", "Ran cargo test"],
+        &["explore", "Read Cargo.toml", "bash $ cargo test"],
     );
     assert!(!before_final.iter().any(|row| row.contains("final answer")));
 
@@ -837,7 +838,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let after_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &after_final,
-        &["• Explored", "Ran cargo test", "final answer"],
+        &["explore", "bash $ cargo test", "final answer"],
     );
 }
 
@@ -1083,7 +1084,7 @@ fn final_completion_collapses_live_viewport_without_blank_gap() {
     let final_answer = row_containing(&rows, "final answer");
     let worked = row_containing(&rows, "Worked for 41s");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
+    let status = row_containing(&rows, "echo · ctx");
     assert!(final_answer < worked, "rows: {rows:?}");
     assert!(
         prompt.saturating_sub(worked) <= 4,
@@ -1149,7 +1150,7 @@ fn finalized_visual_output_renders_in_logical_canvas_without_active_duplicate() 
 
     assert!(text.contains("e^(iπ) + 1 = 0"));
     assert!(text.contains("▌"));
-    assert!(text.contains("fixture/echo"));
+    assert!(text.contains("echo · ctx"));
 
     let second = core.render_visual_canvas(80);
     let second_text = second
@@ -1546,7 +1547,7 @@ fn idle_frame_does_not_render_stale_tool_activity_after_final_answer() {
     let contents = terminal.backend().screen_contents();
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("read_file completed"));
-    assert!(!contents.contains("• Explored"));
+    assert!(!contents.contains("explore"));
     assert!(!contents.contains("# raw instructions"));
 }
 

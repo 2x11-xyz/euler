@@ -543,7 +543,7 @@ fn tui_read_tool_flow_uses_compact_result_without_raw_lifecycle_rows() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    assert!(contents.contains("• Explored"));
+    assert!(contents.contains("explore"));
     assert!(contents.contains("Read README.md"));
     assert!(!contents.contains("raw file contents"));
     assert!(!contents.contains("* Tool read_file"));
@@ -566,10 +566,10 @@ fn tui_shell_run_uses_raw_command_label_without_semantic_prefix() {
 
     let contents = rendered_screen(&events, &theme, 96, 8);
 
-    assert!(contents.contains("Ran rg transcript crates/euler-cli/src/ui"));
+    assert!(contents.contains("bash $ rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("• Ran Search"));
     assert!(!contents.contains("Search rg transcript"));
-    assert!(contents.contains("│ transcript.rs:match"));
+    assert!(contents.contains("  transcript.rs:match"));
 }
 
 #[test]
@@ -706,9 +706,9 @@ fn tui_exploration_coalesces_and_dedupes_read_labels() {
 
     let contents = rendered_screen(&events, &theme, 96, 10);
 
-    assert_eq!(contents.matches("• Explored").count(), 1);
+    assert_eq!(contents.matches("explore").count(), 1);
     assert!(contents.contains("└ Read README.md, Cargo.toml"));
-    assert!(contents.contains("Ran rg transcript crates/euler-cli/src/ui"));
+    assert!(contents.contains("bash $ rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("Search rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("README raw content"));
     assert!(!contents.contains("Cargo raw content"));
@@ -737,7 +737,7 @@ fn tui_assistant_finalization_does_not_leave_stale_exploration_fragments() {
 
     let contents = rendered_screen(&events, &theme, 80, 8);
 
-    assert!(contents.contains("• Explored"));
+    assert!(contents.contains("explore"));
     assert!(contents.contains("Read AGENTS.md"));
     assert_eq!(contents.matches("final answer").count(), 1);
     assert!(!contents.contains("read_file call"));
@@ -767,7 +767,7 @@ fn tui_failed_read_tool_keeps_diagnostic_output_visible() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    assert!(contents.contains("• Explored failed: No such file or directory"));
+    assert!(contents.contains("explore failed: No such file or directory"));
     assert!(contents.contains("os error detail"));
 }
 
@@ -819,12 +819,12 @@ fn tui_edit_flow_keeps_compact_patch_result_without_allow_spam() {
 
     let contents = rendered_screen(&events, &theme, 80, 14);
 
-    assert!(contents.contains("┌─ Edited src/lib.rs (+1 -0)"));
+    assert!(contents.contains("edit src/lib.rs · +1 −0"));
     assert!(contents.contains("two"));
     assert!(!contents.contains("Permission required"));
     assert!(!contents.contains("Permission allowed"));
     assert!(!contents.contains("• Patch proposed"));
-    assert!(!contents.contains("• Edited"));
+    assert!(!contents.contains("Tool edit_file"));
     assert!(!contents.contains("Tool edit_file"));
 }
 
@@ -1117,21 +1117,19 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
         2,
         "expected continuous rail for each wrapped user prompt row, got {prompt_glyph_lines:?}"
     );
-    assert!(contents.contains("│ line one output"));
-    assert!(contents.contains("│ line two output"));
-    assert!(contents.contains("1 hidden lines"));
+    assert!(contents.contains("  line one output"));
+    assert!(contents.contains("  line two output"));
+    assert!(contents.contains("1 more lines"));
     assert!(contents.contains("line five output"));
 
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
         assert!(
             line.starts_with("▌ ")
                 || line.starts_with("• ")
+                || line.starts_with("bash")
                 || line.starts_with("  ")
                 || line.starts_with("  └ ")
-                || line.starts_with("    ")
-                || line.starts_with('┌')
-                || line.starts_with('│')
-                || line.starts_with('└'),
+                || line.starts_with("    "),
             "unstable gutter: {line:?}"
         );
     }
@@ -1195,13 +1193,13 @@ fn vt100_long_tool_output_uses_head_tail_affordance() {
     let theme = Theme::default();
     let contents = rendered_screen(&events, &theme, 80, 16);
 
-    assert!(contents.contains("Ran printf lines"));
-    assert!(contents.contains("│ line 1"));
-    assert!(contents.contains("│ line 2"));
-    assert!(contents.contains("8 hidden lines"));
-    assert!(contents.contains("Ctrl+O expands"));
-    assert!(contents.contains("│ line 11"));
-    assert!(contents.contains("│ line 12"));
+    assert!(contents.contains("bash $ printf lines"));
+    assert!(contents.contains("  line 1"));
+    assert!(contents.contains("  line 2"));
+    assert!(contents.contains("8 more lines"));
+    assert!(contents.contains("ctrl+o expand"));
+    assert!(contents.contains("  line 11"));
+    assert!(contents.contains("  line 12"));
     assert!(!contents.contains("line 3"));
 }
 
@@ -1218,24 +1216,22 @@ fn tui_tool_output_trims_trailing_blank_rows_before_rendering() {
 
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
 
-    assert_eq!(texts.len(), 3, "texts: {texts:?}");
-    assert!(texts[0].contains("Ran printf blank"), "texts: {texts:?}");
-    assert_eq!(display_width(&texts[0]), 80, "texts: {texts:?}");
+    assert_eq!(texts.len(), 2, "texts: {texts:?}");
+    assert!(texts[0].contains("bash $ printf blank"), "texts: {texts:?}");
+    assert!(texts[0].contains("done · 1 line"), "texts: {texts:?}");
+    assert!(display_width(&texts[0]) <= 80, "texts: {texts:?}");
     assert_eq!(display_width(&texts[1]), 80, "texts: {texts:?}");
-    assert_eq!(display_width(&texts[2]), 80, "texts: {texts:?}");
-    assert!(texts[0].starts_with('┌') && texts[0].ends_with('┐'));
-    assert!(texts[1].starts_with('│') && texts[1].ends_with('│'));
-    assert!(texts[2].starts_with('└') && texts[2].ends_with('┘'));
+    assert_no_box_chars(&texts);
+    assert!(texts[1].starts_with("  "));
     assert!(texts[1].contains("visible"), "texts: {texts:?}");
     assert_eq!(
         texts
             .iter()
-            .filter(|line| line.starts_with('│') && line.ends_with('│'))
+            .filter(|line| line.starts_with("  ") && line.contains("visible"))
             .count(),
         1,
         "trailing blank rows should be trimmed before rendering: {texts:?}"
     );
-    assert!(texts[2].contains("done · 1 line"), "texts: {texts:?}");
 }
 
 #[test]
@@ -1252,11 +1248,12 @@ fn tool_artifact_cell_handles_empty_output_without_fold_affordance() {
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("Ran true"), "texts: {texts:?}");
+    assert!(joined.contains("bash $ true"), "texts: {texts:?}");
     assert!(joined.contains("done · 0 lines"), "texts: {texts:?}");
-    assert!(!joined.contains("Ctrl+O"), "texts: {texts:?}");
-    assert_eq!(texts.len(), 3, "empty output keeps one blank body row");
-    assert!(texts[1].starts_with('│') && texts[1].ends_with('│'));
+    assert!(!joined.contains("ctrl+o"), "texts: {texts:?}");
+    assert_eq!(texts.len(), 2, "empty output keeps one blank body row");
+    assert!(texts[1].starts_with("  "));
+    assert_no_box_chars(&texts);
 }
 
 #[test]
@@ -1296,16 +1293,10 @@ fn tool_artifact_cell_folds_only_above_threshold() {
     ))
     .join("\n");
 
-    assert!(!exact.contains("hidden lines"), "exact: {exact:?}");
+    assert!(!exact.contains("more lines"), "exact: {exact:?}");
     assert!(exact.contains("line 10"), "exact: {exact:?}");
-    assert!(
-        overflow.contains("7 hidden lines"),
-        "overflow: {overflow:?}"
-    );
-    assert!(
-        overflow.contains("Ctrl+O expands"),
-        "overflow: {overflow:?}"
-    );
+    assert!(overflow.contains("7 more lines"), "overflow: {overflow:?}");
+    assert!(overflow.contains("ctrl+o expand"), "overflow: {overflow:?}");
     assert!(!overflow.contains("line 3"), "overflow: {overflow:?}");
 }
 
@@ -1333,9 +1324,9 @@ fn tool_artifact_cell_expands_with_unbounded_limit() {
     ))
     .join("\n");
 
-    assert!(folded.contains("8 hidden lines"), "folded: {folded:?}");
+    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
-    assert!(!expanded.contains("hidden lines"), "expanded: {expanded:?}");
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
     assert!(
         expanded.contains("exit 0 · 12 lines"),
@@ -1344,7 +1335,7 @@ fn tool_artifact_cell_expands_with_unbounded_limit() {
 }
 
 #[test]
-fn tool_artifact_border_style_survives_fold_and_expand() {
+fn tool_artifact_flat_style_survives_fold_and_expand() {
     let theme = Theme::default();
     let output = (1..=12)
         .map(|index| format!("line {index}"))
@@ -1361,10 +1352,10 @@ fn tool_artifact_border_style_survives_fold_and_expand() {
     let folded_lines = render_items_for_history(&item, &theme, 80);
     let folded_text = line_texts(&folded_lines).join("\n");
     assert!(
-        folded_text.contains("hidden lines"),
+        folded_text.contains("more lines"),
         "folded: {folded_text:?}"
     );
-    assert_artifact_border_style(
+    assert_artifact_flat_style(
         "folded",
         &folded_lines,
         "find . -maxdepth 2",
@@ -1374,10 +1365,10 @@ fn tool_artifact_border_style_survives_fold_and_expand() {
     let expanded_lines = render_items_for_history_with_limit(&item, &theme, 80, usize::MAX);
     let expanded_text = line_texts(&expanded_lines).join("\n");
     assert!(
-        !expanded_text.contains("hidden lines"),
+        !expanded_text.contains("more lines"),
         "expanded: {expanded_text:?}"
     );
-    assert_artifact_border_style(
+    assert_artifact_flat_style(
         "expanded",
         &expanded_lines,
         "find . -maxdepth 2",
@@ -1390,7 +1381,7 @@ fn tool_artifact_border_style_survives_fold_and_expand() {
 }
 
 #[test]
-fn tool_artifact_border_style_handles_empty_output() {
+fn tool_artifact_flat_style_handles_empty_output() {
     let theme = Theme::default();
     let item = [TranscriptItem::ToolRun {
         command: "printf empty".to_owned(),
@@ -1407,7 +1398,7 @@ fn tool_artifact_border_style_handles_empty_output() {
             render_items_for_history_with_limit(&item, &theme, 80, usize::MAX),
         ),
     ] {
-        assert_artifact_border_style(
+        assert_artifact_flat_style(
             label,
             &lines,
             "printf empty",
@@ -1464,7 +1455,7 @@ fn tool_artifact_cell_uses_available_width_for_long_command_title() {
     }];
 
     let wide = line_texts(&render_items_for_history(&item, &theme, 120));
-    assert_eq!(display_width(&wide[0]), 120, "wide: {wide:?}");
+    assert!(display_width(&wide[0]) <= 120, "wide: {wide:?}");
     assert!(
         wide[0].contains("crates/euler-cli/Cargo.toml"),
         "wide title should use terminal width before truncating: {wide:?}"
@@ -1472,8 +1463,8 @@ fn tool_artifact_cell_uses_available_width_for_long_command_title() {
 
     let narrow = line_texts(&render_items_for_history(&item, &theme, 40));
     assert!(
-        narrow[0].contains("..."),
-        "narrow title should show explicit truncation: {narrow:?}"
+        display_width(&narrow[0]) <= 40,
+        "narrow title should stay width-bounded: {narrow:?}"
     );
     for text in &narrow {
         assert!(
@@ -1496,12 +1487,12 @@ fn tool_artifact_cell_keeps_minimum_width_at_tiny_widths() {
 
     for width in [0, 1, 2, 3] {
         let texts = line_texts(&render_items_for_history(&item, &theme, width));
-        assert_eq!(texts.len(), 3, "width {width}: {texts:?}");
+        assert_eq!(texts.len(), 2, "width {width}: {texts:?}");
         for text in &texts {
             assert_eq!(
                 display_width(text),
                 4,
-                "tiny-width artifact rows keep the minimum box width: {text:?} in {texts:?}"
+                "tiny-width artifact rows keep the minimum flat width: {text:?} in {texts:?}"
             );
         }
     }
@@ -1541,11 +1532,7 @@ fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
         let texts = line_texts(&render_items_for_history(&item, &theme, width));
         let max_width = usize::from(width);
         assert!(
-            texts.first().is_some_and(|line| line.starts_with('┌')),
-            "width {width}: {texts:?}"
-        );
-        assert!(
-            texts.last().is_some_and(|line| line.starts_with('└')),
+            texts.first().is_some_and(|line| line.starts_with("Patch")),
             "width {width}: {texts:?}"
         );
         for text in &texts {
@@ -1556,10 +1543,7 @@ fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
             assert!(!text.contains('\u{1b}'), "escape leaked: {texts:?}");
             assert!(!text.contains('\t'), "tab leaked: {texts:?}");
             assert!(!text.contains('\r'), "carriage return leaked: {texts:?}");
-            assert!(
-                text.starts_with(['┌', '│', '└']) && text.ends_with(['┐', '│', '┘']),
-                "artifact border broken at width {width}: {text:?} in {texts:?}"
-            );
+            assert_no_box_chars(std::slice::from_ref(text));
         }
     }
 }
@@ -1584,14 +1568,17 @@ fn patch_proposed_artifact_uses_boxed_title_and_not_old_child_rows() {
     let joined = texts.join("\n");
 
     assert_eq!(
-        joined.matches("┌─ Patch proposed").count(),
+        joined.matches("Patch proposed").count(),
         2,
         "texts: {texts:?}"
     );
-    assert!(joined.contains("┌─ Patch proposed src/a.rs"));
-    assert!(joined.contains("│    1 - a"));
-    assert!(!joined.contains("@@"), "raw hunk header leaked: {texts:?}");
-    assert_eq!(joined.matches("└─ update").count(), 2, "texts: {texts:?}");
+    assert!(joined.contains("Patch proposed src/a.rs"));
+    assert!(joined.contains("     1 - a"));
+    assert!(
+        joined.contains("@@ -1 +1 @@"),
+        "hunk header missing: {texts:?}"
+    );
+    assert_no_box_chars(&texts);
     assert!(
         !joined.contains("* Patch proposed") && !joined.contains("• Patch proposed"),
         "old parent row leaked: {texts:?}"
@@ -1650,7 +1637,7 @@ fn patch_artifact_is_not_controlled_by_shell_fold_limit() {
     assert_eq!(bounded, shell_expanded);
     let joined = bounded.join("\n");
     assert!(!joined.contains("bounded patch"), "bounded: {bounded:?}");
-    assert!(joined.contains("old 20"), "bounded: {bounded:?}");
+    assert!(joined.contains("ctrl+o expand"), "bounded: {bounded:?}");
     assert!(joined.contains("update · "), "bounded: {bounded:?}");
     assert!(joined.contains("visible rows"), "bounded: {bounded:?}");
 }
@@ -1679,7 +1666,7 @@ fn patch_proposed_artifact_is_not_controlled_by_shell_fold_limit() {
     assert_eq!(bounded, shell_expanded);
     let joined = bounded.join("\n");
     assert!(!joined.contains("bounded patch"), "bounded: {bounded:?}");
-    assert!(joined.contains("old 20"), "bounded: {bounded:?}");
+    assert!(joined.contains("ctrl+o expand"), "bounded: {bounded:?}");
     assert!(joined.contains("update · "), "bounded: {bounded:?}");
     assert!(joined.contains("visible rows"), "bounded: {bounded:?}");
 }
@@ -1696,7 +1683,7 @@ fn path_only_patch_artifact_uses_fallback_title_and_body() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("┌─ Edited src/lib.rs"));
+    assert!(joined.contains("edit src/lib.rs"));
     assert!(joined.contains("no line changes"));
     assert!(joined.contains("unknown · 1 visible rows"));
     assert!(!joined.contains("* Edited"));
@@ -1716,10 +1703,10 @@ fn patch_applied_artifact_keeps_exact_render_shape() {
     assert_eq!(
         texts,
         vec![
-            "┌─ Edited src/lib.rs (+1 -1) ──────────────────┐",
-            "│    1 - a                                     │",
-            "│    1 + b                                     │",
-            "└─ update · 2 visible rows ────────────────────┘",
+            "edit src/lib.rs · +1 −1 · update · 3 visible row",
+            "         @@ -1 +1 @@                            ",
+            "     1 - a                                      ",
+            "     1 + b                                      ",
         ]
     );
 }
@@ -1825,7 +1812,7 @@ fn line_oriented_renderer_names_file_diff_action_path_and_omission() {
 }
 
 #[test]
-fn file_change_metadata_renders_as_boxed_artifact_without_fake_diff() {
+fn file_change_metadata_renders_as_flat_artifact_without_fake_diff() {
     let theme = Theme::default();
     let item = [TranscriptItem::FileChange {
         path: "src/lib.rs".to_owned(),
@@ -1841,13 +1828,13 @@ fn file_change_metadata_renders_as_boxed_artifact_without_fake_diff() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("┌─ File modified src/lib.rs"));
-    assert!(joined.contains("│ action: modify"));
-    assert!(joined.contains("│ origin: apply_patch"));
-    assert!(joined.contains("│ bytes: 10 -> 12"));
-    assert!(joined.contains("│ sha256: abcdef123456 -> fedcba654321"));
-    assert!(joined.contains("│ diff: omitted (metadata only)"));
-    assert!(joined.contains("└─ metadata only"));
+    assert!(joined.contains("File modified src/lib.rs · metadata only"));
+    assert!(joined.contains("  action: modify"));
+    assert!(joined.contains("  origin: apply_patch"));
+    assert!(joined.contains("  bytes: 10 -> 12"));
+    assert!(joined.contains("  sha256: abcdef123456 -> fedcba654321"));
+    assert!(joined.contains("  diff: omitted (metadata only)"));
+    assert_no_box_chars(&texts);
     assert!(!joined.contains("@@"));
     assert!(!joined.contains("+         1 |"));
     assert!(!joined.contains("-         1 |"));
@@ -1869,13 +1856,13 @@ fn file_diff_renders_unified_diff_as_source_first_artifact() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("┌─ Edited src/lib.rs (+1 -1)"));
-    assert!(joined.contains("│    1 - old"));
-    assert!(joined.contains("│    1 + new"));
-    assert!(joined.contains("└─ modify · 2 lines · apply_patch"));
+    assert!(joined.contains("edit src/lib.rs · +1 −1"));
+    assert!(joined.contains("     1 - old"));
+    assert!(joined.contains("     1 + new"));
+    assert_no_box_chars(&texts);
     assert!(!joined.contains("--- a/src/lib.rs"));
     assert!(!joined.contains("+++ b/src/lib.rs"));
-    assert!(!joined.contains("@@ -1 +1 @@"));
+    assert!(joined.contains("@@ -1 +1 @@"));
 }
 
 #[test]
@@ -1893,9 +1880,8 @@ fn file_diff_omission_renders_reason_without_metadata_inference() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("┌─ Edited src/lib.rs"));
-    assert!(joined.contains("│ diff: omitted: secret-like"));
-    assert!(joined.contains("└─ modify · omitted · edit_file"));
+    assert!(joined.contains("edit src/lib.rs"));
+    assert!(joined.contains("  diff: omitted: secret-like"));
     assert!(!joined.contains("@@"));
     assert!(!joined.contains("File modified"));
 }
@@ -1915,8 +1901,7 @@ fn file_diff_missing_omission_reason_uses_stable_fallback() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("│ diff: diff omitted"));
-    assert!(joined.contains("└─ modify · omitted · edit_file"));
+    assert!(joined.contains("  diff: diff omitted"));
 }
 
 #[test]
@@ -1934,8 +1919,7 @@ fn file_diff_empty_diff_is_present_not_omitted() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("│   no diff lines"));
-    assert!(joined.contains("└─ modify · 0 lines · edit_file"));
+    assert!(joined.contains("    no diff lines"));
     assert!(!joined.contains("omitted"));
     assert!(!joined.contains("should not render"));
 }
@@ -1955,8 +1939,7 @@ fn file_diff_whitespace_only_diff_is_present_not_omitted() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("│   no diff lines"));
-    assert!(joined.contains("└─ modify · 0 lines · edit_file"));
+    assert!(joined.contains("    no diff lines"));
     assert!(!joined.contains("omitted"));
     assert!(!joined.contains("should not render"));
 }
@@ -1992,8 +1975,8 @@ fn file_diff_ignores_shell_artifact_limit_and_renders_full_code() {
         !default.contains("hidden diff lines"),
         "default: {default:?}"
     );
-    assert!(!default.contains("Ctrl+O expands"), "default: {default:?}");
-    assert!(default.contains("line 11"), "default: {default:?}");
+    assert!(default.contains("ctrl+o expand"), "default: {default:?}");
+    assert!(!default.contains("line 11"), "default: {default:?}");
     assert!(default.contains("modify · 12 lines · apply_patch · truncated tail"));
 }
 
@@ -2021,7 +2004,6 @@ fn file_diff_sanitizes_controls_and_bounds_width() {
     assert!(!joined.contains('\u{202e}'));
     assert!(!joined.contains("[31m"));
     assert!(!joined.contains("BAD"));
-    assert!(joined.contains("apply    patch") || joined.contains("apply"));
     for row in texts {
         assert!(
             display_width(&row) <= 36,
@@ -2058,17 +2040,17 @@ fn file_change_and_file_diff_artifacts_are_distinct_and_ordered() {
 
     let contents = rendered_screen(&events, &theme, 80, 18);
     let change_index = contents
-        .find("┌─ File modified src/lib.rs")
+        .find("File modified src/lib.rs · metadata only")
         .expect("file change cell");
     let diff_index = contents
-        .find("┌─ Edited src/lib.rs (+1 -1)")
+        .find("edit src/lib.rs · +1 −1")
         .expect("file diff cell");
 
     assert!(change_index < diff_index, "contents: {contents:?}");
-    assert!(contents.contains("│ diff: omitted (metadata only)"));
-    assert!(contents.contains("│    1 - a"));
-    assert!(contents.contains("│    1 + b"));
-    assert!(!contents.contains("@@ -1 +1 @@"));
+    assert!(contents.contains("  diff: omitted (metadata only)"));
+    assert!(contents.contains("     1 - a"));
+    assert!(contents.contains("     1 + b"));
+    assert!(contents.contains("@@ -1 +1 @@"));
 
     let change_block = &contents[change_index..diff_index];
     assert!(
@@ -2114,18 +2096,18 @@ fn patch_file_change_and_file_diff_render_independently_in_event_order() {
     let theme = Theme::default();
 
     let contents = rendered_screen(&events, &theme, 96, 24);
-    let patch_index = contents.find("┌─ Edited src/lib.rs").expect("patch cell");
+    let patch_index = contents.find("edit src/lib.rs").expect("patch cell");
     let change_index = contents
-        .find("┌─ File modified src/lib.rs")
+        .find("File modified src/lib.rs · metadata only")
         .expect("file change cell");
     let diff_index = contents
-        .rfind("┌─ Edited src/lib.rs (+1 -1)")
+        .rfind("edit src/lib.rs · +1 −1")
         .expect("file diff cell");
 
     assert!(patch_index < change_index, "contents: {contents:?}");
     assert!(change_index < diff_index, "contents: {contents:?}");
-    assert!(contents.contains("│    1 - a"));
-    assert!(!contents.contains("│ -a"));
+    assert!(contents.contains("     1 - a"));
+    assert!(!contents.contains("  -a"));
 }
 
 #[test]
@@ -2144,10 +2126,10 @@ fn file_change_add_action_and_one_sided_hashes_render_stable_metadata() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("┌─ File added src/new.rs"));
-    assert!(joined.contains("│ action: add"));
-    assert!(joined.contains("│ bytes: unknown -> 42"));
-    assert!(joined.contains("│ sha256: none -> 0123456789ab"));
+    assert!(joined.contains("File added src/new.rs · metadata only"));
+    assert!(joined.contains("  action: add"));
+    assert!(joined.contains("  bytes: unknown -> 42"));
+    assert!(joined.contains("  sha256: none -> 0123456789ab"));
 }
 
 #[test]
@@ -2166,9 +2148,9 @@ fn file_change_action_is_normalized_for_title_and_body() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("┌─ File modified src/lib.rs"));
-    assert!(joined.contains("│ action: modify"));
-    assert!(joined.contains("│ diff: custom-redaction"));
+    assert!(joined.contains("File modified src/lib.rs · metadata only"));
+    assert!(joined.contains("  action: modify"));
+    assert!(joined.contains("  diff: custom-redaction"));
     assert!(!joined.contains('\u{1b}'));
 }
 
@@ -2199,9 +2181,11 @@ fn multiple_file_change_events_render_separately_in_order() {
     ];
 
     let joined = line_texts(&render_items_for_history(&items, &theme, 80)).join("\n");
-    let first = joined.find("┌─ File added src/a.rs").expect("first cell");
+    let first = joined
+        .find("File added src/a.rs · metadata only")
+        .expect("first cell");
     let second = joined
-        .find("┌─ File modified src/b.rs")
+        .find("File modified src/b.rs · metadata only")
         .expect("second cell");
 
     assert!(first < second, "joined: {joined:?}");
@@ -2223,12 +2207,12 @@ fn file_change_sparse_metadata_uses_stable_fallbacks() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("┌─ File changed (unknown path)"));
-    assert!(joined.contains("│ action: unknown"));
-    assert!(!joined.contains("│ origin:"));
-    assert!(joined.contains("│ bytes: unknown -> unknown"));
-    assert!(!joined.contains("│ sha256:"));
-    assert!(joined.contains("│ diff: metadata only"));
+    assert!(joined.contains("File changed (unknown path) · metadata only"));
+    assert!(joined.contains("  action: unknown"));
+    assert!(!joined.contains("  origin:"));
+    assert!(joined.contains("  bytes: unknown -> unknown"));
+    assert!(!joined.contains("  sha256:"));
+    assert!(joined.contains("  diff: metadata only"));
 }
 
 #[test]
@@ -2251,8 +2235,8 @@ fn file_change_metadata_is_sanitized_and_width_bounded() {
     assert!(!joined.contains('\u{1b}'));
     assert!(!joined.contains('\u{7}'));
     assert!(!joined.contains("[31m"));
-    assert!(joined.contains("│ origin: apply    patch"));
-    assert!(joined.contains("│ sha256: abc -> def456789012"));
+    assert!(joined.contains("  origin: apply    patch"));
+    assert!(joined.contains("  sha256: abc -> def456789012"));
     for row in texts {
         assert!(
             display_width(&row) <= 32,
@@ -2287,15 +2271,15 @@ fn patch_and_file_change_artifacts_are_distinct_and_ordered() {
     let theme = Theme::default();
 
     let contents = rendered_screen(&events, &theme, 80, 18);
-    let patch_index = contents.find("┌─ Edited src/lib.rs").expect("patch cell");
+    let patch_index = contents.find("edit src/lib.rs").expect("patch cell");
     let change_index = contents
-        .find("┌─ File modified src/lib.rs")
+        .find("File modified src/lib.rs · metadata only")
         .expect("file change cell");
 
     assert!(patch_index < change_index, "contents: {contents:?}");
-    assert!(contents.contains("│    1 - a"));
-    assert!(!contents.contains("@@"), "raw hunk header leaked");
-    assert!(contents.contains("│ diff: omitted (metadata only)"));
+    assert!(contents.contains("     1 - a"));
+    assert!(contents.contains("@@"), "hunk header missing");
+    assert!(contents.contains("  diff: omitted (metadata only)"));
 }
 
 #[test]
@@ -2317,8 +2301,8 @@ fn consecutive_patch_artifact_cells_do_not_merge_or_use_old_child_rows() {
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
     let joined = texts.join("\n");
 
-    assert_eq!(joined.matches("┌─ Edited").count(), 2, "texts: {texts:?}");
-    assert_eq!(joined.matches("└─ update").count(), 2, "texts: {texts:?}");
+    assert_eq!(joined.matches("edit src/").count(), 2, "texts: {texts:?}");
+    assert_no_box_chars(&texts);
     assert!(
         !joined.contains("  └ @@"),
         "old child row leaked: {texts:?}"
@@ -2409,11 +2393,11 @@ fn tui_long_tool_output_ignores_trailing_blanks_in_head_tail_preview() {
     let theme = Theme::default();
     let contents = rendered_screen(&events, &theme, 80, 16);
 
-    assert!(contents.contains("8 hidden lines"));
-    assert!(contents.contains("Ctrl+O expands"));
-    assert!(contents.contains("│ line 11"));
-    assert!(contents.contains("│ line 12"));
-    assert!(!contents.contains("14 hidden lines"));
+    assert!(contents.contains("8 more lines"));
+    assert!(contents.contains("ctrl+o expand"));
+    assert!(contents.contains("  line 11"));
+    assert!(contents.contains("  line 12"));
+    assert!(!contents.contains("14 more lines"));
 }
 
 #[test]
@@ -2489,16 +2473,17 @@ fn vt100_reasoning_render_uses_human_header_and_clean_indent() {
     let rows = contents.lines().map(str::trim_end).collect::<Vec<_>>();
 
     assert!(
-        rows.iter().any(|row| row.starts_with("    Thinking ·")),
+        rows.iter()
+            .any(|row| row.starts_with("    ✱ thought for 0s")),
         "contents: {contents:?}"
     );
     assert!(
-        rows.contains(&"    inspect the event projection"),
+        contents.contains("inspect the event projection"),
         "contents: {contents:?}"
     );
     assert!(
         rows.iter()
-            .any(|row| row.starts_with("    Thinking (summary) ·")),
+            .any(|row| row.starts_with("    ✱ thought summary for 0s")),
         "contents: {contents:?}"
     );
     assert!(!contents.contains("* Reasoning"), "contents: {contents:?}");
@@ -2520,7 +2505,7 @@ fn vt100_failed_tool_with_exit_code_and_empty_error_has_no_dangling_colon() {
 
     let contents = rendered_screen(&events, &theme, 48, 4);
 
-    assert!(contents.contains("Ran"));
+    assert!(contents.contains("bash"));
     assert!(contents.contains("exit 2 · 0 lines"));
     assert!(!contents.contains("exit 2:"));
 }
@@ -2682,56 +2667,40 @@ fn line_text(line: &Line<'_>) -> String {
         .collect::<String>()
 }
 
-fn assert_artifact_border_style(
+fn assert_artifact_flat_style(
     label: &str,
     lines: &[Line<'_>],
     title_needle: &str,
     expected: Style,
 ) {
     let texts = line_texts(lines);
-    let top = texts
+    assert_no_box_chars(&texts);
+    let title = texts
         .iter()
-        .position(|line| line.starts_with('┌') && line.contains(title_needle))
-        .unwrap_or_else(|| panic!("{label} missing artifact top border: {texts:?}"));
-    let bottom = texts
-        .iter()
-        .enumerate()
-        .skip(top + 1)
-        .find_map(|(index, line)| line.starts_with('└').then_some(index))
-        .unwrap_or_else(|| panic!("{label} missing artifact bottom border: {texts:?}"));
-    assert!(
-        bottom > top,
-        "{label} artifact box must include distinct top and bottom rows: {texts:?}"
-    );
-    let artifact = &lines[top..=bottom];
-
-    let top_style = artifact
-        .first()
-        .and_then(|line| line.spans.first())
-        .map(|span| span.style);
-    assert_eq!(top_style, Some(expected), "{label} top border: {texts:?}");
-
-    let bottom_style = artifact
-        .last()
-        .and_then(|line| line.spans.first())
-        .map(|span| span.style);
-    assert_eq!(
-        bottom_style,
-        Some(expected),
-        "{label} bottom border: {texts:?}"
-    );
-
-    for line in &artifact[1..artifact.len() - 1] {
+        .position(|line| line.contains(title_needle))
+        .unwrap_or_else(|| panic!("{label} missing artifact title: {texts:?}"));
+    let title_style = lines[title].spans.first().map(|span| span.style);
+    assert_eq!(title_style, Some(expected), "{label} title: {texts:?}");
+    for line in lines.iter().skip(title + 1).take_while(|line| {
         let text = line_text(line);
-        assert!(
-            text.starts_with('│') && text.ends_with('│'),
-            "{label} body row should keep box rails: {texts:?}"
+        text.starts_with("  ")
+    }) {
+        let text = line_text(line);
+        assert!(text.starts_with("  "), "{label} body row: {texts:?}");
+        assert_eq!(
+            line.style.bg,
+            Some(expected.bg.expect("expected background")),
+            "{label} body background: {texts:?}"
         );
-        let left = line.spans.first().map(|span| span.style);
-        let right = line.spans.last().map(|span| span.style);
-        assert_eq!(left, Some(expected), "{label} left border: {texts:?}");
-        assert_eq!(right, Some(expected), "{label} right border: {texts:?}");
     }
+}
+
+fn assert_no_box_chars(texts: &[String]) {
+    let joined = texts.join("\n");
+    assert!(
+        !joined.contains(['┌', '┐', '└', '┘', '│']),
+        "box drawing leaked: {texts:?}"
+    );
 }
 
 fn artifact_border_expected_style(theme: &Theme) -> Style {

@@ -35,8 +35,8 @@ fn permission_prompt_renders_inline_with_command_body() {
     assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
     assert!(!contents.contains("commands that start"));
     assert!(contents.contains("▌"));
-    assert!(contents.contains("fixture/echo medium"));
-    assert!(contents.contains("Context ?% used"));
+    assert!(contents.contains("echo · ctx ?%"));
+    assert!(!contents.contains("Context ?% used"));
     assert!(!contents.contains("◦ Working"));
 
     let rows = terminal.backend().screen_rows();
@@ -137,7 +137,7 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
     let two = row_containing(&rows, "2. Yes, and don't ask again");
     let three = row_containing(&rows, "3. No, and tell euler");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
+    let status = row_containing(&rows, "echo · ctx");
     assert!(one < two && two < three, "rows: {rows:?}");
     assert!(three < prompt, "rows: {rows:?}");
     assert_eq!(
@@ -175,7 +175,7 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
     let two = row_containing(&rows, "2. Yes, and don't ask again");
     let three = row_containing(&rows, "3. No, and tell euler");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
+    let status = row_containing(&rows, "echo · ctx");
     assert_eq!(terminal.viewport_area().height, 8);
     assert!(one < two && two < three, "rows: {rows:?}");
     assert!(three < prompt, "rows: {rows:?}");
@@ -212,7 +212,7 @@ fn inline_patch_approval_ask_hides_working_status_and_keeps_options_visible() {
     let two = row_containing(&rows, "2. Yes, and don't ask again");
     let three = row_containing(&rows, "3. No, and tell euler");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
+    let status = row_containing(&rows, "echo · ctx");
     assert!(one < two && two < three, "rows: {rows:?}");
     assert!(three < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
@@ -256,8 +256,8 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
     assert!(!restored.contains("Would you like"));
     assert!(restored.contains("underlying transcript"));
     assert!(restored.contains("▌ draft"));
-    assert!(restored.contains("fixture/echo medium"));
-    assert!(restored.contains("Context ?% used"));
+    assert!(restored.contains("echo · ctx ?%"));
+    assert!(!restored.contains("Context ?% used"));
 }
 
 fn row_containing(rows: &[String], needle: &str) -> usize {

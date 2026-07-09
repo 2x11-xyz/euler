@@ -63,9 +63,9 @@ pub(super) fn render_tool_run(
     limit: usize,
 ) {
     let heading = if run.command.is_empty() {
-        "Ran".to_owned()
+        "bash".to_owned()
     } else {
-        format!("Ran {}", run.command)
+        format!("bash $ {}", run.command)
     };
     let style = if run.ok {
         theme.transcript.tool
@@ -95,14 +95,18 @@ pub(super) fn render_edit_cell(
     width: u16,
     limit: usize,
 ) {
-    let heading = match diffstat(edit.old, edit.new) {
-        Some((added, removed)) => format!("Edited {} (+{added} -{removed})", edit.path),
-        None => format!("Edited {}", edit.path),
+    let heading = match (
+        patch_diff::action(edit.old, edit.new),
+        diffstat(edit.old, edit.new),
+    ) {
+        ("add", Some((added, _))) => format!("write {} · new · {added} lines", edit.path),
+        (_, Some((added, removed))) => format!("edit {} · +{added} −{removed}", edit.path),
+        _ => format!("edit {}", edit.path),
     };
     render_patch_cell(
         lines,
         PatchRender {
-            label: "Edited",
+            label: "edit",
             title: heading,
             path: edit.path,
             old: edit.old,

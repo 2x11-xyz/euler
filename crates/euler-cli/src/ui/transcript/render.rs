@@ -24,7 +24,9 @@ impl Default for TranscriptRenderLimits {
     fn default() -> Self {
         Self {
             output_lines: TOOL_CALL_MAX_LINES,
-            patch_detail_lines: usize::MAX,
+            patch_detail_lines: super::super::patch_diff::DIFF_PREVIEW_ROWS
+                .max(super::super::patch_diff::NEW_FILE_PREVIEW_ROWS)
+                + 1,
         }
     }
 }
@@ -127,21 +129,10 @@ pub(super) fn render_projected_entries(
                 push_wrapped(
                     &mut lines,
                     "    ",
-                    reasoning_title(fidelity),
+                    &reasoning_summary(fidelity, content),
                     theme.transcript.reasoning,
                     theme,
                     width,
-                );
-                push_bounded_detail(
-                    &mut lines,
-                    content,
-                    DetailRender {
-                        style: theme.transcript.reasoning,
-                        gutter: "    ",
-                    },
-                    theme,
-                    width,
-                    limits.output_lines,
                 );
             }
             TranscriptItem::ToolCall { name } => {
@@ -207,7 +198,7 @@ pub(super) fn render_projected_entries(
                 );
             }
             TranscriptItem::Exploration { summaries } => {
-                push_cell_parent(&mut lines, "Explored", theme.transcript.tool, theme, width);
+                push_cell_parent(&mut lines, "explore", theme.transcript.tool, theme, width);
                 push_child_rows(
                     &mut lines,
                     &super::coalesced_exploration_summaries(summaries),
@@ -474,9 +465,9 @@ pub(super) fn bottom_aligned_with_offset(
 
 fn tool_result_label(name: &str) -> String {
     match name {
-        "read_file" | "git_status" | "git_diff" => "Explored".to_owned(),
-        "run_shell" => "Ran".to_owned(),
-        "edit_file" => "Edited".to_owned(),
+        "read_file" | "git_status" | "git_diff" => "explore".to_owned(),
+        "run_shell" => "bash".to_owned(),
+        "edit_file" => "edit".to_owned(),
         "" => "Used tool".to_owned(),
         _ => format!("Used tool {name}"),
     }
@@ -527,11 +518,37 @@ fn push_bounded_detail(
     }
 }
 
-fn reasoning_title(fidelity: &str) -> &'static str {
-    match fidelity {
-        "summary" => "Thinking (summary)",
-        _ => "Thinking",
+fn reasoning_summary(fidelity: &str, content: &str) -> String {
+    let gist = reasoning_gist(content);
+    let label = if fidelity == "summary" {
+        "thought summary"
+    } else {
+        "thought"
+    };
+    format!("✱ {label} for 0s — {gist} · ctrl+o expand")
+}
+
+fn reasoning_gist(content: &str) -> String {
+    let first_sentence = content
+        .split_terminator(['.', '!', '?'])
+        .next()
+        .unwrap_or(content)
+        .trim();
+    let source = if first_sentence.is_empty() {
+        content.trim()
+    } else {
+        first_sentence
+    };
+    truncate_gist(source, 60)
+}
+
+fn truncate_gist(source: &str, max_chars: usize) -> String {
+    let mut chars = source.chars();
+    let mut out = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        out.push('…');
     }
+    out
 }
 
 #[allow(dead_code)]

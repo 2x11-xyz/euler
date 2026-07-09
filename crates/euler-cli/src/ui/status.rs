@@ -87,7 +87,7 @@ pub fn status_line_text(
     let body_width = status_body_width(width, display_width(indent));
     format!(
         "{indent}{}",
-        join_status_halves(left, context_segment(tokens), body_width)
+        join_status_halves(left, identity_segment(snapshot, tokens), body_width)
     )
 }
 
@@ -197,16 +197,48 @@ fn compact_model_label<'a>(provider: &str, model: &'a str) -> &'a str {
 }
 
 fn status_left_segment(snapshot: &StatusSnapshot, turn: &TurnStatus) -> String {
-    let base = format!(
-        "{}{}{}",
-        model_effort_segment(snapshot),
-        SEGMENT_GAP,
-        cwd_segment(snapshot)
-    );
-    match turn {
-        TurnStatus::Idle => base,
-        TurnStatus::Running(label) => format!("{base}{SEGMENT_GAP}running {label}"),
+    let hints = match turn {
+        TurnStatus::Idle => "⏎ send · / commands · ctrl+o expand".to_owned(),
+        TurnStatus::Running(_) => "⏎ queue · esc interrupt now".to_owned(),
+    };
+    let cwd = cwd_segment(snapshot);
+    format!("{hints}{SEGMENT_GAP}{cwd}")
+}
+
+fn identity_segment(snapshot: &StatusSnapshot, tokens: &TokenUsageSnapshot) -> String {
+    let session = snapshot
+        .session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or("e????");
+    let model = compact_model_label(&snapshot.provider, &snapshot.model);
+    let model = if model.is_empty() { "?" } else { model };
+    let ctx = match tokens.context_window_tokens.filter(|window| *window > 0) {
+        Some(window) => format!(
+            "ctx {}%",
+            rounded_context_percent(tokens.input_tokens, window).min(99)
+        ),
+        None => match (tokens.canvas_retained_bytes, tokens.canvas_budget_bytes) {
+            (Some(retained), Some(budget)) if budget > 0 => {
+                format!(
+                    "canvas {}KB/{}KB",
+                    retained.div_ceil(1024),
+                    budget.div_ceil(1024)
+                )
+            }
+            _ => "ctx ?%".to_owned(),
+        },
+    };
+    let branch = snapshot
+        .git_branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or("?");
+    let mut right = format!("{session} · {model} · {ctx} · {branch}");
+    if tokens.demoted_items > 0 {
+        right.push_str(&format!(" · {} demoted", tokens.demoted_items));
     }
+    right
 }
 
 fn cwd_segment(snapshot: &StatusSnapshot) -> String {
@@ -252,13 +284,14 @@ fn status_line_spans(
     theme: &Theme,
     width: u16,
 ) -> Vec<Span<'static>> {
-    let left = vec![
-        Span::styled(model_effort_segment(snapshot), theme.status.model),
-        Span::styled(SEGMENT_GAP, theme.status.base),
-        Span::styled(cwd_segment(snapshot), theme.status.state),
-    ];
-    let left = status_spans_with_turn(left, turn, theme);
-    let right = vec![Span::styled(context_segment(tokens), theme.status.ctx)];
+    let left = vec![Span::styled(
+        status_left_segment(snapshot, &turn),
+        theme.status.state,
+    )];
+    let right = vec![Span::styled(
+        identity_segment(snapshot, tokens),
+        theme.status.model,
+    )];
     let indent = Span::styled(status_indent(width), theme.status.base);
     let body_width = status_body_width(width, display_width(indent.content.as_ref()));
     let mut spans = vec![indent];
@@ -269,18 +302,6 @@ fn status_line_spans(
         theme.status.base,
     ));
     spans
-}
-
-fn status_spans_with_turn(
-    mut left: Vec<Span<'static>>,
-    turn: TurnStatus,
-    theme: &Theme,
-) -> Vec<Span<'static>> {
-    if let TurnStatus::Running(label) = turn {
-        left.push(Span::styled(SEGMENT_GAP, theme.status.base));
-        left.push(Span::styled(format!("running {label}"), theme.status.state));
-    }
-    left
 }
 
 fn join_status_span_halves(
@@ -365,10 +386,12 @@ mod tests {
         let tokens = TokenUsageSnapshot::default();
 
         let full = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 120);
-        assert!(full.contains("openrouter/z-ai/glm-5.2"));
-        assert!(full.contains("extra-high"));
+        assert!(full.contains("⏎ send · / commands · ctrl+o expand"));
         assert!(full.contains("/repo"));
-        assert!(full.contains("Context ?% used"));
+        assert!(full.contains("e???? · z-ai/glm-5.2 · ctx ?% · main"));
+        assert!(!full.contains("openrouter/z-ai/glm-5.2"));
+        assert!(!full.contains("extra-high"));
+        assert!(!full.contains("Context ?% used"));
         assert!(!full.contains("idle"));
         assert!(!full.contains("run"));
         assert!(!full.contains("--"));
@@ -383,7 +406,10 @@ mod tests {
         let tokens = TokenUsageSnapshot::default();
 
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 80);
-        assert_eq!(rendered, "  fixture/echo ? · /repo · Context ?% used");
+        assert_eq!(
+            rendered,
+            "  ⏎ send · / commands · ctrl+o expand · /repo · e???? · echo · ctx ?% · ?"
+        );
     }
 
     #[test]
@@ -409,7 +435,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "  anthropic/fable-5 medium · /euler · Context 12% used"
+            "  ⏎ send · / commands · ctrl+o expand · /euler · e???? · fable-5 · ctx 12% · ?"
         );
         assert_eq!(snapshot.model, "claude-fable-5");
     }
@@ -421,11 +447,14 @@ mod tests {
 
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 80);
 
-        assert_eq!(rendered, "  fixture/echo ? · / · Context ?% used");
+        assert_eq!(
+            rendered,
+            "  ⏎ send · / commands · ctrl+o expand · / · e???? · echo · ctx ?% · ?"
+        );
     }
 
     #[test]
-    fn statusline_names_running_extension_command() {
+    fn statusline_shows_running_queue_and_interrupt_hints() {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
         let tokens = TokenUsageSnapshot::default();
 
@@ -436,7 +465,8 @@ mod tests {
             120,
         );
 
-        assert!(rendered.contains("running extension causal-dag.catch-up"));
+        assert!(rendered.contains("⏎ queue · esc interrupt now"));
+        assert!(!rendered.contains("running extension causal-dag.catch-up"));
     }
 
     #[test]
@@ -449,13 +479,11 @@ mod tests {
 
         assert!(spans
             .iter()
-            .any(|span| span.content.contains("fixture/echo") && span.style == theme.status.model));
+            .any(|span| span.content.contains("e???? · echo · ctx ?% · ?")
+                && span.style == theme.status.model));
         assert!(spans
             .iter()
             .any(|span| span.content.contains("/repo") && span.style == theme.status.state));
-        assert!(spans
-            .iter()
-            .any(|span| span.content == "Context ?% used" && span.style == theme.status.ctx));
         assert!(spans
             .iter()
             .any(|span| span.content == " · " && span.style == theme.status.base));
@@ -497,7 +525,7 @@ mod tests {
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 72);
 
         assert!(display_width(&rendered) < 72);
-        assert!(rendered.contains("Context ?% used"));
+        assert!(rendered.contains("ctx ?%"));
 
         for width in 1..=10 {
             let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, width);

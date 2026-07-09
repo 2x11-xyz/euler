@@ -257,7 +257,7 @@ mod tests {
         let error = save_theme_preference(&path, "solarized").expect_err("unknown theme");
         assert!(error
             .to_string()
-            .contains("theme preference must be one of gruvbox-dark|gruvbox-light"));
+            .contains("theme preference must be one of gruvbox-dark|gruvbox-light|warm-ledger"));
     }
 
     #[test]

@@ -6,9 +6,9 @@
 
 use super::text::display_width;
 use super::theme::Theme;
-use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 use std::{borrow::Cow, ops::Range};
@@ -98,6 +98,8 @@ struct Renderer<'a> {
     styles: Vec<Style>,
     lists: Vec<ListState>,
     code_block: bool,
+    code_language: String,
+    heading: Option<HeadingLevel>,
     quote_depth: usize,
     table: Option<TableState>,
 }
@@ -118,6 +120,8 @@ impl<'a> Renderer<'a> {
             styles: vec![theme.scopes.markup.body],
             lists: Vec::new(),
             code_block: false,
+            code_language: String::new(),
+            heading: None,
             quote_depth: 0,
             table: None,
         }
@@ -144,7 +148,7 @@ impl<'a> Renderer<'a> {
         match tag {
             Tag::Paragraph => {}
             Tag::BlockQuote(_) => self.quote_depth += 1,
-            Tag::CodeBlock(_) => self.start_code_block(),
+            Tag::CodeBlock(kind) => self.start_code_block(kind),
             Tag::List(next) => self.lists.push(ListState { next }),
             Tag::Item => self.start_item(),
             Tag::Emphasis => self.push_style(self.theme.scopes.markup.emphasis),
@@ -154,17 +158,18 @@ impl<'a> Renderer<'a> {
             Tag::Table(alignments) => self.table = Some(TableState::new(alignments)),
             Tag::TableRow => {}
             Tag::TableCell => {}
-            Tag::Heading { .. } => self.push_style(self.theme.scopes.markup.strong),
+            Tag::Heading { level, .. } => self.start_heading(level),
             _ => {}
         }
     }
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Heading(_) => {
+            TagEnd::Paragraph => {
                 self.flush_current();
                 self.push_block_gap();
             }
+            TagEnd::Heading(_) => self.end_heading(),
             TagEnd::BlockQuote(_) => self.quote_depth = self.quote_depth.saturating_sub(1),
             TagEnd::CodeBlock => {
                 self.end_code_block();
@@ -219,14 +224,57 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn start_code_block(&mut self) {
+    fn start_code_block(&mut self, kind: CodeBlockKind<'_>) {
         self.flush_current();
         self.code_block = true;
+        self.code_language = match kind {
+            CodeBlockKind::Fenced(info) => info
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+            CodeBlockKind::Indented => String::new(),
+        };
+        if !self.code_language.is_empty() {
+            self.lines.push(Line::from(Span::styled(
+                format!("    {}", self.code_language),
+                self.theme.transcript.gutter,
+            )));
+        }
     }
 
     fn end_code_block(&mut self) {
         self.flush_current();
         self.code_block = false;
+        self.code_language.clear();
+    }
+
+    fn start_heading(&mut self, level: HeadingLevel) {
+        self.flush_current();
+        self.heading = Some(level);
+        let style = if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+            Style::default()
+                .fg(self.theme.palette.warning)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            self.theme.scopes.markup.strong
+        };
+        self.push_style(style);
+    }
+
+    fn end_heading(&mut self) {
+        let underline = self
+            .heading
+            .take()
+            .is_some_and(|level| matches!(level, HeadingLevel::H1 | HeadingLevel::H2));
+        self.flush_current();
+        self.styles.pop();
+        if underline {
+            self.lines.push(Line::from(Span::styled(
+                "─".repeat(usize::from(self.width).max(1)),
+                self.theme.transcript.gutter,
+            )));
+        }
     }
 
     fn start_item(&mut self) {
@@ -252,9 +300,15 @@ impl<'a> Renderer<'a> {
         for line in text.split_inclusive('\n') {
             let line = line.strip_suffix('\n').unwrap_or(line);
             self.current.push(Span::styled(
-                format!("    {line}"),
+                "    ".to_owned(),
                 self.theme.scopes.markup.code,
             ));
+            self.current
+                .extend(super::syntax::highlight_markdown_code_line(
+                    &self.code_language,
+                    line,
+                    self.theme,
+                ));
             self.flush_current();
         }
     }

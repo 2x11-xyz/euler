@@ -1311,7 +1311,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(folded.contains("8 hidden lines"), "folded: {folded:?}");
+    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
 
     assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::Render);
@@ -1322,7 +1322,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     );
     assert_eq!(core.visual_scroll_offset(), 0);
     let expanded = drain_finalized_visual_text(&mut core, 80);
-    assert!(!expanded.contains("hidden lines"), "expanded: {expanded:?}");
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
     assert_eq!(core.bottom.composer().submit_text(), "");
 
@@ -1331,10 +1331,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
         CoreEffect::ReplayHistoryWithScrollbackPurge
     );
     let refolded = drain_finalized_visual_text(&mut core, 80);
-    assert!(
-        refolded.contains("8 hidden lines"),
-        "refolded: {refolded:?}"
-    );
+    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
 }
 
@@ -1350,11 +1347,11 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw folded");
     let folded = terminal.backend().screen_contents();
-    assert!(folded.contains("44 hidden lines"), "folded: {folded:?}");
+    assert!(folded.contains("44 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
     let folded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
-        folded_scrollback.contains("44 hidden lines"),
+        folded_scrollback.contains("44 more lines"),
         "folded summary should commit to native scrollback: {folded_scrollback:?}"
     );
 
@@ -1378,7 +1375,7 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw expanded");
     let expanded = terminal.backend().screen_contents();
-    assert!(!expanded.contains("hidden lines"), "expanded: {expanded:?}");
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 48"), "expanded: {expanded:?}");
     let expanded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
@@ -1406,14 +1403,11 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw refolded");
     let refolded = terminal.backend().screen_contents();
-    assert!(
-        refolded.contains("44 hidden lines"),
-        "refolded: {refolded:?}"
-    );
+    assert!(refolded.contains("44 more lines"), "refolded: {refolded:?}");
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
     let refolded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
-        refolded_scrollback.contains("44 hidden lines"),
+        refolded_scrollback.contains("44 more lines"),
         "refold replay should commit folded summary: {refolded_scrollback:?}"
     );
 }
@@ -1593,13 +1587,12 @@ fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
 fn ctrl_o_expands_shell_artifacts_without_expanding_patch_cells() {
     let mut core = core();
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
-    let patch_line = format!("old {}", TOOL_CALL_MAX_LINES + 10);
     core.push_finalized_visual_item(patch_artifact_with_lines(TOOL_CALL_MAX_LINES + 14));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(folded.contains("8 hidden lines"), "folded: {folded:?}");
+    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("bounded patch"), "folded: {folded:?}");
-    assert!(folded.contains(&patch_line), "folded: {folded:?}");
+    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
 
     assert_eq!(
         core.handle_input(ctrl_o()),
@@ -1607,16 +1600,13 @@ fn ctrl_o_expands_shell_artifacts_without_expanding_patch_cells() {
     );
     let expanded = drain_finalized_visual_text(&mut core, 80);
 
-    assert!(
-        !expanded.contains("8 hidden lines"),
-        "expanded: {expanded:?}"
-    );
+    assert!(!expanded.contains("8 more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
     assert!(
         !expanded.contains("bounded patch"),
         "expanded: {expanded:?}"
     );
-    assert!(expanded.contains(&patch_line), "expanded: {expanded:?}");
+    assert!(expanded.contains("ctrl+o expand"), "expanded: {expanded:?}");
 }
 
 #[test]
@@ -1627,7 +1617,7 @@ fn ctrl_o_without_foldable_artifact_is_noop_and_does_not_edit_composer() {
     assert_eq!(core.handle_input(ctrl_o()), CoreEffect::None);
 
     assert_eq!(core.bottom.composer().submit_text(), "");
-    assert!(!drain_finalized_visual_text(&mut core, 80).contains("hidden lines"));
+    assert!(!drain_finalized_visual_text(&mut core, 80).contains("more lines"));
 }
 
 #[test]
@@ -1639,7 +1629,7 @@ fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     assert_eq!(modal_core.handle_input(ctrl_o()), CoreEffect::None);
     let modal_text = drain_finalized_visual_text(&mut modal_core, 80);
     assert!(
-        modal_text.contains("8 hidden lines"),
+        modal_text.contains("8 more lines"),
         "modal_text: {modal_text:?}"
     );
     assert!(matches!(modal_core.modal, Some(Modal::Permission(_))));
@@ -1651,7 +1641,7 @@ fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     assert_eq!(palette_core.handle_input(ctrl_o()), CoreEffect::None);
     let palette_text = drain_finalized_visual_text(&mut palette_core, 80);
     assert!(
-        palette_text.contains("8 hidden lines"),
+        palette_text.contains("8 more lines"),
         "palette_text: {palette_text:?}"
     );
     let BottomOwner::Palette(palette) = palette_core.bottom.owner() else {
@@ -1685,7 +1675,7 @@ fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!text.contains("hidden lines"), "text: {text:?}");
+    assert!(!text.contains("more lines"), "text: {text:?}");
     assert!(text.contains("line 3"), "text: {text:?}");
     assert!(core.turn_in_flight());
 
@@ -1703,7 +1693,7 @@ fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
     assert!(refolded.committable_rows > 0);
     assert!(refolded.committable_rows <= refolded.history_rows);
     assert!(
-        refolded_text.contains("hidden lines"),
+        refolded_text.contains("more lines"),
         "refolded_text: {refolded_text:?}"
     );
     assert!(core.turn_in_flight());
@@ -2599,8 +2589,8 @@ fn layout_renders_at_80_by_24_and_after_resize() {
     terminal.backend_mut().resize(120, 40);
     assert!(terminal.draw(|frame| core.render(frame)).is_ok());
     let resized = terminal.backend().screen_contents();
-    assert!(resized.contains("fixture/echo"));
-    assert!(resized.contains("Context ?% used"));
+    assert!(resized.contains("echo · ctx ?%"));
+    assert!(!resized.contains("Context ?% used"));
 }
 
 #[test]
@@ -2615,7 +2605,8 @@ fn footer_context_is_unknown_before_first_model_result() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Context ?% used"));
+    assert!(contents.contains("ctx ?%"));
+    assert!(!contents.contains("Context ?% used"));
 }
 
 #[test]
@@ -2635,7 +2626,7 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
     assert_eq!(
         rendered,
-        "  fixture/echo medium · /euler · Context 12% used"
+        "  ⏎ send · / commands · ctrl+o expand · /euler · session · echo · ctx 12% · ?"
     );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
@@ -2657,14 +2648,14 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  fixture/echo medium · /euler · Context 12% used"
+        "  ⏎ send · / commands · ctrl+o expand · /euler · session · echo · ctx 12% · ?"
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  fixture/other medium · /euler · Context ?% used"
+        "  ⏎ send · / commands · ctrl+o expand · /euler · session · other · ctx ?% · ?"
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -2673,7 +2664,7 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  fixture/other medium · /euler · Context 13% used"
+        "  ⏎ send · / commands · ctrl+o expand · /euler · session · other · ctx 13% · ?"
     );
 }
 
@@ -2827,7 +2818,7 @@ fn large_patch_modal_keeps_diff_bounded() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("bounded patch"));
+    assert!(contents.contains("ctrl+o expand"));
     assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
     assert!(!contents.contains("line 119"));
 }

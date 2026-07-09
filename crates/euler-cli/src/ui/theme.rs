@@ -113,7 +113,20 @@ impl Theme {
         match choice {
             ThemeChoice::GruvboxDark => Self::default_dark(),
             ThemeChoice::GruvboxLight => Self::default_light(),
+            ThemeChoice::WarmLedger => Self::warm_ledger(),
         }
+    }
+
+    pub fn warm_ledger() -> Self {
+        Self::warm_ledger_with(ThemeOptions {
+            color_level: ColorLevel::TrueColor,
+            background: BackgroundMode::Opaque(Color::Rgb(0x26, 0x23, 0x19)),
+        })
+    }
+
+    pub fn warm_ledger_with(options: ThemeOptions) -> Self {
+        let palette = PaletteSeed::warm_ledger().resolve(options);
+        Self::from_palette(palette, options)
     }
 
     pub fn default_dark() -> Self {
@@ -282,6 +295,33 @@ impl PaletteSeed {
         }
     }
 
+    /// Warm Ledger design-board reference palette (roles → existing slots).
+    fn warm_ledger() -> Self {
+        Self {
+            foreground: Color::Rgb(0xec, 0xe4, 0xcb),
+            background: Color::Rgb(0x26, 0x23, 0x19),
+            surface: Color::Rgb(0x1f, 0x1d, 0x15),
+            surface_high: Color::Rgb(0x38, 0x31, 0x1c),
+            selection: Color::Rgb(0x38, 0x31, 0x1c),
+            added: Color::Rgb(0x9d, 0xb8, 0x77),
+            removed: Color::Rgb(0xc1, 0x55, 0x3f),
+            changed: Color::Rgb(0xd7, 0xa8, 0x3c),
+            muted: Color::Rgb(0x8b, 0x85, 0x70),
+            warning: Color::Rgb(0xd7, 0xa8, 0x3c),
+            error: Color::Rgb(0xc1, 0x55, 0x3f),
+            code: Color::Rgb(0xd7, 0xa8, 0x3c),
+            user: Color::Rgb(0x9d, 0xb8, 0x77),
+            assistant: Color::Rgb(0xec, 0xe4, 0xcb),
+            tool: Color::Rgb(0x4f, 0x8f, 0x8b),
+            gutter: Color::Rgb(0x5f, 0x58, 0x4a),
+            cursor: Color::Rgb(0xd7, 0xa8, 0x3c),
+            st_state: Color::Rgb(0x4f, 0x8f, 0x8b),
+            st_model: Color::Rgb(0xec, 0xe4, 0xcb),
+            st_cost: Color::Rgb(0xd7, 0xa8, 0x3c),
+            st_ctx: Color::Rgb(0x9d, 0xb8, 0x77),
+        }
+    }
+
     fn resolve(self, options: ThemeOptions) -> Palette {
         let background = options.background.resolved(self.background);
         let tint_base = self.background;
@@ -442,7 +482,9 @@ impl TranscriptTheme {
                 .add_modifier(Modifier::BOLD),
             assistant: Style::default().fg(palette.assistant),
             model: Style::default().fg(palette.muted),
-            reasoning: Style::default().fg(palette.changed),
+            reasoning: Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::ITALIC),
             tool: Style::default().fg(palette.tool),
             tool_error: Style::default()
                 .fg(palette.error)
@@ -505,7 +547,7 @@ impl MarkupScopes {
             strong: Style::default()
                 .fg(palette.foreground)
                 .add_modifier(Modifier::BOLD),
-            code: Style::default().fg(palette.code),
+            code: Style::default().fg(palette.tool).bg(palette.surface),
             link: Style::default()
                 .fg(palette.tool)
                 .add_modifier(Modifier::UNDERLINED),
@@ -530,17 +572,24 @@ pub struct DiffScopes {
 impl DiffScopes {
     fn from_palette(palette: &Palette) -> Self {
         Self {
-            inserted: Style::default().fg(palette.added),
-            inserted_body: Style::default().fg(palette.foreground),
-            deleted: Style::default().fg(palette.removed),
-            deleted_body: Style::default().fg(palette.muted),
+            inserted: Style::default().fg(palette.added).bg(palette.added_tint),
+            inserted_body: Style::default()
+                .fg(palette.foreground)
+                .bg(palette.added_tint),
+            deleted: Style::default()
+                .fg(palette.removed)
+                .bg(palette.removed_tint),
+            deleted_body: Style::default()
+                .fg(palette.muted)
+                .bg(palette.removed_tint)
+                .add_modifier(Modifier::DIM),
             changed: Style::default()
                 .fg(palette.changed)
                 .bg(palette.changed_tint),
             context: Style::default().fg(palette.muted),
             hunk: Style::default()
-                .fg(palette.tool)
-                .add_modifier(Modifier::BOLD),
+                .fg(palette.gutter)
+                .add_modifier(Modifier::ITALIC),
         }
     }
 }
@@ -571,17 +620,17 @@ impl SyntaxScopes {
                 .fg(palette.muted)
                 .add_modifier(Modifier::ITALIC),
             keyword: Style::default().fg(palette.warning),
-            type_name: Style::default().fg(palette.changed),
-            function: Style::default().fg(palette.added),
+            type_name: Style::default().fg(palette.warning),
+            function: Style::default().fg(palette.tool),
             string: Style::default().fg(palette.added),
-            number: Style::default().fg(palette.changed),
-            constant: Style::default().fg(palette.changed),
+            number: Style::default().fg(palette.added),
+            constant: Style::default().fg(palette.added),
             variable: Style::default().fg(palette.foreground),
-            property: Style::default().fg(palette.tool),
+            property: Style::default().fg(palette.foreground),
             operator: Style::default().fg(palette.warning),
-            punctuation: Style::default().fg(palette.gutter),
+            punctuation: Style::default().fg(palette.foreground),
             macro_name: Style::default().fg(palette.tool),
-            attribute: Style::default().fg(palette.changed),
+            attribute: Style::default().fg(palette.warning),
         }
     }
 
@@ -831,8 +880,14 @@ mod tests {
         });
 
         assert!(matches!(theme.palette.added_tint, Color::Rgb(_, _, _)));
-        assert_eq!(theme.scopes.diff.inserted.bg, None);
-        assert_eq!(theme.scopes.diff.deleted.bg, None);
+        assert_eq!(
+            theme.scopes.diff.inserted.bg,
+            Some(theme.palette.added_tint)
+        );
+        assert_eq!(
+            theme.scopes.diff.deleted.bg,
+            Some(theme.palette.removed_tint)
+        );
         assert_ne!(theme.palette.added_tint, theme.palette.added);
     }
 
@@ -910,35 +965,59 @@ mod tests {
         let theme = Theme::default_dark();
         assert_eq!(theme.scopes.markup.inserted.fg, Some(theme.palette.added));
         assert_eq!(theme.scopes.markup.deleted.fg, Some(theme.palette.removed));
-        assert_eq!(theme.scopes.diff.hunk.fg, Some(theme.palette.tool));
+        assert_eq!(theme.scopes.diff.hunk.fg, Some(theme.palette.gutter));
         assert_eq!(theme.scopes.diff.context.fg, Some(theme.palette.muted));
         assert_eq!(theme.scopes.diff.inserted.fg, Some(theme.palette.added));
-        assert_eq!(theme.scopes.diff.inserted.bg, None);
+        assert_eq!(
+            theme.scopes.diff.inserted.bg,
+            Some(theme.palette.added_tint)
+        );
         assert_eq!(theme.scopes.diff.deleted.fg, Some(theme.palette.removed));
-        assert_eq!(theme.scopes.diff.deleted.bg, None);
+        assert_eq!(
+            theme.scopes.diff.deleted.bg,
+            Some(theme.palette.removed_tint)
+        );
         assert_eq!(
             theme.scopes.diff.inserted_body.fg,
             Some(theme.palette.foreground)
         );
-        assert_eq!(theme.scopes.diff.inserted_body.bg, None);
+        assert_eq!(
+            theme.scopes.diff.inserted_body.bg,
+            Some(theme.palette.added_tint)
+        );
         assert_eq!(theme.scopes.diff.deleted_body.fg, Some(theme.palette.muted));
-        assert_eq!(theme.scopes.diff.deleted_body.bg, None);
+        assert_eq!(
+            theme.scopes.diff.deleted_body.bg,
+            Some(theme.palette.removed_tint)
+        );
     }
 
     #[test]
-    fn light_and_dark_diff_marker_styles_are_sign_only() {
+    fn light_and_dark_diff_marker_styles_carry_subtle_tint() {
         for theme in [Theme::default_dark(), Theme::default_light()] {
             assert_eq!(theme.scopes.diff.inserted.fg, Some(theme.palette.added));
-            assert_eq!(theme.scopes.diff.inserted.bg, None);
+            assert_eq!(
+                theme.scopes.diff.inserted.bg,
+                Some(theme.palette.added_tint)
+            );
             assert_eq!(
                 theme.scopes.diff.inserted_body.fg,
                 Some(theme.palette.foreground)
             );
-            assert_eq!(theme.scopes.diff.inserted_body.bg, None);
+            assert_eq!(
+                theme.scopes.diff.inserted_body.bg,
+                Some(theme.palette.added_tint)
+            );
             assert_eq!(theme.scopes.diff.deleted.fg, Some(theme.palette.removed));
-            assert_eq!(theme.scopes.diff.deleted.bg, None);
+            assert_eq!(
+                theme.scopes.diff.deleted.bg,
+                Some(theme.palette.removed_tint)
+            );
             assert_eq!(theme.scopes.diff.deleted_body.fg, Some(theme.palette.muted));
-            assert_eq!(theme.scopes.diff.deleted_body.bg, None);
+            assert_eq!(
+                theme.scopes.diff.deleted_body.bg,
+                Some(theme.palette.removed_tint)
+            );
         }
     }
 }

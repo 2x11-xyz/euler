@@ -10,6 +10,8 @@ use ratatui::{
 const CONTEXT_EDGE_LINES: usize = 2;
 
 pub(crate) const MIN_LINE_NUMBER_WIDTH: usize = 4;
+pub(crate) const DIFF_PREVIEW_ROWS: usize = 6;
+pub(crate) const NEW_FILE_PREVIEW_ROWS: usize = 5;
 
 /// Compact Codex-style diff row: `{number:>width} {sign} {source}`. One
 /// right-aligned line-number column (old number for deletions, new number
@@ -22,16 +24,36 @@ pub(crate) fn compact_diff_row(
     body_spans: Vec<Span<'static>>,
     theme: &Theme,
 ) -> UiLine<'static> {
+    let row_bg = diff_row_background(sign, theme);
     let mut spans = vec![
         Span::styled(
             format!("{number:>number_width$} "),
-            theme.scopes.diff.context,
+            with_bg(theme.scopes.diff.context, row_bg),
         ),
-        Span::styled(sign.to_owned(), sign_style),
-        Span::styled(" ".to_owned(), theme.scopes.diff.context),
+        Span::styled(sign.to_owned(), with_bg(sign_style, row_bg)),
+        Span::styled(" ".to_owned(), with_bg(theme.scopes.diff.context, row_bg)),
     ];
-    spans.extend(body_spans);
-    UiLine::from(spans)
+    spans.extend(
+        body_spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.into_owned(), with_bg(span.style, row_bg))),
+    );
+    let mut line = UiLine::from(spans);
+    if let Some(bg) = row_bg {
+        line = line.style(Style::default().bg(bg));
+    }
+    line
+}
+
+pub(crate) fn compact_hunk_row(
+    number_width: usize,
+    body: String,
+    theme: &Theme,
+) -> UiLine<'static> {
+    UiLine::from(vec![
+        Span::styled(" ".repeat(number_width + 3), theme.transcript.gutter),
+        Span::styled(body, theme.scopes.diff.hunk),
+    ])
 }
 
 /// Signless rows (hunk gaps, elisions, no-newline markers) indent to the
@@ -45,6 +67,21 @@ pub(crate) fn compact_muted_row(
         Span::styled(" ".repeat(number_width + 1), theme.transcript.gutter),
         Span::styled(body, theme.transcript.muted),
     ])
+}
+
+fn diff_row_background(sign: &str, theme: &Theme) -> Option<ratatui::style::Color> {
+    match sign {
+        "+" => Some(theme.palette.added_tint),
+        "-" => Some(theme.palette.removed_tint),
+        _ => None,
+    }
+}
+
+fn with_bg(mut style: Style, bg: Option<ratatui::style::Color>) -> Style {
+    if let Some(bg) = bg {
+        style = style.bg(bg);
+    }
+    style
 }
 
 pub(crate) struct PatchDisplay<'a> {
@@ -93,7 +130,15 @@ pub(crate) fn render_patch(
         display.old.unwrap_or_default(),
         display.new.unwrap_or_default(),
     );
-    let mut rows = bounded_rows(patch_rows(&patch), limit);
+    let mut rows = bounded_rows(
+        patch_rows(
+            &patch,
+            display.path,
+            display.old.unwrap_or_default(),
+            display.new.unwrap_or_default(),
+        ),
+        limit,
+    );
     if rows.is_empty() {
         rows.push(DiffRow::new("no line changes".to_owned(), RowKind::Muted));
     }
@@ -127,21 +172,30 @@ fn bounded_rows(rows: Vec<DiffRow>, limit: usize) -> Vec<DiffRow> {
     let mut rendered: Vec<_> = rows.into_iter().take(visible).collect();
     if omitted > 0 {
         rendered.push(DiffRow::new(
-            format!("... +{} diff lines hidden (bounded patch)", omitted + 1),
+            format!("… {} more lines · ctrl+o expand", omitted + 1),
             RowKind::Muted,
         ));
     }
     rendered
 }
 
-fn patch_rows(patch: &diffy::Patch<'_, str>) -> Vec<DiffRow> {
+fn patch_rows(patch: &diffy::Patch<'_, str>, path: &str, old: &str, new: &str) -> Vec<DiffRow> {
     let mut rows = Vec::new();
     for hunk in patch.hunks() {
-        // Raw @@ headers stay off the default surface; an explicit gap row
-        // marks the discontinuity between hunks instead.
         if !rows.is_empty() {
             rows.push(DiffRow::new("⋮".to_owned(), RowKind::Muted));
         }
+        rows.push(DiffRow::new(
+            hunk_header(
+                path,
+                old,
+                new,
+                hunk.old_range(),
+                hunk.new_range(),
+                hunk.function_context(),
+            ),
+            RowKind::Hunk,
+        ));
         rows.extend(hunk_rows(
             hunk.old_range(),
             hunk.new_range(),
@@ -149,6 +203,25 @@ fn patch_rows(patch: &diffy::Patch<'_, str>) -> Vec<DiffRow> {
         ));
     }
     rows
+}
+
+fn hunk_header(
+    path: &str,
+    old: &str,
+    new: &str,
+    old_range: HunkRange,
+    new_range: HunkRange,
+    function_context: Option<&str>,
+) -> String {
+    if let Some(context) = function_context.filter(|context| !context.trim().is_empty()) {
+        return format!("@@ {} · line {} @@", context.trim(), new_range.start());
+    }
+    if let Some(symbol) = syntax::enclosing_symbol(path, new, new_range.start())
+        .or_else(|| syntax::enclosing_symbol(path, old, old_range.start()))
+    {
+        return format!("@@ {symbol} · line {} @@", new_range.start());
+    }
+    format!("@@ -{old_range} +{new_range} @@")
 }
 
 fn hunk_rows(
@@ -304,6 +377,7 @@ impl DiffRow {
             RowKind::Context => theme.scopes.diff.context,
             RowKind::Delete => theme.scopes.diff.deleted,
             RowKind::Insert => theme.scopes.diff.inserted,
+            RowKind::Hunk => theme.scopes.diff.hunk,
             RowKind::Muted => theme.transcript.muted,
         }
     }
@@ -312,7 +386,7 @@ impl DiffRow {
         match self.kind {
             RowKind::Delete => DiffBodyKind::Delete,
             RowKind::Insert => DiffBodyKind::Insert,
-            RowKind::Context | RowKind::Muted => DiffBodyKind::Context,
+            RowKind::Context | RowKind::Hunk | RowKind::Muted => DiffBodyKind::Context,
         }
     }
 }
@@ -331,6 +405,7 @@ enum RowKind {
     Context,
     Delete,
     Insert,
+    Hunk,
     Muted,
 }
 
@@ -344,6 +419,9 @@ fn row_to_line(
     let row_style = row.style(theme);
     let body_kind = row.body_kind();
     match row.content {
+        DiffRowContent::Plain(text) if matches!(row.kind, RowKind::Hunk) => {
+            compact_hunk_row(number_width, text, theme)
+        }
         DiffRowContent::Plain(text) => compact_muted_row(number_width, text, theme),
         DiffRowContent::Split { sign, number, body } => compact_diff_row(
             number,
@@ -379,8 +457,6 @@ fn row_spans_to_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Modifier;
-
     #[test]
     fn action_is_derived_from_old_and_new_content() {
         assert_eq!(action(Some(""), Some("new\n")), "add");
@@ -403,15 +479,15 @@ mod tests {
             },
             &theme,
             80,
-            4,
+            5,
         );
         let text = plain_text(&rows);
 
         assert!(text.contains("* Patch proposed (update): src/lib.rs"));
-        assert!(!text.contains("@@"), "raw hunk header leaked: {text:?}");
+        assert!(text.contains("@@ -1,3 +1,4 @@"));
         assert!(text.contains("   2 - b"));
         assert!(text.contains("   2 + beta"));
-        assert!(text.contains("bounded patch"));
+        assert!(text.contains("ctrl+o expand"));
     }
 
     #[test]
@@ -514,14 +590,14 @@ mod tests {
 
         assert_eq!(line_text(row), "   1 + pub fn main() {");
         assert!(row.spans.len() > 4, "spans: {:?}", row.spans);
-        assert_eq!(row.spans[0].style, theme.scopes.diff.context);
+        assert_eq!(row.spans[0].style.fg, theme.scopes.diff.context.fg);
         assert_eq!(row.spans[1].style, theme.scopes.diff.inserted);
         assert!(row.spans[3..]
             .iter()
-            .any(|span| span.style == theme.scopes.syntax.keyword));
+            .any(|span| span.style.fg == theme.scopes.syntax.keyword.fg));
         assert!(row.spans[3..]
             .iter()
-            .any(|span| span.style == theme.scopes.syntax.function));
+            .any(|span| span.style.fg == theme.scopes.syntax.function.fg));
     }
 
     #[test]
@@ -542,9 +618,9 @@ mod tests {
         let row = find_plain_row(&rows, "   1 + pub fn main").expect("insert row");
 
         assert_eq!(row.spans.len(), 4);
-        assert_eq!(row.spans[0].style, theme.scopes.diff.context);
+        assert_eq!(row.spans[0].style.fg, theme.scopes.diff.context.fg);
         assert_eq!(row.spans[1].style, theme.scopes.diff.inserted);
-        assert_eq!(row.spans[2].style, theme.scopes.diff.context);
+        assert_eq!(row.spans[2].style.fg, theme.scopes.diff.context.fg);
         assert_eq!(row.spans[3].style, theme.scopes.diff.inserted_body);
     }
 
@@ -570,26 +646,20 @@ mod tests {
         assert_eq!(line_text(inserted), "   1 + pub fn new_name() {}");
         assert_eq!(deleted.spans[1].content.as_ref(), "-");
         assert_eq!(inserted.spans[1].content.as_ref(), "+");
-        assert_eq!(deleted.spans[0].style, theme.scopes.diff.context);
+        assert_eq!(deleted.spans[0].style.fg, theme.scopes.diff.context.fg);
         assert_eq!(deleted.spans[1].style, theme.scopes.diff.deleted);
-        assert_eq!(inserted.spans[0].style, theme.scopes.diff.context);
+        assert_eq!(inserted.spans[0].style.fg, theme.scopes.diff.context.fg);
         assert_eq!(inserted.spans[1].style, theme.scopes.diff.inserted);
         assert!(
             inserted.spans.len() > 4,
             "inserted spans: {:?}",
             inserted.spans
         );
-        assert!(
-            deleted.spans.len() > 4,
-            "deleted spans: {:?}",
-            deleted.spans
-        );
+        assert_eq!(deleted.spans.len(), 4, "deleted spans: {:?}", deleted.spans);
         assert!(inserted.spans[3..]
             .iter()
-            .any(|span| span.style == theme.scopes.syntax.keyword));
-        assert!(deleted.spans[3..]
-            .iter()
-            .any(|span| span.style.add_modifier.contains(Modifier::DIM)));
+            .any(|span| span.style.fg == theme.scopes.syntax.keyword.fg));
+        assert_eq!(deleted.spans[3].style, theme.scopes.diff.deleted_body);
     }
 
     #[test]
@@ -610,9 +680,9 @@ mod tests {
         let deleted = find_plain_row(&rows, "   1 - fn removed").expect("delete row");
 
         assert_eq!(line_text(deleted), "   1 - fn removed() {}");
-        assert!(deleted.spans.len() > 4, "spans: {:?}", deleted.spans);
+        assert_eq!(deleted.spans.len(), 4, "spans: {:?}", deleted.spans);
         assert_eq!(deleted.spans[0].content.as_ref(), "   1 ");
-        assert_eq!(deleted.spans[0].style, theme.scopes.diff.context);
+        assert_eq!(deleted.spans[0].style.fg, theme.scopes.diff.context.fg);
         assert_eq!(deleted.spans[1].content.as_ref(), "-");
         assert_eq!(deleted.spans[1].style, theme.scopes.diff.deleted);
         assert_eq!(
@@ -622,9 +692,7 @@ mod tests {
                 .collect::<String>(),
             "fn removed() {}"
         );
-        assert!(deleted.spans[3..]
-            .iter()
-            .any(|span| span.style.add_modifier.contains(Modifier::DIM)));
+        assert_eq!(deleted.spans[3].style, theme.scopes.diff.deleted_body);
     }
 
     #[test]
@@ -695,8 +763,8 @@ mod tests {
         let text = plain_text(&rows);
 
         assert_eq!(rows.len(), 9);
-        assert!(text.contains("bounded patch"));
-        assert!(!text.contains("@@"), "raw hunk header leaked: {text:?}");
+        assert!(text.contains("ctrl+o expand"));
+        assert!(text.contains("@@"), "hunk header missing: {text:?}");
         assert!(text.contains("   1 - let value_0 = 0;"));
         assert!(!syntax::source_pair_within_budget(Some(&old), Some(&new)));
     }
