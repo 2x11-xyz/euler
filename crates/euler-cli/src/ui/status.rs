@@ -11,6 +11,21 @@ use std::path::PathBuf;
 
 const SEGMENT_GAP: &str = " · ";
 
+/// Short display form of a session id, for UI surfaces that only need a
+/// glanceable handle (banner, footer identity cluster, exit recap headline).
+/// A full ULID (26 chars) becomes `e` + its last 4 characters lowercased —
+/// the tail of a ULID varies fastest, so it's the most distinguishing sliver
+/// at a glance. Ids already at or under 5 chars (e.g. the `e????`/`e0000`
+/// no-session fallbacks) are returned unchanged. The full id always belongs
+/// in `/status` output and in copy-ready resume commands.
+pub fn short_session_id(id: &str) -> String {
+    if id.len() <= 5 {
+        return id.to_owned();
+    }
+    let tail_start = id.len().saturating_sub(4);
+    format!("e{}", id[tail_start..].to_lowercase())
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TokenUsageSnapshot {
     pub input_tokens: u64,
@@ -210,7 +225,8 @@ fn identity_segment(snapshot: &StatusSnapshot, tokens: &TokenUsageSnapshot) -> S
         .session_id
         .as_deref()
         .filter(|id| !id.is_empty())
-        .unwrap_or("e????");
+        .map(short_session_id)
+        .unwrap_or_else(|| "e????".to_owned());
     let model = compact_model_label(&snapshot.provider, &snapshot.model);
     let model = if model.is_empty() { "?" } else { model };
     let ctx = identity_context_label(tokens);
@@ -266,7 +282,8 @@ fn identity_segment_spans(
         .session_id
         .as_deref()
         .filter(|id| !id.is_empty())
-        .unwrap_or("e????");
+        .map(short_session_id)
+        .unwrap_or_else(|| "e????".to_owned());
     let model = compact_model_label(&snapshot.provider, &snapshot.model);
     let model = if model.is_empty() { "?" } else { model };
     let ctx = identity_context_label(tokens);

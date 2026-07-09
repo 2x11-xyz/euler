@@ -1,5 +1,6 @@
 //! Turn-end recap and exit-recap formatting (Warm Ledger §5.7 / §5.8).
 
+use crate::ui::status::short_session_id;
 use euler_event::{EventEnvelope, EventKind};
 use std::collections::BTreeMap;
 
@@ -299,16 +300,19 @@ pub fn exit_recap_lines(
     event_count: usize,
     files_changed: usize,
 ) -> Vec<ExitRecapLine> {
-    let id = if session_id.is_empty() {
+    let full_id = if session_id.is_empty() {
         "e????"
     } else {
         session_id
     };
+    let short_id = short_session_id(full_id);
     vec![
         ExitRecapLine::Normal(format!(
-            "session {id} saved · {event_count} events · {files_changed} files changed"
+            "session {short_id} saved · {event_count} events · {files_changed} files changed"
         )),
-        ExitRecapLine::Normal(format!("resume  euler --resume {id}")),
+        // The resume command must keep the full ULID so it actually works
+        // when copy-pasted; only the headline above uses the short form.
+        ExitRecapLine::Normal(format!("resume  euler --resume {full_id}")),
         ExitRecapLine::Faint("export  euler extension run session-export …".to_owned()),
     ]
 }
@@ -407,6 +411,23 @@ mod tests {
         assert!(lines.len() <= 5);
         assert!(lines[1].text().contains("euler --resume e0147"));
         assert!(lines[2].is_faint());
+    }
+
+    #[test]
+    fn exit_recap_shortens_saved_headline_but_keeps_full_id_in_resume_command() {
+        let lines = exit_recap_lines("01KX488KQ6DXYPYGB0FK7GFD4T", 42, 3);
+        assert!(
+            lines[0].text().contains("session efd4t saved"),
+            "headline should use the short display id: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1]
+                .text()
+                .contains("euler --resume 01KX488KQ6DXYPYGB0FK7GFD4T"),
+            "resume command must stay copy-ready with the full ULID: {:?}",
+            lines[1]
+        );
     }
 
     #[test]
