@@ -10,8 +10,8 @@ use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
 use crate::ui::glyphs::user_line_prefix;
 use crate::ui::markdown;
 use crate::ui::text::{
-    blank_gutter, content_width, display_width, hairline_content, timestamp_gutter,
-    tree_gutter_pipe, wrap_text, GUTTER_WIDTH,
+    blank_gutter, content_width, display_width, gutter_width, hairline_content, is_ledger_gutter,
+    timestamp_gutter, tree_gutter_pipe, wrap_text,
 };
 use crate::ui::theme::Theme;
 use ratatui::text::{Line, Span};
@@ -496,12 +496,21 @@ fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
 }
 
 fn stamp_first_line(line: &mut Line<'static>, stamp: &str, theme: &Theme) {
-    if line
-        .spans
-        .first()
-        .is_some_and(|span| display_width(span.content.as_ref()) == GUTTER_WIDTH)
-    {
+    if stamp.is_empty() && gutter_width() == 0 {
+        // Timestamp column hidden: leave content unprefixed.
+        return;
+    }
+    if line.spans.first().is_some_and(|span| {
+        let width = display_width(span.content.as_ref());
+        width == gutter_width() || (gutter_width() == 0 && width == 0)
+    }) {
+        if stamp.is_empty() {
+            return;
+        }
         line.spans[0] = Span::styled(stamp.to_owned(), theme.transcript.gutter);
+        return;
+    }
+    if stamp.is_empty() {
         return;
     }
     line.spans
@@ -509,10 +518,15 @@ fn stamp_first_line(line: &mut Line<'static>, stamp: &str, theme: &Theme) {
 }
 
 fn push_hairline(lines: &mut Vec<Line<'static>>, theme: &Theme, content_cols: usize) {
-    lines.push(Line::from(vec![
-        Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
-        Span::styled(hairline_content(content_cols), theme.transcript.gutter),
-    ]));
+    let hairline = Span::styled(hairline_content(content_cols), theme.transcript.gutter);
+    if blank_gutter().is_empty() {
+        lines.push(Line::from(vec![hairline]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
+            hairline,
+        ]));
+    }
 }
 
 fn render_assistant_prose(content: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
@@ -662,7 +676,10 @@ fn push_wrapped(
     theme: &Theme,
     width: u16,
 ) {
-    debug_assert_eq!(display_width(gutter), GUTTER_WIDTH);
+    debug_assert!(
+        is_ledger_gutter(gutter),
+        "invalid ledger gutter: {gutter:?}"
+    );
     for segment in wrap_text(text, content_width(width)) {
         push_wrapped_segment(lines, gutter, segment, style, theme);
     }
@@ -705,9 +722,16 @@ fn push_wrapped_segment(
     style: ratatui::style::Style,
     theme: &Theme,
 ) {
-    debug_assert_eq!(display_width(gutter), GUTTER_WIDTH);
-    lines.push(Line::from(vec![
-        Span::styled(gutter.to_owned(), theme.transcript.gutter),
-        Span::styled(segment, style),
-    ]));
+    debug_assert!(
+        is_ledger_gutter(gutter),
+        "invalid ledger gutter: {gutter:?}"
+    );
+    if gutter.is_empty() {
+        lines.push(Line::from(vec![Span::styled(segment, style)]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(gutter.to_owned(), theme.transcript.gutter),
+            Span::styled(segment, style),
+        ]));
+    }
 }

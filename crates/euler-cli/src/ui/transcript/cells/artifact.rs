@@ -1,4 +1,4 @@
-use crate::ui::text::{blank_gutter, display_width, truncate_display, GUTTER_WIDTH};
+use crate::ui::text::{blank_gutter, display_width, gutter_width, truncate_display};
 use crate::ui::theme::Theme;
 use ratatui::{
     style::Style,
@@ -109,7 +109,7 @@ pub(in crate::ui::transcript) fn push_artifact_cell(
     theme: &Theme,
 ) {
     let width = artifact_width(cell.width);
-    let body_width = width.saturating_sub(GUTTER_WIDTH).max(ARTIFACT_MIN_WIDTH);
+    let body_width = width.saturating_sub(gutter_width()).max(ARTIFACT_MIN_WIDTH);
     let background_style = artifact_background_style(theme);
     let title_style = background_style.patch(cell.style);
     let title = flat_title_row(body_width, cell.title, cell.footer);

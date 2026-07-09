@@ -253,6 +253,7 @@ pub enum CommandAction {
     Quit,
     ScrollViewportToBottom,
     CopyLastAssistantResponse,
+    ToggleTimestamps,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -402,6 +403,11 @@ const COMMAND_TABLE: &[CommandSpec] = &[
         summary: "copy last assistant response",
         args: "",
     },
+    CommandSpec {
+        token: "/timestamps",
+        summary: "toggle timestamp gutter",
+        args: "",
+    },
 ];
 
 pub fn command_table() -> &'static [CommandSpec] {
@@ -533,6 +539,7 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/help" => CommandEffect::Action(CommandAction::ShowHelp { text: help_text() }),
         "/quit" => CommandEffect::Action(CommandAction::Quit),
         "/copy" => CommandEffect::Action(CommandAction::CopyLastAssistantResponse),
+        "/timestamps" => CommandEffect::Action(CommandAction::ToggleTimestamps),
         token => CommandEffect::Message(format!("unknown command: {token}")),
     }
 }
@@ -729,8 +736,10 @@ fn hotkeys_text() -> String {
     [
         "Enter - send message",
         "Shift+Enter - insert newline",
-        "Esc - close palette or interrupt active turn",
+        "Esc - close palette, search, or interrupt active turn",
         "Ctrl+O - expand/collapse folded blocks",
+        "Ctrl+F - search transcript",
+        "@ - mention a workspace file",
         "Ctrl+C twice - quit",
         "Mouse wheel/PageUp/PageDown - scroll transcript",
     ]
@@ -793,6 +802,10 @@ mod tests {
         assert_eq!(
             dispatch_command("/copy", &context),
             CommandEffect::Action(CommandAction::CopyLastAssistantResponse)
+        );
+        assert_eq!(
+            dispatch_command("/timestamps", &context),
+            CommandEffect::Action(CommandAction::ToggleTimestamps)
         );
         assert_eq!(
             dispatch_command("/quit", &context),

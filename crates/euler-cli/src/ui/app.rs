@@ -113,6 +113,9 @@ pub struct AppOptions {
     pub linefeed_history_insert: bool,
     pub theme_choice: ThemeChoice,
     pub theme_preference_path: Option<PathBuf>,
+    /// When false, the timestamp gutter column is hidden (content widens).
+    /// Defaults to true when unset.
+    pub show_timestamp_gutter: Option<bool>,
     pub model_catalog: Option<MergedModelCatalog>,
     pub session_store: Option<SessionStore>,
     pub extensions: ExtensionSelection,
@@ -149,6 +152,7 @@ pub struct AppCore {
     theme: Theme,
     theme_choice: ThemeChoice,
     theme_preference_path: Option<PathBuf>,
+    show_timestamp_gutter: bool,
     editor: Box<dyn ExternalEditorRunner>,
     clipboard: Box<dyn ClipboardSink>,
     pending_runs: VecDeque<PendingRunRequest>,
@@ -523,12 +527,14 @@ impl AppCore {
         let AppOptions {
             theme_choice,
             theme_preference_path,
+            show_timestamp_gutter,
             model_catalog,
             session_store,
             extensions,
             observe,
             ..
         } = options;
+        let show_timestamp_gutter = show_timestamp_gutter.unwrap_or(true);
         let active_session_home_managed = session_store.is_some();
         let model_catalog = model_catalog.unwrap_or_else(|| {
             crate::model_catalog::load_model_catalog(
@@ -581,6 +587,7 @@ impl AppCore {
             theme,
             theme_choice,
             theme_preference_path,
+            show_timestamp_gutter,
             editor: Box::<SystemExternalEditor>::default(),
             clipboard: Box::<SystemClipboard>::default(),
             pending_runs: VecDeque::new(),
@@ -793,6 +800,11 @@ impl AppCore {
             {
                 self.unqueue_selected_input()
             }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_transcript_search()
+            }
             _ if !matches!(self.bottom.owner(), BottomOwner::Composer) => {
                 self.handle_surface_key(key)
             }
@@ -802,6 +814,10 @@ impl AppCore {
             KeyCode::Enter => self.queue_composer_input(),
             _ if is_slash_command_key(&key) && self.bottom.composer().submit_text().is_empty() => {
                 self.bottom.open_palette();
+                CoreEffect::Render
+            }
+            KeyCode::Char('@') if self.should_open_mention_picker() => {
+                self.bottom.open_mention_picker(&self.status.cwd);
                 CoreEffect::Render
             }
             KeyCode::Char(ch) if text_entry_modifiers(key.modifiers) => {
@@ -857,6 +873,9 @@ impl AppCore {
     }
 
     fn handle_surface_key(&mut self, key: KeyEvent) -> CoreEffect {
+        if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
+            return self.handle_search_key(key);
+        }
         match key.code {
             KeyCode::Esc => {
                 let event = self.bottom.cancel();
@@ -880,15 +899,122 @@ impl AppCore {
             }
             KeyCode::Char(ch) => {
                 self.bottom.palette_insert(&ch.to_string());
+                if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
+                    self.refresh_search_matches();
+                }
                 CoreEffect::Render
             }
-            KeyCode::Backspace => self.edit_palette(BottomSurface::palette_backspace),
-            KeyCode::Delete => self.edit_palette(BottomSurface::palette_delete),
+            KeyCode::Backspace => {
+                let effect = self.edit_palette(BottomSurface::palette_backspace);
+                if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
+                    self.refresh_search_matches();
+                }
+                effect
+            }
+            KeyCode::Delete => {
+                let effect = self.edit_palette(BottomSurface::palette_delete);
+                if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
+                    self.refresh_search_matches();
+                }
+                effect
+            }
             KeyCode::Left => self.edit_palette(BottomSurface::palette_move_left),
             KeyCode::Right => self.edit_palette(BottomSurface::palette_move_right),
             KeyCode::Home => self.edit_palette(BottomSurface::palette_move_home),
             KeyCode::End => self.edit_palette(BottomSurface::palette_move_end),
             _ => CoreEffect::None,
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> CoreEffect {
+        match key.code {
+            KeyCode::Esc => {
+                let event = self.bottom.cancel();
+                self.surface_event(event)
+            }
+            KeyCode::Enter => {
+                let previous = enter_key_intent(&key) == Some(EnterKeyIntent::InsertNewline);
+                if let Some(search) = self.bottom.search_mut() {
+                    if previous {
+                        search.previous_match();
+                    } else {
+                        search.next_match();
+                    }
+                }
+                self.scroll_to_current_search_match();
+                CoreEffect::Render
+            }
+            KeyCode::Char(ch)
+                if text_entry_modifiers(key.modifiers) || key.modifiers.is_empty() =>
+            {
+                self.bottom.palette_insert(&ch.to_string());
+                self.refresh_search_matches();
+                self.scroll_to_current_search_match();
+                CoreEffect::Render
+            }
+            KeyCode::Backspace => {
+                self.bottom.palette_backspace();
+                self.refresh_search_matches();
+                self.scroll_to_current_search_match();
+                CoreEffect::Render
+            }
+            KeyCode::Delete => {
+                self.bottom.palette_delete();
+                self.refresh_search_matches();
+                self.scroll_to_current_search_match();
+                CoreEffect::Render
+            }
+            KeyCode::Left => self.edit_palette(BottomSurface::palette_move_left),
+            KeyCode::Right => self.edit_palette(BottomSurface::palette_move_right),
+            KeyCode::Home => self.edit_palette(BottomSurface::palette_move_home),
+            KeyCode::End => self.edit_palette(BottomSurface::palette_move_end),
+            _ => CoreEffect::None,
+        }
+    }
+
+    fn refresh_search_matches(&mut self) {
+        let lines = self.search_haystack_lines();
+        if let Some(search) = self.bottom.search_mut() {
+            search.recompute(&lines);
+        }
+    }
+
+    fn search_haystack_lines(&self) -> Vec<String> {
+        // Plain text of committed history rows only — search is read-only and
+        // must not expand folds or reproject with different limits.
+        let width = self.composer_navigation_width.max(40);
+        let items = self.transcript.live_committed_items();
+        let lines = crate::ui::text::with_timestamp_gutter(self.show_timestamp_gutter, || {
+            transcript::render_items_for_history(&items, &self.theme, width)
+        });
+        lines
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn scroll_to_current_search_match(&mut self) {
+        let Some(line_index) = self
+            .bottom
+            .search()
+            .and_then(|search| search.current_match())
+            .map(|m| m.line_index)
+        else {
+            return;
+        };
+        let total = self.search_haystack_lines().len();
+        let height = self.last_history_viewport.1.max(1);
+        // visual_scroll_offset is rows above the bottom-aligned tail.
+        let bottom_start = total.saturating_sub(height);
+        if line_index >= bottom_start {
+            self.visual_scroll_offset = 0;
+        } else {
+            self.visual_scroll_offset = bottom_start.saturating_sub(line_index);
         }
     }
 
@@ -912,6 +1038,10 @@ impl AppCore {
                 self.bottom.open_palette();
                 CoreEffect::Render
             }
+            KeyCode::Char('@') if self.should_open_mention_picker() => {
+                self.bottom.open_mention_picker(&self.status.cwd);
+                CoreEffect::Render
+            }
             KeyCode::Char(ch) => self.edit_composer_text(|draft| draft.insert_char(ch)),
             KeyCode::Backspace => self.edit_composer_text(|draft| draft.backspace()),
             KeyCode::Delete => self.edit_composer_text(|draft| draft.delete()),
@@ -925,6 +1055,19 @@ impl AppCore {
             KeyCode::End => self.move_composer_cursor(|draft| draft.move_end()),
             _ => CoreEffect::None,
         }
+    }
+
+    fn should_open_mention_picker(&self) -> bool {
+        // Open when `@` starts a token (start of draft or after whitespace).
+        let text = self.bottom.composer().render_text();
+        let cursor = self.bottom.composer().cursor_offset();
+        if cursor == 0 {
+            return true;
+        }
+        let units: Vec<char> = text.chars().collect();
+        units
+            .get(cursor.saturating_sub(1))
+            .is_some_and(|ch| ch.is_whitespace())
     }
 
     fn handle_control_key(&mut self, key: KeyEvent) -> Option<CoreEffect> {
@@ -953,9 +1096,21 @@ impl AppCore {
             {
                 Some(self.unqueue_selected_input())
             }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(self.open_transcript_search())
+            }
             KeyCode::Esc => Some(CoreEffect::None),
             _ => None,
         }
+    }
+
+    fn open_transcript_search(&mut self) -> CoreEffect {
+        self.disarm_quit_notice();
+        self.bottom.open_search();
+        self.refresh_search_matches();
+        CoreEffect::Render
     }
 
     fn handle_enter(&mut self, intent: EnterKeyIntent) -> CoreEffect {
@@ -1092,6 +1247,10 @@ impl AppCore {
     }
 
     fn handle_submit(&mut self) -> CoreEffect {
+        // Mention segments submit as workspace-relative paths (file references
+        // in the user.message content). A dedicated context.slot.updated path
+        // is deferred until core exposes a non-extension slot writer — do not
+        // invent a parallel canvas channel here.
         let prompt = self.bottom.composer().submit_text();
         if prompt.trim().is_empty() {
             return self.continue_queued_input();
@@ -1222,7 +1381,34 @@ impl AppCore {
             }
             CommandAction::CopyLastAssistantResponse => self.copy_last_assistant_response(),
             CommandAction::NameSession { name } => self.name_current_session(name),
+            CommandAction::ToggleTimestamps => self.toggle_timestamps(),
         }
+    }
+
+    fn toggle_timestamps(&mut self) -> CoreEffect {
+        self.show_timestamp_gutter = !self.show_timestamp_gutter;
+        if let Some(path) = self.theme_preference_path.as_deref() {
+            if let Err(error) =
+                model_preference::save_timestamps_preference(path, self.show_timestamp_gutter)
+            {
+                self.push_notice_item(format!(
+                    "timestamps {}; preference not saved: {error}",
+                    if self.show_timestamp_gutter {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                ));
+                return CoreEffect::Render;
+            }
+        }
+        // Faint confirmation line; also logged as a transcript notice item.
+        let message = if self.show_timestamp_gutter {
+            "timestamps shown".to_owned()
+        } else {
+            "timestamps hidden".to_owned()
+        };
+        self.notice_item(message)
     }
 
     fn rollback_workspace_checkpoint(&mut self, event_id: String) -> CoreEffect {

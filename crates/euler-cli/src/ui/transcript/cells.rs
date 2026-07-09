@@ -1,6 +1,6 @@
 use crate::ui::patch_diff::{self, PatchDisplay};
 use crate::ui::text::{
-    blank_gutter, content_width, display_width, tree_gutter_last, wrap_text, GUTTER_WIDTH,
+    blank_gutter, content_width, display_width, is_ledger_gutter, tree_gutter_last, wrap_text,
 };
 use crate::ui::theme::Theme;
 use ratatui::text::{Line, Span};
@@ -766,8 +766,8 @@ fn push_wrapped_with_prefix(
     theme: &Theme,
     width: u16,
 ) {
-    let first_is_ledger = display_width(prefixes.first) == GUTTER_WIDTH;
-    let next_is_ledger = display_width(prefixes.next) == GUTTER_WIDTH;
+    let first_is_ledger = is_ledger_gutter(prefixes.first);
+    let next_is_ledger = is_ledger_gutter(prefixes.next);
     let first_content = if first_is_ledger {
         0
     } else {

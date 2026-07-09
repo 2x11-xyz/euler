@@ -3183,6 +3183,100 @@ fn drain_finalized_visual_text(core: &mut AppCore, width: u16) -> String {
         .join("\n")
 }
 
+#[test]
+fn ctrl_f_opens_read_only_transcript_search() {
+    let mut core = core();
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert!(matches!(core.bottom.owner(), BottomOwner::Search(_)));
+    let status = core.canvas_status_snapshot(80);
+    assert!(
+        status.line.plain_text().contains("find:"),
+        "search should replace footer hints: {}",
+        status.line.plain_text()
+    );
+
+    core.handle_input(key(KeyCode::Char('x')));
+    assert!(matches!(core.bottom.owner(), BottomOwner::Search(_)));
+    // Search must not clear fold state.
+    assert!(core.expanded_artifact_keys.is_empty());
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_eq!(core.visual_scroll_offset, 0);
+}
+
+#[test]
+fn timestamps_toggle_persists_and_logs_confirmation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let preference_path = temp.path().join("preferences.json");
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            theme_preference_path: Some(preference_path.clone()),
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+
+    assert!(core.show_timestamp_gutter);
+    assert_eq!(
+        core.handle_command_action(CommandAction::ToggleTimestamps),
+        CoreEffect::Render
+    );
+    assert!(!core.show_timestamp_gutter);
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        text.contains("timestamps hidden"),
+        "expected confirmation in transcript: {text}"
+    );
+    assert_eq!(
+        crate::model_preference::load_timestamps_preference(&preference_path),
+        crate::model_preference::TimestampsPreferenceLoad::Loaded(false)
+    );
+
+    assert_eq!(
+        core.handle_command_action(CommandAction::ToggleTimestamps),
+        CoreEffect::Render
+    );
+    assert!(core.show_timestamp_gutter);
+}
+
+#[test]
+fn at_mention_inserts_path_token_into_composer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join("src")).expect("src");
+    std::fs::write(temp.path().join("src/lib.rs"), "fn x() {}").expect("write");
+    let mut core = core_with_provider_at(EchoProvider, temp.path());
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('@'))),
+        CoreEffect::Render
+    );
+    assert!(matches!(core.bottom.owner(), BottomOwner::Mention(_)));
+
+    // Narrow to the only file if needed, then confirm.
+    for ch in "lib".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    let text = core.bottom.composer().render_text();
+    assert!(
+        text.contains("lib.rs") || text.contains("@"),
+        "composer should show mention path: {text:?}"
+    );
+    assert!(
+        !core.bottom.composer().mentioned_paths().is_empty()
+            || core.bottom.composer().submit_text().contains("lib.rs"),
+        "mention should attach path for submit"
+    );
+}
+
 fn wait_for_patch_diff(core: &mut AppCore) {
     for _ in 0..100 {
         core.drain_background();

@@ -37,8 +37,11 @@ impl AppCore {
         let snapshot = self.visual_canvas_snapshot(width);
         let theme = self.theme.clone();
         let expanded = self.expanded_artifact_keys.clone();
+        let show_ts = self.show_timestamp_gutter;
         let mut frame = self.visual_canvas.render(snapshot, |items, width| {
-            render_finalized_visual_items(items, &theme, width, TOOL_CALL_MAX_LINES, &expanded)
+            crate::ui::text::with_timestamp_gutter(show_ts, || {
+                render_finalized_visual_items(items, &theme, width, TOOL_CALL_MAX_LINES, &expanded)
+            })
         });
         // Active turns may commit finalized history and the markdown-stable
         // live transcript prefix. If no live prefix exists, keep the boundary
@@ -76,23 +79,27 @@ impl AppCore {
         composer: &CanvasComposerSnapshot,
     ) -> Vec<VisualBlock> {
         let mut blocks = Vec::new();
-        push_visual_block(
-            &mut blocks,
-            VisualBlockRole::Transcript,
-            ratatui_lines_to_canvas(transcript::render_items_for_history(
-                &self.transcript.live_committed_items(),
-                &self.theme,
-                width,
-            )),
-        );
+        let show_ts = self.show_timestamp_gutter;
+        let mut history =
+            ratatui_lines_to_canvas(crate::ui::text::with_timestamp_gutter(show_ts, || {
+                transcript::render_items_for_history(
+                    &self.transcript.live_committed_items(),
+                    &self.theme,
+                    width,
+                )
+            }));
+        self.apply_search_highlights(&mut history);
+        push_visual_block(&mut blocks, VisualBlockRole::Transcript, history);
         push_visual_block(
             &mut blocks,
             VisualBlockRole::LiveTranscript,
-            ratatui_lines_to_canvas(transcript::render_items_for_history(
-                &self.transcript.live_mutable_items(),
-                &self.theme,
-                width,
-            )),
+            ratatui_lines_to_canvas(crate::ui::text::with_timestamp_gutter(show_ts, || {
+                transcript::render_items_for_history(
+                    &self.transcript.live_mutable_items(),
+                    &self.theme,
+                    width,
+                )
+            })),
         );
         self.push_visual_modal_block(width, &mut blocks);
         self.push_visual_permission_block(width, &mut blocks);
@@ -149,10 +156,9 @@ impl AppCore {
         push_visual_block(
             blocks,
             VisualBlockRole::PermissionAsk,
-            ratatui_lines_to_canvas(transcript::render_items_for_history(
-                &[item],
-                &self.theme,
-                width,
+            ratatui_lines_to_canvas(crate::ui::text::with_timestamp_gutter(
+                self.show_timestamp_gutter,
+                || transcript::render_items_for_history(&[item], &self.theme, width),
             )),
         );
     }
@@ -207,9 +213,34 @@ impl AppCore {
         );
     }
 
+    fn apply_search_highlights(&self, lines: &mut [CanvasLine]) {
+        let Some(search) = self.bottom.search() else {
+            return;
+        };
+        let select = self.theme.palette.selection;
+        for (index, line) in lines.iter_mut().enumerate() {
+            if !search.line_has_match(index) {
+                continue;
+            }
+            // Matches use select background; the current match tints the whole row.
+            let whole_row = search.is_current_line(index);
+            for span in &mut line.spans {
+                if whole_row || span.style.bg.is_none() {
+                    span.style.bg = Some(select);
+                }
+            }
+        }
+    }
+
     pub(super) fn canvas_status_snapshot(&self, width: u16) -> CanvasStatusSnapshot {
         let target = format!("{}/{}", self.status.provider, self.status.model);
-        let line = status_line_text(&self.status, &self.token_usage, self.turn_status(), width);
+        let line = if let Some(search) = self.bottom.search() {
+            // Spec §5.4: search swaps the footer hint line for `find: · k/N`.
+            let indent = "  ";
+            format!("{indent}{}", search.status_line())
+        } else {
+            status_line_text(&self.status, &self.token_usage, self.turn_status(), width)
+        };
         CanvasStatusSnapshot::new(target, CanvasLine::styled_lossy(line, TextRole::Status))
     }
 
@@ -238,7 +269,10 @@ impl AppCore {
         }
         match self.bottom.owner() {
             BottomOwner::Composer => FocusOwner::Composer,
-            BottomOwner::Palette(_) | BottomOwner::Picker(_) => FocusOwner::BottomSurface,
+            BottomOwner::Palette(_)
+            | BottomOwner::Picker(_)
+            | BottomOwner::Mention(_)
+            | BottomOwner::Search(_) => FocusOwner::BottomSurface,
         }
     }
 }

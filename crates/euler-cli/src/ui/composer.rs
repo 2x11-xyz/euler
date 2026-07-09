@@ -12,6 +12,8 @@ pub struct PasteTokenId(u64);
 enum DraftSegment {
     Text(String),
     Paste(PasteSegment),
+    /// Workspace file mention inserted via `@` palette (atomic, user-role style).
+    Mention(MentionSegment),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +21,12 @@ struct PasteSegment {
     id: PasteTokenId,
     label: String,
     payload: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MentionSegment {
+    /// Workspace-relative path shown and submitted.
+    path: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -70,6 +78,28 @@ impl ComposerDraft {
             payload,
         })]);
         Some(id)
+    }
+
+    /// Insert a workspace file mention as an atomic user-role token.
+    pub fn insert_mention(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        self.splice_at_cursor(vec![DraftSegment::Mention(MentionSegment {
+            path: path.to_owned(),
+        })]);
+    }
+
+    /// Paths attached via `@` mentions, in composer order.
+    pub fn mentioned_paths(&self) -> Vec<String> {
+        self.segments
+            .iter()
+            .filter_map(|segment| match segment {
+                DraftSegment::Mention(mention) => Some(mention.path.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn set_scroll_line(&mut self, scroll_line: usize) {
@@ -248,6 +278,7 @@ impl DraftSegment {
         match self {
             Self::Text(text) => text.clone(),
             Self::Paste(paste) => paste.label.clone(),
+            Self::Mention(mention) => format!("@{}", mention.path),
         }
     }
 
@@ -255,6 +286,8 @@ impl DraftSegment {
         match self {
             Self::Text(text) => text.clone(),
             Self::Paste(paste) => paste.payload.clone(),
+            // Path only: the agent receives a file reference, not a decorative @.
+            Self::Mention(mention) => mention.path.clone(),
         }
     }
 }
@@ -263,6 +296,7 @@ impl DraftSegment {
 enum RenderUnit {
     Text(char),
     Paste(String),
+    Mention(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,7 +326,7 @@ impl RenderUnit {
     fn display_width(&self) -> usize {
         match self {
             Self::Text(ch) => unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(0),
-            Self::Paste(label) => display_width(label),
+            Self::Paste(label) | Self::Mention(label) => display_width(label),
         }
     }
 
@@ -307,6 +341,9 @@ fn render_units(segments: &[DraftSegment]) -> Vec<RenderUnit> {
         match segment {
             DraftSegment::Text(text) => units.extend(text.chars().map(RenderUnit::Text)),
             DraftSegment::Paste(paste) => units.push(RenderUnit::Paste(paste.label.clone())),
+            DraftSegment::Mention(mention) => {
+                units.push(RenderUnit::Mention(format!("@{}", mention.path)));
+            }
         }
     }
     units
@@ -317,7 +354,7 @@ fn segment_units(segments: &[DraftSegment]) -> usize {
         .iter()
         .map(|segment| match segment {
             DraftSegment::Text(text) => text.chars().count(),
-            DraftSegment::Paste(_) => 1,
+            DraftSegment::Paste(_) | DraftSegment::Mention(_) => 1,
         })
         .sum()
 }
@@ -350,11 +387,11 @@ fn split_segment(
 ) -> bool {
     match segment {
         DraftSegment::Text(text) => split_text_segment(text, remaining, left, right),
-        DraftSegment::Paste(_) if *remaining == 0 => {
+        DraftSegment::Paste(_) | DraftSegment::Mention(_) if *remaining == 0 => {
             right.push(segment.clone());
             true
         }
-        DraftSegment::Paste(_) => {
+        DraftSegment::Paste(_) | DraftSegment::Mention(_) => {
             left.push(segment.clone());
             *remaining = remaining.saturating_sub(1);
             false

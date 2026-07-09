@@ -22,6 +22,7 @@ pub(crate) mod markdown_stream;
 pub(crate) mod metrics;
 pub(crate) mod patch_approval;
 pub(crate) mod patch_diff;
+pub(crate) mod search;
 #[allow(dead_code)]
 pub mod status;
 pub(crate) mod syntax;
@@ -39,3 +40,4 @@ mod transcript_patch_tests;
 mod transcript_tests;
 pub mod tui_decider;
 pub mod visual_canvas;
+pub(crate) mod workspace_files;

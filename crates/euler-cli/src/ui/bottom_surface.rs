@@ -4,9 +4,12 @@ use super::commands::{
     ResumeItem, ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
+use super::search::TranscriptSearch;
+use super::workspace_files::{filter_workspace_files, list_workspace_files};
 use crate::ui::text::{display_width, truncate_display};
 use euler_core::ApprovalMode;
 use euler_sdk::Capability;
+use std::path::Path;
 
 const DEFAULT_PICKER_VISIBLE_ROWS: usize = 6;
 const PALETTE_QUERY_PREFIX: &str = "\u{258c} ";
@@ -32,6 +35,8 @@ pub enum BottomOwner {
     Composer,
     Palette(CommandPalette),
     Picker(ReplacementPicker),
+    Search(TranscriptSearch),
+    Mention(MentionPicker),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,7 +119,8 @@ impl BottomSurface {
         match &self.owner {
             BottomOwner::Palette(palette) => Some(palette.render_lines(width)),
             BottomOwner::Picker(picker) => Some(picker.render_lines(width)),
-            BottomOwner::Composer => None,
+            BottomOwner::Mention(mention) => Some(mention.render_lines(width)),
+            BottomOwner::Search(_) | BottomOwner::Composer => None,
         }
     }
 
@@ -122,7 +128,8 @@ impl BottomSurface {
         match &self.owner {
             BottomOwner::Palette(palette) => palette.line_count(),
             BottomOwner::Picker(picker) => picker.line_count(),
-            BottomOwner::Composer => 0,
+            BottomOwner::Mention(mention) => mention.line_count(),
+            BottomOwner::Search(_) | BottomOwner::Composer => 0,
         }
     }
 
@@ -132,7 +139,22 @@ impl BottomSurface {
         }
         match &self.owner {
             BottomOwner::Palette(palette) => Some(palette.cursor_target(width)),
-            BottomOwner::Picker(_) | BottomOwner::Composer => None,
+            BottomOwner::Mention(mention) => Some(mention.cursor_target(width)),
+            BottomOwner::Picker(_) | BottomOwner::Search(_) | BottomOwner::Composer => None,
+        }
+    }
+
+    pub fn search(&self) -> Option<&TranscriptSearch> {
+        match &self.owner {
+            BottomOwner::Search(search) => Some(search),
+            _ => None,
+        }
+    }
+
+    pub fn search_mut(&mut self) -> Option<&mut TranscriptSearch> {
+        match &mut self.owner {
+            BottomOwner::Search(search) => Some(search),
+            _ => None,
         }
     }
 
@@ -148,6 +170,16 @@ impl BottomSurface {
         self.owner = BottomOwner::Palette(CommandPalette::new(saved_draft));
     }
 
+    pub fn open_search(&mut self) {
+        self.owner = BottomOwner::Search(TranscriptSearch::new());
+    }
+
+    pub fn open_mention_picker(&mut self, workspace_root: &Path) {
+        let saved_draft = self.composer.clone();
+        let files = list_workspace_files(workspace_root);
+        self.owner = BottomOwner::Mention(MentionPicker::new(saved_draft, files));
+    }
+
     pub fn open_picker(&mut self, spec: PickerSpec) {
         let draft = self.composer.clone();
         self.open_picker_from_spec(spec, draft);
@@ -157,6 +189,8 @@ impl BottomSurface {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.insert_text(text),
             BottomOwner::Picker(picker) => picker.insert_query_text(text),
+            BottomOwner::Mention(mention) => mention.insert_text(text),
+            BottomOwner::Search(search) => search.insert_text(text),
             BottomOwner::Composer => {}
         }
     }
@@ -165,6 +199,8 @@ impl BottomSurface {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.backspace(),
             BottomOwner::Picker(picker) => picker.backspace_query(),
+            BottomOwner::Mention(mention) => mention.backspace(),
+            BottomOwner::Search(search) => search.backspace(),
             BottomOwner::Composer => {}
         }
     }
@@ -173,31 +209,45 @@ impl BottomSurface {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.delete(),
             BottomOwner::Picker(picker) => picker.clear_query(),
+            BottomOwner::Mention(mention) => mention.delete(),
+            BottomOwner::Search(search) => search.delete(),
             BottomOwner::Composer => {}
         }
     }
 
     pub fn palette_move_left(&mut self) {
-        if let BottomOwner::Palette(palette) = &mut self.owner {
-            palette.move_left();
+        match &mut self.owner {
+            BottomOwner::Palette(palette) => palette.move_left(),
+            BottomOwner::Mention(mention) => mention.move_left(),
+            BottomOwner::Search(search) => search.move_left(),
+            BottomOwner::Picker(_) | BottomOwner::Composer => {}
         }
     }
 
     pub fn palette_move_right(&mut self) {
-        if let BottomOwner::Palette(palette) = &mut self.owner {
-            palette.move_right();
+        match &mut self.owner {
+            BottomOwner::Palette(palette) => palette.move_right(),
+            BottomOwner::Mention(mention) => mention.move_right(),
+            BottomOwner::Search(search) => search.move_right(),
+            BottomOwner::Picker(_) | BottomOwner::Composer => {}
         }
     }
 
     pub fn palette_move_home(&mut self) {
-        if let BottomOwner::Palette(palette) = &mut self.owner {
-            palette.move_home();
+        match &mut self.owner {
+            BottomOwner::Palette(palette) => palette.move_home(),
+            BottomOwner::Mention(mention) => mention.move_home(),
+            BottomOwner::Search(search) => search.move_home(),
+            BottomOwner::Picker(_) | BottomOwner::Composer => {}
         }
     }
 
     pub fn palette_move_end(&mut self) {
-        if let BottomOwner::Palette(palette) = &mut self.owner {
-            palette.move_end();
+        match &mut self.owner {
+            BottomOwner::Palette(palette) => palette.move_end(),
+            BottomOwner::Mention(mention) => mention.move_end(),
+            BottomOwner::Search(search) => search.move_end(),
+            BottomOwner::Picker(_) | BottomOwner::Composer => {}
         }
     }
 
@@ -205,7 +255,8 @@ impl BottomSurface {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.move_down(),
             BottomOwner::Picker(picker) => picker.move_down(),
-            BottomOwner::Composer => {}
+            BottomOwner::Mention(mention) => mention.move_down(),
+            BottomOwner::Search(_) | BottomOwner::Composer => {}
         }
     }
 
@@ -213,13 +264,22 @@ impl BottomSurface {
         match &mut self.owner {
             BottomOwner::Palette(palette) => palette.move_up(),
             BottomOwner::Picker(picker) => picker.move_up(),
-            BottomOwner::Composer => {}
+            BottomOwner::Mention(mention) => mention.move_up(),
+            BottomOwner::Search(_) | BottomOwner::Composer => {}
         }
     }
 
     pub fn autocomplete(&mut self) {
-        if let BottomOwner::Palette(palette) = &mut self.owner {
-            palette.autocomplete_selected();
+        match std::mem::replace(&mut self.owner, BottomOwner::Composer) {
+            BottomOwner::Palette(mut palette) => {
+                palette.autocomplete_selected();
+                self.owner = BottomOwner::Palette(palette);
+            }
+            BottomOwner::Mention(mention) => {
+                // Tab inserts like Enter.
+                let _ = self.confirm_mention(mention);
+            }
+            other => self.owner = other,
         }
     }
 
@@ -227,6 +287,10 @@ impl BottomSurface {
         match std::mem::replace(&mut self.owner, BottomOwner::Composer) {
             BottomOwner::Palette(palette) => self.composer = palette.saved_draft,
             BottomOwner::Picker(picker) => self.composer = picker.saved_draft,
+            BottomOwner::Mention(mention) => self.composer = mention.saved_draft,
+            BottomOwner::Search(_) => {
+                return SurfaceEvent::Action(CommandAction::ScrollViewportToBottom);
+            }
             BottomOwner::Composer => {}
         }
         SurfaceEvent::None
@@ -236,8 +300,25 @@ impl BottomSurface {
         match std::mem::replace(&mut self.owner, BottomOwner::Composer) {
             BottomOwner::Palette(palette) => self.confirm_palette(palette),
             BottomOwner::Picker(picker) => self.confirm_picker(picker),
+            BottomOwner::Mention(mention) => self.confirm_mention(mention),
+            BottomOwner::Search(search) => {
+                // Search Enter is handled by the app (next/prev match) without
+                // leaving search mode; restore owner if confirm was called.
+                self.owner = BottomOwner::Search(search);
+                SurfaceEvent::None
+            }
             BottomOwner::Composer => SurfaceEvent::None,
         }
+    }
+
+    fn confirm_mention(&mut self, mention: MentionPicker) -> SurfaceEvent {
+        let Some(path) = mention.selected_path() else {
+            self.owner = BottomOwner::Mention(mention);
+            return SurfaceEvent::None;
+        };
+        self.composer = mention.saved_draft;
+        self.composer.insert_mention(&path);
+        SurfaceEvent::None
     }
 
     fn confirm_palette(&mut self, palette: CommandPalette) -> SurfaceEvent {
@@ -323,6 +404,156 @@ impl ComposerHistory {
 fn replace_draft_text(draft: &mut ComposerDraft, text: &str) {
     *draft = ComposerDraft::new();
     draft.insert_text(text);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MentionPicker {
+    query: String,
+    cursor: usize,
+    selected: usize,
+    files: Vec<String>,
+    saved_draft: ComposerDraft,
+}
+
+impl MentionPicker {
+    fn new(saved_draft: ComposerDraft, files: Vec<String>) -> Self {
+        Self {
+            query: String::new(),
+            cursor: 0,
+            selected: 0,
+            files,
+            saved_draft,
+        }
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn matches(&self) -> Vec<String> {
+        filter_workspace_files(&self.files, &self.query)
+    }
+
+    pub fn selected_path(&self) -> Option<String> {
+        self.matches().get(self.selected).cloned()
+    }
+
+    fn render_lines(&self, width: u16) -> Vec<String> {
+        let mut lines = vec![truncate_display(
+            &format!("{PALETTE_QUERY_PREFIX}@{}", self.query),
+            usize::from(width),
+        )];
+        let matches = self.matches();
+        let match_count = matches.len();
+        let start = self.selected.saturating_sub(3);
+        lines.extend(
+            matches
+                .into_iter()
+                .enumerate()
+                .skip(start)
+                .take(4)
+                .map(|(index, path)| {
+                    let marker = if index == self.selected { "› " } else { "  " };
+                    truncate_display(&format!("{marker}{path}"), usize::from(width))
+                }),
+        );
+        lines.push(truncate_display(
+            &format!(
+                "({}/{match_count})  Enter/Tab insert  Esc close",
+                self.selected.saturating_add(1).min(match_count)
+            ),
+            usize::from(width),
+        ));
+        lines
+    }
+
+    fn cursor_target(&self, width: u16) -> (u16, u16) {
+        let input_prefix = self.query.chars().take(self.cursor).collect::<String>();
+        let raw_column = display_width(PALETTE_QUERY_PREFIX) + 1 + display_width(&input_prefix);
+        let max_column = usize::from(width.saturating_sub(1));
+        (
+            0,
+            u16::try_from(raw_column.min(max_column)).unwrap_or(u16::MAX),
+        )
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        let byte_index = byte_index_for_char_offset(&self.query, self.cursor);
+        self.query.insert_str(byte_index, text);
+        self.cursor += text.chars().count();
+        self.clamp_selection();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = byte_index_for_char_offset(&self.query, self.cursor);
+        self.cursor -= 1;
+        let start = byte_index_for_char_offset(&self.query, self.cursor);
+        self.query.replace_range(start..end, "");
+        self.clamp_selection();
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.query.chars().count() {
+            return;
+        }
+        let start = byte_index_for_char_offset(&self.query, self.cursor);
+        let end = byte_index_for_char_offset(&self.query, self.cursor + 1);
+        self.query.replace_range(start..end, "");
+        self.clamp_selection();
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.query.chars().count());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.query.chars().count();
+    }
+
+    fn move_down(&mut self) {
+        let len = self.matches().len();
+        if len > 0 {
+            self.selected = (self.selected + 1) % len;
+        }
+    }
+
+    fn move_up(&mut self) {
+        let len = self.matches().len();
+        if len > 0 {
+            self.selected = (self.selected + len - 1) % len;
+        }
+    }
+
+    fn autocomplete_selected(&mut self) {
+        // Selection is committed by confirm/Tab via selected_path.
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.matches().len();
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(len - 1);
+        }
+    }
+
+    fn line_count(&self) -> u16 {
+        let matches = self.matches().len();
+        let start = self.selected.saturating_sub(3);
+        let rows = 2 + matches.saturating_sub(start).min(4);
+        u16::try_from(rows).unwrap_or(u16::MAX)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

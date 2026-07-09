@@ -212,6 +212,8 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let providers = tui_provider_set(run.provider_id.clone(), run.provider, &run.custom_providers);
     let preference_path = model_preference::default_model_preference_path();
     let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
+    let show_timestamp_gutter =
+        load_timestamps_preference(preference_path.as_deref()).unwrap_or(true);
     let mut session = Session::new_with_providers(live_session.config, providers, decider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
     if let Some((_, extension)) = observer {
@@ -224,6 +226,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             linefeed_history_insert: run.linefeed_history_insert,
             theme_choice,
             theme_preference_path: preference_path,
+            show_timestamp_gutter: Some(show_timestamp_gutter),
             model_catalog: Some(run.model_catalog),
             session_store: live_session
                 .refresh
@@ -2043,6 +2046,18 @@ fn load_known_theme_preference(preference_path: Option<&Path>) -> Option<ThemeCh
         ThemePreferenceLoad::Missing => None,
         ThemePreferenceLoad::Ignored(message) => {
             eprintln!("warning: ignored theme preference: {message}");
+            None
+        }
+    }
+}
+
+fn load_timestamps_preference(preference_path: Option<&Path>) -> Option<bool> {
+    let path = preference_path?;
+    match model_preference::load_timestamps_preference(path) {
+        model_preference::TimestampsPreferenceLoad::Loaded(show) => Some(show),
+        model_preference::TimestampsPreferenceLoad::Missing => None,
+        model_preference::TimestampsPreferenceLoad::Ignored(message) => {
+            eprintln!("warning: ignored timestamps preference: {message}");
             None
         }
     }

@@ -432,7 +432,7 @@ fn display_units(draft: &ComposerDraft) -> Vec<DisplayUnit> {
                 });
                 source_offset += 1;
             }
-            RenderUnit::Paste(label) => {
+            RenderUnit::Paste(label) | RenderUnit::Mention(label) => {
                 // The visible placeholder may wrap, but it remains one
                 // editable source unit for cursor movement and deletion.
                 for ch in label.chars() {

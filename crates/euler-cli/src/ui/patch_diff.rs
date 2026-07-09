@@ -1,4 +1,4 @@
-use super::text::{blank_gutter, display_width, GUTTER_WIDTH};
+use super::text::{blank_gutter, is_ledger_gutter};
 use super::theme::Theme;
 use super::{syntax, syntax::DiffBodyKind};
 use diffy::{HunkRange, Line as DiffLine};
@@ -352,7 +352,10 @@ fn push_row(
     style: Style,
     theme: &Theme,
 ) {
-    debug_assert_eq!(display_width(gutter), GUTTER_WIDTH);
+    debug_assert!(
+        is_ledger_gutter(gutter),
+        "invalid ledger gutter: {gutter:?}"
+    );
     lines.push(plain_row_to_line(gutter, text, style, theme));
 }
 
@@ -465,8 +468,14 @@ fn row_spans_to_line(
     spans: Vec<Span<'static>>,
     theme: &Theme,
 ) -> UiLine<'static> {
-    debug_assert_eq!(display_width(gutter), GUTTER_WIDTH);
-    let mut row = vec![Span::styled(gutter.to_owned(), theme.transcript.gutter)];
+    debug_assert!(
+        is_ledger_gutter(gutter),
+        "invalid ledger gutter: {gutter:?}"
+    );
+    let mut row = Vec::with_capacity(spans.len() + 1);
+    if !gutter.is_empty() {
+        row.push(Span::styled(gutter.to_owned(), theme.transcript.gutter));
+    }
     row.extend(spans);
     UiLine::from(row)
 }
@@ -474,6 +483,8 @@ fn row_spans_to_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::text::display_width;
+
     #[test]
     fn action_is_derived_from_old_and_new_content() {
         assert_eq!(action(Some(""), Some("new\n")), "add");

@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use unicode_width::UnicodeWidthChar;
 
 /// Fixed Warm Ledger timestamp column: `HH:MM:SS` + trailing space (9 cells).
 pub(crate) const TIMESTAMP_GUTTER_WIDTH: usize = 9;
-/// Alias so existing `debug_assert_eq!(display_width(gutter), GUTTER_WIDTH)` sites stay valid.
+/// Alias so existing `debug_assert_eq!(display_width(gutter), GUTTER_WIDTH)` sites stay valid
+/// when the timestamp gutter is shown (the default).
 pub(crate) const GUTTER_WIDTH: usize = TIMESTAMP_GUTTER_WIDTH;
 
 const BLANK_GUTTER: &str = "         "; // 9 spaces
@@ -10,28 +12,80 @@ const BLANK_GUTTER: &str = "         "; // 9 spaces
 const TREE_GUTTER_LAST: &str = "       └ ";
 const TREE_GUTTER_MID: &str = "       ├ ";
 const TREE_GUTTER_PIPE: &str = "       | ";
+// Compact nesting when the timestamp column is hidden (content widens).
+const TREE_GUTTER_LAST_NARROW: &str = "└ ";
+const TREE_GUTTER_MID_NARROW: &str = "├ ";
+const TREE_GUTTER_PIPE_NARROW: &str = "| ";
+
+thread_local! {
+    static SHOW_TIMESTAMP_GUTTER: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Run `f` with the timestamp gutter column shown or hidden.
+///
+/// When hidden, ledger gutters collapse so the content column widens; hairlines
+/// and nesting glyphs remain. Default (and outside this scope) is shown.
+pub(crate) fn with_timestamp_gutter<T>(show: bool, f: impl FnOnce() -> T) -> T {
+    SHOW_TIMESTAMP_GUTTER.with(|cell| {
+        let previous = cell.replace(show);
+        let out = f();
+        cell.set(previous);
+        out
+    })
+}
+
+pub(crate) fn timestamp_gutter_shown() -> bool {
+    SHOW_TIMESTAMP_GUTTER.with(Cell::get)
+}
+
+pub(crate) fn gutter_width() -> usize {
+    if timestamp_gutter_shown() {
+        TIMESTAMP_GUTTER_WIDTH
+    } else {
+        0
+    }
+}
 
 pub(crate) fn content_width(width: u16) -> usize {
-    usize::from(width).saturating_sub(GUTTER_WIDTH).max(1)
+    usize::from(width).saturating_sub(gutter_width()).max(1)
 }
 
 pub(crate) fn blank_gutter() -> &'static str {
-    BLANK_GUTTER
+    if timestamp_gutter_shown() {
+        BLANK_GUTTER
+    } else {
+        ""
+    }
 }
 
 pub(crate) fn tree_gutter_last() -> &'static str {
-    TREE_GUTTER_LAST
+    if timestamp_gutter_shown() {
+        TREE_GUTTER_LAST
+    } else {
+        TREE_GUTTER_LAST_NARROW
+    }
 }
 
 pub(crate) fn tree_gutter_mid() -> &'static str {
-    TREE_GUTTER_MID
+    if timestamp_gutter_shown() {
+        TREE_GUTTER_MID
+    } else {
+        TREE_GUTTER_MID_NARROW
+    }
 }
 
 pub(crate) fn tree_gutter_pipe() -> &'static str {
-    TREE_GUTTER_PIPE
+    if timestamp_gutter_shown() {
+        TREE_GUTTER_PIPE
+    } else {
+        TREE_GUTTER_PIPE_NARROW
+    }
 }
 
 pub(crate) fn timestamp_gutter(absolute: Option<&str>) -> String {
+    if !timestamp_gutter_shown() {
+        return String::new();
+    }
     match absolute {
         Some(ts) if display_width(ts) == 8 => {
             let mut out = String::with_capacity(TIMESTAMP_GUTTER_WIDTH);
@@ -60,6 +114,20 @@ pub(crate) fn timestamp_gutter(absolute: Option<&str>) -> String {
 
 pub(crate) fn hairline_content(content_cols: usize) -> String {
     "─".repeat(content_cols.max(1))
+}
+
+/// True when `gutter` is a valid ledger prefix for the current gutter mode.
+pub(crate) fn is_ledger_gutter(gutter: &str) -> bool {
+    let width = display_width(gutter);
+    if timestamp_gutter_shown() {
+        width == TIMESTAMP_GUTTER_WIDTH
+    } else {
+        // Hidden timestamp column: blank (0) or compact tree prefixes.
+        width == 0
+            || gutter == TREE_GUTTER_LAST_NARROW
+            || gutter == TREE_GUTTER_MID_NARROW
+            || gutter == TREE_GUTTER_PIPE_NARROW
+    }
 }
 
 pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -161,5 +229,20 @@ mod tests {
         assert_eq!(display_width(tree_gutter_mid()), 9);
         assert_eq!(display_width(tree_gutter_pipe()), 9);
         assert_eq!(timestamp_gutter(None), blank_gutter());
+    }
+
+    #[test]
+    fn hidden_timestamp_gutter_widens_content() {
+        with_timestamp_gutter(false, || {
+            assert_eq!(gutter_width(), 0);
+            assert_eq!(blank_gutter(), "");
+            assert_eq!(timestamp_gutter(Some("14:32:07")), "");
+            assert_eq!(content_width(80), 80);
+            assert_eq!(tree_gutter_last(), "└ ");
+            assert!(is_ledger_gutter(""));
+            assert!(is_ledger_gutter("└ "));
+        });
+        assert_eq!(gutter_width(), TIMESTAMP_GUTTER_WIDTH);
+        assert_eq!(content_width(80), 71);
     }
 }

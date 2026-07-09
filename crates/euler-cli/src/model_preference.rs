@@ -85,6 +85,59 @@ pub fn save_theme_preference(path: &Path, theme: &str) -> Result<()> {
     write_preference_object(path, payload)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TimestampsPreferenceLoad {
+    Loaded(bool),
+    Missing,
+    Ignored(String),
+}
+
+pub fn load_timestamps_preference(path: &Path) -> TimestampsPreferenceLoad {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return TimestampsPreferenceLoad::Missing
+        }
+        Err(error) => {
+            return TimestampsPreferenceLoad::Ignored(format!(
+                "could not read timestamps preference: {error}"
+            ));
+        }
+    };
+    timestamps_preference_from_json(&contents)
+}
+
+pub fn save_timestamps_preference(path: &Path, show: bool) -> Result<()> {
+    let mut payload = read_preference_object_for_save(path)?;
+    payload.insert("timestamps".to_owned(), Value::Bool(show));
+    write_preference_object(path, payload)
+}
+
+fn timestamps_preference_from_json(contents: &str) -> TimestampsPreferenceLoad {
+    let value: Value = match serde_json::from_str(contents) {
+        Ok(value) => value,
+        Err(error) => {
+            return TimestampsPreferenceLoad::Ignored(format!(
+                "malformed timestamps preference: {error}"
+            ));
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return TimestampsPreferenceLoad::Ignored(
+            "malformed timestamps preference: expected object".to_owned(),
+        );
+    };
+    let Some(timestamps) = object.get("timestamps") else {
+        return TimestampsPreferenceLoad::Missing;
+    };
+    match timestamps.as_bool() {
+        Some(show) => TimestampsPreferenceLoad::Loaded(show),
+        None => TimestampsPreferenceLoad::Ignored(
+            "malformed timestamps preference: timestamps must be a boolean".to_owned(),
+        ),
+    }
+}
+
 fn preference_from_json(contents: &str) -> PreferenceLoad {
     let value: Value = match serde_json::from_str(contents) {
         Ok(value) => value,
@@ -191,6 +244,7 @@ mod tests {
         save_model_preference(&path, "openrouter", "glm-5.2").expect("save");
         save_theme_preference(&path, "light").expect("save theme");
         save_model_preference(&path, "anthropic", "claude-custom").expect("overwrite model");
+        save_timestamps_preference(&path, false).expect("save timestamps");
 
         let contents = fs::read_to_string(&path).expect("read");
         let value: Value = serde_json::from_str(&contents).expect("json");
@@ -200,8 +254,13 @@ mod tests {
             vec![
                 "model".to_owned(),
                 "provider".to_owned(),
-                "theme".to_owned()
+                "theme".to_owned(),
+                "timestamps".to_owned(),
             ]
+        );
+        assert_eq!(
+            load_timestamps_preference(&path),
+            TimestampsPreferenceLoad::Loaded(false)
         );
         assert_eq!(
             load_model_preference(&path),

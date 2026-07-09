@@ -415,7 +415,10 @@ fn push_wrapped(
     theme: &Theme,
     width: u16,
 ) {
-    debug_assert_eq!(display_width(gutter), GUTTER_WIDTH);
+    debug_assert!(
+        display_width(gutter) == GUTTER_WIDTH || gutter.is_empty(),
+        "invalid activity gutter: {gutter:?}"
+    );
 
     for segment in wrap_text(text, content_width(width)) {
         lines.push(Line::from(vec![
