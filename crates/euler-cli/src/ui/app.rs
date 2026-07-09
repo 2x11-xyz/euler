@@ -624,7 +624,8 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         observe,
         ..
     } = options;
-    let show_timestamp_gutter = show_timestamp_gutter.unwrap_or(true);
+    // v2 Warm Spine default: spine only; /timestamps opts the gutter in.
+    let show_timestamp_gutter = show_timestamp_gutter.unwrap_or(false);
     let notifications_enabled = notifications_enabled.unwrap_or(true);
     let active_session_home_managed = session_store.is_some();
     let model_catalog = model_catalog.unwrap_or_else(|| {
