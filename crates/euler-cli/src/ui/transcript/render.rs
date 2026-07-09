@@ -291,6 +291,8 @@ pub(super) fn render_projected_entries_with_expansion(
                 reason,
                 command,
                 scope_prefix,
+                prior_count,
+                selected_option,
                 companion_name,
             } => {
                 render_permission_ask(
@@ -300,6 +302,8 @@ pub(super) fn render_projected_entries_with_expansion(
                         reason,
                         command: command.as_deref(),
                         scope_prefix: scope_prefix.as_deref(),
+                        prior_count: *prior_count,
+                        selected_option: *selected_option,
                         companion_name: companion_name.as_deref(),
                     },
                     theme,

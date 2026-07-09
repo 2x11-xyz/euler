@@ -579,7 +579,9 @@ Still open (do not invent beyond Spec; tag first blocking slice):
 1. Default theme after warm-ledger lands: gruvbox vs warm-ledger — **Slice 1** (ship both; leave default gruvbox until user switches or product picks).
 2. Queue selection arrows vs last-only; queue survives quit/crash? — **Slice 4**.
 3. Search: folded-hidden text or visible only; `!a`/`!f` kind map — **Slice 8**.
-4. Approval “ran before” exact/normalized/prefix; duration & network sources — **Slice 5**.
+4. Approval duration & network sources; ran-before now uses a capability-level
+   prior allowed-decision count until product chooses exact/normalized/prefix
+   event semantics — **Slice 5**.
 5. `/diff` scope: session-attributed vs full working tree — **Slice 9**.
 6. `/usage` cost when catalog has no prices — **Slice 9**.
 7. File-mention freshness guarantee — **Slice 8**.
@@ -588,6 +590,10 @@ Still open (do not invent beyond Spec; tag first blocking slice):
 10. Reduced-motion / no-color: detect vs user setting — **Slice 1 / hardening**.
 11. Notification body privacy limits — **Slice 11**.
 12. Extension manager add/remove/toggle records: current transcript notices must become canonical decision-record ledger events — **Slice 9 debt**.
+13. Shell running state (F27): build a live `ToolRun` projection via the app.rs
+    live-render seam shared with F2 scroll-pill wiring; current transcript only
+    projects completed `tool.result` rows, so spinner + elapsed + ≤2 replacing
+    tail lines are not honest yet — **Slice 1 / live-render debt**.
 
 ## Appendix B · GPT-5.5 audit incorporation checklist
 

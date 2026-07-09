@@ -17,7 +17,7 @@ use super::external_clipboard::{terminal_clipboard_sequence, ClipboardSink, Syst
 use super::external_editor::{EditorResult, ExternalEditorRunner, SystemExternalEditor};
 use super::glyphs::user_line_prefix;
 use super::metrics;
-use super::patch_approval::{self, PatchApprovalModal, PatchPreview};
+use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPreview};
 #[cfg(test)]
 use super::status::status_widget;
 use super::status::{status_line_text, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
@@ -145,6 +145,7 @@ pub struct AppCore {
     composer_navigation_width: u16,
     last_working_elapsed_secs: Option<u64>,
     modal: Option<Modal>,
+    approval_selection: ApprovalOption,
     quit_armed: Option<Instant>,
     notice: Option<String>,
     pending_terminal_clipboard: Option<String>,
@@ -667,6 +668,7 @@ impl AppCore {
             composer_navigation_width: 80,
             last_working_elapsed_secs: None,
             modal: None,
+            approval_selection: ApprovalOption::default(),
             quit_armed: None,
             notice: None,
             pending_terminal_clipboard: None,
@@ -1366,6 +1368,13 @@ impl AppCore {
         // (deny with the typed instruction) or a quit chord decide.
         let draft_empty = self.bottom.composer().submit_text().is_empty();
         match key.code {
+            KeyCode::Up if draft_empty => self.move_approval_selection_up(),
+            KeyCode::Down if draft_empty => self.move_approval_selection_down(),
+            KeyCode::Enter
+                if draft_empty && enter_key_intent(&key) == Some(EnterKeyIntent::Submit) =>
+            {
+                self.reply_to_selected_approval()
+            }
             KeyCode::Char('y') | KeyCode::Char('Y') if draft_empty => {
                 self.reply_to_modal(PermissionReply::AllowOnce)
             }
@@ -1385,6 +1394,31 @@ impl AppCore {
                 CoreEffect::Quit
             }
             _ => self.handle_modal_composer_key(key),
+        }
+    }
+
+    fn move_approval_selection_up(&mut self) -> CoreEffect {
+        self.approval_selection = self.approval_selection.previous();
+        CoreEffect::Render
+    }
+
+    fn move_approval_selection_down(&mut self) -> CoreEffect {
+        self.approval_selection = self.approval_selection.next();
+        CoreEffect::Render
+    }
+
+    fn reply_to_selected_approval(&mut self) -> CoreEffect {
+        match self.approval_selection {
+            ApprovalOption::AllowOnce => self.reply_to_modal(PermissionReply::AllowOnce),
+            ApprovalOption::AllowSession => {
+                let prefix = self.modal_scope_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
+            }
+            ApprovalOption::AllowProject => {
+                let prefix = self.modal_scope_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
+            }
+            ApprovalOption::Deny => self.reply_deny_from_modal(),
         }
     }
 
@@ -2658,6 +2692,7 @@ impl AppCore {
             match self.permission_rx.try_recv() {
                 Ok(request) => {
                     self.drain_turn_events();
+                    self.approval_selection = ApprovalOption::default();
                     self.modal = Some(self.modal_for_request(request));
                     self.queue_notification(NotifyEvent::ApprovalNeeded);
                     changed = true;
@@ -2968,12 +3003,14 @@ impl AppCore {
 
     fn reply_to_modal(&mut self, reply: PermissionReply) -> CoreEffect {
         self.modal = None;
+        self.approval_selection = ApprovalOption::default();
         let _ = self.reply_tx.send(reply);
         CoreEffect::Render
     }
 
     fn deny_open_modal(&mut self) {
         if self.modal.take().is_some() {
+            self.approval_selection = ApprovalOption::default();
             let _ = self.reply_tx.send(PermissionReply::Deny);
         }
     }
@@ -3051,15 +3088,30 @@ impl AppCore {
         let Some(Modal::Permission(request)) = &self.modal else {
             return None;
         };
+        let scope_prefix = patch_approval::derive_scope_prefix(request);
         Some(TranscriptItem::PermissionAsk {
             capability: request.capability.as_str().to_owned(),
             reason: request.reason.clone(),
             command: self
                 .shell_command_for_permission(request)
                 .or_else(|| request.command.clone()),
-            scope_prefix: patch_approval::derive_scope_prefix(request),
+            prior_count: self.prior_permission_count(request, scope_prefix.as_deref()),
+            selected_option: self.approval_selection,
+            scope_prefix,
             companion_name: self.in_flight_companion_name.clone(),
         })
+    }
+
+    fn prior_permission_count(
+        &self,
+        request: &PermissionRequest,
+        scope_prefix: Option<&str>,
+    ) -> usize {
+        transcript::prior_permission_allow_count(
+            self.transcript.events(),
+            request.capability.as_str(),
+            scope_prefix,
+        )
     }
 
     fn shell_command_for_permission(&self, request: &PermissionRequest) -> Option<String> {

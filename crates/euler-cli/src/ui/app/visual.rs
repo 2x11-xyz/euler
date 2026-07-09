@@ -146,6 +146,11 @@ impl AppCore {
             &self.status.cwd,
             &self.theme,
             width,
+            self.prior_permission_count(
+                &modal.request,
+                patch_approval::derive_scope_prefix(&modal.request).as_deref(),
+            ),
+            self.approval_selection,
         ))
     }
 

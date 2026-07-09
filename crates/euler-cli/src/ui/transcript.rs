@@ -1,3 +1,4 @@
+use super::patch_approval::ApprovalOption;
 use super::patch_diff;
 use super::theme::Theme;
 use crate::ui::markdown_stream::MarkdownStreamCollector;
@@ -74,6 +75,10 @@ pub enum TranscriptItem {
         command: Option<String>,
         /// Honest scope prefix for `a`/`p` labels; `None` → unscoped labels.
         scope_prefix: Option<String>,
+        /// Prior allowed decisions for this capability / scope in the session.
+        prior_count: usize,
+        /// Currently highlighted approval option; defaults to allow-once.
+        selected_option: ApprovalOption,
         /// Companion persona/name when the ask bubbles from an in-flight companion.
         companion_name: Option<String>,
     },
@@ -572,6 +577,49 @@ pub(crate) fn render_items_for_history_with_expansion(
         TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
         expanded_artifact_keys,
     )
+}
+
+pub(crate) fn prior_permission_allow_count(
+    events: &[EventEnvelope],
+    capability: &str,
+    scope_prefix: Option<&str>,
+) -> usize {
+    if capability.is_empty() {
+        return 0;
+    }
+    events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .filter(|event| {
+            event
+                .payload
+                .get("allowed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .filter(|event| {
+            event
+                .payload
+                .get("capability")
+                .and_then(serde_json::Value::as_str)
+                == Some(capability)
+        })
+        .filter(|event| prior_permission_scope_matches(event, scope_prefix))
+        .count()
+}
+
+fn prior_permission_scope_matches(event: &EventEnvelope, scope_prefix: Option<&str>) -> bool {
+    let Some(prefix) = scope_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return true;
+    };
+    event
+        .payload
+        .get("grant_pattern")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|pattern| pattern == prefix)
 }
 
 fn project_live_event(event: &EventEnvelope) -> Option<TranscriptItem> {
