@@ -513,9 +513,7 @@ fn render_table(table: TableState, theme: &Theme, width: u16) -> Vec<Line<'stati
     let mut out = Vec::new();
     for (idx, row) in table.rows.iter().enumerate() {
         if idx == 1 {
-            out.push(separator_line(&widths, '━', theme));
-        } else if idx > 1 {
-            out.push(separator_line(&widths, '─', theme));
+            out.push(header_rule_line(&widths, theme));
         }
         out.extend(table_row_lines(
             row,
@@ -662,26 +660,16 @@ fn shrink_widths(mut widths: Vec<usize>, budget: usize) -> Vec<usize> {
     widths
 }
 
-fn separator_line(widths: &[usize], marker: char, theme: &Theme) -> Line<'static> {
-    let fill = marker.to_string();
-    let joint = separator_joint(marker);
+fn header_rule_line(widths: &[usize], theme: &Theme) -> Line<'static> {
     let last = widths.len().saturating_sub(1);
     let mut text = String::new();
     for (idx, width) in widths.iter().enumerate() {
         if idx > 0 {
-            text.push(joint);
+            text.push('┼');
         }
-        text.push_str(&fill.repeat(width + separator_padding_width(idx, last)));
+        text.push_str(&"─".repeat(width + separator_padding_width(idx, last)));
     }
-    Line::from(Span::styled(text, theme.transcript.gutter))
-}
-
-fn separator_joint(marker: char) -> char {
-    if marker == '━' {
-        '╋'
-    } else {
-        '┼'
-    }
+    Line::from(Span::styled(text, theme.transcript.hairline))
 }
 
 fn separator_padding_width(idx: usize, last: usize) -> usize {
