@@ -34,7 +34,8 @@ pub(super) fn render_patch_modal(frame: &mut Frame<'_>, modal: &PatchApprovalMod
         chunks.diff,
     );
     frame.render_widget(
-        Paragraph::new(patch_approval::PROMPT_TEXT).style(theme.transcript.permission),
+        Paragraph::new(patch_approval::options_text(&modal.request))
+            .style(theme.transcript.permission),
         chunks.prompt,
     );
 }

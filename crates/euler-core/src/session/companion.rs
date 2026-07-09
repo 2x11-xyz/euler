@@ -2,10 +2,10 @@
 
 use super::{
     approval_mode_str, canvas_snapshot_payload, context_budget_exhausted, elapsed_ms,
-    file_change_payload, file_diff_payload, model_input_item, permission_decision_payload,
-    permission_request_for_tool, used_tokens, validate_model_target_shape, ModelRoundData,
-    ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session, SessionError,
-    TurnState, SYSTEM_INSTRUCTIONS,
+    file_change_payload, file_diff_payload, maybe_store_pre_image, model_input_item,
+    permission_decision_payload, permission_request_for_tool, used_tokens,
+    validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig,
+    RoundLoopIo, RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
@@ -37,6 +37,7 @@ struct CompanionLoop<'a, D> {
     agent_id: String,
     target: ModelTarget,
     task: AgentTask,
+    workspace_root: std::path::PathBuf,
     auto_compaction: AutoCompactionPolicy,
     reasoning_effort: ReasoningEffort,
     max_output_tokens: Option<u64>,
@@ -186,6 +187,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             agent_id,
             target,
             task,
+            workspace_root: session.config.root.clone(),
             auto_compaction: session.config.auto_compaction,
             reasoning_effort: session.config.reasoning_effort,
             max_output_tokens,
@@ -363,10 +365,11 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let patch_applied_id = self
             .append(EventKind::PATCH_APPLIED, payload, Some(patch_proposed_id))?
             .id;
+        let pre_image_blob = maybe_store_pre_image(self.workspace_root.as_path(), patch);
         let file_change_id = self
             .append(
                 EventKind::FILE_CHANGE,
-                file_change_payload(&call.id, patch),
+                file_change_payload(&call.id, patch, pre_image_blob.as_deref()),
                 Some(patch_applied_id.clone()),
             )?
             .id;

@@ -1,6 +1,7 @@
 use super::commands::{
-    dispatch_command, filter_commands, CommandAction, CommandContext, CommandEffect, CommandSpec,
-    EffortChoice, ModelChoice, PermissionChoice, PickerSpec, ResumeItem, ThemeChoiceItem,
+    dispatch_command, filter_commands, CheckpointItem, CommandAction, CommandContext,
+    CommandEffect, CommandSpec, EffortChoice, ModelChoice, PermissionChoice, PickerSpec,
+    ResumeItem, ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
 use crate::ui::text::{display_width, truncate_display};
@@ -145,6 +146,11 @@ impl BottomSurface {
     pub fn open_palette(&mut self) {
         let saved_draft = self.composer.clone();
         self.owner = BottomOwner::Palette(CommandPalette::new(saved_draft));
+    }
+
+    pub fn open_picker(&mut self, spec: PickerSpec) {
+        let draft = self.composer.clone();
+        self.open_picker_from_spec(spec, draft);
     }
 
     pub fn palette_insert(&mut self, text: &str) {
@@ -857,6 +863,11 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             "Resume a previous session".to_owned(),
             resume_items(items),
         ),
+        PickerSpec::Rollback(items) => (
+            PickerKind::Generic,
+            "Rollback workspace checkpoint".to_owned(),
+            rollback_items(items),
+        ),
     }
 }
 
@@ -915,16 +926,37 @@ fn theme_items(choices: Vec<ThemeChoiceItem>) -> Vec<PickerItem> {
 fn permission_items(choices: Vec<PermissionChoice>) -> Vec<PickerItem> {
     choices
         .into_iter()
-        .map(|choice| PickerItem {
-            label: human_permission_label(choice.capability, choice.mode).to_owned(),
-            detail: None,
-            status: None,
-            group: Some(capability_group_label(choice.capability).to_owned()),
-            provider_tag: None,
-            current: false,
-            action: CommandAction::SetPermissionMode {
-                capability: choice.capability,
-                mode: choice.mode,
+        .map(|choice| match choice {
+            PermissionChoice::SetMode {
+                capability,
+                mode,
+                label: _,
+            } => PickerItem {
+                label: human_permission_label(capability, mode).to_owned(),
+                detail: None,
+                status: None,
+                group: Some(capability_group_label(capability).to_owned()),
+                provider_tag: None,
+                current: false,
+                action: CommandAction::SetPermissionMode { capability, mode },
+            },
+            PermissionChoice::Revoke {
+                capability,
+                pattern,
+                source,
+                label,
+            } => PickerItem {
+                label,
+                detail: None,
+                status: None,
+                group: Some("Active grants".to_owned()),
+                provider_tag: None,
+                current: false,
+                action: CommandAction::RevokeGrant {
+                    capability,
+                    pattern,
+                    source,
+                },
             },
         })
         .collect()
@@ -954,6 +986,23 @@ fn capability_group_label(capability: Capability) -> &'static str {
         Capability::ShellExec => "Shell",
         _ => "Extensions",
     }
+}
+
+fn rollback_items(items: Vec<CheckpointItem>) -> Vec<PickerItem> {
+    items
+        .into_iter()
+        .map(|item| PickerItem {
+            label: item.label(),
+            detail: Some(item.event_id.clone()),
+            status: None,
+            group: None,
+            provider_tag: None,
+            current: false,
+            action: CommandAction::RollbackCheckpoint {
+                event_id: item.event_id,
+            },
+        })
+        .collect()
 }
 
 fn resume_items(items: Vec<ResumeItem>) -> Vec<PickerItem> {
@@ -1115,7 +1164,7 @@ fn byte_index_for_char_offset(text: &str, offset: usize) -> usize {
 mod tests {
     use super::*;
     use crate::ui::commands::{
-        command_table, theme_choices, EffortChoice, ModelChoice, ResumeItem,
+        command_table, permission_choices, theme_choices, EffortChoice, ModelChoice, ResumeItem,
     };
     use crate::ui::theme::ThemeChoice;
     use euler_core::{ApprovalMode, ReasoningEffort};
@@ -1491,11 +1540,19 @@ mod tests {
     }
 
     #[test]
-    fn permissions_picker_selects_existing_capability_and_mode() {
+    fn permissions_palette_opens_via_action() {
         let mut surface = BottomSurface::new(CommandContext::default());
         surface.open_palette();
         surface.palette_insert("permissions");
-        assert_eq!(surface.confirm(), SurfaceEvent::None);
+        assert_eq!(
+            surface.confirm(),
+            SurfaceEvent::Action(CommandAction::OpenPermissions)
+        );
+    }
+
+    fn permissions_picker_selects_existing_capability_and_mode() {
+        let mut surface = BottomSurface::new(CommandContext::default());
+        surface.open_picker(PickerSpec::Permissions(permission_choices()));
         let rendered = surface
             .surface_lines(80)
             .expect("permissions picker")

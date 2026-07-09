@@ -5,6 +5,7 @@ use crate::canvas::{
     AutoCompactionPolicy, CompactionTier,
 };
 use crate::canvas::{render_context_slot, CanvasItem, CanvasRole};
+use crate::checkpoints::{self, list_from_events, WorkspaceCheckpointRef};
 use crate::compaction::{
     build_compaction_candidate, heuristic_projection, select_layer1_candidates, should_compact,
     validate_candidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
@@ -12,8 +13,9 @@ use crate::compaction::{
 use crate::file_diff::{
     file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
 };
+use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
 use crate::permissions::{
-    ApprovalMode, GrantDecision, PermissionDecider, PermissionGate, PermissionRequest,
+    ApprovalMode, GrantDecision, GrantSource, PermissionDecider, PermissionGate, PermissionRequest,
 };
 use crate::provenance::ProvenanceWriter;
 use crate::session_kind::SessionKind;
@@ -223,6 +225,21 @@ pub enum SessionError {
     InvalidCompanionTask(String),
     #[error("companion spawn requires provenance writer")]
     CompanionProvenanceUnavailable,
+    #[error("checkpoint not found: {event_id}")]
+    CheckpointNotFound { event_id: String },
+    #[error("checkpoint has no restorable pre-image: {event_id}")]
+    CheckpointMissingBlob { event_id: String },
+    #[error("checkpoint blob unavailable: {0}")]
+    CheckpointBlob(String),
+}
+
+/// Outcome of a successful workspace restore (`/rollback`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceRestoreOutcome {
+    pub event_id: String,
+    pub path: String,
+    pub checkpoint_event_id: String,
+    pub blob_sha256: String,
 }
 
 #[derive(Debug, Error)]
@@ -822,6 +839,21 @@ impl<D> Session<D> {
         self.permissions.set_mode(capability, mode);
     }
 
+    /// Active session + project grants for `/permissions` listing.
+    pub fn list_grants(&self) -> Vec<(GrantSource, ActiveGrant)> {
+        self.permissions.list_grants()
+    }
+
+    /// Revoke a session or project grant. Project revokes rewrite `.euler/grants.json`.
+    pub fn revoke_grant(
+        &mut self,
+        capability: Capability,
+        pattern: &ScopePattern,
+        source: GrantSource,
+    ) -> Result<usize, ProjectGrantError> {
+        self.permissions.revoke(capability, pattern, source)
+    }
+
     pub fn active_target(&self) -> &ModelTarget {
         &self.active_target
     }
@@ -1265,6 +1297,74 @@ impl<D: PermissionDecider> Session<D> {
         );
         self.accept_control_event(event)?;
         Ok(normalized)
+    }
+
+    /// List restorable workspace checkpoints from this session's `file.change`
+    /// events (newest first). Used by `/rollback`.
+    pub fn workspace_checkpoints(&self) -> Vec<WorkspaceCheckpointRef> {
+        list_from_events(self.bus.events())
+    }
+
+    /// Restore one workspace file to the pre-image captured on a `file.change`
+    /// event. Appends a new `workspace.restore` ledger event; never rewrites
+    /// history.
+    pub fn restore_workspace_checkpoint(
+        &mut self,
+        checkpoint_event_id: &str,
+    ) -> Result<WorkspaceRestoreOutcome, SessionError> {
+        let checkpoint = self
+            .bus
+            .events()
+            .iter()
+            .find(|event| {
+                event.id == checkpoint_event_id && event.kind.as_str() == EventKind::FILE_CHANGE
+            })
+            .ok_or_else(|| SessionError::CheckpointNotFound {
+                event_id: checkpoint_event_id.to_owned(),
+            })?;
+        let path = checkpoint
+            .payload
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| SessionError::CheckpointMissingBlob {
+                event_id: checkpoint_event_id.to_owned(),
+            })?
+            .to_owned();
+        let blob_sha256 = checkpoint
+            .payload
+            .get("pre_image_blob")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| SessionError::CheckpointMissingBlob {
+                event_id: checkpoint_event_id.to_owned(),
+            })?
+            .to_owned();
+        let content = checkpoints::load_pre_image(self.config.root.as_path(), &blob_sha256)
+            .map_err(|error| SessionError::CheckpointBlob(error.to_string()))?;
+        self.tools
+            .write_workspace_file(&path, &content)
+            .map_err(SessionError::from)?;
+        let payload = object([
+            ("path", path.clone().into()),
+            ("checkpoint_event_id", checkpoint_event_id.to_owned().into()),
+            ("blob_sha256", blob_sha256.clone().into()),
+            ("restored", true.into()),
+        ]);
+        self.emit_control_event_required(EventKind::WORKSPACE_RESTORE, payload)?;
+        let event_id = self
+            .bus
+            .events()
+            .last()
+            .expect("workspace.restore just accepted")
+            .id
+            .clone();
+        Ok(WorkspaceRestoreOutcome {
+            event_id,
+            path,
+            checkpoint_event_id: checkpoint_event_id.to_owned(),
+            blob_sha256,
+        })
     }
 
     pub fn run_turn(&mut self, user_message: &str) -> Result<Vec<EventEnvelope>, SessionError> {
@@ -1721,9 +1821,10 @@ impl<D: PermissionDecider> Session<D> {
                         payload,
                         Some(patch_proposed_id),
                     )?;
+                    let pre_image_blob = maybe_store_pre_image(self.config.root.as_path(), &patch);
                     let file_change_id = self.emit_with_parent(
                         EventKind::FILE_CHANGE,
-                        file_change_payload(&call.id, &patch),
+                        file_change_payload(&call.id, &patch, pre_image_blob.as_deref()),
                         Some(patch_applied_id.clone()),
                     )?;
                     self.emit_with_parent(
@@ -2251,8 +2352,12 @@ fn effective_stub_budget(
     configured_budget_bytes.min(token_proxy_budget)
 }
 
-fn file_change_payload(tool_call_id: &str, patch: &PatchEvents) -> JsonObject {
-    object([
+fn file_change_payload(
+    tool_call_id: &str,
+    patch: &PatchEvents,
+    pre_image_blob: Option<&str>,
+) -> JsonObject {
+    let mut payload = object([
         ("tool_call_id", tool_call_id.to_owned().into()),
         ("origin", patch.origin.into()),
         ("action", patch.action.into()),
@@ -2269,7 +2374,19 @@ fn file_change_payload(tool_call_id: &str, patch: &PatchEvents) -> JsonObject {
         ("before_byte_len", patch.before_byte_len.into()),
         ("after_byte_len", patch.after_byte_len.into()),
         ("diff_redaction", "omitted".into()),
-    ])
+    ]);
+    if let Some(hash) = pre_image_blob {
+        payload.insert("pre_image_blob".to_owned(), hash.into());
+    }
+    payload
+}
+
+pub(crate) fn maybe_store_pre_image(root: &std::path::Path, patch: &PatchEvents) -> Option<String> {
+    // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
+    if patch.action != "modify" || patch.before.is_empty() {
+        return None;
+    }
+    checkpoints::store_pre_image(root, &patch.path, &patch.before)
 }
 
 fn file_diff_payload(tool_call_id: &str, file_change_id: &str, patch: &PatchEvents) -> JsonObject {

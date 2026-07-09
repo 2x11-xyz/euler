@@ -11,6 +11,8 @@ use ratatui::{
 pub struct ComposerSnapshot<'a> {
     pub draft: &'a ComposerDraft,
     pub queued: Vec<QueuedComposerLine>,
+    /// Override empty-composer ghost text (e.g. deny-with-instruction prompt).
+    pub empty_ghost: Option<&'a str>,
 }
 
 impl<'a> ComposerSnapshot<'a> {
@@ -18,11 +20,17 @@ impl<'a> ComposerSnapshot<'a> {
         Self {
             draft,
             queued: Vec::new(),
+            empty_ghost: None,
         }
     }
 
     pub fn with_queued(mut self, queued: Vec<QueuedComposerLine>) -> Self {
         self.queued = queued;
+        self
+    }
+
+    pub fn with_empty_ghost(mut self, ghost: Option<&'a str>) -> Self {
+        self.empty_ghost = ghost;
         self
     }
 }
@@ -165,6 +173,7 @@ pub fn render_lines(
         width,
         draft_height,
         true,
+        snapshot.empty_ghost.unwrap_or(EMPTY_COMPOSER_GHOST),
     ));
     lines
 }
@@ -293,6 +302,7 @@ fn visible_draft_lines(
     width: u16,
     visible_height: usize,
     prompt_first_line: bool,
+    empty_ghost: &str,
 ) -> Vec<ComposerLine> {
     let rows = visual_rows(draft, width);
     let empty_draft = draft.submit_text().is_empty();
@@ -329,7 +339,7 @@ fn visible_draft_lines(
                 } = &mut line
                 {
                     if *prompt && text.is_empty() {
-                        *text = EMPTY_COMPOSER_GHOST.to_owned();
+                        *text = empty_ghost.to_owned();
                         *ghost = true;
                     }
                 }

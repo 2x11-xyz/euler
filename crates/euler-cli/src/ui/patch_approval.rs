@@ -1,6 +1,7 @@
 use super::patch_diff::{self, PatchDisplay};
 use super::text::{display_width, wrap_text};
 use super::theme::Theme;
+use euler_core::grants::command_first_token;
 use euler_core::permissions::PermissionRequest;
 use euler_core::{parse_single_file_apply_patch, ApplyPatchDocument};
 use euler_event::{EventEnvelope, EventKind};
@@ -10,13 +11,6 @@ use ratatui::layout::Rect;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::{Line, Span};
 use std::path::Path;
-
-#[cfg(test)]
-pub(crate) const PROMPT_TEXT: &str = "\
-y  Allow once
-a  AllowSession — session-level capability allow
-n/esc  Deny
-hint: every decision is logged";
 
 const PANEL_TITLE: &str = "Approval required";
 
@@ -68,7 +62,7 @@ pub(crate) fn preview_from_events(events: &[EventEnvelope]) -> PatchPreview {
 #[cfg(test)]
 pub(crate) fn modal_area(area: Rect) -> Rect {
     let width = 88.min(area.width);
-    let height = 18.min(area.height);
+    let height = 20.min(area.height);
     centered_rect(area, width, height)
 }
 
@@ -79,7 +73,7 @@ pub(crate) fn modal_chunks(area: Rect) -> PatchModalAreas {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(4),
+            Constraint::Length(5),
         ])
         .split(area);
     PatchModalAreas {
@@ -111,7 +105,9 @@ pub(crate) fn panel_lines(
     let panel_width = width.clamp(8, 96);
     let body_width = usize::from(panel_width.saturating_sub(4)).max(1);
     // Compact preview only — full review is the transcript nearest-block fold.
-    let diff_area = Rect::new(0, 0, body_width as u16, 8);
+    // Keep this short enough that y/a/p/n + hint remain visible in a normal
+    // 24-row frame with composer + status.
+    let diff_area = Rect::new(0, 0, body_width as u16, 5);
     let mut content = header_text_with_cwd(&modal.request, &cwd.display().to_string())
         .lines()
         .flat_map(|line| wrap_text(line, body_width))
@@ -127,11 +123,7 @@ pub(crate) fn panel_lines(
             }),
     );
     content.push(consequences_row(&modal.preview));
-    content.extend(
-        options_text(&modal.request.capability)
-            .lines()
-            .map(str::to_owned),
-    );
+    content.extend(options_text(&modal.request).lines().map(str::to_owned));
     bordered_panel(content, panel_width, theme)
 }
 
@@ -142,10 +134,61 @@ pub(crate) fn consequences_row(preview: &PatchPreview) -> String {
     )
 }
 
-pub(crate) fn options_text(capability: &Capability) -> String {
+/// Shell: first whitespace token of the live command. Edit: top-level
+/// workspace-relative directory. Returns `None` when derivation is not possible
+/// (caller falls back to unscoped and labels honestly).
+pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String> {
+    match request.capability {
+        Capability::ShellExec => request.command.as_deref().and_then(derive_shell_prefix),
+        Capability::FsWrite => request.path.as_deref().and_then(derive_edit_prefix),
+        _ => None,
+    }
+}
+
+pub(crate) fn derive_shell_prefix(command: &str) -> Option<String> {
+    command_first_token(command).map(str::to_owned)
+}
+
+pub(crate) fn derive_edit_prefix(path: &Path) -> Option<String> {
+    let raw = path.to_string_lossy();
+    let normalized = raw
+        .trim_start_matches("./")
+        .trim_start_matches('\\')
+        .replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+    let first = normalized
+        .split('/')
+        .find(|part| !part.is_empty())?
+        .to_owned();
+    if first == ".." || first == "." {
+        return None;
+    }
+    Some(first)
+}
+
+pub(crate) fn options_text(request: &PermissionRequest) -> String {
+    approval_options_text(
+        request.capability.as_str(),
+        derive_scope_prefix(request).as_deref(),
+    )
+}
+
+/// Honest option labels: never show a prefix the gate will not grant.
+pub(crate) fn approval_options_text(capability: &str, scope_prefix: Option<&str>) -> String {
+    let (session_line, project_line) = match scope_prefix.filter(|p| !p.is_empty()) {
+        Some(prefix) => (
+            format!("a  Allow {prefix} * for this session"),
+            format!("p  Allow {prefix} * in this project"),
+        ),
+        None => (
+            format!("a  Allow {capability} for this session"),
+            format!("p  Allow {capability} in this project"),
+        ),
+    };
     format!(
-        "y  Allow once\na  AllowSession — session-level capability allow ({})\nn/esc  Deny\nhint: every decision is logged",
-        capability.as_str()
+        "y  Allow once\n{session_line}\n{project_line}\nn/esc  Deny\nhint: every decision is logged"
     )
 }
 

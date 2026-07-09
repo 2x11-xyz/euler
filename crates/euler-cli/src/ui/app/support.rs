@@ -1,5 +1,7 @@
 use super::super::{
-    commands::{theme_choices, CommandContext, EffortChoice, ModelChoice, ResumeItem},
+    commands::{
+        theme_choices, CheckpointItem, CommandContext, EffortChoice, ModelChoice, ResumeItem,
+    },
     event_loop::{InputEvent, UiEvent},
     status::TokenUsageSnapshot,
     theme::ThemeChoice,
@@ -66,13 +68,18 @@ pub(super) fn read_terminal_event() -> Result<Option<UiEvent>> {
     Ok(event)
 }
 
+pub(super) struct CommandContextParts {
+    pub current_effort: ReasoningEffort,
+    pub current_theme: ThemeChoice,
+    pub current_session_id: Option<String>,
+    pub checkpoint_items: Vec<CheckpointItem>,
+}
+
 pub(super) fn command_context(
     model_catalog: &MergedModelCatalog,
     provider: &str,
     model: &str,
-    current_effort: ReasoningEffort,
-    current_theme: ThemeChoice,
-    current_session_id: Option<&str>,
+    parts: CommandContextParts,
 ) -> CommandContext {
     // This is called when the bottom surface is rebuilt for session lifecycle
     // transitions, not during frame rendering or palette filtering.
@@ -81,9 +88,10 @@ pub(super) fn command_context(
     );
     CommandContext {
         model_choices: model_choices(model_catalog, &provider_config.registry, provider, model),
-        effort_choices: effort_choices(current_effort),
-        theme_choices: theme_choices(current_theme),
-        resume_items: resume_items_from_home(current_session_id),
+        effort_choices: effort_choices(parts.current_effort),
+        theme_choices: theme_choices(parts.current_theme),
+        resume_items: resume_items_from_home(parts.current_session_id.as_deref()),
+        checkpoint_items: parts.checkpoint_items,
     }
 }
 

@@ -72,6 +72,8 @@ pub enum TranscriptItem {
         capability: String,
         reason: String,
         command: Option<String>,
+        /// Honest scope prefix for `a`/`p` labels; `None` → unscoped labels.
+        scope_prefix: Option<String>,
     },
     PermissionDecision {
         capability: String,
@@ -97,6 +99,7 @@ pub enum TranscriptItem {
         before_byte_len: Option<u64>,
         after_byte_len: Option<u64>,
         diff_redaction: String,
+        checkpoint_event_id: Option<String>,
     },
     FileDiff {
         path: String,
@@ -106,6 +109,11 @@ pub enum TranscriptItem {
         truncated: bool,
         truncation: String,
         omitted_reason: Option<String>,
+        checkpoint_event_id: Option<String>,
+    },
+    WorkspaceRestore {
+        path: String,
+        checkpoint_event_id: String,
     },
     CheckStarted {
         name: String,
@@ -149,7 +157,26 @@ enum ToolCallProjection {
 }
 
 pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
-    events.iter().filter_map(project_event).collect()
+    let checkpoint_ids = checkpoint_event_ids(events);
+    events
+        .iter()
+        .filter_map(|event| project_event_with_checkpoints(event, &checkpoint_ids))
+        .collect()
+}
+
+fn checkpoint_event_ids(events: &[EventEnvelope]) -> std::collections::HashSet<String> {
+    events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .filter(|event| {
+            event
+                .payload
+                .get("pre_image_blob")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+        .map(|event| event.id.clone())
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -321,8 +348,15 @@ pub(crate) fn transcript_items_widget<'a>(
     }
 }
 
-#[allow(clippy::too_many_lines)] // ratchet: 82 lines, refactor target
 fn project_event(event: &EventEnvelope) -> Option<TranscriptItem> {
+    project_event_with_checkpoints(event, &std::collections::HashSet::new())
+}
+
+#[allow(clippy::too_many_lines)] // ratchet: 82 lines, refactor target
+fn project_event_with_checkpoints(
+    event: &EventEnvelope,
+    checkpoint_ids: &std::collections::HashSet<String>,
+) -> Option<TranscriptItem> {
     match event.kind.as_str() {
         EventKind::USER_MESSAGE => {
             payload_string(event, "content").map(TranscriptItem::UserMessage)
@@ -382,7 +416,11 @@ fn project_event(event: &EventEnvelope) -> Option<TranscriptItem> {
         EventKind::PATCH_PROPOSED => Some(project_patch(event, true)),
         EventKind::PATCH_APPLIED => Some(project_patch(event, false)),
         EventKind::FILE_CHANGE => Some(project_file_change(event)),
-        EventKind::FILE_DIFF => Some(project_file_diff(event)),
+        EventKind::FILE_DIFF => Some(project_file_diff(event, checkpoint_ids)),
+        EventKind::WORKSPACE_RESTORE => Some(TranscriptItem::WorkspaceRestore {
+            path: payload_string(event, "path").unwrap_or_default(),
+            checkpoint_event_id: payload_string(event, "checkpoint_event_id").unwrap_or_default(),
+        }),
         EventKind::CHECK_STARTED => Some(TranscriptItem::CheckStarted {
             name: payload_string(event, "name").unwrap_or_default(),
         }),
@@ -738,6 +776,12 @@ fn project_patch(event: &EventEnvelope, proposed: bool) -> TranscriptItem {
 }
 
 fn project_file_change(event: &EventEnvelope) -> TranscriptItem {
+    let checkpoint_event_id = event
+        .payload
+        .get("pre_image_blob")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|_| event.id.clone());
     TranscriptItem::FileChange {
         path: payload_string(event, "path").unwrap_or_default(),
         action: payload_string(event, "action").unwrap_or_default(),
@@ -747,10 +791,16 @@ fn project_file_change(event: &EventEnvelope) -> TranscriptItem {
         before_byte_len: payload_u64(event, "before_byte_len"),
         after_byte_len: payload_u64(event, "after_byte_len"),
         diff_redaction: payload_string(event, "diff_redaction").unwrap_or_default(),
+        checkpoint_event_id,
     }
 }
 
-fn project_file_diff(event: &EventEnvelope) -> TranscriptItem {
+fn project_file_diff(
+    event: &EventEnvelope,
+    checkpoint_ids: &std::collections::HashSet<String>,
+) -> TranscriptItem {
+    let checkpoint_event_id =
+        payload_string(event, "file_change_id").filter(|id| checkpoint_ids.contains(id));
     TranscriptItem::FileDiff {
         path: payload_string(event, "path").unwrap_or_default(),
         action: payload_string(event, "action").unwrap_or_default(),
@@ -759,6 +809,7 @@ fn project_file_diff(event: &EventEnvelope) -> TranscriptItem {
         truncated: payload_bool(event, "truncated").unwrap_or(false),
         truncation: payload_string(event, "truncation").unwrap_or_default(),
         omitted_reason: payload_string(event, "omitted_reason"),
+        checkpoint_event_id,
     }
 }
 

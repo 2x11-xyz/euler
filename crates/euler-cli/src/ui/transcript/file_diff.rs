@@ -18,6 +18,7 @@ pub(super) struct FileDiffRender<'a> {
     pub(super) truncated: bool,
     pub(super) truncation: &'a str,
     pub(super) omitted_reason: Option<&'a str>,
+    pub(super) checkpoint_event_id: Option<&'a str>,
 }
 
 struct FileDiffRows {
@@ -50,7 +51,7 @@ pub(super) fn render_file_diff_cell(
 ) {
     let path = file_change_path_label(diff.path);
     let action = file_change_action_label(diff.action);
-    let (title, rows, footer) = match diff.diff {
+    let (mut title, rows, footer) = match diff.diff {
         Some(diff_text) => {
             let rows = file_diff_artifact_rows(diff_text, theme, diff.path, limit);
             (
@@ -68,6 +69,9 @@ pub(super) fn render_file_diff_cell(
             )
         }
     };
+    if let Some(event_id) = diff.checkpoint_event_id {
+        title.push_str(&format!(" · ckpt {event_id}"));
+    }
     push_artifact_cell(
         lines,
         ArtifactCellRender {
@@ -687,6 +691,7 @@ mod tests {
                 truncated: false,
                 truncation: "none",
                 omitted_reason: None,
+                checkpoint_event_id: None,
             },
             &theme,
             28,

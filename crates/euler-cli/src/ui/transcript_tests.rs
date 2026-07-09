@@ -1762,6 +1762,7 @@ fn projects_file_change_metadata_events() {
             before_byte_len: Some(10),
             after_byte_len: Some(12),
             diff_redaction: "omitted".to_owned(),
+            checkpoint_event_id: None,
         }]
     );
 }
@@ -1791,7 +1792,94 @@ fn projects_file_diff_artifact_events() {
             truncated: true,
             truncation: "tail".to_owned(),
             omitted_reason: Some("diff exceeded 65536 bytes".to_owned()),
+            checkpoint_event_id: None,
         }]
+    );
+}
+
+#[test]
+fn projects_checkpoint_suffix_and_workspace_restore() {
+    let change = event(
+        EventKind::FILE_CHANGE,
+        object([
+            ("path", "src/lib.rs".into()),
+            ("action", "modify".into()),
+            ("origin", "edit_file".into()),
+            ("pre_image_blob", "abc".into()),
+        ]),
+    );
+    let change_id = change.id.clone();
+    let events = vec![
+        change,
+        event(
+            EventKind::FILE_DIFF,
+            object([
+                ("path", "src/lib.rs".into()),
+                ("action", "modify".into()),
+                ("origin", "edit_file".into()),
+                ("file_change_id", change_id.clone().into()),
+                ("diff", "--- a/src/lib.rs\n+++ b/src/lib.rs\n+new\n".into()),
+                ("truncated", false.into()),
+                ("truncation", "none".into()),
+                ("omitted_reason", serde_json::Value::Null),
+            ]),
+        ),
+        event(
+            EventKind::WORKSPACE_RESTORE,
+            object([
+                ("path", "src/lib.rs".into()),
+                ("checkpoint_event_id", change_id.clone().into()),
+                ("blob_sha256", "abc".into()),
+                ("restored", true.into()),
+            ]),
+        ),
+    ];
+
+    let projected = project_events(&events);
+    assert_eq!(
+        projected[0],
+        TranscriptItem::FileChange {
+            path: "src/lib.rs".to_owned(),
+            action: "modify".to_owned(),
+            origin: "edit_file".to_owned(),
+            before_sha256: None,
+            after_sha256: None,
+            before_byte_len: None,
+            after_byte_len: None,
+            diff_redaction: String::new(),
+            checkpoint_event_id: Some(change_id.clone()),
+        }
+    );
+    assert_eq!(
+        projected[1],
+        TranscriptItem::FileDiff {
+            path: "src/lib.rs".to_owned(),
+            action: "modify".to_owned(),
+            origin: "edit_file".to_owned(),
+            diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n+new\n".to_owned()),
+            truncated: false,
+            truncation: "none".to_owned(),
+            omitted_reason: None,
+            checkpoint_event_id: Some(change_id.clone()),
+        }
+    );
+    assert_eq!(
+        projected[2],
+        TranscriptItem::WorkspaceRestore {
+            path: "src/lib.rs".to_owned(),
+            checkpoint_event_id: change_id.clone(),
+        }
+    );
+
+    let theme = Theme::default();
+    let joined = line_texts(&render_items_for_history(&projected[2..], &theme, 120)).join("\n");
+    assert!(
+        joined.contains(&format!("↩ reverted src/lib.rs → ckpt {change_id}")),
+        "joined: {joined:?}"
+    );
+    assert!(
+        joined.contains("files restored, history intact"),
+        "joined: {joined:?}"
     );
 }
 
@@ -1847,6 +1935,7 @@ fn file_change_metadata_renders_as_flat_artifact_without_fake_diff() {
         before_byte_len: Some(10),
         after_byte_len: Some(12),
         diff_redaction: "omitted".to_owned(),
+        checkpoint_event_id: None,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
@@ -1875,6 +1964,7 @@ fn file_diff_renders_unified_diff_as_source_first_artifact() {
         truncated: false,
         truncation: "none".to_owned(),
         omitted_reason: None,
+        checkpoint_event_id: None,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
@@ -1900,6 +1990,7 @@ fn file_diff_omission_renders_reason_without_metadata_inference() {
         truncated: false,
         truncation: "none".to_owned(),
         omitted_reason: Some("secret-like".to_owned()),
+        checkpoint_event_id: None,
     }];
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -1921,6 +2012,7 @@ fn file_diff_missing_omission_reason_uses_stable_fallback() {
         truncated: false,
         truncation: "none".to_owned(),
         omitted_reason: None,
+        checkpoint_event_id: None,
     }];
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -1939,6 +2031,7 @@ fn file_diff_empty_diff_is_present_not_omitted() {
         truncated: false,
         truncation: "none".to_owned(),
         omitted_reason: Some("should not render".to_owned()),
+        checkpoint_event_id: None,
     }];
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -1959,6 +2052,7 @@ fn file_diff_whitespace_only_diff_is_present_not_omitted() {
         truncated: false,
         truncation: "none".to_owned(),
         omitted_reason: Some("should not render".to_owned()),
+        checkpoint_event_id: None,
     }];
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -1983,6 +2077,7 @@ fn file_diff_ignores_shell_artifact_limit_and_renders_full_code() {
         truncated: true,
         truncation: "tail".to_owned(),
         omitted_reason: Some("diff exceeded 65536 bytes".to_owned()),
+        checkpoint_event_id: None,
     }];
 
     let default = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -2024,6 +2119,7 @@ fn file_diff_sanitizes_controls_and_bounds_width() {
         truncated: false,
         truncation: "none".to_owned(),
         omitted_reason: None,
+        checkpoint_event_id: None,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 36));
@@ -2152,6 +2248,7 @@ fn file_change_add_action_and_one_sided_hashes_render_stable_metadata() {
         before_byte_len: None,
         after_byte_len: Some(42),
         diff_redaction: "omitted".to_owned(),
+        checkpoint_event_id: None,
     }];
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -2174,6 +2271,7 @@ fn file_change_action_is_normalized_for_title_and_body() {
         before_byte_len: None,
         after_byte_len: None,
         diff_redaction: "custom-redaction".to_owned(),
+        checkpoint_event_id: None,
     }];
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -2197,6 +2295,7 @@ fn multiple_file_change_events_render_separately_in_order() {
             before_byte_len: None,
             after_byte_len: Some(1),
             diff_redaction: "omitted".to_owned(),
+            checkpoint_event_id: None,
         },
         TranscriptItem::FileChange {
             path: "src/b.rs".to_owned(),
@@ -2207,6 +2306,7 @@ fn multiple_file_change_events_render_separately_in_order() {
             before_byte_len: Some(1),
             after_byte_len: Some(2),
             diff_redaction: "omitted".to_owned(),
+            checkpoint_event_id: None,
         },
     ];
 
@@ -2233,6 +2333,7 @@ fn file_change_sparse_metadata_uses_stable_fallbacks() {
         before_byte_len: None,
         after_byte_len: None,
         diff_redaction: String::new(),
+        checkpoint_event_id: None,
     }];
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -2257,6 +2358,7 @@ fn file_change_metadata_is_sanitized_and_width_bounded() {
         before_byte_len: Some(0),
         after_byte_len: Some(2048),
         diff_redaction: "omitted\nnever diff".to_owned(),
+        checkpoint_event_id: None,
     }];
 
     // Width 48 keeps the sanitized origin fully visible after the 9-cell gutter.

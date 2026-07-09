@@ -41,8 +41,8 @@ use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseE
 use euler_core::permissions::PermissionRequest;
 use euler_core::{
     fold_session, heuristic_projection, read_resume_prefix, resume_session_from_folded_prefix,
-    AgentResult, AgentTask, ApprovalMode, EulerHome, ModelTarget, ProvenanceWriter,
-    ReasoningEffort, Session, SessionStore,
+    AgentResult, AgentTask, ApprovalMode, EulerHome, GrantSource, ModelTarget, ProvenanceWriter,
+    ReasoningEffort, ScopePattern, Session, SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -68,6 +68,7 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
+const DENIED_COMPOSER_GHOST: &str = "denied — tell euler what to do instead";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
 
@@ -97,7 +98,7 @@ use self::visual::{ratatui_lines_to_canvas, render_finalized_visual_items};
 
 use self::support::{
     command_context, is_copy_key, merge_effects, read_terminal_event, session_resume_label,
-    session_root_status_path, update_token_usage,
+    session_root_status_path, update_token_usage, CommandContextParts,
 };
 
 pub struct App {
@@ -154,6 +155,8 @@ pub struct AppCore {
     queued_inputs: VecDeque<String>,
     queued_selection: Option<usize>,
     queue_auto_flush_paused: bool,
+    /// Empty-composer ghost override (deny-with-instruction empty path).
+    empty_composer_ghost: Option<&'static str>,
     in_flight_label: Option<String>,
     in_flight_cancellable: bool,
     extensions: ExtensionSelection,
@@ -547,9 +550,12 @@ impl AppCore {
                 &model_catalog,
                 &target.provider,
                 &target.model,
-                reasoning_effort,
-                theme_choice,
-                Some(&session_id),
+                CommandContextParts {
+                    current_effort: reasoning_effort,
+                    current_theme: theme_choice,
+                    current_session_id: Some(session_id.clone()),
+                    checkpoint_items: Vec::new(),
+                },
             )),
             status,
             model_catalog,
@@ -581,6 +587,7 @@ impl AppCore {
             queued_inputs: VecDeque::new(),
             queued_selection: None,
             queue_auto_flush_paused: false,
+            empty_composer_ghost: None,
             in_flight_label: None,
             in_flight_cancellable: false,
             extensions,
@@ -589,27 +596,51 @@ impl AppCore {
     }
 
     fn rebuild_bottom_surface(&mut self) {
-        let current_session_id = self.status.session_id.as_deref();
+        let parts = CommandContextParts {
+            current_effort: self.current_reasoning_effort(),
+            current_theme: self.theme_choice,
+            current_session_id: self.status.session_id.clone(),
+            checkpoint_items: self.current_checkpoint_items(),
+        };
         self.bottom.reset_context(command_context(
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
-            self.current_reasoning_effort(),
-            self.theme_choice,
-            current_session_id,
+            parts,
         ));
     }
 
     fn replace_bottom_surface_for_session(&mut self) {
-        let current_session_id = self.status.session_id.as_deref();
+        let parts = CommandContextParts {
+            current_effort: self.current_reasoning_effort(),
+            current_theme: self.theme_choice,
+            current_session_id: self.status.session_id.clone(),
+            checkpoint_items: self.current_checkpoint_items(),
+        };
         self.bottom = BottomSurface::new(command_context(
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
-            self.current_reasoning_effort(),
-            self.theme_choice,
-            current_session_id,
+            parts,
         ));
+    }
+
+    fn current_checkpoint_items(&self) -> Vec<crate::ui::commands::CheckpointItem> {
+        let AppState::Idle { session } = &self.state else {
+            return Vec::new();
+        };
+        session
+            .workspace_checkpoints()
+            .into_iter()
+            .map(|item| {
+                crate::ui::commands::CheckpointItem::new(
+                    item.event_id,
+                    item.action,
+                    item.path,
+                    item.ts,
+                )
+            })
+            .collect()
     }
 
     fn current_reasoning_effort(&self) -> ReasoningEffort {
@@ -621,7 +652,9 @@ impl AppCore {
     }
 
     fn composer_snapshot(&self) -> ComposerSnapshot<'_> {
-        ComposerSnapshot::new(self.bottom.composer()).with_queued(self.queued_composer_lines())
+        ComposerSnapshot::new(self.bottom.composer())
+            .with_queued(self.queued_composer_lines())
+            .with_empty_ghost(self.empty_composer_ghost)
     }
 
     fn queued_composer_lines(&self) -> Vec<QueuedComposerLine> {
@@ -941,6 +974,7 @@ impl AppCore {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
         }
+        self.empty_composer_ghost = None;
         self.bottom.edit_composer(|draft| {
             let _ = draft.insert_bracketed_paste(text);
         });
@@ -954,22 +988,7 @@ impl AppCore {
         if matches!(self.modal, Some(Modal::PatchApproval(_))) {
             return self.handle_patch_modal_key(key);
         }
-        match key.code {
-            KeyCode::Char('1') | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.reply_to_modal(PermissionReply::Allow)
-            }
-            KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.reply_to_modal(PermissionReply::Deny)
-            }
-            _ if modal_quit_key(&key) => {
-                self.reply_to_modal(PermissionReply::Deny);
-                CoreEffect::Quit
-            }
-            KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.reply_to_modal(PermissionReply::AllowAll)
-            }
-            _ => self.handle_modal_composer_key(key),
-        }
+        self.handle_approval_modal_key(key)
     }
 
     fn handle_help_input(&mut self, input: InputEvent) -> CoreEffect {
@@ -990,27 +1009,60 @@ impl AppCore {
     }
 
     fn handle_patch_modal_key(&mut self, key: KeyEvent) -> CoreEffect {
+        self.handle_approval_modal_key(key)
+    }
+
+    fn handle_approval_modal_key(&mut self, key: KeyEvent) -> CoreEffect {
         match key.code {
-            KeyCode::Char('1') | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.reply_to_modal(PermissionReply::Allow)
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.reply_to_modal(PermissionReply::AllowOnce)
             }
-            KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.reply_to_modal(PermissionReply::Deny)
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                let prefix = self.modal_scope_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
             }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                let prefix = self.modal_scope_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.reply_deny_from_modal(),
             _ if modal_quit_key(&key) => {
+                // Quit path: bare deny only — do not queue a follow-up turn.
                 self.reply_to_modal(PermissionReply::Deny);
                 CoreEffect::Quit
             }
-            KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.reply_to_modal(PermissionReply::AllowAll)
-            }
             _ => self.handle_modal_composer_key(key),
+        }
+    }
+
+    fn modal_scope_prefix(&self) -> Option<String> {
+        let request = match &self.modal {
+            Some(Modal::Permission(request)) => request,
+            Some(Modal::PatchApproval(modal)) => &modal.request,
+            None | Some(Modal::Help) => return None,
+        };
+        patch_approval::derive_scope_prefix(request)
+    }
+
+    fn reply_deny_from_modal(&mut self) -> CoreEffect {
+        let draft = self.bottom.composer().submit_text();
+        if draft.trim().is_empty() {
+            self.empty_composer_ghost = Some(DENIED_COMPOSER_GHOST);
+            self.reply_to_modal(PermissionReply::Deny)
+        } else {
+            self.bottom.replace_composer_text("");
+            self.empty_composer_ghost = None;
+            // Front of queue: next user turn after the denied tool turn finishes.
+            self.queued_inputs.push_front(draft.clone());
+            self.queued_selection = Some(0);
+            self.reply_to_modal(PermissionReply::DenyWithInstruction(draft))
         }
     }
 
     fn handle_modal_composer_input(&mut self, input: InputEvent) -> CoreEffect {
         match input {
             InputEvent::Paste(text) => {
+                self.empty_composer_ghost = None;
                 self.bottom.edit_composer(|draft| {
                     let _ = draft.insert_bracketed_paste(&text);
                 });
@@ -1150,9 +1202,18 @@ impl AppCore {
             CommandAction::SetPermissionMode { capability, mode } => {
                 self.set_permission_mode(capability, mode)
             }
+            CommandAction::OpenPermissions => self.open_permissions_picker(),
+            CommandAction::RevokeGrant {
+                capability,
+                pattern,
+                source,
+            } => self.revoke_grant(capability, pattern, source),
             CommandAction::ShowHelp { text } => self.summary_item(text),
             CommandAction::ResumeSession { session_id } => {
                 self.resume_session_from_picker(session_id)
+            }
+            CommandAction::RollbackCheckpoint { event_id } => {
+                self.rollback_workspace_checkpoint(event_id)
             }
             CommandAction::ScrollViewportToBottom => {
                 self.transcript.scroll_to_bottom();
@@ -1161,6 +1222,29 @@ impl AppCore {
             }
             CommandAction::CopyLastAssistantResponse => self.copy_last_assistant_response(),
             CommandAction::NameSession { name } => self.name_current_session(name),
+        }
+    }
+
+    fn rollback_workspace_checkpoint(&mut self, event_id: String) -> CoreEffect {
+        let AppState::Idle { session } = &mut self.state else {
+            return self.notice_item("rollback waits for the active turn".to_owned());
+        };
+        let prior_len = session.events().len();
+        match session.restore_workspace_checkpoint(&event_id) {
+            Ok(outcome) => {
+                let new_events = session.events()[prior_len..].to_vec();
+                for event in new_events {
+                    self.transcript.push_event(event);
+                    self.queue_finalized_visual_output_for_latest_event();
+                }
+                self.rebuild_bottom_surface();
+                self.notice = Some(format!(
+                    "restored {} from checkpoint {}",
+                    outcome.path, outcome.checkpoint_event_id
+                ));
+                CoreEffect::Render
+            }
+            Err(error) => self.notice_item(format!("rollback failed: {error}")),
         }
     }
 
@@ -1710,6 +1794,57 @@ impl AppCore {
         ))
     }
 
+    fn open_permissions_picker(&mut self) -> CoreEffect {
+        let AppState::Idle { session } = &self.state else {
+            return self.notice_item("permissions wait for the active turn".to_owned());
+        };
+        let grants = session.list_grants();
+        let choices = super::commands::permission_choices_with_grants(&grants);
+        self.bottom
+            .open_picker(super::commands::PickerSpec::Permissions(choices));
+        CoreEffect::Render
+    }
+
+    fn revoke_grant(
+        &mut self,
+        capability: Capability,
+        pattern: String,
+        source: GrantSource,
+    ) -> CoreEffect {
+        let AppState::Idle { session } = &mut self.state else {
+            return self.notice_item("revoke waits for the active turn".to_owned());
+        };
+        let pattern = match ScopePattern::new(pattern) {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                return self.notice_item(format!("invalid grant pattern: {error}"));
+            }
+        };
+        match session.revoke_grant(capability, &pattern, source) {
+            Ok(0) => self.notice_item(format!(
+                "no {} grant for {} ({})",
+                source.as_str(),
+                capability.as_str(),
+                if pattern.is_unscoped() {
+                    "all"
+                } else {
+                    pattern.as_str()
+                }
+            )),
+            Ok(_) => self.notice_item(format!(
+                "revoked {} {} ({})",
+                source.as_str(),
+                capability.as_str(),
+                if pattern.is_unscoped() {
+                    "all"
+                } else {
+                    pattern.as_str()
+                }
+            )),
+            Err(error) => self.notice_item(format!("revoke failed: {error}")),
+        }
+    }
+
     fn handle_ctrl_c(&mut self) -> CoreEffect {
         let now = Instant::now();
         if self
@@ -1734,6 +1869,7 @@ impl AppCore {
         &mut self,
         edit: impl FnOnce(&mut super::composer::ComposerDraft),
     ) -> CoreEffect {
+        self.empty_composer_ghost = None;
         self.bottom.edit_composer(edit);
         CoreEffect::Render
     }
@@ -2326,7 +2462,10 @@ impl AppCore {
         Some(TranscriptItem::PermissionAsk {
             capability: request.capability.as_str().to_owned(),
             reason: request.reason.clone(),
-            command: self.shell_command_for_permission(request),
+            command: self
+                .shell_command_for_permission(request)
+                .or_else(|| request.command.clone()),
+            scope_prefix: patch_approval::derive_scope_prefix(request),
         })
     }
 

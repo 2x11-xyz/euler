@@ -387,14 +387,18 @@ fn worker_completion_returns_idle() {
 }
 
 #[test]
-fn modal_input_replies_allow_deny_and_allow_all() {
+fn modal_input_replies_allow_deny_and_scoped() {
     for (code, reply) in [
-        (KeyCode::Char('1'), PermissionReply::Allow),
-        (KeyCode::Char('y'), PermissionReply::Allow),
-        (KeyCode::Char('3'), PermissionReply::Deny),
+        (KeyCode::Char('y'), PermissionReply::AllowOnce),
         (KeyCode::Char('n'), PermissionReply::Deny),
-        (KeyCode::Char('2'), PermissionReply::AllowAll),
-        (KeyCode::Char('a'), PermissionReply::AllowAll),
+        (
+            KeyCode::Char('a'),
+            PermissionReply::AllowSessionScope(String::new()),
+        ),
+        (
+            KeyCode::Char('p'),
+            PermissionReply::AllowProjectScope(String::new()),
+        ),
     ] {
         let mut core = core();
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -409,17 +413,23 @@ fn modal_input_replies_allow_deny_and_allow_all() {
 }
 
 #[test]
-fn patch_modal_option_two_uses_existing_session_capability_approval() {
+fn patch_modal_session_scope_uses_path_prefix_when_present() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+    core.modal = Some(Modal::PatchApproval(PatchApprovalModal {
+        request: fs_write_request().with_path("crates/euler-cli/src/lib.rs"),
+        preview: diff_preview("alpha\n", "beta\n"),
+    }));
 
-    let effect = core.handle_input(key(KeyCode::Char('2')));
+    let effect = core.handle_input(key(KeyCode::Char('a')));
 
     assert_eq!(effect, CoreEffect::Render);
     assert!(core.modal.is_none());
-    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::AllowAll);
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowSessionScope("crates".into())
+    );
 }
 
 #[test]
@@ -1549,6 +1559,7 @@ fn live_file_diff_replaces_prior_patch_preview_for_same_path() {
         before_byte_len: None,
         after_byte_len: Some(20),
         diff_redaction: "omitted".to_owned(),
+        checkpoint_event_id: None,
     });
     core.push_finalized_visual_item(TranscriptItem::FileDiff {
         path: "src/lib.rs".to_owned(),
@@ -1558,6 +1569,7 @@ fn live_file_diff_replaces_prior_patch_preview_for_same_path() {
         truncated: false,
         truncation: String::new(),
         omitted_reason: None,
+        checkpoint_event_id: None,
     });
 
     let rendered = core
@@ -2766,7 +2778,8 @@ fn patch_approval_modal_renders_diff_and_prompt() {
     assert!(contents.contains("alpha"));
     assert!(contents.contains("beta"));
     assert!(contents.contains("y  Allow once"));
-    assert!(contents.contains("a  AllowSession"));
+    assert!(contents.contains("a  Allow fs-write"));
+    assert!(contents.contains("p  Allow fs-write"));
     assert!(contents.contains("n/esc  Deny"));
     assert!(contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));

@@ -60,6 +60,10 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::FileDiff {
             path, action, diff, ..
         } => line_oriented_file_diff(path, action, diff.as_deref()),
+        super::TranscriptItem::WorkspaceRestore {
+            path,
+            checkpoint_event_id,
+        } => format!("workspace.restore: {path} → ckpt {checkpoint_event_id}\n"),
         super::TranscriptItem::CheckStarted { name } => format!("check.started: {name}\n"),
         super::TranscriptItem::CheckResult { name, ok, .. } => {
             if *ok {

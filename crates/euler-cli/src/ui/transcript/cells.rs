@@ -49,6 +49,7 @@ pub(super) struct FileChangeRender<'a> {
     pub(super) before_byte_len: Option<u64>,
     pub(super) after_byte_len: Option<u64>,
     pub(super) diff_redaction: &'a str,
+    pub(super) checkpoint_event_id: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -174,7 +175,10 @@ pub(super) fn render_file_change_cell(
 ) {
     let path = file_change_path_label(change.path);
     let action = file_change_action_label(change.action);
-    let title = format!("File {} {path}", file_change_action_title(&action));
+    let mut title = format!("File {} {path}", file_change_action_title(&action));
+    if let Some(event_id) = change.checkpoint_event_id {
+        title.push_str(&format!(" · ckpt {event_id}"));
+    }
     let mut rows = Vec::new();
     rows.push(metadata_row("action", &action, theme.transcript.muted));
     let origin = sanitize_metadata_text(change.origin);
@@ -256,28 +260,35 @@ pub(super) fn render_permission_decision(
     );
 }
 
+pub(super) struct PermissionAskView<'a> {
+    pub(super) capability: &'a str,
+    pub(super) reason: &'a str,
+    pub(super) command: Option<&'a str>,
+    pub(super) scope_prefix: Option<&'a str>,
+}
+
 pub(super) fn render_permission_ask(
     lines: &mut Vec<Line<'static>>,
-    capability: &str,
-    reason: &str,
-    command: Option<&str>,
+    ask: PermissionAskView<'_>,
     theme: &Theme,
     width: u16,
 ) {
-    let preview = command
+    let preview = ask
+        .command
         .filter(|command| !command.is_empty())
         .map(|command| format!("command: $ {command}"))
-        .unwrap_or_else(|| format!("request: {reason}"));
-    let rows = [
+        .unwrap_or_else(|| format!("request: {}", ask.reason));
+    let mut rows = vec![
         "Approval required".to_owned(),
-        format!("{capability} · cwd {}", current_cwd_label()),
+        format!("{} · cwd {}", ask.capability, current_cwd_label()),
         preview,
-        consequences_row(capability),
-        "y  Allow once".to_owned(),
-        format!("a  AllowSession — session-level capability allow ({capability})"),
-        "n/esc  Deny".to_owned(),
-        "hint: every decision is logged".to_owned(),
+        consequences_row(ask.capability),
     ];
+    rows.extend(
+        crate::ui::patch_approval::approval_options_text(ask.capability, ask.scope_prefix)
+            .lines()
+            .map(str::to_owned),
+    );
     push_bordered_permission_panel(lines, &rows, theme, width);
 }
 

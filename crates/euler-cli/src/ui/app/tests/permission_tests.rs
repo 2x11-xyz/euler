@@ -31,7 +31,8 @@ fn permission_prompt_renders_inline_with_command_body() {
     assert!(contents.contains("shell-exec · cwd"));
     assert!(contents.contains("$ cargo test"));
     assert!(contents.contains("y  Allow once"));
-    assert!(contents.contains("a  AllowSession — session-level capability allow (shell-exec)"));
+    assert!(contents.contains("a  Allow shell-exec for this session"));
+    assert!(contents.contains("p  Allow shell-exec in this project"));
     assert!(contents.contains("n/esc  Deny"));
     assert!(contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
@@ -109,13 +110,14 @@ fn non_patch_permission_uses_generic_inline_ask() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("Approval required"));
-    assert!(contents.contains("a  AllowSession — session-level capability allow (shell-exec)"));
+    assert!(contents.contains("a  Allow shell-exec for this session"));
+    assert!(contents.contains("p  Allow shell-exec in this project"));
     assert!(!contents.contains("Patch approval required"));
 }
 
 #[test]
 fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
-    let mut terminal = Terminal::new(VT100Backend::new(58, 11)).expect("terminal");
+    let mut terminal = Terminal::new(VT100Backend::new(58, 12)).expect("terminal");
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
@@ -127,13 +129,14 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let rows = terminal.backend().screen_rows();
     let one = row_containing(&rows, "y  Allow once");
-    let two = row_containing(&rows, "a  AllowSession");
-    let three = row_containing(&rows, "n/esc  Deny");
+    let two = row_containing(&rows, "a  Allow shell-exec");
+    let three = row_containing(&rows, "p  Allow shell-exec");
+    let four = row_containing(&rows, "n/esc  Deny");
     let hint = row_containing(&rows, "hint: every decision is logged");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
-    assert!(one < two && two < three, "rows: {rows:?}");
-    assert!(three < hint && hint < prompt, "rows: {rows:?}");
+    assert!(one < two && two < three && three < four, "rows: {rows:?}");
+    assert!(four < hint && hint < prompt, "rows: {rows:?}");
     assert_eq!(
         status,
         prompt + 1,
@@ -146,7 +149,7 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
 
 #[test]
 fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport() {
-    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 8), 8)
+    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 9), 9)
         .expect("inline terminal");
     let mut core = core();
     core.notice = Some("lower priority notice".to_owned());
@@ -169,7 +172,7 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
     let hint = row_containing(&rows, "hint: every decision is logged");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
-    assert_eq!(terminal.viewport_area().height, 8);
+    assert_eq!(terminal.viewport_area().height, 9);
     assert!(three < hint && hint < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
     assert!(
@@ -186,7 +189,7 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
 
 #[test]
 fn inline_patch_approval_ask_hides_working_status_and_keeps_options_visible() {
-    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 12), 12)
+    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 13), 13)
         .expect("inline terminal");
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
@@ -201,12 +204,13 @@ fn inline_patch_approval_ask_hides_working_status_and_keeps_options_visible() {
 
     let rows = terminal.backend().screen_rows();
     let one = row_containing(&rows, "y  Allow once");
-    let two = row_containing(&rows, "a  AllowSession");
-    let three = row_containing(&rows, "n/esc  Deny");
+    let two = row_containing(&rows, "a  Allow fs-write");
+    let three = row_containing(&rows, "p  Allow fs-write");
+    let four = row_containing(&rows, "n/esc  Deny");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
-    assert!(one < two && two < three, "rows: {rows:?}");
-    assert!(three < prompt, "rows: {rows:?}");
+    assert!(one < two && two < three && three < four, "rows: {rows:?}");
+    assert!(four < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
     assert!(
         !rows.iter().any(|row| row.contains("⠧ working")),
@@ -241,15 +245,88 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
     assert!(contents.contains("Approval required"));
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
-    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::DenyWithInstruction("draft".into())
+    );
+    assert_eq!(
+        core.queued_inputs.front().map(String::as_str),
+        Some("draft")
+    );
     terminal.draw(|frame| core.render(frame)).expect("redraw");
 
     let restored = terminal.backend().screen_contents();
     assert!(!restored.contains("Approval required"));
     assert!(restored.contains("underlying transcript"));
-    assert!(restored.contains("▌ draft"));
     assert!(restored.contains("echo · ctx ?%"));
     assert!(!restored.contains("Context ?% used"));
+}
+
+#[test]
+fn empty_deny_sets_denied_composer_ghost() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 16)).expect("terminal");
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "run command".to_owned(),
+    )));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('n'))),
+        CoreEffect::Render
+    );
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("denied — tell euler what to do instead"));
+}
+
+#[test]
+fn scoped_shell_labels_and_replies_use_command_prefix() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+            .with_command("cargo test -q"),
+    ));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("a  Allow cargo * for this session"));
+    assert!(contents.contains("p  Allow cargo * in this project"));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('a'))),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowSessionScope("cargo".into())
+    );
+}
+
+#[test]
+fn project_scope_key_sends_project_prefix() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned())
+            .with_path("src/main.rs"),
+    ));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('p'))),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowProjectScope("src".into())
+    );
 }
 
 fn row_containing(rows: &[String], needle: &str) -> usize {

@@ -1,5 +1,5 @@
 use super::theme::ThemeChoice;
-use euler_core::{ApprovalMode, ReasoningEffort};
+use euler_core::{ActiveGrant, ApprovalMode, GrantSource, ReasoningEffort};
 use euler_sdk::Capability;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +15,7 @@ pub struct CommandContext {
     pub effort_choices: Vec<EffortChoice>,
     pub theme_choices: Vec<ThemeChoiceItem>,
     pub resume_items: Vec<ResumeItem>,
+    pub checkpoint_items: Vec<CheckpointItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +140,60 @@ impl ResumeItem {
     }
 }
 
+/// One restorable workspace checkpoint for the `/rollback` picker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointItem {
+    pub event_id: String,
+    pub action: String,
+    pub path: String,
+    pub time: String,
+}
+
+impl CheckpointItem {
+    pub fn new(
+        event_id: impl Into<String>,
+        action: impl Into<String>,
+        path: impl Into<String>,
+        time: impl Into<String>,
+    ) -> Self {
+        Self {
+            event_id: event_id.into(),
+            action: action.into(),
+            path: path.into(),
+            time: time.into(),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{}  {}  {}  {}",
+            short_event_id(&self.event_id),
+            self.action,
+            self.path,
+            short_time(&self.time)
+        )
+    }
+}
+
+fn short_event_id(event_id: &str) -> String {
+    if event_id.len() <= 10 {
+        event_id.to_owned()
+    } else {
+        event_id[event_id.len().saturating_sub(8)..].to_owned()
+    }
+}
+
+fn short_time(ts: &str) -> String {
+    // RFC3339 millis: keep HH:MM:SS when present.
+    if let Some(t_idx) = ts.find('T') {
+        let time = &ts[t_idx + 1..];
+        if time.len() >= 8 {
+            return time[..8].to_owned();
+        }
+    }
+    ts.to_owned()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandAction {
     NewSession,
@@ -179,8 +234,18 @@ pub enum CommandAction {
         capability: Capability,
         mode: ApprovalMode,
     },
+    /// Open the permissions picker with live session/project grants.
+    OpenPermissions,
+    RevokeGrant {
+        capability: Capability,
+        pattern: String,
+        source: GrantSource,
+    },
     ResumeSession {
         session_id: String,
+    },
+    RollbackCheckpoint {
+        event_id: String,
     },
     ShowHelp {
         text: String,
@@ -204,13 +269,30 @@ pub enum PickerSpec {
     Theme(Vec<ThemeChoiceItem>),
     Permissions(Vec<PermissionChoice>),
     Resume(Vec<ResumeItem>),
+    Rollback(Vec<CheckpointItem>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PermissionChoice {
-    pub capability: Capability,
-    pub mode: ApprovalMode,
-    pub label: String,
+pub enum PermissionChoice {
+    SetMode {
+        capability: Capability,
+        mode: ApprovalMode,
+        label: String,
+    },
+    Revoke {
+        capability: Capability,
+        pattern: String,
+        source: GrantSource,
+        label: String,
+    },
+}
+
+impl PermissionChoice {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::SetMode { label, .. } | Self::Revoke { label, .. } => label,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,12 +374,17 @@ const COMMAND_TABLE: &[CommandSpec] = &[
     },
     CommandSpec {
         token: "/permissions",
-        summary: "set capability approval mode",
+        summary: "approval modes and active grants",
         args: "",
     },
     CommandSpec {
         token: "/resume",
         summary: "resume a prior session",
+        args: "",
+    },
+    CommandSpec {
+        token: "/rollback",
+        summary: "restore a workspace file from a checkpoint",
         args: "",
     },
     CommandSpec {
@@ -363,14 +450,45 @@ pub fn dispatch_command(input: &str, context: &CommandContext) -> CommandEffect 
 }
 
 pub fn permission_choices() -> Vec<PermissionChoice> {
-    [
-        Capability::FsRead,
-        Capability::FsWrite,
-        Capability::ShellExec,
-    ]
-    .into_iter()
-    .flat_map(|capability| permission_modes(capability).into_iter())
-    .collect()
+    permission_choices_with_grants(&[])
+}
+
+/// Mode choices plus revoke rows for active session/project grants.
+pub fn permission_choices_with_grants(
+    grants: &[(GrantSource, ActiveGrant)],
+) -> Vec<PermissionChoice> {
+    let mut choices = grants
+        .iter()
+        .map(|(source, grant)| {
+            let pattern = grant.pattern.as_str();
+            let pattern_label = if pattern.is_empty() {
+                "all".to_owned()
+            } else {
+                format!("{pattern}*")
+            };
+            PermissionChoice::Revoke {
+                capability: grant.capability,
+                pattern: pattern.to_owned(),
+                source: *source,
+                label: format!(
+                    "Revoke {} {} ({})",
+                    source.as_str(),
+                    grant.capability.as_str(),
+                    pattern_label
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    choices.extend(
+        [
+            Capability::FsRead,
+            Capability::FsWrite,
+            Capability::ShellExec,
+        ]
+        .into_iter()
+        .flat_map(permission_modes),
+    );
+    choices
 }
 
 pub fn help_text() -> String {
@@ -409,13 +527,23 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
                 name: name.to_owned(),
             }
         }),
-        "/permissions" => CommandEffect::OpenPicker(PickerSpec::Permissions(permission_choices())),
+        "/permissions" => CommandEffect::Action(CommandAction::OpenPermissions),
         "/resume" => CommandEffect::OpenPicker(PickerSpec::Resume(context.resume_items.clone())),
+        "/rollback" => rollback_effect(context),
         "/help" => CommandEffect::Action(CommandAction::ShowHelp { text: help_text() }),
         "/quit" => CommandEffect::Action(CommandAction::Quit),
         "/copy" => CommandEffect::Action(CommandAction::CopyLastAssistantResponse),
         token => CommandEffect::Message(format!("unknown command: {token}")),
     }
+}
+
+fn rollback_effect(context: &CommandContext) -> CommandEffect {
+    if context.checkpoint_items.is_empty() {
+        return CommandEffect::Message(
+            "no workspace checkpoints in this session (edit a file first)".to_owned(),
+        );
+    }
+    CommandEffect::OpenPicker(PickerSpec::Rollback(context.checkpoint_items.clone()))
 }
 
 fn companion_effect(arg: Option<&str>) -> CommandEffect {
@@ -555,7 +683,7 @@ fn permission_modes(capability: Capability) -> Vec<PermissionChoice> {
         ApprovalMode::AlwaysDeny,
     ]
     .into_iter()
-    .map(|mode| PermissionChoice {
+    .map(|mode| PermissionChoice::SetMode {
         capability,
         mode,
         label: format!("{} {}", capability_label(capability), mode_label(mode)),
@@ -764,6 +892,30 @@ mod tests {
         assert_eq!(
             dispatch_command("/model", &context),
             CommandEffect::OpenPicker(PickerSpec::Model(vec![ModelChoice::new("fixture", "echo")]))
+        );
+    }
+
+    #[test]
+    fn rollback_without_checkpoints_messages_and_with_items_opens_picker() {
+        assert_eq!(
+            dispatch_command("/rollback", &CommandContext::default()),
+            CommandEffect::Message(
+                "no workspace checkpoints in this session (edit a file first)".to_owned()
+            )
+        );
+        let item = CheckpointItem::new(
+            "01ABCDEFGHJKLMNPQRSTUVWXYZ",
+            "modify",
+            "src/lib.rs",
+            "2026-07-09T12:34:56.000Z",
+        );
+        let context = CommandContext {
+            checkpoint_items: vec![item.clone()],
+            ..CommandContext::default()
+        };
+        assert_eq!(
+            dispatch_command("/rollback", &context),
+            CommandEffect::OpenPicker(PickerSpec::Rollback(vec![item]))
         );
     }
 
