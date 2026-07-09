@@ -6636,6 +6636,291 @@ fn replay_rejects_invalid_non_final_line_followed_by_trailing_whitespace() {
     assert!(String::from_utf8_lossy(&replayed.stderr).contains("invalid provenance line"));
 }
 
+/// Reconstruct the terminal's final state (scrollback + visible screen) from
+/// raw PTY bytes. Legit repaints overwrite in place; only real emissions
+/// survive here — so a line appearing twice means it was committed twice.
+fn pty_final_state_text(output: &[u8], rows: u16, cols: u16) -> String {
+    let mut parser = vt100::Parser::new(rows, cols, 5000);
+    parser.process(output);
+    // Clamp to the actual scrollback length.
+    parser.set_scrollback(usize::MAX);
+    let total_scrollback = parser.screen().scrollback();
+    let mut lines: Vec<String> = Vec::new();
+    let mut offset = total_scrollback;
+    loop {
+        parser.set_scrollback(offset);
+        let contents = parser.screen().contents();
+        let screen_rows: Vec<&str> = contents.lines().collect();
+        if offset == total_scrollback {
+            lines.extend(screen_rows.iter().map(|row| row.to_string()));
+        } else {
+            // Overlapping windows: keep only the rows that scrolled into view.
+            let new_rows = usize::from(rows).min(total_scrollback - offset + usize::from(rows));
+            let skip = screen_rows.len().saturating_sub(new_rows);
+            let _ = skip;
+            // Simpler: rebuild from scratch below.
+            lines.clear();
+            break;
+        }
+        if offset == 0 {
+            break;
+        }
+        offset = offset.saturating_sub(usize::from(rows));
+        if total_scrollback - offset < usize::from(rows) {
+            offset = 0;
+        }
+    }
+    if !lines.is_empty() {
+        return lines.join("\n");
+    }
+    // Fallback path: walk row windows without overlap bookkeeping errors by
+    // stepping exactly one row at a time and keeping the top row of each view.
+    let mut rebuilt: Vec<String> = Vec::new();
+    let mut offset = total_scrollback;
+    loop {
+        parser.set_scrollback(offset);
+        let contents = parser.screen().contents();
+        let mut screen_rows = contents.lines();
+        if let Some(top) = screen_rows.next() {
+            rebuilt.push(top.to_string());
+        }
+        if offset == 0 {
+            // The remaining visible rows complete the picture.
+            rebuilt.extend(contents.lines().skip(1).map(|row| row.to_string()));
+            break;
+        }
+        offset -= 1;
+    }
+    rebuilt.join("\n")
+}
+
+/// Final-state reconstruction across mid-session resizes: process each byte
+/// segment at its dimensions.
+fn pty_final_state_with_resizes(
+    output: &[u8],
+    initial: (u16, u16),
+    resizes: &[(usize, u16, u16)],
+) -> String {
+    let (mut rows, mut cols) = initial;
+    let mut parser = vt100::Parser::new(rows, cols, 5000);
+    let mut start = 0usize;
+    for (offset, new_rows, new_cols) in resizes {
+        parser.process(&output[start..*offset]);
+        parser.set_size(*new_rows, *new_cols);
+        start = *offset;
+        rows = *new_rows;
+        cols = *new_cols;
+    }
+    parser.process(&output[start..]);
+    let _ = (rows, cols);
+    parser.set_scrollback(usize::MAX);
+    let total_scrollback = parser.screen().scrollback();
+    let mut rebuilt: Vec<String> = Vec::new();
+    let mut offset = total_scrollback;
+    loop {
+        parser.set_scrollback(offset);
+        let contents = parser.screen().contents();
+        let mut screen_rows = contents.lines();
+        if let Some(top) = screen_rows.next() {
+            rebuilt.push(top.to_string());
+        }
+        if offset == 0 {
+            rebuilt.extend(contents.lines().skip(1).map(|row| row.to_string()));
+            break;
+        }
+        offset -= 1;
+    }
+    rebuilt.join("\n")
+}
+
+#[test]
+fn tui_pty_resize_does_not_duplicate_committed_lines() {
+    // Regression target for the duplicate-line audit finding (P1): a terminal
+    // resize while history has been committed to native scrollback must not
+    // re-emit already-committed lines.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut events = Vec::new();
+    for paragraph in 1..=6 {
+        let sentence = format!(
+            "Paragraph {paragraph}: streaming content long enough to wrap and \
+             scroll so history rows land in native scrollback before resize."
+        );
+        for chunk in sentence.as_bytes().chunks(8) {
+            events.push(serde_json::json!({
+                "text_delta": String::from_utf8_lossy(chunk)
+            }));
+        }
+        events.push(serde_json::json!({"text_delta": "\n\n"}));
+    }
+    events.push(serde_json::json!({"finished": {"stop_reason": "completed"}}));
+    let second_response = serde_json::json!({"events": [
+        {"text_delta": "Post-resize response committed once."},
+        {"finished": {"stop_reason": "completed"}},
+    ]});
+    let script = write_fixture_script(
+        temp.path(),
+        "resize-stream.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": events}, second_response]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(
+        tui.wait_for_screen("· ctx"),
+        "initial TUI did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("overview please\r");
+    assert!(
+        tui.wait_for_screen("Paragraph 6:"),
+        "streamed response did not render:\n{}",
+        tui.screen_text()
+    );
+    // Resize after the turn completed and history is committed.
+    tui.resize(24, 100);
+    // Provoke a post-resize repaint + another committed event.
+    tui.write("second message\r");
+    std::thread::sleep(Duration::from_millis(600));
+    tui.quit();
+
+    let resizes = tui.resizes.clone();
+    let final_state = pty_final_state_with_resizes(&tui.output, (24, 80), &resizes);
+    let mut failures = Vec::new();
+    for paragraph in 1..=6 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = final_state
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .count();
+        if occurrences != 1 {
+            failures.push(format!("`{needle}` committed {occurrences}× (expected 1)"));
+        }
+    }
+    let orientation = final_state
+        .lines()
+        .filter(|line| line.contains("resumable with /resume"))
+        .count();
+    if orientation != 1 {
+        failures.push(format!(
+            "orientation line committed {orientation}× (expected 1)"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "resize duplicated committed lines:\n{}\nFinal state:\n{final_state}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "diagnostic: set EULER_RAW_CAPTURE to a raw PTY byte file"]
+fn diag_reconstruct_final_state_from_capture() {
+    let path = std::env::var("EULER_RAW_CAPTURE").expect("EULER_RAW_CAPTURE");
+    let raw = fs::read(path).expect("raw capture");
+    let state = pty_final_state_text(&raw, 24, 80);
+    println!("=== FINAL STATE ===\n{state}\n=== END ===");
+    for needle in [
+        "new session",
+        "Looking at the repository",
+        "Here is an overview",
+        "overview please",
+    ] {
+        let count = state.lines().filter(|line| line.contains(needle)).count();
+        println!("COUNT {needle} -> {count}");
+    }
+}
+
+#[test]
+fn tui_pty_transcript_lines_commit_exactly_once() {
+    // Regression for the duplicate-line streaming repaint bug (Warm Spine
+    // implementation review, P1): the final terminal state — scrollback plus
+    // visible screen — must contain each transcript line exactly once, even
+    // when a long response streams in small deltas and scrolls the viewport.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut events = Vec::new();
+    for paragraph in 1..=6 {
+        let sentence = format!(
+            "Paragraph {paragraph}: here is an overview sentence that is long \
+             enough to wrap at eighty columns and scroll the viewport as it \
+             streams in small deltas."
+        );
+        for chunk in sentence.as_bytes().chunks(8) {
+            events.push(serde_json::json!({
+                "text_delta": String::from_utf8_lossy(chunk)
+            }));
+        }
+        events.push(serde_json::json!({"text_delta": "\n\n"}));
+    }
+    events.push(serde_json::json!({"finished": {"stop_reason": "completed"}}));
+    let script = write_fixture_script(
+        temp.path(),
+        "long-stream.json",
+        &serde_json::json!({"version": 1, "responses": [{"events": events}]}).to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(
+        tui.wait_for_screen("· ctx"),
+        "initial TUI did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("overview please\r");
+    assert!(
+        tui.wait_for_screen("Paragraph 6:"),
+        "streamed response did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let final_state = pty_final_state_text(&tui.output, 24, 80);
+    let mut failures = Vec::new();
+    for paragraph in 1..=6 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = final_state
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .count();
+        if occurrences != 1 {
+            failures.push(format!("`{needle}` committed {occurrences}× (expected 1)"));
+        }
+    }
+    let orientation = final_state
+        .lines()
+        .filter(|line| line.contains("resumable with /resume"))
+        .count();
+    if orientation != 1 {
+        failures.push(format!(
+            "orientation line committed {orientation}× (expected 1)"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "duplicate-line repaint bug:\n{}\nFinal state:\n{final_state}",
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn tui_pty_submit_fixture_turn_and_quit() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -6878,6 +7163,8 @@ struct PtyHarness {
     rx: Receiver<Vec<u8>>,
     output: Vec<u8>,
     cursor_report_scan_offset: usize,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    resizes: Vec<(usize, u16, u16)>,
 }
 
 const PTY_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -6908,7 +7195,27 @@ impl PtyHarness {
             rx,
             output: Vec::new(),
             cursor_report_scan_offset: 0,
+            master: pty.master,
+            resizes: Vec::new(),
         }
+    }
+
+    /// Resize the PTY mid-session, recording the output offset so final-state
+    /// reconstruction can resize its emulator at the same point.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        // Drain pending output so the offset is accurate.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let _ = self.wait_for_stable_screen(Duration::from_millis(250), |_| false);
+        let _ = deadline;
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty resize");
+        self.resizes.push((self.output.len(), rows, cols));
     }
 
     fn write(&mut self, input: &str) {
@@ -7026,8 +7333,16 @@ impl PtyHarness {
     }
 
     fn screen_text(&self) -> String {
+        // Honor mid-session resizes: process each byte segment at the
+        // dimensions that were active when it was emitted.
         let mut parser = vt100::Parser::new(24, 80, 0);
-        parser.process(&self.output);
+        let mut start = 0usize;
+        for (offset, rows, cols) in &self.resizes {
+            parser.process(&self.output[start..*offset]);
+            parser.set_size(*rows, *cols);
+            start = *offset;
+        }
+        parser.process(&self.output[start..]);
         parser.screen().contents()
     }
 }

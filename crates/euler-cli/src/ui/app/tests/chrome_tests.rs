@@ -1,5 +1,6 @@
 use super::*;
 use crate::ui::visual_canvas::CursorTarget;
+use super::super::visual::render_finalized_visual_items_with_offsets;
 
 #[test]
 fn question_mark_help_overlay_is_global_only_for_idle_composer() {
@@ -529,7 +530,7 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
 #[test]
 fn finalized_wrapped_prompt_uses_continuous_user_rail() {
     let theme = Theme::default();
-    let lines = render_finalized_visual_items(
+    let lines = render_finalized_visual_items_with_offsets(
         &[TranscriptItem::UserMessage(
             "alpha beta gamma delta epsilon".to_owned(),
         )],
@@ -538,6 +539,7 @@ fn finalized_wrapped_prompt_uses_continuous_user_rail() {
         TOOL_CALL_MAX_LINES,
         &std::collections::HashSet::new(),
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
@@ -564,13 +566,14 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     let theme = Theme::default();
     let table = "| Layer | Responsibility | Repo location |\n|---|---|---|\n| CLI/TUI layer | User-facing command-line and Ratatui transcript composer status UX | euler-cli |\n";
 
-    let narrow = render_finalized_visual_items(
+    let narrow = render_finalized_visual_items_with_offsets(
         &[TranscriptItem::AssistantMessage(table.to_owned())],
         &theme,
         44,
         TOOL_CALL_MAX_LINES,
         &std::collections::HashSet::new(),
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
@@ -598,13 +601,14 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         "narrow stacked table overflowed: {narrow:?}"
     );
 
-    let wide = render_finalized_visual_items(
+    let wide = render_finalized_visual_items_with_offsets(
         &[TranscriptItem::AssistantMessage(table.to_owned())],
         &theme,
         100,
         TOOL_CALL_MAX_LINES,
         &std::collections::HashSet::new(),
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
@@ -676,7 +680,7 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
 #[test]
 fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
     let theme = Theme::default();
-    let lines = render_finalized_visual_items(
+    let lines = render_finalized_visual_items_with_offsets(
         &[
             TranscriptItem::UserMessage("hi".to_owned()),
             TranscriptItem::AssistantMessage("Hi! How can I help?".to_owned()),
@@ -687,6 +691,7 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
         TOOL_CALL_MAX_LINES,
         &std::collections::HashSet::new(),
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
@@ -714,7 +719,7 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
 #[test]
 fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
     let theme = Theme::default();
-    let lines = render_finalized_visual_items(
+    let lines = render_finalized_visual_items_with_offsets(
         &[TranscriptItem::ToolRun {
             command: "ls -la".to_owned(),
             ok: true,
@@ -727,6 +732,7 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
         TOOL_CALL_MAX_LINES,
         &std::collections::HashSet::new(),
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();

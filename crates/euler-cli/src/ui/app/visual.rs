@@ -23,6 +23,14 @@ impl AppCore {
         self.visual_canvas.push_finalized(item);
     }
 
+    pub(crate) fn set_committed_history_items(&mut self, committed: usize) {
+        self.visual_canvas.set_committed_items(committed);
+    }
+
+    pub(crate) fn reset_committed_history_items(&mut self) {
+        self.visual_canvas.reset_committed_items();
+    }
+
     pub(super) fn visual_scroll_offset(&self) -> usize {
         self.visual_scroll_offset
     }
@@ -40,7 +48,13 @@ impl AppCore {
         let show_ts = self.show_timestamp_gutter;
         let mut frame = self.visual_canvas.render(snapshot, |items, width| {
             crate::ui::text::with_timestamp_gutter(show_ts, || {
-                render_finalized_visual_items(items, &theme, width, TOOL_CALL_MAX_LINES, &expanded)
+                render_finalized_visual_items_with_offsets(
+                    items,
+                    &theme,
+                    width,
+                    TOOL_CALL_MAX_LINES,
+                    &expanded,
+                )
             })
         });
         // Active turns may commit finalized history and the markdown-stable
@@ -297,24 +311,29 @@ fn push_visual_spacer_block(blocks: &mut Vec<VisualBlock>) {
     ));
 }
 
-pub(super) fn render_finalized_visual_items(
+pub(super) fn render_finalized_visual_items_with_offsets(
     items: &[TranscriptItem],
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
     expanded_artifact_keys: &std::collections::HashSet<String>,
-) -> Vec<CanvasLine> {
-    let mut lines = ratatui_lines_to_canvas(transcript::render_items_for_history_with_expansion(
+) -> (Vec<CanvasLine>, Vec<usize>) {
+    let (lines, mut item_end_offsets) = transcript::render_items_for_history_with_offsets(
         items,
         theme,
         width,
         output_limit_lines,
         expanded_artifact_keys,
-    ));
+    );
+    let mut lines = ratatui_lines_to_canvas(lines);
     if finalized_batch_needs_trailing_rhythm(items) {
         lines.push(CanvasLine::plain_lossy(""));
+        // The rhythm row belongs to the last item's committed region.
+        if let Some(last) = item_end_offsets.last_mut() {
+            *last += 1;
+        }
     }
-    lines
+    (lines, item_end_offsets)
 }
 
 fn finalized_batch_needs_trailing_rhythm(items: &[TranscriptItem]) -> bool {

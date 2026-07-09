@@ -99,7 +99,7 @@ mod turn_recap;
 mod visual;
 
 #[cfg(test)]
-use self::visual::{ratatui_lines_to_canvas, render_finalized_visual_items};
+use self::visual::ratatui_lines_to_canvas;
 
 use self::support::{
     command_context, is_copy_key, merge_effects, read_terminal_event, session_resume_label,
@@ -528,6 +528,10 @@ impl App {
         self.terminal
             .set_review_scroll_offset(self.core.visual_scroll_offset());
         self.terminal.draw_visual_frame(&visual_canvas_frame)?;
+        // Committed rows are physically in native scrollback now: freeze the
+        // covered items against merges/removals (visual_canvas boundary).
+        self.core
+            .set_committed_history_items(self.terminal.committed_history_items());
         Ok(())
     }
 
@@ -537,6 +541,7 @@ impl App {
         // frame instead of a visible blank-then-refill sweep; the guard must
         // close even when the replay fails.
         self.terminal.begin_synchronized_update()?;
+        self.core.reset_committed_history_items();
         let replay = self
             .terminal
             .reset_for_history_replay(purge_scrollback)

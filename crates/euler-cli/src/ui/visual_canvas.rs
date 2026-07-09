@@ -5,6 +5,10 @@ use ratatui::style::Style;
 pub struct VisualCanvasState {
     finalized: Vec<TranscriptItem>,
     history_cache: Option<RenderedHistoryCache>,
+    /// Finalized items whose rows are already committed to native scrollback.
+    /// Items below this boundary must never be mutated or removed — their
+    /// rendered rows are physically in the terminal and cannot be recalled.
+    committed_items: usize,
 }
 impl VisualCanvasState {
     pub fn new(finalized: Vec<TranscriptItem>) -> Self {
@@ -16,7 +20,13 @@ impl VisualCanvasState {
             })
     }
     pub fn push_finalized(&mut self, item: TranscriptItem) {
+        // Merges/removals may only touch items past the committed boundary:
+        // rows already in native scrollback cannot change, so mutating their
+        // source item would shift every later row and re-emit stale content
+        // (the duplicate-line audit finding, P1).
+        let boundary = self.committed_items;
         if matches!(item, TranscriptItem::WorkedDuration(_))
+            && self.finalized.len() > boundary
             && matches!(
                 self.finalized.last(),
                 Some(TranscriptItem::WorkedDuration(_))
@@ -25,17 +35,19 @@ impl VisualCanvasState {
             return;
         }
         if let TranscriptItem::Exploration { summaries } = item {
-            if let Some(TranscriptItem::Exploration {
-                summaries: existing,
-            }) = self.finalized.last_mut()
-            {
-                for summary in summaries {
-                    if !existing.contains(&summary) {
-                        existing.push(summary);
+            if self.finalized.len() > boundary {
+                if let Some(TranscriptItem::Exploration {
+                    summaries: existing,
+                }) = self.finalized.last_mut()
+                {
+                    for summary in summaries {
+                        if !existing.contains(&summary) {
+                            existing.push(summary);
+                        }
                     }
+                    self.history_cache = None;
+                    return;
                 }
-                self.history_cache = None;
-                return;
             }
             self.finalized
                 .push(TranscriptItem::Exploration { summaries });
@@ -43,7 +55,7 @@ impl VisualCanvasState {
             return;
         }
         if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
-            if let Some(existing) = self.finalized.iter_mut().rev().find(|existing| {
+            if let Some(existing) = self.finalized[boundary..].iter_mut().rev().find(|existing| {
                 existing.companion_spawn_event_id() == Some(spawn_event_id.as_str())
             }) {
                 let _ = super::transcript::merge_companion_item(existing, item);
@@ -52,19 +64,32 @@ impl VisualCanvasState {
             }
         }
         if let TranscriptItem::FileDiff { path, .. } = &item {
-            if let Some(index) = self.finalized.iter().rposition(
+            if let Some(index) = self.finalized[boundary..].iter().rposition(
                 |item| matches!(item, TranscriptItem::PatchApplied { path: p, .. } if p == path),
             ) {
-                self.finalized.remove(index);
+                self.finalized.remove(boundary + index);
             }
-            if let Some(index) = self.finalized.iter().rposition(
+            if let Some(index) = self.finalized[boundary..].iter().rposition(
                 |item| matches!(item, TranscriptItem::FileChange { path: p, .. } if p == path),
             ) {
-                self.finalized.remove(index);
+                self.finalized.remove(boundary + index);
             }
         }
         self.finalized.push(item);
         self.history_cache = None;
+    }
+
+    /// Advance the committed-items boundary (monotonic; from the terminal's
+    /// native-scrollback accounting after each draw).
+    pub fn set_committed_items(&mut self, committed: usize) {
+        self.committed_items = self
+            .committed_items
+            .max(committed.min(self.finalized.len()));
+    }
+
+    /// Reset the boundary (history replay purges native scrollback).
+    pub fn reset_committed_items(&mut self) {
+        self.committed_items = 0;
     }
 
     pub fn has_foldable_artifact(&self, output_limit_lines: usize) -> bool {
@@ -87,32 +112,35 @@ impl VisualCanvasState {
         render_finalized: R,
     ) -> VisualCanvasFrame
     where
-        R: FnOnce(&[TranscriptItem], u16) -> Vec<CanvasLine>,
+        R: FnOnce(&[TranscriptItem], u16) -> (Vec<CanvasLine>, Vec<usize>),
     {
-        let history = self.render_history(snapshot.width, render_finalized);
+        let (history, offsets) = self.render_history(snapshot.width, render_finalized);
         if !history.is_empty() {
             snapshot
                 .blocks
                 .insert(0, VisualBlock::new(VisualBlockRole::History, history));
         }
-        derive_frame(&snapshot)
+        let mut frame = derive_frame(&snapshot);
+        frame.history_item_offsets = offsets;
+        frame
     }
 
-    fn render_history<R>(&mut self, width: u16, render_finalized: R) -> Vec<CanvasLine>
+    fn render_history<R>(&mut self, width: u16, render_finalized: R) -> (Vec<CanvasLine>, Vec<usize>)
     where
-        R: FnOnce(&[TranscriptItem], u16) -> Vec<CanvasLine>,
+        R: FnOnce(&[TranscriptItem], u16) -> (Vec<CanvasLine>, Vec<usize>),
     {
         if let Some(cache) = &self.history_cache {
             if cache.width == width {
-                return cache.lines.clone();
+                return (cache.lines.clone(), cache.item_end_offsets.clone());
             }
         }
-        let lines = render_finalized(&self.finalized, width);
+        let (lines, item_end_offsets) = render_finalized(&self.finalized, width);
         self.history_cache = Some(RenderedHistoryCache {
             width,
             lines: lines.clone(),
+            item_end_offsets: item_end_offsets.clone(),
         });
-        lines
+        (lines, item_end_offsets)
     }
 }
 
@@ -120,6 +148,7 @@ impl VisualCanvasState {
 struct RenderedHistoryCache {
     width: u16,
     lines: Vec<CanvasLine>,
+    item_end_offsets: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +187,10 @@ pub struct VisualCanvasFrame {
     pub committable_rows: usize,
     pub pinned_rows: usize,
     pub prefer_stable_height: bool,
+    /// Cumulative end-row offset of each finalized history item at this
+    /// frame's width. Native-scrollback commits snap to these boundaries so
+    /// a width change can remap the committed prefix exactly.
+    pub history_item_offsets: Vec<usize>,
 }
 
 pub fn derive_frame(snapshot: &VisualCanvasSnapshot) -> VisualCanvasFrame {
@@ -195,6 +228,7 @@ pub fn derive_frame(snapshot: &VisualCanvasSnapshot) -> VisualCanvasFrame {
         history_rows,
         committable_rows,
         prefer_stable_height: snapshot.focus == FocusOwner::BottomSurface,
+        history_item_offsets: Vec::new(),
     }
 }
 
