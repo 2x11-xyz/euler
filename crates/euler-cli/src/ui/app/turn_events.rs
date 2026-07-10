@@ -112,12 +112,15 @@ impl AppCore {
         update_token_usage(&mut self.token_usage, event, context_window_tokens);
     }
 
-    /// Working HUD phase verb (issue #27): thinking / exploring / reading X /
-    /// writing X / running bash / running tests, falling back to "working"
-    /// only when nothing more specific applies. Only reasoning and tool-call
-    /// events carry a new phase — other event kinds (streamed text deltas,
-    /// tool results) leave the verb in place so it swaps only when the phase
-    /// actually changes, not on every event.
+    /// Working HUD phase verb (issue #27, #62): thinking / exploring /
+    /// reading X / writing X / running bash / running tests, falling back to
+    /// "working" only when nothing more specific applies. Reasoning and
+    /// tool-call events set a new phase; a tool result — success, failure,
+    /// *or* auto-denial via the turn denial cache (#62) — clears it back to
+    /// `None` so the HUD falls back to the live phase (working, or whatever
+    /// the next reasoning/tool-call event sets) instead of parroting the verb
+    /// of a tool call that has already finished. Streamed text deltas leave
+    /// the verb alone so it doesn't flicker mid-phase.
     fn update_phase_verb(&mut self, event: &EventEnvelope) {
         match event.kind.as_str() {
             EventKind::MODEL_REASONING => {
@@ -125,6 +128,9 @@ impl AppCore {
             }
             EventKind::TOOL_CALL => {
                 self.current_phase_verb = Some(phase_verb_for_tool_call(event));
+            }
+            EventKind::TOOL_RESULT => {
+                self.current_phase_verb = None;
             }
             _ => {}
         }

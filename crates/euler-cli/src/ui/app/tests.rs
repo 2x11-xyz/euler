@@ -3120,6 +3120,67 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
     assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
 }
 
+/// #62: the verb must not go stale once its tool call terminates — success,
+/// failure, *or* auto-denial via the turn denial cache all resolve through
+/// the same `tool.result` event, so all three must clear the verb back to
+/// the live phase instead of parroting a tool that already finished.
+#[test]
+fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-bash".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "ls -la"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+
+    // Auto-denied via the turn denial cache: `ok: false`, no distinct
+    // tool-call event precedes it — same shape as a normal failure result.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-bash".into()),
+            ("name", "run_shell".into()),
+            ("ok", false.into()),
+            ("error", "permission denied".into()),
+        ]),
+    )));
+    assert_eq!(
+        core.current_phase_verb, None,
+        "verb must fall back to the live phase once the tool call resolves, denied or not"
+    );
+
+    // A second bash attempt that succeeds also clears on its own result.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-bash-2".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "ls -la"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-bash-2".into()),
+            ("name", "run_shell".into()),
+            ("ok", true.into()),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb, None);
+}
+
 /// #47(a): while reasoning streams, the dim-italic reasoning text itself
 /// renders as continuation lines under the live `thinking · Ns` line.
 #[test]
