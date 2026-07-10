@@ -2947,7 +2947,7 @@ fn patch_approval_modal_renders_diff_and_prompt() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("Edit file?"));
-    assert!(contents.contains("Approval required"));
+    assert!(!contents.contains("Approval required"));
     assert!(contents.contains("fs-write · cwd"));
     assert!(contents.contains("note.txt"));
     assert!(contents.contains("alpha"));
@@ -2963,15 +2963,59 @@ fn patch_approval_modal_renders_diff_and_prompt() {
         visual.contains("write scope note.txt"),
         "visual: {visual:?}"
     );
-    assert!(visual.contains("ran-before 0×"), "visual: {visual:?}");
+    // v2.1 (§7b): unknown/zero fields are omitted, not padded with "ran-before 0×".
+    assert!(!visual.contains("ran-before"), "visual: {visual:?}");
     assert!(contents.contains("y  Allow once"));
-    assert!(contents.contains("Allow once (default selection)"));
+    assert!(!contents.contains("(default selection)"));
     assert!(contents.contains("a  Allow fs-write"));
     assert!(contents.contains("p  Allow fs-write"));
     assert!(contents.contains("n/esc  Deny"));
     assert!(contents.contains("Deny with instructions"));
-    assert!(contents.contains("hint: every decision is logged"));
+    assert!(!contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
+}
+
+#[test]
+fn patch_approval_modal_has_blank_line_before_options_and_gold_selection() {
+    let mut core = core();
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    let lines = core
+        .visual_canvas_frame(80)
+        .active_frame_lines
+        .into_iter()
+        .collect::<Vec<_>>();
+    let plain = lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let options_row = plain
+        .iter()
+        .position(|line| line.contains("y  Allow once"))
+        .expect("options row present");
+    assert!(
+        plain[options_row - 1].trim().is_empty()
+            || plain[options_row - 1].trim_matches(['│', ' ']).is_empty(),
+        "a blank line should separate the command block from the options: {plain:?}"
+    );
+
+    let selected_style = lines[options_row]
+        .spans
+        .iter()
+        .find(|span| span.text.as_str().contains("Allow once"))
+        .expect("selected span")
+        .style;
+    assert_eq!(
+        selected_style.fg,
+        Some(core.theme.palette.warning),
+        "the default-selected option should use gold text"
+    );
+    assert_eq!(
+        selected_style.bg,
+        Some(core.theme.palette.selection),
+        "the default-selected option should use the select-bg token"
+    );
 }
 
 #[test]
@@ -2989,12 +3033,9 @@ fn patch_approval_modal_clears_full_rows_behind_modal() {
     let contents = terminal.backend().screen_contents();
     for (needle, expected) in [
         ("Edit file?", "Edit file?"),
-        ("Approval required", "Approval required"),
         ("fs-write · cwd", "fs-write · cwd"),
-        (
-            "hint: every decision is logged",
-            "hint: every decision is logged",
-        ),
+        ("y  Allow once", "y  Allow once"),
+        ("n/esc  Deny", "n/esc  Deny"),
     ] {
         let line = contents
             .lines()

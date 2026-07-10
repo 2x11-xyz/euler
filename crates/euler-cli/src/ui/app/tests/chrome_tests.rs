@@ -320,7 +320,7 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     assert!(terminal
         .backend()
         .screen_contents()
-        .contains("Approval required"));
+        .contains("Run command?"));
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('y'))),
@@ -1679,7 +1679,7 @@ fn patch_approval_hides_completed_read_file_activity() {
         .draw(|frame| core.render(frame))
         .expect("patch approval draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Approval required"));
+    assert!(contents.contains("Edit file?"));
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("read_file completed"));
     assert!(!contents.contains("raw transcript source"));
@@ -1694,10 +1694,7 @@ fn patch_approval_remains_visible_and_active_when_question_mark_is_pressed() {
     terminal
         .draw(|frame| core.render(frame))
         .expect("draw before");
-    assert!(terminal
-        .backend()
-        .screen_contents()
-        .contains("Approval required"));
+    assert!(terminal.backend().screen_contents().contains("Edit file?"));
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('?'))),
@@ -1710,12 +1707,9 @@ fn patch_approval_remains_visible_and_active_when_question_mark_is_pressed() {
         .draw(|frame| core.render(frame))
         .expect("draw after");
     let contents = terminal.backend().screen_contents();
-    assert!(
-        contents.contains("Approval required"),
-        "contents:\n{contents}"
-    );
-    // Height-tight frames may clip the trailing hint line; the decision
-    // keys are the durable affordance that must remain visible.
+    assert!(contents.contains("Edit file?"), "contents:\n{contents}");
+    // Height-tight frames may clip the trailing rows; the decision keys are
+    // the durable affordance that must remain visible.
     assert!(
         contents.contains("y  Allow once") && contents.contains("n/esc  Deny"),
         "contents:\n{contents}"
