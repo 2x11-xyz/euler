@@ -76,7 +76,6 @@ const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
 /// Working HUD braille spinner cadence (issue #27, spec v2.1 §13.3: 80-100ms).
 const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(90);
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
-const DENIED_COMPOSER_GHOST: &str = "denied — tell euler what to do instead";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
 
@@ -201,8 +200,6 @@ pub struct AppCore {
     queued_inputs: VecDeque<String>,
     queued_selection: Option<usize>,
     queue_auto_flush_paused: bool,
-    /// Empty-composer ghost override (deny-with-instruction empty path).
-    empty_composer_ghost: Option<&'static str>,
     in_flight_label: Option<String>,
     /// Persona/name of the in-flight companion run, for approval panel tagging.
     in_flight_companion_name: Option<String>,
@@ -741,7 +738,6 @@ impl AppCore {
             queued_inputs: VecDeque::new(),
             queued_selection: None,
             queue_auto_flush_paused: false,
-            empty_composer_ghost: None,
             in_flight_label: None,
             in_flight_companion_name: None,
             in_flight_cancellable: false,
@@ -841,9 +837,7 @@ impl AppCore {
     }
 
     fn composer_snapshot(&self) -> ComposerSnapshot<'_> {
-        ComposerSnapshot::new(self.bottom.composer())
-            .with_queued(self.queued_composer_lines())
-            .with_empty_ghost(self.empty_composer_ghost)
+        ComposerSnapshot::new(self.bottom.composer()).with_queued(self.queued_composer_lines())
     }
 
     fn queued_composer_lines(&self) -> Vec<QueuedComposerLine> {
@@ -1373,7 +1367,6 @@ impl AppCore {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
         }
-        self.empty_composer_ghost = None;
         self.bottom.edit_composer(|draft| {
             let _ = draft.insert_bracketed_paste(text);
         });
@@ -1483,11 +1476,12 @@ impl AppCore {
     fn reply_deny_from_modal(&mut self) -> CoreEffect {
         let draft = self.bottom.composer().submit_text();
         if draft.trim().is_empty() {
-            self.empty_composer_ghost = Some(DENIED_COMPOSER_GHOST);
+            // Spec §13.2: empty composer is rail + dim cursor only, in every
+            // state — the transcript's `denied` event line is the single
+            // carrier of that guidance (#57). No composer ghost text here.
             self.reply_to_modal(PermissionReply::Deny)
         } else {
             self.bottom.replace_composer_text("");
-            self.empty_composer_ghost = None;
             // Front of queue: next user turn after the denied tool turn finishes.
             self.queued_inputs.push_front(draft.clone());
             self.queued_selection = Some(0);
@@ -1498,7 +1492,6 @@ impl AppCore {
     fn handle_modal_composer_input(&mut self, input: InputEvent) -> CoreEffect {
         match input {
             InputEvent::Paste(text) => {
-                self.empty_composer_ghost = None;
                 self.bottom.edit_composer(|draft| {
                     let _ = draft.insert_bracketed_paste(&text);
                 });
@@ -1911,7 +1904,6 @@ impl AppCore {
         &mut self,
         edit: impl FnOnce(&mut super::composer::ComposerDraft),
     ) -> CoreEffect {
-        self.empty_composer_ghost = None;
         self.bottom.edit_composer(edit);
         CoreEffect::Render
     }

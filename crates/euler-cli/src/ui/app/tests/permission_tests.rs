@@ -333,7 +333,11 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
 }
 
 #[test]
-fn empty_deny_sets_denied_composer_ghost() {
+fn empty_deny_leaves_composer_empty_without_ghost_text() {
+    // #57: spec §13.2 is unconditional — an empty composer is rail + dim
+    // cursor only, in every state, including right after a bare deny. The
+    // transcript's own `denied` event line is the single carrier of that
+    // guidance; the composer must not restate it.
     let mut terminal = Terminal::new(VT100Backend::new(80, 16)).expect("terminal");
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -350,7 +354,8 @@ fn empty_deny_sets_denied_composer_ghost() {
     assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("denied — tell euler what to do instead"));
+    assert!(!contents.contains("denied — tell euler what to do instead"));
+    assert_eq!(core.bottom.composer().submit_text(), "");
 }
 
 #[test]
