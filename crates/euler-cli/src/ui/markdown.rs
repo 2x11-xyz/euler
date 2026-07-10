@@ -514,6 +514,11 @@ fn render_table(table: TableState, theme: &Theme, width: u16) -> Vec<Line<'stati
     for (idx, row) in table.rows.iter().enumerate() {
         if idx == 1 {
             out.push(header_rule_line(&widths, theme));
+        } else if idx > 1 {
+            // v2 (§10b): one blank line between data rows so wrapped cells
+            // read as a single block per row — no rule above the header,
+            // none after the last row, just the one header separator.
+            out.push(Line::from(""));
         }
         out.extend(table_row_lines(
             row,
@@ -730,9 +735,16 @@ fn table_row_line(
             .and_then(|cell| cell.get(row_idx))
             .cloned()
             .unwrap_or_default();
+        // v2 (§10b): the first column reads as a row label — dim. The
+        // header row stays cream bold across every column.
+        let style = if idx == 0 && !header {
+            theme.transcript.muted
+        } else {
+            cell_style
+        };
         spans.push(Span::styled(
             align_text(&text, *width, alignments.get(idx).copied()),
-            cell_style,
+            style,
         ));
     }
     Line::from(spans)
