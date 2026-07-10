@@ -93,7 +93,6 @@ impl Default for ThemeOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct Theme {
     pub palette: Palette,
     pub activity: ActivityTheme,
@@ -107,7 +106,6 @@ pub struct Theme {
     pub background: BackgroundMode,
 }
 
-#[allow(dead_code)]
 impl Theme {
     pub fn for_choice(choice: ThemeChoice) -> Self {
         match choice {
@@ -170,7 +168,6 @@ impl Default for Theme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct Palette {
     pub foreground: Color,
     pub background: Color,
@@ -202,18 +199,9 @@ pub struct Palette {
     pub st_ctx: Color,
 }
 
-#[allow(dead_code)]
 impl Palette {
-    pub fn default_dark() -> Self {
-        Self::default_dark_with(ThemeOptions::default_dark())
-    }
-
     pub fn default_dark_with(options: ThemeOptions) -> Self {
         PaletteSeed::default_dark().resolve(options)
-    }
-
-    pub fn default_light() -> Self {
-        Self::default_light_with(ThemeOptions::default_light())
     }
 
     pub fn default_light_with(options: ThemeOptions) -> Self {
@@ -410,7 +398,6 @@ impl PaletteSeed {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct ActivityTheme {
     pub status: Style,
     pub header: Style,
@@ -419,13 +406,11 @@ pub struct ActivityTheme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct BannerTheme {
     pub wordmark: Style,
     pub identity: Style,
 }
 
-#[allow(dead_code)]
 impl BannerTheme {
     fn from_palette(palette: &Palette) -> Self {
         // Brand rule: letterforms are one tone (theme foreground, no
@@ -439,7 +424,6 @@ impl BannerTheme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct ComposerTheme {
     pub rule: Style,
     pub queued_rule: Style,
@@ -449,7 +433,6 @@ pub struct ComposerTheme {
     pub token_bar: Style,
 }
 
-#[allow(dead_code)]
 impl ComposerTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
@@ -464,7 +447,6 @@ impl ComposerTheme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct StatusTheme {
     pub base: Style,
     pub state: Style,
@@ -473,7 +455,6 @@ pub struct StatusTheme {
     pub ctx: Style,
 }
 
-#[allow(dead_code)]
 impl StatusTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
@@ -486,7 +467,6 @@ impl StatusTheme {
     }
 }
 
-#[allow(dead_code)]
 impl ActivityTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
@@ -501,7 +481,6 @@ impl ActivityTheme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct TranscriptTheme {
     pub body: Style,
     pub user: Style,
@@ -526,7 +505,6 @@ pub struct TranscriptTheme {
     pub companion: Style,
 }
 
-#[allow(dead_code)]
 impl TranscriptTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
