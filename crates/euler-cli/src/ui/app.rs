@@ -1664,7 +1664,7 @@ impl AppCore {
                 pattern,
                 source,
             } => self.revoke_grant(capability, pattern, source),
-            CommandAction::ShowHelp { text } => self.summary_item(text),
+            CommandAction::ShowHelp { text } => self.notice_item(text),
             CommandAction::ResumeSession { session_id } => {
                 self.resume_session_from_picker(session_id)
             }
@@ -1734,7 +1734,7 @@ impl AppCore {
                 ));
                 CoreEffect::Render
             }
-            Err(error) => self.notice_item(format!("rollback failed: {error}")),
+            Err(error) => self.error_item(format!("rollback failed: {error}")),
         }
     }
 
@@ -1751,11 +1751,11 @@ impl AppCore {
         });
         let (session_id, events_path) = match created {
             Ok(created) => created,
-            Err(error) => return self.notice_item(format!("new session failed: {error}")),
+            Err(error) => return self.error_item(format!("new session failed: {error}")),
         };
         let writer = match ProvenanceWriter::new(&events_path) {
             Ok(writer) => writer,
-            Err(error) => return self.notice_item(format!("new session failed: {error}")),
+            Err(error) => return self.error_item(format!("new session failed: {error}")),
         };
         let old_session = self.take_idle_session();
         let active_target = old_session.active_target().clone();
@@ -1795,7 +1795,7 @@ impl AppCore {
     fn companion_run(&mut self, input: serde_json::Value) -> CoreEffect {
         let request = match crate::companion_run::parse_agent_task_value(&input) {
             Ok(task) => CompanionRunRequest { task },
-            Err(error) => return self.notice_item(format!("companion run failed: {error}")),
+            Err(error) => return self.error_item(format!("companion run failed: {error}")),
         };
         match std::mem::replace(&mut self.state, AppState::Empty) {
             AppState::Idle { session } => {
@@ -1852,13 +1852,13 @@ impl AppCore {
     }
 
     fn login_guidance(&mut self, provider: String) -> CoreEffect {
-        self.summary_item(format!(
+        self.notice_item(format!(
             "Run outside the TUI:\neuler login --provider {provider}\n\nThe picker stays offline; auth is checked when a request uses the provider."
         ))
     }
 
     fn logout_guidance(&mut self, provider: String) -> CoreEffect {
-        self.summary_item(format!(
+        self.notice_item(format!(
             "Run outside the TUI:\neuler logout --provider {provider}"
         ))
     }
@@ -2161,29 +2161,45 @@ impl AppCore {
         }
     }
 
+    /// Muted, non-error informational line (review v2 §3/§6/§14.4, #53) — no
+    /// glyph, no "ui:" source prefix, indented to the content column.
+    /// Consecutive `Notice` items stack directly without a separating blank
+    /// line (the renderer special-cases this run). Used for every neutral
+    /// confirmation/refusal: state guards ("waits for the active turn"),
+    /// setting confirmations (/theme, /model set, /effort, /status, /usage,
+    /// /compact, permission changes, extension toggles, timestamps toggle,
+    /// code-swarm save/config lines, resume refusal) — none of these are
+    /// failures, so none should read as one. Real failures go through
+    /// `error_item` instead.
     fn notice_item(&mut self, message: String) -> CoreEffect {
         self.push_notice_item(message);
         CoreEffect::Render
     }
 
     fn push_notice_item(&mut self, message: String) {
+        self.push_finalized_visual_item(TranscriptItem::Notice(message));
+    }
+
+    /// Alias kept for call sites that read more naturally as "teaching" the
+    /// user something (disabled-extension guidance, etc.) — identical
+    /// rendering to `notice_item`.
+    fn teach_notice(&mut self, message: String) -> CoreEffect {
+        self.notice_item(message)
+    }
+
+    /// Red, `✗`-anchored failure line (review v2 §3, #53) — reserved for
+    /// genuine failures: an operation was attempted and an error came back.
+    /// Never use this for state guards or confirmations.
+    fn error_item(&mut self, message: String) -> CoreEffect {
+        self.push_error_item(message);
+        CoreEffect::Render
+    }
+
+    fn push_error_item(&mut self, message: String) {
         self.push_finalized_visual_item(TranscriptItem::Error {
             source: "ui".to_owned(),
             message,
         });
-    }
-
-    /// Muted, non-error informational line (review v2 §3/§6/§14.4) — no
-    /// glyph, no "ui:" source prefix, indented to the content column.
-    /// Consecutive `Notice` items stack directly without a separating blank
-    /// line (the renderer special-cases this run). Used for every neutral
-    /// confirmation/refusal (extension toggles, timestamps toggle,
-    /// code-swarm save/config lines, resume refusal, teach messages like the
-    /// disabled-extension notice) — none of these are failures, so none
-    /// should read as one.
-    fn teach_notice(&mut self, message: String) -> CoreEffect {
-        self.push_finalized_visual_item(TranscriptItem::Notice(message));
-        CoreEffect::Render
     }
 
     fn summary_item(&mut self, text: String) -> CoreEffect {

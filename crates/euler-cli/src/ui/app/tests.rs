@@ -2854,9 +2854,8 @@ fn slash_palette_backspace_corrects_input_before_confirm() {
 
     core.handle_input(key(KeyCode::Enter));
 
-    assert!(
-        drain_finalized_visual_text(&mut core, 80).contains("ui: reasoning effort set to large")
-    );
+    // #53: setting confirmations are neutral notices, not "ui:" errors.
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("reasoning effort set to large"));
 }
 
 #[test]
@@ -2883,7 +2882,9 @@ fn slash_palette_trailing_noise_correction_submits_visible_effort_argument() {
     core.handle_input(key(KeyCode::Enter));
 
     let pending = drain_finalized_visual_text(&mut core, 80);
-    assert!(pending.contains("ui: reasoning effort set to large"));
+    // #53: setting confirmations are neutral notices, not "ui:" errors.
+    assert!(pending.contains("reasoning effort set to large"));
+    assert!(!pending.contains("ui: reasoning effort set to large"));
     assert!(!pending.contains("unknown command: /effort//"));
 }
 

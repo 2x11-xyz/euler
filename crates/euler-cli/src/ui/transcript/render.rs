@@ -520,10 +520,13 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 );
             }
             TranscriptItem::SessionSummary(summary) => {
+                // No `* Summary:` plumbing label (#53): say the thing
+                // plainly, muted, bullet-anchored like any other neutral
+                // event — no stray asterisk.
                 push_wrapped(
                     &mut lines,
                     blank_gutter(),
-                    &format!("* Summary: {summary}"),
+                    summary,
                     theme.transcript.control,
                     theme,
                     width,
