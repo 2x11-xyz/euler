@@ -348,7 +348,21 @@ impl<D> PermissionGate<D> {
         source: GrantSource,
     ) -> Result<usize, ProjectGrantError> {
         match source {
-            GrantSource::Session => Ok(self.session_grants.revoke(capability, pattern)),
+            GrantSource::Session => {
+                let removed = self.session_grants.revoke(capability, pattern);
+                // An unscoped session grant flipped the capability to
+                // SessionAllow; revoking it must also stop execution, not
+                // just remove the list entry. Ask is the safe restoration —
+                // the grant could only have been issued from a promptable
+                // mode.
+                if removed > 0
+                    && pattern.is_unscoped()
+                    && self.mode(capability) == ApprovalMode::SessionAllow
+                {
+                    self.set_mode(capability, ApprovalMode::Ask);
+                }
+                Ok(removed)
+            }
             GrantSource::Project => {
                 let store = self
                     .project_store
@@ -623,6 +637,32 @@ mod tests {
             GrantScope::Project(ScopePattern::new("git").expect("pattern")),
         );
         assert!(matches!(result, Err(ProjectGrantError::NoStore)));
+    }
+
+    #[test]
+    fn revoking_unscoped_session_grant_restores_ask_mode() {
+        // Review finding: revoke only removed the list entry while the
+        // SessionAllow mode installed with the grant kept allowing.
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.set_mode(Capability::ShellExec, ApprovalMode::Ask);
+        gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::Session(ScopePattern::unscoped()),
+        )
+        .expect("install");
+        assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::SessionAllow);
+
+        gate.revoke(
+            Capability::ShellExec,
+            &ScopePattern::unscoped(),
+            GrantSource::Session,
+        )
+        .expect("revoke");
+
+        assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::Ask);
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(!gate.is_granted(&request));
     }
 
     #[test]
