@@ -14,8 +14,8 @@ output) remains.
 
 Warm Ledger is specified by:
 
-- `docs/notes/warm-ledger-tui-plan-2026-07-09.md` (implementation program)
-- `docs/contracts/ui.md` (normative UI contract)
+- `docs/contracts/ui.md` (normative UI contract; absorbed the implementation
+  program formerly kept as a working note)
 - Design package *Euler TUI Spec* (option 3a); Spec text wins over Concepts mockups
 
 ## Ledger rules (normative summary)

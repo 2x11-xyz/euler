@@ -5,7 +5,7 @@ Directions, not commitments. Ordered roughly by intent; no dates.
 ## Near term (v0.2)
 
 - **Warm Ledger TUI.** Core CLI transcript layout/interaction system (ADR 0010,
-  `docs/contracts/ui.md`, plan `docs/notes/warm-ledger-tui-plan-2026-07-09.md`).
+  `docs/contracts/ui.md`).
   Docs/contracts first; then multi-slice implementation on a long-lived branch
   for user dogfood before PR. Sequence (scheduled, not opportunistic): ledger
   foundation + themes → diff renderer → thinking/markdown → live composer/queue

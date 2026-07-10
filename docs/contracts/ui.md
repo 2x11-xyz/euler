@@ -5,8 +5,8 @@ Euler adopts **Warm Ledger** as the core CLI layout and interaction system
 swappable profiles over semantic tokens. The CLI representation is an ordered
 event transcript, not a sidebar or dashboard.
 
-Normative design detail lives in the Warm Ledger Spec (option 3a) and
-`docs/notes/warm-ledger-tui-plan-2026-07-09.md`. Where a mockup and this
+Normative design detail lives in the Warm Spine Spec (v2.1, option 3a
+lineage). Where a mockup and this
 contract disagree, this contract and the Spec text win over Concepts frames.
 
 ## Baseline
