@@ -3576,15 +3576,13 @@ fn companion_block_collapses_by_default_and_expands_with_ctrl_o_key() {
         "collapsed should hide findings: {collapsed:?}"
     );
 
-    let mut expanded_keys = std::collections::HashSet::new();
-    expanded_keys.insert(super::transcript::artifact_key_for_index(0));
     let expanded = line_texts(
         &super::transcript::render_items_for_history_with_offsets(
             &[item],
             &theme,
             100,
             DEFAULT_OUTPUT_LIMIT_LINES,
-            &expanded_keys,
+            true,
         )
         .0,
     )

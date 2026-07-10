@@ -1688,15 +1688,43 @@ fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
     );
 }
 
+/// Issue #49: `ctrl+o` is a single global toggle — every foldable cell in a
+/// mixed transcript (tool run, reasoning, diff) expands together on the
+/// first press and collapses together on the second, with no per-cell
+/// targeting or invisible nearest-to-viewport heuristic.
 #[test]
-fn ctrl_o_expands_only_nearest_foldable_artifact() {
+fn ctrl_o_expands_all_foldable_artifacts_globally() {
     let mut core = core();
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    core.push_finalized_visual_item(TranscriptItem::ModelReasoning {
+        fidelity: "detailed".to_owned(),
+        content: "Weighing the tradeoffs between approach A and approach B. \
+            After a long deliberation the conclusion lands on approach B \
+            because it is the option that fully honors the unique reasoning marker."
+            .to_owned(),
+    });
+    core.push_finalized_visual_item(TranscriptItem::PatchApplied {
+        path: "src/lib.rs".to_owned(),
+        old: None,
+        new: Some(
+            (1..=20)
+                .map(|line| format!("added line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        ),
+    });
     core.push_finalized_visual_item(shell_artifact_with_lines(14));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
     assert!(folded.contains("8 more lines"), "folded: {folded:?}");
     assert!(folded.contains("10 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
+    assert!(
+        !folded.contains("unique reasoning marker"),
+        "folded: {folded:?}"
+    );
+    assert!(!folded.contains("added line 15"), "folded: {folded:?}");
 
     assert_eq!(
         core.handle_input(ctrl_o()),
@@ -1704,14 +1732,34 @@ fn ctrl_o_expands_only_nearest_foldable_artifact() {
     );
     let expanded = drain_finalized_visual_text(&mut core, 80);
 
-    // Exactly one foldable expands (nearest to viewport center).
-    let still_folded = usize::from(expanded.contains("8 more lines"))
-        + usize::from(expanded.contains("10 more lines"));
-    assert_eq!(
-        still_folded, 1,
-        "exactly one artifact should remain folded: {expanded:?}"
-    );
+    // All foldable cells expand together — none remain collapsed.
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
+    assert!(
+        expanded.contains("unique reasoning marker"),
+        "expanded: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("ctrl+o collapse"),
+        "expanded: {expanded:?}"
+    );
+    assert!(expanded.contains("added line 15"), "expanded: {expanded:?}");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("10 more lines"), "refolded: {refolded:?}");
+    assert!(
+        !refolded.contains("unique reasoning marker"),
+        "refolded: {refolded:?}"
+    );
+    assert!(
+        !refolded.contains("added line 15"),
+        "refolded: {refolded:?}"
+    );
 }
 
 #[test]
@@ -3887,7 +3935,7 @@ fn ctrl_f_opens_read_only_transcript_search() {
     core.handle_input(key(KeyCode::Char('x')));
     assert!(matches!(core.bottom.owner(), BottomOwner::Search(_)));
     // Search must not clear fold state.
-    assert!(core.expanded_artifact_keys.is_empty());
+    assert!(!core.tool_output_expanded);
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
     assert!(matches!(core.bottom.owner(), BottomOwner::Composer));

@@ -61,7 +61,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 #[cfg(test)]
 use ratatui::Frame;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
@@ -181,12 +181,14 @@ pub struct AppCore {
     pending_terminal_clipboard: Option<String>,
     interrupted_guidance: bool,
     in_flight_error: Option<String>,
-    /// Keys of foldable history items currently expanded (`history:{index}`).
-    expanded_artifact_keys: HashSet<String>,
-    /// Last known history viewport as `(top_row, height)` for nearest-block fold.
+    /// Global `ctrl+o` fold state (issue #49): one flag for every foldable
+    /// history item — no per-cell targeting, no invisible nearest-to-
+    /// viewport heuristic. All foldable cells expand together, and collapse
+    /// together on the next `ctrl+o`.
+    tool_output_expanded: bool,
+    /// Last known history viewport as `(top_row, height)`, used to position
+    /// search-match scrolling.
     last_history_viewport: (usize, usize),
-    /// Foldable item spans recorded on the last history render.
-    last_foldable_spans: Vec<FoldableSpan>,
     theme: Theme,
     theme_choice: ThemeChoice,
     theme_preference_path: Option<PathBuf>,
@@ -728,9 +730,8 @@ impl AppCore {
             pending_terminal_clipboard: None,
             interrupted_guidance: false,
             in_flight_error: None,
-            expanded_artifact_keys: HashSet::new(),
+            tool_output_expanded: false,
             last_history_viewport: (0, 24),
-            last_foldable_spans: Vec::new(),
             theme,
             theme_choice,
             theme_preference_path,
@@ -1783,8 +1784,7 @@ impl AppCore {
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
         self.token_usage.context_window_tokens = self.active_context_window_tokens();
-        self.expanded_artifact_keys.clear();
-        self.last_foldable_spans.clear();
+        self.tool_output_expanded = false;
         self.modal = None;
         self.quit_armed = None;
         self.last_working_elapsed_secs = None;
@@ -1999,6 +1999,13 @@ impl AppCore {
         CoreEffect::Render
     }
 
+    /// Issue #49: `ctrl+o` is a single global expand/collapse toggle, not a
+    /// per-cell targeting gesture. Per-cell "nearest to viewport center"
+    /// targeting had no honest input method once the mouse click path (#29)
+    /// was removed — it was an invisible heuristic with no visible affordance
+    /// to aim it. A global toggle is simple and predictable: one keystroke,
+    /// every foldable cell in the transcript expands or collapses together;
+    /// native scrollback and `ctrl+f` remain the navigation tools.
     fn toggle_tool_artifact_expansion(&mut self) -> CoreEffect {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
@@ -2009,77 +2016,10 @@ impl AppCore {
         {
             return CoreEffect::None;
         }
-        self.refresh_foldable_spans(self.composer_navigation_width);
-        let Some(key) = self.nearest_foldable_key() else {
-            return CoreEffect::None;
-        };
-        if !self.expanded_artifact_keys.remove(&key) {
-            self.expanded_artifact_keys.insert(key);
-        }
+        self.tool_output_expanded = !self.tool_output_expanded;
         self.visual_canvas.invalidate_history_cache();
         self.visual_scroll_offset = 0;
         CoreEffect::ReplayHistoryWithScrollbackPurge
-    }
-
-    fn nearest_foldable_key(&self) -> Option<String> {
-        let spans = &self.last_foldable_spans;
-        if spans.is_empty() {
-            return None;
-        }
-        let (top, height) = self.last_history_viewport;
-        let height = height.max(1);
-        let center = top.saturating_add(height / 2);
-        let mut best: Option<(usize, usize, &str)> = None;
-        for (index, span) in spans.iter().enumerate() {
-            let mid = span
-                .start
-                .saturating_add(span.end.saturating_sub(span.start) / 2);
-            let dist = mid.abs_diff(center);
-            let rank = (dist, spans.len() - 1 - index);
-            match best {
-                Some((best_dist, best_rev, _)) if rank >= (best_dist, best_rev) => {}
-                _ => best = Some((rank.0, rank.1, span.key.as_str())),
-            }
-        }
-        best.map(|(_, _, key)| key.to_owned())
-    }
-
-    fn refresh_foldable_spans(&mut self, width: u16) {
-        let items = self.visual_canvas.finalized_items();
-        let theme = self.theme.clone();
-        let mut row = 0usize;
-        let mut spans = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            let key = transcript::artifact_key_for_index(index);
-            let folded = !self.expanded_artifact_keys.contains(&key);
-            let limit = if folded {
-                TOOL_CALL_MAX_LINES
-            } else {
-                usize::MAX
-            };
-            let lines = transcript::render_items_for_history_with_limit(
-                std::slice::from_ref(item),
-                &theme,
-                width,
-                limit,
-            );
-            let line_count = lines.len();
-            if item.is_foldable_artifact(TOOL_CALL_MAX_LINES) {
-                let end = row.saturating_add(line_count.saturating_sub(1));
-                spans.push(FoldableSpan {
-                    key,
-                    start: row,
-                    end,
-                });
-            }
-            row = row.saturating_add(line_count);
-        }
-        let height = self.last_history_viewport.1.max(1);
-        let top = row
-            .saturating_sub(height)
-            .saturating_sub(self.visual_scroll_offset);
-        self.last_history_viewport = (top, height);
-        self.last_foldable_spans = spans;
     }
 
     fn open_external_editor(&mut self) -> CoreEffect {
@@ -2438,21 +2378,6 @@ impl AppCore {
         let export_dir = self.session_store()?.home().root().join("exports");
         Ok(export_dir.join(format!("euler-session-{session_id}.json")))
     }
-}
-
-/// A foldable history item's rendered row range, recorded on each history
-/// render so `ctrl+o` (nearest-to-viewport) can target the right artifact
-/// without re-deriving layout from scratch. `ctrl+o` is the only fold/unfold
-/// affordance — euler runs without mouse capture (native selection and
-/// scrollback stay intact), so there is no click target to hit-test here.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct FoldableSpan {
-    key: String,
-    /// First rendered row of the item (inclusive).
-    start: usize,
-    /// Last rendered row of the item (inclusive) — includes the trailing
-    /// blank spacer row the transcript renderer appends after every event.
-    end: usize,
 }
 
 fn resolve_session_store() -> Result<SessionStore> {

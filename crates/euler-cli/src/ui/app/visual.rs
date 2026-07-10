@@ -53,7 +53,7 @@ impl AppCore {
         self.composer_navigation_width = width;
         let snapshot = self.visual_canvas_snapshot(width);
         let theme = self.theme.clone();
-        let expanded = self.expanded_artifact_keys.clone();
+        let expanded = self.tool_output_expanded;
         let show_ts = self.show_timestamp_gutter;
         let mut frame = self.visual_canvas.render(snapshot, |items, width| {
             crate::ui::text::with_timestamp_gutter(show_ts, || {
@@ -62,7 +62,7 @@ impl AppCore {
                     &theme,
                     width,
                     TOOL_CALL_MAX_LINES,
-                    &expanded,
+                    expanded,
                 )
             })
         });
@@ -73,7 +73,6 @@ impl AppCore {
         if self.turn_in_flight() && self.transcript.live_committed_items().is_empty() {
             frame.committable_rows = frame.committable_rows.min(frame.history_rows);
         }
-        self.refresh_foldable_spans(width);
         let height = self.last_history_viewport.1.max(1);
         let top = frame
             .history_rows
@@ -416,14 +415,14 @@ pub(super) fn render_finalized_visual_items_with_offsets(
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
-    expanded_artifact_keys: &std::collections::HashSet<String>,
+    expanded: bool,
 ) -> (Vec<CanvasLine>, Vec<usize>) {
     let (lines, item_end_offsets) = transcript::render_entries_for_history_with_offsets(
         entries,
         theme,
         width,
         output_limit_lines,
-        expanded_artifact_keys,
+        expanded,
     );
     // v2: the renderer already separates every event with one blank line —
     // the old trailing-rhythm row would double it AND desync the live vs

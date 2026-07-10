@@ -261,10 +261,6 @@ pub(crate) fn item_wants_timestamp(item: &TranscriptItem) -> bool {
     )
 }
 
-pub(crate) fn artifact_key_for_index(index: usize) -> String {
-    format!("history:{index}")
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ToolCallProjection {
     Exploration(String),
@@ -635,6 +631,7 @@ pub(crate) fn render_items_for_history(
     render_projected_items(items, theme, width, TranscriptRenderLimits::default())
 }
 
+#[cfg(test)]
 pub(crate) fn render_items_for_history_with_limit(
     items: &[TranscriptItem],
     theme: &Theme,
@@ -660,7 +657,7 @@ pub(crate) fn render_items_for_history_with_offsets(
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
-    expanded_artifact_keys: &std::collections::HashSet<String>,
+    expanded: bool,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let entries: Vec<_> = items
         .iter()
@@ -672,7 +669,7 @@ pub(crate) fn render_items_for_history_with_offsets(
         theme,
         width,
         TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
-        expanded_artifact_keys,
+        expanded,
         true,
     )
 }
@@ -688,14 +685,14 @@ pub(crate) fn render_entries_for_history_with_offsets(
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
-    expanded_artifact_keys: &std::collections::HashSet<String>,
+    expanded: bool,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     render::render_projected_entries_with_expansion_and_offsets(
         entries,
         theme,
         width,
         TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
-        expanded_artifact_keys,
+        expanded,
         false,
     )
 }
