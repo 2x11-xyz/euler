@@ -1694,6 +1694,64 @@ fn expanded_tool_run_keeps_full_output_without_result_line_prefix() {
 }
 
 #[test]
+fn turn_recap_omits_files_line_when_no_files_changed() {
+    let theme = Theme::default();
+    let items = vec![TranscriptItem::TurnRecap {
+        summary: "0 files · ctx 5%".to_owned(),
+        files: None,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 80));
+
+    assert_eq!(
+        texts.iter().filter(|line| !line.trim().is_empty()).count(),
+        1,
+        "zero-file turn should render only the summary line: {texts:?}"
+    );
+    assert!(texts[0].contains("0 files · ctx 5%"), "texts: {texts:?}");
+}
+
+#[test]
+fn turn_recap_renders_faint_files_line_when_files_changed() {
+    let theme = Theme::default();
+    let items = vec![TranscriptItem::TurnRecap {
+        summary: "2 files · +3 −1 · ctx 5%".to_owned(),
+        files: Some("src/a.rs  src/b.rs".to_owned()),
+    }];
+
+    let lines = render_items_for_history(&items, &theme, 80);
+    let texts = line_texts(&lines);
+    let joined = texts.join("\n");
+
+    assert!(
+        joined.contains("2 files · +3 −1 · ctx 5%"),
+        "texts: {texts:?}"
+    );
+    assert!(joined.contains("src/a.rs  src/b.rs"), "texts: {texts:?}");
+
+    // The files line is the dimmer of the two rows (review v2 §14.3): the
+    // spec calls for a faint second line, and gutter is dimmer than muted.
+    let files_line = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("src/a.rs"))
+        })
+        .expect("files line present");
+    let files_style = files_line
+        .spans
+        .iter()
+        .find(|span| span.content.contains("src/a.rs"))
+        .map(|span| span.style)
+        .expect("files span present");
+    assert_eq!(
+        files_style, theme.transcript.gutter,
+        "files line should use the faint gutter style"
+    );
+}
+
+#[test]
 fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
     let theme = Theme::default();
     let long_path = "crates/euler-cli/src/ui/transcript/very/deep/path/with spaces/cells.rs";
