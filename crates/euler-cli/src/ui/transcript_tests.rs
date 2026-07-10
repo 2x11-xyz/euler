@@ -147,6 +147,50 @@ fn transcript_state_streams_live_thinking_line_until_text_arrives() {
 }
 
 #[test]
+fn transcript_state_late_reasoning_delta_does_not_hide_streamed_text() {
+    // Core allows reasoning -> text -> reasoning interleaving within a
+    // round. Once answer text has started streaming, a later reasoning
+    // delta must not re-open the transient thinking line and suppress the
+    // already-visible in-progress answer.
+    let mut state = TranscriptState::default();
+    state.push_event(event_at(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "hmm".into())]),
+        "2026-07-05T00:00:00.000Z",
+    ));
+    assert_eq!(
+        state.live_mutable_items(),
+        vec![TranscriptItem::ModelReasoningLive {
+            elapsed: "0s".to_owned()
+        }]
+    );
+
+    state.push_event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer so far".into())]),
+    ));
+    assert_eq!(
+        state.live_mutable_items(),
+        vec![TranscriptItem::AssistantMessage("answer so far".to_owned())]
+    );
+
+    // A late reasoning delta arrives after text started; it must be
+    // dropped rather than re-opening the thinking line over the text.
+    state.push_event(event_at(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "more thought".into()),
+        ]),
+        "2026-07-05T00:00:05.000Z",
+    ));
+    assert_eq!(
+        state.live_mutable_items(),
+        vec![TranscriptItem::AssistantMessage("answer so far".to_owned())]
+    );
+}
+
+#[test]
 fn transcript_state_clears_live_thinking_on_finalized_reasoning_and_results() {
     // Finalized thought item replaces the live line.
     let mut state = TranscriptState::default();

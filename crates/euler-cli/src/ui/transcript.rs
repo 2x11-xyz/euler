@@ -402,7 +402,11 @@ impl TranscriptState {
         {
             // Reasoning streams as a transient thinking line; elapsed comes
             // from the delta timestamps so the display stays event-driven.
-            Some("reasoning") => {
+            // A reasoning delta arriving after answer text has already
+            // started streaming this round must not re-open the thinking
+            // line and suppress the in-progress answer (core allows
+            // reasoning -> text -> reasoning interleaving).
+            Some("reasoning") if !self.text_streamed_this_round() => {
                 if let Some(time) = parse_event_time(&event.ts) {
                     let start = self.reasoning_live.map_or(time, |(start, _)| start);
                     self.reasoning_live = Some((start, time));
@@ -425,6 +429,16 @@ impl TranscriptState {
             }
             _ => {}
         }
+    }
+
+    /// True once answer text has started streaming in the current round
+    /// (cleared by `clear_transient_live_tail`/`preserve_tool_call_live_tail`
+    /// at the next turn boundary). Used to stop a late reasoning delta from
+    /// re-opening the transient thinking line over already-visible text.
+    fn text_streamed_this_round(&self) -> bool {
+        self.stream.mutable_source().is_some()
+            || self.stream.committed_source().is_some()
+            || !self.live_tail.is_empty()
     }
 
     fn live_reasoning_item(&self) -> Option<TranscriptItem> {
@@ -960,6 +974,10 @@ impl TranscriptItem {
                 rows,
                 ..
             } => !rows.is_empty() || output_limit_lines > 0,
+            // Finalized thought lines collapse to a one-line summary and
+            // advertise "ctrl+o expand" (see transcript/render.rs); they
+            // must be classified foldable for ctrl+o to target them.
+            Self::ModelReasoning { .. } => true,
             _ => false,
         }
     }
