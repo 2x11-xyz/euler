@@ -29,8 +29,17 @@ impl VisualCanvasState {
     /// provenance — resume, new session, rollback). Timing is taken as-is,
     /// not recomputed, since `entries` already carries each item's real
     /// event time.
-    pub fn new_with_entries(entries: Vec<ProjectedEntry>) -> Self {
-        let mut state = Self::default();
+    ///
+    /// `clock_seed` is the `TimingClock` as of the last of those entries
+    /// (see `TranscriptState::timed_items`). Without it, the first item
+    /// pushed after the rebuild would restart `since_start` at ~0 and lose
+    /// `since_previous` continuity instead of picking up the session's real
+    /// timeline where the rebuilt entries left off.
+    pub fn new_with_entries(entries: Vec<ProjectedEntry>, clock_seed: TimingClock) -> Self {
+        let mut state = Self {
+            clock: clock_seed,
+            ..Self::default()
+        };
         for entry in entries {
             state.push_finalized_entry(entry.item, entry.timing);
         }
@@ -565,6 +574,54 @@ fn line_count_u16(lines: &[CanvasLine]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuild_reseeds_clock_so_new_items_continue_the_pre_rebuild_timeline() {
+        // Review finding: `new_with_entries` used to build `Self::default()`,
+        // giving the fresh clock a blank first/previous. The first item
+        // stamped after a resume/rollback rebuild then got since_start≈0 and
+        // since_previous=None instead of continuing the session's real
+        // timeline. Fixed ts strings only — never wall clock (hermeticity).
+        let mut clock = TimingClock::default();
+        let first_timing = clock
+            .stamp_at("2026-07-05T00:00:00.000Z")
+            .expect("valid ts");
+        let previous_timing = clock
+            .stamp_at("2026-07-05T00:00:10.000Z")
+            .expect("valid ts");
+        let entries = vec![
+            ProjectedEntry {
+                item: TranscriptItem::UserMessage("hello".to_owned()),
+                timing: Some(first_timing),
+            },
+            ProjectedEntry {
+                item: TranscriptItem::AssistantMessage("hi there".to_owned()),
+                timing: Some(previous_timing),
+            },
+        ];
+
+        // `clock` now holds the seed a real rebuild caller (timed_items)
+        // would thread through: first = 00:00:00, previous = 00:00:10.
+        let mut state = VisualCanvasState::new_with_entries(entries, clock);
+
+        state.push_finalized_with_ts(
+            TranscriptItem::AssistantMessage("continued".to_owned()),
+            Some("2026-07-05T00:00:25.000Z"),
+        );
+
+        let pushed = state.finalized.last().expect("pushed entry");
+        let timing = pushed.timing.as_ref().expect("timed item");
+        assert_eq!(
+            timing.since_previous_for_test(),
+            Some("15s"),
+            "since_previous should continue from the pre-rebuild previous stamp (00:00:10), not restart at None"
+        );
+        assert_eq!(
+            timing.since_start_for_test(),
+            Some("25s"),
+            "since_start should continue from the pre-rebuild first stamp (00:00:00), not restart at ~0"
+        );
+    }
 
     #[test]
     fn text_rejects_escape_bytes_instead_of_carrying_raw_terminal_payloads() {
