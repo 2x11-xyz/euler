@@ -206,11 +206,14 @@ impl AppCore {
         let label = request.label();
         std::thread::spawn(move || {
             let start = session.events().len();
-            let result = session.execute_extension_command(
+            // Gated: declared capabilities become grants only through the
+            // permission gate (the approval panel asks; session grants
+            // cover later runs). Never pass a descriptor list as authority.
+            let result = session.execute_extension_command_gated(
                 worker_request.extension,
                 &worker_request.command,
                 worker_request.input.clone(),
-                worker_request.capabilities.iter().copied(),
+                &worker_request.capabilities,
             );
             let events = session.events()[start..].to_vec();
             let outcome = match result {

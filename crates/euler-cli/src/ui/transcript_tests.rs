@@ -3242,7 +3242,7 @@ fn extension_result_renders_foldable_pretty_artifact() {
         .join("\n");
     let theme = Theme::default();
     let items = [TranscriptItem::ExtensionResult {
-        reference: "code-swarm.review-brief".to_owned(),
+        reference: "code-swarm.review".to_owned(),
         ok: true,
         output,
     }];
@@ -3250,7 +3250,7 @@ fn extension_result_renders_foldable_pretty_artifact() {
     let texts = line_texts(&render_items_for_history(&items, &theme, 100));
     let joined = texts.join("\n");
     assert!(
-        joined.contains("extension code-swarm.review-brief ✓"),
+        joined.contains("extension code-swarm.review ✓"),
         "texts: {joined}"
     );
     assert!(

@@ -13,6 +13,7 @@ use euler_sdk::{
     valid_checkpoint_name, EventFeedCheckpoint, EventFeedCheckpointError,
     MAX_EVENT_FEED_CHECKPOINT_BYTES,
 };
+use euler_sdk::{AgentOutcome, SpawnAgentTask};
 use euler_sdk::{ArtifactRecord, ArtifactWrite, Capability, CommandContext, CommandRegistrar};
 use euler_sdk::{
     CommandDescriptor, Extension, ExtensionCommand, ExtensionError, HostAgentRecord,
@@ -303,6 +304,18 @@ impl ExtensionHost {
         command: &str,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, ExtensionHostError> {
+        self.execute_command_with_spawner(command, input, None)
+    }
+
+    /// Execute a command with an agent-spawn service scoped to this call.
+    /// `spawn_agent` calls made by the command are checked against the
+    /// command's granted capabilities, then delegated to `spawner`.
+    pub fn execute_command_with_spawner(
+        &mut self,
+        command: &str,
+        input: serde_json::Value,
+        spawner: Option<&dyn ExtensionSpawner>,
+    ) -> Result<serde_json::Value, ExtensionHostError> {
         let record = self
             .commands
             .get(command)
@@ -324,6 +337,7 @@ impl ExtensionHost {
             capabilities: capabilities.clone(),
             artifact_recorder: self.artifact_recorder.clone(),
             denied_capabilities: Mutex::new(BTreeSet::new()),
+            spawner,
         };
         match catch_extension_unwind(|| runner.execute(CommandContext { input }, &host)) {
             Ok(Ok(output)) => Ok(output),
@@ -469,20 +483,47 @@ impl ExtensionFailureKind {
 
 #[derive(Default)]
 struct PendingRegistrar(Vec<(String, Box<dyn ExtensionCommand>)>);
-struct CommandHost {
+
+/// Session-side service that fulfills `HostApi::spawn_agent` during one
+/// command execution. The host owns the capability and attenuation checks;
+/// the spawner owns running the child and recording provenance.
+pub trait ExtensionSpawner {
+    fn spawn_agent(&self, task: SpawnAgentTask) -> Result<AgentOutcome, ExtensionError>;
+}
+
+struct CommandHost<'a> {
     log_path: PathBuf,
     extension_id: String,
     command_name: String,
     capabilities: BTreeSet<Capability>,
     artifact_recorder: Option<ArtifactRecorder>,
     denied_capabilities: Mutex<BTreeSet<Capability>>,
+    spawner: Option<&'a dyn ExtensionSpawner>,
 }
 impl CommandRegistrar for PendingRegistrar {
     fn register_command(&mut self, name: &str, command: Box<dyn ExtensionCommand>) {
         self.0.push((name.to_owned(), command));
     }
 }
-impl HostApi for CommandHost {
+impl HostApi for CommandHost<'_> {
+    fn spawn_agent(&self, task: SpawnAgentTask) -> Result<AgentOutcome, ExtensionError> {
+        let _guard = ExtensionPanicSuppressionGuard::suspend_for_host_api();
+        self.require_capability(Capability::AgentSpawn)?;
+        // Exact-flat attenuation: the child set must be a subset of this
+        // command's grant. Rejected before any event is emitted.
+        if let Some(&capability) = task
+            .capabilities
+            .iter()
+            .find(|capability| !self.capabilities.contains(capability))
+        {
+            return Err(ExtensionError::CapabilityDenied { capability });
+        }
+        let spawner = self.spawner.ok_or_else(|| {
+            ExtensionError::Message("agent spawn unavailable on this host".to_owned())
+        })?;
+        spawner.spawn_agent(task)
+    }
+
     fn query_provenance(
         &self,
         query: euler_sdk::ProvenanceQuery,
@@ -1137,7 +1178,7 @@ fn checkpoint_name_from_file(file_name: &str) -> Option<&str> {
     valid_checkpoint_name(name).then_some(name)
 }
 
-impl CommandHost {
+impl CommandHost<'_> {
     fn require_capability(&self, capability: Capability) -> Result<(), ExtensionError> {
         if self.capabilities.contains(&capability) {
             return Ok(());

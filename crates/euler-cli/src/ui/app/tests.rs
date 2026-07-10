@@ -4221,117 +4221,34 @@ fn wait_for_idle(core: &mut AppCore) {
 }
 
 mod code_swarm_tests {
-    use super::*;
-
-    fn brief_output(count: usize) -> serde_json::Value {
-        let briefs: Vec<serde_json::Value> = (0..count)
-            .map(|index| {
-                serde_json::json!({
-                    "task": format!("review as reviewer {index}"),
-                    "persona": format!("code-swarm-reviewer-{index}"),
-                    "provider": "fixture",
-                    "model": "echo",
-                    "system_prompt": "stay review-only",
-                    "capabilities": [],
-                    "budget": {"max_turns": 1, "max_tool_calls": 0, "max_tokens": 64},
-                })
-            })
-            .collect();
-        serde_json::json!({"schema": "euler.code_swarm.review_brief.v1", "briefs": briefs})
-    }
+    use crate::ui::app::code_swarm::code_swarm_review_input;
 
     #[test]
-    fn brief_completion_queues_one_companion_per_brief() {
-        let mut core = core();
-        core.code_swarm_run = Some(CodeSwarmRun::Briefing);
+    fn review_input_carries_models_prompt_and_personas() {
+        let input = code_swarm_review_input(
+            vec!["fixture::echo".to_owned(), "fixture::alt".to_owned()],
+            Some("focus on the parser".to_owned()),
+            Some(vec!["safety".to_owned()]),
+        );
 
-        core.code_swarm_on_brief_complete(&brief_output(3));
-
-        assert_eq!(core.pending_runs.len(), 3);
         assert_eq!(
-            core.code_swarm_run,
-            Some(CodeSwarmRun::Reviewing {
-                remaining: 3,
-                total: 3
+            input,
+            serde_json::json!({
+                "models": ["fixture::echo", "fixture::alt"],
+                "prompt": "focus on the parser",
+                "reviewers": ["safety"],
             })
         );
-        assert!(core
-            .pending_runs
-            .iter()
-            .all(|request| matches!(request, PendingRunRequest::Companion(_))));
     }
 
     #[test]
-    fn companion_completions_advance_then_queue_report() {
-        let mut core = core();
-        core.code_swarm_run = Some(CodeSwarmRun::Reviewing {
-            remaining: 2,
-            total: 2,
-        });
-
-        core.code_swarm_on_companion_done();
-        assert_eq!(
-            core.code_swarm_run,
-            Some(CodeSwarmRun::Reviewing {
-                remaining: 1,
-                total: 2
-            })
-        );
-        assert!(core.pending_runs.is_empty());
-
-        core.code_swarm_on_companion_done();
-        assert_eq!(
-            core.code_swarm_run,
-            Some(CodeSwarmRun::Reporting { total: 2 })
-        );
-        assert_eq!(core.pending_runs.len(), 1);
-        match core.pending_runs.front().expect("report request") {
-            PendingRunRequest::Extension(request) => {
-                assert_eq!(request.id, "code-swarm");
-                assert_eq!(request.command, "review-report");
-            }
-            PendingRunRequest::Companion(_) => panic!("expected extension report request"),
-        }
-    }
-
-    #[test]
-    fn companion_done_outside_swarm_is_inert() {
-        let mut core = core();
-        core.code_swarm_on_companion_done();
-        assert_eq!(core.code_swarm_run, None);
-        assert!(core.pending_runs.is_empty());
-    }
-
-    #[test]
-    fn report_completion_emits_summary_and_clears_run() {
-        let mut core = core();
-        core.code_swarm_run = Some(CodeSwarmRun::Reporting { total: 3 });
-
-        core.code_swarm_on_report_complete(
-            true,
-            Some(&serde_json::json!({
-                "relative_path": "extensions/code-swarm/artifacts/abc",
-                "reviewer_count": 3,
-            })),
+    fn review_input_omits_blank_prompt_and_empty_personas() {
+        let input = code_swarm_review_input(
+            vec!["fixture::echo".to_owned()],
+            Some("   ".to_owned()),
+            Some(Vec::new()),
         );
 
-        assert_eq!(core.code_swarm_run, None);
-        let rendered = drain_finalized_visual_text(&mut core, 120);
-        assert!(
-            rendered.contains("✓ code-swarm review complete · 3 reviewers"),
-            "rendered: {rendered}"
-        );
-        assert!(rendered.contains("extensions/code-swarm/artifacts/abc"));
-    }
-
-    #[test]
-    fn malformed_briefs_abort_without_queueing() {
-        let mut core = core();
-        core.code_swarm_run = Some(CodeSwarmRun::Briefing);
-
-        core.code_swarm_on_brief_complete(&serde_json::json!({"briefs": []}));
-
-        assert_eq!(core.code_swarm_run, None);
-        assert!(core.pending_runs.is_empty());
+        assert_eq!(input, serde_json::json!({"models": ["fixture::echo"]}));
     }
 }

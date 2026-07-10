@@ -93,6 +93,48 @@ those words. See
 the causal DAG and review workflows' demands on the SDK. The v0
 design must not foreclose future push subscription/channel primitives.
 
+## Extension-driven spawn (v0.1)
+
+Extensions gain the authority to run child agents through one SDK method:
+`HostApi::spawn_agent(task) -> AgentOutcome`, gated by a new capability.
+
+- **Capability**: a command must declare `agent-spawn` in
+  `required_capabilities` to call `spawn_agent`; hosts reject the call
+  otherwise. The capability is grantable/deniable like any other and appears
+  in permission provenance.
+- **Attenuation (exact flat, per the capabilities contract)**: the child's
+  capability set must be a subset of the capabilities granted to the
+  invoking command's execution. A task requesting anything broader is
+  rejected before any event is emitted.
+- **Synchronous, depth one (v0.1)**: `spawn_agent` runs the child to
+  completion within the extension command's execution and returns its
+  outcome. Child sessions do not receive an extension host; a child cannot
+  spawn. Parallel/background extension spawns are future work on the
+  background-handle substrate above.
+- **Per-command quota**: one command execution may run at most
+  `MAX_SPAWNS_PER_COMMAND` (16) child agents; the host rejects further
+  `spawn_agent` calls regardless of the extension's own input validation.
+  Extensions declare tighter caps for their own semantics (code-swarm: 5).
+- **Provenance unchanged**: the host records the same `agent.spawn` /
+  `agent.result` pair the session companion path records, authored by the
+  parent session envelope agent. The returned `AgentOutcome` carries the
+  result payload plus the spawn/result event ids, the child agent id, and
+  the resolved child target (inherited targets come back resolved, exactly
+  as the spawn event recorded them) so extensions can cite provenance
+  without re-querying it. Provenance remains the record; this method
+  removes the need to use it as the transport.
+- **Budgets**: the task's `AgentBudget` is recorded as today and enforced to
+  the extent the child session loop enforces budgets; accounting/escrow
+  remain future work.
+- **Failure**: worker launch/panic degradation follows the background-agent
+  rules above (sanitized failure `agent.result`); `spawn_agent` then returns
+  the failure outcome rather than an SDK error, so extensions observe
+  exactly what provenance recorded.
+
+Observer, companion, peer, adversarial remain extension compositions; core
+still never knows those words — `spawn_agent` is mechanism, the pattern
+lives in the extension.
+
 ## Companion UI presentation (v0)
 
 The terminal companion block is a **presentation of existing multi-agent

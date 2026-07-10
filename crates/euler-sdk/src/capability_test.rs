@@ -9,6 +9,7 @@ fn capability_registry_round_trips_every_known_capability() {
         "diagnostics-read",
         "artifact-write",
         "agent-record",
+        "agent-spawn",
         "shell-exec",
         "network",
         "config-write",

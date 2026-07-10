@@ -650,7 +650,7 @@ pub fn build_extension_slash_commands(
                 token: "/code-swarm".to_owned(),
                 summary: format!("{} · reviewer swarm", item.id),
                 extension_id: item.id.clone(),
-                command: "swarm".to_owned(),
+                command: "review".to_owned(),
                 enabled: item.enabled,
             });
         }
@@ -1427,7 +1427,7 @@ mod tests {
                 bundled: true,
                 materialization: None,
                 version: "0.1.0".to_owned(),
-                commands: vec!["review-brief".to_owned(), "review-report".to_owned()],
+                commands: vec!["review".to_owned()],
                 capabilities: vec![],
                 audit_status: None,
             }],
@@ -1493,18 +1493,18 @@ mod tests {
         assert_eq!(entry.extension_id, "code-swarm");
         assert!(entry.summary.contains("reviewer swarm"));
         assert!(!entry.enabled);
-        // The command tokens still register alongside the surface token.
-        assert!(cmds.iter().any(|cmd| cmd.token == "/review-brief"));
+        // The command token still registers alongside the surface token.
+        assert!(cmds.iter().any(|cmd| cmd.token == "/review"));
     }
 
     #[test]
     fn extension_slash_arguments_parse_or_reject_never_drop() {
         let context = CommandContext {
             extension_slash_commands: vec![ExtensionSlashCommand {
-                token: "/review-brief".to_owned(),
-                summary: "code-swarm · review-brief".to_owned(),
+                token: "/review".to_owned(),
+                summary: "code-swarm · review".to_owned(),
                 extension_id: "code-swarm".to_owned(),
-                command: "review-brief".to_owned(),
+                command: "review".to_owned(),
                 enabled: true,
             }],
             ..CommandContext::default()
@@ -1512,40 +1512,40 @@ mod tests {
 
         // JSON argument parses into the input.
         assert_eq!(
-            dispatch_command("/review-brief {\"reviewers\":[\"tests\"]}", &context),
+            dispatch_command("/review {\"reviewers\":[\"tests\"]}", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
                 id: "code-swarm".to_owned(),
-                command: "review-brief".to_owned(),
+                command: "review".to_owned(),
                 input: serde_json::json!({"reviewers": ["tests"]}),
                 raw_args: None,
             })
         );
         // Flag arguments travel to resolve-time ArgSpec parsing.
         assert_eq!(
-            dispatch_command("/review-brief --reviewer tests --model a::b", &context),
+            dispatch_command("/review --reviewer tests --model a::b", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
                 id: "code-swarm".to_owned(),
-                command: "review-brief".to_owned(),
+                command: "review".to_owned(),
                 input: serde_json::json!({}),
                 raw_args: Some("--reviewer tests --model a::b".to_owned()),
             })
         );
         // Invalid JSON is an error, not a silent default run.
         assert!(matches!(
-            dispatch_command("/review-brief {broken", &context),
+            dispatch_command("/review {broken", &context),
             CommandEffect::Message(message) if message.contains("must be JSON")
         ));
         // Free text is a usage error, not a silent default run.
         assert!(matches!(
-            dispatch_command("/review-brief tests please", &context),
+            dispatch_command("/review tests please", &context),
             CommandEffect::Message(message) if message.contains("usage:")
         ));
         // No argument still dispatches with empty input.
         assert_eq!(
-            dispatch_command("/review-brief", &context),
+            dispatch_command("/review", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
                 id: "code-swarm".to_owned(),
-                command: "review-brief".to_owned(),
+                command: "review".to_owned(),
                 input: serde_json::json!({}),
                 raw_args: None,
             })

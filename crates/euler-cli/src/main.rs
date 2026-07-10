@@ -644,6 +644,20 @@ fn run_live_extension_command(
     let Some(bundled) = bundled_extension_by_id(id) else {
         return headless_extension_error(format!("unknown extension id: {id}"));
     };
+    // Piped headless runs cannot prompt (stdin is the command protocol):
+    // invoking `extension_run` names the command explicitly, so its declared
+    // capabilities are granted for this run — with visibility, never silently.
+    if !command_descriptor.required_capabilities.is_empty() {
+        let granted = command_descriptor
+            .required_capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "extension {id}.{command}: granting declared capabilities for this run: {granted}"
+        );
+    }
     match session.execute_extension_command(
         bundled.extension,
         command,

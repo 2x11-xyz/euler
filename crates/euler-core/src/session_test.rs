@@ -10,7 +10,7 @@ use euler_provider::{
 use euler_sdk::{
     ArtifactWrite, CommandContext, CommandDescriptor, CommandRegistrar, Extension,
     ExtensionCommand, ExtensionError, ExtensionManifest, HostAgentBudget, HostAgentResult,
-    HostAgentTask, HostApi,
+    HostAgentTask, HostApi, SpawnAgentTask,
 };
 use serde_json::Map;
 use std::sync::{Arc, Mutex};
@@ -328,6 +328,424 @@ fn live_extension_agent_records_publish_to_session_and_stay_out_of_canvas() {
     assert!(
         assemble_canvas(session.events(), &AutoCompactionPolicy::default()).is_empty(),
         "extension agent records must not enter model canvas"
+    );
+}
+
+fn spawn_session(
+    responses: Vec<FixtureResponse>,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    Session<ScriptedDecider>,
+) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-spawn");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-spawn".to_owned();
+    config.agent_id = "agent-spawn".to_owned();
+    enable_test_extensions(&mut config, &["spawn-ext"]);
+    let session = Session::new(
+        config,
+        ScriptedProvider::new(responses),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    (temp, log, session)
+}
+
+fn agent_pair_events(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    events
+        .iter()
+        .filter(|event| {
+            let kind = event.kind.as_str();
+            kind == EventKind::AGENT_SPAWN || kind == EventKind::AGENT_RESULT
+        })
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn live_extension_spawn_agent_runs_child_and_records_pair() {
+    let (_temp, log, mut session) = spawn_session(vec![FixtureResponse::Assistant(
+        "child review complete".to_owned(),
+    )]);
+    let extension = test_extension(
+        "spawn-ext",
+        vec![Capability::AgentSpawn],
+        TestCommandBehavior::SpawnAgent {
+            declare: true,
+            child_capabilities: Vec::new(),
+            artifact_first: false,
+            spawn_count: 1,
+        },
+    );
+
+    let output = session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::AgentSpawn])
+        .expect("execute spawn extension command");
+
+    assert_eq!(output["ok"], json!(true));
+    assert_eq!(output["output"], json!("child review complete"));
+    let live_pair = agent_pair_events(session.events());
+    assert_eq!(live_pair.len(), 2);
+    assert_eq!(live_pair[0].kind.as_str(), EventKind::AGENT_SPAWN);
+    assert_eq!(live_pair[1].kind.as_str(), EventKind::AGENT_RESULT);
+    assert_eq!(output["spawn_event_id"], json!(live_pair[0].id));
+    assert_eq!(output["result_event_id"], json!(live_pair[1].id));
+    assert_eq!(
+        output["child_agent_id"],
+        live_pair[0].payload["child_agent_id"]
+    );
+    // The pair is authored by the parent session envelope agent, exactly as
+    // the session companion path records it.
+    assert_eq!(live_pair[0].agent, "agent-spawn");
+    let durable = read_provenance(&log).expect("durable events");
+    assert_eq!(agent_pair_events(&durable), live_pair);
+    assert_eq!(
+        durable.iter().map(|event| &event.id).collect::<Vec<_>>(),
+        session
+            .events()
+            .iter()
+            .map(|event| &event.id)
+            .collect::<Vec<_>>(),
+        "live bus and durable log must agree after a mid-command spawn"
+    );
+}
+
+#[test]
+fn live_extension_spawn_agent_after_artifact_write_keeps_event_order() {
+    let (_temp, log, mut session) =
+        spawn_session(vec![FixtureResponse::Assistant("child done".to_owned())]);
+    let extension = test_extension(
+        "spawn-ext",
+        vec![Capability::AgentSpawn, Capability::ArtifactWrite],
+        TestCommandBehavior::SpawnAgent {
+            declare: true,
+            child_capabilities: Vec::new(),
+            artifact_first: true,
+            spawn_count: 1,
+        },
+    );
+
+    let output = session
+        .execute_extension_command(
+            &extension,
+            "write",
+            json!(null),
+            [Capability::AgentSpawn, Capability::ArtifactWrite],
+        )
+        .expect("execute spawn-after-artifact command");
+
+    assert_eq!(output["ok"], json!(true));
+    let durable = read_provenance(&log).expect("durable events");
+    let artifact_index = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::EXTENSION_ARTIFACT)
+        .expect("artifact event");
+    let spawn_index = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
+        .expect("spawn event");
+    assert!(
+        artifact_index < spawn_index,
+        "queued artifact event must precede the spawn it happened before"
+    );
+    assert_eq!(
+        durable.iter().map(|event| &event.id).collect::<Vec<_>>(),
+        session
+            .events()
+            .iter()
+            .map(|event| &event.id)
+            .collect::<Vec<_>>(),
+        "queued events synced before the spawn must keep bus/log identical"
+    );
+}
+
+#[test]
+fn live_extension_spawn_agent_requires_capability() {
+    let (_temp, log, mut session) = spawn_session(Vec::new());
+    // The command does not declare agent-spawn, so registration succeeds and
+    // the runtime capability check in spawn_agent is what must reject.
+    let extension = test_extension(
+        "spawn-ext",
+        vec![],
+        TestCommandBehavior::SpawnAgent {
+            declare: false,
+            child_capabilities: Vec::new(),
+            artifact_first: false,
+            spawn_count: 1,
+        },
+    );
+
+    let error = session
+        .execute_extension_command(&extension, "write", json!(null), [])
+        .expect_err("spawn without agent-spawn capability");
+
+    assert!(matches!(
+        error,
+        ExtensionExecutionError::CapabilityDenied {
+            capability: Capability::AgentSpawn
+        }
+    ));
+    assert!(agent_pair_events(session.events()).is_empty());
+    assert!(agent_pair_events(&read_provenance(&log).expect("durable events")).is_empty());
+}
+
+#[test]
+fn live_extension_spawn_agent_rejects_broader_child_capabilities() {
+    let (_temp, log, mut session) = spawn_session(Vec::new());
+    let extension = test_extension(
+        "spawn-ext",
+        vec![Capability::AgentSpawn],
+        TestCommandBehavior::SpawnAgent {
+            declare: true,
+            // Broader than the command grant: attenuation must reject before
+            // any event is emitted.
+            child_capabilities: vec![Capability::FsRead],
+            artifact_first: false,
+            spawn_count: 1,
+        },
+    );
+
+    let error = session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::AgentSpawn])
+        .expect_err("child capabilities broader than the command grant");
+
+    assert!(matches!(
+        error,
+        ExtensionExecutionError::CapabilityDenied {
+            capability: Capability::FsRead
+        }
+    ));
+    assert!(agent_pair_events(session.events()).is_empty());
+    assert!(agent_pair_events(&read_provenance(&log).expect("durable events")).is_empty());
+}
+
+#[test]
+fn live_extension_spawn_agent_returns_failure_outcome() {
+    // Empty provider script: the child turn fails, and the extension must
+    // observe the recorded failure outcome rather than an SDK error.
+    let (_temp, log, mut session) = spawn_session(Vec::new());
+    let extension = test_extension(
+        "spawn-ext",
+        vec![Capability::AgentSpawn],
+        TestCommandBehavior::SpawnAgent {
+            declare: true,
+            child_capabilities: Vec::new(),
+            artifact_first: false,
+            spawn_count: 1,
+        },
+    );
+
+    let output = session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::AgentSpawn])
+        .expect("failure outcome is still a command success");
+
+    assert_eq!(output["ok"], json!(false));
+    let durable = read_provenance(&log).expect("durable events");
+    let pair = agent_pair_events(&durable);
+    assert_eq!(pair.len(), 2);
+    assert_eq!(output["spawn_event_id"], json!(pair[0].id));
+    assert_eq!(output["result_event_id"], json!(pair[1].id));
+    assert_eq!(pair[1].payload["ok"], json!(false));
+}
+
+#[test]
+fn gated_extension_run_asks_for_declared_capabilities() {
+    // Review finding: descriptors self-granted their declared capabilities.
+    // The gated path must turn each unconfigured capability into a real
+    // user decision, recorded in provenance.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-gated");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-gated".to_owned();
+    enable_test_extensions(&mut config, &["artifact-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    )
+    .with_provenance(writer);
+    let extension = test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"gated artifact".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    let output = session
+        .execute_extension_command_gated(
+            &extension,
+            "write",
+            json!(null),
+            &[Capability::ArtifactWrite],
+        )
+        .expect("gated run with scripted allow");
+
+    assert!(output["records"][0]["persisted_event_id"].is_string());
+    let prompt = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::PERMISSION_PROMPT
+                && event.payload["extension_id"] == json!("artifact-ext")
+        })
+        .expect("user prompt for the declared capability");
+    assert_eq!(prompt.payload["capability"], json!("artifact-write"));
+    let decision = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::PERMISSION_DECISION
+                && event.payload["extension_id"] == json!("artifact-ext")
+        })
+        .expect("user decision recorded");
+    assert_eq!(decision.payload["allowed"], json!(true));
+    assert_eq!(decision.parent.as_deref(), Some(prompt.id.as_str()));
+}
+
+#[test]
+fn gated_extension_run_denial_blocks_execution() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-gated-deny");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-gated-deny".to_owned();
+    enable_test_extensions(&mut config, &["artifact-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Deny]),
+    )
+    .with_provenance(writer);
+    let extension = test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"never written".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    let error = session
+        .execute_extension_command_gated(
+            &extension,
+            "write",
+            json!(null),
+            &[Capability::ArtifactWrite],
+        )
+        .expect_err("scripted denial blocks the run");
+
+    assert!(matches!(
+        error,
+        ExtensionExecutionError::CapabilityDenied {
+            capability: Capability::ArtifactWrite
+        }
+    ));
+    assert!(extension_artifacts(session.events()).is_empty());
+    // The denial itself is provenance.
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::PERMISSION_DECISION
+            && event.payload["allowed"] == json!(false)
+            && event.payload["extension_id"] == json!("artifact-ext")
+    }));
+}
+
+#[test]
+fn gated_extension_run_session_grant_covers_later_runs() {
+    // First run asks; an AllowSession verdict covers the second run with no
+    // fresh prompt or decision record (covered-grant contract).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-gated-cover");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-gated-cover".to_owned();
+    enable_test_extensions(&mut config, &["artifact-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::AllowSession]),
+    )
+    .with_provenance(writer);
+    let extension = test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"first".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    session
+        .execute_extension_command_gated(
+            &extension,
+            "write",
+            json!(null),
+            &[Capability::ArtifactWrite],
+        )
+        .expect("first gated run");
+    session
+        .execute_extension_command_gated(
+            &extension,
+            "write",
+            json!(null),
+            &[Capability::ArtifactWrite],
+        )
+        .expect("second gated run covered by the session grant");
+
+    let prompts = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
+        .count();
+    assert_eq!(prompts, 1, "second run must be covered, not re-asked");
+}
+
+#[test]
+fn live_extension_spawn_agent_enforces_per_command_quota() {
+    // Host-side fan-out ceiling: even an extension whose own input
+    // validation fails must not spawn unbounded agents from one command.
+    use crate::session::MAX_SPAWNS_PER_COMMAND;
+    let responses = (0..MAX_SPAWNS_PER_COMMAND)
+        .map(|index| FixtureResponse::Assistant(format!("review {index}")))
+        .collect::<Vec<_>>();
+    let (_temp, log, mut session) = spawn_session(responses);
+    let extension = test_extension(
+        "spawn-ext",
+        vec![Capability::AgentSpawn],
+        TestCommandBehavior::SpawnAgent {
+            declare: true,
+            child_capabilities: Vec::new(),
+            artifact_first: false,
+            spawn_count: MAX_SPAWNS_PER_COMMAND + 1,
+        },
+    );
+
+    let error = session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::AgentSpawn])
+        .expect_err("spawn past the quota fails the command");
+
+    assert!(
+        error.to_string().contains("quota")
+            || matches!(error, ExtensionExecutionError::CommandFailed)
+    );
+    let durable = read_provenance(&log).expect("durable events");
+    assert_eq!(
+        agent_pair_events(&durable).len(),
+        MAX_SPAWNS_PER_COMMAND * 2,
+        "exactly the quota's worth of spawn/result pairs, then rejection"
     );
 }
 
@@ -1155,6 +1573,12 @@ enum TestCommandBehavior {
         after: AfterWrite,
     },
     RecordAgent,
+    SpawnAgent {
+        declare: bool,
+        child_capabilities: Vec<Capability>,
+        artifact_first: bool,
+        spawn_count: usize,
+    },
     Slot {
         slot: &'static str,
         content: &'static str,
@@ -1217,6 +1641,20 @@ impl ExtensionCommand for TestCommand {
         let required_capabilities = match &self.behavior {
             TestCommandBehavior::Write { .. } => vec![Capability::ArtifactWrite],
             TestCommandBehavior::RecordAgent => vec![Capability::AgentRecord],
+            TestCommandBehavior::SpawnAgent {
+                declare,
+                artifact_first,
+                ..
+            } => {
+                let mut capabilities = Vec::new();
+                if *declare {
+                    capabilities.push(Capability::AgentSpawn);
+                }
+                if *artifact_first {
+                    capabilities.push(Capability::ArtifactWrite);
+                }
+                capabilities
+            }
             TestCommandBehavior::Slot { .. } => vec![Capability::ContextSlot],
             TestCommandBehavior::Noop(_) => Vec::new(),
         };
@@ -1240,6 +1678,45 @@ impl ExtensionCommand for TestCommand {
             TestCommandBehavior::Slot { slot, content } => {
                 host.update_context_slot(slot, content)?;
                 Ok(json!({"ok": true}))
+            }
+            TestCommandBehavior::SpawnAgent {
+                declare: _,
+                child_capabilities,
+                artifact_first,
+                spawn_count,
+            } => {
+                if *artifact_first {
+                    host.write_artifact(ArtifactWrite {
+                        display_name: "pre-spawn artifact".to_owned(),
+                        media_type: "text/plain".to_owned(),
+                        bytes: b"before spawn".to_vec(),
+                        source_event_ids: Vec::new(),
+                        metadata: Map::new(),
+                    })?;
+                }
+                let mut outcome = None;
+                for _ in 0..*spawn_count {
+                    outcome = Some(host.spawn_agent(SpawnAgentTask {
+                        task: "review the diff".to_owned(),
+                        persona: "reviewer".to_owned(),
+                        provider: String::new(),
+                        model: String::new(),
+                        system_prompt: String::new(),
+                        capabilities: child_capabilities.clone(),
+                        max_turns: Some(4),
+                        max_tool_calls: Some(4),
+                        max_tokens: Some(2048),
+                    })?);
+                }
+                let outcome = outcome.expect("at least one spawn");
+                Ok(json!({
+                    "ok": outcome.ok,
+                    "summary": outcome.summary,
+                    "output": outcome.output,
+                    "child_agent_id": outcome.child_agent_id,
+                    "spawn_event_id": outcome.spawn_event_id,
+                    "result_event_id": outcome.result_event_id,
+                }))
             }
             TestCommandBehavior::RecordAgent => {
                 let record = host.record_agent_task_result(

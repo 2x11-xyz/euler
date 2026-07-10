@@ -2353,14 +2353,11 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
             concat!(
                 r#"{{"id":"code-swarm","display_name":"CodeSwarm Review","#,
                 r#""version":"{}","source_kind":"bundled","#,
-                r#""runtime_kind":"native-rust","capabilities":["provenance-read","#,
-                r#""artifact-write"],"commands":[{{"name":"review-brief","#,
-                r#""display_name":"Build CodeSwarm review briefs","#,
-                r#""summary":"Build review-only companion AgentTask briefs for the current session.","#,
-                r#""required_capabilities":[]}},{{"name":"review-report","#,
-                r#""display_name":"Write CodeSwarm review report","#,
-                r#""summary":"Consolidate CodeSwarm companion results into a review artifact.","#,
-                r#""required_capabilities":["provenance-read","artifact-write"]}}]}}"#,
+                r#""runtime_kind":"native-rust","capabilities":["agent-spawn","#,
+                r#""artifact-write"],"commands":[{{"name":"review","#,
+                r#""display_name":"Run CodeSwarm review","#,
+                r#""summary":"Run 1-5 review-only agents over the current session and write a consolidated review artifact.","#,
+                r#""required_capabilities":["agent-spawn","artifact-write"]}}]}}"#,
                 "\n"
             ),
             version
@@ -2922,11 +2919,10 @@ fn extension_cli_enable_run_and_disable_session_export() {
 }
 
 #[test]
-fn extension_cli_code_swarm_report_accepts_injected_session_id() {
-    // Contract: commands declaring `accepts_session_id: true` receive an
-    // injected `session_id` field from the offline runner and must accept it.
-    // Regression for the review-report input allowlist rejecting the
-    // injection (calibration finding E1).
+fn extension_cli_code_swarm_review_validates_input_and_stays_live_only() {
+    // The review command validates input before any reviewer spawns, and the
+    // offline runner has no live session to spawn against — the run must fail
+    // with the honest spawn-unavailable error, not a hang or a phantom review.
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
 
@@ -2952,24 +2948,37 @@ fn extension_cli_code_swarm_report_accepts_injected_session_id() {
         .expect("extension enable code-swarm");
     assert!(enabled.status.success());
 
-    let report = command_with_home(exe, &home)
-        .args(["extension", "run", "code-swarm.review-report", &session_id])
+    let bad_model = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "code-swarm.review",
+            &session_id,
+            "--model",
+            "no-separator",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("code swarm report run");
-    // The session has no reviewer results, so the run fails — but it must
-    // fail with the actionable zero-results guidance, proving the injected
-    // session_id passed input validation.
-    assert!(!report.status.success());
-    let stderr = String::from_utf8_lossy(&report.stderr);
+        .expect("code swarm review run with bad model");
+    assert!(!bad_model.status.success());
+    let stderr = String::from_utf8_lossy(&bad_model.stderr);
     assert!(
-        stderr.contains("no CodeSwarm reviewer results"),
-        "expected zero-results guidance, got: {stderr}"
+        stderr.contains("provider::model"),
+        "expected model target guidance, got: {stderr}"
     );
+
+    let offline = command_with_home(exe, &home)
+        .args(["extension", "run", "code-swarm.review", &session_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("code swarm review offline run");
+    assert!(!offline.status.success());
+    let stderr = String::from_utf8_lossy(&offline.stderr);
     assert!(
-        !stderr.contains("unknown input field"),
-        "session_id injection must be accepted: {stderr}"
+        stderr.contains("agent spawn unavailable"),
+        "expected spawn-unavailable error from the offline host, got: {stderr}"
     );
 }
 
@@ -4793,7 +4802,6 @@ fn extension_search_reports_linked_metadata_without_private_inventory_fields() {
         vec![
             "session-export",
             "causal-dag",
-            "code-swarm",
             "autoresearch",
             "maxproof",
             "example-extension"

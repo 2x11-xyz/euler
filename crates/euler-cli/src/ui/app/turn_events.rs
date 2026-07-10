@@ -238,16 +238,12 @@ impl AppCore {
                     "extension {}.{} complete",
                     request.id, request.command
                 ));
-                if request.id == "code-swarm" {
-                    match (request.command.as_str(), &self.code_swarm_run) {
-                        ("review-brief", Some(CodeSwarmRun::Briefing)) => {
-                            self.code_swarm_on_brief_complete(&output);
-                        }
-                        ("review-report", Some(CodeSwarmRun::Reporting { .. })) => {
-                            self.code_swarm_on_report_complete(true, Some(&output));
-                        }
-                        _ => {}
-                    }
+                if request.id == "code-swarm" && request.command == "review" {
+                    let reviewers = output["reviewer_count"].as_u64().unwrap_or(0);
+                    let path = output["relative_path"].as_str().unwrap_or("(unknown path)");
+                    let _ = self.summary_item(format!(
+                        "✓ code-swarm review complete · {reviewers} reviewers · artifact {path}"
+                    ));
                 }
             }
             ExtensionOutcome::Failed(message) => {
@@ -259,15 +255,6 @@ impl AppCore {
                     "extension {}.{} failed: {message}",
                     request.id, request.command
                 ));
-                if request.id == "code-swarm" && self.code_swarm_run.is_some() {
-                    if matches!(self.code_swarm_run, Some(CodeSwarmRun::Reporting { .. })) {
-                        self.code_swarm_on_report_complete(false, None);
-                    } else {
-                        self.code_swarm_run = None;
-                        let _ =
-                            self.notice_item("✗ code-swarm review aborted at briefing".to_owned());
-                    }
-                }
             }
         }
     }
@@ -300,9 +287,6 @@ impl AppCore {
                 self.notice = Some(format!("companion run failed: {message}"));
             }
         }
-        // A failed reviewer still advances the swarm — the report includes
-        // whichever spawn/result pairs actually landed.
-        self.code_swarm_on_companion_done();
     }
 
     fn refresh_patch_modal_preview(&mut self) {
