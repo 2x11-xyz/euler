@@ -193,8 +193,11 @@ fn transient_notice_composer_and_status_are_separated_by_blank_rows() {
     assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
 }
 
+/// Issue #23: the slash palette renders fully inside the rail-bounded
+/// composer container — in the composer's own slot — so nothing renders
+/// below the footer/status line.
 #[test]
-fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() {
+fn slash_palette_renders_inside_composer_container_with_nothing_below_footer() {
     let mut core = core();
     core.drain_finalized_visual_lines(80);
 
@@ -210,22 +213,24 @@ fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() 
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
 
-    let prompt = lines
-        .iter()
-        .position(|line| line.starts_with('▌'))
-        .expect("prompt row");
     let status = lines
         .iter()
         .position(|line| line.contains("echo · ctx"))
         .expect("status row");
+    assert_eq!(
+        status,
+        lines.len() - 1,
+        "status/footer must be the last rendered line: lines: {lines:?}"
+    );
+
     let slash = lines
         .iter()
         .position(|line| line.trim() == "\u{258c} /")
         .expect("slash input row");
-
-    assert_eq!(status, prompt + 2, "lines: {lines:?}");
-    assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
-    assert_eq!(slash, status + 1, "lines: {lines:?}");
+    assert!(
+        slash < status,
+        "palette must render above the footer, not below it: lines: {lines:?}"
+    );
     assert_eq!(
         after.cursor,
         Some(CursorTarget {

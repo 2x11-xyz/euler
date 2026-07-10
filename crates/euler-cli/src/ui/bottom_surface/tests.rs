@@ -805,6 +805,87 @@ fn palette_render_keeps_selected_command_visible() {
     )));
 }
 
+/// Issue #23: 8 visible rows (raised from a prior 4).
+#[test]
+fn palette_shows_up_to_eight_match_rows() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_palette();
+
+    let BottomOwner::Palette(palette) = surface.owner() else {
+        panic!("palette should own surface");
+    };
+    assert!(
+        palette.matches().len() > 8,
+        "fixture command table should exceed one page for this test to be meaningful"
+    );
+    let rendered = palette.render_lines(80);
+    // query row + 8 match rows + position/hint row.
+    assert_eq!(rendered.len(), 10, "rendered: {rendered:?}");
+}
+
+/// Issue #23: backspacing over the leading `/` with nothing else typed
+/// exits the palette (checked at the `BottomSurface` level the app's key
+/// handler consults before calling `palette_backspace`).
+#[test]
+fn palette_backspace_would_exit_only_at_bare_leading_slash() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_palette();
+    assert!(surface.palette_backspace_would_exit());
+
+    surface.palette_insert("mo");
+    assert!(!surface.palette_backspace_would_exit());
+
+    surface.palette_backspace();
+    surface.palette_backspace();
+    assert!(surface.palette_backspace_would_exit());
+}
+
+/// Issue #23: the selected row is a full-width select-bar (selection token
+/// background) with gold (warning-token) text, routed through `Theme`
+/// rather than a hardcoded hex.
+#[test]
+fn palette_selected_row_uses_full_width_select_bar_and_warning_text() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_palette();
+    let theme = Theme::warm_ledger();
+    let width = 40u16;
+
+    let lines = surface
+        .surface_canvas_lines(&theme, width)
+        .expect("palette lines");
+    let selected_line = &lines[1]; // query row, then first match row (selected).
+    assert_eq!(selected_line.spans.len(), 1);
+    let span = &selected_line.spans[0];
+    assert_eq!(span.style.fg, Some(theme.palette.warning));
+    assert_eq!(span.style.bg, Some(theme.palette.selection));
+    assert_eq!(
+        crate::ui::text::display_width(span.text.as_str()),
+        usize::from(width),
+        "select bar must span the full row width"
+    );
+}
+
+/// Issue #23: the typed `/` (and the rest of the query) stays green
+/// throughout, independent of the selected row's styling below it.
+#[test]
+fn palette_query_row_keeps_the_slash_green() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_palette();
+    surface.palette_insert("mo");
+    let theme = Theme::warm_ledger();
+
+    let lines = surface
+        .surface_canvas_lines(&theme, 40)
+        .expect("palette lines");
+    let query_line = &lines[0];
+    let slash_span = query_line
+        .spans
+        .iter()
+        .find(|span| span.text.as_str().contains('/'))
+        .expect("query span carrying the slash");
+    assert_eq!(slash_span.style.fg, Some(theme.palette.added));
+}
+
 #[test]
 fn palette_line_count_matches_rendered_rows_at_boundaries() {
     let mut no_match = BottomSurface::new(CommandContext::default());

@@ -128,14 +128,20 @@ impl AppCore {
         self.push_visual_transient_block(&mut blocks);
         // No spacer here: the transcript renderer ends every event batch
         // (banner included) with one blank line — it owns vertical rhythm.
-        self.push_visual_composer_block(composer, &mut blocks);
+        //
+        // Issue #23: an active bottom surface (slash palette, pickers, ...)
+        // renders fully inside the rail-bounded composer container — in the
+        // composer's own slot, directly above the footer — never appended
+        // after the status line. Only one of the two ever renders.
+        if !self.push_visual_bottom_surface_block(width, &mut blocks) {
+            self.push_visual_composer_block(composer, &mut blocks);
+        }
         push_visual_spacer_block(&mut blocks);
         push_visual_block(
             &mut blocks,
             VisualBlockRole::Status,
             vec![status.line.clone()],
         );
-        self.push_visual_bottom_surface_block(width, &mut blocks);
         blocks
     }
 
@@ -213,18 +219,20 @@ impl AppCore {
         });
     }
 
-    fn push_visual_bottom_surface_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) {
-        if let Some(lines) = self.bottom.surface_lines(width) {
-            let block = VisualBlock::new(
-                VisualBlockRole::BottomSurface,
-                lines.into_iter().map(CanvasLine::plain_lossy).collect(),
-            );
-            let block = match self.bottom.surface_cursor(width) {
-                Some((row, column)) => block.with_cursor(BlockCursor { row, column }),
-                None => block,
-            };
-            blocks.push(block);
-        }
+    /// Renders the active bottom surface (palette, pickers, ...) in place of
+    /// the composer. Returns whether a surface was active (and therefore
+    /// pushed) so the caller can fall back to the composer block.
+    fn push_visual_bottom_surface_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) -> bool {
+        let Some(lines) = self.bottom.surface_canvas_lines(&self.theme, width) else {
+            return false;
+        };
+        let block = VisualBlock::new(VisualBlockRole::BottomSurface, lines);
+        let block = match self.bottom.surface_cursor(width) {
+            Some((row, column)) => block.with_cursor(BlockCursor { row, column }),
+            None => block,
+        };
+        blocks.push(block);
+        true
     }
 
     fn push_visual_transient_block(&self, blocks: &mut Vec<VisualBlock>) {

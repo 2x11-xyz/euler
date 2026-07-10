@@ -1105,6 +1105,13 @@ impl AppCore {
                 CoreEffect::Render
             }
             KeyCode::Backspace => {
+                // Issue #23: backspacing over the leading `/` with nothing
+                // else typed exits the palette (same as Esc) instead of the
+                // prior no-op clamp.
+                if self.bottom.palette_backspace_would_exit() {
+                    let event = self.bottom.cancel();
+                    return self.surface_event(event);
+                }
                 let effect = self.edit_palette(BottomSurface::palette_backspace);
                 if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
                     self.refresh_search_matches();
