@@ -51,6 +51,7 @@ use thiserror::Error;
 
 mod companion;
 mod extension_bridge;
+pub use extension_bridge::MAX_SPAWNS_PER_COMMAND;
 mod observer;
 mod round_loop;
 pub use companion::AgentResultSummary;

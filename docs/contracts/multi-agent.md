@@ -111,6 +111,10 @@ Extensions gain the authority to run child agents through one SDK method:
   outcome. Child sessions do not receive an extension host; a child cannot
   spawn. Parallel/background extension spawns are future work on the
   background-handle substrate above.
+- **Per-command quota**: one command execution may run at most
+  `MAX_SPAWNS_PER_COMMAND` (16) child agents; the host rejects further
+  `spawn_agent` calls regardless of the extension's own input validation.
+  Extensions declare tighter caps for their own semantics (code-swarm: 5).
 - **Provenance unchanged**: the host records the same `agent.spawn` /
   `agent.result` pair the session companion path records, authored by the
   parent session envelope agent. The returned `AgentOutcome` carries the

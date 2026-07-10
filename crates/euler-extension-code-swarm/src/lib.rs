@@ -371,6 +371,14 @@ fn parse_charters(value: Option<&Value>) -> Result<Vec<Charter>, ExtensionError>
     if values.is_empty() {
         return Err(input_error("reviewers must not be empty"));
     }
+    // Without explicit models, one agent spawns per charter entry — the
+    // swarm cap must bound this list too, not just `models`.
+    if values.len() > MAX_SWARM_AGENTS {
+        return Err(input_error(format!(
+            "reviewers lists {} entries; the swarm cap is {MAX_SWARM_AGENTS}",
+            values.len()
+        )));
+    }
     values
         .iter()
         .map(|value| {
@@ -590,6 +598,19 @@ mod tests {
             );
             assert!(host.spawned.borrow().is_empty(), "no spawn before reject");
         }
+    }
+
+    #[test]
+    fn review_rejects_over_cap_reviewer_lists() {
+        // The 5-agent cap must bound the charter path too: repeated
+        // reviewer names would otherwise spawn unbounded agents.
+        let host = MockHost::default();
+        let input = json!({"reviewers": ["tests", "tests", "tests", "tests", "tests", "tests"]});
+        let error = ReviewCommand
+            .execute(CommandContext { input }, &host)
+            .expect_err("over-cap reviewers");
+        assert!(error.to_string().contains("cap is 5"));
+        assert!(host.spawned.borrow().is_empty(), "no spawn before reject");
     }
 
     #[test]

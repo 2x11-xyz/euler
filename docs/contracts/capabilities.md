@@ -49,6 +49,20 @@ A capability decision is one of:
 
 Permission prompts and decisions are session events and are recorded in provenance. Privileged secret/config edits always require explicit approval even if broader write access was granted.
 
+## Extension capability approval
+
+A command descriptor's `required_capabilities` is a *declaration*, never a
+grant. On surfaces that can ask the user (the TUI), each declared capability
+becomes a real permission decision before the command executes: explicit
+`session-allow` grants silently, explicit `always-deny` denies without a
+prompt, and `ask` or unconfigured capabilities prompt the user — recorded as
+`permission.prompt`/`permission.decision` events carrying `extension_id` and
+`command`. Session-scoped approvals cover later runs (covered requests run
+under the original decision, with no fresh record). Piped headless runs
+cannot prompt (stdin is the command protocol): there, explicitly invoking a
+named command grants its declared capabilities for that run, announced on
+stderr — visible, never silent.
+
 ## Scoped Grants
 
 Capability modes are the coarse gate. **Scoped grants** sit above `ask`: when a

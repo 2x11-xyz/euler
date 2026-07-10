@@ -200,6 +200,14 @@ impl<D> PermissionGate<D> {
         self.modes.insert(capability, mode);
     }
 
+    /// Explicitly configured mode, if any. Unconfigured capabilities read as
+    /// `AlwaysDeny` through [`Self::mode`] (tool dispatch fails closed), but
+    /// surfaces that can ask the user — extension-run capability approval —
+    /// treat unconfigured as `Ask` instead.
+    pub fn configured_mode(&self, capability: Capability) -> Option<ApprovalMode> {
+        self.modes.get(&capability).copied()
+    }
+
     pub fn mode(&self, capability: Capability) -> ApprovalMode {
         self.modes
             .get(&capability)
