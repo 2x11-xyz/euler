@@ -36,6 +36,7 @@ pub enum Capability {
     DiagnosticsRead,
     ArtifactWrite,
     AgentRecord,
+    AgentSpawn,
     ShellExec,
     Network,
     ConfigWrite,
@@ -51,6 +52,7 @@ impl Capability {
         Self::DiagnosticsRead,
         Self::ArtifactWrite,
         Self::AgentRecord,
+        Self::AgentSpawn,
         Self::ShellExec,
         Self::Network,
         Self::ConfigWrite,
@@ -66,6 +68,7 @@ impl Capability {
             Self::DiagnosticsRead => "diagnostics-read",
             Self::ArtifactWrite => "artifact-write",
             Self::AgentRecord => "agent-record",
+            Self::AgentSpawn => "agent-spawn",
             Self::ShellExec => "shell-exec",
             Self::Network => "network",
             Self::ConfigWrite => "config-write",
@@ -82,6 +85,7 @@ impl Capability {
             "diagnostics-read" => Some(Self::DiagnosticsRead),
             "artifact-write" => Some(Self::ArtifactWrite),
             "agent-record" => Some(Self::AgentRecord),
+            "agent-spawn" => Some(Self::AgentSpawn),
             "shell-exec" => Some(Self::ShellExec),
             "network" => Some(Self::Network),
             "config-write" => Some(Self::ConfigWrite),
@@ -195,6 +199,33 @@ pub struct DiagnosticsPage {
     pub truncated: bool,
 }
 
+/// Task description for `HostApi::spawn_agent` (mirrors the fields the
+/// session companion path validates; free-form fields are bounded by core).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpawnAgentTask {
+    pub task: String,
+    pub persona: String,
+    /// Empty provider+model inherit the session's active target.
+    pub provider: String,
+    pub model: String,
+    pub system_prompt: String,
+    pub capabilities: Vec<Capability>,
+    pub max_turns: Option<u64>,
+    pub max_tool_calls: Option<u64>,
+    pub max_tokens: Option<u64>,
+}
+
+/// Outcome of a completed `spawn_agent` call: what provenance recorded,
+/// with the event ids so extensions can cite it without re-querying.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentOutcome {
+    pub ok: bool,
+    pub summary: String,
+    pub output: String,
+    pub spawn_event_id: String,
+    pub result_event_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArtifactWrite {
     pub display_name: String,
@@ -303,6 +334,15 @@ pub trait HostApi {
     }
     fn state_dir(&self) -> Result<PathBuf, ExtensionError>;
     fn write_artifact(&self, artifact: ArtifactWrite) -> Result<ArtifactRecord, ExtensionError>;
+    /// Run one child agent to completion (multi-agent contract, v0.1).
+    /// Requires `Capability::AgentSpawn`; the child's capabilities must be a
+    /// subset of the invoking command's grant. Hosts without live spawn
+    /// support reject the call.
+    fn spawn_agent(&self, _task: SpawnAgentTask) -> Result<AgentOutcome, ExtensionError> {
+        Err(ExtensionError::Message(
+            "agent spawn unavailable on this host".to_owned(),
+        ))
+    }
     fn load_event_feed_checkpoint(
         &self,
         name: &str,
