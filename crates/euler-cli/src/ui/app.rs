@@ -26,7 +26,7 @@ use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPrevi
 use super::status::status_widget;
 use super::status::{status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
 use super::terminal::{self, PendingSignal, TerminalSession};
-use super::theme::{Theme, ThemeChoice};
+use super::theme::{ColorLevel, Theme, ThemeChoice};
 #[cfg(test)]
 use super::transcript::transcript_items_widget;
 use super::transcript::{self, TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
@@ -634,7 +634,12 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         )
         .catalog
     });
-    let theme = Theme::for_choice(theme_choice);
+    // #64: detect truecolor support once at startup; every theme RGB
+    // quantizes to ANSI-256 at this boundary when unsupported (e.g.
+    // Terminal.app / TERM_PROGRAM=Apple_Terminal), so all render sites
+    // degrade together instead of leaving 24-bit SGR for the terminal to
+    // mangle.
+    let theme = Theme::for_choice_with_color_level(theme_choice, ColorLevel::detect());
     let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
     status.session_id = Some(session_id.clone());
     status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());

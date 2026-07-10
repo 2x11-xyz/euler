@@ -19,6 +19,39 @@ pub enum ColorLevel {
 impl ColorLevel {
     pub const SUPPORTED: [Self; 3] = [Self::TrueColor, Self::Indexed256, Self::Basic16];
 
+    /// Detect truecolor support once at startup (#64) from the real process
+    /// environment. See [`Self::from_env_signals`] for the decision rule.
+    pub fn detect() -> Self {
+        Self::from_env_signals(
+            std::env::var("COLORTERM").ok().as_deref(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+        )
+    }
+
+    /// Pure decision rule behind [`Self::detect`], taking the two signals as
+    /// plain strings so it's testable without touching process env vars.
+    ///
+    /// `COLORTERM=truecolor`/`=24bit` is a positive signal and wins outright.
+    /// Otherwise a conservative denylist of terminals known to mangle 24-bit
+    /// SGR sequences into two or three colors — `TERM_PROGRAM=Apple_Terminal`
+    /// (#64) — forces the ANSI-256 fallback. Everything else defaults to
+    /// truecolor, matching prior behavior for terminals that don't advertise
+    /// either signal.
+    pub(crate) fn from_env_signals(colorterm: Option<&str>, term_program: Option<&str>) -> Self {
+        let advertises_truecolor = colorterm
+            .map(|value| {
+                value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
+            })
+            .unwrap_or(false);
+        if advertises_truecolor {
+            return Self::TrueColor;
+        }
+        if term_program == Some("Apple_Terminal") {
+            return Self::Indexed256;
+        }
+        Self::TrueColor
+    }
+
     pub fn quantize(self, color: Color) -> Color {
         match (self, color) {
             (_, Color::Reset) | (ColorLevel::TrueColor, _) => color,
@@ -107,14 +140,32 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn for_choice(choice: ThemeChoice) -> Self {
+    /// Production entry point (#64): the color level should always come
+    /// from [`ColorLevel::detect`] (or a preserved prior value on a theme
+    /// switch) rather than defaulting to truecolor, so every theme RGB
+    /// quantizes at the theme boundary when the terminal can't render
+    /// 24-bit color.
+    pub fn for_choice_with_color_level(choice: ThemeChoice, color_level: ColorLevel) -> Self {
         match choice {
-            ThemeChoice::GruvboxDark => Self::default_dark(),
-            ThemeChoice::GruvboxLight => Self::default_light(),
-            ThemeChoice::WarmLedger => Self::warm_ledger(),
+            ThemeChoice::GruvboxDark => Self::default_dark_with(ThemeOptions {
+                color_level,
+                ..ThemeOptions::default_dark()
+            }),
+            ThemeChoice::GruvboxLight => Self::default_light_with(ThemeOptions {
+                color_level,
+                ..ThemeOptions::default_light()
+            }),
+            ThemeChoice::WarmLedger => Self::warm_ledger_with(ThemeOptions {
+                color_level,
+                background: BackgroundMode::Opaque(Color::Rgb(0x26, 0x23, 0x19)),
+            }),
         }
     }
 
+    /// Truecolor convenience constructor kept for tests that don't care
+    /// about color-level fallback; production always goes through
+    /// [`Self::for_choice_with_color_level`].
+    #[cfg(test)]
     pub fn warm_ledger() -> Self {
         Self::warm_ledger_with(ThemeOptions {
             color_level: ColorLevel::TrueColor,
@@ -131,6 +182,9 @@ impl Theme {
         Self::default_dark_with(ThemeOptions::default_dark())
     }
 
+    /// Truecolor convenience constructor kept for tests; see
+    /// [`Self::warm_ledger`].
+    #[cfg(test)]
     pub fn default_light() -> Self {
         Self::default_light_with(ThemeOptions::default_light())
     }
@@ -1000,6 +1054,73 @@ mod tests {
             Color::White | Color::Gray
         ));
         assert!(!matches!(basic.palette.added, Color::Rgb(_, _, _)));
+    }
+
+    // #64: deterministic RGB->256 mappings for the quantizer, pinned to
+    // known xterm-256 index values so a regression in the cube/greyscale
+    // math (or the basic-16 exact-match short-circuit) shows up immediately.
+    #[test]
+    fn quantizer_maps_known_rgb_values_to_known_xterm_indices() {
+        // Exact basic-16 hits win over the 216-cube/greyscale entries that
+        // also contain them (both are distance 0; the basic slot sorts
+        // first in index order).
+        assert_eq!(
+            ColorLevel::Indexed256.quantize(Color::Rgb(0, 0, 0)),
+            Color::Indexed(0),
+            "pure black should hit the basic-16 black slot"
+        );
+        assert_eq!(
+            ColorLevel::Indexed256.quantize(Color::Rgb(255, 0, 0)),
+            Color::Indexed(9),
+            "pure red should hit the basic-16 bright-red slot"
+        );
+        // A color-cube-exact RGB triple (steps are 0/95/135/175/215/255) with
+        // no basic-16 or greyscale-ramp collision.
+        assert_eq!(
+            ColorLevel::Indexed256.quantize(Color::Rgb(95, 135, 175)),
+            Color::Indexed(67),
+            "cube-exact steel-blue should hit xterm index 67"
+        );
+        // A greyscale-ramp-exact RGB triple with no cube or basic-16 collision.
+        assert_eq!(
+            ColorLevel::Indexed256.quantize(Color::Rgb(38, 38, 38)),
+            Color::Indexed(235),
+            "greyscale-ramp-exact grey should hit xterm index 235"
+        );
+    }
+
+    // #64: TERM_PROGRAM=Apple_Terminal is a known non-supporter and must
+    // force the ANSI-256 fallback even with no other signal present.
+    #[test]
+    fn apple_terminal_forces_indexed_256_fallback() {
+        assert_eq!(
+            ColorLevel::from_env_signals(None, Some("Apple_Terminal")),
+            ColorLevel::Indexed256
+        );
+    }
+
+    #[test]
+    fn colorterm_truecolor_wins_even_over_apple_terminal() {
+        assert_eq!(
+            ColorLevel::from_env_signals(Some("truecolor"), Some("Apple_Terminal")),
+            ColorLevel::TrueColor
+        );
+        assert_eq!(
+            ColorLevel::from_env_signals(Some("24bit"), Some("Apple_Terminal")),
+            ColorLevel::TrueColor
+        );
+    }
+
+    #[test]
+    fn unset_signals_default_to_truecolor() {
+        assert_eq!(
+            ColorLevel::from_env_signals(None, None),
+            ColorLevel::TrueColor
+        );
+        assert_eq!(
+            ColorLevel::from_env_signals(None, Some("ghostty")),
+            ColorLevel::TrueColor
+        );
     }
 
     #[test]

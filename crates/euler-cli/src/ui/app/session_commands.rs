@@ -154,7 +154,11 @@ impl AppCore {
 
     pub(super) fn set_theme(&mut self, choice: ThemeChoice) -> CoreEffect {
         self.theme_choice = choice;
-        self.theme = Theme::for_choice(choice);
+        // #64: carry forward the color level detected at startup — switching
+        // themes must not silently reintroduce truecolor SGR on a terminal
+        // that can't render it.
+        let color_level = self.theme.color_level;
+        self.theme = Theme::for_choice_with_color_level(choice, color_level);
         self.rebuild_bottom_surface();
         match self
             .theme_preference_path
