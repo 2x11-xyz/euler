@@ -2385,6 +2385,61 @@ fn accepting_resume_purges_prior_native_scrollback() {
 }
 
 #[test]
+fn accepting_resume_restamps_replayed_history_when_timestamps_are_on() {
+    // Review v2 §6: a rebuild (resume, new session, rollback) must stamp
+    // every replayed event from its own provenance time — not leave the
+    // gutter blank until new events arrive.
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(".");
+    config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider);
+    let events = vec![event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "resumed content".into())]),
+    )];
+
+    core.accept_tui_resume(
+        "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned(),
+        TuiResume {
+            session,
+            channels,
+            events,
+            active_target: ModelTarget::new("fixture", "echo"),
+            display_label: "useful resumed name".to_owned(),
+            recovery_closure_appended: false,
+            warning_count: 0,
+            events_replayed: 1,
+        },
+    );
+
+    let lines = core
+        .drain_finalized_visual_lines(80)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let row = lines
+        .iter()
+        .position(|line| line.contains("resumed content"))
+        .expect("replayed row");
+    let stamp: String = lines[row].chars().take(8).collect();
+    assert!(
+        looks_like_hh_mm_ss(&stamp),
+        "replayed history should be restamped, not blank: {:?}",
+        lines[row]
+    );
+}
+
+#[test]
 fn accepting_resume_boundary_includes_recovery_and_warnings() {
     let mut core = core();
     let (decider, channels) = TuiDecider::new();
@@ -3383,6 +3438,70 @@ fn timestamps_toggle_persists_and_logs_confirmation() {
         CoreEffect::Render
     );
     assert!(core.show_timestamp_gutter);
+}
+
+#[test]
+fn toggled_on_timestamp_gutter_stamps_every_event_first_row() {
+    // Review v2 §6: the opt-in gutter must show every event's real
+    // provenance time, not a blank column — this is the production
+    // visual-canvas path (real EventEnvelope timestamps), not a bare
+    // TranscriptItem fixture.
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+    core.drain_finalized_visual_lines(80);
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::USER_MESSAGE,
+        object([("content", "hi".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "hello there".into())]),
+    )));
+
+    let lines = core
+        .drain_finalized_visual_lines(80)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let user_row = lines
+        .iter()
+        .position(|line| line.contains("hi"))
+        .expect("user row");
+    let answer_row = lines
+        .iter()
+        .position(|line| line.contains("hello there"))
+        .expect("answer row");
+
+    for (label, row) in [("user", user_row), ("answer", answer_row)] {
+        let line = &lines[row];
+        let stamp: String = line.chars().take(8).collect();
+        assert!(
+            looks_like_hh_mm_ss(&stamp),
+            "{label} row should stamp a real HH:MM:SS, not a blank gutter: {line:?}"
+        );
+    }
+}
+
+fn looks_like_hh_mm_ss(stamp: &str) -> bool {
+    let chars: Vec<char> = stamp.chars().collect();
+    chars.len() == 8
+        && chars[0].is_ascii_digit()
+        && chars[1].is_ascii_digit()
+        && chars[2] == ':'
+        && chars[3].is_ascii_digit()
+        && chars[4].is_ascii_digit()
+        && chars[5] == ':'
+        && chars[6].is_ascii_digit()
+        && chars[7].is_ascii_digit()
 }
 
 #[test]

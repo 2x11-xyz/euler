@@ -1,6 +1,17 @@
 use super::super::visual::render_finalized_visual_items_with_offsets;
 use super::*;
+use crate::ui::transcript::ProjectedEntry;
 use crate::ui::visual_canvas::CursorTarget;
+
+/// Test-only helper: wrap bare items as untimed entries for callers of
+/// `render_finalized_visual_items_with_offsets`, which (in production)
+/// always receives real per-item timing from the visual canvas.
+fn untimed_entries(items: Vec<TranscriptItem>) -> Vec<ProjectedEntry> {
+    items
+        .into_iter()
+        .map(|item| ProjectedEntry { item, timing: None })
+        .collect()
+}
 
 #[test]
 fn question_mark_help_overlay_is_global_only_for_idle_composer() {
@@ -538,9 +549,9 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
 fn finalized_wrapped_prompt_uses_continuous_user_rail() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::UserMessage(
+        &untimed_entries(vec![TranscriptItem::UserMessage(
             "alpha beta gamma delta epsilon".to_owned(),
-        )],
+        )]),
         &theme,
         28,
         TOOL_CALL_MAX_LINES,
@@ -574,7 +585,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     let table = "| Layer | Responsibility | Repo location |\n|---|---|---|\n| CLI/TUI layer | User-facing command-line and Ratatui transcript composer status UX | euler-cli |\n";
 
     let narrow = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::AssistantMessage(table.to_owned())],
+        &untimed_entries(vec![TranscriptItem::AssistantMessage(table.to_owned())]),
         &theme,
         44,
         TOOL_CALL_MAX_LINES,
@@ -611,7 +622,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     );
 
     let wide = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::AssistantMessage(table.to_owned())],
+        &untimed_entries(vec![TranscriptItem::AssistantMessage(table.to_owned())]),
         &theme,
         100,
         TOOL_CALL_MAX_LINES,
@@ -692,11 +703,11 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
 fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[
+        &untimed_entries(vec![
             TranscriptItem::UserMessage("hi".to_owned()),
             TranscriptItem::AssistantMessage("Hi! How can I help?".to_owned()),
             TranscriptItem::WorkedDuration("5s".to_owned()),
-        ],
+        ]),
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
@@ -731,14 +742,14 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
 fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::ToolRun {
+        &untimed_entries(vec![TranscriptItem::ToolRun {
             command: "ls -la".to_owned(),
             ok: true,
             error: String::new(),
             output: "exit 0\nfile".to_owned(),
             exit_code: Some(0),
             grant_source: None,
-        }],
+        }]),
         &theme,
         80,
         TOOL_CALL_MAX_LINES,

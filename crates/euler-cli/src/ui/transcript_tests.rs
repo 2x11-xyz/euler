@@ -3217,7 +3217,10 @@ fn vt100_renders_absolute_time_duration_and_turn_footer() {
     ];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 80, 6);
+    // Inline elapsed/turn-footer decorations are toggle-gated in the real
+    // app (review v2 §6); opt in here to exercise them directly.
+    let contents =
+        crate::ui::text::with_timestamp_gutter(true, || rendered_screen(&events, &theme, 80, 6));
 
     let start = local_hms("2026-06-20T14:32:07.000Z");
     let done = local_hms("2026-06-20T14:34:00.000Z");
@@ -3242,7 +3245,8 @@ fn vt100_skips_invalid_timestamps_without_breaking_transcript() {
     ];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 80, 6);
+    let contents =
+        crate::ui::text::with_timestamp_gutter(true, || rendered_screen(&events, &theme, 80, 6));
 
     assert!(contents.contains("bad time"));
     assert!(!contents.contains("not-a-time"));
@@ -3266,7 +3270,8 @@ fn vt100_clamps_out_of_order_timestamp_duration_to_zero() {
     ];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 80, 6);
+    let contents =
+        crate::ui::text::with_timestamp_gutter(true, || rendered_screen(&events, &theme, 80, 6));
 
     let earlier = local_hms("2026-06-20T14:32:07.000Z");
     assert!(contents.contains(&format!("earlier · +0s · {earlier}")));

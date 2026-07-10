@@ -1166,7 +1166,7 @@ impl AppCore {
         // Plain text of finalized ledger history rows — the same set the
         // visual canvas projects. Not live streaming markdown only.
         let width = self.composer_navigation_width.max(40);
-        let items = self.visual_canvas.finalized_items().to_vec();
+        let items = self.visual_canvas.finalized_items();
         let lines = crate::ui::text::with_timestamp_gutter(self.show_timestamp_gutter, || {
             transcript::render_items_for_history(&items, &self.theme, width)
         });
@@ -1806,13 +1806,19 @@ impl AppCore {
             transcript.push_event(event.clone());
         }
         transcript.scroll_to_bottom();
-        let mut finalized = vec![TranscriptItem::Banner {
-            session_id: self.status.session_id.clone(),
+        let mut finalized = vec![transcript::ProjectedEntry {
+            item: TranscriptItem::Banner {
+                session_id: self.status.session_id.clone(),
+            },
+            timing: None,
         }];
-        finalized.extend(transcript.items());
+        // Restamp the whole rebuilt transcript from real event provenance
+        // (review v2 §6) rather than the blank gutter a plain items() +
+        // fresh push would produce.
+        finalized.extend(transcript.timed_items());
         self.transcript = transcript;
         self.token_usage = token_usage;
-        self.visual_canvas = VisualCanvasState::new(finalized);
+        self.visual_canvas = VisualCanvasState::new_with_entries(finalized);
     }
 
     fn handle_ctrl_c(&mut self) -> CoreEffect {
@@ -1968,7 +1974,7 @@ impl AppCore {
     }
 
     fn refresh_foldable_spans(&mut self, width: u16) {
-        let items = self.visual_canvas.finalized_items().to_vec();
+        let items = self.visual_canvas.finalized_items();
         let theme = self.theme.clone();
         let mut row = 0usize;
         let mut spans = Vec::new();

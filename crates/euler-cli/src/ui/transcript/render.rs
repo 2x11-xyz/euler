@@ -13,7 +13,7 @@ use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
 use crate::ui::text::{
     blank_gutter, content_width, display_width, gutter_width, is_ledger_gutter, timestamp_gutter,
-    tree_gutter_pipe, wrap_text,
+    timestamp_gutter_shown, tree_gutter_pipe, wrap_text,
 };
 use crate::ui::theme::Theme;
 use ratatui::style::Style;
@@ -95,6 +95,7 @@ pub(super) fn render_projected_entries_with_expansion(
         width,
         limits,
         expanded_artifact_keys,
+        true,
     )
     .0
 }
@@ -103,6 +104,12 @@ pub(super) fn render_projected_entries_with_expansion(
 /// cumulative end-row offset of each entry. Offsets let the terminal commit
 /// native scrollback at item boundaries so a width change can remap its
 /// committed prefix exactly (no lost rows, no duplicates).
+///
+/// `show_turn_footer` renders the trailing "elapsed since first event"
+/// footer when the last entry carries timing. That reads correctly for a
+/// single bounded batch (the CLI/test transcript widget); the visual
+/// canvas's incrementally growing whole-session history is never one batch,
+/// so it passes `false`.
 #[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
 pub(super) fn render_projected_entries_with_expansion_and_offsets(
     entries: &[ProjectedEntry],
@@ -110,6 +117,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
     width: u16,
     limits: TranscriptRenderLimits,
     expanded_artifact_keys: &HashSet<String>,
+    show_turn_footer: bool,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
     let mut item_end_offsets = Vec::with_capacity(entries.len());
@@ -592,13 +600,15 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             let anchor = spine_anchor(item, theme);
             stamp_first_line(&mut lines[first_line], &stamp, anchor.as_ref(), theme);
             if let Some(timing) = &entry.timing {
-                if !item_renders_inline_timing(item) {
+                if !item_renders_inline_timing(item) && timestamp_gutter_shown() {
                     append_timing(&mut lines[first_line], timing, theme, width);
                 }
             }
         } else if let Some(timing) = &entry.timing {
-            if let Some(line) = lines.get_mut(first_line) {
-                append_timing(line, timing, theme, width);
+            if timestamp_gutter_shown() {
+                if let Some(line) = lines.get_mut(first_line) {
+                    append_timing(line, timing, theme, width);
+                }
             }
         }
         // §1: separation is the spine plus one blank line — applied after
@@ -624,7 +634,10 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
         item_end_offsets.push(lines.len());
     }
 
-    if let Some(footer) = super::turn_footer(entries) {
+    if let Some(footer) = show_turn_footer
+        .then(|| super::turn_footer(entries))
+        .flatten()
+    {
         push_wrapped(
             &mut lines,
             blank_gutter(),
@@ -643,16 +656,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
 }
 
 fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
-    // Live control chrome (permission ask panel, turn separators, worked
-    // banners) is not a ledger event: no timestamp stamp, no hairline.
-    !matches!(
-        item,
-        TranscriptItem::Banner { .. }
-            | TranscriptItem::TurnSeparator
-            | TranscriptItem::WorkedDuration(_)
-            | TranscriptItem::TurnRecap { .. }
-            | TranscriptItem::PermissionAsk { .. }
-    )
+    super::item_wants_timestamp(item)
 }
 
 fn item_renders_inline_timing(item: &TranscriptItem) -> bool {
@@ -664,8 +668,10 @@ fn item_renders_inline_timing(item: &TranscriptItem) -> bool {
 
 fn tool_group_header(label: &str, steps: usize, timing: Option<&EventTiming>) -> String {
     let mut parts = vec![label.to_owned(), step_count_label(steps)];
-    if let Some(elapsed) = timing.and_then(|timing| timing.since_previous.as_deref()) {
-        parts.push(elapsed.to_owned());
+    if timestamp_gutter_shown() {
+        if let Some(elapsed) = timing.and_then(|timing| timing.since_previous.as_deref()) {
+            parts.push(elapsed.to_owned());
+        }
     }
     parts.join(" · ")
 }
@@ -1057,12 +1063,16 @@ mod tests {
             }),
         }];
 
-        let lines = render_projected_entries(
-            &entries,
-            &Theme::default(),
-            80,
-            TranscriptRenderLimits::default(),
-        );
+        // Exploration step-elapsed is a timing decoration, toggle-gated in
+        // the real app (review v2 §6); opt in here to exercise it directly.
+        let lines = crate::ui::text::with_timestamp_gutter(true, || {
+            render_projected_entries(
+                &entries,
+                &Theme::default(),
+                80,
+                TranscriptRenderLimits::default(),
+            )
+        });
         let text = plain_text(&lines);
 
         assert!(text.contains("explore · 2 steps · 6s"), "text: {text:?}");

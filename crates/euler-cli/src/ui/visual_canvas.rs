@@ -1,14 +1,19 @@
 const ESC: char = '\u{1b}';
-use super::transcript::TranscriptItem;
+use super::transcript::{item_wants_timestamp, parse_event_time, EventTiming, ProjectedEntry};
+use super::transcript::{TimingClock, TranscriptItem};
+use chrono::Local;
 use ratatui::style::Style;
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct VisualCanvasState {
-    finalized: Vec<TranscriptItem>,
+    finalized: Vec<ProjectedEntry>,
     history_cache: Option<RenderedHistoryCache>,
     /// Finalized items whose rows are already committed to native scrollback.
     /// Items below this boundary must never be mutated or removed — their
     /// rendered rows are physically in the terminal and cannot be recalled.
     committed_items: usize,
+    /// Running reference clock for stamping newly pushed items (review v2
+    /// §6): every event gets its own honest time, not a blank column.
+    clock: TimingClock,
 }
 impl VisualCanvasState {
     pub fn new(finalized: Vec<TranscriptItem>) -> Self {
@@ -19,7 +24,40 @@ impl VisualCanvasState {
                 state
             })
     }
+
+    /// Build from already-timed entries (a full rebuild from event
+    /// provenance — resume, new session, rollback). Timing is taken as-is,
+    /// not recomputed, since `entries` already carries each item's real
+    /// event time.
+    pub fn new_with_entries(entries: Vec<ProjectedEntry>) -> Self {
+        let mut state = Self::default();
+        for entry in entries {
+            state.push_finalized_entry(entry.item, entry.timing);
+        }
+        state
+    }
+
     pub fn push_finalized(&mut self, item: TranscriptItem) {
+        self.push_finalized_with_ts(item, None);
+    }
+
+    /// Push a finalized item stamped from a real event's provenance time
+    /// (`ts`, RFC3339) when available, else the current wall time. Live
+    /// control chrome (`item_wants_timestamp` false) is never stamped.
+    pub fn push_finalized_with_ts(&mut self, item: TranscriptItem, ts: Option<&str>) {
+        let timing = self.stamp_for(&item, ts);
+        self.push_finalized_entry(item, timing);
+    }
+
+    fn stamp_for(&mut self, item: &TranscriptItem, ts: Option<&str>) -> Option<EventTiming> {
+        if !item_wants_timestamp(item) {
+            return None;
+        }
+        let current = ts.and_then(parse_event_time).unwrap_or_else(Local::now);
+        Some(self.clock.stamp(current))
+    }
+
+    fn push_finalized_entry(&mut self, item: TranscriptItem, timing: Option<EventTiming>) {
         // Merges/removals may only touch items past the committed boundary:
         // rows already in native scrollback cannot change, so mutating their
         // source item would shift every later row and re-emit stale content
@@ -28,7 +66,7 @@ impl VisualCanvasState {
         if matches!(item, TranscriptItem::WorkedDuration(_))
             && self.finalized.len() > boundary
             && matches!(
-                self.finalized.last(),
+                self.finalized.last().map(|entry| &entry.item),
                 Some(TranscriptItem::WorkedDuration(_))
             )
         {
@@ -36,8 +74,12 @@ impl VisualCanvasState {
         }
         if let TranscriptItem::Exploration { summaries } = item {
             if self.finalized.len() > boundary {
-                if let Some(TranscriptItem::Exploration {
-                    summaries: existing,
+                if let Some(ProjectedEntry {
+                    item:
+                        TranscriptItem::Exploration {
+                            summaries: existing,
+                        },
+                    timing: existing_timing,
                 }) = self.finalized.last_mut()
                 {
                     for summary in summaries {
@@ -45,41 +87,45 @@ impl VisualCanvasState {
                             existing.push(summary);
                         }
                     }
+                    if timing.is_some() {
+                        *existing_timing = timing;
+                    }
                     self.history_cache = None;
                     return;
                 }
             }
-            self.finalized
-                .push(TranscriptItem::Exploration { summaries });
+            self.finalized.push(ProjectedEntry {
+                item: TranscriptItem::Exploration { summaries },
+                timing,
+            });
             self.history_cache = None;
             return;
         }
         if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
-            if let Some(existing) = self.finalized[boundary..]
-                .iter_mut()
-                .rev()
-                .find(|existing| {
-                    existing.companion_spawn_event_id() == Some(spawn_event_id.as_str())
-                })
-            {
-                let _ = super::transcript::merge_companion_item(existing, item);
+            if let Some(entry) = self.finalized[boundary..].iter_mut().rev().find(|entry| {
+                entry.item.companion_spawn_event_id() == Some(spawn_event_id.as_str())
+            }) {
+                let _ = super::transcript::merge_companion_item(&mut entry.item, item);
+                if timing.is_some() {
+                    entry.timing = timing;
+                }
                 self.history_cache = None;
                 return;
             }
         }
         if let TranscriptItem::FileDiff { path, .. } = &item {
-            if let Some(index) = self.finalized[boundary..].iter().rposition(
-                |item| matches!(item, TranscriptItem::PatchApplied { path: p, .. } if p == path),
-            ) {
+            if let Some(index) = self.finalized[boundary..].iter().rposition(|entry| {
+                matches!(&entry.item, TranscriptItem::PatchApplied { path: p, .. } if p == path)
+            }) {
                 self.finalized.remove(boundary + index);
             }
-            if let Some(index) = self.finalized[boundary..].iter().rposition(
-                |item| matches!(item, TranscriptItem::FileChange { path: p, .. } if p == path),
-            ) {
+            if let Some(index) = self.finalized[boundary..].iter().rposition(|entry| {
+                matches!(&entry.item, TranscriptItem::FileChange { path: p, .. } if p == path)
+            }) {
                 self.finalized.remove(boundary + index);
             }
         }
-        self.finalized.push(item);
+        self.finalized.push(ProjectedEntry { item, timing });
         self.history_cache = None;
     }
 
@@ -99,11 +145,14 @@ impl VisualCanvasState {
     pub fn has_foldable_artifact(&self, output_limit_lines: usize) -> bool {
         self.finalized
             .iter()
-            .any(|item| item.is_foldable_artifact(output_limit_lines))
+            .any(|entry| entry.item.is_foldable_artifact(output_limit_lines))
     }
 
-    pub fn finalized_items(&self) -> &[TranscriptItem] {
-        &self.finalized
+    pub fn finalized_items(&self) -> Vec<TranscriptItem> {
+        self.finalized
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect()
     }
 
     pub fn invalidate_history_cache(&mut self) {
@@ -116,7 +165,7 @@ impl VisualCanvasState {
         render_finalized: R,
     ) -> VisualCanvasFrame
     where
-        R: FnOnce(&[TranscriptItem], u16) -> (Vec<CanvasLine>, Vec<usize>),
+        R: FnOnce(&[ProjectedEntry], u16) -> (Vec<CanvasLine>, Vec<usize>),
     {
         let (history, offsets) = self.render_history(snapshot.width, render_finalized);
         if !history.is_empty() {
@@ -135,7 +184,7 @@ impl VisualCanvasState {
         render_finalized: R,
     ) -> (Vec<CanvasLine>, Vec<usize>)
     where
-        R: FnOnce(&[TranscriptItem], u16) -> (Vec<CanvasLine>, Vec<usize>),
+        R: FnOnce(&[ProjectedEntry], u16) -> (Vec<CanvasLine>, Vec<usize>),
     {
         if let Some(cache) = &self.history_cache {
             if cache.width == width {
