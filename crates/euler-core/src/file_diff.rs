@@ -556,10 +556,7 @@ mod secret_detector_tests {
             "apiKey: xyz",
             "credentials.json contents",
         ] {
-            assert!(
-                secret_like_text(text, ""),
-                "detector must flag: {text}"
-            );
+            assert!(secret_like_text(text, ""), "detector must flag: {text}");
         }
         assert!(!secret_like_text("fn max_tokens(&self) -> u64 { 42 }", ""));
         assert!(!secret_like_text("let x = compute_totals();", ""));

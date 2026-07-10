@@ -335,9 +335,7 @@ impl ProjectGrantStore {
     /// moved or differently-spelled path cannot borrow another root's consent.
     pub fn consent_path_for_root(consent_dir: &Path, root: &Path) -> PathBuf {
         use sha2::{Digest, Sha256};
-        let canonical = root
-            .canonicalize()
-            .unwrap_or_else(|_| root.to_path_buf());
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let mut hasher = Sha256::new();
         hasher.update(canonical.to_string_lossy().as_bytes());
         let digest = hasher.finalize();

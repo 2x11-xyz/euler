@@ -547,7 +547,8 @@ mod tests {
             PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
                 GrantScope::Project(ScopePattern::new("src").expect("pattern")),
             )]));
-        gate.load_project_grants(&root, Some(&consent)).expect("load");
+        gate.load_project_grants(&root, Some(&consent))
+            .expect("load");
         let request =
             PermissionRequest::new(Capability::FsWrite, "tool edit_file").with_path("src/lib.rs");
         let decision = gate.decide_detailed(&request, ApprovalMode::Ask);
@@ -578,7 +579,8 @@ mod tests {
             .expect("preseed workspace grants");
 
         let mut gate = PermissionGate::new(PanicDecider);
-        gate.load_project_grants(&root, Some(&consent)).expect("load");
+        gate.load_project_grants(&root, Some(&consent))
+            .expect("load");
 
         let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
             .with_command("rm -rf /");
@@ -599,7 +601,8 @@ mod tests {
             PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
                 GrantScope::Project(ScopePattern::new("cargo").expect("pattern")),
             )]));
-        gate.load_project_grants(&root, Some(&consent)).expect("load");
+        gate.load_project_grants(&root, Some(&consent))
+            .expect("load");
         let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
             .with_command("cargo test");
         assert!(gate.decide(&request, ApprovalMode::Ask));
