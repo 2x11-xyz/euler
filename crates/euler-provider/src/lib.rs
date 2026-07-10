@@ -506,6 +506,15 @@ impl ProviderSet {
         self.providers.contains_key(provider)
     }
 
+    /// Configured AND authenticated: `validate_auth` succeeds today. This is
+    /// a live credential check (env var / token file presence, not a network
+    /// call) so it is cheap enough to run when populating a picker.
+    pub fn is_authenticated(&self, provider: &str) -> bool {
+        self.providers
+            .get(provider)
+            .is_some_and(|provider| provider.validate_auth().is_ok())
+    }
+
     pub fn reasoning_effort(&self, provider: &str, model: &str) -> Option<&str> {
         self.providers
             .get(provider)

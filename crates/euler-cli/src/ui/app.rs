@@ -654,6 +654,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         &model_catalog,
         &target.provider,
         &target.model,
+        Some(session.providers()),
         empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
     );
     AppCoreBootstrap {
@@ -776,6 +777,7 @@ impl AppCore {
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
+            self.current_providers(),
             parts,
         ));
     }
@@ -795,8 +797,16 @@ impl AppCore {
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
+            self.current_providers(),
             parts,
         ));
+    }
+
+    fn current_providers(&self) -> Option<&euler_provider::ProviderSet> {
+        match &self.state {
+            AppState::Idle { session } => Some(session.providers()),
+            _ => None,
+        }
     }
 
     fn current_checkpoint_items(&self) -> Vec<crate::ui::commands::CheckpointItem> {

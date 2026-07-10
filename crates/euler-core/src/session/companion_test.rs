@@ -433,8 +433,15 @@ fn companion_model_routing_inherits_overrides_and_rejects_unknown_provider() {
 
     let bad = AgentTask::new("task", "default", "missing", "model").expect("bad task");
     let before = session.events().len();
-    assert!(session.spawn_companion(bad).is_err());
+    let error = session
+        .spawn_companion(bad)
+        .expect_err("unconfigured provider rejected");
     assert_eq!(session.events().len(), before);
+    let message = error.to_string();
+    assert!(
+        message.contains("missing") && message.contains("/login"),
+        "error should name the bad target and suggest /login: {message}"
+    );
 
     let captured = captured.lock().expect("captured").clone();
     assert_eq!(

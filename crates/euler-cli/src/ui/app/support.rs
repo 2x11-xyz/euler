@@ -14,6 +14,7 @@ use euler_core::{EulerHome, ReasoningEffort, SessionRecord, SessionStore};
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
+use euler_provider::ProviderSet;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -100,6 +101,7 @@ pub(super) fn command_context(
     model_catalog: &MergedModelCatalog,
     provider: &str,
     model: &str,
+    providers: Option<&ProviderSet>,
     parts: CommandContextParts,
 ) -> CommandContext {
     // This is called when the bottom surface is rebuilt for session lifecycle
@@ -107,8 +109,24 @@ pub(super) fn command_context(
     let provider_config = provider_config_runtime::load_provider_config(
         provider_config_runtime::default_provider_config_path().as_deref(),
     );
+    let model_choices = model_choices(model_catalog, &provider_config.registry, provider, model);
+    // The reviewer-model picker must not offer a target that will burn a
+    // spawn slot to discover it isn't authenticated (#58): filter to
+    // providers `validate_auth` accepts today. The general `/model` picker
+    // keeps the full list — switching to an unauthenticated provider there
+    // is a normal way to be prompted to /login. No active session (rare,
+    // between-session rebuilds) means no targets can be validated yet.
+    let code_swarm_model_choices = match providers {
+        Some(providers) => model_choices
+            .iter()
+            .filter(|choice| providers.is_authenticated(&choice.provider))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
     CommandContext {
-        model_choices: model_choices(model_catalog, &provider_config.registry, provider, model),
+        model_choices,
+        code_swarm_model_choices,
         effort_choices: effort_choices(parts.current_effort),
         theme_choices: theme_choices(parts.current_theme),
         resume_items: resume_items_from_home(parts.current_session_id.as_deref()),

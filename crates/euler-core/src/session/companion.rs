@@ -138,8 +138,12 @@ impl<D: PermissionDecider> Session<D> {
         let target = ModelTarget::new(provider, model);
         validate_model_target_shape(&target).map_err(SessionError::InvalidCompanionTask)?;
         if !self.providers.contains(&target.provider) {
+            // Named up front (not just "a target failed") and actionable:
+            // this aborts the whole spawn batch (extension callers stop on
+            // the first spawn Err), so a code-swarm run with a bad target
+            // must not burn the remaining reviewer slots to find out (#58).
             return Err(SessionError::InvalidCompanionTask(format!(
-                "provider is not configured: {}",
+                "provider `{}` is not configured for this session; run /login to authenticate it or pick a different target from the reviewer-model picker",
                 target.provider
             )));
         }
