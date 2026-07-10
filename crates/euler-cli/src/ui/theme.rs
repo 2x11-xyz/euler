@@ -453,6 +453,12 @@ pub struct StatusTheme {
     pub model: Style,
     pub cost: Style,
     pub ctx: Style,
+    /// Footer v2 (Review v2 §15): the whole footer's default faint token —
+    /// reuses the existing `gutter` role (Warm Ledger: `#5f584a`).
+    pub faint: Style,
+    /// Footer v2 §15: branch parens sit one step brighter than the rest of
+    /// the footer — reuses the existing `muted` role (Warm Ledger: `#8b8570`).
+    pub branch: Style,
 }
 
 impl StatusTheme {
@@ -463,6 +469,8 @@ impl StatusTheme {
             model: Style::default().fg(palette.st_model),
             cost: Style::default().fg(palette.st_cost),
             ctx: Style::default().fg(palette.st_ctx),
+            faint: Style::default().fg(palette.gutter),
+            branch: Style::default().fg(palette.muted),
         }
     }
 }

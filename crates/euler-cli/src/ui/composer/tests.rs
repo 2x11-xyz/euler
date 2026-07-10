@@ -269,7 +269,7 @@ mod composer_tests {
         assert!(contents.contains("line6"));
         assert!(!contents.contains("line1"));
         let screen_lines = contents.lines().collect::<Vec<_>>();
-        assert!(screen_lines[usize::from(height)].contains("echo · ctx ?% · ?"));
+        assert!(screen_lines[usize::from(height)].contains("echo · ctx ?%"));
         assert!(!screen_lines[usize::from(height)].contains("Context ?% used"));
     }
 

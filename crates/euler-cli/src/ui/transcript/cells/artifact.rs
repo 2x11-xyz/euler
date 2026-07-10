@@ -52,7 +52,7 @@ pub(in crate::ui::transcript) fn artifact_output_rows(
         .take(OUTPUT_PREVIEW_HEAD_LINES)
         .cloned()
         .collect::<Vec<_>>();
-    preview.push(format!("… {hidden} more lines · tap to expand"));
+    preview.push(format!("… {hidden} more lines · ctrl+o expand"));
     preview.extend(
         rows.iter()
             .skip(total_rows.saturating_sub(OUTPUT_PREVIEW_TAIL_LINES))

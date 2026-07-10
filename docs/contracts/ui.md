@@ -61,9 +61,15 @@ emission + unrelated renderers.
 
 ### Fold
 
-- **One** fold key: `ctrl+o`.
-- Target: the foldable block whose vertical span is closest to the **viewport
-  center** (tie → later block). No second expand affordance.
+- **One** fold key: `ctrl+o`. **Global toggle** (issue #49), not a per-cell
+  gesture: one press expands every foldable cell in the transcript at once
+  (tool output, reasoning, diffs); the next press collapses them all
+  together. No per-cell targeting and no invisible "nearest to viewport
+  center" heuristic — this is deliberate: mouse capture is off (native
+  selection and native scrollback stay intact, see the Mouse section), so
+  there is no honest per-cell input method, and a predictable global state
+  beats an invisible one. Native scrollback and `ctrl+f` search remain the
+  navigation tools; `ctrl+o` only decides how much of each cell is showing.
 - Search and other read-only modes must not mutate fold state.
 
 ### Typography
@@ -128,9 +134,14 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
 
 ### Mouse
 
-The live terminal may enable mouse capture so wheel events drive in-app
-transcript scroll while streaming. Wheel = scroll intent only; clicks/drags are
-not semantic input unless a focused surface owns them.
+Mouse capture is deliberately off (terminal enter-session modes never emit
+`\x1b[?1000h`/`\x1b[?1006h`) so the terminal's native text selection and
+native scrollback stay fully usable — copying transcript text and scrolling
+back through history work exactly as they would in any other CLI output. A
+practical consequence: crossterm never delivers mouse events in a real
+terminal, so click/drag is not a supported input path — there is no
+click-to-expand affordance. `ctrl+o` (global fold toggle) and `ctrl+f`
+(search) are the supported disclosure and navigation controls.
 
 ## Transcript event model
 

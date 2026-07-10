@@ -6,6 +6,11 @@ pub(super) struct TuiResume {
     pub(super) events: Vec<EventEnvelope>,
     pub(super) active_target: ModelTarget,
     pub(super) display_label: String,
+    /// Footer #46: the user-set `/name`, distinct from `display_label`
+    /// (which falls back to the auto title, then the session id, for the
+    /// resume-boundary banner line — the footer only ever shows a real
+    /// name or nothing).
+    pub(super) session_name: Option<String>,
     pub(super) recovery_closure_appended: bool,
     pub(super) warning_count: usize,
     pub(super) events_replayed: usize,
@@ -135,6 +140,7 @@ impl AppCore {
             events,
             active_target: outcome.active_target,
             display_label: session_resume_label(&record),
+            session_name: record.name().map(str::to_owned),
             recovery_closure_appended: outcome.recovery_closure_appended,
             warning_count: outcome.warnings.len(),
             events_replayed,
@@ -157,6 +163,7 @@ impl AppCore {
         self.status.session_id = Some(session_id.clone());
         self.status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
         self.status.git_branch = detect_git_branch(&self.status.cwd);
+        self.status.session_name = resume.session_name.clone();
         self.active_session_home_managed = true;
         self.replace_bottom_surface_for_session();
         // Rebuild first so token_usage reflects the resumed event stream under

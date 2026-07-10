@@ -24,7 +24,7 @@ use super::metrics;
 use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPreview};
 #[cfg(test)]
 use super::status::status_widget;
-use super::status::{status_line_text, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
+use super::status::{status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
 use super::terminal::{self, PendingSignal, TerminalSession};
 use super::theme::{Theme, ThemeChoice};
 #[cfg(test)]
@@ -43,9 +43,7 @@ use crate::bundled_extensions::{
 use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection};
 use crate::model_preference;
 use anyhow::{anyhow, Result};
-use crossterm::event::{
-    self, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use euler_core::permissions::PermissionRequest;
 use euler_core::{
     event_is_runtime_only, fold_session, heuristic_projection, load_extension_package,
@@ -59,12 +57,11 @@ use euler_sdk::{Capability, Extension};
 use ratatui::backend::CrosstermBackend;
 #[cfg(test)]
 use ratatui::layout::Rect;
-use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::widgets::Paragraph;
 #[cfg(test)]
 use ratatui::Frame;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
@@ -131,6 +128,11 @@ pub(super) enum HudLine {
         spinner: &'static str,
         verb: String,
         suffix: String,
+        /// #47: already-wrapped continuation lines of the reasoning text
+        /// currently streaming, rendered dim italic under the spinner line.
+        /// Empty unless the phase is "thinking" and a fidelity-permitting
+        /// provider is streaming reasoning content.
+        reasoning_tail: Vec<String>,
     },
 }
 
@@ -179,12 +181,14 @@ pub struct AppCore {
     pending_terminal_clipboard: Option<String>,
     interrupted_guidance: bool,
     in_flight_error: Option<String>,
-    /// Keys of foldable history items currently expanded (`history:{index}`).
-    expanded_artifact_keys: HashSet<String>,
-    /// Last known history viewport as `(top_row, height)` for nearest-block fold.
+    /// Global `ctrl+o` fold state (issue #49): one flag for every foldable
+    /// history item — no per-cell targeting, no invisible nearest-to-
+    /// viewport heuristic. All foldable cells expand together, and collapse
+    /// together on the next `ctrl+o`.
+    tool_output_expanded: bool,
+    /// Last known history viewport as `(top_row, height)`, used to position
+    /// search-match scrolling.
     last_history_viewport: (usize, usize),
-    /// Foldable item spans recorded on the last history render.
-    last_foldable_spans: Vec<FoldableSpan>,
     theme: Theme,
     theme_choice: ThemeChoice,
     theme_preference_path: Option<PathBuf>,
@@ -215,6 +219,15 @@ pub struct AppCore {
     /// running bash/running tests), derived from streamed turn events.
     /// `None` falls back to the generic "working" label.
     current_phase_verb: Option<String>,
+    /// #47: a bounded tail of the reasoning text currently streaming under
+    /// the live `thinking · Ns` HUD line (readable-fidelity providers only).
+    /// Cleared the moment a text delta arrives, a `MODEL_REASONING` item
+    /// finalizes, or the turn ends — a late reasoning delta must never
+    /// reopen it once answer text has started.
+    reasoning_stream_tail: String,
+    /// Set once an answer text delta has streamed this turn; while set, a
+    /// late reasoning delta is ignored rather than reopening the tail.
+    reasoning_tail_locked: bool,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     turn_event_start: usize,
@@ -493,27 +506,12 @@ impl App {
     fn handle_input_batch(&mut self, inputs: Vec<InputEvent>) -> CoreEffect {
         let mut effect = CoreEffect::None;
         for input in inputs {
-            effect = merge_effects(effect, self.route_input(input));
+            effect = merge_effects(effect, self.core.handle_input(input));
             if effect == CoreEffect::Quit {
                 break;
             }
         }
         effect
-    }
-
-    /// Mouse-down events need the active viewport's screen offset (owned by
-    /// the terminal, not `AppCore`) translated into a row within the
-    /// rendered history before core can hit-test a fold marker; every other
-    /// input still flows through the generic `handle_input` path.
-    fn route_input(&mut self, input: InputEvent) -> CoreEffect {
-        if let InputEvent::Mouse(mouse) = &input {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                let viewport_top = self.terminal.viewport_top();
-                let relative_row = mouse.row.saturating_sub(viewport_top);
-                return self.core.handle_fold_click(relative_row);
-            }
-        }
-        self.core.handle_input(input)
     }
 
     fn shutdown(&mut self) -> Result<bool> {
@@ -732,9 +730,8 @@ impl AppCore {
             pending_terminal_clipboard: None,
             interrupted_guidance: false,
             in_flight_error: None,
-            expanded_artifact_keys: HashSet::new(),
+            tool_output_expanded: false,
             last_history_viewport: (0, 24),
-            last_foldable_spans: Vec::new(),
             theme,
             theme_choice,
             theme_preference_path,
@@ -754,6 +751,8 @@ impl AppCore {
             spinner_frame: 0,
             spinner_last_tick: None,
             current_phase_verb: None,
+            reasoning_stream_tail: String::new(),
+            reasoning_tail_locked: false,
             extensions,
             observe,
             turn_event_start: 0,
@@ -1616,6 +1615,8 @@ impl AppCore {
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
         self.current_phase_verb = None;
+        self.reasoning_stream_tail.clear();
+        self.reasoning_tail_locked = false;
         self.spinner_frame = 0;
         self.spinner_last_tick = None;
         self.interrupted_guidance = false;
@@ -1783,8 +1784,7 @@ impl AppCore {
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
         self.token_usage.context_window_tokens = self.active_context_window_tokens();
-        self.expanded_artifact_keys.clear();
-        self.last_foldable_spans.clear();
+        self.tool_output_expanded = false;
         self.modal = None;
         self.quit_armed = None;
         self.last_working_elapsed_secs = None;
@@ -1999,6 +1999,13 @@ impl AppCore {
         CoreEffect::Render
     }
 
+    /// Issue #49: `ctrl+o` is a single global expand/collapse toggle, not a
+    /// per-cell targeting gesture. Per-cell "nearest to viewport center"
+    /// targeting had no honest input method once the mouse click path (#29)
+    /// was removed — it was an invisible heuristic with no visible affordance
+    /// to aim it. A global toggle is simple and predictable: one keystroke,
+    /// every foldable cell in the transcript expands or collapses together;
+    /// native scrollback and `ctrl+f` remain the navigation tools.
     fn toggle_tool_artifact_expansion(&mut self) -> CoreEffect {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
@@ -2009,128 +2016,10 @@ impl AppCore {
         {
             return CoreEffect::None;
         }
-        self.refresh_foldable_spans(self.composer_navigation_width);
-        let Some(key) = self.nearest_foldable_key() else {
-            return CoreEffect::None;
-        };
-        if !self.expanded_artifact_keys.remove(&key) {
-            self.expanded_artifact_keys.insert(key);
-        }
+        self.tool_output_expanded = !self.tool_output_expanded;
         self.visual_canvas.invalidate_history_cache();
         self.visual_scroll_offset = 0;
         CoreEffect::ReplayHistoryWithScrollbackPurge
-    }
-
-    /// Per-cell mouse click target for a fold marker (issue #29). `row` is
-    /// already relative to the active viewport's top (translated by the
-    /// `App` wrapper from the raw screen row using `terminal.viewport_area`).
-    ///
-    /// Native scrollback rows that have already committed are physically
-    /// outside the active viewport and outside crossterm's mouse-reporting
-    /// region once scrolled past — clicking a fold marker there is not
-    /// reachable through this plumbing (documented residual: only markers
-    /// still in the live viewport are click targets; `ctrl+o` remains the
-    /// only way to expand/collapse history that has scrolled into real
-    /// scrollback).
-    fn handle_fold_click(&mut self, row: u16) -> CoreEffect {
-        if !matches!(self.bottom.owner(), BottomOwner::Composer) {
-            return CoreEffect::None;
-        }
-        let (top, height) = self.last_history_viewport;
-        let row = usize::from(row);
-        if row >= height {
-            return CoreEffect::None;
-        }
-        let absolute_row = top + row;
-        let Some(key) = self.foldable_key_at_marker_row(absolute_row) else {
-            return CoreEffect::None;
-        };
-        self.expanded_artifact_keys.insert(key);
-        self.visual_canvas.invalidate_history_cache();
-        self.visual_scroll_offset = 0;
-        CoreEffect::ReplayHistoryWithScrollbackPurge
-    }
-
-    /// The clickable row is exactly the final rendered row of a collapsed
-    /// foldable span — the "… N more lines · tap to expand" line itself, not
-    /// the artifact body above it. Expanded spans have no marker row, so
-    /// they are never a click target here (only `ctrl+o` toggles collapse).
-    fn foldable_key_at_marker_row(&self, absolute_row: usize) -> Option<String> {
-        self.last_foldable_spans
-            .iter()
-            .find(|span| span.marker_row == Some(absolute_row))
-            .map(|span| span.key.clone())
-    }
-
-    fn nearest_foldable_key(&self) -> Option<String> {
-        let spans = &self.last_foldable_spans;
-        if spans.is_empty() {
-            return None;
-        }
-        let (top, height) = self.last_history_viewport;
-        let height = height.max(1);
-        let center = top.saturating_add(height / 2);
-        let mut best: Option<(usize, usize, &str)> = None;
-        for (index, span) in spans.iter().enumerate() {
-            let mid = span
-                .start
-                .saturating_add(span.end.saturating_sub(span.start) / 2);
-            let dist = mid.abs_diff(center);
-            let rank = (dist, spans.len() - 1 - index);
-            match best {
-                Some((best_dist, best_rev, _)) if rank >= (best_dist, best_rev) => {}
-                _ => best = Some((rank.0, rank.1, span.key.as_str())),
-            }
-        }
-        best.map(|(_, _, key)| key.to_owned())
-    }
-
-    fn refresh_foldable_spans(&mut self, width: u16) {
-        let items = self.visual_canvas.finalized_items();
-        let theme = self.theme.clone();
-        let mut row = 0usize;
-        let mut spans = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            let key = transcript::artifact_key_for_index(index);
-            let folded = !self.expanded_artifact_keys.contains(&key);
-            let limit = if folded {
-                TOOL_CALL_MAX_LINES
-            } else {
-                usize::MAX
-            };
-            let lines = transcript::render_items_for_history_with_limit(
-                std::slice::from_ref(item),
-                &theme,
-                width,
-                limit,
-            );
-            let line_count = lines.len();
-            if item.is_foldable_artifact(TOOL_CALL_MAX_LINES) {
-                let end = row.saturating_add(line_count.saturating_sub(1));
-                // The clickable row is the literal "… N more lines · tap to
-                // expand" row, which is not always the span's last row (a
-                // folded preview can still show trailing tail lines after
-                // the marker) and not always present at all (expanded spans
-                // have no marker).
-                let marker_row = folded
-                    .then(|| fold_marker_row_offset(&lines))
-                    .flatten()
-                    .map(|offset| row + offset);
-                spans.push(FoldableSpan {
-                    key,
-                    start: row,
-                    end,
-                    marker_row,
-                });
-            }
-            row = row.saturating_add(line_count);
-        }
-        let height = self.last_history_viewport.1.max(1);
-        let top = row
-            .saturating_sub(height)
-            .saturating_sub(self.visual_scroll_offset);
-        self.last_history_viewport = (top, height);
-        self.last_foldable_spans = spans;
     }
 
     fn open_external_editor(&mut self) -> CoreEffect {
@@ -2322,7 +2211,7 @@ impl AppCore {
     /// cases are unstyled one-liners; the working case carries the spinner,
     /// phase verb, and dim suffix as separate pieces so the real path can
     /// color them independently (gold spinner, dim elapsed/hint).
-    fn working_hud_line(&self) -> Option<HudLine> {
+    fn working_hud_line(&self, width: u16) -> Option<HudLine> {
         if matches!(
             self.modal,
             Some(Modal::Permission(_) | Modal::PatchApproval(_))
@@ -2351,6 +2240,7 @@ impl AppCore {
                 spinner,
                 verb: format!("running {label}"),
                 suffix: format!(" · {secs}s · not cancellable"),
+                reasoning_tail: Vec::new(),
             });
         }
         let verb = if label == "turn" {
@@ -2360,11 +2250,33 @@ impl AppCore {
         } else {
             format!("working {label}")
         };
+        let reasoning_tail = if verb == "thinking" {
+            self.reasoning_tail_lines(width)
+        } else {
+            Vec::new()
+        };
         Some(HudLine::Working {
             spinner,
             verb,
             suffix: format!(" · {secs}s · esc to interrupt"),
+            reasoning_tail,
         })
+    }
+
+    /// #47: wraps the bounded streaming-reasoning tail to `width`, keeping
+    /// only the last 3 wrapped lines — the live line shows a readable
+    /// preview, not the full reasoning transcript.
+    fn reasoning_tail_lines(&self, width: u16) -> Vec<String> {
+        const MAX_WRAPPED_LINES: usize = 3;
+        if self.reasoning_stream_tail.is_empty() {
+            return Vec::new();
+        }
+        let content_width = usize::from(width).saturating_sub(2).max(1);
+        let mut wrapped = crate::ui::text::wrap_text(&self.reasoning_stream_tail, content_width);
+        if wrapped.len() > MAX_WRAPPED_LINES {
+            wrapped = wrapped.split_off(wrapped.len() - MAX_WRAPPED_LINES);
+        }
+        wrapped
     }
 
     /// Plain-text flattening of `working_hud_line`, kept for the legacy
@@ -2372,12 +2284,13 @@ impl AppCore {
     /// that predates the visual-canvas renderer and does not carry styled spans.
     #[cfg(test)]
     fn live_status_line(&self) -> Option<String> {
-        Some(match self.working_hud_line()? {
+        Some(match self.working_hud_line(80)? {
             HudLine::Plain(text) => text,
             HudLine::Working {
                 spinner,
                 verb,
                 suffix,
+                reasoning_tail: _,
             } => format!("{spinner} {verb}{suffix}"),
         })
     }
@@ -2465,35 +2378,6 @@ impl AppCore {
         let export_dir = self.session_store()?.home().root().join("exports");
         Ok(export_dir.join(format!("euler-session-{session_id}.json")))
     }
-}
-
-/// A foldable history item's rendered row range, recorded on each history
-/// render so `ctrl+o` (nearest-to-viewport) and mouse clicks (exact row) can
-/// both target the right artifact without re-deriving layout from scratch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct FoldableSpan {
-    key: String,
-    /// First rendered row of the item (inclusive).
-    start: usize,
-    /// Last rendered row of the item (inclusive) — includes the trailing
-    /// blank spacer row the transcript renderer appends after every event,
-    /// so it is deliberately *not* assumed to be the fold marker's row.
-    end: usize,
-    /// Row of the literal "… N more lines · tap to expand" line, when the
-    /// item is currently folded and therefore has one. `None` once expanded.
-    marker_row: Option<usize>,
-}
-
-/// Find the rendered row (0-based, relative to this item's own render) that
-/// carries the fold marker text, by literal content rather than position —
-/// preview shapes vary (some artifacts show head+marker+tail, others just
-/// head+marker), so the marker is not reliably the item's last content row.
-fn fold_marker_row_offset(lines: &[Line<'static>]) -> Option<usize> {
-    lines.iter().position(|line| {
-        line.spans
-            .iter()
-            .any(|span| span.content.contains("more lines · tap to expand"))
-    })
 }
 
 fn resolve_session_store() -> Result<SessionStore> {

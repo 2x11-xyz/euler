@@ -88,7 +88,7 @@ fn empty_composer_prompt_has_breathing_room_above_statusline() {
     assert!(screen_row(&contents, areas.bottom.y).starts_with("▌ "));
     let status = screen_row(&contents, areas.status.y);
     assert!(status.starts_with("  / commands"));
-    assert!(status.contains(" · echo · ctx ?% · "));
+    assert!(status.trim_end().ends_with("echo · ctx ?%"));
     assert!(!status.contains("Context ?% used"));
 }
 
@@ -560,7 +560,7 @@ fn finalized_wrapped_prompt_uses_continuous_user_rail() {
         &theme,
         28,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -594,7 +594,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         &theme,
         44,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -631,7 +631,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         &theme,
         100,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -716,7 +716,7 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -758,7 +758,7 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()

@@ -18,7 +18,6 @@ use crate::ui::text::{
 use crate::ui::theme::Theme;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TranscriptRenderLimits {
@@ -54,7 +53,7 @@ pub(super) fn render_projected_items(
     width: u16,
     limits: TranscriptRenderLimits,
 ) -> Vec<Line<'static>> {
-    render_projected_items_with_expansion(items, theme, width, limits, &HashSet::new())
+    render_projected_items_with_expansion(items, theme, width, limits, false)
 }
 
 pub(super) fn render_projected_items_with_expansion(
@@ -62,14 +61,14 @@ pub(super) fn render_projected_items_with_expansion(
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
-    expanded_artifact_keys: &HashSet<String>,
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     let entries: Vec<_> = items
         .iter()
         .cloned()
         .map(|item| ProjectedEntry { item, timing: None })
         .collect();
-    render_projected_entries_with_expansion(&entries, theme, width, limits, expanded_artifact_keys)
+    render_projected_entries_with_expansion(&entries, theme, width, limits, expanded)
 }
 
 #[cfg(test)]
@@ -79,7 +78,7 @@ pub(super) fn render_projected_entries(
     width: u16,
     limits: TranscriptRenderLimits,
 ) -> Vec<Line<'static>> {
-    render_projected_entries_with_expansion(entries, theme, width, limits, &HashSet::new())
+    render_projected_entries_with_expansion(entries, theme, width, limits, false)
 }
 
 pub(super) fn render_projected_entries_with_expansion(
@@ -87,15 +86,10 @@ pub(super) fn render_projected_entries_with_expansion(
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
-    expanded_artifact_keys: &HashSet<String>,
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     render_projected_entries_with_expansion_and_offsets(
-        entries,
-        theme,
-        width,
-        limits,
-        expanded_artifact_keys,
-        true,
+        entries, theme, width, limits, expanded, true,
     )
     .0
 }
@@ -110,13 +104,16 @@ pub(super) fn render_projected_entries_with_expansion(
 /// single bounded batch (the CLI/test transcript widget); the visual
 /// canvas's incrementally growing whole-session history is never one batch,
 /// so it passes `false`.
+///
+/// `expanded` is the single global `ctrl+o` fold state (issue #49) — every
+/// foldable item in `entries` shares it; there is no per-item targeting.
 #[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
 pub(super) fn render_projected_entries_with_expansion_and_offsets(
     entries: &[ProjectedEntry],
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
-    expanded_artifact_keys: &HashSet<String>,
+    expanded: bool,
     show_turn_footer: bool,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
@@ -125,7 +122,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
     for (index, entry) in entries.iter().enumerate() {
         let first_line = lines.len();
         let item = &entry.item;
-        let item_expanded = expanded_artifact_keys.contains(&super::artifact_key_for_index(index));
+        let item_expanded = expanded;
         let item_limits = if item_expanded {
             limits.expanded()
         } else {

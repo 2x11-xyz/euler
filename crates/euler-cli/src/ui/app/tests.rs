@@ -1438,64 +1438,6 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
 }
 
-/// Issue #29: the fold marker ("… N more lines · tap to expand") is a
-/// per-cell mouse click target in the visible viewport, in addition to the
-/// unchanged `ctrl+o` shortcut.
-#[test]
-fn mouse_click_on_fold_marker_row_expands_the_artifact() {
-    let mut core = core();
-    core.push_finalized_visual_item(shell_artifact_with_lines(12));
-
-    let folded_lines = drain_finalized_visual_text(&mut core, 80)
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let marker_row = folded_lines
-        .iter()
-        .position(|line| line.contains("more lines · tap to expand"))
-        .expect("fold marker row present");
-    let row = u16::try_from(marker_row).expect("row fits u16");
-
-    assert_eq!(
-        core.handle_fold_click(row),
-        CoreEffect::ReplayHistoryWithScrollbackPurge
-    );
-    assert_eq!(core.visual_scroll_offset(), 0);
-
-    let expanded = drain_finalized_visual_text(&mut core, 80);
-    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
-    assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
-    // A second click on the artifact re-expanded above does nothing further
-    // (no marker row exists once expanded).
-    assert_eq!(core.handle_fold_click(row), CoreEffect::None);
-}
-
-/// Clicking a row that is not the fold marker itself (e.g. the artifact
-/// title/body above it) is not a click target — only the final "tap to
-/// expand" row is.
-#[test]
-fn mouse_click_off_the_fold_marker_row_is_a_noop() {
-    let mut core = core();
-    core.push_finalized_visual_item(shell_artifact_with_lines(12));
-
-    let folded_lines = drain_finalized_visual_text(&mut core, 80)
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let title_row = 0;
-    assert!(!folded_lines[title_row].contains("tap to expand"));
-
-    assert_eq!(
-        core.handle_fold_click(u16::try_from(title_row).unwrap()),
-        CoreEffect::None
-    );
-    let still_folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(
-        still_folded.contains("8 more lines"),
-        "still_folded: {still_folded:?}"
-    );
-}
-
 #[test]
 fn ctrl_o_expands_and_refolds_finalized_reasoning_items() {
     // Review finding: the collapsed thought line advertises "ctrl+o expand"
@@ -1789,15 +1731,43 @@ fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
     );
 }
 
+/// Issue #49: `ctrl+o` is a single global toggle — every foldable cell in a
+/// mixed transcript (tool run, reasoning, diff) expands together on the
+/// first press and collapses together on the second, with no per-cell
+/// targeting or invisible nearest-to-viewport heuristic.
 #[test]
-fn ctrl_o_expands_only_nearest_foldable_artifact() {
+fn ctrl_o_expands_all_foldable_artifacts_globally() {
     let mut core = core();
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    core.push_finalized_visual_item(TranscriptItem::ModelReasoning {
+        fidelity: "detailed".to_owned(),
+        content: "Weighing the tradeoffs between approach A and approach B. \
+            After a long deliberation the conclusion lands on approach B \
+            because it is the option that fully honors the unique reasoning marker."
+            .to_owned(),
+    });
+    core.push_finalized_visual_item(TranscriptItem::PatchApplied {
+        path: "src/lib.rs".to_owned(),
+        old: None,
+        new: Some(
+            (1..=20)
+                .map(|line| format!("added line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        ),
+    });
     core.push_finalized_visual_item(shell_artifact_with_lines(14));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
     assert!(folded.contains("8 more lines"), "folded: {folded:?}");
     assert!(folded.contains("10 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
+    assert!(
+        !folded.contains("unique reasoning marker"),
+        "folded: {folded:?}"
+    );
+    assert!(!folded.contains("added line 15"), "folded: {folded:?}");
 
     assert_eq!(
         core.handle_input(ctrl_o()),
@@ -1805,14 +1775,34 @@ fn ctrl_o_expands_only_nearest_foldable_artifact() {
     );
     let expanded = drain_finalized_visual_text(&mut core, 80);
 
-    // Exactly one foldable expands (nearest to viewport center).
-    let still_folded = usize::from(expanded.contains("8 more lines"))
-        + usize::from(expanded.contains("10 more lines"));
-    assert_eq!(
-        still_folded, 1,
-        "exactly one artifact should remain folded: {expanded:?}"
-    );
+    // All foldable cells expand together — none remain collapsed.
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
+    assert!(
+        expanded.contains("unique reasoning marker"),
+        "expanded: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("ctrl+o collapse"),
+        "expanded: {expanded:?}"
+    );
+    assert!(expanded.contains("added line 15"), "expanded: {expanded:?}");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("10 more lines"), "refolded: {refolded:?}");
+    assert!(
+        !refolded.contains("unique reasoning marker"),
+        "refolded: {refolded:?}"
+    );
+    assert!(
+        !refolded.contains("added line 15"),
+        "refolded: {refolded:?}"
+    );
 }
 
 #[test]
@@ -2134,6 +2124,42 @@ fn name_session_refreshes_metadata_after_durable_rename() {
         .expect("find session")
         .expect("session record");
     assert_eq!(refreshed.name(), Some("clean name"));
+
+    // #46: the footer picks up the name from the same render, no extra
+    // rebuild needed — and even though naming failed the metadata refresh
+    // in the sibling test above, the footer there still updates (asserted
+    // separately below) because it never depended on that refresh.
+    assert_eq!(core.status.session_name.as_deref(), Some("clean name"));
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(rendered.ends_with("echo · ctx ?% · clean name"));
+}
+
+#[test]
+fn name_session_updates_footer_immediately_even_if_metadata_refresh_fails() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    config.agent_id = "tui-test".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(record.events_path()).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    let alternate_home = EulerHome::from_root(temp.path().join(".other-euler")).expect("home");
+    core.session_store = Some(SessionStore::new(alternate_home).expect("alternate store"));
+
+    assert_eq!(core.status.session_name, None);
+    assert_eq!(
+        core.name_current_session("still named".to_owned()),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.status.session_name.as_deref(), Some("still named"));
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(rendered.ends_with("echo · ctx ?% · still named"));
 }
 
 #[test]
@@ -2524,6 +2550,7 @@ fn accepting_resume_purges_prior_native_scrollback() {
             events,
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "useful resumed name".to_owned(),
+            session_name: None,
             recovery_closure_appended: false,
             warning_count: 0,
             events_replayed: 1,
@@ -2576,6 +2603,7 @@ fn accepting_resume_restamps_replayed_history_when_timestamps_are_on() {
             events,
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "useful resumed name".to_owned(),
+            session_name: None,
             recovery_closure_appended: false,
             warning_count: 0,
             events_replayed: 1,
@@ -2616,6 +2644,7 @@ fn accepting_resume_boundary_includes_recovery_and_warnings() {
             events: Vec::new(),
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "broken tail".to_owned(),
+            session_name: None,
             recovery_closure_appended: true,
             warning_count: 2,
             events_replayed: 7,
@@ -3090,6 +3119,185 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
     assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
 }
 
+/// #47(a): while reasoning streams, the dim-italic reasoning text itself
+/// renders as continuation lines under the live `thinking · Ns` line.
+#[test]
+fn reasoning_stream_tail_renders_under_the_thinking_line() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "let me check the ".into()),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "call site first".into()),
+        ]),
+    )));
+
+    let frame = core.render_visual_canvas(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("let me check the call site first"), "{text}");
+
+    let reasoning_line = frame
+        .active_frame_lines
+        .iter()
+        .find(|line| line.plain_text().contains("let me check"))
+        .expect("reasoning continuation line present");
+    assert_eq!(
+        reasoning_line.spans[0].style,
+        core.theme.transcript.reasoning
+    );
+}
+
+/// #47(a): the tail clears the moment answer text starts streaming, and a
+/// late reasoning delta afterward must never reopen it.
+#[test]
+fn reasoning_stream_tail_clears_when_answer_text_starts_and_never_reopens() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "thinking...".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "thinking...");
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+
+    // A late reasoning delta (unusual, but must not reopen the tail).
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "too late".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+}
+
+/// #47(a): the tail also clears the moment the reasoning item finalizes
+/// (`MODEL_REASONING`), and it never survives past the turn's end.
+#[test]
+fn reasoning_stream_tail_clears_on_finalize_and_turn_end() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "thinking...".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "thinking...");
+
+    // A second `MODEL_REASONING` (e.g. a further reasoning round after a
+    // tool call) finalizes the current item and clears the live tail.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "final thought".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "one more round".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "one more round");
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+    assert_eq!(core.reasoning_stream_tail, "");
+}
+
+/// #47(a): the streamed tail is bounded (~400 chars) and truncates from the
+/// left on a char boundary — never splitting a multibyte glyph.
+#[test]
+fn reasoning_stream_tail_is_bounded_and_multibyte_safe() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+
+    // Push enough multibyte deltas to overflow the 400-char bound.
+    for _ in 0..30 {
+        core.handle_turn_event(TurnEvent::Event(event(
+            EventKind::MODEL_DELTA,
+            object([
+                ("kind", "reasoning".into()),
+                ("delta", "こんにちは世界 ".into()),
+            ]),
+        )));
+    }
+
+    assert!(core.reasoning_stream_tail.chars().count() <= 400);
+    assert!(
+        core.reasoning_stream_tail
+            .chars()
+            .all(|ch| ch != '\u{fffd}'),
+        "{:?}",
+        core.reasoning_stream_tail
+    );
+}
+
 #[test]
 fn working_hud_phase_verb_resets_when_a_new_turn_spawns() {
     let mut core = core();
@@ -3288,7 +3496,12 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     wait_for_idle(&mut core);
 
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
-    assert_eq!(rendered, "  / commands · euler · echo · ctx 12% · ?");
+    // Footer v2 (#48): two hard-edged clusters, empty middle, no branch on
+    // the right (there is none here — non-git fixture cwd) and no `?` fill.
+    assert_eq!(
+        rendered,
+        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
+    );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
     assert_eq!(core.token_usage.reasoning_tokens, Some(500));
@@ -3309,14 +3522,14 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  / commands · euler · echo · ctx 12% · ?"
+        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  / commands · euler · other · ctx ?% · ?"
+        format!("  / commands · /tmp/euler{}other · ctx ?%", " ".repeat(80))
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -3325,7 +3538,7 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  / commands · euler · other · ctx 13% · ?"
+        format!("  / commands · /tmp/euler{}other · ctx 13%", " ".repeat(79))
     );
 }
 
@@ -3529,7 +3742,7 @@ fn large_patch_modal_keeps_diff_bounded() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("tap to expand"));
+    assert!(contents.contains("ctrl+o expand"));
     assert!(contents.contains("n/esc  Deny"));
     assert!(!contents.contains("line 119"));
 }
@@ -3824,7 +4037,7 @@ fn ctrl_f_opens_read_only_transcript_search() {
     core.handle_input(key(KeyCode::Char('x')));
     assert!(matches!(core.bottom.owner(), BottomOwner::Search(_)));
     // Search must not clear fold state.
-    assert!(core.expanded_artifact_keys.is_empty());
+    assert!(!core.tool_output_expanded);
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
     assert!(matches!(core.bottom.owner(), BottomOwner::Composer));

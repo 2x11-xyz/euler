@@ -1,6 +1,7 @@
 use super::*;
 use crate::ui::transcript;
 use ratatui::style::Style;
+use ratatui::text::Line;
 
 impl AppCore {
     pub(super) fn queue_finalized_visual_output_for_latest_event(&mut self) {
@@ -52,7 +53,7 @@ impl AppCore {
         self.composer_navigation_width = width;
         let snapshot = self.visual_canvas_snapshot(width);
         let theme = self.theme.clone();
-        let expanded = self.expanded_artifact_keys.clone();
+        let expanded = self.tool_output_expanded;
         let show_ts = self.show_timestamp_gutter;
         let mut frame = self.visual_canvas.render(snapshot, |items, width| {
             crate::ui::text::with_timestamp_gutter(show_ts, || {
@@ -61,7 +62,7 @@ impl AppCore {
                     &theme,
                     width,
                     TOOL_CALL_MAX_LINES,
-                    &expanded,
+                    expanded,
                 )
             })
         });
@@ -72,7 +73,6 @@ impl AppCore {
         if self.turn_in_flight() && self.transcript.live_committed_items().is_empty() {
             frame.committable_rows = frame.committable_rows.min(frame.history_rows);
         }
-        self.refresh_foldable_spans(width);
         let height = self.last_history_viewport.1.max(1);
         let top = frame
             .history_rows
@@ -132,7 +132,7 @@ impl AppCore {
         // the HUD and the composer, so it's dropped whenever the HUD is
         // active; a *real* notice (e.g. "resume waits for the active turn")
         // still renders, directly below the HUD.
-        if self.push_visual_activity_block(&mut blocks) {
+        if self.push_visual_activity_block(width, &mut blocks) {
             let notice = self.transient_notice_text();
             if !notice.is_empty() {
                 push_visual_block(
@@ -217,33 +217,46 @@ impl AppCore {
     /// Returns whether the HUD is active (and therefore was pushed), so the
     /// caller can skip the transient-notice placeholder row that would
     /// otherwise land between the HUD and the composer.
-    fn push_visual_activity_block(&self, blocks: &mut Vec<VisualBlock>) -> bool {
-        let Some(hud) = self.working_hud_line() else {
+    fn push_visual_activity_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) -> bool {
+        let Some(hud) = self.working_hud_line(width) else {
             return false;
         };
-        let line = match hud {
-            HudLine::Plain(text) => CanvasLine::plain_lossy(text),
+        let lines = match hud {
+            HudLine::Plain(text) => vec![CanvasLine::plain_lossy(text)],
             HudLine::Working {
                 spinner,
                 verb,
                 suffix,
-            } => CanvasLine::from_spans(vec![
-                // Gold (warning-token) spinner — routed through Theme, never
-                // a literal hex (issue #27).
-                CanvasSpan::styled_lossy(
-                    format!("{spinner} "),
-                    TextRole::Plain,
-                    Style::default().fg(self.theme.palette.warning),
-                ),
-                CanvasSpan::new_lossy(verb, TextRole::Plain),
-                CanvasSpan::styled_lossy(
-                    suffix,
-                    TextRole::Plain,
-                    Style::default().fg(self.theme.palette.muted),
-                ),
-            ]),
+                reasoning_tail,
+            } => {
+                let mut lines = vec![CanvasLine::from_spans(vec![
+                    // Gold (warning-token) spinner — routed through Theme, never
+                    // a literal hex (issue #27).
+                    CanvasSpan::styled_lossy(
+                        format!("{spinner} "),
+                        TextRole::Plain,
+                        Style::default().fg(self.theme.palette.warning),
+                    ),
+                    CanvasSpan::new_lossy(verb, TextRole::Plain),
+                    CanvasSpan::styled_lossy(
+                        suffix,
+                        TextRole::Plain,
+                        Style::default().fg(self.theme.palette.muted),
+                    ),
+                ])];
+                // #47: dim italic continuation lines of the reasoning text
+                // currently streaming, directly under the thinking line.
+                lines.extend(reasoning_tail.into_iter().map(|text| {
+                    CanvasLine::from_spans(vec![CanvasSpan::styled_lossy(
+                        format!("  {text}"),
+                        TextRole::Plain,
+                        self.theme.transcript.reasoning,
+                    )])
+                }));
+                lines
+            }
         };
-        push_visual_block(blocks, VisualBlockRole::Activity, vec![line]);
+        push_visual_block(blocks, VisualBlockRole::Activity, lines);
         true
     }
 
@@ -312,23 +325,27 @@ impl AppCore {
 
     pub(super) fn canvas_status_snapshot(&self, width: u16) -> CanvasStatusSnapshot {
         let target = format!("{}/{}", self.status.provider, self.status.model);
-        let line = if let Some(search) = self.bottom.search() {
+        if let Some(search) = self.bottom.search() {
             // Spec §5.4: search swaps the footer hint line for `find: · k/N`.
             let indent = "  ";
-            format!("{indent}{}", search.status_line())
-        } else {
-            let has_foldable = self
-                .visual_canvas
-                .has_foldable_artifact(TOOL_CALL_MAX_LINES);
-            status_line_text(
-                &self.status,
-                &self.token_usage,
-                self.turn_status(),
-                has_foldable,
-                width,
-            )
-        };
-        CanvasStatusSnapshot::new(target, CanvasLine::styled_lossy(line, TextRole::Status))
+            let line = format!("{indent}{}", search.status_line());
+            return CanvasStatusSnapshot::new(
+                target,
+                CanvasLine::styled_lossy(line, TextRole::Status),
+            );
+        }
+        let has_foldable = self
+            .visual_canvas
+            .has_foldable_artifact(TOOL_CALL_MAX_LINES);
+        let line = status_line_canvas(
+            &self.status,
+            &self.token_usage,
+            self.turn_status(),
+            has_foldable,
+            &self.theme,
+            width,
+        );
+        CanvasStatusSnapshot::new(target, line)
     }
 
     fn canvas_composer_snapshot(&self, width: u16) -> CanvasComposerSnapshot {
@@ -398,14 +415,14 @@ pub(super) fn render_finalized_visual_items_with_offsets(
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
-    expanded_artifact_keys: &std::collections::HashSet<String>,
+    expanded: bool,
 ) -> (Vec<CanvasLine>, Vec<usize>) {
     let (lines, item_end_offsets) = transcript::render_entries_for_history_with_offsets(
         entries,
         theme,
         width,
         output_limit_lines,
-        expanded_artifact_keys,
+        expanded,
     );
     // v2: the renderer already separates every event with one blank line —
     // the old trailing-rhythm row would double it AND desync the live vs
