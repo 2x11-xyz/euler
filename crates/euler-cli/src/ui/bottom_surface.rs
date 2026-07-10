@@ -76,6 +76,7 @@ impl BottomSurface {
         &self.composer
     }
 
+    #[cfg(test)]
     pub fn composer_mut(&mut self) -> &mut ComposerDraft {
         &mut self.composer
     }
@@ -145,6 +146,7 @@ impl BottomSurface {
         }
     }
 
+    #[cfg(test)]
     pub fn surface_line_count(&self) -> u16 {
         match &self.owner {
             BottomOwner::Palette(palette) => palette.line_count(),
@@ -185,6 +187,7 @@ impl BottomSurface {
         }
     }
 
+    #[cfg(test)]
     pub fn set_picker_visible_rows(&mut self, visible_rows: usize) {
         self.picker_visible_rows = visible_rows.max(1);
         if let BottomOwner::Picker(picker) = &mut self.owner {
@@ -623,10 +626,6 @@ impl MentionPicker {
         }
     }
 
-    pub fn query(&self) -> &str {
-        &self.query
-    }
-
     pub fn matches(&self) -> Vec<String> {
         filter_workspace_files(&self.files, &self.query)
     }
@@ -732,10 +731,6 @@ impl MentionPicker {
         }
     }
 
-    fn autocomplete_selected(&mut self) {
-        // Selection is committed by confirm/Tab via selected_path.
-    }
-
     fn clamp_selection(&mut self) {
         let len = self.matches().len();
         if len == 0 {
@@ -745,6 +740,7 @@ impl MentionPicker {
         }
     }
 
+    #[cfg(test)]
     fn line_count(&self) -> u16 {
         let matches = self.matches().len();
         let start = self.selected.saturating_sub(3);

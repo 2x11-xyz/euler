@@ -92,6 +92,7 @@ impl ComposerDraft {
     }
 
     /// Paths attached via `@` mentions, in composer order.
+    #[cfg(test)]
     pub fn mentioned_paths(&self) -> Vec<String> {
         self.segments
             .iter()
@@ -102,6 +103,7 @@ impl ComposerDraft {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn set_scroll_line(&mut self, scroll_line: usize) {
         self.scroll_line = scroll_line;
     }
@@ -146,6 +148,7 @@ impl ComposerDraft {
         self.preferred_column = None;
     }
 
+    #[cfg(test)]
     pub fn move_up(&mut self) {
         let units = self.render_units();
         let lines = line_ranges(&units);
@@ -156,6 +159,7 @@ impl ComposerDraft {
         self.move_to_line_column(&units, &lines, line_index, line_index - 1);
     }
 
+    #[cfg(test)]
     pub fn move_down(&mut self) {
         let units = self.render_units();
         let lines = line_ranges(&units);
@@ -244,6 +248,7 @@ impl ComposerDraft {
         lines[current_line_index(&lines, self.cursor)]
     }
 
+    #[cfg(test)]
     fn move_to_line_column(
         &mut self,
         units: &[RenderUnit],
@@ -323,6 +328,7 @@ struct VisualRow {
 }
 
 impl RenderUnit {
+    #[cfg(test)]
     fn display_width(&self) -> usize {
         match self {
             Self::Text(ch) => unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(0),
@@ -467,6 +473,7 @@ fn current_line_index(lines: &[LineRange], cursor: usize) -> usize {
         .unwrap_or_else(|| lines.len().saturating_sub(1))
 }
 
+#[cfg(test)]
 fn display_column(units: &[RenderUnit], range: LineRange) -> usize {
     units[range.start..range.end]
         .iter()
@@ -474,6 +481,7 @@ fn display_column(units: &[RenderUnit], range: LineRange) -> usize {
         .sum()
 }
 
+#[cfg(test)]
 fn cursor_display_column(units: &[RenderUnit], line: LineRange, cursor: usize) -> usize {
     display_column(
         units,
@@ -484,6 +492,7 @@ fn cursor_display_column(units: &[RenderUnit], line: LineRange, cursor: usize) -
     )
 }
 
+#[cfg(test)]
 fn offset_for_column(units: &[RenderUnit], line: LineRange, column: usize) -> usize {
     let mut width = 0;
     for (offset, unit) in units[line.start..line.end].iter().enumerate() {
@@ -499,10 +508,6 @@ fn offset_for_column(units: &[RenderUnit], line: LineRange, column: usize) -> us
 mod render;
 
 pub use render::*;
-
-fn logical_lines(draft: &ComposerDraft) -> Vec<String> {
-    draft.render_text().split('\n').map(str::to_owned).collect()
-}
 
 fn normalize_lf(input: &str) -> String {
     let mut output = String::with_capacity(input.len());

@@ -4,10 +4,11 @@ use super::theme::Theme;
 use crate::ui::markdown_stream::MarkdownStreamCollector;
 use chrono::{DateTime, Local};
 use euler_event::{EventEnvelope, EventKind};
-use ratatui::{buffer::Buffer, layout::Rect, text::Line, widgets::Widget};
+use ratatui::text::Line;
+#[cfg(test)]
+use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 use std::collections::HashMap;
 
-#[allow(dead_code)]
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 10;
 
 mod cells;
@@ -19,10 +20,8 @@ use cells::{file_change_action_label, file_change_path_label, tool_output_is_fol
 use file_diff::file_diff_is_foldable;
 use line::render_line_oriented_item;
 #[cfg(test)]
-use render::bottom_aligned_with_offset;
-use render::{
-    bottom_aligned, render_projected_entries, render_projected_items, TranscriptRenderLimits,
-};
+use render::{bottom_aligned, bottom_aligned_with_offset, render_projected_entries};
+use render::{render_projected_items, TranscriptRenderLimits};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptItem {
@@ -407,7 +406,7 @@ pub fn render_line_oriented(events: &[EventEnvelope]) -> String {
     output
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn transcript_widget<'a>(
     events: &'a [EventEnvelope],
     theme: &'a Theme,
@@ -1340,14 +1339,14 @@ fn tool_projection_for_result<'a>(
     None
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub struct TranscriptWidget<'a> {
     events: &'a [EventEnvelope],
     theme: &'a Theme,
     limits: TranscriptRenderLimits,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl<'a> TranscriptWidget<'a> {
     pub fn new(events: &'a [EventEnvelope], theme: &'a Theme) -> Self {
         Self {
@@ -1363,7 +1362,7 @@ impl<'a> TranscriptWidget<'a> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Widget for TranscriptWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let entries = project_timed_events(self.events);
@@ -1399,6 +1398,7 @@ impl Widget for TranscriptItemsWidget<'_> {
     }
 }
 
+#[cfg(test)]
 fn project_timed_events(events: &[EventEnvelope]) -> Vec<ProjectedEntry> {
     let mut first = None;
     let mut previous = None;
@@ -1431,6 +1431,7 @@ fn project_timed_events(events: &[EventEnvelope]) -> Vec<ProjectedEntry> {
     entries
 }
 
+#[cfg(test)]
 fn push_projected_entry(
     entries: &mut Vec<ProjectedEntry>,
     item: TranscriptItem,

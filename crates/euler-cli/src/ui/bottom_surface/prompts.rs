@@ -64,6 +64,7 @@ impl TextPrompt {
         ]
     }
 
+    #[cfg(test)]
     pub(super) fn line_count(&self) -> u16 {
         3
     }
@@ -125,6 +126,7 @@ impl ConfirmPrompt {
         vec![truncate_display(&self.message, usize::from(width))]
     }
 
+    #[cfg(test)]
     pub(super) fn line_count(&self) -> u16 {
         1
     }

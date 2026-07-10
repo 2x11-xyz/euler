@@ -109,10 +109,7 @@ impl ReplacementPicker {
         self.resume_preview = None;
     }
 
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
+    #[cfg(test)]
     pub fn selected_index(&self) -> usize {
         self.selected
     }
@@ -390,6 +387,7 @@ impl ReplacementPicker {
             .map(|detail| format!("Detail: {detail}"))
     }
 
+    #[cfg(test)]
     pub(super) fn set_visible_rows(&mut self, visible_rows: usize) {
         self.visible_rows = visible_rows.max(1);
         self.ensure_selected_visible();
@@ -413,6 +411,7 @@ impl ReplacementPicker {
         self.selected_item().map(|item| &item.action)
     }
 
+    #[cfg(test)]
     pub(super) fn line_count(&self) -> u16 {
         let filtered_count = self.filtered_indices().len();
         let end = (self.scroll_offset + self.visible_rows).min(filtered_count);

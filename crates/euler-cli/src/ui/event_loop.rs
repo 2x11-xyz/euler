@@ -24,7 +24,6 @@ pub enum UiEvent {
     Resize { width: u16, height: u16 },
     FocusChanged(bool),
     Signal(TerminalSignal),
-    Tick,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,7 +110,6 @@ impl EventLoop {
             UiEvent::Signal(TerminalSignal::Terminate) => {
                 self.pending_shutdown = true;
             }
-            UiEvent::Tick => {}
         }
     }
 

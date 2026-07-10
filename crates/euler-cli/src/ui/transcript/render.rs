@@ -72,6 +72,7 @@ pub(super) fn render_projected_items_with_expansion(
     render_projected_entries_with_expansion(&entries, theme, width, limits, expanded_artifact_keys)
 }
 
+#[cfg(test)]
 pub(super) fn render_projected_entries(
     entries: &[ProjectedEntry],
     theme: &Theme,
@@ -798,11 +799,12 @@ fn append_timing(line: &mut Line<'static>, timing: &EventTiming, theme: &Theme, 
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn bottom_aligned(lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
     bottom_aligned_with_offset(lines, height, 0)
 }
 
+#[cfg(test)]
 pub(super) fn bottom_aligned_with_offset(
     lines: Vec<Line<'static>>,
     height: u16,
@@ -833,7 +835,6 @@ struct DetailRender {
     gutter: &'static str,
 }
 
-#[allow(dead_code)]
 fn push_bounded_detail(
     lines: &mut Vec<Line<'static>>,
     detail: &str,

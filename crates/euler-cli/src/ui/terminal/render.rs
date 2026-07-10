@@ -217,6 +217,7 @@ pub(super) fn stale_rows_after_resize(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn canvas_lines_to_ratatui(lines: &[CanvasLine]) -> Vec<Line<'static>> {
     lines
         .iter()

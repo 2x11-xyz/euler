@@ -523,6 +523,7 @@ fn permissions_palette_opens_via_action() {
     );
 }
 
+#[test]
 fn permissions_picker_selects_existing_capability_and_mode() {
     let mut surface = BottomSurface::new(CommandContext::default());
     surface.open_picker(PickerSpec::Permissions(permission_choices()));

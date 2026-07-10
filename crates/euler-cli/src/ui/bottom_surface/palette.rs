@@ -21,10 +21,12 @@ impl CommandPalette {
         }
     }
 
+    #[cfg(test)]
     pub fn input(&self) -> &str {
         &self.input
     }
 
+    #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -170,6 +172,7 @@ impl CommandPalette {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn line_count(&self) -> u16 {
         let matches = self.matches();
         let match_count = matches.len();

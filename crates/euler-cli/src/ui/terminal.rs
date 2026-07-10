@@ -16,8 +16,12 @@ use ratatui::{
     backend::Backend,
     layout::{Position, Rect, Size},
     style::{Color as RatatuiColor, Modifier, Style},
+    Terminal, TerminalOptions, Viewport,
+};
+#[cfg(test)]
+use ratatui::{
     text::{Line, Span},
-    Frame, Terminal, TerminalOptions, Viewport,
+    Frame,
 };
 use signal_hook::{consts::signal, flag, low_level, SigId};
 use std::{
@@ -253,9 +257,6 @@ fn restore_terminal_session_modes(output: &mut impl Write) -> io::Result<()> {
     output.flush()
 }
 
-/// Scrollback commits resume this long after the last resize notification.
-const RESIZE_COMMIT_QUIESCENCE: std::time::Duration = std::time::Duration::from_millis(400);
-
 pub(crate) struct InlineTerminal<B>
 where
     // Euler owns an inline, native-scrollback terminal surface. Keep this
@@ -325,6 +326,7 @@ where
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn draw<F>(&mut self, render_callback: F) -> io::Result<()>
     where
         F: FnOnce(&mut Frame<'_>),
@@ -336,10 +338,12 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn write_finalized_lines(&mut self, lines: &[CanvasLine]) -> io::Result<()> {
         self.write_finalized_lines_preserving_bottom_band(lines, None)
     }
 
+    #[cfg(test)]
     fn write_finalized_lines_preserving_bottom_band(
         &mut self,
         lines: &[CanvasLine],
@@ -669,6 +673,7 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn size(&self) -> io::Result<Size> {
         self.inner.size()
     }
@@ -695,23 +700,19 @@ where
         Ok(Some(screen_size))
     }
 
+    #[cfg(test)]
     pub(crate) fn backend(&self) -> &B {
         self.inner.backend()
     }
 
+    #[cfg(test)]
     pub(crate) fn backend_mut(&mut self) -> &mut B {
         self.inner.backend_mut()
     }
 
+    #[cfg(test)]
     pub(crate) fn viewport_area(&self) -> Rect {
         self.viewport_area
-    }
-
-    pub(crate) fn cursor_position_for_restore(&mut self) -> Position {
-        if let Ok(position) = self.queried_cursor_position() {
-            self.last_known_cursor_pos = position;
-        }
-        self.last_known_cursor_pos
     }
 
     fn queried_cursor_position(&mut self) -> io::Result<Position> {
@@ -791,11 +792,6 @@ where
         Ok(height)
     }
 
-    pub(crate) fn clear_viewport(&mut self) -> io::Result<()> {
-        self.invalidate_draw_cache();
-        self.inner.clear()
-    }
-
     fn autoresize(&mut self) -> io::Result<()> {
         let screen_size = self.inner.size()?;
         if screen_size == self.last_known_screen_size {
@@ -804,11 +800,6 @@ where
         self.resize_active_height(self.viewport_area.height)?;
         self.last_known_screen_size = screen_size;
         Ok(())
-    }
-
-    fn clear_area(&mut self, area: Rect) -> io::Result<()> {
-        let writer = self.inner.backend_mut();
-        queue_clear_area(writer, area, self.background)
     }
 
     fn invalidate_draw_cache(&mut self) {
