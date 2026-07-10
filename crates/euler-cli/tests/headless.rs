@@ -6056,8 +6056,9 @@ fn concurrent_cli_writer_fails_with_session_locked_message() {
         log.file_name().expect("log filename").to_string_lossy()
     ));
     let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
 
-    let mut first = Command::new(exe)
+    let mut first = command_with_home(exe, &home)
         .arg("--provider")
         .arg("fixture")
         .arg("--provenance")
@@ -6079,7 +6080,7 @@ fn concurrent_cli_writer_fails_with_session_locked_message() {
 
     let second = if lock_ready {
         Some(
-            Command::new(exe)
+            command_with_home(exe, &home)
                 .arg("--provider")
                 .arg("fixture")
                 .arg("--provenance")
@@ -6285,8 +6286,9 @@ fn replay_missing_blob_exits_nonzero_and_names_blob() {
     let log = temp.path().join("events.jsonl");
     write_blob_reference_event(&log);
     let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
 
-    let output = Command::new(exe)
+    let output = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&log)
         .output()
@@ -6307,8 +6309,9 @@ fn replay_corrupted_blob_exits_nonzero_and_names_blob() {
     fs::create_dir_all(&blobs).expect("blob dir");
     fs::write(blobs.join(BLOB_HASH), "corrupt").expect("corrupt blob");
     let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
 
-    let output = Command::new(exe)
+    let output = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&log)
         .output()
@@ -6379,8 +6382,9 @@ fn concurrent_cli_resume_fails_with_session_locked_message() {
     );
     let lock = lock_path_for(&log);
     let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
 
-    let mut first = Command::new(exe)
+    let mut first = command_with_home(exe, &home)
         .arg("--resume")
         .arg(&log)
         .stdin(Stdio::piped())
@@ -6400,7 +6404,7 @@ fn concurrent_cli_resume_fails_with_session_locked_message() {
 
     let second = if lock_ready {
         Some(
-            Command::new(exe)
+            command_with_home(exe, &home)
                 .arg("--resume")
                 .arg(&log)
                 .stdin(Stdio::null())
@@ -6472,7 +6476,8 @@ fn replaying_permission_events_projects_transcript_to_stdout() {
     fs::write(&provenance, format!("{jsonl}\n")).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6503,7 +6508,8 @@ fn replay_warns_and_skips_unknown_event_kinds() {
     write_events(&provenance, &events);
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6545,7 +6551,8 @@ fn replay_ignores_truncated_final_jsonl_line() {
     fs::write(&provenance, jsonl).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6577,7 +6584,8 @@ fn replay_ignores_malformed_final_jsonl_line_without_trailing_newline() {
     fs::write(&provenance, jsonl).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6606,7 +6614,8 @@ fn replay_rejects_malformed_final_jsonl_line_with_trailing_newline() {
     fs::write(&provenance, jsonl).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6634,7 +6643,8 @@ fn replay_rejects_invalid_non_final_line_followed_by_trailing_whitespace() {
     fs::write(&provenance, jsonl).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()

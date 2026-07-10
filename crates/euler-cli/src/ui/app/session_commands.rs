@@ -107,7 +107,13 @@ impl AppCore {
     pub(super) fn export_session(&mut self, path: Option<String>) -> CoreEffect {
         let (session_id, events) = match &self.state {
             AppState::Idle { session } => {
-                (session.session_id().to_owned(), session.events().to_vec())
+                let events: Vec<_> = session
+                    .events()
+                    .iter()
+                    .filter(|event| !event_is_runtime_only(event.kind.as_str()))
+                    .cloned()
+                    .collect();
+                (session.session_id().to_owned(), events)
             }
             _ => return self.notice_item("export waits for the active turn".to_owned()),
         };

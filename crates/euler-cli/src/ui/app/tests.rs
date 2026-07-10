@@ -2150,6 +2150,65 @@ fn export_session_creates_private_files() {
 }
 
 #[test]
+fn export_session_omits_runtime_only_model_delta_and_stays_parent_closed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let out = temp.path().join("session.json");
+    let mut core = core();
+
+    // Drive a real turn through EchoProvider, which streams a TextDelta
+    // before finishing; this produces at least one model.delta event in
+    // session.events() (runtime-only, never persisted per
+    // docs/contracts/events.md).
+    for ch in "hello".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(&mut core);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should be idle");
+    };
+    assert!(
+        session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_DELTA),
+        "test setup should produce a model.delta event to filter"
+    );
+
+    assert_eq!(
+        core.export_session(Some(out.display().to_string())),
+        CoreEffect::Render
+    );
+
+    let exported: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out).expect("read export"))
+            .expect("export json");
+    let events = exported["events"].as_array().expect("events array").clone();
+    assert!(!events.is_empty());
+
+    let exported_ids: std::collections::BTreeSet<&str> = events
+        .iter()
+        .map(|event| event["id"].as_str().expect("event id"))
+        .collect();
+
+    for event in &events {
+        assert_ne!(
+            event["kind"].as_str(),
+            Some(EventKind::MODEL_DELTA),
+            "exported events must never include runtime-only model.delta"
+        );
+        if let Some(parent) = event["parent"].as_str() {
+            assert!(
+                exported_ids.contains(parent),
+                "exported event {:?} parents {parent:?}, which is missing from the export",
+                event["id"]
+            );
+        }
+    }
+}
+
+#[test]
 fn status_reports_session_id_while_turn_is_in_flight() {
     let mut core = core();
     let session_id = core.status.session_id.clone().expect("session id");
