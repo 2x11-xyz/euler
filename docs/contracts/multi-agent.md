@@ -92,3 +92,17 @@ compositions of core primitives, not core lifecycle concepts**; core never knows
 those words. See
 the causal DAG and review workflows' demands on the SDK. The v0
 design must not foreclose future push subscription/channel primitives.
+
+## Companion UI presentation (v0)
+
+The terminal companion block is a **presentation of existing multi-agent
+events** (`agent.spawn`, drained `agent.message`, `agent.result`). It does not
+introduce a core `Companion` lifecycle type or a second chat pane. Nested live
+child tool rows are **not** joinable from the multi-agent surface in v0: the UI
+must not invent tool-call rows that were never reported. Honest v0 projection is
+spawn header + finding/report rows from bounded `agent.message` payloads +
+collapse on `agent.result`. Live nested child tool streaming remains debt on
+this projection contract (and any future joinable child event feed). Permission
+asks do not carry a durable companion name on `PermissionRequest` in v0; the
+CLI may tag the approval panel from the in-flight companion persona when a
+`/companion` run owns the session, and otherwise leaves the ask untagged.

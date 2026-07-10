@@ -338,6 +338,16 @@ fn omission_reason(source: &FileDiffSource<'_>) -> Option<&'static str> {
     }
 }
 
+/// Whether a single file body is safe to retain as a workspace checkpoint
+/// pre-image. Reuses the `file.diff` binary / secret-like policy so skipped
+/// diffs and skipped checkpoints stay aligned.
+pub fn content_is_checkpoint_safe(path: &str, content: &str) -> bool {
+    !content.contains('\0')
+        && !unsupported_control(content)
+        && !secret_like_path(path)
+        && !secret_like_text(content, "")
+}
+
 fn unsupported_control(text: &str) -> bool {
     text.chars()
         .any(|ch| ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t')

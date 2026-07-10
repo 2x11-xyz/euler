@@ -38,6 +38,7 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `patch.applied`
 - `file.change`
 - `file.diff`
+- `workspace.restore`
 - `check.started`
 - `check.result`
 - `model.call`
@@ -87,6 +88,18 @@ envelope `v` per `docs/contracts/persistence.md`.
   exactly this shape onto their wire formats.
 - `permission.prompt`: `capability`, `reason`.
 - `permission.decision`: `capability`, `mode`, `allowed`, `decision`.
+  Additive optional fields for scoped grants (see
+  `docs/contracts/capabilities.md`):
+  - `grant_scope`: `once` | `session` | `project` when the decision allowed a
+    grant (or recorded an allow under an existing grant / mode).
+  - `grant_pattern`: non-empty scope pattern string when the grant is patterned;
+    omitted for unscoped grants.
+  - `scope`: legacy resume marker; present as `"session"` only for **unscoped**
+    session grants so resume can fold capability-wide session allows. Patterned
+    session grants use `grant_scope`/`grant_pattern` and do not set this field
+    until resume learns patterned fold.
+  - `instruction`: non-empty deny-with-guidance text when the user denied with
+    instructions; omitted on bare deny and on allows.
 - `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file
@@ -95,10 +108,11 @@ envelope `v` per `docs/contracts/persistence.md`.
   revised separately.
 - `file.change`: `tool_call_id`, `origin`, `action`, `path`, `old_path`,
   `before_sha256`, `after_sha256`, `before_byte_len`, `after_byte_len`,
-  `diff_redaction`. This event is metadata-only: `origin` is descriptive edit
-  metadata with known values `edit_file`, `apply_patch`,
-  `run_shell:apply_patch`, and `run_shell`; `action` is `add`, `modify`, or
-  `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
+  `diff_redaction`; optional `pre_image_blob` (sha256 hex) when a workspace
+  checkpoint pre-image was stored for this edit. This event is metadata-only:
+  `origin` is descriptive edit metadata with known values `edit_file`,
+  `apply_patch`, `run_shell:apply_patch`, and `run_shell`; `action` is `add`,
+  `modify`, or `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
   `run_shell:apply_patch` means Euler intercepted a strict apply-patch heredoc
   before shell execution; it does not mean a shell process ran. `run_shell`
   means Euler observed a bounded net filesystem change around an ordinary shell
@@ -106,6 +120,21 @@ envelope `v` per `docs/contracts/persistence.md`.
   `after_byte_len` is `0`.
   No raw file content, before/after content, or unified diff bytes belong in
   this payload. This is only a `file.change` payload rule.
+  When present, `pre_image_blob` is a content-addressed hash of the pre-edit
+  file body stored under the **workspace-scoped** checkpoint dir
+  (`.euler/checkpoints/<sha256>`), not the session provenance blob store.
+  Pre-images are never stored for secret-like paths/content, binary content, or
+  oversize files (aligned with `file.diff` omission policy); when skipped the
+  field is omitted and the transcript shows no checkpoint suffix. v0 stores
+  pre-images for safe single-file `edit_file` / `apply_patch` **modify** only;
+  adds, deletes, multi-file shell observations, and external disk drift are out
+  of scope.
+- `workspace.restore`: `path`, `checkpoint_event_id`, `blob_sha256`,
+  `restored` (always `true` on success). Appended when the user restores a
+  workspace file via `/rollback` to the pre-image of a prior `file.change`.
+  The transcript is never rewritten: restore is new provenance; the dead-end
+  history stays queryable. Rendered as
+  `↩ reverted <path> → ckpt <checkpoint_event_id> · files restored, history intact`.
 - `file.diff`: `tool_call_id`, `file_change_id`, `path`, `old_path`,
   `action`, `origin`, `diff`, `truncated`, `truncation`, `omitted_reason`;
   optional `before_sha256`, `after_sha256`, `before_byte_len`,
@@ -366,5 +395,10 @@ Rules:
 - Provider-opaque reasoning artifacts (signatures, encrypted items) are
   preserved verbatim in the payload/blobs so the owning provider adapter can
   replay them per provider rules.
+- **Storage ≠ display ≠ canvas.** Provenance may retain maximum fidelity.
+  Core UI renders only adapter-classified user-displayable, taint-safe
+  content (see `docs/contracts/ui.md` and ADR 0007). Opaque/encrypted
+  artifacts are never rendered as transcript prose by core. Canvas inclusion
+  is separate (ADR 0002 / `canvas.md`).
 - Reasoning events are taint-checked like all other events: resolved secrets
   never appear in them.

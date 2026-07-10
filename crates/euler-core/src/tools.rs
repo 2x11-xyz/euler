@@ -292,6 +292,13 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Write UTF-8 content to a workspace-relative path (used by `/rollback`).
+    pub fn write_workspace_file(&self, relative: &str, content: &str) -> Result<(), ToolError> {
+        let path = self.resolve_path(relative)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
     fn run_shell(&self, input: &Value) -> Result<ToolExecution, ToolError> {
         let command = required_str(input, "command")?;
         let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(DEFAULT_MAX_BYTES);

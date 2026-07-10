@@ -48,6 +48,59 @@ A capability decision is one of:
 
 Permission prompts and decisions are session events and are recorded in provenance. Privileged secret/config edits always require explicit approval even if broader write access was granted.
 
+## Scoped Grants
+
+Capability modes are the coarse gate. **Scoped grants** sit above `ask`: when a
+request matches an active session or project grant, the gate allows it without
+re-prompting. `always-deny` still denies even if a grant exists.
+`session-allow` remains capability-wide and does not require a grant match.
+
+Grant lifetime and pattern:
+
+| Scope | Lifetime | Pattern |
+|-------|----------|---------|
+| `once` | this request only | none |
+| `session` | current session | optional `ScopePattern` |
+| `project` | workspace project config | optional `ScopePattern` |
+
+`ScopePattern` is an opaque bounded string:
+
+- **Unscoped** (empty pattern): whole capability (legacy `AllowSession`).
+- **`shell-exec`**: command first token (`cargo`, `git`).
+- **`fs-write`**: workspace-relative directory prefix (typically the path's
+  top-level directory). Matching is prefix: `src` covers `src` and `src/lib.rs`.
+
+Derivation of a display/default pattern from a live request (first token, top
+level dir) is a caller concern; core stores and matches opaque patterns.
+
+### Decisions
+
+A decider may return:
+
+- allow once (`once`);
+- allow session-scoped (`session` + pattern, possibly unscoped);
+- allow project-scoped (`project` + pattern);
+- deny;
+- deny with **instruction** text — guidance the UI passes back as a user turn.
+
+Legacy verdicts map as: `Allow` → `once`, `AllowSession` → `session` unscoped,
+`Deny` → deny without instruction.
+
+### Project grants
+
+Project grants persist under the workspace at `.euler/grants.json` (see
+`docs/contracts/persistence.md`). Installing a project grant is an explicit
+config write: the approval that grants project scope **must** be recorded as a
+`permission.decision` event with `grant_scope: "project"` (and pattern when
+set). Silent project-config mutation is forbidden.
+
+### Revocation and listing
+
+Core exposes list and revoke APIs over session and project grant stores for
+surfaces such as `/permissions`. Revoking a project grant rewrites
+`.euler/grants.json`. Child-agent capability attenuation remains exact flat
+subset semantics; scoped grants do not change child capability sets.
+
 `provenance-read` gates host-mediated bounded provenance queries. It is not
 raw filesystem read access. The v0 pull-based event feed uses this same
 capability because it reads the accepted durable provenance prefix through the

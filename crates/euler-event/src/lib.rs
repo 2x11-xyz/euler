@@ -32,6 +32,7 @@ impl EventKind {
     pub const PATCH_APPLIED: &'static str = "patch.applied";
     pub const FILE_CHANGE: &'static str = "file.change";
     pub const FILE_DIFF: &'static str = "file.diff";
+    pub const WORKSPACE_RESTORE: &'static str = "workspace.restore";
     pub const CHECK_STARTED: &'static str = "check.started";
     pub const CHECK_RESULT: &'static str = "check.result";
     pub const MODEL_CALL: &'static str = "model.call";
@@ -67,6 +68,7 @@ impl EventKind {
         Self::PATCH_APPLIED,
         Self::FILE_CHANGE,
         Self::FILE_DIFF,
+        Self::WORKSPACE_RESTORE,
         Self::CHECK_STARTED,
         Self::CHECK_RESULT,
         Self::MODEL_CALL,
@@ -262,6 +264,15 @@ mod tests {
             ]),
         );
         assert_round_trip(
+            EventKind::WORKSPACE_RESTORE,
+            object([
+                ("path", "file".into()),
+                ("checkpoint_event_id", "evt-file-change".into()),
+                ("blob_sha256", "sha-before".into()),
+                ("restored", true.into()),
+            ]),
+        );
+        assert_round_trip(
             EventKind::CHECK_STARTED,
             object([("name", "cargo test".into())]),
         );
@@ -388,6 +399,7 @@ mod tests {
             EventKind::PATCH_APPLIED,
             EventKind::FILE_CHANGE,
             EventKind::FILE_DIFF,
+            EventKind::WORKSPACE_RESTORE,
             EventKind::CHECK_STARTED,
             EventKind::CHECK_RESULT,
             EventKind::MODEL_CALL,
@@ -517,6 +529,15 @@ mod tests {
                     "truncated": false,
                     "truncation": "none",
                     "omitted_reason": null
+                }),
+            ),
+            base(
+                EventKind::WORKSPACE_RESTORE,
+                json!({
+                    "path": "a.txt",
+                    "checkpoint_event_id": "evt-file-change",
+                    "blob_sha256": "sha-before",
+                    "restored": true
                 }),
             ),
             base(EventKind::CHECK_STARTED, json!({"name": "cargo test"})),
@@ -668,6 +689,9 @@ mod tests {
                     "truncation",
                     "omitted_reason",
                 ]
+            }
+            EventKind::WORKSPACE_RESTORE => {
+                vec!["path", "checkpoint_event_id", "blob_sha256", "restored"]
             }
             EventKind::MODEL_CALL => vec!["provider", "model", "canvas_items"],
             EventKind::MODEL_RESULT => {

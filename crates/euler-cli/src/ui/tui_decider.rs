@@ -61,6 +61,8 @@ mod tests {
         PermissionRequest {
             capability: Capability::FsWrite,
             reason: "edit file".to_owned(),
+            command: None,
+            path: None,
         }
     }
 
