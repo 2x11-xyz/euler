@@ -1,7 +1,12 @@
 use super::{elapsed_ms, ExtensionExecutionError, Session, SessionError};
-use crate::extensions::{ExtensionHost, ExtensionHostError, QueuedExtensionEvents};
-use euler_sdk::{Capability, Extension};
+use crate::extensions::{
+    ExtensionHost, ExtensionHostError, ExtensionSpawner, QueuedExtensionEvents,
+};
+use crate::permissions::PermissionDecider;
+use euler_agents::{AgentBudget, AgentError, AgentTask};
+use euler_sdk::{AgentOutcome, Capability, Extension, ExtensionError, SpawnAgentTask};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,6 +30,78 @@ impl ExtensionExecutionError {
             | ExtensionHostError::MissingCommand(_) => Self::RegistrationFailed,
         }
     }
+}
+
+/// Fulfills `HostApi::spawn_agent` on the session thread while the extension
+/// command executes. The command blocks synchronously inside `spawn_agent`,
+/// so the `RefCell` borrow can never be contended.
+struct SessionSpawner<'s, D> {
+    session: RefCell<&'s mut Session<D>>,
+    queue: Arc<QueuedExtensionEvents>,
+}
+
+impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
+    fn spawn_agent(&self, task: SpawnAgentTask) -> Result<AgentOutcome, ExtensionError> {
+        let agent_task = convert_spawn_task(task)?;
+        let mut session = self.session.borrow_mut();
+        // Companion events append through the session bus. Sync already-queued
+        // extension events into the bus first, so the durable parent chain the
+        // post-command publish asserts stays intact.
+        session
+            .publish_queued_extension_events(&self.queue)
+            .map_err(spawn_failed)?;
+        let summary = session.spawn_companion(agent_task).map_err(spawn_failed)?;
+        Ok(AgentOutcome {
+            ok: summary.result.ok(),
+            summary: summary.result.summary().to_owned(),
+            output: summary.result.output().unwrap_or_default().to_owned(),
+            error: summary.result.error().map(str::to_owned),
+            child_agent_id: summary.child_agent_id,
+            spawn_event_id: summary.spawn_event_id,
+            result_event_id: summary.result_event_id,
+        })
+    }
+}
+
+fn spawn_failed(error: SessionError) -> ExtensionError {
+    ExtensionError::Message(format!("agent spawn failed: {error}"))
+}
+
+fn invalid_spawn_task(error: AgentError) -> ExtensionError {
+    ExtensionError::Message(format!("invalid agent task: {error}"))
+}
+
+fn convert_spawn_task(task: SpawnAgentTask) -> Result<AgentTask, ExtensionError> {
+    let mut agent_task = if task.provider.is_empty() && task.model.is_empty() {
+        AgentTask::new_inheriting_target(&task.task, &task.persona)
+    } else {
+        AgentTask::new(&task.task, &task.persona, &task.provider, &task.model)
+    }
+    .map_err(invalid_spawn_task)?;
+    if !task.system_prompt.is_empty() {
+        agent_task = agent_task
+            .with_system_prompt(&task.system_prompt)
+            .map_err(invalid_spawn_task)?;
+    }
+    let budget = AgentBudget::new(
+        budget_u32("max_turns", task.max_turns)?,
+        budget_u32("max_tool_calls", task.max_tool_calls)?,
+        task.max_tokens,
+    )
+    .map_err(invalid_spawn_task)?;
+    Ok(agent_task
+        .with_capabilities(task.capabilities)
+        .with_budget(budget))
+}
+
+fn budget_u32(field: &str, value: Option<u64>) -> Result<Option<u32>, ExtensionError> {
+    value
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                ExtensionError::Message(format!("invalid agent task: {field} out of range"))
+            })
+        })
+        .transpose()
 }
 
 impl<D> Session<D> {
@@ -84,17 +161,25 @@ impl<D> Session<D> {
         command: &str,
         input: Value,
         granted: impl IntoIterator<Item = Capability>,
-    ) -> Result<Value, ExtensionExecutionError> {
+    ) -> Result<Value, ExtensionExecutionError>
+    where
+        D: PermissionDecider,
+    {
         let extension_id = extension.manifest().id;
         if !self.extension_enabled(&extension_id) {
             return Err(ExtensionExecutionError::Disabled { id: extension_id });
         }
         let started = Instant::now();
         let (mut host, queue) = self.extension_host_with_event_queue(granted)?;
-        let result = host
-            .register_extension_for_command(extension, command)
-            .and_then(|()| host.execute_command(command, input))
-            .map_err(ExtensionExecutionError::from_host_error);
+        let result = {
+            let spawner = SessionSpawner {
+                session: RefCell::new(&mut *self),
+                queue: Arc::clone(&queue),
+            };
+            host.register_extension_for_command(extension, command)
+                .and_then(|()| host.execute_command_with_spawner(command, input, Some(&spawner)))
+                .map_err(ExtensionExecutionError::from_host_error)
+        };
         // If command execution and queued-event publication both fail, publication
         // failure wins the returned error because the live session is degraded;
         // the command failure has already been recorded by the host path.

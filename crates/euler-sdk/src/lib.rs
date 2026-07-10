@@ -222,6 +222,9 @@ pub struct AgentOutcome {
     pub ok: bool,
     pub summary: String,
     pub output: String,
+    /// Failure detail when `ok` is false, exactly as provenance recorded it.
+    pub error: Option<String>,
+    pub child_agent_id: String,
     pub spawn_event_id: String,
     pub result_event_id: String,
 }
