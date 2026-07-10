@@ -89,6 +89,25 @@ Priority order per Eli: P1 resize, P1 functional, P2 conformance, P3 polish.
 Nothing hard-new; 5c/S12 and tappable folds could slip to a follow-up PR if
 the spine PR grows too large.
 
+## Status
+- B2 FIXED+pushed: palette-selected extension entries route through
+  dispatch_command (code-swarm opens its config; teach-line consistent).
+- B3 FIXED+pushed: covered grants emit no fresh decision record; tool result
+  carries grant_source -> dim `· session grant` on the bash header. Core
+  regression test (1 prompt / 1 decision / tagged second result).
+- B4 FIXED+pushed: resume_provider_set now fills the full builtin+custom
+  provider set (shared fill_provider_set with startup); mid-session /model
+  switches work after resume.
+- B5 OPEN: dup lines + malformed third shell block (no bash header) after an
+  approval. Repro plan: PTY fixture script with 3 shell calls + 'a' session
+  grant; inspect final state; suspect projection after the inline-ask flow.
+  NOTE: B3's change alters this exact flow (covered calls no longer emit
+  decisions) — re-verify B5 symptoms on top of B3 before digging.
+- B1 OPEN (the deep one): replace resize commit accounting with
+  coalesce + re-wrap-from-logical-lines + repaint-in-place, never append to
+  scrollback on resize. Supersedes the item-remap approach. Verify with the
+  PTY drag test (multi-step resize) + AppleScript real-terminal harness.
+
 ## Execution order
 1. B1–B5 on feat/warm-ledger-tui (B1 is the deep one; B2–B4 are contained).
 2. PR split: euler-core PR (grants/checkpoints/contracts — B3 fix included),
