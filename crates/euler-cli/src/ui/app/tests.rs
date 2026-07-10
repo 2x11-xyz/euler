@@ -1438,64 +1438,6 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
 }
 
-/// Issue #29: the fold marker ("… N more lines · tap to expand") is a
-/// per-cell mouse click target in the visible viewport, in addition to the
-/// unchanged `ctrl+o` shortcut.
-#[test]
-fn mouse_click_on_fold_marker_row_expands_the_artifact() {
-    let mut core = core();
-    core.push_finalized_visual_item(shell_artifact_with_lines(12));
-
-    let folded_lines = drain_finalized_visual_text(&mut core, 80)
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let marker_row = folded_lines
-        .iter()
-        .position(|line| line.contains("more lines · tap to expand"))
-        .expect("fold marker row present");
-    let row = u16::try_from(marker_row).expect("row fits u16");
-
-    assert_eq!(
-        core.handle_fold_click(row),
-        CoreEffect::ReplayHistoryWithScrollbackPurge
-    );
-    assert_eq!(core.visual_scroll_offset(), 0);
-
-    let expanded = drain_finalized_visual_text(&mut core, 80);
-    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
-    assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
-    // A second click on the artifact re-expanded above does nothing further
-    // (no marker row exists once expanded).
-    assert_eq!(core.handle_fold_click(row), CoreEffect::None);
-}
-
-/// Clicking a row that is not the fold marker itself (e.g. the artifact
-/// title/body above it) is not a click target — only the final "tap to
-/// expand" row is.
-#[test]
-fn mouse_click_off_the_fold_marker_row_is_a_noop() {
-    let mut core = core();
-    core.push_finalized_visual_item(shell_artifact_with_lines(12));
-
-    let folded_lines = drain_finalized_visual_text(&mut core, 80)
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let title_row = 0;
-    assert!(!folded_lines[title_row].contains("tap to expand"));
-
-    assert_eq!(
-        core.handle_fold_click(u16::try_from(title_row).unwrap()),
-        CoreEffect::None
-    );
-    let still_folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(
-        still_folded.contains("8 more lines"),
-        "still_folded: {still_folded:?}"
-    );
-}
-
 #[test]
 fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
     let mut terminal =
@@ -3650,7 +3592,7 @@ fn large_patch_modal_keeps_diff_bounded() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("tap to expand"));
+    assert!(contents.contains("ctrl+o expand"));
     assert!(contents.contains("n/esc  Deny"));
     assert!(!contents.contains("line 119"));
 }

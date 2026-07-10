@@ -1,6 +1,7 @@
 use super::*;
 use crate::ui::transcript;
 use ratatui::style::Style;
+use ratatui::text::Line;
 
 impl AppCore {
     pub(super) fn queue_finalized_visual_output_for_latest_event(&mut self) {
