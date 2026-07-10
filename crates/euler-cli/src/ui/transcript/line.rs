@@ -16,6 +16,8 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::ModelReasoning { fidelity, content } => {
             format!("model.reasoning: {fidelity}: {content}\n")
         }
+        // Transient live line; never part of the line-oriented record.
+        super::TranscriptItem::ModelReasoningLive { .. } => String::new(),
         super::TranscriptItem::ToolCall { name } => format!("tool.call: {name}\n"),
         super::TranscriptItem::ToolResult { name, ok: true, .. } => {
             format!("tool.result: {name} ok\n")

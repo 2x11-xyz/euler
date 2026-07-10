@@ -1439,6 +1439,49 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
 }
 
 #[test]
+fn ctrl_o_expands_and_refolds_finalized_reasoning_items() {
+    // Review finding: the collapsed thought line advertises "ctrl+o expand"
+    // but ModelReasoning was not classified foldable, so ctrl+o never
+    // targeted it. Verify the toggle actually reaches a reasoning item.
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::ModelReasoning {
+        fidelity: "raw".to_owned(),
+        content: "First sentence stays short.\nSecond paragraph reveals much \
+                  more detail that only appears once ctrl+o expands the full thought."
+            .to_owned(),
+    });
+
+    let folded = drain_finalized_visual_text(&mut core, 80);
+    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
+    assert!(!folded.contains("Second paragraph"), "folded: {folded:?}");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let expanded = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        expanded.contains("ctrl+o collapse"),
+        "expanded: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("Second paragraph"),
+        "expanded: {expanded:?}"
+    );
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(refolded.contains("ctrl+o expand"), "refolded: {refolded:?}");
+    assert!(
+        !refolded.contains("Second paragraph"),
+        "refolded: {refolded:?}"
+    );
+}
+
+#[test]
 fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
     let mut terminal =
         crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 10), 10).expect("terminal");
