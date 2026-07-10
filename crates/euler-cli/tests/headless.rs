@@ -6910,6 +6910,102 @@ fn diag_reconstruct_final_state_from_capture() {
 }
 
 #[test]
+fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
+    // Review v2 §2/§8: after "allow for session", subsequent shell blocks
+    // must still render through the block renderer (header + fold), carry
+    // the dim `· session grant` tag instead of fresh decision records, and
+    // nothing may duplicate.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut responses = Vec::new();
+    for (id, cmd) in [
+        ("call-1", "echo alpha-one"),
+        ("call-2", "echo beta-two"),
+        ("call-3", "echo gamma-three"),
+    ] {
+        responses.push(serde_json::json!({"events": [
+            {"tool_call": {"id": id, "name": "run_shell", "input": {"command": cmd}}},
+            {"finished": {"stop_reason": "tool_use"}},
+        ]}));
+    }
+    responses.push(serde_json::json!({"events": [
+        {"text_delta": "ran all three."},
+        {"finished": {"stop_reason": "completed"}},
+    ]}));
+    let script = write_fixture_script(
+        temp.path(),
+        "grant-blocks.json",
+        &serde_json::json!({"version": 1, "responses": responses}).to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    tui.write("run the three commands\r");
+    // First shell call prompts; grant the session scope.
+    assert!(
+        tui.wait_for_screen("Run command?"),
+        "approval panel did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("a");
+    assert!(
+        tui.wait_for_screen("ran all three."),
+        "turn did not finish:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let final_state = pty_final_state_text(&tui.output, 24, 80);
+    let mut failures = Vec::new();
+    for cmd in ["echo alpha-one", "echo beta-two", "echo gamma-three"] {
+        let headers = final_state
+            .lines()
+            .filter(|line| line.contains(&format!("bash $ {cmd}")))
+            .count();
+        if headers != 1 {
+            failures.push(format!("`bash $ {cmd}` header appears {headers}× (want 1)"));
+        }
+    }
+    for output in ["alpha-one", "beta-two", "gamma-three"] {
+        let occurrences = final_state
+            .lines()
+            .filter(|line| line.contains(output) && !line.contains("bash $") && !line.contains("run the three"))
+            .count();
+        if occurrences > 1 {
+            failures.push(format!("output `{output}` duplicated ({occurrences}×)"));
+        }
+    }
+    // Exactly one decision record; later runs tagged on the header instead.
+    let decisions = final_state
+        .lines()
+        .filter(|line| line.contains("allowed for session"))
+        .count();
+    if decisions != 1 {
+        failures.push(format!("decision records: {decisions} (want 1)"));
+    }
+    let grant_tags = final_state
+        .lines()
+        .filter(|line| line.contains("· session grant"))
+        .count();
+    if grant_tags != 2 {
+        failures.push(format!("session-grant header tags: {grant_tags} (want 2)"));
+    }
+    assert!(
+        failures.is_empty(),
+        "{}\nFinal state:\n{final_state}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn tui_pty_transcript_lines_commit_exactly_once() {
     // Regression for the duplicate-line streaming repaint bug (Warm Spine
     // implementation review, P1): the final terminal state — scrollback plus

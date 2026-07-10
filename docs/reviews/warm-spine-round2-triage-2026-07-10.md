@@ -98,11 +98,12 @@ the spine PR grows too large.
 - B4 FIXED+pushed: resume_provider_set now fills the full builtin+custom
   provider set (shared fill_provider_set with startup); mid-session /model
   switches work after resume.
-- B5 OPEN: dup lines + malformed third shell block (no bash header) after an
-  approval. Repro plan: PTY fixture script with 3 shell calls + 'a' session
-  grant; inspect final state; suspect projection after the inline-ask flow.
-  NOTE: B3's change alters this exact flow (covered calls no longer emit
-  decisions) — re-verify B5 symptoms on top of B3 before digging.
+- B5 LIKELY-FIXED-BY-B3 (unconfirmed): the 3-shell-calls + session-grant PTY
+  scenario passes on HEAD — well-formed headers x3, no duplicates, exactly
+  one decision record, session-grant tags on the two covered runs (invariant
+  locked by tui_pty_session_grant_keeps_tool_blocks_well_formed). The old
+  mid-flow decision event was the prime suspect for the malformed pairing.
+  NEEDS Eli dogfood confirmation with a real provider before closing.
 - B1 OPEN (the deep one): replace resize commit accounting with
   coalesce + re-wrap-from-logical-lines + repaint-in-place, never append to
   scrollback on resize. Supersedes the item-remap approach. Verify with the
