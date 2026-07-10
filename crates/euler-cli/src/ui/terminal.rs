@@ -715,6 +715,13 @@ where
         self.viewport_area
     }
 
+    /// Screen-space top row of the active viewport — needed to translate a
+    /// raw mouse event's absolute row into a row within the rendered active
+    /// frame (fold-marker click targeting, issue #29).
+    pub(crate) fn viewport_top(&self) -> u16 {
+        self.viewport_area.top()
+    }
+
     fn queried_cursor_position(&mut self) -> io::Result<Position> {
         // The DSR round-trip bypasses the buffered writer, so queued bytes
         // must reach the terminal before the query for the response to

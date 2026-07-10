@@ -202,7 +202,7 @@ fn bounded_rows(rows: Vec<DiffRow>, limit: usize) -> Vec<DiffRow> {
     let mut rendered: Vec<_> = rows.into_iter().take(visible).collect();
     if omitted > 0 {
         rendered.push(DiffRow::new(
-            format!("… {} more lines · ctrl+o expand", omitted + 1),
+            format!("… {} more lines · tap to expand", omitted + 1),
             RowKind::Muted,
         ));
     }
@@ -548,7 +548,7 @@ mod tests {
         assert!(text.contains("@@ -1,3 +1,4 @@"));
         assert!(text.contains("   2 - b"));
         assert!(text.contains("   2 + beta"));
-        assert!(text.contains("ctrl+o expand"));
+        assert!(text.contains("tap to expand"));
     }
 
     #[test]
@@ -824,7 +824,7 @@ mod tests {
         let text = plain_text(&rows);
 
         assert_eq!(rows.len(), 9);
-        assert!(text.contains("ctrl+o expand"));
+        assert!(text.contains("tap to expand"));
         assert!(text.contains("@@"), "hunk header missing: {text:?}");
         assert!(text.contains("   1 - let value_0 = 0;"));
         assert!(!syntax::source_pair_within_budget(Some(&old), Some(&new)));
@@ -851,7 +851,7 @@ mod tests {
         let text = plain_text(&rows);
 
         assert_eq!(rows.len(), 6);
-        assert!(text.contains("ctrl+o expand"), "text: {text:?}");
+        assert!(text.contains("tap to expand"), "text: {text:?}");
         assert!(!text.contains("line 7"), "text: {text:?}");
     }
 

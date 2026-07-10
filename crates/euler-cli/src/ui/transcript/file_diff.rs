@@ -133,7 +133,7 @@ fn bounded_preview_rows(rows: Vec<FileDiffRow>, limit: usize) -> Vec<FileDiffRow
     let omitted = rows.len().saturating_sub(visible);
     let mut out = rows.into_iter().take(visible).collect::<Vec<_>>();
     out.push(muted_diff_row(format!(
-        "… {omitted} more lines · ctrl+o expand"
+        "… {omitted} more lines · tap to expand"
     )));
     out
 }

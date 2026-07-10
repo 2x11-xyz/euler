@@ -225,7 +225,7 @@ fn informative_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
     }
     let hidden = total_rows.saturating_sub(preview.len() + tail.len());
     if hidden > 0 {
-        preview.push(format!("… {hidden} more lines · ctrl+o expand"));
+        preview.push(format!("… {hidden} more lines · tap to expand"));
     }
     preview.extend(tail);
     ArtifactOutputRows {

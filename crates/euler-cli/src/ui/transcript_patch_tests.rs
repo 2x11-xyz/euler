@@ -72,7 +72,7 @@ fn vt100_renders_patch_diff_with_line_numbers_and_bounded_preview() {
     assert!(contents.contains("     2 - b"));
     assert!(contents.contains("     2 + beta"));
     assert!(!contents.contains("bounded patch"));
-    assert!(contents.contains("ctrl+o expand"));
+    assert!(contents.contains("tap to expand"));
     assert!(!contents.contains("extra 14"));
     assert!(contents.contains(""));
     assert!(!contents.contains("• Edited"));

@@ -90,6 +90,32 @@ mod composer_tests {
         ));
     }
 
+    /// Spec v2.1 §13.4/§13.8: the composer's default scroll cap is 12 lines
+    /// (raised from a prior 6) so the 8-row slash palette, which shares the
+    /// composer's rail-bounded container, never clips against the footer.
+    #[test]
+    fn default_max_visible_lines_caps_the_composer_at_twelve_rows() {
+        let mut draft = ComposerDraft::new();
+        draft.insert_text(
+            &(1..=20)
+                .map(|n| format!("line{n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let snapshot = ComposerSnapshot::new(&draft);
+        let options = ComposerRenderOptions::default();
+
+        assert_eq!(options.max_visible_lines, 12);
+        assert_eq!(desired_height_for_width(&snapshot, &options, 80), 12);
+
+        let lines = render_lines(&snapshot, &options, 80, 12);
+        assert_eq!(lines.len(), 12);
+        assert!(matches!(
+            lines.last(),
+            Some(ComposerLine::Draft { text, .. }) if text == "line20"
+        ));
+    }
+
     #[test]
     fn active_composer_word_wraps_at_boundaries() {
         let mut draft = ComposerDraft::new();

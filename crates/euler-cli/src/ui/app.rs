@@ -43,7 +43,9 @@ use crate::bundled_extensions::{
 use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection};
 use crate::model_preference;
 use anyhow::{anyhow, Result};
-use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use euler_core::permissions::PermissionRequest;
 use euler_core::{
     fold_session, heuristic_projection, load_extension_package, read_resume_prefix,
@@ -165,8 +167,8 @@ pub struct AppCore {
     expanded_artifact_keys: HashSet<String>,
     /// Last known history viewport as `(top_row, height)` for nearest-block fold.
     last_history_viewport: (usize, usize),
-    /// Foldable item spans recorded on the last history render: `(key, start, end)`.
-    last_foldable_spans: Vec<(String, usize, usize)>,
+    /// Foldable item spans recorded on the last history render.
+    last_foldable_spans: Vec<FoldableSpan>,
     theme: Theme,
     theme_choice: ThemeChoice,
     theme_preference_path: Option<PathBuf>,
@@ -458,12 +460,27 @@ impl App {
     fn handle_input_batch(&mut self, inputs: Vec<InputEvent>) -> CoreEffect {
         let mut effect = CoreEffect::None;
         for input in inputs {
-            effect = merge_effects(effect, self.core.handle_input(input));
+            effect = merge_effects(effect, self.route_input(input));
             if effect == CoreEffect::Quit {
                 break;
             }
         }
         effect
+    }
+
+    /// Mouse-down events need the active viewport's screen offset (owned by
+    /// the terminal, not `AppCore`) translated into a row within the
+    /// rendered history before core can hit-test a fold marker; every other
+    /// input still flows through the generic `handle_input` path.
+    fn route_input(&mut self, input: InputEvent) -> CoreEffect {
+        if let InputEvent::Mouse(mouse) = &input {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                let viewport_top = self.terminal.viewport_top();
+                let relative_row = mouse.row.saturating_sub(viewport_top);
+                return self.core.handle_fold_click(relative_row);
+            }
+        }
+        self.core.handle_input(input)
     }
 
     fn shutdown(&mut self) -> Result<bool> {
@@ -1952,6 +1969,47 @@ impl AppCore {
         CoreEffect::ReplayHistoryWithScrollbackPurge
     }
 
+    /// Per-cell mouse click target for a fold marker (issue #29). `row` is
+    /// already relative to the active viewport's top (translated by the
+    /// `App` wrapper from the raw screen row using `terminal.viewport_area`).
+    ///
+    /// Native scrollback rows that have already committed are physically
+    /// outside the active viewport and outside crossterm's mouse-reporting
+    /// region once scrolled past — clicking a fold marker there is not
+    /// reachable through this plumbing (documented residual: only markers
+    /// still in the live viewport are click targets; `ctrl+o` remains the
+    /// only way to expand/collapse history that has scrolled into real
+    /// scrollback).
+    fn handle_fold_click(&mut self, row: u16) -> CoreEffect {
+        if !matches!(self.bottom.owner(), BottomOwner::Composer) {
+            return CoreEffect::None;
+        }
+        let (top, height) = self.last_history_viewport;
+        let row = usize::from(row);
+        if row >= height {
+            return CoreEffect::None;
+        }
+        let absolute_row = top + row;
+        let Some(key) = self.foldable_key_at_marker_row(absolute_row) else {
+            return CoreEffect::None;
+        };
+        self.expanded_artifact_keys.insert(key);
+        self.visual_canvas.invalidate_history_cache();
+        self.visual_scroll_offset = 0;
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    }
+
+    /// The clickable row is exactly the final rendered row of a collapsed
+    /// foldable span — the "… N more lines · tap to expand" line itself, not
+    /// the artifact body above it. Expanded spans have no marker row, so
+    /// they are never a click target here (only `ctrl+o` toggles collapse).
+    fn foldable_key_at_marker_row(&self, absolute_row: usize) -> Option<String> {
+        self.last_foldable_spans
+            .iter()
+            .find(|span| span.marker_row == Some(absolute_row))
+            .map(|span| span.key.clone())
+    }
+
     fn nearest_foldable_key(&self) -> Option<String> {
         let spans = &self.last_foldable_spans;
         if spans.is_empty() {
@@ -1961,13 +2019,15 @@ impl AppCore {
         let height = height.max(1);
         let center = top.saturating_add(height / 2);
         let mut best: Option<(usize, usize, &str)> = None;
-        for (index, (key, start, end)) in spans.iter().enumerate() {
-            let mid = start.saturating_add(end.saturating_sub(*start) / 2);
+        for (index, span) in spans.iter().enumerate() {
+            let mid = span
+                .start
+                .saturating_add(span.end.saturating_sub(span.start) / 2);
             let dist = mid.abs_diff(center);
             let rank = (dist, spans.len() - 1 - index);
             match best {
                 Some((best_dist, best_rev, _)) if rank >= (best_dist, best_rev) => {}
-                _ => best = Some((rank.0, rank.1, key.as_str())),
+                _ => best = Some((rank.0, rank.1, span.key.as_str())),
             }
         }
         best.map(|(_, _, key)| key.to_owned())
@@ -1980,21 +2040,36 @@ impl AppCore {
         let mut spans = Vec::new();
         for (index, item) in items.iter().enumerate() {
             let key = transcript::artifact_key_for_index(index);
-            let limit = if self.expanded_artifact_keys.contains(&key) {
-                usize::MAX
-            } else {
+            let folded = !self.expanded_artifact_keys.contains(&key);
+            let limit = if folded {
                 TOOL_CALL_MAX_LINES
+            } else {
+                usize::MAX
             };
-            let line_count = transcript::render_items_for_history_with_limit(
+            let lines = transcript::render_items_for_history_with_limit(
                 std::slice::from_ref(item),
                 &theme,
                 width,
                 limit,
-            )
-            .len();
+            );
+            let line_count = lines.len();
             if item.is_foldable_artifact(TOOL_CALL_MAX_LINES) {
                 let end = row.saturating_add(line_count.saturating_sub(1));
-                spans.push((key, row, end));
+                // The clickable row is the literal "… N more lines · tap to
+                // expand" row, which is not always the span's last row (a
+                // folded preview can still show trailing tail lines after
+                // the marker) and not always present at all (expanded spans
+                // have no marker).
+                let marker_row = folded
+                    .then(|| fold_marker_row_offset(&lines))
+                    .flatten()
+                    .map(|offset| row + offset);
+                spans.push(FoldableSpan {
+                    key,
+                    start: row,
+                    end,
+                    marker_row,
+                });
             }
             row = row.saturating_add(line_count);
         }
@@ -2267,6 +2342,35 @@ impl AppCore {
         let export_dir = self.session_store()?.home().root().join("exports");
         Ok(export_dir.join(format!("euler-session-{session_id}.json")))
     }
+}
+
+/// A foldable history item's rendered row range, recorded on each history
+/// render so `ctrl+o` (nearest-to-viewport) and mouse clicks (exact row) can
+/// both target the right artifact without re-deriving layout from scratch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FoldableSpan {
+    key: String,
+    /// First rendered row of the item (inclusive).
+    start: usize,
+    /// Last rendered row of the item (inclusive) — includes the trailing
+    /// blank spacer row the transcript renderer appends after every event,
+    /// so it is deliberately *not* assumed to be the fold marker's row.
+    end: usize,
+    /// Row of the literal "… N more lines · tap to expand" line, when the
+    /// item is currently folded and therefore has one. `None` once expanded.
+    marker_row: Option<usize>,
+}
+
+/// Find the rendered row (0-based, relative to this item's own render) that
+/// carries the fold marker text, by literal content rather than position —
+/// preview shapes vary (some artifacts show head+marker+tail, others just
+/// head+marker), so the marker is not reliably the item's last content row.
+fn fold_marker_row_offset(lines: &[Line<'static>]) -> Option<usize> {
+    lines.iter().position(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.content.contains("more lines · tap to expand"))
+    })
 }
 
 fn resolve_session_store() -> Result<SessionStore> {
