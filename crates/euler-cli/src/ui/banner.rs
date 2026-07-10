@@ -13,12 +13,15 @@
 
 use super::status::short_session_id;
 use super::theme::Theme;
+#[cfg(test)]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
+    widgets::{Paragraph, Widget},
+};
+use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 
 /// Letterform rows, excluding the rail column. Each row is rendered as
@@ -55,22 +58,22 @@ const CAPTION_LINE: usize = FIRST_WORDMARK_LINE + WORDMARK_BODY.len() + 1;
 /// blank + wordmark rows + blank + caption + help + blank.
 const HEIGHT: u16 = WORDMARK_BODY.len() as u16 + 5;
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn height() -> u16 {
     HEIGHT
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn banner_widget(theme: &Theme) -> BannerWidget<'_> {
     BannerWidget { theme }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub struct BannerWidget<'a> {
     theme: &'a Theme,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Widget for BannerWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         Paragraph::new(styled_lines(self.theme)).render(area, buf);
@@ -185,6 +188,7 @@ fn color_allowed() -> bool {
 
 /// Ratatui rendering: rail spans carry the brand slot colors; letterforms and
 /// caption take their tones from the theme.
+#[cfg(test)]
 pub fn styled_lines(theme: &Theme) -> Vec<Line<'static>> {
     styled_lines_with_session(theme, None)
 }

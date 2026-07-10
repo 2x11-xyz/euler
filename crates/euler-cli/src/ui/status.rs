@@ -1,5 +1,7 @@
 use super::text::{display_width, truncate_display};
+#[cfg(test)]
 use super::theme::Theme;
+#[cfg(test)]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -76,23 +78,6 @@ pub struct StatusSlots {
     labels: Vec<String>,
 }
 
-impl StatusSlots {
-    pub fn push_label(&mut self, label: impl Into<String>) {
-        self.labels.push(label.into());
-    }
-
-    fn has_renderable_labels(&self) -> bool {
-        self.labels.iter().any(|label| !label.is_empty())
-    }
-
-    fn renderable_labels(&self) -> impl Iterator<Item = &str> {
-        self.labels
-            .iter()
-            .map(String::as_str)
-            .filter(|label| !label.is_empty())
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnStatus {
     Idle,
@@ -114,6 +99,7 @@ pub fn status_line_text(
     )
 }
 
+#[cfg(test)]
 pub fn status_widget<'a>(snapshot: &'a StatusSnapshot, theme: &'a Theme) -> StatusWidget<'a> {
     StatusWidget {
         snapshot,
@@ -123,6 +109,7 @@ pub fn status_widget<'a>(snapshot: &'a StatusSnapshot, theme: &'a Theme) -> Stat
     }
 }
 
+#[cfg(test)]
 pub struct StatusWidget<'a> {
     snapshot: &'a StatusSnapshot,
     tokens: Option<&'a TokenUsageSnapshot>,
@@ -130,6 +117,7 @@ pub struct StatusWidget<'a> {
     theme: &'a Theme,
 }
 
+#[cfg(test)]
 impl<'a> StatusWidget<'a> {
     pub fn runtime(mut self, tokens: &'a TokenUsageSnapshot, turn: TurnStatus) -> Self {
         self.tokens = Some(tokens);
@@ -138,6 +126,7 @@ impl<'a> StatusWidget<'a> {
     }
 }
 
+#[cfg(test)]
 impl Widget for StatusWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let default_tokens;
@@ -152,6 +141,7 @@ impl Widget for StatusWidget<'_> {
     }
 }
 
+#[cfg(test)]
 pub fn context_segment(snapshot: &TokenUsageSnapshot) -> String {
     let mut base = match snapshot.context_window_tokens.filter(|window| *window > 0) {
         Some(window) => {
@@ -185,30 +175,6 @@ fn rounded_context_percent(input_tokens: u64, window: u64) -> u64 {
         .saturating_add(u128::from(window / 2));
     let percent = numerator / u128::from(window);
     u64::try_from(percent).unwrap_or(u64::MAX)
-}
-
-fn model_effort_segment(snapshot: &StatusSnapshot) -> String {
-    let model = compact_model_label(&snapshot.provider, &snapshot.model);
-    let target = if snapshot.provider.is_empty() && snapshot.model.is_empty() {
-        "?/?".to_owned()
-    } else if snapshot.provider.is_empty() {
-        model.to_owned()
-    } else {
-        format!("{}/{}", snapshot.provider, model)
-    };
-    let target = if display_width(&target) > 32 {
-        let mut truncated = truncate_display(&target, 31);
-        truncated.push('…');
-        truncated
-    } else {
-        target
-    };
-    let effort = snapshot
-        .reasoning_effort
-        .as_deref()
-        .filter(|effort| !effort.is_empty())
-        .unwrap_or("?");
-    format!("{target} {effort}")
 }
 
 fn compact_model_label<'a>(provider: &str, model: &'a str) -> &'a str {
@@ -273,6 +239,7 @@ fn identity_context_percent(tokens: &TokenUsageSnapshot) -> Option<u64> {
         .map(|window| rounded_context_percent(tokens.input_tokens, window).min(99))
 }
 
+#[cfg(test)]
 fn identity_context_style(tokens: &TokenUsageSnapshot, theme: &Theme) -> Style {
     match identity_context_percent(tokens) {
         Some(percent) if percent >= 85 => Style::default().fg(theme.palette.error),
@@ -281,6 +248,7 @@ fn identity_context_style(tokens: &TokenUsageSnapshot, theme: &Theme) -> Style {
     }
 }
 
+#[cfg(test)]
 fn identity_segment_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
@@ -337,6 +305,7 @@ fn join_status_halves(left: String, right: String, width: usize) -> String {
     truncate_display(&right, width)
 }
 
+#[cfg(test)]
 fn status_line(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
@@ -347,6 +316,7 @@ fn status_line(
     Line::from(status_line_spans(snapshot, tokens, turn, theme, width))
 }
 
+#[cfg(test)]
 fn status_line_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
@@ -371,6 +341,7 @@ fn status_line_spans(
     spans
 }
 
+#[cfg(test)]
 fn join_status_span_halves(
     left: Vec<Span<'static>>,
     right: Vec<Span<'static>>,
@@ -412,6 +383,7 @@ fn status_body_width(width: u16, indent_width: usize) -> usize {
         .saturating_sub(1)
 }
 
+#[cfg(test)]
 fn spans_width(spans: &[Span<'_>]) -> usize {
     spans
         .iter()
@@ -419,6 +391,7 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
         .sum()
 }
 
+#[cfg(test)]
 fn truncate_spans(spans: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut remaining = width;

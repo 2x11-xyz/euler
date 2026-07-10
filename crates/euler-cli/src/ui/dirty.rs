@@ -52,12 +52,9 @@ impl DirtyRegions {
         self.mark_all(RedrawLevel::Full);
     }
 
+    #[cfg(test)]
     pub fn level(&self, region: Region) -> RedrawLevel {
         self.levels[region.index()]
-    }
-
-    pub fn is_stale(&self, region: Region) -> bool {
-        self.level(region) != RedrawLevel::Clean
     }
 
     pub fn any_stale(&self) -> bool {

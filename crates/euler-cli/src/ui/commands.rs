@@ -455,14 +455,6 @@ pub enum PermissionChoice {
     },
 }
 
-impl PermissionChoice {
-    pub fn label(&self) -> &str {
-        match self {
-            Self::SetMode { label, .. } | Self::Revoke { label, .. } => label,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedCommand<'a> {
     pub token: &'a str,
@@ -596,6 +588,7 @@ pub fn command_table() -> &'static [CommandSpec] {
     COMMAND_TABLE
 }
 
+#[cfg(test)]
 pub fn filter_commands(input: &str) -> Vec<CommandSpec> {
     let needle = filter_needle(input);
     command_table()
@@ -713,6 +706,7 @@ pub fn dispatch_command(input: &str, context: &CommandContext) -> CommandEffect 
     }
 }
 
+#[cfg(test)]
 pub fn permission_choices() -> Vec<PermissionChoice> {
     permission_choices_with_grants(&[])
 }

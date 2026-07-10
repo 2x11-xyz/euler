@@ -1,6 +1,8 @@
+#[cfg(test)]
 use super::super::{text::truncate_display, theme::Theme};
 use super::*;
 use crate::ui::glyphs::user_line_prefix;
+#[cfg(test)]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -63,6 +65,7 @@ pub struct ComposerCursorPosition {
     pub visible_row: Option<usize>,
 }
 
+#[cfg(test)]
 pub fn cursor_position(
     draft: &ComposerDraft,
     width: u16,
@@ -115,6 +118,7 @@ pub fn desired_height_for_width(
     u16::try_from(snapshot.queued.len().saturating_add(visible)).unwrap_or(u16::MAX)
 }
 
+#[cfg(test)]
 pub fn composer_widget<'a>(
     snapshot: &'a ComposerSnapshot<'a>,
     theme: &'a Theme,
@@ -127,12 +131,14 @@ pub fn composer_widget<'a>(
     }
 }
 
+#[cfg(test)]
 pub struct ComposerWidget<'a> {
     snapshot: &'a ComposerSnapshot<'a>,
     theme: &'a Theme,
     options: ComposerRenderOptions,
 }
 
+#[cfg(test)]
 impl Widget for ComposerWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let lines = render_lines(
@@ -627,6 +633,7 @@ impl OverflowIndicator {
     }
 }
 
+#[cfg(test)]
 fn render_line(line: ComposerLine, x: u16, y: u16, width: u16, buf: &mut Buffer, theme: &Theme) {
     let spans = match line {
         ComposerLine::Queued(line) => queued_spans(line, width, theme),
@@ -640,6 +647,7 @@ fn render_line(line: ComposerLine, x: u16, y: u16, width: u16, buf: &mut Buffer,
     Line::from(spans).render(Rect::new(x, y, width, 1), buf);
 }
 
+#[cfg(test)]
 fn queued_spans(line: QueuedComposerLine, width: u16, theme: &Theme) -> Vec<Span<'static>> {
     let marker = if line.selected { "•" } else { " " };
     let prefix = format!("▌ {marker}{}/{} ", line.position, line.total);
@@ -654,6 +662,7 @@ fn queued_spans(line: QueuedComposerLine, width: u16, theme: &Theme) -> Vec<Span
     ]
 }
 
+#[cfg(test)]
 fn draft_spans(
     indicator: Option<OverflowIndicator>,
     prompt: bool,

@@ -3,15 +3,10 @@ pub mod app;
 #[cfg(test)]
 pub(crate) mod app_layout;
 pub mod banner;
-#[allow(dead_code)]
 pub mod bottom_surface;
-#[allow(dead_code)]
 pub mod commands;
-#[allow(dead_code)]
 pub mod composer;
-#[allow(dead_code)]
 pub mod dirty;
-#[allow(dead_code)]
 pub mod event_loop;
 pub(crate) mod external_clipboard;
 pub(crate) mod external_editor;
@@ -23,10 +18,8 @@ pub(crate) mod metrics;
 pub(crate) mod patch_approval;
 pub(crate) mod patch_diff;
 pub(crate) mod search;
-#[allow(dead_code)]
 pub mod status;
 pub(crate) mod syntax;
-#[allow(dead_code)]
 pub mod terminal;
 #[cfg(test)]
 #[path = "test_backend_test.rs"]
