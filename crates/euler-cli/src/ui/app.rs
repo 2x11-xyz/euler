@@ -76,6 +76,8 @@ use std::time::{Duration, Instant};
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
+/// Working HUD braille spinner cadence (issue #27, spec v2.1 §13.3: 80-100ms).
+const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(90);
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
 const DENIED_COMPOSER_GHOST: &str = "denied — tell euler what to do instead";
 
@@ -117,6 +119,20 @@ use self::support::{
     read_terminal_event, session_resume_label, session_root_status_path, update_token_usage,
     CommandContextParts,
 };
+
+/// Working HUD content, shared by the plain-text and styled render paths
+/// (issue #27). See `AppCore::working_hud_line`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum HudLine {
+    /// Unstyled one-liner (interrupted / turn-failed).
+    Plain(String),
+    /// Spinner glyph, phase verb, and dim suffix rendered as distinct spans.
+    Working {
+        spinner: &'static str,
+        verb: String,
+        suffix: String,
+    },
+}
 
 pub struct App {
     terminal: CrosstermTerminal,
@@ -189,6 +205,16 @@ pub struct AppCore {
     /// Persona/name of the in-flight companion run, for approval panel tagging.
     in_flight_companion_name: Option<String>,
     in_flight_cancellable: bool,
+    /// Braille spinner animation frame (issue #27) — advanced by a tick
+    /// counter, never derived from `Instant::now()` at render time.
+    spinner_frame: usize,
+    /// Wall-clock anchor for the last spinner tick; only read outside
+    /// render, in the periodic background poll.
+    spinner_last_tick: Option<Instant>,
+    /// Current turn phase verb (thinking/exploring/reading X/writing X/
+    /// running bash/running tests), derived from streamed turn events.
+    /// `None` falls back to the generic "working" label.
+    current_phase_verb: Option<String>,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     turn_event_start: usize,
@@ -312,7 +338,14 @@ impl App {
                 PendingSignal::Terminate => TerminalSignal::Terminate,
             }));
         }
-        if self.core.drain_background() || self.core.mark_working_timer_dirty() {
+        // Three independent dirty checks — evaluated with `|` (not `||`) so
+        // a `true` earlier in the chain can never short-circuit a later
+        // one's bookkeeping (the spinner's tick-scheduling state in
+        // particular must advance every poll or its cadence drifts).
+        let background_dirty = self.core.drain_background();
+        let timer_dirty = self.core.mark_working_timer_dirty();
+        let spinner_dirty = self.core.advance_spinner();
+        if background_dirty | timer_dirty | spinner_dirty {
             self.request_render(RedrawLevel::Full);
         }
         self.emit_pending_notifications();
@@ -718,6 +751,9 @@ impl AppCore {
             in_flight_label: None,
             in_flight_companion_name: None,
             in_flight_cancellable: false,
+            spinner_frame: 0,
+            spinner_last_tick: None,
+            current_phase_verb: None,
             extensions,
             observe,
             turn_event_start: 0,
@@ -1579,6 +1615,9 @@ impl AppCore {
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
+        self.current_phase_verb = None;
+        self.spinner_frame = 0;
+        self.spinner_last_tick = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         self.turn_event_start = self.transcript.events().len();
@@ -2186,6 +2225,41 @@ impl AppCore {
         true
     }
 
+    /// Advance the working HUD's spinner animation frame (issue #27). The
+    /// rendered glyph is a pure function of `spinner_frame` — a tick
+    /// counter, not `Instant::now()` read at render time — so it stays
+    /// testable without wall-clock assertions; only this scheduling check
+    /// (called from the periodic background poll, never from render) reads
+    /// the clock, exactly like the neighboring elapsed-seconds timer.
+    fn advance_spinner(&mut self) -> bool {
+        self.advance_spinner_at(Instant::now())
+    }
+
+    /// `now` is injected (rather than read internally) so tests can drive
+    /// the tick-scheduling boundary deterministically, without sleeping —
+    /// e.g. `Instant::now() - Duration::from_millis(100)` as the "last
+    /// tick" to force the next call to fire.
+    fn advance_spinner_at(&mut self, now: Instant) -> bool {
+        if !self.turn_in_flight() {
+            let was_animating = self.spinner_frame != 0 || self.spinner_last_tick.is_some();
+            self.spinner_frame = 0;
+            self.spinner_last_tick = None;
+            return was_animating;
+        }
+        match self.spinner_last_tick {
+            None => {
+                self.spinner_last_tick = Some(now);
+                false
+            }
+            Some(last) if now.duration_since(last) >= SPINNER_TICK_INTERVAL => {
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                self.spinner_last_tick = Some(now);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
     fn reply_to_modal(&mut self, reply: PermissionReply) -> CoreEffect {
         self.modal = None;
         self.approval_selection = ApprovalOption::default();
@@ -2241,7 +2315,13 @@ impl AppCore {
         }
     }
 
-    fn live_status_line(&self) -> Option<String> {
+    /// Working HUD content (issue #27), shared by the plain-text legacy
+    /// path (`live_status_line`) and the real styled render path
+    /// (`app::visual::push_visual_activity_block`). The interrupted/failed
+    /// cases are unstyled one-liners; the working case carries the spinner,
+    /// phase verb, and dim suffix as separate pieces so the real path can
+    /// color them independently (gold spinner, dim elapsed/hint).
+    fn working_hud_line(&self) -> Option<HudLine> {
         if matches!(
             self.modal,
             Some(Modal::Permission(_) | Modal::PatchApproval(_))
@@ -2250,25 +2330,55 @@ impl AppCore {
         }
         let interrupt = super::glyphs::interrupt();
         if self.interrupted_guidance {
-            return Some(format!(
+            return Some(HudLine::Plain(format!(
                 "{interrupt} interrupted — tell euler what to do differently"
-            ));
+            )));
         }
         if self.in_flight_error.is_some() {
-            return Some(format!("{interrupt} turn failed — waiting for cleanup"));
+            return Some(HudLine::Plain(format!(
+                "{interrupt} turn failed — waiting for cleanup"
+            )));
         }
         let AppState::TurnInFlight { started_at, .. } = &self.state else {
             return None;
         };
         let secs = started_at.elapsed().as_secs();
+        let spinner = super::glyphs::glyph_set().spinner(self.spinner_frame);
         let label = self.in_flight_label.as_deref().unwrap_or("turn");
         if !self.is_in_flight_cancellable() {
-            return Some(format!("⠧ running {label} · {secs}s · not cancellable"));
+            return Some(HudLine::Working {
+                spinner,
+                verb: format!("running {label}"),
+                suffix: format!(" · {secs}s · not cancellable"),
+            });
         }
-        if label == "turn" {
-            return Some(format!("⠧ working · {secs}s · esc to interrupt"));
-        }
-        Some(format!("⠧ working {label} · {secs}s · esc to interrupt"))
+        let verb = if label == "turn" {
+            self.current_phase_verb
+                .clone()
+                .unwrap_or_else(|| "working".to_owned())
+        } else {
+            format!("working {label}")
+        };
+        Some(HudLine::Working {
+            spinner,
+            verb,
+            suffix: format!(" · {secs}s · esc to interrupt"),
+        })
+    }
+
+    /// Plain-text flattening of `working_hud_line`, kept for the legacy
+    /// `#[cfg(test)]` Frame-based render scaffolding (render_tests_support_test.rs)
+    /// that predates the visual-canvas renderer and does not carry styled spans.
+    #[cfg(test)]
+    fn live_status_line(&self) -> Option<String> {
+        Some(match self.working_hud_line()? {
+            HudLine::Plain(text) => text,
+            HudLine::Working {
+                spinner,
+                verb,
+                suffix,
+            } => format!("{spinner} {verb}{suffix}"),
+        })
     }
 
     fn working_elapsed_seconds(&self) -> Option<u64> {

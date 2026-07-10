@@ -1261,7 +1261,7 @@ fn active_turn_frame_shows_working_state_and_next_draft() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(text.contains("⠧ working"), "frame: {text:?}");
+    assert!(text.contains("⠋ working"), "frame: {text:?}");
     assert!(text.contains("▌ next draft"), "frame: {text:?}");
 }
 
@@ -1291,7 +1291,7 @@ fn active_turn_live_transcript_prefix_is_committable() {
         .join("\n");
 
     assert!(text.contains("line one"), "frame: {text:?}");
-    assert!(text.contains("⠧ working"), "frame: {text:?}");
+    assert!(text.contains("⠋ working"), "frame: {text:?}");
     assert!(frame.committable_rows > 0);
     assert!(frame.committable_rows < frame.active_frame_lines.len());
 }
@@ -2847,7 +2847,7 @@ fn activity_live_status_is_gated_by_turn_state() {
     terminal
         .draw(|frame| core.render(frame))
         .expect("idle draw");
-    assert!(!terminal.backend().screen_contents().contains("⠧ working"));
+    assert!(!terminal.backend().screen_contents().contains("⠋ working"));
 
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -2859,8 +2859,240 @@ fn activity_live_status_is_gated_by_turn_state() {
         .draw(|frame| core.render(frame))
         .expect("in-flight draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("⠧ working · 0s · esc to interrupt"));
+    assert!(contents.contains("⠋ working · 0s · esc to interrupt"));
     assert!(contents.contains("▌"));
+}
+
+/// Issue #27: the spinner frame is a pure tick counter, advanced only by
+/// `advance_spinner` (the periodic background poll) never by reading
+/// `Instant::now()` fresh in render — so the animation is testable by
+/// injecting synthetic `now` values instead of sleeping.
+#[test]
+fn working_hud_spinner_advances_on_tick_not_wall_clock() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    let t0 = Instant::now();
+
+    // First call only seeds the schedule; no tick fires yet.
+    assert!(!core.advance_spinner_at(t0));
+    assert_eq!(core.spinner_frame, 0);
+
+    // Under the 90ms cadence: no advance.
+    assert!(!core.advance_spinner_at(t0 + Duration::from_millis(50)));
+    assert_eq!(core.spinner_frame, 0);
+
+    // At/after the cadence: advances exactly one frame.
+    assert!(core.advance_spinner_at(t0 + Duration::from_millis(90)));
+    assert_eq!(core.spinner_frame, 1);
+    assert!(!core.advance_spinner_at(t0 + Duration::from_millis(120)));
+    assert_eq!(core.spinner_frame, 1);
+    assert!(core.advance_spinner_at(t0 + Duration::from_millis(200)));
+    assert_eq!(core.spinner_frame, 2);
+}
+
+#[test]
+fn working_hud_spinner_resets_when_turn_ends() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    let t0 = Instant::now();
+    core.advance_spinner_at(t0);
+    core.advance_spinner_at(t0 + Duration::from_millis(90));
+    assert_eq!(core.spinner_frame, 1);
+
+    core.state = AppState::Empty;
+    assert!(core.advance_spinner());
+    assert_eq!(core.spinner_frame, 0);
+}
+
+/// Issue #27: the phase verb swaps in place as streamed tool-call/reasoning
+/// events arrive, with `run_shell` distinguishing bash from a test-runner
+/// invocation, and falls back to "working" before any such event lands.
+#[test]
+fn working_hud_phase_verb_reflects_streamed_turn_events() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    assert_eq!(core.current_phase_verb, None);
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("input", json!({"path": "src/lib.rs"})),
+        ]),
+    )));
+    assert_eq!(
+        core.current_phase_verb.as_deref(),
+        Some("reading src/lib.rs")
+    );
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-edit".into()),
+            ("name", "edit_file".into()),
+            ("input", json!({"path": "src/lib.rs"})),
+        ]),
+    )));
+    assert_eq!(
+        core.current_phase_verb.as_deref(),
+        Some("writing src/lib.rs")
+    );
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-bash".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "ls -la"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-test".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "cargo nextest run --workspace"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+
+    // A non-phase-carrying event (model delta) leaves the verb in place.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer".into())]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+}
+
+#[test]
+fn working_hud_phase_verb_resets_when_a_new_turn_spawns() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    core.current_phase_verb = Some("thinking".to_owned());
+    core.spinner_frame = 3;
+
+    core.spawn_turn("next".to_owned(), session);
+
+    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(core.spinner_frame, 0);
+}
+
+#[test]
+fn working_hud_phase_verb_resets_when_the_turn_completes() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.current_phase_verb = Some("thinking".to_owned());
+    core.spinner_frame = 3;
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+
+    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(core.spinner_frame, 0);
+}
+
+/// Issue #27: the spinner is gold (the theme's warning token) and the
+/// elapsed/hint suffix is dim (muted) — both routed through `Theme`, not a
+/// hardcoded hex; the verb itself carries no explicit color.
+#[test]
+fn working_hud_canvas_line_uses_theme_tokens_for_spinner_and_suffix() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.theme = Theme::warm_ledger();
+
+    let frame = core.render_visual_canvas(80);
+    let activity_line = frame
+        .active_frame_lines
+        .iter()
+        .find(|line| line.plain_text().contains("working"))
+        .expect("activity line present");
+    assert_eq!(activity_line.spans.len(), 3);
+    assert_eq!(
+        activity_line.spans[0].style.fg,
+        Some(core.theme.palette.warning)
+    );
+    assert_eq!(activity_line.spans[1].style.fg, None);
+    assert_eq!(
+        activity_line.spans[2].style.fg,
+        Some(core.theme.palette.muted)
+    );
+}
+
+/// Issue #27: the HUD line sits directly above the composer with no blank
+/// line between them.
+#[test]
+fn working_hud_sits_directly_above_composer_with_no_blank_line() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    let frame = core.render_visual_canvas(80);
+    let lines = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let hud_row = lines
+        .iter()
+        .position(|line| line.contains("working"))
+        .expect("HUD row present");
+    let composer_row = lines
+        .iter()
+        .enumerate()
+        .skip(hud_row + 1)
+        .find(|(_, line)| line.starts_with('▌'))
+        .map(|(index, _)| index)
+        .expect("composer row present");
+    assert_eq!(
+        composer_row,
+        hud_row + 1,
+        "no blank row between the HUD and the composer: lines: {lines:?}"
+    );
 }
 
 #[test]
@@ -2881,7 +3113,7 @@ fn interrupted_live_status_replaces_working_affordance() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("■ interrupted — tell euler what to do differently"));
-    assert!(!contents.contains("⠧ working"));
+    assert!(!contents.contains("⠋ working"));
 }
 
 #[test]
