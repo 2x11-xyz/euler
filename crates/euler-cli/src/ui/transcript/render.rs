@@ -586,12 +586,20 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     append_timing(&mut lines[first_line], timing, theme, width);
                 }
             }
-            // §1: separation is the spine plus one blank line — no hairlines.
-            lines.push(Line::default());
         } else if let Some(timing) = &entry.timing {
             if let Some(line) = lines.get_mut(first_line) {
                 append_timing(line, timing, theme, width);
             }
+        }
+        // §1: separation is the spine plus one blank line — applied after
+        // every rendered event (dividers and recaps included) so batches
+        // always end separated from whatever renders below. The renderer is
+        // the single owner of vertical rhythm; no other layer adds spacers
+        // around history content.
+        // Banner lines end with their own built-in blank; everything else
+        // gets the uniform one-blank separator here.
+        if first_line < lines.len() && !matches!(item, TranscriptItem::Banner { .. }) {
+            lines.push(Line::default());
         }
         item_end_offsets.push(lines.len());
     }

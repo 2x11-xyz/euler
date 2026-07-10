@@ -2574,10 +2574,12 @@ fn worked_separator_degrades_to_single_bare_label_at_narrow_widths() {
     let equal = line_texts(&render_items_for_history(&item, &theme, label.len() as u16));
     let wide = line_texts(&render_items_for_history(&item, &theme, 32));
 
-    assert_eq!(below, vec![label]);
-    assert_eq!(equal, vec![label]);
-    assert_eq!(wide.len(), 1);
+    // Uniform event rhythm: every rendered event ends with one blank row.
+    assert_eq!(below, vec![label, ""]);
+    assert_eq!(equal, vec![label, ""]);
+    assert_eq!(wide.len(), 2);
     assert!(wide[0].contains(label));
+    assert!(wide[1].is_empty());
     assert!(wide[0].contains('─'));
 }
 

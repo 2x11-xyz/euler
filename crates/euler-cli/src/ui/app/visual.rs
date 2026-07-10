@@ -123,7 +123,8 @@ impl AppCore {
         self.push_visual_permission_block(width, &mut blocks);
         self.push_visual_activity_block(&mut blocks);
         self.push_visual_transient_block(&mut blocks);
-        push_visual_spacer_block(&mut blocks);
+        // No spacer here: the transcript renderer ends every event batch
+        // (banner included) with one blank line — it owns vertical rhythm.
         self.push_visual_composer_block(composer, &mut blocks);
         push_visual_spacer_block(&mut blocks);
         push_visual_block(
@@ -308,7 +309,21 @@ fn push_visual_block(blocks: &mut Vec<VisualBlock>, role: VisualBlockRole, lines
     }
 }
 
+/// One blank spacer row — but only when the preceding content doesn't
+/// already end blank (the transcript renderer owns event rhythm and ends
+/// every batch with a blank line; doubling it makes canyons).
 fn push_visual_spacer_block(blocks: &mut Vec<VisualBlock>) {
+    let previous_ends_blank = blocks
+        .last()
+        .and_then(|block| block.lines.last())
+        .is_some_and(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.text.as_str().trim().is_empty())
+        });
+    if previous_ends_blank {
+        return;
+    }
     blocks.push(VisualBlock::new(
         VisualBlockRole::Spacer,
         vec![CanvasLine::plain_lossy("")],

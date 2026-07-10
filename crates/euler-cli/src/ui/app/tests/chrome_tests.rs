@@ -174,9 +174,11 @@ fn transient_notice_composer_and_status_are_separated_by_blank_rows() {
         .position(|line| line.contains("echo · ctx"))
         .expect("status row");
 
-    assert_eq!(prompt, notice + 2, "lines: {lines:?}");
+    // Spec v2.1 §13.3: the transient/HUD line sits DIRECTLY above the
+    // composer (no blank line); one blank still separates composer from
+    // the status footer.
+    assert_eq!(prompt, notice + 1, "lines: {lines:?}");
     assert_eq!(status, prompt + 2, "lines: {lines:?}");
-    assert!(lines[notice + 1].is_empty(), "lines: {lines:?}");
     assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
 }
 
@@ -241,11 +243,11 @@ fn repeated_finalized_writes_move_banner_up_without_gap_or_clipping() {
     let second = row_containing(&rows, "second generated");
     let prompt = row_containing(&rows, "▌");
     assert!(equation < first, "rows: {rows:?}");
-    // first, hairline, second — Warm Ledger places a dim rule under each block
+    // first, blank, second — one uniform blank separates events (§1)
     assert_eq!(second, first + 2, "rows: {rows:?}");
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
-    // second, hairline, three breathing blanks, prompt
-    assert_eq!(prompt, second + 5, "rows: {rows:?}");
+    // second, event blank, composer breathing row, prompt
+    assert_eq!(prompt, second + 3, "rows: {rows:?}");
 }
 
 #[test]
