@@ -6855,6 +6855,28 @@ fn pty_final_state_with_resizes(
     initial: (u16, u16),
     resizes: &[(usize, u16, u16)],
 ) -> String {
+    // A debounced post-resize replay purges euler-emitted scrollback
+    // (ESC[3J) and re-emits the transcript once at the settled width
+    // (issue #38). The FINAL state is therefore everything from the last
+    // purge onward; bridge rows and vt100 scrollback before it were erased
+    // on the real terminal.
+    let last_purge = output
+        .windows(4)
+        .rposition(|window| window == b"\x1b[3J")
+        .map(|at| at + 4);
+    if let Some(cut) = last_purge {
+        let size_at_cut = resizes
+            .iter()
+            .take_while(|(offset, _, _)| *offset <= cut)
+            .last()
+            .map_or(initial, |(_, rows, cols)| (*rows, *cols));
+        let remaining: Vec<(usize, u16, u16)> = resizes
+            .iter()
+            .filter(|(offset, _, _)| *offset > cut)
+            .map(|(offset, rows, cols)| (offset - cut, *rows, *cols))
+            .collect();
+        return pty_final_state_with_resizes(&output[cut..], size_at_cut, &remaining);
+    }
     let (mut rows, mut cols) = initial;
     let mut parser = vt100::Parser::new(rows, cols, 5000);
     let mut start = 0usize;
@@ -7142,8 +7164,8 @@ fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
         tui.resize(24, cols);
         std::thread::sleep(Duration::from_millis(30));
     }
-    // Quiescence so commits resume before quitting.
-    std::thread::sleep(Duration::from_millis(600));
+    // Quiescence so the debounced settled-width replay runs before quitting.
+    std::thread::sleep(Duration::from_millis(900));
     tui.quit();
 
     // Assert the MECHANISM from the raw byte stream (emulator-independent):
@@ -7159,16 +7181,47 @@ fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
         during.len(),
         during.join("\n")
     );
-    // Each paragraph may be bridge-committed at most twice in total
-    // (pre-drag copy + one bounded post-quiescence re-emission).
+    // Invariant (issue #38): a re-emission is only legal when a scrollback
+    // purge precedes it — append-without-purge is the fossil-copy bug. Every
+    // paragraph may appear at most once more than the number of purges
+    // (the original commit + one purge-paired re-emission per purge), and
+    // the final post-purge state must hold exactly one copy.
+    let purge_count = tui
+        .output
+        .windows(4)
+        .filter(|window| *window == b"\x1b[3J")
+        .count();
+    assert!(
+        purge_count >= 1,
+        "no scrollback purge observed — the debounced settled-width replay did not run"
+    );
     let all_rows = extract_bridge_committed_rows(&tui.output);
     let mut failures = Vec::new();
     for paragraph in 1..=6 {
         let needle = format!("Paragraph {paragraph}:");
         let occurrences = all_rows.iter().filter(|row| row.contains(&needle)).count();
-        if occurrences > 2 {
+        if occurrences > purge_count + 1 {
             failures.push(format!(
-                "`{needle}` bridge-committed {occurrences}× (want ≤2)"
+                "`{needle}` bridge-committed {occurrences}× with only {purge_count} purges — an append happened without a purge"
+            ));
+        }
+    }
+    let last_purge = tui
+        .output
+        .windows(4)
+        .rposition(|window| window == b"\x1b[3J")
+        .map(|at| at + 4)
+        .expect("purge offset");
+    let settled_rows = extract_bridge_committed_rows(&tui.output[last_purge..]);
+    for paragraph in 1..=6 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = settled_rows
+            .iter()
+            .filter(|row| row.contains(&needle))
+            .count();
+        if occurrences > 1 {
+            failures.push(format!(
+                "`{needle}` appears {occurrences}× after the final purge (want exactly one settled copy)"
             ));
         }
     }

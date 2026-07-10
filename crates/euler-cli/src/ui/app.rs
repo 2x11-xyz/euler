@@ -70,6 +70,12 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Trailing debounce for the post-resize history replay. Matches the
+/// terminal's RESIZE_COMMIT_QUIESCENCE so there is exactly one notion of
+/// "the resize has settled": long enough that even slow PTY delivery of a
+/// drag's ticks coalesces into a single purge+replay, short enough to feel
+/// immediate once the user lets go.
+const RESIZE_REPLAY_DEBOUNCE: Duration = Duration::from_millis(450);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
@@ -141,6 +147,12 @@ pub struct App {
     _terminal_session: TerminalSession,
     event_loop: EventLoop,
     core: AppCore,
+    /// Trailing-debounce deadline for the post-resize history replay: every
+    /// resize event pushes it out, so a drag settles into exactly ONE
+    /// purge+replay at the final width instead of appending a fossil copy of
+    /// the transcript to scrollback per width tick (issue #38; mechanism
+    /// adopted from codex's resize reflow).
+    resize_replay_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -327,6 +339,7 @@ impl App {
             _terminal_session: terminal_session,
             event_loop,
             core,
+            resize_replay_deadline: None,
         })
     }
 
@@ -339,7 +352,23 @@ impl App {
             if self.drain_actions()? {
                 return Ok(());
             }
+            self.flush_resize_replay()?;
         }
+    }
+
+    /// Run the debounced post-resize replay once the deadline passes with no
+    /// further resize events: purge euler-emitted scrollback and re-emit the
+    /// transcript from the event log at the settled width (exactly one copy).
+    fn flush_resize_replay(&mut self) -> Result<()> {
+        let due = self
+            .resize_replay_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !due {
+            return Ok(());
+        }
+        self.resize_replay_deadline = None;
+        self.core.invalidate_history_cache();
+        self.replay_history(true)
     }
 
     fn poll_background(&mut self) {
@@ -370,9 +399,14 @@ impl App {
     }
 
     fn poll_timeout(&self) -> Duration {
-        self.event_loop
+        let mut timeout = self
+            .event_loop
             .poll_timeout(Instant::now())
-            .min(WORKER_POLL_INTERVAL)
+            .min(WORKER_POLL_INTERVAL);
+        if let Some(deadline) = self.resize_replay_deadline {
+            timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        timeout
     }
 
     fn poll_terminal(&mut self, timeout: Duration) -> Result<()> {
@@ -440,14 +474,17 @@ impl App {
             }
             UiAction::Resize { .. } => {
                 metrics::record(metrics::Metric::ResizeAction);
-                // No replay, no scrollback purge: rows already in native
-                // scrollback stay untouched (re-purging duplicated them in
-                // 3J-ignoring terminals and destroyed them in honoring ones —
-                // the P1 audit finding). The canvas re-renders at the new
-                // width and the terminal remaps its committed boundary by
-                // item identity (commit_scrolled_history width branch).
+                // Intermediate ticks are cheap: re-render the live viewport
+                // at the new width and leave scrollback alone. The real
+                // reconciliation is a SINGLE purge+replay at the settled
+                // width, scheduled with a trailing debounce below — the
+                // per-tick variants (purge every tick, or never purge) both
+                // corrupted real terminals (review v3 §R2: Ghostty, iTerm2,
+                // and Terminal.app all accumulated one fossil re-render per
+                // width step).
                 self.core.invalidate_history_cache();
                 self.render_frame()?;
+                self.resize_replay_deadline = Some(Instant::now() + RESIZE_REPLAY_DEBOUNCE);
                 return Ok(false);
             }
             UiAction::Render(_) => {
