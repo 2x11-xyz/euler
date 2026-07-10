@@ -140,6 +140,11 @@ pub struct SessionConfig {
     /// disables the observer entirely; a configured observer additionally
     /// requires [`Session::set_observer_extension`].
     pub round_observer: Option<RoundObserverConfig>,
+    /// User-home directory holding per-root project-grant consent stores.
+    /// `None` (default) disables project grants entirely: the repo-local
+    /// `.euler/grants.json` is repo-controlled content and must never become
+    /// authority without a matching user consent entry outside the repo.
+    pub project_grant_consent_dir: Option<PathBuf>,
 }
 
 impl SessionConfig {
@@ -162,6 +167,7 @@ impl SessionConfig {
             compaction_reserve_tokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
             round_observer: None,
+            project_grant_consent_dir: None,
         }
     }
 }
@@ -653,7 +659,8 @@ impl<D> Session<D> {
         let mut permissions = PermissionGate::new(decider);
         // Project grants are best-effort at open: missing file is empty; corrupt
         // files leave the store unloaded so project writes fail closed.
-        let _ = permissions.load_project_grants(&config.root);
+        let _ = permissions
+            .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         Self {
             config,
             active_target,
@@ -932,7 +939,8 @@ impl<D> Session<D> {
         let tools = ToolRegistry::new(config.root.clone());
         let persisted_events = events.len();
         let mut permissions = PermissionGate::new(decider);
-        let _ = permissions.load_project_grants(&config.root);
+        let _ = permissions
+            .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         Self {
             config,
             active_target,

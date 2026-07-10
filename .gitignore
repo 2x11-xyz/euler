@@ -1,1 +1,7 @@
 /target
+
+# Local agent/session state — never repo content
+.claude/
+CLAUDE.md
+.euler/
+docs/scratch/

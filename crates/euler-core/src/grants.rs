@@ -5,6 +5,14 @@
 //! grant allows a request without re-prompting. Project grants persist under
 //! the workspace `.euler/` directory; every project-grant write is a user
 //! decision that callers must record in provenance (see capabilities contract).
+//!
+//! The workspace grants file is repo-controlled content: a cloned repository
+//! could ship one. Repo content must never be durable authority on its own,
+//! so an active project grant requires BOTH the workspace entry AND a
+//! matching entry in this user's consent store (a per-root file under the
+//! user-owned euler home, written when the user approves the grant). Either
+//! side alone grants nothing: the repo file cannot preseed authority, and a
+//! stale consent entry dies with the workspace entry it consented to.
 
 use euler_sdk::Capability;
 use serde::{Deserialize, Serialize};
@@ -262,6 +270,19 @@ impl GrantList {
     pub fn clear(&mut self) {
         self.grants.clear();
     }
+
+    /// Entries present in BOTH lists (workspace file ∩ user consent store) —
+    /// the only project grants that are ever active.
+    pub fn intersection(&self, other: &GrantList) -> GrantList {
+        GrantList {
+            grants: self
+                .grants
+                .iter()
+                .filter(|grant| other.grants.contains(grant))
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 /// Project-local grants file under `<root>/.euler/grants.json`.
@@ -276,6 +297,32 @@ impl ProjectGrantStore {
         Self {
             path: root.join(EULER_DIR).join(GRANTS_FILE),
         }
+    }
+
+    /// Store at an explicit file path (used for the user-home consent store).
+    pub fn at_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// User-consent store path for a workspace root: one file per root under
+    /// `<consent_dir>/project-grants/`, keyed by the canonicalized root so a
+    /// moved or differently-spelled path cannot borrow another root's consent.
+    pub fn consent_path_for_root(consent_dir: &Path, root: &Path) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let canonical = root
+            .canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf());
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        let digest = hasher.finalize();
+        let mut name = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(name, "{byte:02x}");
+        }
+        consent_dir
+            .join("project-grants")
+            .join(format!("{name}.json"))
     }
 
     pub fn path(&self) -> &Path {
