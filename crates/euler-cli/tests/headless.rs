@@ -7544,8 +7544,14 @@ impl PtyHarness {
             self.screen_text()
         );
         self.write("\x03");
+        // Loaded CI runners can take well past the standard 5s window to
+        // flush the armed notice through the PTY (observed on shared
+        // runners); use a generous ceiling here — this wait is on the exit
+        // path, so a fast local run never pays it.
         assert!(
-            self.wait_for_screen("ctrl+c again to quit · session saved, /resume restores"),
+            self.wait_for_stable_screen(Duration::from_secs(20), |screen| {
+                screen.contains("ctrl+c again to quit · session saved, /resume restores")
+            }),
             "TUI did not arm quit notice:\n{}",
             self.screen_text()
         );
