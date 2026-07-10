@@ -5,8 +5,11 @@
 //! `<workspace>/.euler/checkpoints/<sha256>` so a later restore can rewrite the
 //! file without mutating ledger history.
 //!
-//! Safety: secret-like and binary content is never stored. Prefer skipping a
-//! checkpoint over risking raw secret retention.
+//! Safety: content the heuristic detector classifies as secret-like, and
+//! binary content, is not stored. The detector is substring-based and not a
+//! guarantee; prefer skipping a checkpoint over risking raw secret retention.
+//! Blobs are written 0o600 via random create_new temp files (no symlink
+//! following on write, dedup, or rename).
 
 use euler_event::{EventEnvelope, EventKind};
 use sha2::{Digest, Sha256};
@@ -118,23 +121,45 @@ pub(crate) fn checkpoint_blob_path(root: &Path, sha256: &str) -> PathBuf {
 fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
-    if path.exists() && fs::read(path)? == bytes {
+    // Dedup fast path: only trust a regular file at the content-addressed
+    // path — a planted symlink must not be followed.
+    if path
+        .symlink_metadata()
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+        && fs::read(path)? == bytes
+    {
         let file = OpenOptions::new().read(true).open(path)?;
         file.sync_data()?;
         return Ok(());
     }
-    let temp_path = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&temp_path)?;
+    // Random temp name + create_new + 0o600: a predictable temp path could
+    // be pre-planted as a symlink and the old truncating open followed it.
+    let temp_path = path.with_extension(format!("{}.tmp", ulid::Ulid::new()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path)?;
     file.write_all(bytes)?;
     file.flush()?;
     file.sync_data()?;
     drop(file);
-    fs::rename(&temp_path, path)?;
+    // rename replaces a planted symlink at the final path rather than
+    // following it.
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
     if let Some(parent) = path.parent() {
         let dir = File::open(parent)?;
         dir.sync_data()?;

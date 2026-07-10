@@ -2091,9 +2091,14 @@ fn extension_resolution_rejects_unknown_ids_and_malformed_project_file() {
         .expect("project unknown");
     assert!(!project.status.success());
     let project_stderr = String::from_utf8_lossy(&project.stderr);
+    // The binary reports the canonicalized overlay path (macOS tempdirs live
+    // behind the /var -> /private/var symlink).
+    let canonical_project_file = project_file
+        .canonicalize()
+        .expect("canonicalize project overlay path");
     assert!(project_stderr.contains(&format!(
         "unknown extension id in {}: nope; {valid}",
-        project_file.display()
+        canonical_project_file.display()
     )));
 
     let malformed_home = isolated_home();
@@ -2112,10 +2117,13 @@ fn extension_resolution_rejects_unknown_ids_and_malformed_project_file() {
         .output()
         .expect("malformed project");
     assert!(!malformed.status.success());
+    let canonical_malformed_file = malformed_file
+        .canonicalize()
+        .expect("canonicalize malformed overlay path");
     assert!(
         String::from_utf8_lossy(&malformed.stderr).contains(&format!(
             "malformed project extensions file {}",
-            malformed_file.display()
+            canonical_malformed_file.display()
         ))
     );
 

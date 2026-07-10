@@ -1,5 +1,7 @@
 /target
-.claude/worktrees/
+
+# Local agent/session state — never repo content
+.claude/
+CLAUDE.md
 .euler/
 docs/scratch/
-CLAUDE.md
