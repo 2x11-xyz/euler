@@ -228,7 +228,10 @@ fn budget_exhaustion_after_in_flight_tool_records_result_before_failure() {
 #[test]
 fn budget_exhaustion_after_token_exceeding_completion_keeps_model_result() {
     let (_temp, _log, mut session) = session_with_provider(
-        UsageProvider { output_tokens: 9 },
+        UsageProvider {
+            input_tokens: 0,
+            output_tokens: 9,
+        },
         ScriptedDecider::new(Vec::new()),
     );
     let task =
@@ -240,6 +243,43 @@ fn budget_exhaustion_after_token_exceeding_completion_keeps_model_result() {
     let result = only_event(session.events(), EventKind::MODEL_RESULT);
     assert_eq!(result.payload["content"], json!("token heavy completion"));
     assert!(events_of_kind(session.events(), EventKind::ASSISTANT_MESSAGE).is_empty());
+}
+
+#[test]
+fn token_budget_counts_output_tokens_not_total_usage() {
+    // #58: reviewers see the whole session canvas as input, which alone can
+    // dwarf an output-scale budget. A large input usage must not exhaust the
+    // budget as long as the OUTPUT usage stays within max_tokens.
+    let (_temp, _log, mut session) = session_with_provider(
+        UsageProvider {
+            input_tokens: 50_000,
+            output_tokens: 100,
+        },
+        ScriptedDecider::new(Vec::new()),
+    );
+    let task =
+        task_with_caps([]).with_budget(AgentBudget::new(None, None, Some(8192)).expect("budget"));
+
+    let summary = session.spawn_companion(task).expect("companion");
+
+    assert!(summary.result.ok(), "{:?}", summary.result.error());
+}
+
+#[test]
+fn token_budget_still_exhausts_on_output_tokens_alone() {
+    let (_temp, _log, mut session) = session_with_provider(
+        UsageProvider {
+            input_tokens: 50_000,
+            output_tokens: 9_000,
+        },
+        ScriptedDecider::new(Vec::new()),
+    );
+    let task =
+        task_with_caps([]).with_budget(AgentBudget::new(None, None, Some(8192)).expect("budget"));
+
+    let summary = session.spawn_companion(task).expect("companion");
+
+    assert_budget_failure(&summary, "budget exhausted: max_tokens");
 }
 
 #[test]
@@ -675,6 +715,7 @@ impl PermissionDecider for ChannelDecider {
 }
 
 struct UsageProvider {
+    input_tokens: u64,
     output_tokens: u64,
 }
 
@@ -692,7 +733,7 @@ impl ModelProvider for UsageProvider {
                 Ok(ModelStreamEvent::Finished {
                     stop_reason: StopReason::Completed,
                     usage: Some(Usage {
-                        input_tokens: 0,
+                        input_tokens: self.input_tokens,
                         output_tokens: self.output_tokens,
                         cached_tokens: Some(0),
                         reasoning_tokens: Some(0),

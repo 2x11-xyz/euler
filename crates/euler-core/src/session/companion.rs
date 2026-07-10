@@ -3,9 +3,9 @@
 use super::{
     approval_mode_str, canvas_snapshot_payload, context_budget_exhausted, elapsed_ms,
     file_change_payload, file_diff_payload, maybe_store_pre_image, model_input_item,
-    permission_decision_payload, permission_request_for_tool, used_tokens,
-    validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig,
-    RoundLoopIo, RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
+    permission_decision_payload, permission_request_for_tool, validate_model_target_shape,
+    ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session,
+    SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
@@ -55,6 +55,8 @@ struct CompanionLoop<'a, D> {
     permissions: PermissionGate<&'a mut D>,
     turn_state: TurnState,
     tool_calls: u32,
+    /// Cumulative OUTPUT tokens only (see `add_usage`), checked against
+    /// `AgentBudget::max_tokens`.
     tokens: u64,
 }
 
@@ -555,9 +557,16 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             .is_some_and(|max| self.tokens > max)
     }
 
+    /// `AgentBudget::max_tokens` bounds OUTPUT (completion) tokens, not
+    /// total usage: reviewers/companions see the whole session canvas as
+    /// input, which routinely exceeds any output-scale budget on its own
+    /// (#58). Only `usage.output_tokens` counts against it here; it is the
+    /// same quantity `max_output_tokens` already asks the provider to cap
+    /// (see `CompanionLoop::new`), so the request-side cap and the
+    /// round-accounting check now agree.
     fn add_usage(&mut self, usage: Option<&Usage>) {
         if let Some(usage) = usage {
-            self.tokens = self.tokens.saturating_add(used_tokens(usage));
+            self.tokens = self.tokens.saturating_add(usage.output_tokens);
         }
     }
 }
