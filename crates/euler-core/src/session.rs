@@ -18,6 +18,7 @@ use crate::permissions::{
     ApprovalMode, GrantDecision, GrantSource, PermissionDecider, PermissionGate, PermissionRequest,
 };
 use crate::provenance::ProvenanceWriter;
+use crate::redaction::SecretRedactor;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
@@ -430,6 +431,9 @@ pub struct Session<D> {
     providers: ProviderSet,
     bus: EventBus,
     permissions: PermissionGate<D>,
+    /// Secret redaction applied to tool output before it reaches the canvas
+    /// or the ledger (contract: secrets.md redaction rules; issue #56).
+    redactor: SecretRedactor,
     tools: ToolRegistry,
     provenance: Option<Arc<ProvenanceWriter>>,
     persisted_events: usize,
@@ -668,6 +672,7 @@ impl<D> Session<D> {
             providers,
             bus,
             permissions,
+            redactor: SecretRedactor::from_env(),
             tools,
             provenance: None,
             persisted_events: 0,
@@ -709,6 +714,13 @@ impl<D> Session<D> {
 
     pub fn events(&self) -> &[EventEnvelope] {
         self.bus.events()
+    }
+
+    /// Register a known secret value for redaction from tool output (auth
+    /// credentials, resolved x-secret values). Values shorter than the
+    /// redaction minimum are ignored.
+    pub fn add_redacted_secret(&mut self, value: impl Into<String>) {
+        self.redactor.add_value(value);
     }
 
     pub fn extension_enabled(&self, id: &str) -> bool {
@@ -948,6 +960,7 @@ impl<D> Session<D> {
             providers,
             bus: EventBus { events },
             permissions,
+            redactor: SecretRedactor::from_env(),
             tools,
             provenance: None,
             persisted_events,
@@ -1853,7 +1866,7 @@ impl<D: PermissionDecider> Session<D> {
                                 ("id", call.id.into()),
                                 ("name", execution.name.into()),
                                 ("ok", false.into()),
-                                ("error", error.to_string().into()),
+                                ("error", self.redactor.redact(&error.to_string()).into()),
                             ]),
                             Some(tool_call_event_id),
                         )?;
@@ -1898,7 +1911,7 @@ impl<D: PermissionDecider> Session<D> {
                     ("id", call.id.into()),
                     ("name", execution.name.into()),
                     ("ok", true.into()),
-                    ("output", execution.output.into()),
+                    ("output", self.redactor.redact(&execution.output).into()),
                 ]);
                 if let Some(exit_code) = execution.exit_code {
                     payload.insert("exit_code".to_owned(), exit_code.into());
@@ -1924,7 +1937,7 @@ impl<D: PermissionDecider> Session<D> {
                         ("id", call.id.into()),
                         ("name", call.name.into()),
                         ("ok", false.into()),
-                        ("error", error.to_string().into()),
+                        ("error", self.redactor.redact(&error.to_string()).into()),
                     ]),
                     Some(tool_call_event_id),
                 )?;

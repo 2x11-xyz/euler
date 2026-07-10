@@ -185,6 +185,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let providers = ProviderSet::single_named(run.provider_id.clone(), run.provider);
     let mut session = Session::new_with_providers(live_session.config, providers, CliDecider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
+    crate::session_lifecycle::seed_secret_redaction(&mut session);
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
@@ -220,6 +221,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         load_notifications_preference(preference_path.as_deref()).unwrap_or(true);
     let mut session = Session::new_with_providers(live_session.config, providers, decider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
+    crate::session_lifecycle::seed_secret_redaction(&mut session);
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
@@ -290,6 +292,7 @@ fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
         SubagentDecider::new(exec.auto_approve),
     )
     .with_provenance(ProvenanceWriter::new(log_path)?);
+    crate::session_lifecycle::seed_secret_redaction(&mut session);
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
@@ -478,6 +481,7 @@ where
 
     let outcome = resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
     let mut session = outcome.session;
+    crate::session_lifecycle::seed_secret_redaction(&mut session);
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }

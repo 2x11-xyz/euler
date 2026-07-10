@@ -98,6 +98,30 @@ pub(crate) fn live_session_config(
     }
 }
 
+/// Load this user's stored credential values into the session's redaction
+/// set so tool output can never carry them to the canvas or the ledger
+/// (secrets contract; issue #56). Best-effort: a missing/corrupt auth file
+/// only means fewer known values — the shape-based layer still applies.
+pub(crate) fn seed_secret_redaction<D>(session: &mut euler_core::Session<D>) {
+    let Ok(storage) = euler_core::auth_storage::AuthStorage::new_default() else {
+        return;
+    };
+    for provider in storage.list() {
+        match storage.get(&provider) {
+            Some(euler_core::auth_storage::Credential::ApiKey { key }) => {
+                session.add_redacted_secret(key.expose_secret());
+            }
+            Some(euler_core::auth_storage::Credential::OAuth {
+                access, refresh, ..
+            }) => {
+                session.add_redacted_secret(access.expose_secret());
+                session.add_redacted_secret(refresh.expose_secret());
+            }
+            None => {}
+        }
+    }
+}
+
 pub(crate) fn session_config(
     root: PathBuf,
     provider: String,
