@@ -1,18 +1,23 @@
 use super::cells::{
-    output_rows_without_trailing_blanks, push_bounded_children, push_cell_parent, push_child_rows,
-    render_edit_cell, render_file_change_cell, render_interrupted, render_patch_cell,
-    render_permission_ask, render_permission_decision, render_tool_run, render_worked_duration,
-    tool_failure_status, EditRender, FileChangeRender, PatchRender, ToolRunRender,
+    edit_failure_status, output_rows_without_trailing_blanks, push_bounded_children,
+    push_bounded_failure_children, push_cell_parent, push_child_rows, render_companion_block,
+    render_edit_cell, render_extension_result, render_file_change_cell, render_interrupted,
+    render_patch_cell, render_permission_ask, render_permission_decision, render_resume_boundary,
+    render_tool_run, render_turn_recap, render_worked_duration, tool_failure_status,
+    CompanionRender, EditRender, ExtensionResultRender, FileChangeRender, PatchRender,
+    PermissionAskView, PermissionDecisionView, ResumeBoundaryRender, ToolRunRender,
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
-use crate::ui::glyphs::user_line_prefix;
+use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
-use crate::ui::text::{content_width, display_width, wrap_text};
+use crate::ui::text::{
+    blank_gutter, content_width, display_width, gutter_width, is_ledger_gutter, timestamp_gutter,
+    timestamp_gutter_shown, tree_gutter_pipe, wrap_text,
+};
 use crate::ui::theme::Theme;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-
-const ASSISTANT_PROSE_GUTTER: &str = "  ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TranscriptRenderLimits {
@@ -24,7 +29,7 @@ impl Default for TranscriptRenderLimits {
     fn default() -> Self {
         Self {
             output_lines: TOOL_CALL_MAX_LINES,
-            patch_detail_lines: usize::MAX,
+            patch_detail_lines: super::super::patch_diff::DIFF_PREVIEW_ROWS + 1,
         }
     }
 }
@@ -34,42 +39,97 @@ impl TranscriptRenderLimits {
         self.output_lines = output_lines;
         self
     }
+
+    fn expanded(mut self) -> Self {
+        self.output_lines = usize::MAX;
+        self.patch_detail_lines = usize::MAX;
+        self
+    }
 }
 
-#[allow(dead_code)]
 pub(super) fn render_projected_items(
     items: &[TranscriptItem],
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
 ) -> Vec<Line<'static>> {
+    render_projected_items_with_expansion(items, theme, width, limits, false)
+}
+
+pub(super) fn render_projected_items_with_expansion(
+    items: &[TranscriptItem],
+    theme: &Theme,
+    width: u16,
+    limits: TranscriptRenderLimits,
+    expanded: bool,
+) -> Vec<Line<'static>> {
     let entries: Vec<_> = items
         .iter()
         .cloned()
         .map(|item| ProjectedEntry { item, timing: None })
         .collect();
-    render_projected_entries(&entries, theme, width, limits)
+    render_projected_entries_with_expansion(&entries, theme, width, limits, expanded)
 }
 
-#[allow(dead_code)]
-#[allow(clippy::too_many_lines)] // ratchet: 243 lines, refactor target
+#[cfg(test)]
 pub(super) fn render_projected_entries(
     entries: &[ProjectedEntry],
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
 ) -> Vec<Line<'static>> {
+    render_projected_entries_with_expansion(entries, theme, width, limits, false)
+}
+
+pub(super) fn render_projected_entries_with_expansion(
+    entries: &[ProjectedEntry],
+    theme: &Theme,
+    width: u16,
+    limits: TranscriptRenderLimits,
+    expanded: bool,
+) -> Vec<Line<'static>> {
+    render_projected_entries_with_expansion_and_offsets(
+        entries, theme, width, limits, expanded, true,
+    )
+    .0
+}
+
+/// Like `render_projected_entries_with_expansion`, additionally returning the
+/// cumulative end-row offset of each entry. Offsets let the terminal commit
+/// native scrollback at item boundaries so a width change can remap its
+/// committed prefix exactly (no lost rows, no duplicates).
+///
+/// `show_turn_footer` renders the trailing "elapsed since first event"
+/// footer when the last entry carries timing. That reads correctly for a
+/// single bounded batch (the CLI/test transcript widget); the visual
+/// canvas's incrementally growing whole-session history is never one batch,
+/// so it passes `false`.
+///
+/// `expanded` is the single global `ctrl+o` fold state (issue #49) — every
+/// foldable item in `entries` shares it; there is no per-item targeting.
+#[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
+pub(super) fn render_projected_entries_with_expansion_and_offsets(
+    entries: &[ProjectedEntry],
+    theme: &Theme,
+    width: u16,
+    limits: TranscriptRenderLimits,
+    expanded: bool,
+    show_turn_footer: bool,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
+    let mut item_end_offsets = Vec::with_capacity(entries.len());
 
     for (index, entry) in entries.iter().enumerate() {
-        if index > 0 {
-            lines.push(Line::from(""));
-        }
-
         let first_line = lines.len();
         let item = &entry.item;
+        let item_expanded = expanded;
+        let item_limits = if item_expanded {
+            limits.expanded()
+        } else {
+            limits
+        };
         match item {
-            TranscriptItem::Banner => {
+            TranscriptItem::Banner { .. } => {
                 lines.extend(super::super::banner::styled_lines(theme));
             }
             TranscriptItem::TurnSeparator => {
@@ -106,7 +166,7 @@ pub(super) fn render_projected_entries(
             TranscriptItem::ModelCall { provider, model } => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Model {provider}/{model}"),
                     theme.transcript.model,
                     theme,
@@ -116,7 +176,7 @@ pub(super) fn render_projected_entries(
             TranscriptItem::ModelResult(content) => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Model result: {content}"),
                     theme.transcript.model,
                     theme,
@@ -124,30 +184,53 @@ pub(super) fn render_projected_entries(
                 );
             }
             TranscriptItem::ModelReasoning { fidelity, content } => {
+                let elapsed = reasoning_elapsed(entries, index);
+                let label = match fidelity.as_str() {
+                    "summary" => "thought summary",
+                    _ => "thought",
+                };
+                if item_expanded {
+                    push_wrapped(
+                        &mut lines,
+                        blank_gutter(),
+                        &format!("{label} for {elapsed} · ctrl+o collapse"),
+                        theme.transcript.reasoning,
+                        theme,
+                        width,
+                    );
+                    push_wrapped(
+                        &mut lines,
+                        tree_gutter_pipe(),
+                        content,
+                        theme.transcript.reasoning,
+                        theme,
+                        width,
+                    );
+                } else {
+                    push_wrapped(
+                        &mut lines,
+                        blank_gutter(),
+                        &reasoning_summary(label, content, &elapsed),
+                        theme.transcript.reasoning,
+                        theme,
+                        width,
+                    );
+                }
+            }
+            TranscriptItem::ModelReasoningLive { elapsed } => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
-                    reasoning_title(fidelity),
+                    blank_gutter(),
+                    &format!("thinking · {elapsed}"),
                     theme.transcript.reasoning,
                     theme,
                     width,
-                );
-                push_bounded_detail(
-                    &mut lines,
-                    content,
-                    DetailRender {
-                        style: theme.transcript.reasoning,
-                        gutter: "    ",
-                    },
-                    theme,
-                    width,
-                    limits.output_lines,
                 );
             }
             TranscriptItem::ToolCall { name } => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Tool {name}"),
                     theme.transcript.tool,
                     theme,
@@ -160,30 +243,40 @@ pub(super) fn render_projected_entries(
                 error,
                 output,
                 exit_code,
+                path,
             } => {
-                let label = tool_result_label(name);
-                let (status, style) = if *ok {
-                    (String::new(), theme.transcript.tool)
-                } else {
+                let (heading, style) = if *ok {
+                    (tool_result_label(name), theme.transcript.tool)
+                } else if matches!(name.as_str(), "edit_file" | "apply_patch" | "apply-patch") {
                     (
-                        tool_failure_status(*exit_code, error),
+                        edit_failure_status(path.as_deref().unwrap_or(""), error),
                         theme.transcript.tool_error,
                     )
-                };
-                let heading = if status.is_empty() {
-                    label
                 } else {
-                    format!("{label} {status}")
+                    let label = tool_result_label(name);
+                    let status = tool_failure_status(*exit_code, error);
+                    (format!("{label} {status}"), theme.transcript.tool_error)
                 };
                 push_cell_parent(&mut lines, &heading, style, theme, width);
-                push_bounded_children(
-                    &mut lines,
-                    output,
-                    theme.transcript.muted,
-                    theme,
-                    width,
-                    limits.output_lines,
-                );
+                if *ok {
+                    push_bounded_children(
+                        &mut lines,
+                        output,
+                        theme.transcript.muted,
+                        theme,
+                        width,
+                        item_limits.output_lines,
+                    );
+                } else {
+                    push_bounded_failure_children(
+                        &mut lines,
+                        output,
+                        theme.transcript.muted,
+                        theme,
+                        width,
+                        item_limits.output_lines,
+                    );
+                }
             }
             TranscriptItem::ToolRun {
                 command,
@@ -191,6 +284,7 @@ pub(super) fn render_projected_entries(
                 error,
                 output,
                 exit_code,
+                grant_source,
             } => {
                 render_tool_run(
                     &mut lines,
@@ -200,21 +294,19 @@ pub(super) fn render_projected_entries(
                         error,
                         output,
                         exit_code: *exit_code,
+                        grant_source: grant_source.as_deref(),
                     },
                     theme,
                     width,
-                    limits.output_lines,
+                    item_limits.output_lines,
                 );
             }
             TranscriptItem::Exploration { summaries } => {
-                push_cell_parent(&mut lines, "Explored", theme.transcript.tool, theme, width);
-                push_child_rows(
-                    &mut lines,
-                    &super::coalesced_exploration_summaries(summaries),
-                    theme.transcript.muted,
-                    theme,
-                    width,
-                );
+                let rows =
+                    exploration_detail_rows(&super::coalesced_exploration_summaries(summaries));
+                let header = tool_group_header("explore", rows.len(), entry.timing.as_ref());
+                push_cell_parent(&mut lines, &header, theme.transcript.tool, theme, width);
+                push_child_rows(&mut lines, &rows, theme.transcript.muted, theme, width);
             }
             TranscriptItem::PermissionPrompt { capability, reason } => {
                 let text = if reason.is_empty() {
@@ -224,7 +316,7 @@ pub(super) fn render_projected_entries(
                 };
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &text,
                     theme.transcript.permission,
                     theme,
@@ -235,12 +327,22 @@ pub(super) fn render_projected_entries(
                 capability,
                 reason,
                 command,
+                scope_prefix,
+                prior_count,
+                selected_option,
+                companion_name,
             } => {
                 render_permission_ask(
                     &mut lines,
-                    capability,
-                    reason,
-                    command.as_deref(),
+                    PermissionAskView {
+                        capability,
+                        reason,
+                        command: command.as_deref(),
+                        scope_prefix: scope_prefix.as_deref(),
+                        prior_count: *prior_count,
+                        selected_option: *selected_option,
+                        companion_name: companion_name.as_deref(),
+                    },
                     theme,
                     width,
                 );
@@ -249,9 +351,20 @@ pub(super) fn render_projected_entries(
                 capability,
                 decision,
                 allowed,
+                grant_scope,
+                instruction,
             } => {
                 render_permission_decision(
-                    &mut lines, capability, decision, *allowed, theme, width,
+                    &mut lines,
+                    PermissionDecisionView {
+                        capability,
+                        decision,
+                        allowed: *allowed,
+                        grant_scope: grant_scope.as_deref(),
+                        instruction: instruction.as_deref(),
+                    },
+                    theme,
+                    width,
                 );
             }
             TranscriptItem::PatchProposed { path, old, new } => {
@@ -266,7 +379,7 @@ pub(super) fn render_projected_entries(
                     },
                     theme,
                     width,
-                    limits.patch_detail_lines,
+                    item_limits.patch_detail_lines,
                 );
             }
             TranscriptItem::PatchApplied { path, old, new } => {
@@ -279,7 +392,7 @@ pub(super) fn render_projected_entries(
                     },
                     theme,
                     width,
-                    limits.patch_detail_lines,
+                    item_limits.patch_detail_lines,
                 );
             }
             TranscriptItem::FileChange {
@@ -291,6 +404,7 @@ pub(super) fn render_projected_entries(
                 before_byte_len,
                 after_byte_len,
                 diff_redaction,
+                checkpoint_event_id,
             } => {
                 render_file_change_cell(
                     &mut lines,
@@ -303,6 +417,7 @@ pub(super) fn render_projected_entries(
                         before_byte_len: *before_byte_len,
                         after_byte_len: *after_byte_len,
                         diff_redaction,
+                        checkpoint_event_id: checkpoint_event_id.as_deref(),
                     },
                     theme,
                     width,
@@ -316,6 +431,7 @@ pub(super) fn render_projected_entries(
                 truncated,
                 truncation,
                 omitted_reason,
+                checkpoint_event_id,
             } => {
                 render_file_diff_cell(
                     &mut lines,
@@ -327,16 +443,32 @@ pub(super) fn render_projected_entries(
                         truncated: *truncated,
                         truncation,
                         omitted_reason: omitted_reason.as_deref(),
+                        checkpoint_event_id: checkpoint_event_id.as_deref(),
                     },
                     theme,
                     width,
-                    limits.output_lines,
+                    item_limits.output_lines,
+                );
+            }
+            TranscriptItem::WorkspaceRestore {
+                path,
+                checkpoint_event_id,
+            } => {
+                push_wrapped(
+                    &mut lines,
+                    blank_gutter(),
+                    &format!(
+                        "reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact"
+                    ),
+                    theme.transcript.muted,
+                    theme,
+                    width,
                 );
             }
             TranscriptItem::CheckStarted { name } => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Check started: {name}"),
                     theme.transcript.check,
                     theme,
@@ -352,7 +484,7 @@ pub(super) fn render_projected_entries(
                 };
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Check {name} {status}"),
                     style,
                     theme,
@@ -363,17 +495,34 @@ pub(super) fn render_projected_entries(
                     output,
                     DetailRender {
                         style: theme.transcript.muted,
-                        gutter: "  | ",
+                        gutter: tree_gutter_pipe(),
                     },
                     theme,
                     width,
-                    limits.output_lines,
+                    item_limits.output_lines,
+                );
+            }
+            TranscriptItem::ExtensionResult {
+                reference,
+                ok,
+                output,
+            } => {
+                render_extension_result(
+                    &mut lines,
+                    ExtensionResultRender {
+                        reference,
+                        ok: *ok,
+                        output,
+                        limit: item_limits.output_lines,
+                    },
+                    theme,
+                    width,
                 );
             }
             TranscriptItem::SessionSummary(summary) => {
                 push_wrapped(
                     &mut lines,
-                    "    ",
+                    blank_gutter(),
                     &format!("* Summary: {summary}"),
                     theme.transcript.control,
                     theme,
@@ -386,52 +535,282 @@ pub(super) fn render_projected_entries(
             TranscriptItem::WorkedDuration(duration) => {
                 render_worked_duration(&mut lines, duration, theme, width);
             }
+            TranscriptItem::TurnRecap { summary, files } => {
+                render_turn_recap(&mut lines, summary, files.as_deref(), theme, width);
+            }
+            TranscriptItem::ResumeBoundary {
+                label,
+                recovery_closure_appended,
+                warning_count,
+                events_replayed,
+            } => {
+                render_resume_boundary(
+                    &mut lines,
+                    ResumeBoundaryRender {
+                        label,
+                        recovery_closure_appended: *recovery_closure_appended,
+                        warning_count: *warning_count,
+                        events_replayed: *events_replayed,
+                    },
+                    theme,
+                    width,
+                );
+            }
+            TranscriptItem::Companion {
+                name,
+                task,
+                status,
+                rows,
+                ..
+            } => {
+                let expanded = item_expanded || item_limits.output_lines == usize::MAX;
+                render_companion_block(
+                    &mut lines,
+                    CompanionRender {
+                        name,
+                        task,
+                        status,
+                        rows,
+                        expanded,
+                    },
+                    theme,
+                    width,
+                );
+            }
             TranscriptItem::Error { source, message } => {
                 push_wrapped(
                     &mut lines,
-                    "  ! ",
+                    blank_gutter(),
+                    // The ✗ lives in the spine anchor (§1).
                     &format!("{source}: {message}"),
                     theme.transcript.error,
                     theme,
                     width,
                 );
             }
-        }
-
-        if let Some(timing) = &entry.timing {
-            if let Some(line) = lines.get_mut(first_line) {
-                append_timing(line, timing, theme, width);
+            TranscriptItem::Notice(message) => {
+                // No glyph, no source prefix — a plain muted line anchored
+                // by the default `•` spine bullet (review v2 §14.4).
+                push_wrapped(
+                    &mut lines,
+                    blank_gutter(),
+                    message,
+                    theme.transcript.muted,
+                    theme,
+                    width,
+                );
             }
         }
+
+        if first_line < lines.len() && is_meaningful_ledger_item(item) {
+            let stamp = timestamp_gutter(entry.timing.as_ref().map(|tm| tm.absolute.as_str()));
+            let anchor = spine_anchor(item, theme);
+            stamp_first_line(&mut lines[first_line], &stamp, anchor.as_ref(), theme);
+            if let Some(timing) = &entry.timing {
+                if !item_renders_inline_timing(item) && timestamp_gutter_shown() {
+                    append_timing(&mut lines[first_line], timing, theme, width);
+                }
+            }
+        } else if let Some(timing) = &entry.timing {
+            if timestamp_gutter_shown() {
+                if let Some(line) = lines.get_mut(first_line) {
+                    append_timing(line, timing, theme, width);
+                }
+            }
+        }
+        // §1: separation is the spine plus one blank line — applied after
+        // every rendered event (dividers and recaps included) so batches
+        // always end separated from whatever renders below. The renderer is
+        // the single owner of vertical rhythm; no other layer adds spacers
+        // around history content.
+        // Banner lines end with their own built-in blank; everything else
+        // gets the uniform one-blank separator here. Exception (review v2
+        // §3/§6): a run of consecutive `Notice` items stacks directly — no
+        // blank line between one notice and the next.
+        let next_is_notice_continuation = matches!(item, TranscriptItem::Notice(_))
+            && matches!(
+                entries.get(index + 1).map(|entry| &entry.item),
+                Some(TranscriptItem::Notice(_))
+            );
+        if first_line < lines.len()
+            && !matches!(item, TranscriptItem::Banner { .. })
+            && !next_is_notice_continuation
+        {
+            lines.push(Line::default());
+        }
+        item_end_offsets.push(lines.len());
     }
 
-    if let Some(footer) = super::turn_footer(entries) {
+    if let Some(footer) = show_turn_footer
+        .then(|| super::turn_footer(entries))
+        .flatten()
+    {
         push_wrapped(
             &mut lines,
-            "    ",
+            blank_gutter(),
             &footer,
             theme.transcript.muted,
             theme,
             width,
         );
+        // The footer belongs to the last entry's committed region.
+        if let Some(last) = item_end_offsets.last_mut() {
+            *last = lines.len();
+        }
     }
 
-    lines
+    (lines, item_end_offsets)
+}
+
+fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
+    super::item_wants_timestamp(item)
+}
+
+fn item_renders_inline_timing(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Exploration { .. } | TranscriptItem::Companion { .. }
+    )
+}
+
+fn tool_group_header(label: &str, steps: usize, timing: Option<&EventTiming>) -> String {
+    let mut parts = vec![label.to_owned(), step_count_label(steps)];
+    if timestamp_gutter_shown() {
+        if let Some(elapsed) = timing.and_then(|timing| timing.since_previous.as_deref()) {
+            parts.push(elapsed.to_owned());
+        }
+    }
+    parts.join(" · ")
+}
+
+fn step_count_label(steps: usize) -> String {
+    if steps == 1 {
+        "1 step".to_owned()
+    } else {
+        format!("{steps} steps")
+    }
+}
+
+fn exploration_detail_rows(rows: &[String]) -> Vec<String> {
+    let parsed = rows
+        .iter()
+        .map(|row| split_exploration_row(row))
+        .collect::<Vec<_>>();
+    let verb_width = parsed
+        .iter()
+        .map(|(verb, _)| verb.chars().count())
+        .max()
+        .unwrap_or(0);
+    parsed
+        .into_iter()
+        .map(|(verb, detail)| aligned_exploration_row(&verb, &detail, verb_width))
+        .collect()
+}
+
+fn split_exploration_row(row: &str) -> (String, String) {
+    for (prefix, verb) in [
+        ("Read ", "Read"),
+        ("Git ", "Git"),
+        ("List ", "List"),
+        ("Search ", "Search"),
+    ] {
+        if let Some(detail) = row.strip_prefix(prefix) {
+            return (verb.to_owned(), detail.to_owned());
+        }
+    }
+    ("Tool".to_owned(), row.to_owned())
+}
+
+fn aligned_exploration_row(verb: &str, detail: &str, verb_width: usize) -> String {
+    if detail.is_empty() {
+        verb.to_owned()
+    } else {
+        format!("{verb:<width$} {detail}", width = verb_width)
+    }
+}
+
+/// v2 anchor spine: glyph + style for an event's first row (§1). `None`
+/// keeps the blank spine (user messages carry the ▌ rail instead; separators
+/// have no anchor).
+fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)> {
+    let anchor = match item {
+        TranscriptItem::UserMessage(_)
+        | TranscriptItem::Banner { .. }
+        | TranscriptItem::TurnSeparator
+        | TranscriptItem::WorkedDuration(_)
+        | TranscriptItem::TurnRecap { .. } => return None,
+        TranscriptItem::ModelReasoning { .. } | TranscriptItem::ModelReasoningLive { .. } => {
+            (glyphs::thinking().to_owned(), theme.transcript.warning)
+        }
+        TranscriptItem::PermissionDecision { allowed, .. } => {
+            if allowed.unwrap_or(false) {
+                (glyphs::check().to_owned(), theme.transcript.added)
+            } else {
+                (glyphs::cross().to_owned(), theme.transcript.removed)
+            }
+        }
+        TranscriptItem::ResumeBoundary { .. } => {
+            (glyphs::check().to_owned(), theme.transcript.added)
+        }
+        TranscriptItem::Companion { .. } => (
+            glyphs::companion_glyph().to_owned(),
+            theme.transcript.companion,
+        ),
+        TranscriptItem::WorkspaceRestore { .. } => {
+            (glyphs::revert().to_owned(), theme.transcript.added)
+        }
+        TranscriptItem::Interrupted => (glyphs::interrupt().to_owned(), theme.transcript.warning),
+        TranscriptItem::Error { .. } => (glyphs::cross().to_owned(), theme.transcript.error),
+        _ => (glyphs::bullet().to_owned(), theme.transcript.gutter),
+    };
+    Some(anchor)
+}
+
+/// Stamp an event's first row: `[HH:MM:SS ]` (when the gutter is opted in)
+/// followed by the 2-cell spine anchor. Continuation rows keep the blank
+/// prefix from `blank_gutter()`.
+fn stamp_first_line(
+    line: &mut Line<'static>,
+    stamp: &str,
+    anchor: Option<&(String, Style)>,
+    theme: &Theme,
+) {
+    let prefix_width = gutter_width();
+    let has_prefix = line
+        .spans
+        .first()
+        .is_some_and(|span| display_width(span.content.as_ref()) == prefix_width);
+    if !has_prefix {
+        return;
+    }
+    let mut spans = Vec::with_capacity(2);
+    if !stamp.is_empty() {
+        spans.push(Span::styled(stamp.to_owned(), theme.transcript.gutter));
+    }
+    match anchor {
+        Some((glyph, style)) => {
+            let pad = crate::ui::text::SPINE_WIDTH.saturating_sub(display_width(glyph));
+            spans.push(Span::styled(format!("{glyph}{}", " ".repeat(pad)), *style));
+        }
+        None => spans.push(Span::styled(
+            crate::ui::text::BLANK_SPINE.to_owned(),
+            theme.transcript.gutter,
+        )),
+    }
+    line.spans.splice(0..1, spans);
 }
 
 fn render_assistant_prose(content: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     // Leave one right-edge cell unused. Exact-width writes can put terminals
     // into auto-wrap state, which makes table rows look clipped or disturbed
     // until a resize forces a different layout.
-    let prose_width = width
-        .saturating_sub(ASSISTANT_PROSE_GUTTER.len() as u16)
-        .saturating_sub(1);
-    markdown::render_agent_markdown(content, theme, prose_width.max(1))
+    let prose_width = content_width(width).saturating_sub(1).max(1);
+    markdown::render_agent_markdown(content, theme, prose_width as u16)
         .into_iter()
         .map(|mut line| {
             let mut spans = Vec::with_capacity(line.spans.len() + 1);
             spans.push(Span::styled(
-                ASSISTANT_PROSE_GUTTER.to_owned(),
+                blank_gutter().to_owned(),
                 theme.transcript.gutter,
             ));
             spans.append(&mut line.spans);
@@ -452,11 +831,12 @@ fn append_timing(line: &mut Line<'static>, timing: &EventTiming, theme: &Theme, 
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn bottom_aligned(lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
     bottom_aligned_with_offset(lines, height, 0)
 }
 
+#[cfg(test)]
 pub(super) fn bottom_aligned_with_offset(
     lines: Vec<Line<'static>>,
     height: u16,
@@ -474,9 +854,9 @@ pub(super) fn bottom_aligned_with_offset(
 
 fn tool_result_label(name: &str) -> String {
     match name {
-        "read_file" | "git_status" | "git_diff" => "Explored".to_owned(),
-        "run_shell" => "Ran".to_owned(),
-        "edit_file" => "Edited".to_owned(),
+        "read_file" | "git_status" | "git_diff" => "explore".to_owned(),
+        "run_shell" => "bash".to_owned(),
+        "edit_file" => "edit".to_owned(),
         "" => "Used tool".to_owned(),
         _ => format!("Used tool {name}"),
     }
@@ -487,7 +867,6 @@ struct DetailRender {
     gutter: &'static str,
 }
 
-#[allow(dead_code)]
 fn push_bounded_detail(
     lines: &mut Vec<Line<'static>>,
     detail: &str,
@@ -527,14 +906,85 @@ fn push_bounded_detail(
     }
 }
 
-fn reasoning_title(fidelity: &str) -> &'static str {
-    match fidelity {
-        "summary" => "Thinking (summary)",
-        _ => "Thinking",
-    }
+fn reasoning_summary(label: &str, content: &str, elapsed: &str) -> String {
+    // The ✱ lives in the spine anchor (§1).
+    format!(
+        "{label} for {elapsed} — {} · ctrl+o expand",
+        reasoning_gist(content)
+    )
 }
 
-#[allow(dead_code)]
+fn reasoning_elapsed(entries: &[ProjectedEntry], index: usize) -> String {
+    let start = entries.get(..index).and_then(|prior| {
+        prior.iter().rev().find_map(|entry| match &entry.item {
+            TranscriptItem::ModelCall { .. } => entry.timing.as_ref(),
+            _ => None,
+        })
+    });
+    let end = entries
+        .get(index)
+        .and_then(|entry| entry.timing.as_ref())
+        .or_else(|| {
+            entries
+                .get(index + 1..)?
+                .iter()
+                .take_while(|entry| !matches!(entry.item, TranscriptItem::ModelCall { .. }))
+                .find_map(|entry| match &entry.item {
+                    TranscriptItem::ModelResult(_) => entry.timing.as_ref(),
+                    _ => None,
+                })
+        });
+    if let (Some(start), Some(end)) = (start, end) {
+        if let (Some(start), Some(end)) = (
+            parse_clock_seconds(&start.absolute),
+            parse_clock_seconds(&end.absolute),
+        ) {
+            return super::format_duration((end - start).rem_euclid(24 * 60 * 60));
+        }
+    }
+    end.and_then(|timing| {
+        timing
+            .since_previous
+            .as_deref()
+            .or(timing.since_start.as_deref())
+            .filter(|elapsed| !elapsed.is_empty())
+            .map(ToOwned::to_owned)
+    })
+    .unwrap_or_else(|| "0s".to_owned())
+}
+
+fn parse_clock_seconds(clock: &str) -> Option<i64> {
+    let mut parts = clock.split(':');
+    let hours = parts.next()?.parse::<i64>().ok()?;
+    let minutes = parts.next()?.parse::<i64>().ok()?;
+    let seconds = parts.next()?.parse::<i64>().ok()?;
+    (parts.next().is_none() && hours < 24 && minutes < 60 && seconds < 60)
+        .then_some(hours * 3600 + minutes * 60 + seconds)
+}
+
+fn reasoning_gist(content: &str) -> String {
+    let first_sentence = content
+        .split_terminator(['.', '!', '?'])
+        .next()
+        .unwrap_or(content)
+        .trim();
+    let source = if first_sentence.is_empty() {
+        content.trim()
+    } else {
+        first_sentence
+    };
+    truncate_gist(source, 60)
+}
+
+fn truncate_gist(source: &str, max_chars: usize) -> String {
+    let mut chars = source.chars();
+    let mut out = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
 fn push_wrapped(
     lines: &mut Vec<Line<'static>>,
     gutter: &'static str,
@@ -543,43 +993,45 @@ fn push_wrapped(
     theme: &Theme,
     width: u16,
 ) {
-    let body_width = usize::from(width)
-        .saturating_sub(display_width(gutter))
-        .max(1);
-
-    for segment in wrap_text(text, body_width) {
+    debug_assert!(
+        is_ledger_gutter(gutter),
+        "invalid ledger gutter: {gutter:?}"
+    );
+    for segment in wrap_text(text, content_width(width)) {
         push_wrapped_segment(lines, gutter, segment, style, theme);
     }
 }
 
 fn push_wrapped_with_continuation(
     lines: &mut Vec<Line<'static>>,
-    gutters: (&'static str, &'static str),
+    content_prefixes: (&'static str, &'static str),
     text: &str,
     style: ratatui::style::Style,
     theme: &Theme,
     width: u16,
 ) {
-    let (first_gutter, next_gutter) = gutters;
-    let body_width = usize::from(width)
-        .saturating_sub(display_width(first_gutter).max(display_width(next_gutter)))
+    let (first_prefix, next_prefix) = content_prefixes;
+    let body_width = content_width(width)
+        .saturating_sub(display_width(first_prefix).max(display_width(next_prefix)))
         .max(1);
-
     let mut first_segment = true;
     for raw_line in text.split('\n') {
         for segment in wrap_text(raw_line, body_width) {
-            let gutter = if first_segment {
-                first_gutter
+            let prefix = if first_segment {
+                first_prefix
             } else {
-                next_gutter
+                next_prefix
             };
             first_segment = false;
-            push_wrapped_segment(lines, gutter, segment, style, theme);
+            lines.push(Line::from(vec![
+                Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
+                Span::styled(prefix.to_owned(), theme.transcript.gutter),
+                Span::styled(segment, style),
+            ]));
         }
     }
 }
 
-#[allow(dead_code)]
 fn push_wrapped_segment(
     lines: &mut Vec<Line<'static>>,
     gutter: &'static str,
@@ -587,8 +1039,93 @@ fn push_wrapped_segment(
     style: ratatui::style::Style,
     theme: &Theme,
 ) {
-    lines.push(Line::from(vec![
-        Span::styled(gutter.to_owned(), theme.transcript.gutter),
-        Span::styled(segment, style),
-    ]));
+    debug_assert!(
+        is_ledger_gutter(gutter),
+        "invalid ledger gutter: {gutter:?}"
+    );
+    if gutter.is_empty() {
+        lines.push(Line::from(vec![Span::styled(segment, style)]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(gutter.to_owned(), theme.transcript.gutter),
+            Span::styled(segment, style),
+        ]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exploration_group_header_carries_steps_elapsed_and_tree_children() {
+        let entries = vec![ProjectedEntry {
+            item: TranscriptItem::Exploration {
+                summaries: vec!["Read Cargo.toml".to_owned(), "Git diff".to_owned()],
+            },
+            timing: Some(EventTiming {
+                absolute: "12:00:06".to_owned(),
+                since_previous: Some("6s".to_owned()),
+                since_start: Some("6s".to_owned()),
+            }),
+        }];
+
+        // Exploration step-elapsed is a timing decoration, toggle-gated in
+        // the real app (review v2 §6); opt in here to exercise it directly.
+        let lines = crate::ui::text::with_timestamp_gutter(true, || {
+            render_projected_entries(
+                &entries,
+                &Theme::default(),
+                80,
+                TranscriptRenderLimits::default(),
+            )
+        });
+        let text = plain_text(&lines);
+
+        assert!(text.contains("explore · 2 steps · 6s"), "text: {text:?}");
+        assert!(text.contains("├ Read Cargo.toml"), "text: {text:?}");
+        assert!(text.contains("└ Git  diff"), "text: {text:?}");
+        assert!(!text.contains("└ Read Cargo.toml"), "text: {text:?}");
+        assert!(!text.contains("├ Git  diff"), "text: {text:?}");
+    }
+
+    #[test]
+    fn successful_shell_output_promotes_informative_result_line() {
+        let item = TranscriptItem::ToolRun {
+            command: "cargo test".to_owned(),
+            ok: true,
+            error: String::new(),
+            output: "line 1\nline 2\nline 3\nline 4\ntest result: ok. 12 passed; 0 failed\ntail 1\ntail 2\n".to_owned(),
+            exit_code: Some(0),
+            grant_source: None,
+        };
+
+        let lines = render_projected_items(
+            &[item],
+            &Theme::default(),
+            96,
+            TranscriptRenderLimits::default().with_output_lines(4),
+        );
+        let text = plain_text(&lines);
+
+        assert!(
+            text.contains("test result: ok. 12 passed; 0 failed")
+                && text.contains("tail 2")
+                && !text.contains("line 1"),
+            "text: {text:?}"
+        );
+    }
+
+    fn plain_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }

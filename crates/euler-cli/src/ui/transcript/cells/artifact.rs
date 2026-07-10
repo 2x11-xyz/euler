@@ -1,4 +1,4 @@
-use crate::ui::text::{display_width, truncate_display};
+use crate::ui::text::{blank_gutter, display_width, gutter_width, truncate_display};
 use crate::ui::theme::Theme;
 use ratatui::{
     style::Style,
@@ -18,6 +18,7 @@ pub(in crate::ui::transcript) struct ArtifactOutputRows {
 
 pub(in crate::ui::transcript) struct ArtifactCellRender<'a> {
     pub(in crate::ui::transcript) title: &'a str,
+    pub(in crate::ui::transcript) title_suffix: Option<&'a str>,
     pub(in crate::ui::transcript) rows: &'a [Line<'static>],
     pub(in crate::ui::transcript) footer: &'a str,
     pub(in crate::ui::transcript) style: Style,
@@ -51,9 +52,7 @@ pub(in crate::ui::transcript) fn artifact_output_rows(
         .take(OUTPUT_PREVIEW_HEAD_LINES)
         .cloned()
         .collect::<Vec<_>>();
-    preview.push(format!(
-        "... {hidden} hidden lines ({total_rows} total; Ctrl+O expands)"
-    ));
+    preview.push(format!("… {hidden} more lines · ctrl+o expand"));
     preview.extend(
         rows.iter()
             .skip(total_rows.saturating_sub(OUTPUT_PREVIEW_TAIL_LINES))
@@ -111,25 +110,55 @@ pub(in crate::ui::transcript) fn push_artifact_cell(
     theme: &Theme,
 ) {
     let width = artifact_width(cell.width);
+    let body_width = width.saturating_sub(gutter_width()).max(ARTIFACT_MIN_WIDTH);
     let background_style = artifact_background_style(theme);
-    let border_style = background_style.patch(cell.style);
-    lines.push(
-        Line::from(Span::styled(
-            edge_row(width, '┌', '┐', cell.title),
-            border_style,
-        ))
-        .style(background_style),
-    );
+    let title_style = background_style.patch(cell.style);
+    let suffix_style = background_style.patch(theme.transcript.muted);
+    let mut title_spans = vec![Span::styled(
+        blank_gutter().to_owned(),
+        background_style.patch(theme.transcript.gutter),
+    )];
+    title_spans.extend(flat_title_spans(
+        body_width,
+        cell.title,
+        cell.title_suffix,
+        cell.footer,
+        title_style,
+        suffix_style,
+    ));
+    lines.push(Line::from(title_spans).style(background_style));
     for row in cell.rows {
-        lines.push(artifact_body_line(width, row, theme, border_style));
+        lines.push(artifact_body_line(body_width, row, theme));
     }
-    lines.push(
-        Line::from(Span::styled(
-            edge_row(width, '└', '┘', cell.footer),
-            border_style,
-        ))
-        .style(background_style),
-    );
+}
+
+fn flat_title_spans(
+    width: usize,
+    title: &str,
+    suffix: Option<&str>,
+    footer: &str,
+    title_style: Style,
+    suffix_style: Style,
+) -> Vec<Span<'static>> {
+    let mut parts = Vec::new();
+    push_title_part(&mut parts, sanitize_artifact_text(title), title_style);
+    if let Some(suffix) = suffix {
+        push_title_part(&mut parts, sanitize_artifact_text(suffix), suffix_style);
+    }
+    push_title_part(&mut parts, sanitize_artifact_text(footer), title_style);
+    fit_artifact_spans(&parts, width)
+}
+
+fn push_title_part(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    let content = if spans.is_empty() {
+        text
+    } else {
+        format!(" · {text}")
+    };
+    spans.push(Span::styled(content, style));
 }
 
 fn sanitize_artifact_text(source: &str) -> String {
@@ -192,42 +221,20 @@ fn artifact_width(width: u16) -> usize {
     usize::from(width).max(ARTIFACT_MIN_WIDTH)
 }
 
-fn edge_row(width: usize, left: char, right: char, label: &str) -> String {
-    let inner_width = width.saturating_sub(2);
-    let label = sanitize_artifact_text(label);
-    let label = truncate_edge_label(&format!("─ {label} "), inner_width);
-    let fill = "─".repeat(inner_width.saturating_sub(display_width(&label)));
-    format!("{left}{label}{fill}{right}")
-}
-
-fn truncate_edge_label(label: &str, max_width: usize) -> String {
-    if display_width(label) <= max_width {
-        return label.to_owned();
-    }
-    if max_width <= 3 {
-        return truncate_display(label, max_width);
-    }
-    format!("{}...", truncate_display(label, max_width - 3))
-}
-
-fn artifact_body_line(
-    width: usize,
-    row: &Line<'static>,
-    theme: &Theme,
-    border_style: Style,
-) -> Line<'static> {
-    let content_width = width.saturating_sub(ARTIFACT_BODY_PADDING + 2);
-    let content = fit_artifact_spans(&row.spans, content_width);
+fn artifact_body_line(width: usize, row: &Line<'static>, theme: &Theme) -> Line<'static> {
+    let body_width = width.saturating_sub(ARTIFACT_BODY_PADDING);
+    let content = fit_artifact_spans(&row.spans, body_width);
     let content_used = spans_width(&content);
-    let padding = " ".repeat(content_width.saturating_sub(content_used));
+    let padding = " ".repeat(body_width.saturating_sub(content_used));
     let mut spans = vec![
-        Span::styled("│", border_style),
-        Span::styled(" ", theme.transcript.muted),
+        Span::styled(
+            blank_gutter().to_owned(),
+            artifact_background_style(theme).patch(theme.transcript.gutter),
+        ),
+        Span::styled("  ", theme.transcript.muted),
     ];
     spans.extend(content);
     spans.push(Span::styled(padding, theme.transcript.muted));
-    spans.push(Span::styled(" ", theme.transcript.muted));
-    spans.push(Span::styled("│", border_style));
     Line::from(spans).style(artifact_background_style(theme))
 }
 
@@ -280,7 +287,7 @@ mod tests {
     fn artifact_body_line_sanitizes_shell_rows_through_span_fitter() {
         let theme = Theme::default();
         let row = Line::from(Span::raw("\u{1b}[31mred\twide\r\u{8}tail"));
-        let text = line_text(&artifact_body_line(32, &row, &theme, theme.transcript.tool));
+        let text = line_text(&artifact_body_line(32, &row, &theme));
 
         assert!(!text.contains('\u{1b}'), "text: {text:?}");
         assert!(!text.contains('\t'), "text: {text:?}");
@@ -299,6 +306,7 @@ mod tests {
             &mut lines,
             ArtifactCellRender {
                 title: "title",
+                title_suffix: None,
                 rows: &rows,
                 footer: "footer",
                 style: theme.transcript.tool,
@@ -315,12 +323,35 @@ mod tests {
             Some(theme.surfaces.transcript.background)
         );
         assert_eq!(
-            lines[1].spans[0].style.bg,
+            lines[1].style.bg,
             Some(theme.surfaces.transcript.background)
         );
+    }
+
+    #[test]
+    fn artifact_title_suffix_uses_muted_style() {
+        let theme = Theme::default();
+        let mut lines = Vec::new();
+        push_artifact_cell(
+            &mut lines,
+            ArtifactCellRender {
+                title: "File modified src/lib.rs",
+                title_suffix: Some("ckpt e1234"),
+                rows: &[],
+                footer: "metadata only",
+                style: theme.transcript.patch,
+                width: 80,
+            },
+            &theme,
+        );
+        let suffix = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("ckpt e1234"))
+            .expect("checkpoint suffix span");
         assert_eq!(
-            lines[1].spans.last().expect("right border").style.bg,
-            Some(theme.surfaces.transcript.background)
+            suffix.style,
+            artifact_background_style(&theme).patch(theme.transcript.muted)
         );
     }
 

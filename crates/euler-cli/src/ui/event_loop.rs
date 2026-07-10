@@ -22,8 +22,8 @@ pub enum UiEvent {
     Input(InputEvent),
     RenderRequested(Region, RedrawLevel),
     Resize { width: u16, height: u16 },
+    FocusChanged(bool),
     Signal(TerminalSignal),
-    Tick,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +31,7 @@ pub enum UiAction {
     InputBatch(Vec<InputEvent>),
     Render(DirtyRegions),
     Resize { width: u16, height: u16 },
+    FocusChanged(bool),
     InterruptCurrentTurn,
     Shutdown,
 }
@@ -66,6 +67,7 @@ pub struct EventLoop {
     dirty: DirtyRegions,
     pending_input: Vec<InputEvent>,
     pending_resize: Option<(u16, u16)>,
+    pending_focus: Option<bool>,
     pending_interrupt: bool,
     pending_shutdown: bool,
 }
@@ -82,6 +84,7 @@ impl EventLoop {
             dirty: DirtyRegions::new(),
             pending_input: Vec::new(),
             pending_resize: None,
+            pending_focus: None,
             pending_interrupt: false,
             pending_shutdown: false,
         }
@@ -98,13 +101,15 @@ impl EventLoop {
                 self.pending_resize = Some((width, height));
                 self.dirty.mark_resize();
             }
+            UiEvent::FocusChanged(focused) => {
+                self.pending_focus = Some(focused);
+            }
             UiEvent::Signal(TerminalSignal::Interrupt) => {
                 self.pending_interrupt = true;
             }
             UiEvent::Signal(TerminalSignal::Terminate) => {
                 self.pending_shutdown = true;
             }
-            UiEvent::Tick => {}
         }
     }
 
@@ -116,6 +121,7 @@ impl EventLoop {
             self.pending_interrupt = false;
             self.pending_input.clear();
             self.pending_resize = None;
+            self.pending_focus = None;
             let _ = self.dirty.take();
             self.next_frame_at = now + self.frame_interval;
             actions.push(UiAction::Shutdown);
@@ -127,6 +133,10 @@ impl EventLoop {
             actions.push(UiAction::InterruptCurrentTurn);
         }
 
+        if let Some(focused) = self.pending_focus.take() {
+            actions.push(UiAction::FocusChanged(focused));
+        }
+
         if !self.pending_input.is_empty() {
             actions.push(UiAction::InputBatch(std::mem::take(
                 &mut self.pending_input,
@@ -134,10 +144,13 @@ impl EventLoop {
         }
 
         if let Some((width, height)) = self.pending_resize.take() {
-            // The resize action replays history and repaints the full canvas
-            // unconditionally, so a queued Render in the same batch would only
-            // paint the same frame twice. Consume the dirty state and re-arm
-            // the frame gate instead.
+            // Only the latest size in a batch matters (drag ticks coalesce
+            // here). The resize action re-renders the full canvas at the new
+            // width — scrollback commits stay suspended until the size is
+            // quiescent (terminal.rs RESIZE_COMMIT_QUIESCENCE) so a drag
+            // never appends re-wrapped copies per tick (review v2 §11/§12).
+            // A queued Render in the same batch would paint the same frame
+            // twice; consume the dirty state and re-arm the frame gate.
             let _ = self.dirty.take();
             self.next_frame_at = now + self.frame_interval;
             actions.push(UiAction::Resize { width, height });
@@ -154,6 +167,7 @@ impl EventLoop {
     pub fn poll_timeout(&self, now: Instant) -> Duration {
         if self.pending_shutdown
             || self.pending_interrupt
+            || self.pending_focus.is_some()
             || !self.pending_input.is_empty()
             || self.pending_resize.is_some()
         {

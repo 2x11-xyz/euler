@@ -12,12 +12,15 @@
 //! row source so they cannot drift.
 
 use super::theme::Theme;
+#[cfg(test)]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
+    widgets::{Paragraph, Widget},
+};
+use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 
 /// Letterform rows, excluding the rail column. Each row is rendered as
@@ -54,22 +57,22 @@ const CAPTION_LINE: usize = FIRST_WORDMARK_LINE + WORDMARK_BODY.len() + 1;
 /// blank + wordmark rows + blank + caption + blank.
 const HEIGHT: u16 = WORDMARK_BODY.len() as u16 + 4;
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn height() -> u16 {
     HEIGHT
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn banner_widget(theme: &Theme) -> BannerWidget<'_> {
     BannerWidget { theme }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub struct BannerWidget<'a> {
     theme: &'a Theme,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Widget for BannerWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         Paragraph::new(styled_lines(self.theme)).render(area, buf);
@@ -119,7 +122,7 @@ pub fn render(_width: usize) -> Vec<String> {
 pub fn ansi_string(color: bool) -> String {
     if !color {
         let mut out = String::new();
-        for line in render(0) {
+        for line in render(usize::MAX) {
             out.push_str(&line);
             out.push('\n');
         }
@@ -236,6 +239,14 @@ mod tests {
     }
 
     #[test]
+    fn banner_has_no_orientation_line() {
+        let joined = plain().join("\n");
+        assert!(!joined.contains("new session"));
+        assert!(!joined.contains("resumable with /resume"));
+        assert!(!joined.contains("for commands"));
+    }
+
+    #[test]
     fn no_color_rendering_has_zero_escapes() {
         let out = ansi_string(false);
         assert!(!out.contains('\x1b'), "no SGR escapes without color");
@@ -290,6 +301,7 @@ mod tests {
         let contents = terminal.backend().screen_contents();
         assert!(contents.contains("██▄▄"));
         assert!(contents.contains("e^(iπ) + 1 = 0"));
+        assert!(!contents.contains("new session"));
         assert!(contents.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     }
 }

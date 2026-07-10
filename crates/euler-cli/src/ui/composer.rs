@@ -1,8 +1,14 @@
 use super::text::display_width;
 
-const DEFAULT_MAX_VISIBLE_LINES: usize = 5;
-// Collapse pasted input as soon as it exceeds the composer rows a user can scan.
-const LARGE_PASTE_LINE_LIMIT: usize = DEFAULT_MAX_VISIBLE_LINES;
+// Spec v2.1 §13.4/§13.8: raised from the prior 6-line cap so the 8-row
+// slash palette (which shares the composer's rail-bounded container) never
+// clips against the footer.
+const DEFAULT_MAX_VISIBLE_LINES: usize = 12;
+// Collapse pasted input as soon as it exceeds the rows a user can scan at a
+// glance. Deliberately independent of `DEFAULT_MAX_VISIBLE_LINES`: raising
+// the composer's scroll capacity should not change when a paste collapses
+// into a placeholder token.
+const LARGE_PASTE_LINE_LIMIT: usize = 5;
 const LARGE_PASTE_CHAR_LIMIT: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +18,8 @@ pub struct PasteTokenId(u64);
 enum DraftSegment {
     Text(String),
     Paste(PasteSegment),
+    /// Workspace file mention inserted via `@` palette (atomic, user-role style).
+    Mention(MentionSegment),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +27,12 @@ struct PasteSegment {
     id: PasteTokenId,
     label: String,
     payload: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MentionSegment {
+    /// Workspace-relative path shown and submitted.
+    path: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -72,6 +86,30 @@ impl ComposerDraft {
         Some(id)
     }
 
+    /// Insert a workspace file mention as an atomic user-role token.
+    pub fn insert_mention(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        self.splice_at_cursor(vec![DraftSegment::Mention(MentionSegment {
+            path: path.to_owned(),
+        })]);
+    }
+
+    /// Paths attached via `@` mentions, in composer order.
+    #[cfg(test)]
+    pub fn mentioned_paths(&self) -> Vec<String> {
+        self.segments
+            .iter()
+            .filter_map(|segment| match segment {
+                DraftSegment::Mention(mention) => Some(mention.path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn set_scroll_line(&mut self, scroll_line: usize) {
         self.scroll_line = scroll_line;
     }
@@ -116,6 +154,7 @@ impl ComposerDraft {
         self.preferred_column = None;
     }
 
+    #[cfg(test)]
     pub fn move_up(&mut self) {
         let units = self.render_units();
         let lines = line_ranges(&units);
@@ -126,6 +165,7 @@ impl ComposerDraft {
         self.move_to_line_column(&units, &lines, line_index, line_index - 1);
     }
 
+    #[cfg(test)]
     pub fn move_down(&mut self) {
         let units = self.render_units();
         let lines = line_ranges(&units);
@@ -214,6 +254,7 @@ impl ComposerDraft {
         lines[current_line_index(&lines, self.cursor)]
     }
 
+    #[cfg(test)]
     fn move_to_line_column(
         &mut self,
         units: &[RenderUnit],
@@ -248,6 +289,7 @@ impl DraftSegment {
         match self {
             Self::Text(text) => text.clone(),
             Self::Paste(paste) => paste.label.clone(),
+            Self::Mention(mention) => format!("@{}", mention.path),
         }
     }
 
@@ -255,6 +297,8 @@ impl DraftSegment {
         match self {
             Self::Text(text) => text.clone(),
             Self::Paste(paste) => paste.payload.clone(),
+            // Path only: the agent receives a file reference, not a decorative @.
+            Self::Mention(mention) => mention.path.clone(),
         }
     }
 }
@@ -263,6 +307,7 @@ impl DraftSegment {
 enum RenderUnit {
     Text(char),
     Paste(String),
+    Mention(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,10 +334,11 @@ struct VisualRow {
 }
 
 impl RenderUnit {
+    #[cfg(test)]
     fn display_width(&self) -> usize {
         match self {
             Self::Text(ch) => unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(0),
-            Self::Paste(label) => display_width(label),
+            Self::Paste(label) | Self::Mention(label) => display_width(label),
         }
     }
 
@@ -307,6 +353,9 @@ fn render_units(segments: &[DraftSegment]) -> Vec<RenderUnit> {
         match segment {
             DraftSegment::Text(text) => units.extend(text.chars().map(RenderUnit::Text)),
             DraftSegment::Paste(paste) => units.push(RenderUnit::Paste(paste.label.clone())),
+            DraftSegment::Mention(mention) => {
+                units.push(RenderUnit::Mention(format!("@{}", mention.path)));
+            }
         }
     }
     units
@@ -317,7 +366,7 @@ fn segment_units(segments: &[DraftSegment]) -> usize {
         .iter()
         .map(|segment| match segment {
             DraftSegment::Text(text) => text.chars().count(),
-            DraftSegment::Paste(_) => 1,
+            DraftSegment::Paste(_) | DraftSegment::Mention(_) => 1,
         })
         .sum()
 }
@@ -350,11 +399,11 @@ fn split_segment(
 ) -> bool {
     match segment {
         DraftSegment::Text(text) => split_text_segment(text, remaining, left, right),
-        DraftSegment::Paste(_) if *remaining == 0 => {
+        DraftSegment::Paste(_) | DraftSegment::Mention(_) if *remaining == 0 => {
             right.push(segment.clone());
             true
         }
-        DraftSegment::Paste(_) => {
+        DraftSegment::Paste(_) | DraftSegment::Mention(_) => {
             left.push(segment.clone());
             *remaining = remaining.saturating_sub(1);
             false
@@ -430,6 +479,7 @@ fn current_line_index(lines: &[LineRange], cursor: usize) -> usize {
         .unwrap_or_else(|| lines.len().saturating_sub(1))
 }
 
+#[cfg(test)]
 fn display_column(units: &[RenderUnit], range: LineRange) -> usize {
     units[range.start..range.end]
         .iter()
@@ -437,6 +487,7 @@ fn display_column(units: &[RenderUnit], range: LineRange) -> usize {
         .sum()
 }
 
+#[cfg(test)]
 fn cursor_display_column(units: &[RenderUnit], line: LineRange, cursor: usize) -> usize {
     display_column(
         units,
@@ -447,6 +498,7 @@ fn cursor_display_column(units: &[RenderUnit], line: LineRange, cursor: usize) -
     )
 }
 
+#[cfg(test)]
 fn offset_for_column(units: &[RenderUnit], line: LineRange, column: usize) -> usize {
     let mut width = 0;
     for (offset, unit) in units[line.start..line.end].iter().enumerate() {
@@ -462,10 +514,6 @@ fn offset_for_column(units: &[RenderUnit], line: LineRange, column: usize) -> us
 mod render;
 
 pub use render::*;
-
-fn logical_lines(draft: &ComposerDraft) -> Vec<String> {
-    draft.render_text().split('\n').map(str::to_owned).collect()
-}
 
 fn normalize_lf(input: &str) -> String {
     let mut output = String::with_capacity(input.len());

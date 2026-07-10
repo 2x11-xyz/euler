@@ -323,7 +323,10 @@ fn headless_observer_companion_observe_composition_persists_artifact() {
 }
 
 #[test]
-fn headless_code_swarm_review_composition_persists_report_artifact() {
+fn headless_code_swarm_review_spawns_reviewer_and_persists_report_artifact() {
+    // One command runs the whole swarm: the extension spawns its reviewer
+    // through HostApi::spawn_agent and consolidates the outcomes itself —
+    // no host-side brief/report orchestration.
     let (temp, mut session) = companion_test_session(vec![
         FixtureResponse::Assistant("implementation complete".to_owned()),
         FixtureResponse::Assistant("Finding: boundary condition needs coverage".to_owned()),
@@ -332,24 +335,25 @@ fn headless_code_swarm_review_composition_persists_report_artifact() {
         .run_turn("implement a tiny change")
         .expect("seed turn");
 
-    let brief_line = execute_headless_extension_run(
+    let report_line = execute_headless_extension_run(
         &mut session,
-        "code-swarm.review-brief {\"reviewers\":[\"tests\"],\"max_tokens\":2048}",
+        "code-swarm.review {\"reviewers\":[\"tests\"],\"max_tokens\":2048}",
     );
-    assert_eq!(brief_line["type"], json!("extension_run_result"));
-    let brief = brief_line["result"]["briefs"][0].clone();
-    let companion_line = execute_headless_companion_run(&mut session, &brief.to_string());
-    assert_eq!(companion_line["type"], json!("companion_run_result"));
-    let result_event_id = companion_line["result_event_id"]
-        .as_str()
-        .expect("result id");
-
-    let report_line =
-        execute_headless_extension_run(&mut session, "code-swarm.review-report {\"limit\":32}");
 
     assert_eq!(report_line["type"], json!("extension_run_result"));
     let result = &report_line["result"];
     assert_eq!(result["reviewer_count"], json!(1));
+    // Inherited target comes back resolved from the recorded spawn.
+    assert_eq!(result["reviewers"][0]["provider"], json!("fixture"));
+    assert_eq!(result["reviewers"][0]["model"], json!("echo"));
+    assert_eq!(result["reviewers"][0]["ok"], json!(true));
+    let result_event_id = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .expect("reviewer agent.result recorded")
+        .id
+        .clone();
     let relative_path = result["relative_path"].as_str().expect("relative path");
     let artifact_path = temp.path().join(relative_path);
     let artifact_bytes = std::fs::read(artifact_path).expect("artifact bytes");

@@ -1,5 +1,5 @@
 use super::theme::ThemeChoice;
-use euler_core::{ApprovalMode, ReasoningEffort};
+use euler_core::{ActiveGrant, ApprovalMode, GrantSource, ReasoningEffort};
 use euler_sdk::Capability;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +15,130 @@ pub struct CommandContext {
     pub effort_choices: Vec<EffortChoice>,
     pub theme_choices: Vec<ThemeChoiceItem>,
     pub resume_items: Vec<ResumeItem>,
+    pub checkpoint_items: Vec<CheckpointItem>,
+    /// Bundled + linked extensions for the `/extension` manager and palette.
+    pub extension_items: Vec<ExtensionManagerItem>,
+    /// Extension slash entries (⋄ annotated in the palette).
+    pub extension_slash_commands: Vec<ExtensionSlashCommand>,
+    /// Saved `/code-swarm` reviewer model set (provider::model strings).
+    pub code_swarm_models: Vec<String>,
+}
+
+/// One extension row for the `/extension` manager picker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionManagerItem {
+    pub id: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub bundled: bool,
+    pub materialization: Option<String>,
+    pub version: String,
+    pub commands: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub audit_status: Option<String>,
+}
+
+impl ExtensionManagerItem {
+    pub fn label(&self) -> String {
+        let mark = if self.enabled { "●" } else { "○" };
+        let kind = if self.bundled {
+            "bundled"
+        } else {
+            self.materialization.as_deref().unwrap_or("linked")
+        };
+        format!("{mark} {}  ({kind})", self.id)
+    }
+
+    pub fn details_text(&self) -> String {
+        let mut lines = vec![
+            format!("{}  v{}", self.display_name, self.version),
+            format!("id: {}", self.id),
+            format!(
+                "state: {}",
+                if self.enabled { "enabled" } else { "disabled" }
+            ),
+            format!(
+                "source: {}",
+                if self.bundled {
+                    "bundled".to_owned()
+                } else {
+                    self.materialization
+                        .clone()
+                        .unwrap_or_else(|| "linked".to_owned())
+                }
+            ),
+        ];
+        if !self.commands.is_empty() {
+            lines.push(format!("commands: {}", self.commands.join(", ")));
+        }
+        if !self.capabilities.is_empty() {
+            lines.push(format!("capabilities: {}", self.capabilities.join(", ")));
+        }
+        if let Some(audit) = &self.audit_status {
+            lines.push(format!("audit: {audit}"));
+        }
+        if self.bundled {
+            lines.push("bundled extensions can be toggled but not removed".to_owned());
+        }
+        lines.join("\n")
+    }
+}
+
+/// Extension-provided slash command surfaced in the palette under EXTENSIONS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionSlashCommand {
+    pub token: String,
+    pub summary: String,
+    pub extension_id: String,
+    pub command: String,
+    pub enabled: bool,
+}
+
+/// Palette row: core static command or extension-sourced entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaletteEntry {
+    pub token: String,
+    pub summary: String,
+    pub args: String,
+    pub kind: PaletteEntryKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaletteEntryKind {
+    Core,
+    Extension {
+        extension_id: String,
+        command: String,
+        enabled: bool,
+    },
+}
+
+impl PaletteEntry {
+    pub fn from_core(spec: CommandSpec) -> Self {
+        Self {
+            token: spec.token.to_owned(),
+            summary: spec.summary.to_owned(),
+            args: command_args(&spec),
+            kind: PaletteEntryKind::Core,
+        }
+    }
+
+    pub fn from_extension(cmd: &ExtensionSlashCommand) -> Self {
+        Self {
+            token: cmd.token.clone(),
+            summary: cmd.summary.clone(),
+            args: String::new(),
+            kind: PaletteEntryKind::Extension {
+                extension_id: cmd.extension_id.clone(),
+                command: cmd.command.clone(),
+                enabled: cmd.enabled,
+            },
+        }
+    }
+
+    pub fn is_extension(&self) -> bool {
+        matches!(self.kind, PaletteEntryKind::Extension { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +263,60 @@ impl ResumeItem {
     }
 }
 
+/// One restorable workspace checkpoint for the `/rollback` picker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointItem {
+    pub event_id: String,
+    pub action: String,
+    pub path: String,
+    pub time: String,
+}
+
+impl CheckpointItem {
+    pub fn new(
+        event_id: impl Into<String>,
+        action: impl Into<String>,
+        path: impl Into<String>,
+        time: impl Into<String>,
+    ) -> Self {
+        Self {
+            event_id: event_id.into(),
+            action: action.into(),
+            path: path.into(),
+            time: time.into(),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{}  {}  {}  {}",
+            short_event_id(&self.event_id),
+            self.action,
+            self.path,
+            short_time(&self.time)
+        )
+    }
+}
+
+fn short_event_id(event_id: &str) -> String {
+    if event_id.len() <= 10 {
+        event_id.to_owned()
+    } else {
+        event_id[event_id.len().saturating_sub(8)..].to_owned()
+    }
+}
+
+fn short_time(ts: &str) -> String {
+    // RFC3339 millis: keep HH:MM:SS when present.
+    if let Some(t_idx) = ts.find('T') {
+        let time = &ts[t_idx + 1..];
+        if time.len() >= 8 {
+            return time[..8].to_owned();
+        }
+    }
+    ts.to_owned()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandAction {
     NewSession,
@@ -161,9 +339,22 @@ pub enum CommandAction {
         id: String,
         command: String,
         input: serde_json::Value,
+        /// `--flag value…` text typed after the token; parsed against the
+        /// command's ArgSpec at resolve time (where the descriptor lives).
+        /// Mutually exclusive with a non-empty `input`.
+        raw_args: Option<String>,
     },
     CompanionRun {
         input: serde_json::Value,
+    },
+    /// Persist the `/code-swarm` reviewer model set (1-5 provider::model).
+    CodeSwarmSaveModels {
+        models: Vec<String>,
+    },
+    /// Run the reviewer swarm: brief -> spawn companions -> report.
+    CodeSwarmReview {
+        prompt: Option<String>,
+        personas: Option<Vec<String>>,
     },
     ShowStatus,
     Login {
@@ -179,8 +370,18 @@ pub enum CommandAction {
         capability: Capability,
         mode: ApprovalMode,
     },
+    /// Open the permissions picker with live session/project grants.
+    OpenPermissions,
+    RevokeGrant {
+        capability: Capability,
+        pattern: String,
+        source: GrantSource,
+    },
     ResumeSession {
         session_id: String,
+    },
+    RollbackCheckpoint {
+        event_id: String,
     },
     ShowHelp {
         text: String,
@@ -188,6 +389,32 @@ pub enum CommandAction {
     Quit,
     ScrollViewportToBottom,
     CopyLastAssistantResponse,
+    ToggleTimestamps,
+    /// Session-attributed aggregate diff (files this session touched).
+    ShowDiff,
+    /// Token breakdown for the session (costs only when catalog prices exist).
+    ShowUsage,
+    /// Dispatch to `causal-dag.export` (teach when extension disabled).
+    DagExport,
+    /// Open the extensions manager picker.
+    OpenExtensionManager,
+    /// Toggle extension enablement (registry + live session set).
+    ExtensionToggle {
+        id: String,
+        enable: bool,
+    },
+    /// Show extension details in the transcript.
+    ExtensionDetails {
+        id: String,
+    },
+    /// Remove a non-bundled extension (unlink/uninstall).
+    ExtensionRemove {
+        id: String,
+    },
+    /// Validate → link → install → audit → enable a local package path.
+    ExtensionAdd {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +422,9 @@ pub enum CommandEffect {
     Action(CommandAction),
     OpenPicker(PickerSpec),
     Message(String),
+    /// Muted, non-error informational line (review v2 §14.4) — e.g. the
+    /// disabled-extension teach message. Never styled red, never prefixed.
+    Notice(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,13 +434,28 @@ pub enum PickerSpec {
     Theme(Vec<ThemeChoiceItem>),
     Permissions(Vec<PermissionChoice>),
     Resume(Vec<ResumeItem>),
+    Rollback(Vec<CheckpointItem>),
+    Extensions(Vec<ExtensionManagerItem>),
+    /// `/code-swarm` reviewer-model checklist: selection IS the agent count.
+    CodeSwarmModels {
+        choices: Vec<ModelChoice>,
+        selected: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PermissionChoice {
-    pub capability: Capability,
-    pub mode: ApprovalMode,
-    pub label: String,
+pub enum PermissionChoice {
+    SetMode {
+        capability: Capability,
+        mode: ApprovalMode,
+        label: String,
+    },
+    Revoke {
+        capability: Capability,
+        pattern: String,
+        source: GrantSource,
+        label: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -257,8 +502,23 @@ const COMMAND_TABLE: &[CommandSpec] = &[
     },
     CommandSpec {
         token: "/extension",
-        summary: "run an extension command",
-        args: "run <ext>.<cmd> [json-input]",
+        summary: "manage extensions or run a command",
+        args: "[run <ext>.<cmd> [json-input]]",
+    },
+    CommandSpec {
+        token: "/diff",
+        summary: "session file changes (aggregate diff)",
+        args: "",
+    },
+    CommandSpec {
+        token: "/usage",
+        summary: "token usage for this session",
+        args: "",
+    },
+    CommandSpec {
+        token: "/dag",
+        summary: "export causal DAG for this session",
+        args: "",
     },
     CommandSpec {
         token: "/companion",
@@ -292,12 +552,17 @@ const COMMAND_TABLE: &[CommandSpec] = &[
     },
     CommandSpec {
         token: "/permissions",
-        summary: "set capability approval mode",
+        summary: "approval modes and active grants",
         args: "",
     },
     CommandSpec {
         token: "/resume",
         summary: "resume a prior session",
+        args: "",
+    },
+    CommandSpec {
+        token: "/rollback",
+        summary: "restore a workspace file from a checkpoint",
         args: "",
     },
     CommandSpec {
@@ -315,12 +580,18 @@ const COMMAND_TABLE: &[CommandSpec] = &[
         summary: "copy last assistant response",
         args: "",
     },
+    CommandSpec {
+        token: "/timestamps",
+        summary: "toggle timestamp gutter",
+        args: "",
+    },
 ];
 
 pub fn command_table() -> &'static [CommandSpec] {
     COMMAND_TABLE
 }
 
+#[cfg(test)]
 pub fn filter_commands(input: &str) -> Vec<CommandSpec> {
     let needle = filter_needle(input);
     command_table()
@@ -328,6 +599,82 @@ pub fn filter_commands(input: &str) -> Vec<CommandSpec> {
         .copied()
         .filter(|spec| command_matches(spec, &needle))
         .collect()
+}
+
+/// Core + extension palette entries, filtered by the first token of `input`.
+/// Unfiltered lists put extension rows after core under an EXTENSIONS group
+/// (rendered by the palette, not as a selectable entry).
+pub fn filter_palette_entries(input: &str, context: &CommandContext) -> Vec<PaletteEntry> {
+    let needle = filter_needle(input);
+    let mut entries: Vec<PaletteEntry> = command_table()
+        .iter()
+        .copied()
+        .filter(|spec| command_matches(spec, &needle))
+        .map(PaletteEntry::from_core)
+        .collect();
+    for cmd in &context.extension_slash_commands {
+        if palette_token_matches(&cmd.token, &needle) {
+            entries.push(PaletteEntry::from_extension(cmd));
+        }
+    }
+    entries
+}
+
+fn palette_token_matches(token: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let token = token.trim_start_matches('/').to_lowercase();
+    token.starts_with(needle) || token.contains(needle)
+}
+
+/// Build extension slash entries: short token when free, else `/<ext>.<cmd>`.
+/// Core always wins collisions.
+pub fn build_extension_slash_commands(
+    items: &[ExtensionManagerItem],
+) -> Vec<ExtensionSlashCommand> {
+    let core_tokens: std::collections::BTreeSet<String> = command_table()
+        .iter()
+        .map(|spec| spec.token.trim_start_matches('/').to_lowercase())
+        .collect();
+    let mut claimed = core_tokens;
+    let mut out = Vec::new();
+    for item in items {
+        if item.id == "code-swarm" {
+            // TUI-side surface (picker + orchestration) keyed to this
+            // extension; dispatched by the explicit "/code-swarm" arm, never
+            // by the generic ExtensionRun fallback. v1 special case — see
+            // docs/reviews/extension-ux-code-swarm-2026-07-09.md.
+            claimed.insert("code-swarm".to_owned());
+            out.push(ExtensionSlashCommand {
+                token: "/code-swarm".to_owned(),
+                summary: format!("{} · reviewer swarm", item.id),
+                extension_id: item.id.clone(),
+                command: "review".to_owned(),
+                enabled: item.enabled,
+            });
+        }
+        for command in &item.commands {
+            let short = command.to_lowercase();
+            let (token, summary) = if claimed.contains(&short) {
+                (
+                    format!("/{}.{}", item.id, command),
+                    format!("{} · {}", item.id, command),
+                )
+            } else {
+                claimed.insert(short);
+                (format!("/{command}"), format!("{} · {}", item.id, command))
+            };
+            out.push(ExtensionSlashCommand {
+                token,
+                summary,
+                extension_id: item.id.clone(),
+                command: command.clone(),
+                enabled: item.enabled,
+            });
+        }
+    }
+    out
 }
 
 pub fn filter_token(input: &str) -> &str {
@@ -362,15 +709,47 @@ pub fn dispatch_command(input: &str, context: &CommandContext) -> CommandEffect 
     }
 }
 
+#[cfg(test)]
 pub fn permission_choices() -> Vec<PermissionChoice> {
-    [
-        Capability::FsRead,
-        Capability::FsWrite,
-        Capability::ShellExec,
-    ]
-    .into_iter()
-    .flat_map(|capability| permission_modes(capability).into_iter())
-    .collect()
+    permission_choices_with_grants(&[])
+}
+
+/// Mode choices plus revoke rows for active session/project grants.
+pub fn permission_choices_with_grants(
+    grants: &[(GrantSource, ActiveGrant)],
+) -> Vec<PermissionChoice> {
+    let mut choices = grants
+        .iter()
+        .map(|(source, grant)| {
+            let pattern = grant.pattern.as_str();
+            let pattern_label = if pattern.is_empty() {
+                "all".to_owned()
+            } else {
+                format!("{pattern}*")
+            };
+            PermissionChoice::Revoke {
+                capability: grant.capability,
+                pattern: pattern.to_owned(),
+                source: *source,
+                label: format!(
+                    "Revoke {} {} ({})",
+                    source.as_str(),
+                    grant.capability.as_str(),
+                    pattern_label
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    choices.extend(
+        [
+            Capability::FsRead,
+            Capability::FsWrite,
+            Capability::ShellExec,
+        ]
+        .into_iter()
+        .flat_map(permission_modes),
+    );
+    choices
 }
 
 pub fn help_text() -> String {
@@ -392,7 +771,7 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/export" => CommandEffect::Action(CommandAction::ExportSession {
             path: parsed.arg.map(str::to_owned),
         }),
-        "/extension" => extension_effect(parsed.arg),
+        "/extension" => extension_effect(parsed.arg, context),
         "/companion" => companion_effect(parsed.arg),
         "/status" => CommandEffect::Action(CommandAction::ShowStatus),
         "/hotkeys" => CommandEffect::Action(CommandAction::ShowHelp {
@@ -409,13 +788,145 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
                 name: name.to_owned(),
             }
         }),
-        "/permissions" => CommandEffect::OpenPicker(PickerSpec::Permissions(permission_choices())),
+        "/permissions" => CommandEffect::Action(CommandAction::OpenPermissions),
         "/resume" => CommandEffect::OpenPicker(PickerSpec::Resume(context.resume_items.clone())),
+        "/rollback" => rollback_effect(context),
         "/help" => CommandEffect::Action(CommandAction::ShowHelp { text: help_text() }),
         "/quit" => CommandEffect::Action(CommandAction::Quit),
         "/copy" => CommandEffect::Action(CommandAction::CopyLastAssistantResponse),
-        token => CommandEffect::Message(format!("unknown command: {token}")),
+        "/timestamps" => CommandEffect::Action(CommandAction::ToggleTimestamps),
+        "/diff" => CommandEffect::Action(CommandAction::ShowDiff),
+        "/usage" => CommandEffect::Action(CommandAction::ShowUsage),
+        "/dag" => CommandEffect::Action(CommandAction::DagExport),
+        "/code-swarm" => code_swarm_effect(parsed.arg, context),
+        token => extension_slash_or_unknown(token, parsed.arg, context),
     }
+}
+
+/// `/code-swarm` — extension-provided surface (teaches when disabled).
+/// No arg: open the reviewer-model checklist picker (selection IS the count).
+/// `review [--personas a,b,c] [--prompt <text…>]`: run the swarm.
+fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
+    const USAGE: &str = "usage: /code-swarm  or  /code-swarm review [--personas correctness,safety,tests] [--prompt <focus…>]";
+    let enabled = context
+        .extension_items
+        .iter()
+        .find(|item| item.id == "code-swarm")
+        .is_some_and(|item| item.enabled);
+    if !enabled {
+        return CommandEffect::Notice(disabled_extension_teach("/code-swarm", "code-swarm"));
+    }
+    let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
+        return CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
+            choices: context.model_choices.clone(),
+            selected: context.code_swarm_models.clone(),
+        });
+    };
+    let Some(rest) = arg.strip_prefix("review") else {
+        return CommandEffect::Message(USAGE.to_owned());
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return CommandEffect::Message(USAGE.to_owned());
+    }
+    match parse_code_swarm_review_args(rest.trim_start()) {
+        Ok((prompt, personas)) => {
+            CommandEffect::Action(CommandAction::CodeSwarmReview { prompt, personas })
+        }
+        Err(message) => CommandEffect::Message(format!("{message}\n{USAGE}")),
+    }
+}
+
+/// `--personas a,b,c` and `--prompt <everything after it>`. Prompt must come
+/// last so it can contain spaces without quoting.
+#[allow(clippy::type_complexity)]
+fn parse_code_swarm_review_args(
+    rest: &str,
+) -> Result<(Option<String>, Option<Vec<String>>), String> {
+    let mut prompt = None;
+    let mut personas = None;
+    let mut remaining = rest.trim();
+    while !remaining.is_empty() {
+        if let Some(value) = remaining.strip_prefix("--prompt") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err("--prompt requires text".to_owned());
+            }
+            prompt = Some(value.to_owned());
+            remaining = "";
+        } else if let Some(value) = remaining.strip_prefix("--personas") {
+            let value = value.trim_start();
+            let (list, rest) = match value.split_once(char::is_whitespace) {
+                Some((list, rest)) => (list, rest.trim_start()),
+                None => (value, ""),
+            };
+            if list.is_empty() {
+                return Err("--personas requires a comma-separated list".to_owned());
+            }
+            personas = Some(list.split(',').map(str::trim).map(str::to_owned).collect());
+            remaining = rest;
+        } else {
+            return Err(format!("unknown argument: {remaining}"));
+        }
+    }
+    Ok((prompt, personas))
+}
+
+fn extension_slash_or_unknown(
+    token: &str,
+    arg: Option<&str>,
+    context: &CommandContext,
+) -> CommandEffect {
+    if let Some(cmd) = context
+        .extension_slash_commands
+        .iter()
+        .find(|cmd| cmd.token == token)
+    {
+        if !cmd.enabled {
+            return CommandEffect::Notice(disabled_extension_teach(&cmd.token, &cmd.extension_id));
+        }
+        // Arguments are never dropped: JSON parses here, `--flag` text is
+        // parsed against the ArgSpec at resolve time, anything else is a
+        // usage error.
+        let (input, raw_args) = match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
+            None => (serde_json::Value::Object(serde_json::Map::new()), None),
+            Some(json) if json.starts_with('{') => match serde_json::from_str(json) {
+                Ok(value) => (value, None),
+                Err(error) => {
+                    return CommandEffect::Message(format!("{token} input must be JSON: {error}"));
+                }
+            },
+            Some(flags) if flags.starts_with("--") => (
+                serde_json::Value::Object(serde_json::Map::new()),
+                Some(flags.to_owned()),
+            ),
+            Some(other) => {
+                return CommandEffect::Message(format!(
+                    "usage: {token} [--flag value…]  or  {token} {{json}}  — got `{other}`"
+                ));
+            }
+        };
+        return CommandEffect::Action(CommandAction::ExtensionRun {
+            id: cmd.extension_id.clone(),
+            command: cmd.command.clone(),
+            input,
+            raw_args,
+        });
+    }
+    CommandEffect::Message(format!("unknown command: {token}"))
+}
+
+/// Faint teach line when an extension-backed command is invoked while disabled.
+pub fn disabled_extension_teach(token: &str, extension_id: &str) -> String {
+    format!("{token} — provided by {extension_id} (disabled) · /extension to enable")
+}
+
+fn rollback_effect(context: &CommandContext) -> CommandEffect {
+    if context.checkpoint_items.is_empty() {
+        return CommandEffect::Message(
+            "no workspace checkpoints in this session (edit a file first)".to_owned(),
+        );
+    }
+    CommandEffect::OpenPicker(PickerSpec::Rollback(context.checkpoint_items.clone()))
 }
 
 fn companion_effect(arg: Option<&str>) -> CommandEffect {
@@ -438,37 +949,67 @@ fn companion_effect(arg: Option<&str>) -> CommandEffect {
     }
 }
 
-fn extension_effect(arg: Option<&str>) -> CommandEffect {
+fn extension_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
     let Some(arg) = arg else {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Action(CommandAction::OpenExtensionManager);
     };
     let Some(rest) = arg.strip_prefix("run") else {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Message(
+            "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned(),
+        );
     };
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Message(
+            "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned(),
+        );
     }
     let mut parts = rest.trim_start().splitn(2, char::is_whitespace);
     let Some(reference) = parts.next().filter(|value| !value.is_empty()) else {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Message(
+            "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned(),
+        );
     };
     let Some((id, command)) = parse_extension_reference(reference) else {
-        return CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned());
+        return CommandEffect::Message(
+            "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned(),
+        );
     };
-    let input = match parts
+    if let Some(item) = context.extension_items.iter().find(|item| item.id == id) {
+        if !item.enabled {
+            return CommandEffect::Notice(disabled_extension_teach(
+                &format!("/{id}.{command}"),
+                &id,
+            ));
+        }
+    }
+    let (input, raw_args) = match parts
         .next()
         .map(str::trim_start)
         .filter(|value| !value.is_empty())
     {
-        Some(json) => match serde_json::from_str(json) {
-            Ok(value) => value,
+        Some(json) if json.starts_with('{') => match serde_json::from_str(json) {
+            Ok(value) => (value, None),
             Err(error) => {
                 return CommandEffect::Message(format!("extension input must be JSON: {error}"));
             }
         },
-        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(flags) if flags.starts_with("--") => (
+            serde_json::Value::Object(serde_json::Map::new()),
+            Some(flags.to_owned()),
+        ),
+        Some(other) => {
+            return CommandEffect::Message(format!(
+                "usage: /extension run <ext>.<cmd> [{{json}} | --flag value…]  — got `{other}`"
+            ));
+        }
+        None => (serde_json::Value::Object(serde_json::Map::new()), None),
     };
-    CommandEffect::Action(CommandAction::ExtensionRun { id, command, input })
+    CommandEffect::Action(CommandAction::ExtensionRun {
+        id,
+        command,
+        input,
+        raw_args,
+    })
 }
 
 fn parse_extension_reference(reference: &str) -> Option<(String, String)> {
@@ -555,7 +1096,7 @@ fn permission_modes(capability: Capability) -> Vec<PermissionChoice> {
         ApprovalMode::AlwaysDeny,
     ]
     .into_iter()
-    .map(|mode| PermissionChoice {
+    .map(|mode| PermissionChoice::SetMode {
         capability,
         mode,
         label: format!("{} {}", capability_label(capability), mode_label(mode)),
@@ -601,8 +1142,10 @@ fn hotkeys_text() -> String {
     [
         "Enter - send message",
         "Shift+Enter - insert newline",
-        "Esc - close palette or interrupt active turn",
+        "Esc - close palette, search, or interrupt active turn",
         "Ctrl+O - expand/collapse folded blocks",
+        "Ctrl+F - search transcript",
+        "@ - mention a workspace file",
         "Ctrl+C twice - quit",
         "Mouse wheel/PageUp/PageDown - scroll transcript",
     ]
@@ -667,6 +1210,10 @@ mod tests {
             CommandEffect::Action(CommandAction::CopyLastAssistantResponse)
         );
         assert_eq!(
+            dispatch_command("/timestamps", &context),
+            CommandEffect::Action(CommandAction::ToggleTimestamps)
+        );
+        assert_eq!(
             dispatch_command("/quit", &context),
             CommandEffect::Action(CommandAction::Quit)
         );
@@ -697,6 +1244,7 @@ mod tests {
                 id: "session-export".to_owned(),
                 command: "session-export".to_owned(),
                 input: serde_json::json!({"limit": 1}),
+                raw_args: None,
             })
         );
         assert_eq!(
@@ -705,6 +1253,7 @@ mod tests {
                 id: "causal-dag".to_owned(),
                 command: "catch-up".to_owned(),
                 input: serde_json::json!({}),
+                raw_args: None,
             })
         );
         assert_eq!(
@@ -768,6 +1317,30 @@ mod tests {
     }
 
     #[test]
+    fn rollback_without_checkpoints_messages_and_with_items_opens_picker() {
+        assert_eq!(
+            dispatch_command("/rollback", &CommandContext::default()),
+            CommandEffect::Message(
+                "no workspace checkpoints in this session (edit a file first)".to_owned()
+            )
+        );
+        let item = CheckpointItem::new(
+            "01ABCDEFGHJKLMNPQRSTUVWXYZ",
+            "modify",
+            "src/lib.rs",
+            "2026-07-09T12:34:56.000Z",
+        );
+        let context = CommandContext {
+            checkpoint_items: vec![item.clone()],
+            ..CommandContext::default()
+        };
+        assert_eq!(
+            dispatch_command("/rollback", &context),
+            CommandEffect::OpenPicker(PickerSpec::Rollback(vec![item]))
+        );
+    }
+
+    #[test]
     fn model_choice_label_includes_known_metadata_without_changing_value_fields() {
         let choice = ModelChoice::with_metadata("openai", "gpt-5.5", Some(1_050_000), Some(true));
 
@@ -804,10 +1377,223 @@ mod tests {
 
     #[test]
     fn help_text_uses_catalog_theme_usage() {
-        assert!(help_text().contains("/theme [gruvbox-dark|gruvbox-light] - switch theme"));
+        assert!(help_text().contains(&format!(
+            "/theme [{}] - switch theme",
+            ThemeChoice::format_canonical_ids("|")
+        )));
         assert!(command_table()
             .iter()
             .any(|spec| spec.token == "/theme" && spec.args.is_empty()));
+        assert!(command_table().iter().any(|spec| spec.token == "/diff"));
+        assert!(command_table().iter().any(|spec| spec.token == "/usage"));
+        assert!(command_table().iter().any(|spec| spec.token == "/dag"));
+        assert!(command_table().iter().any(|spec| spec.token == "/rollback"));
+        assert!(command_table()
+            .iter()
+            .any(|spec| spec.token == "/timestamps"));
+    }
+
+    #[test]
+    fn extension_slash_collisions_prefer_core_token_and_qualified_extension() {
+        let items = vec![ExtensionManagerItem {
+            id: "causal-dag".to_owned(),
+            display_name: "Causal DAG".to_owned(),
+            enabled: true,
+            bundled: true,
+            materialization: None,
+            version: "0.1.0".to_owned(),
+            commands: vec!["export".to_owned(), "catch-up".to_owned()],
+            capabilities: vec![],
+            audit_status: None,
+        }];
+        let cmds = build_extension_slash_commands(&items);
+        assert!(cmds.iter().any(|c| c.token == "/causal-dag.export"));
+        assert!(cmds.iter().any(|c| c.token == "/catch-up"));
+        assert!(!cmds.iter().any(|c| c.token == "/export"));
+    }
+
+    fn code_swarm_context(enabled: bool) -> CommandContext {
+        CommandContext {
+            model_choices: vec![
+                ModelChoice::new("openrouter", "z-ai/glm-5.2"),
+                ModelChoice::new("anthropic", "claude-opus-5"),
+                ModelChoice::new("openai", "gpt-5.5"),
+                ModelChoice::new("mistral", "large-3"),
+            ],
+            extension_items: vec![ExtensionManagerItem {
+                id: "code-swarm".to_owned(),
+                display_name: "CodeSwarm Review".to_owned(),
+                enabled,
+                bundled: true,
+                materialization: None,
+                version: "0.1.0".to_owned(),
+                commands: vec!["review".to_owned()],
+                capabilities: vec![],
+                audit_status: None,
+            }],
+            ..CommandContext::default()
+        }
+    }
+
+    #[test]
+    fn code_swarm_no_arg_opens_model_checklist_picker() {
+        let context = code_swarm_context(true);
+        match dispatch_command("/code-swarm", &context) {
+            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels { choices, selected }) => {
+                assert_eq!(choices.len(), 4);
+                assert!(selected.is_empty());
+            }
+            other => panic!("expected picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_swarm_review_parses_personas_and_trailing_prompt() {
+        let context = code_swarm_context(true);
+        assert_eq!(
+            dispatch_command(
+                "/code-swarm review --personas tests,safety --prompt focus on the retry logic",
+                &context
+            ),
+            CommandEffect::Action(CommandAction::CodeSwarmReview {
+                prompt: Some("focus on the retry logic".to_owned()),
+                personas: Some(vec!["tests".to_owned(), "safety".to_owned()]),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/code-swarm review", &context),
+            CommandEffect::Action(CommandAction::CodeSwarmReview {
+                prompt: None,
+                personas: None,
+            })
+        );
+        assert!(matches!(
+            dispatch_command("/code-swarm review --bogus", &context),
+            CommandEffect::Message(message) if message.contains("usage:")
+        ));
+        assert!(matches!(
+            dispatch_command("/code-swarm bogus", &context),
+            CommandEffect::Message(message) if message.contains("usage:")
+        ));
+    }
+
+    #[test]
+    fn code_swarm_disabled_teaches_and_palette_entry_registers() {
+        let context = code_swarm_context(false);
+        assert_eq!(
+            dispatch_command("/code-swarm", &context),
+            CommandEffect::Notice(disabled_extension_teach("/code-swarm", "code-swarm"))
+        );
+
+        let cmds = build_extension_slash_commands(&context.extension_items);
+        let entry = cmds
+            .iter()
+            .find(|cmd| cmd.token == "/code-swarm")
+            .expect("code-swarm palette entry");
+        assert_eq!(entry.extension_id, "code-swarm");
+        assert!(entry.summary.contains("reviewer swarm"));
+        assert!(!entry.enabled);
+        // The command token still registers alongside the surface token.
+        assert!(cmds.iter().any(|cmd| cmd.token == "/review"));
+    }
+
+    #[test]
+    fn extension_slash_arguments_parse_or_reject_never_drop() {
+        let context = CommandContext {
+            extension_slash_commands: vec![ExtensionSlashCommand {
+                token: "/review".to_owned(),
+                summary: "code-swarm · review".to_owned(),
+                extension_id: "code-swarm".to_owned(),
+                command: "review".to_owned(),
+                enabled: true,
+            }],
+            ..CommandContext::default()
+        };
+
+        // JSON argument parses into the input.
+        assert_eq!(
+            dispatch_command("/review {\"reviewers\":[\"tests\"]}", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "code-swarm".to_owned(),
+                command: "review".to_owned(),
+                input: serde_json::json!({"reviewers": ["tests"]}),
+                raw_args: None,
+            })
+        );
+        // Flag arguments travel to resolve-time ArgSpec parsing.
+        assert_eq!(
+            dispatch_command("/review --reviewer tests --model a::b", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "code-swarm".to_owned(),
+                command: "review".to_owned(),
+                input: serde_json::json!({}),
+                raw_args: Some("--reviewer tests --model a::b".to_owned()),
+            })
+        );
+        // Invalid JSON is an error, not a silent default run.
+        assert!(matches!(
+            dispatch_command("/review {broken", &context),
+            CommandEffect::Message(message) if message.contains("must be JSON")
+        ));
+        // Free text is a usage error, not a silent default run.
+        assert!(matches!(
+            dispatch_command("/review tests please", &context),
+            CommandEffect::Message(message) if message.contains("usage:")
+        ));
+        // No argument still dispatches with empty input.
+        assert_eq!(
+            dispatch_command("/review", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "code-swarm".to_owned(),
+                command: "review".to_owned(),
+                input: serde_json::json!({}),
+                raw_args: None,
+            })
+        );
+    }
+
+    #[test]
+    fn disabled_extension_slash_teaches_instead_of_unknown() {
+        let context = CommandContext {
+            extension_slash_commands: vec![ExtensionSlashCommand {
+                token: "/catch-up".to_owned(),
+                summary: "causal-dag · catch-up".to_owned(),
+                extension_id: "causal-dag".to_owned(),
+                command: "catch-up".to_owned(),
+                enabled: false,
+            }],
+            ..CommandContext::default()
+        };
+        assert_eq!(
+            dispatch_command("/catch-up", &context),
+            CommandEffect::Notice(disabled_extension_teach("/catch-up", "causal-dag"))
+        );
+    }
+
+    #[test]
+    fn disabled_extension_run_form_teaches_instead_of_running() {
+        // Third entrance (review v2 §14.4): `/extension run <ext>.<cmd>`.
+        let context = CommandContext {
+            extension_items: vec![ExtensionManagerItem {
+                id: "causal-dag".to_owned(),
+                display_name: "Causal DAG".to_owned(),
+                enabled: false,
+                bundled: true,
+                materialization: None,
+                version: "0.1.0".to_owned(),
+                commands: vec!["catch-up".to_owned()],
+                capabilities: vec![],
+                audit_status: None,
+            }],
+            ..CommandContext::default()
+        };
+        assert_eq!(
+            dispatch_command("/extension run causal-dag.catch-up", &context),
+            CommandEffect::Notice(disabled_extension_teach(
+                "/causal-dag.catch-up",
+                "causal-dag"
+            ))
+        );
     }
 
     #[test]
@@ -832,15 +1618,32 @@ mod tests {
         );
         assert_eq!(
             dispatch_command("/theme gruvbox", &context),
-            CommandEffect::Message("usage: /theme <gruvbox-dark|gruvbox-light>".to_owned())
+            CommandEffect::Message(format!(
+                "usage: /theme <{}>",
+                ThemeChoice::format_canonical_ids("|")
+            ))
         );
         assert_eq!(
             dispatch_command("/extension", &context),
-            CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned())
+            CommandEffect::Action(CommandAction::OpenExtensionManager)
         );
         assert_eq!(
             dispatch_command("/extension run causal-dag", &context),
-            CommandEffect::Message("usage: /extension run <ext>.<cmd> [json-input]".to_owned())
+            CommandEffect::Message(
+                "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned()
+            )
+        );
+        assert_eq!(
+            dispatch_command("/diff", &context),
+            CommandEffect::Action(CommandAction::ShowDiff)
+        );
+        assert_eq!(
+            dispatch_command("/usage", &context),
+            CommandEffect::Action(CommandAction::ShowUsage)
+        );
+        assert_eq!(
+            dispatch_command("/dag", &context),
+            CommandEffect::Action(CommandAction::DagExport)
         );
         assert!(matches!(
             dispatch_command("/extension run causal-dag.catch-up {", &context),

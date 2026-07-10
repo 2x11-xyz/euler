@@ -85,6 +85,112 @@ pub fn save_theme_preference(path: &Path, theme: &str) -> Result<()> {
     write_preference_object(path, payload)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TimestampsPreferenceLoad {
+    Loaded(bool),
+    Missing,
+    Ignored(String),
+}
+
+pub fn load_timestamps_preference(path: &Path) -> TimestampsPreferenceLoad {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return TimestampsPreferenceLoad::Missing
+        }
+        Err(error) => {
+            return TimestampsPreferenceLoad::Ignored(format!(
+                "could not read timestamps preference: {error}"
+            ));
+        }
+    };
+    timestamps_preference_from_json(&contents)
+}
+
+pub fn save_timestamps_preference(path: &Path, show: bool) -> Result<()> {
+    let mut payload = read_preference_object_for_save(path)?;
+    payload.insert("timestamps".to_owned(), Value::Bool(show));
+    write_preference_object(path, payload)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NotificationsPreferenceLoad {
+    Loaded(bool),
+    Missing,
+    Ignored(String),
+}
+
+pub fn load_notifications_preference(path: &Path) -> NotificationsPreferenceLoad {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return NotificationsPreferenceLoad::Missing
+        }
+        Err(error) => {
+            return NotificationsPreferenceLoad::Ignored(format!(
+                "could not read notifications preference: {error}"
+            ));
+        }
+    };
+    notifications_preference_from_json(&contents)
+}
+
+pub fn save_notifications_preference(path: &Path, enabled: bool) -> Result<()> {
+    let mut payload = read_preference_object_for_save(path)?;
+    payload.insert("notifications".to_owned(), Value::Bool(enabled));
+    write_preference_object(path, payload)
+}
+
+fn notifications_preference_from_json(contents: &str) -> NotificationsPreferenceLoad {
+    let value: Value = match serde_json::from_str(contents) {
+        Ok(value) => value,
+        Err(error) => {
+            return NotificationsPreferenceLoad::Ignored(format!(
+                "malformed notifications preference: {error}"
+            ));
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return NotificationsPreferenceLoad::Ignored(
+            "malformed notifications preference: expected object".to_owned(),
+        );
+    };
+    let Some(notifications) = object.get("notifications") else {
+        return NotificationsPreferenceLoad::Missing;
+    };
+    match notifications.as_bool() {
+        Some(enabled) => NotificationsPreferenceLoad::Loaded(enabled),
+        None => NotificationsPreferenceLoad::Ignored(
+            "malformed notifications preference: notifications must be a boolean".to_owned(),
+        ),
+    }
+}
+
+fn timestamps_preference_from_json(contents: &str) -> TimestampsPreferenceLoad {
+    let value: Value = match serde_json::from_str(contents) {
+        Ok(value) => value,
+        Err(error) => {
+            return TimestampsPreferenceLoad::Ignored(format!(
+                "malformed timestamps preference: {error}"
+            ));
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return TimestampsPreferenceLoad::Ignored(
+            "malformed timestamps preference: expected object".to_owned(),
+        );
+    };
+    let Some(timestamps) = object.get("timestamps") else {
+        return TimestampsPreferenceLoad::Missing;
+    };
+    match timestamps.as_bool() {
+        Some(show) => TimestampsPreferenceLoad::Loaded(show),
+        None => TimestampsPreferenceLoad::Ignored(
+            "malformed timestamps preference: timestamps must be a boolean".to_owned(),
+        ),
+    }
+}
+
 fn preference_from_json(contents: &str) -> PreferenceLoad {
     let value: Value = match serde_json::from_str(contents) {
         Ok(value) => value,
@@ -139,6 +245,67 @@ fn theme_preference_from_json(contents: &str) -> ThemePreferenceLoad {
     }
 }
 
+/// Saved `/code-swarm` reviewer model set (`provider::model` strings, 1–5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodeSwarmModelsLoad {
+    Loaded(Vec<String>),
+    Missing,
+    Ignored(String),
+}
+
+pub fn load_code_swarm_models_preference(path: &Path) -> CodeSwarmModelsLoad {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return CodeSwarmModelsLoad::Missing,
+        Err(error) => {
+            return CodeSwarmModelsLoad::Ignored(format!(
+                "could not read code-swarm models preference: {error}"
+            ));
+        }
+    };
+    let value: Value = match serde_json::from_str(&contents) {
+        Ok(value) => value,
+        Err(error) => {
+            return CodeSwarmModelsLoad::Ignored(format!(
+                "malformed code-swarm models preference: {error}"
+            ));
+        }
+    };
+    let Some(models) = value
+        .as_object()
+        .and_then(|object| object.get("code_swarm_models"))
+    else {
+        return CodeSwarmModelsLoad::Missing;
+    };
+    let Some(entries) = models.as_array() else {
+        return CodeSwarmModelsLoad::Ignored(
+            "malformed code-swarm models preference: expected array".to_owned(),
+        );
+    };
+    let parsed: Vec<String> = entries
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|entry| entry.contains("::"))
+        .map(str::to_owned)
+        .collect();
+    if parsed.is_empty() || parsed.len() != entries.len() || parsed.len() > 5 {
+        return CodeSwarmModelsLoad::Ignored(
+            "malformed code-swarm models preference: expected 1-5 provider::model strings"
+                .to_owned(),
+        );
+    }
+    CodeSwarmModelsLoad::Loaded(parsed)
+}
+
+pub fn save_code_swarm_models_preference(path: &Path, models: &[String]) -> Result<()> {
+    let mut payload = read_preference_object_for_save(path)?;
+    payload.insert(
+        "code_swarm_models".to_owned(),
+        Value::Array(models.iter().cloned().map(Value::String).collect()),
+    );
+    write_preference_object(path, payload)
+}
+
 fn read_preference_object_for_save(path: &Path) -> Result<Map<String, Value>> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -191,6 +358,7 @@ mod tests {
         save_model_preference(&path, "openrouter", "glm-5.2").expect("save");
         save_theme_preference(&path, "light").expect("save theme");
         save_model_preference(&path, "anthropic", "claude-custom").expect("overwrite model");
+        save_timestamps_preference(&path, false).expect("save timestamps");
 
         let contents = fs::read_to_string(&path).expect("read");
         let value: Value = serde_json::from_str(&contents).expect("json");
@@ -200,8 +368,13 @@ mod tests {
             vec![
                 "model".to_owned(),
                 "provider".to_owned(),
-                "theme".to_owned()
+                "theme".to_owned(),
+                "timestamps".to_owned(),
             ]
+        );
+        assert_eq!(
+            load_timestamps_preference(&path),
+            TimestampsPreferenceLoad::Loaded(false)
         );
         assert_eq!(
             load_model_preference(&path),
@@ -257,7 +430,7 @@ mod tests {
         let error = save_theme_preference(&path, "solarized").expect_err("unknown theme");
         assert!(error
             .to_string()
-            .contains("theme preference must be one of gruvbox-dark|gruvbox-light"));
+            .contains("theme preference must be one of gruvbox-dark|gruvbox-light|warm-ledger"));
     }
 
     #[test]

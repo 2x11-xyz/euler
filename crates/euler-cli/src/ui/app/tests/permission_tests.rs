@@ -19,37 +19,40 @@ fn permission_prompt_renders_inline_with_command_body() {
             ),
         ]),
     ));
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to run the following command?"));
-    assert!(contents.contains("Reason: shell-exec: tool run_shell"));
+    assert!(contents.contains("Run command?"));
+    assert!(!contents.contains("Approval required"));
+    assert!(contents.contains("shell-exec · cwd"));
     assert!(contents.contains("$ cargo test"));
-    assert!(contents.contains("1. Yes, proceed (y)"));
-    assert!(contents.contains("2. Yes, and don't ask again for shell-exec this session (a)"));
-    assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
+    assert!(!contents.contains("command: $"));
+    assert!(contents.contains("y  Allow once"));
+    assert!(!contents.contains("(default selection)"));
+    assert!(contents.contains("a  Allow shell-exec for this session"));
+    assert!(contents.contains("p  Allow shell-exec in this project"));
+    assert!(contents.contains("n/esc  Deny"));
+    assert!(contents.contains("Deny with instructions"));
+    assert!(!contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
     assert!(contents.contains("▌"));
-    assert!(contents.contains("fixture/echo medium"));
-    assert!(contents.contains("Context ?% used"));
-    assert!(!contents.contains("◦ Working"));
+    assert!(contents.contains("echo · ctx ?%"));
+    assert!(!contents.contains("Context ?% used"));
+    assert!(!contents.contains("⠧ working"));
 
     let rows = terminal.backend().screen_rows();
     assert!(
-        rows[row_containing(&rows, "Would you like to run the following command?")]
-            .starts_with("  "),
-        "permission question should use content gutter: {rows:?}"
+        rows[row_containing(&rows, "Run command?")].starts_with("│ "),
+        "permission question should use bordered approval panel: {rows:?}"
     );
     assert!(
-        rows[row_containing(&rows, "1. Yes, proceed (y)")].starts_with("  "),
-        "permission options should use content gutter: {rows:?}"
+        rows[row_containing(&rows, "y  Allow once")].starts_with("│ "),
+        "permission options should use bordered approval panel: {rows:?}"
     );
 }
 
@@ -76,80 +79,133 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
             ("input", serde_json::json!({"path": "Cargo.toml"})),
         ]),
     ));
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to run the following command?"));
+    assert!(contents.contains("Run command?"));
+    assert!(!contents.contains("Approval required"));
     assert!(contents.contains("$ cargo test"));
 
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool edit_file".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::FsWrite,
+        "tool edit_file".to_owned(),
+    )));
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Reason: fs-write: tool edit_file"));
+    assert!(contents.contains("Edit file?"));
+    assert!(contents.contains("fs-write · cwd"));
     assert!(!contents.contains("$ cargo test"));
-    assert!(!contents.contains("Would you like to run the following command?"));
+    assert!(!contents.contains("Approval required"));
 }
 
 #[test]
 fn non_patch_permission_uses_generic_inline_ask() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();
-    let request = PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-        command: None,
-        path: None,
-    };
+    let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned());
     core.modal = Some(core.modal_for_request(request));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to allow this request?"));
-    assert!(contents.contains("2. Yes, and don't ask again for shell-exec this session (a)"));
+    assert!(contents.contains("Run command?"));
+    assert!(!contents.contains("Approval required"));
+    assert!(contents.contains("a  Allow shell-exec for this session"));
+    assert!(contents.contains("p  Allow shell-exec in this project"));
     assert!(!contents.contains("Patch approval required"));
 }
 
 #[test]
+fn permission_panel_consequences_use_available_write_scope() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned())
+            .with_path("src/main.rs"),
+    ));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Edit file?"), "contents: {contents:?}");
+    assert!(
+        contents.contains("write scope src"),
+        "contents: {contents:?}"
+    );
+    // v2.1 (§7b): unknown/zero fields are omitted, not padded with "ran-before 0×".
+    assert!(!contents.contains("ran-before"), "contents: {contents:?}");
+}
+
+#[test]
+fn inline_permission_ask_has_blank_line_before_options_and_gold_selection() {
+    let mut core = core();
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
+
+    let lines = core.visual_canvas_frame(80).active_frame_lines;
+    let plain = lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let options_row = plain
+        .iter()
+        .position(|line| line.contains("y  Allow once"))
+        .expect("options row present");
+    assert!(
+        plain[options_row - 1].trim_matches(['│', ' ']).is_empty(),
+        "a blank line should separate the command block from the options: {plain:?}"
+    );
+
+    let selected_style = lines[options_row]
+        .spans
+        .iter()
+        .find(|span| span.text.as_str().contains("Allow once"))
+        .expect("selected span")
+        .style;
+    assert_eq!(
+        selected_style.fg,
+        Some(core.theme.palette.warning),
+        "the default-selected option should use gold text"
+    );
+    assert_eq!(
+        selected_style.bg,
+        Some(core.theme.palette.selection),
+        "the default-selected option should use the select-bg token"
+    );
+}
+
+#[test]
 fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
-    let mut terminal = Terminal::new(VT100Backend::new(58, 11)).expect("terminal");
+    let mut terminal = Terminal::new(VT100Backend::new(58, 12)).expect("terminal");
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let rows = terminal.backend().screen_rows();
-    assert!(
-        rows[row_containing(&rows, "Would you like to allow this request?")].starts_with("  "),
-        "permission prompt should align with transcript content gutter: {rows:?}"
-    );
-    let one = row_containing(&rows, "1. Yes, proceed (y)");
-    let two = row_containing(&rows, "2. Yes, and don't ask again");
-    let three = row_containing(&rows, "3. No, and tell euler");
+    let one = row_containing(&rows, "y  Allow once");
+    let two = row_containing(&rows, "a  Allow shell-exec");
+    let three = row_containing(&rows, "p  Allow shell-exec");
+    let four = row_containing(&rows, "n/esc  Deny");
+    let border = row_containing(&rows, "╰");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
-    assert!(one < two && two < three, "rows: {rows:?}");
-    assert!(three < prompt, "rows: {rows:?}");
+    let status = row_containing(&rows, "echo · ctx");
+    assert!(one < two && two < three && three < four, "rows: {rows:?}");
+    assert!(four < border && border < prompt, "rows: {rows:?}");
     assert_eq!(
         status,
         prompt + 1,
@@ -162,7 +218,7 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
 
 #[test]
 fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport() {
-    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 8), 8)
+    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 9), 9)
         .expect("inline terminal");
     let mut core = core();
     core.notice = Some("lower priority notice".to_owned());
@@ -173,24 +229,20 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
             ("delta", "live transcript should yield\n".into()),
         ]),
     ));
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool edit_file".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::FsWrite,
+        "tool edit_file".to_owned(),
+    )));
 
     render_inline_frame(&mut terminal, &mut core);
 
     let rows = terminal.backend().screen_rows();
-    let one = row_containing(&rows, "1. Yes, proceed (y)");
-    let two = row_containing(&rows, "2. Yes, and don't ask again");
-    let three = row_containing(&rows, "3. No, and tell euler");
+    let three = row_containing(&rows, "n/esc  Deny");
+    let border = row_containing(&rows, "╰");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
-    assert_eq!(terminal.viewport_area().height, 8);
-    assert!(one < two && two < three, "rows: {rows:?}");
-    assert!(three < prompt, "rows: {rows:?}");
+    let status = row_containing(&rows, "echo · ctx");
+    assert_eq!(terminal.viewport_area().height, 9);
+    assert!(three < border && border < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
     assert!(
         !rows.iter().any(|row| row.contains("lower priority notice")),
@@ -206,7 +258,7 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
 
 #[test]
 fn inline_patch_approval_ask_hides_working_status_and_keeps_options_visible() {
-    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 12), 12)
+    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 13), 13)
         .expect("inline terminal");
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
@@ -220,16 +272,17 @@ fn inline_patch_approval_ask_hides_working_status_and_keeps_options_visible() {
     render_inline_frame(&mut terminal, &mut core);
 
     let rows = terminal.backend().screen_rows();
-    let one = row_containing(&rows, "1. Yes, proceed (y)");
-    let two = row_containing(&rows, "2. Yes, and don't ask again");
-    let three = row_containing(&rows, "3. No, and tell euler");
+    let one = row_containing(&rows, "y  Allow once");
+    let two = row_containing(&rows, "a  Allow fs-write");
+    let three = row_containing(&rows, "p  Allow fs-write");
+    let four = row_containing(&rows, "n/esc  Deny");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
-    assert!(one < two && two < three, "rows: {rows:?}");
-    assert!(three < prompt, "rows: {rows:?}");
+    let status = row_containing(&rows, "echo · ctx");
+    assert!(one < two && two < three && three < four, "rows: {rows:?}");
+    assert!(four < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
     assert!(
-        !rows.iter().any(|row| row.contains("◦ Working")),
+        !rows.iter().any(|row| row.contains("⠧ working")),
         "patch approval should own the live flow, rows: {rows:?}"
     );
 }
@@ -250,28 +303,149 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
         ]),
     ));
     core.bottom.composer_mut().insert_text("draft");
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "run command".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "run command".to_owned(),
+    )));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like"));
+    assert!(contents.contains("Run command?"));
+    assert!(!contents.contains("Approval required"));
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
-    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::DenyWithInstruction("draft".into())
+    );
+    assert_eq!(
+        core.queued_inputs.front().map(String::as_str),
+        Some("draft")
+    );
     terminal.draw(|frame| core.render(frame)).expect("redraw");
 
     let restored = terminal.backend().screen_contents();
-    assert!(!restored.contains("Would you like"));
+    assert!(!restored.contains("Run command?"));
     assert!(restored.contains("underlying transcript"));
-    assert!(restored.contains("▌ draft"));
-    assert!(restored.contains("fixture/echo medium"));
-    assert!(restored.contains("Context ?% used"));
+    assert!(restored.contains("echo · ctx ?%"));
+    assert!(!restored.contains("Context ?% used"));
+}
+
+#[test]
+fn empty_deny_sets_denied_composer_ghost() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 16)).expect("terminal");
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "run command".to_owned(),
+    )));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('n'))),
+        CoreEffect::Render
+    );
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("denied — tell euler what to do instead"));
+}
+
+#[test]
+fn typed_permission_instruction_does_not_fire_hotkeys() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
+
+    for code in [
+        KeyCode::Char('w'),
+        KeyCode::Char('a'),
+        KeyCode::Char('i'),
+        KeyCode::Char('t'),
+        KeyCode::Char('y'),
+        KeyCode::Backspace,
+    ] {
+        assert_eq!(core.handle_input(key(code)), CoreEffect::Render);
+    }
+    assert!(matches!(
+        reply_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::DenyWithInstruction("wait".into())
+    );
+}
+
+#[test]
+fn empty_permission_instruction_keeps_y_hotkey() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('y'))),
+        CoreEffect::Render
+    );
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::AllowOnce);
+}
+
+#[test]
+fn scoped_shell_labels_and_replies_use_command_prefix() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+            .with_command("cargo test -q"),
+    ));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("a  Allow cargo * for this session"));
+    assert!(contents.contains("p  Allow cargo * in this project"));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('a'))),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowSessionScope("cargo".into())
+    );
+}
+
+#[test]
+fn project_scope_key_sends_project_prefix() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned())
+            .with_path("src/main.rs"),
+    ));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('p'))),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowProjectScope("src".into())
+    );
 }
 
 fn row_containing(rows: &[String], needle: &str) -> usize {

@@ -2453,3 +2453,17 @@ fn reasoning_effort_rejected_outside_exec_and_bad_values() {
         assert_eq!(error.to_string(), expected);
     }
 }
+
+#[test]
+fn resume_provider_set_includes_all_builtin_providers_for_mid_session_switch() {
+    // Review v2 §14.5: a resumed session rejected /model switches with
+    // "provider is not configured" because only {active, original} providers
+    // were constructed. The full builtin set must be present (auth is lazy).
+    let original = euler_core::ModelTarget::new("fixture".to_owned(), "echo".to_owned());
+    let active = euler_core::ModelTarget::new("fixture".to_owned(), "echo".to_owned());
+    let providers =
+        crate::resume_provider_set(&original, &active, None).expect("resume provider set");
+    for id in ["fixture", "anthropic", "openai", "openrouter", "chatgpt"] {
+        assert!(providers.contains(id), "missing provider: {id}");
+    }
+}

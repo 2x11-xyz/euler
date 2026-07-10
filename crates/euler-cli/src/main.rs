@@ -212,6 +212,12 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let providers = tui_provider_set(run.provider_id.clone(), run.provider, &run.custom_providers);
     let preference_path = model_preference::default_model_preference_path();
     let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
+    // v2 Warm Spine: timestamps are opt-in (§5.5); the anchor spine carries
+    // the ledger by default.
+    let show_timestamp_gutter =
+        load_timestamps_preference(preference_path.as_deref()).unwrap_or(false);
+    let notifications_enabled =
+        load_notifications_preference(preference_path.as_deref()).unwrap_or(true);
     let mut session = Session::new_with_providers(live_session.config, providers, decider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
     if let Some((_, extension)) = observer {
@@ -224,6 +230,8 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             linefeed_history_insert: run.linefeed_history_insert,
             theme_choice,
             theme_preference_path: preference_path,
+            show_timestamp_gutter: Some(show_timestamp_gutter),
+            notifications_enabled: Some(notifications_enabled),
             model_catalog: Some(run.model_catalog),
             session_store: live_session
                 .refresh
@@ -636,6 +644,20 @@ fn run_live_extension_command(
     let Some(bundled) = bundled_extension_by_id(id) else {
         return headless_extension_error(format!("unknown extension id: {id}"));
     };
+    // Piped headless runs cannot prompt (stdin is the command protocol):
+    // invoking `extension_run` names the command explicitly, so its declared
+    // capabilities are granted for this run — with visibility, never silently.
+    if !command_descriptor.required_capabilities.is_empty() {
+        let granted = command_descriptor
+            .required_capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "extension {id}.{command}: granting declared capabilities for this run: {granted}"
+        );
+    }
     match session.execute_extension_command(
         bundled.extension,
         command,
@@ -1966,23 +1988,18 @@ fn resume_provider_set_with_custom(
             providers.insert_named(original.provider.clone(), original_provider);
         }
     }
+    // A resumed session must be able to /model-switch to any configured
+    // provider, exactly like a fresh TUI session (review v2 §14.5 — switches
+    // were rejected with "provider is not configured"). Auth stays lazy:
+    // invoking an un-credentialed provider still fails loudly at call time.
+    fill_provider_set(&mut providers, custom_providers);
     Ok(providers)
 }
 
-fn tui_provider_set(
-    active_provider_id: String,
-    active_provider: Box<dyn ModelProvider>,
-    custom_providers: &ProviderConfigRegistry,
-) -> ProviderSet {
-    let mut providers = ProviderSet::new();
-    providers.insert_named(active_provider_id.clone(), active_provider);
+/// Best-effort: add every builtin + custom provider not already present.
+fn fill_provider_set(providers: &mut ProviderSet, custom_providers: &ProviderConfigRegistry) {
     for descriptor in BUILTIN_PROVIDERS {
-        insert_tui_provider_if_missing(
-            &mut providers,
-            descriptor.id,
-            &active_provider_id,
-            custom_providers,
-        );
+        insert_provider_if_missing(providers, descriptor.id, custom_providers);
     }
     let mut custom_ids = custom_providers
         .providers()
@@ -1990,23 +2007,16 @@ fn tui_provider_set(
         .collect::<Vec<_>>();
     custom_ids.sort_unstable();
     for provider_id in custom_ids {
-        insert_tui_provider_if_missing(
-            &mut providers,
-            provider_id,
-            &active_provider_id,
-            custom_providers,
-        );
+        insert_provider_if_missing(providers, provider_id, custom_providers);
     }
-    providers
 }
 
-fn insert_tui_provider_if_missing(
+fn insert_provider_if_missing(
     providers: &mut ProviderSet,
     provider_id: &str,
-    active_provider_id: &str,
     custom_providers: &ProviderConfigRegistry,
 ) {
-    if provider_id == active_provider_id || providers.contains(provider_id) {
+    if providers.contains(provider_id) {
         return;
     }
     let Ok(provider) = provider_for_id(
@@ -2018,6 +2028,17 @@ fn insert_tui_provider_if_missing(
         return;
     };
     providers.insert_named(provider_id.to_owned(), provider);
+}
+
+fn tui_provider_set(
+    active_provider_id: String,
+    active_provider: Box<dyn ModelProvider>,
+    custom_providers: &ProviderConfigRegistry,
+) -> ProviderSet {
+    let mut providers = ProviderSet::new();
+    providers.insert_named(active_provider_id, active_provider);
+    fill_provider_set(&mut providers, custom_providers);
+    providers
 }
 
 fn invocation_target(run: &RunArgs) -> ModelTarget {
@@ -2043,6 +2064,30 @@ fn load_known_theme_preference(preference_path: Option<&Path>) -> Option<ThemeCh
         ThemePreferenceLoad::Missing => None,
         ThemePreferenceLoad::Ignored(message) => {
             eprintln!("warning: ignored theme preference: {message}");
+            None
+        }
+    }
+}
+
+fn load_timestamps_preference(preference_path: Option<&Path>) -> Option<bool> {
+    let path = preference_path?;
+    match model_preference::load_timestamps_preference(path) {
+        model_preference::TimestampsPreferenceLoad::Loaded(show) => Some(show),
+        model_preference::TimestampsPreferenceLoad::Missing => None,
+        model_preference::TimestampsPreferenceLoad::Ignored(message) => {
+            eprintln!("warning: ignored timestamps preference: {message}");
+            None
+        }
+    }
+}
+
+fn load_notifications_preference(preference_path: Option<&Path>) -> Option<bool> {
+    let path = preference_path?;
+    match model_preference::load_notifications_preference(path) {
+        model_preference::NotificationsPreferenceLoad::Loaded(enabled) => Some(enabled),
+        model_preference::NotificationsPreferenceLoad::Missing => None,
+        model_preference::NotificationsPreferenceLoad::Ignored(message) => {
+            eprintln!("warning: ignored notifications preference: {message}");
             None
         }
     }

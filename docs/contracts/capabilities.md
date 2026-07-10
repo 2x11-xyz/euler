@@ -32,6 +32,7 @@ Minimum v0 scopes:
 - `diagnostics-read`
 - `artifact-write`
 - `agent-record`
+- `agent-spawn`
 - `context-slot`
 - `shell-exec`
 - `network`
@@ -47,6 +48,20 @@ A capability decision is one of:
 - `always-deny` — deny without prompting.
 
 Permission prompts and decisions are session events and are recorded in provenance. Privileged secret/config edits always require explicit approval even if broader write access was granted.
+
+## Extension capability approval
+
+A command descriptor's `required_capabilities` is a *declaration*, never a
+grant. On surfaces that can ask the user (the TUI), each declared capability
+becomes a real permission decision before the command executes: explicit
+`session-allow` grants silently, explicit `always-deny` denies without a
+prompt, and `ask` or unconfigured capabilities prompt the user — recorded as
+`permission.prompt`/`permission.decision` events carrying `extension_id` and
+`command`. Session-scoped approvals cover later runs (covered requests run
+under the original decision, with no fresh record). Piped headless runs
+cannot prompt (stdin is the command protocol): there, explicitly invoking a
+named command grants its declared capabilities for that run, announced on
+stderr — visible, never silent.
 
 ## Scoped Grants
 
@@ -134,6 +149,17 @@ worker, an observer daemon, or an arbitrary child-process launcher. Child
 capabilities use the same exact flat subset semantics as core child agents:
 the child set may be empty or equal to the command grant, duplicates are
 normalized, and escalation fails before the host appends any agent events.
+
+`agent-spawn` gates host-mediated live child-agent execution
+(`HostApi::spawn_agent`): the host runs one child session to completion for a
+validated `AgentTask` and records the same `agent.spawn`/`agent.result` pair
+the session companion path records. Everything `agent-record` is not, this is
+also not — except live model invocation of exactly one child per call. Child
+capability attenuation uses the same exact flat subset semantics; the child
+set must be a subset of the invoking command's granted capabilities. Children
+do not receive an extension host and cannot spawn (depth one in v0.1).
+Synchronous per call; background/parallel extension spawns remain future work
+(see the multi-agent contract).
 
 Extension event-feed checkpoints are private extension state:
 

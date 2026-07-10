@@ -3,6 +3,7 @@ pub enum ThemeChoice {
     #[default]
     GruvboxDark,
     GruvboxLight,
+    WarmLedger,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +79,13 @@ const THEME_PROFILES: &[ThemeProfile] = &[
         mode: ThemeMode::Light,
         aliases: &["light"],
     },
+    ThemeProfile {
+        choice: ThemeChoice::WarmLedger,
+        id: "warm-ledger",
+        label: "Warm Ledger",
+        mode: ThemeMode::Dark,
+        aliases: &["warm"],
+    },
 ];
 
 fn normalize_theme_id(value: &str) -> String {
@@ -111,12 +119,17 @@ mod tests {
     fn theme_catalog_exposes_structured_profiles_and_usage_ids() {
         assert_eq!(
             ThemeChoice::canonical_ids().collect::<Vec<_>>(),
-            vec!["gruvbox-dark", "gruvbox-light"]
+            vec!["gruvbox-dark", "gruvbox-light", "warm-ledger"]
         );
         assert_eq!(
             ThemeChoice::format_canonical_ids("|"),
-            "gruvbox-dark|gruvbox-light"
+            "gruvbox-dark|gruvbox-light|warm-ledger"
         );
+        assert_eq!(
+            ThemeChoice::parse("warm-ledger"),
+            Some(ThemeChoice::WarmLedger)
+        );
+        assert_eq!(ThemeChoice::parse("warm"), Some(ThemeChoice::WarmLedger));
         assert_eq!(ThemeChoice::GruvboxLight.label(), "Gruvbox Light");
         assert_eq!(ThemeChoice::GruvboxDark.profile().mode, ThemeMode::Dark);
         for profile in ThemeChoice::all() {

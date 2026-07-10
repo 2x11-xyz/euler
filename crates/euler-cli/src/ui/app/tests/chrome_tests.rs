@@ -1,5 +1,17 @@
+use super::super::visual::render_finalized_visual_items_with_offsets;
 use super::*;
+use crate::ui::transcript::ProjectedEntry;
 use crate::ui::visual_canvas::CursorTarget;
+
+/// Test-only helper: wrap bare items as untimed entries for callers of
+/// `render_finalized_visual_items_with_offsets`, which (in production)
+/// always receives real per-item timing from the visual canvas.
+fn untimed_entries(items: Vec<TranscriptItem>) -> Vec<ProjectedEntry> {
+    items
+        .into_iter()
+        .map(|item| ProjectedEntry { item, timing: None })
+        .collect()
+}
 
 #[test]
 fn question_mark_help_overlay_is_global_only_for_idle_composer() {
@@ -75,8 +87,9 @@ fn empty_composer_prompt_has_breathing_room_above_statusline() {
     assert_eq!(areas.notice.height, 0);
     assert!(screen_row(&contents, areas.bottom.y).starts_with("▌ "));
     let status = screen_row(&contents, areas.status.y);
-    assert!(status.starts_with("  fixture/echo medium · "));
-    assert!(status.contains(" · Context ?% used"));
+    assert!(status.starts_with("  / commands"));
+    assert!(status.trim_end().ends_with("echo · ctx ?%"));
+    assert!(!status.contains("Context ?% used"));
 }
 
 #[test]
@@ -90,7 +103,7 @@ fn startup_history_sits_immediately_above_prompt_status_in_compact_viewport() {
     let rows = terminal.backend().screen_rows();
     let equation = row_containing(&rows, "e^(iπ) + 1 = 0");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
+    let status = row_containing(&rows, "echo · ctx");
     assert_eq!(status, prompt + 2, "rows: {rows:?}");
     assert!(rows[prompt + 1].trim().is_empty(), "rows: {rows:?}");
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
@@ -118,10 +131,9 @@ fn ctrl_c_quit_notice_uses_reserved_transient_row_without_growing_frame() {
         before.active_frame_lines.len()
     );
     assert!(
-        after
-            .active_frame_lines
-            .iter()
-            .any(|line| line.plain_text() == "press Ctrl+C again to quit"),
+        after.active_frame_lines.iter().any(|line| {
+            line.plain_text() == "ctrl+c again to quit · session saved, /resume restores"
+        }),
         "lines: {:?}",
         after
             .active_frame_lines
@@ -136,10 +148,9 @@ fn ctrl_c_quit_notice_uses_reserved_transient_row_without_growing_frame() {
     );
     let palette = core.visual_canvas_frame(80);
     assert!(
-        !palette
-            .active_frame_lines
-            .iter()
-            .any(|line| line.plain_text() == "press Ctrl+C again to quit"),
+        !palette.active_frame_lines.iter().any(|line| {
+            line.plain_text() == "ctrl+c again to quit · session saved, /resume restores"
+        }),
         "lines: {:?}",
         palette
             .active_frame_lines
@@ -171,17 +182,22 @@ fn transient_notice_composer_and_status_are_separated_by_blank_rows() {
         .expect("prompt row");
     let status = lines
         .iter()
-        .position(|line| line.contains("fixture/echo"))
+        .position(|line| line.contains("echo · ctx"))
         .expect("status row");
 
-    assert_eq!(prompt, notice + 2, "lines: {lines:?}");
+    // Spec v2.1 §13.3: the transient/HUD line sits DIRECTLY above the
+    // composer (no blank line); one blank still separates composer from
+    // the status footer.
+    assert_eq!(prompt, notice + 1, "lines: {lines:?}");
     assert_eq!(status, prompt + 2, "lines: {lines:?}");
-    assert!(lines[notice + 1].is_empty(), "lines: {lines:?}");
     assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
 }
 
+/// Issue #23: the slash palette renders fully inside the rail-bounded
+/// composer container — in the composer's own slot — so nothing renders
+/// below the footer/status line.
 #[test]
-fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() {
+fn slash_palette_renders_inside_composer_container_with_nothing_below_footer() {
     let mut core = core();
     core.drain_finalized_visual_lines(80);
 
@@ -197,22 +213,24 @@ fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() 
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
 
-    let prompt = lines
-        .iter()
-        .position(|line| line.starts_with('▌'))
-        .expect("prompt row");
     let status = lines
         .iter()
-        .position(|line| line.contains("fixture/echo"))
+        .position(|line| line.contains("echo · ctx"))
         .expect("status row");
+    assert_eq!(
+        status,
+        lines.len() - 1,
+        "status/footer must be the last rendered line: lines: {lines:?}"
+    );
+
     let slash = lines
         .iter()
         .position(|line| line.trim() == "\u{258c} /")
         .expect("slash input row");
-
-    assert_eq!(status, prompt + 2, "lines: {lines:?}");
-    assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
-    assert_eq!(slash, status + 1, "lines: {lines:?}");
+    assert!(
+        slash < status,
+        "palette must render above the footer, not below it: lines: {lines:?}"
+    );
     assert_eq!(
         after.cursor,
         Some(CursorTarget {
@@ -241,9 +259,11 @@ fn repeated_finalized_writes_move_banner_up_without_gap_or_clipping() {
     let second = row_containing(&rows, "second generated");
     let prompt = row_containing(&rows, "▌");
     assert!(equation < first, "rows: {rows:?}");
+    // first, blank, second — one uniform blank separates events (§1)
     assert_eq!(second, first + 2, "rows: {rows:?}");
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
-    assert_eq!(prompt, second + 4, "rows: {rows:?}");
+    // second, event blank, composer breathing row, prompt
+    assert_eq!(prompt, second + 3, "rows: {rows:?}");
 }
 
 #[test]
@@ -297,23 +317,21 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
         ]),
     )));
     render_compact_frame(&mut terminal, &mut core);
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::ShellExec,
-        reason: "tool run_shell".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
     render_compact_frame(&mut terminal, &mut core);
     assert!(terminal
         .backend()
         .screen_contents()
-        .contains("Would you like to run the following command?"));
+        .contains("Run command?"));
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('y'))),
         CoreEffect::Render
     );
-    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Allow);
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::AllowOnce);
     insert_event_and_render(
         &mut terminal,
         &mut core,
@@ -342,12 +360,10 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     );
 
     let rows = terminal.backend().scrollback_rows();
-    assert!(!rows
-        .iter()
-        .any(|row| row.contains("Would you like to run the following command?")));
-    assert!(!rows.iter().any(|row| row.contains("1. Yes, proceed")));
-    let decision = row_containing(&rows, "✔ Permission approved: shell-exec (allowed)");
-    let tool = row_containing(&rows, "Ran cargo check");
+    assert!(!rows.iter().any(|row| row.contains("Approval required")));
+    assert!(!rows.iter().any(|row| row.contains("y  Allow once")));
+    let decision = row_containing(&rows, "✓ allowed once · shell-exec");
+    let tool = row_containing(&rows, "bash $ cargo check");
     let blank_rows_between = rows[decision + 1..tool]
         .iter()
         .filter(|row| row.trim().is_empty())
@@ -416,7 +432,7 @@ fn scrollback_preserves_banner_user_tool_and_final_after_many_insertions() {
         &[
             "e^(iπ) + 1 = 0",
             "▌ inspect",
-            "• Explored",
+            "explore",
             "Read AGENTS.md",
             "final prose",
             "filler 11",
@@ -493,9 +509,20 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
         .collect::<Vec<_>>();
     let user_row = user_lines
         .iter()
-        .position(|line| line == "▌ hi")
+        .position(|line| line.contains("▌ hi"))
         .expect("user row");
-    assert_eq!(user_lines.get(user_row + 1).map(String::as_str), Some(""));
+    // v2 (§1): the rhythm row under the user block is one blank line —
+    // per-event hairlines are gone.
+    assert!(
+        user_lines
+            .get(user_row + 1)
+            .is_some_and(|line| line.trim().is_empty()),
+        "user_lines: {user_lines:?}"
+    );
+    assert!(
+        !user_lines.iter().any(|line| line.contains('─')),
+        "no hairline should follow the user block: {user_lines:?}"
+    );
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::ASSISTANT_MESSAGE,
@@ -508,11 +535,13 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
         .collect::<Vec<_>>();
     let answer_row = answer_lines
         .iter()
-        .position(|line| line == "  Hi! How can I help?")
+        .position(|line| line.contains("Hi! How can I help?"))
         .expect("answer row");
-    assert_eq!(
-        answer_lines.get(answer_row + 1).map(String::as_str),
-        Some("")
+    assert!(
+        answer_lines
+            .get(answer_row + 1)
+            .is_some_and(|line| line.trim().is_empty()),
+        "answer_lines: {answer_lines:?}"
     );
 
     core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(4)));
@@ -524,25 +553,32 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
 #[test]
 fn finalized_wrapped_prompt_uses_continuous_user_rail() {
     let theme = Theme::default();
-    let lines = render_finalized_visual_items(
-        &[TranscriptItem::UserMessage(
+    let lines = render_finalized_visual_items_with_offsets(
+        &untimed_entries(vec![TranscriptItem::UserMessage(
             "alpha beta gamma delta epsilon".to_owned(),
-        )],
+        )]),
         &theme,
         28,
         TOOL_CALL_MAX_LINES,
+        false,
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
-    assert_eq!(
-        lines.first().map(String::as_str),
-        Some("▌ alpha beta gamma delta")
+    assert!(
+        lines.iter().any(|line| line.contains("▌ alpha beta gamma")),
+        "lines: {lines:?}"
     );
-    assert_eq!(lines.get(1).map(String::as_str), Some("▌ epsilon"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("▌") && (line.contains("epsilon") || line.contains("delta"))),
+        "lines: {lines:?}"
+    );
     assert_eq!(
-        lines.iter().filter(|line| line.starts_with("▌")).count(),
+        lines.iter().filter(|line| line.contains("▌")).count(),
         2,
         "wrapped prompt should keep a continuous user rail: {lines:?}"
     );
@@ -553,30 +589,34 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     let theme = Theme::default();
     let table = "| Layer | Responsibility | Repo location |\n|---|---|---|\n| CLI/TUI layer | User-facing command-line and Ratatui transcript composer status UX | euler-cli |\n";
 
-    let narrow = render_finalized_visual_items(
-        &[TranscriptItem::AssistantMessage(table.to_owned())],
+    let narrow = render_finalized_visual_items_with_offsets(
+        &untimed_entries(vec![TranscriptItem::AssistantMessage(table.to_owned())]),
         &theme,
         44,
         TOOL_CALL_MAX_LINES,
+        false,
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
     assert!(
-        narrow.iter().any(|line| line == "  Layer: CLI/TUI layer"),
+        // The v2 anchor spine puts a `•` on the row's first visual line;
+        // wrapped stacked-row continuations keep the plain two-space pad.
+        narrow
+            .iter()
+            .any(|line| line.trim_start() == "• Layer: CLI/TUI layer"),
         "stacked table row missing at narrow width: {narrow:?}"
     );
     assert!(
         narrow
             .iter()
-            .any(|line| line == "  Repo location: euler-cli"),
+            .any(|line| line.trim_start() == "Repo location: euler-cli"),
         "stacked repo row missing at narrow width: {narrow:?}"
     );
     assert!(
-        narrow
-            .iter()
-            .all(|line| !line.contains('━') && !line.contains('─')),
+        narrow.iter().all(|line| !line.contains('┼')),
         "narrow multi-column table should not render as a grid: {narrow:?}"
     );
     assert!(
@@ -586,12 +626,14 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         "narrow stacked table overflowed: {narrow:?}"
     );
 
-    let wide = render_finalized_visual_items(
-        &[TranscriptItem::AssistantMessage(table.to_owned())],
+    let wide = render_finalized_visual_items_with_offsets(
+        &untimed_entries(vec![TranscriptItem::AssistantMessage(table.to_owned())]),
         &theme,
         100,
         TOOL_CALL_MAX_LINES,
+        false,
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
@@ -600,13 +642,16 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         wide.iter().any(|line| line.contains("CLI/TUI layer")),
         "wide grid table row missing: {wide:?}"
     );
-    assert!(
-        wide.iter().any(|line| line.contains('━')),
-        "wide table should render as a grid: {wide:?}"
+    assert_eq!(
+        wide.iter().filter(|line| line.contains('┼')).count(),
+        1,
+        "wide table should render as a grid with exactly one header rule: {wide:?}"
     );
     assert!(
-        wide.iter()
-            .all(|line| line != "  Layer: CLI/TUI layer" && line != "  Repo location: euler-cli"),
+        wide.iter().all(|line| {
+            let trimmed = line.trim_start();
+            trimmed != "Layer: CLI/TUI layer" && trimmed != "Repo location: euler-cli"
+        }),
         "wide table should not include stacked rows: {wide:?}"
     );
     assert!(
@@ -636,16 +681,18 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
         .map(|row| row.trim_end().to_owned())
         .collect::<Vec<_>>();
     assert!(
-        rows.iter().any(|row| row == "  Layer: CLI/TUI layer"),
+        // The v2 anchor spine puts a `•` on the row's first visual line.
+        rows.iter()
+            .any(|row| row.trim_start() == "• Layer: CLI/TUI layer"),
         "stacked table row missing after resize: {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row == "  Repo location: euler-cli"),
+        rows.iter()
+            .any(|row| row.trim_start() == "Repo location: euler-cli"),
         "stacked repo row missing after resize: {rows:?}"
     );
     assert!(
-        rows.iter()
-            .all(|row| !row.contains('━') && !row.contains('─')),
+        rows.iter().all(|row| !row.contains('┼')),
         "resized multi-column table should not leave grid artifacts: {rows:?}"
     );
     assert_eq!(
@@ -660,22 +707,32 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
 #[test]
 fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
     let theme = Theme::default();
-    let lines = render_finalized_visual_items(
-        &[
+    let lines = render_finalized_visual_items_with_offsets(
+        &untimed_entries(vec![
             TranscriptItem::UserMessage("hi".to_owned()),
             TranscriptItem::AssistantMessage("Hi! How can I help?".to_owned()),
             TranscriptItem::WorkedDuration("5s".to_owned()),
-        ],
+        ]),
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
+        false,
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
-    assert_eq!(lines.first().map(String::as_str), Some("▌ hi"));
-    assert!(lines.iter().any(|line| line == "  Hi! How can I help?"));
+    assert!(
+        lines.first().is_some_and(|line| line.contains("▌ hi")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Hi! How can I help?")),
+        "lines: {lines:?}"
+    );
     assert!(lines.iter().any(|line| line.contains("Worked for 5s")));
     assert_eq!(lines.last().map(String::as_str), Some(""));
     assert!(
@@ -689,24 +746,30 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
 #[test]
 fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
     let theme = Theme::default();
-    let lines = render_finalized_visual_items(
-        &[TranscriptItem::ToolRun {
+    let lines = render_finalized_visual_items_with_offsets(
+        &untimed_entries(vec![TranscriptItem::ToolRun {
             command: "ls -la".to_owned(),
             ok: true,
             error: String::new(),
             output: "exit 0\nfile".to_owned(),
             exit_code: Some(0),
-        }],
+            grant_source: None,
+        }]),
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
+        false,
     )
+    .0
     .iter()
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
-    assert!(lines.iter().any(|line| line.contains("Ran ls -la")));
-    assert_ne!(lines.last().map(String::as_str), Some(""));
+    assert!(lines.iter().any(|line| line.contains("bash $ ls -la")));
+    // v2 (§1): hairlines are gone; every event — including the last one — is
+    // followed by exactly one blank line instead. A trailing blank row is
+    // expected now, not a leftover "prompt/answer rhythm" hairline.
+    assert_eq!(lines.last().map(String::as_str), Some(""));
 }
 
 #[test]
@@ -722,6 +785,7 @@ fn finalized_tool_output_batch_separates_following_assistant_prose() {
         error: String::new(),
         output: "last tool output row".to_owned(),
         exit_code: Some(0),
+        grant_source: None,
     });
     render_compact_frame(&mut terminal, &mut core);
 
@@ -732,10 +796,12 @@ fn finalized_tool_output_batch_separates_following_assistant_prose() {
 
     let rows = terminal.backend().scrollback_rows();
     let tool_last = row_containing(&rows, "last tool output row");
-    assert!(rows[tool_last + 1].contains("exit 0 · 1 line"));
-    assert_eq!(rows[tool_last + 2].trim(), "", "rows: {rows:?}");
+    assert!(rows.iter().any(|row| row.contains("exit 0 · 1 line")));
+    // v2 (§1): one blank line under the tool block separates it from the
+    // following assistant prose — no hairline.
+    assert!(rows[tool_last + 1].trim().is_empty(), "rows: {rows:?}");
     assert!(
-        rows[tool_last + 3].starts_with("  I see 16 em dashes"),
+        rows[tool_last + 2].contains("I see 16 em dashes"),
         "rows: {rows:?}"
     );
 }
@@ -824,7 +890,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let before_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &before_final,
-        &["• Explored", "Read Cargo.toml", "Ran cargo test"],
+        &["explore", "Read Cargo.toml", "bash $ cargo test"],
     );
     assert!(!before_final.iter().any(|row| row.contains("final answer")));
 
@@ -839,7 +905,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let after_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &after_final,
-        &["• Explored", "Ran cargo test", "final answer"],
+        &["explore", "bash $ cargo test", "final answer"],
     );
 }
 
@@ -892,7 +958,7 @@ fn tool_round_limit_finalizes_guidance_without_raw_session_failure() {
         .iter()
         .any(|row| row.contains("run_turn: model exceeded maximum tool rounds")));
     let screen = terminal.backend().screen_contents();
-    assert!(!screen.contains("◦ Working"));
+    assert!(!screen.contains("⠋ working"));
     assert!(!screen.contains("turn failed"));
     assert!(screen.contains("▌"));
 }
@@ -939,7 +1005,7 @@ fn permission_denial_returns_failed_tool_result_not_interruption() {
         .iter()
         .any(|row| row.contains("Permission was denied for shell-exec")));
     let screen = terminal.backend().screen_contents();
-    assert!(!screen.contains("Conversation interrupted"));
+    assert!(!screen.contains("interrupted — tell euler what to do differently"));
     assert!(screen.contains("▌"));
 }
 
@@ -978,8 +1044,8 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
 
     let failed_gap = terminal.backend().screen_contents();
     assert!(failed_gap.contains("provider: transport down"));
-    assert!(failed_gap.contains("■ Turn failed - waiting for cleanup."));
-    assert!(!failed_gap.contains("◦ Working"));
+    assert!(failed_gap.contains("■ turn failed — waiting for cleanup"));
+    assert!(!failed_gap.contains("⠋ working"));
     assert!(
         !terminal
             .backend()
@@ -1001,7 +1067,7 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
     assert!(!history.contains("run_turn: transport down"));
     let done = terminal.backend().screen_contents();
     assert!(!done.contains("■ Turn failed"));
-    assert!(!done.contains("◦ Working"));
+    assert!(!done.contains("⠋ working"));
     assert!(done.contains("▌"));
 }
 
@@ -1031,7 +1097,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     )));
     render_compact_frame(&mut terminal, &mut core);
     let before_done = terminal.backend().screen_contents();
-    assert!(before_done.contains("◦ Working"));
+    assert!(before_done.contains("⠋ working"));
     assert!(!before_done.contains("■ Turn failed"));
 
     core.handle_turn_event(TurnEvent::TurnDone {
@@ -1045,7 +1111,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     assert!(history.contains("run_turn: transport down"));
     let done = terminal.backend().screen_contents();
     assert!(!done.contains("■ Turn failed"));
-    assert!(!done.contains("◦ Working"));
+    assert!(!done.contains("⠋ working"));
     assert!(done.contains("▌"));
 }
 
@@ -1084,12 +1150,14 @@ fn final_completion_collapses_live_viewport_without_blank_gap() {
     let rows = terminal.backend().screen_rows();
     let final_answer = row_containing(&rows, "final answer");
     let worked = row_containing(&rows, "Worked for 41s");
+    let recap = row_containing(&rows, "0 files · ctx");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "fixture/echo");
+    let status = row_containing(&rows, "echo · ctx");
     assert!(final_answer < worked, "rows: {rows:?}");
+    assert!(worked < recap, "recap follows worked-for, rows: {rows:?}");
     assert!(
-        prompt.saturating_sub(worked) <= 4,
-        "final worked row should be adjacent to prompt/status, rows: {rows:?}"
+        prompt.saturating_sub(recap) <= 4,
+        "final recap row should be adjacent to prompt/status, rows: {rows:?}"
     );
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
     assert_eq!(status, prompt + 2, "rows: {rows:?}");
@@ -1151,7 +1219,7 @@ fn finalized_visual_output_renders_in_logical_canvas_without_active_duplicate() 
 
     assert!(text.contains("e^(iπ) + 1 = 0"));
     assert!(text.contains("▌"));
-    assert!(text.contains("fixture/echo"));
+    assert!(text.contains("echo · ctx"));
 
     let second = core.render_visual_canvas(80);
     let second_text = second
@@ -1292,13 +1360,28 @@ fn finalized_visual_output_uses_worked_separator_as_turn_boundary() {
         object([("content", "second".into())]),
     )));
 
-    let second = core
+    let second_lines = core
         .drain_finalized_visual_lines(40)
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
-        .collect::<String>();
-    assert!(!second.contains(&"─".repeat(40)));
-    assert!(second.contains("second"));
+        .collect::<Vec<_>>();
+    let second = second_lines.join("");
+    // Full-frame drain still shows the prior Worked separator as the turn
+    // boundary; the new user row must follow it, and it must not be re-emitted.
+    assert_eq!(
+        second.matches("Worked for").count(),
+        1,
+        "second_lines: {second_lines:?}"
+    );
+    let worked = second_lines
+        .iter()
+        .position(|line| line.contains("Worked for"))
+        .expect("worked separator");
+    let second_user = second_lines
+        .iter()
+        .position(|line| line.contains("second"))
+        .expect("second user");
+    assert!(worked < second_user, "second_lines: {second_lines:?}");
 }
 
 #[test]
@@ -1548,7 +1631,7 @@ fn idle_frame_does_not_render_stale_tool_activity_after_final_answer() {
     let contents = terminal.backend().screen_contents();
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("read_file completed"));
-    assert!(!contents.contains("• Explored"));
+    assert!(!contents.contains("explore"));
     assert!(!contents.contains("# raw instructions"));
 }
 
@@ -1601,7 +1684,7 @@ fn patch_approval_hides_completed_read_file_activity() {
         .draw(|frame| core.render(frame))
         .expect("patch approval draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to apply this patch?"));
+    assert!(contents.contains("Edit file?"));
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("read_file completed"));
     assert!(!contents.contains("raw transcript source"));
@@ -1616,20 +1699,26 @@ fn patch_approval_remains_visible_and_active_when_question_mark_is_pressed() {
     terminal
         .draw(|frame| core.render(frame))
         .expect("draw before");
-    assert!(terminal
-        .backend()
-        .screen_contents()
-        .contains("Would you like to apply this patch?"));
+    assert!(terminal.backend().screen_contents().contains("Edit file?"));
 
-    assert_eq!(core.handle_input(key(KeyCode::Char('?'))), CoreEffect::None);
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('?'))),
+        CoreEffect::Render
+    );
     assert!(matches!(core.modal, Some(Modal::PatchApproval(_))));
+    assert_eq!(core.bottom.composer().submit_text(), "?");
 
     terminal
         .draw(|frame| core.render(frame))
         .expect("draw after");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to apply this patch?"));
-    assert!(contents.contains("r. Review expanded patch (r)"));
+    assert!(contents.contains("Edit file?"), "contents:\n{contents}");
+    // Height-tight frames may clip the trailing rows; the decision keys are
+    // the durable affordance that must remain visible.
+    assert!(
+        contents.contains("y  Allow once") && contents.contains("n/esc  Deny"),
+        "contents:\n{contents}"
+    );
     assert!(!contents.contains("Euler keys"));
 }
 
@@ -1747,7 +1836,9 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
         "finalized projection duplicated tool block: {finalized}"
     );
     assert_eq!(
-        finalized.matches("Conversation interrupted").count(),
+        finalized
+            .matches("interrupted — tell euler what to do differently")
+            .count(),
         2,
         "two interruptions were finalized: {finalized}"
     );
@@ -1773,7 +1864,7 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
     );
     let interrupted_count = durable
         .iter()
-        .filter(|row| row.contains("Conversation interrupted"))
+        .filter(|row| row.contains("interrupted — tell euler what to do differently"))
         .count();
     assert_eq!(
         interrupted_count, 2,
@@ -1782,7 +1873,7 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
     // The tool block must not repeat between the two notices.
     let first_notice = durable
         .iter()
-        .position(|row| row.contains("Conversation interrupted"))
+        .position(|row| row.contains("interrupted — tell euler what to do differently"))
         .expect("first notice");
     assert!(
         !durable[first_notice..]
@@ -1790,4 +1881,52 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
             .any(|row| row.contains("exit 0 · 14 lines")),
         "tool footer reappears after first interruption notice: {durable:?}"
     );
+}
+
+#[test]
+fn turn_end_recap_follows_worked_duration_with_files_and_ctx() {
+    let mut core = core();
+    core.drain_finalized_visual_lines(72);
+    core.turn_event_start = 0;
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::FILE_DIFF,
+        object([
+            ("path", "src/lib.rs".into()),
+            ("diff", "--- a\n+++ b\n@@\n-old\n+new\n+extra\n".into()),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "edited".into())]),
+    )));
+    core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(8)));
+    let text = drain_finalized_visual_text(&mut core, 72);
+    assert!(text.contains("Worked for 8s"), "{text}");
+    assert!(text.contains("1 file · +2 −1 · ctx ?%"), "{text}");
+    assert!(text.contains("src/lib.rs"), "{text}");
+}
+
+#[test]
+fn notifications_only_queue_when_unfocused_and_enabled() {
+    let mut core = core();
+    core.queue_notification(super::super::notify::NotifyEvent::TurnDone);
+    assert!(core.take_pending_notification().is_none());
+    core.set_terminal_focused(false);
+    core.queue_notification(super::super::notify::NotifyEvent::TurnDone);
+    assert_eq!(
+        core.take_pending_notification(),
+        Some(super::super::notify::NotifyEvent::TurnDone)
+    );
+    core.notifications_enabled = false;
+    core.queue_notification(super::super::notify::NotifyEvent::Failure);
+    assert!(core.take_pending_notification().is_none());
+}
+
+#[test]
+fn exit_recap_is_bounded_and_copy_ready() {
+    let core = core();
+    let lines = core.exit_recap_lines();
+    assert!(lines.len() <= 5);
+    assert!(lines[1].text().contains("euler --resume"));
+    assert!(lines[2].is_faint());
 }

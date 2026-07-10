@@ -1,3 +1,8 @@
+use self::code_swarm::load_code_swarm_models_startup;
+use self::extension_runs::{list_extension_manager_items, ExtensionOutcome, ExtensionRunRequest};
+use self::notify::{NotifyEvent, STALL_THRESHOLD};
+#[cfg(test)]
+use self::resume::TuiResume;
 #[cfg(test)]
 use super::app_layout::{layout, string_lines};
 use super::bottom_surface::{BottomOwner, BottomSurface, SurfaceEvent};
@@ -5,8 +10,8 @@ use super::commands::CommandAction;
 #[cfg(test)]
 use super::composer::composer_widget;
 use super::composer::{
-    cursor_position, desired_height_for_width, render_lines as composer_render_lines, ComposerLine,
-    ComposerRenderOptions, ComposerSnapshot, OverflowIndicator,
+    cursor_position_for_snapshot, desired_height_for_width, render_lines as composer_render_lines,
+    ComposerLine, ComposerRenderOptions, ComposerSnapshot, OverflowIndicator, QueuedComposerLine,
 };
 use super::dirty::{RedrawLevel, Region};
 use super::event_loop::{
@@ -16,15 +21,15 @@ use super::external_clipboard::{terminal_clipboard_sequence, ClipboardSink, Syst
 use super::external_editor::{EditorResult, ExternalEditorRunner, SystemExternalEditor};
 use super::glyphs::user_line_prefix;
 use super::metrics;
-use super::patch_approval::{self, PatchApprovalModal, PatchPreview};
+use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPreview};
 #[cfg(test)]
 use super::status::status_widget;
-use super::status::{status_line_text, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
+use super::status::{status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
 use super::terminal::{self, PendingSignal, TerminalSession};
 use super::theme::{Theme, ThemeChoice};
 #[cfg(test)]
 use super::transcript::transcript_items_widget;
-use super::transcript::{TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
+use super::transcript::{self, TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
 use super::tui_decider::{PermissionChannels, PermissionReply, TuiDecider};
 use super::visual_canvas::{
     BlockCursor, CanvasComposerSnapshot, CanvasLine, CanvasSpan, CanvasStatusSnapshot, FocusOwner,
@@ -32,7 +37,8 @@ use super::visual_canvas::{
     VisualCanvasState,
 };
 use crate::bundled_extensions::{
-    bundled_descriptor_by_id, bundled_extension_by_id, bundled_round_observer, ObserveOptions,
+    bundled_descriptor_by_id, bundled_descriptors, bundled_extension_by_id, bundled_round_observer,
+    ObserveOptions,
 };
 use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection};
 use crate::model_preference;
@@ -40,23 +46,24 @@ use anyhow::{anyhow, Result};
 use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use euler_core::permissions::PermissionRequest;
 use euler_core::{
-    fold_session, heuristic_projection, read_resume_prefix, resume_session_from_folded_prefix,
-    AgentResult, AgentTask, ApprovalMode, EulerHome, ModelTarget, ProvenanceWriter,
-    ReasoningEffort, Session, SessionStore,
+    event_is_runtime_only, fold_session, heuristic_projection, load_extension_package,
+    read_resume_prefix, resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode,
+    EulerHome, ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource,
+    ModelTarget, ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
 use euler_sdk::{Capability, Extension};
 use ratatui::backend::CrosstermBackend;
+#[cfg(test)]
 use ratatui::layout::Rect;
-use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::widgets::Paragraph;
 #[cfg(test)]
 use ratatui::Frame;
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -66,7 +73,10 @@ use std::time::{Duration, Instant};
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
-const QUIT_ARM_NOTICE: &str = "press Ctrl+C again to quit";
+/// Working HUD braille spinner cadence (issue #27, spec v2.1 §13.3: 80-100ms).
+const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(90);
+const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
+const DENIED_COMPOSER_GHOST: &str = "denied — tell euler what to do instead";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
 
@@ -83,19 +93,48 @@ fn is_slash_command_key(key: &KeyEvent) -> bool {
 }
 
 #[cfg(test)]
+#[path = "app/chrome_test.rs"]
 mod chrome;
+mod code_swarm;
+mod extension_runs;
+mod notify;
 #[cfg(test)]
+#[path = "app/render_tests_support_test.rs"]
 mod render_tests_support;
+mod resume;
+mod session_commands;
 mod support;
+mod turn_events;
+mod turn_recap;
 mod visual;
 
 #[cfg(test)]
-use self::visual::{ratatui_lines_to_canvas, render_finalized_visual_items};
+use self::visual::ratatui_lines_to_canvas;
 
 use self::support::{
-    command_context, is_copy_key, merge_effects, read_terminal_event, session_resume_label,
-    session_root_status_path, update_token_usage,
+    command_context, context_window_tokens_for, detect_git_branch, is_copy_key, merge_effects,
+    read_terminal_event, session_resume_label, session_root_status_path, update_token_usage,
+    CommandContextParts,
 };
+
+/// Working HUD content, shared by the plain-text and styled render paths
+/// (issue #27). See `AppCore::working_hud_line`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum HudLine {
+    /// Unstyled one-liner (interrupted / turn-failed).
+    Plain(String),
+    /// Spinner glyph, phase verb, and dim suffix rendered as distinct spans.
+    Working {
+        spinner: &'static str,
+        verb: String,
+        suffix: String,
+        /// #47: already-wrapped continuation lines of the reasoning text
+        /// currently streaming, rendered dim italic under the spinner line.
+        /// Empty unless the phase is "thinking" and a fidelity-permitting
+        /// provider is streaming reasoning content.
+        reasoning_tail: Vec<String>,
+    },
+}
 
 pub struct App {
     terminal: CrosstermTerminal,
@@ -109,6 +148,11 @@ pub struct AppOptions {
     pub linefeed_history_insert: bool,
     pub theme_choice: ThemeChoice,
     pub theme_preference_path: Option<PathBuf>,
+    /// When false, the timestamp gutter column is hidden (content widens).
+    /// Defaults to true when unset.
+    pub show_timestamp_gutter: Option<bool>,
+    /// When false, OS notifications are suppressed. Defaults to true when unset.
+    pub notifications_enabled: Option<bool>,
     pub model_catalog: Option<MergedModelCatalog>,
     pub session_store: Option<SessionStore>,
     pub extensions: ExtensionSelection,
@@ -131,22 +175,65 @@ pub struct AppCore {
     composer_navigation_width: u16,
     last_working_elapsed_secs: Option<u64>,
     modal: Option<Modal>,
+    approval_selection: ApprovalOption,
     quit_armed: Option<Instant>,
     notice: Option<String>,
     pending_terminal_clipboard: Option<String>,
     interrupted_guidance: bool,
     in_flight_error: Option<String>,
-    tool_artifacts_expanded: bool,
+    /// Global `ctrl+o` fold state (issue #49): one flag for every foldable
+    /// history item — no per-cell targeting, no invisible nearest-to-
+    /// viewport heuristic. All foldable cells expand together, and collapse
+    /// together on the next `ctrl+o`.
+    tool_output_expanded: bool,
+    /// Last known history viewport as `(top_row, height)`, used to position
+    /// search-match scrolling.
+    last_history_viewport: (usize, usize),
     theme: Theme,
     theme_choice: ThemeChoice,
     theme_preference_path: Option<PathBuf>,
+    show_timestamp_gutter: bool,
     editor: Box<dyn ExternalEditorRunner>,
     clipboard: Box<dyn ClipboardSink>,
     pending_runs: VecDeque<PendingRunRequest>,
+    /// Saved /code-swarm reviewer model set (provider::model), session copy.
+    code_swarm_models: Vec<String>,
+    queued_inputs: VecDeque<String>,
+    queued_selection: Option<usize>,
+    queue_auto_flush_paused: bool,
+    /// Empty-composer ghost override (deny-with-instruction empty path).
+    empty_composer_ghost: Option<&'static str>,
     in_flight_label: Option<String>,
+    /// Persona/name of the in-flight companion run, for approval panel tagging.
+    in_flight_companion_name: Option<String>,
     in_flight_cancellable: bool,
+    /// Braille spinner animation frame (issue #27) — advanced by a tick
+    /// counter, never derived from `Instant::now()` at render time.
+    spinner_frame: usize,
+    /// Wall-clock anchor for the last spinner tick; only read outside
+    /// render, in the periodic background poll.
+    spinner_last_tick: Option<Instant>,
+    /// Current turn phase verb (thinking/exploring/reading X/writing X/
+    /// running bash/running tests), derived from streamed turn events.
+    /// `None` falls back to the generic "working" label.
+    current_phase_verb: Option<String>,
+    /// #47: a bounded tail of the reasoning text currently streaming under
+    /// the live `thinking · Ns` HUD line (readable-fidelity providers only).
+    /// Cleared the moment a text delta arrives, a `MODEL_REASONING` item
+    /// finalizes, or the turn ends — a late reasoning delta must never
+    /// reopen it once answer text has started.
+    reasoning_stream_tail: String,
+    /// Set once an answer text delta has streamed this turn; while set, a
+    /// late reasoning delta is ignored rather than reopening the tail.
+    reasoning_tail_locked: bool,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
+    turn_event_start: usize,
+    last_turn_activity_at: Option<Instant>,
+    stall_notified: bool,
+    terminal_focused: bool,
+    notifications_enabled: bool,
+    pending_notifications: VecDeque<NotifyEvent>,
 }
 
 enum AppState {
@@ -181,16 +268,6 @@ enum TurnEvent {
     },
 }
 
-struct TuiResume {
-    session: Session<TuiDecider>,
-    channels: PermissionChannels,
-    events: Vec<EventEnvelope>,
-    active_target: ModelTarget,
-    display_label: String,
-    recovery_closure_appended: bool,
-    warning_count: usize,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TurnOutcome {
     Complete,
@@ -199,24 +276,9 @@ enum TurnOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ExtensionOutcome {
-    Complete(serde_json::Value),
-    Failed(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 enum CompanionOutcome {
     Complete(AgentResult),
     Failed(String),
-}
-
-#[derive(Clone)]
-struct ExtensionRunRequest {
-    id: String,
-    command: String,
-    input: serde_json::Value,
-    extension: &'static dyn Extension,
-    capabilities: Vec<Capability>,
 }
 
 #[derive(Clone, Debug)]
@@ -228,12 +290,6 @@ struct CompanionRunRequest {
 enum PendingRunRequest {
     Extension(ExtensionRunRequest),
     Companion(CompanionRunRequest),
-}
-
-impl ExtensionRunRequest {
-    fn label(&self) -> String {
-        format!("extension {}.{}", self.id, self.command)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,8 +349,23 @@ impl App {
                 PendingSignal::Terminate => TerminalSignal::Terminate,
             }));
         }
-        if self.core.drain_background() || self.core.mark_working_timer_dirty() {
+        // Three independent dirty checks — evaluated with `|` (not `||`) so
+        // a `true` earlier in the chain can never short-circuit a later
+        // one's bookkeeping (the spinner's tick-scheduling state in
+        // particular must advance every poll or its cadence drifts).
+        let background_dirty = self.core.drain_background();
+        let timer_dirty = self.core.mark_working_timer_dirty();
+        let spinner_dirty = self.core.advance_spinner();
+        if background_dirty | timer_dirty | spinner_dirty {
             self.request_render(RedrawLevel::Full);
+        }
+        self.emit_pending_notifications();
+    }
+
+    fn emit_pending_notifications(&mut self) {
+        while let Some(event) = self.core.take_pending_notification() {
+            let sequence = self::notify::notification_sequence(event);
+            let _ = self.terminal.write_terminal_sequence(&sequence);
         }
     }
 
@@ -363,9 +434,21 @@ impl App {
             UiAction::InputBatch(inputs) => self.handle_input_batch(inputs),
             UiAction::InterruptCurrentTurn => self.core.handle_terminal_interrupt(),
             UiAction::Shutdown => return self.shutdown(),
+            UiAction::FocusChanged(focused) => {
+                self.core.set_terminal_focused(focused);
+                CoreEffect::None
+            }
             UiAction::Resize { .. } => {
                 metrics::record(metrics::Metric::ResizeAction);
-                CoreEffect::ReplayHistoryWithScrollbackPurge
+                // No replay, no scrollback purge: rows already in native
+                // scrollback stay untouched (re-purging duplicated them in
+                // 3J-ignoring terminals and destroyed them in honoring ones —
+                // the P1 audit finding). The canvas re-renders at the new
+                // width and the terminal remaps its committed boundary by
+                // item identity (commit_scrolled_history width branch).
+                self.core.invalidate_history_cache();
+                self.render_frame()?;
+                return Ok(false);
             }
             UiAction::Render(_) => {
                 self.render_frame()?;
@@ -430,11 +513,14 @@ impl App {
     }
 
     fn shutdown(&mut self) -> Result<bool> {
-        if self.core.turn_in_flight() {
+        let hard_exit = self.core.turn_in_flight();
+        if hard_exit {
             self.core.deny_open_modal();
-            // run_turn is synchronous. Hard-exit instead of joining an
-            // in-flight provider call that may not return.
-            terminal::restore_terminal();
+        }
+        let lines = self.core.exit_recap_lines();
+        terminal::restore_terminal();
+        print_exit_recap_lines(&lines);
+        if hard_exit {
             std::process::exit(0);
         }
         Ok(true)
@@ -454,6 +540,10 @@ impl App {
         self.terminal
             .set_review_scroll_offset(self.core.visual_scroll_offset());
         self.terminal.draw_visual_frame(&visual_canvas_frame)?;
+        // Committed rows are physically in native scrollback now: freeze the
+        // covered items against merges/removals (visual_canvas boundary).
+        self.core
+            .set_committed_history_items(self.terminal.committed_history_items());
         Ok(())
     }
 
@@ -463,6 +553,7 @@ impl App {
         // frame instead of a visible blank-then-refill sweep; the guard must
         // close even when the replay fails.
         self.terminal.begin_synchronized_update()?;
+        self.core.reset_committed_history_items();
         let replay = self
             .terminal
             .reset_for_history_replay(purge_scrollback)
@@ -491,6 +582,98 @@ fn set_terminal_theme_colors(terminal: &mut CrosstermTerminal, core: &AppCore) -
     )
 }
 
+fn print_exit_recap_lines(lines: &[self::turn_recap::ExitRecapLine]) {
+    let stdout_tty = io::stdout().is_terminal();
+    for line in lines {
+        if line.is_faint() && stdout_tty {
+            let _ = writeln!(io::stdout(), "\x1b[2m{}\x1b[0m", line.text());
+        } else {
+            let _ = writeln!(io::stdout(), "{}", line.text());
+        }
+    }
+    let _ = io::stdout().flush();
+}
+
+struct AppCoreBootstrap {
+    session_id: String,
+    theme_choice: ThemeChoice,
+    theme_preference_path: Option<PathBuf>,
+    show_timestamp_gutter: bool,
+    notifications_enabled: bool,
+    model_catalog: MergedModelCatalog,
+    session_store: Option<SessionStore>,
+    extensions: ExtensionSelection,
+    observe: ObserveOptions,
+    active_session_home_managed: bool,
+    theme: Theme,
+    status: StatusSnapshot,
+    initial_token_usage: TokenUsageSnapshot,
+    initial_context: super::commands::CommandContext,
+}
+
+fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> AppCoreBootstrap {
+    let target = session.active_target().clone();
+    let reasoning_effort = session.reasoning_effort();
+    let session_id = session.session_id().to_owned();
+    let cwd = session_root_status_path();
+    let AppOptions {
+        theme_choice,
+        theme_preference_path,
+        show_timestamp_gutter,
+        notifications_enabled,
+        model_catalog,
+        session_store,
+        extensions,
+        observe,
+        ..
+    } = options;
+    // v2 Warm Spine default: spine only; /timestamps opts the gutter in.
+    let show_timestamp_gutter = show_timestamp_gutter.unwrap_or(false);
+    let notifications_enabled = notifications_enabled.unwrap_or(true);
+    let active_session_home_managed = session_store.is_some();
+    let model_catalog = model_catalog.unwrap_or_else(|| {
+        crate::model_catalog::load_model_catalog(
+            crate::model_catalog::default_model_catalog_path().as_deref(),
+        )
+        .catalog
+    });
+    let theme = Theme::for_choice(theme_choice);
+    let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
+    status.session_id = Some(session_id.clone());
+    status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+    status.git_branch = detect_git_branch(&status.cwd);
+    let initial_token_usage = TokenUsageSnapshot {
+        context_window_tokens: context_window_tokens_for(
+            &model_catalog,
+            &target.provider,
+            &target.model,
+        ),
+        ..TokenUsageSnapshot::default()
+    };
+    let initial_context = command_context(
+        &model_catalog,
+        &target.provider,
+        &target.model,
+        empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
+    );
+    AppCoreBootstrap {
+        session_id,
+        theme_choice,
+        theme_preference_path,
+        show_timestamp_gutter,
+        notifications_enabled,
+        model_catalog,
+        session_store,
+        extensions,
+        observe,
+        active_session_home_managed,
+        theme,
+        status,
+        initial_token_usage,
+        initial_context,
+    }
+}
+
 impl AppCore {
     #[cfg(test)]
     pub fn new(session: Session<TuiDecider>, channels: PermissionChannels) -> Self {
@@ -502,96 +685,151 @@ impl AppCore {
         channels: PermissionChannels,
         options: AppOptions,
     ) -> Self {
-        let target = session.active_target().clone();
-        let reasoning_effort = session.reasoning_effort();
-        let session_id = session.session_id().to_owned();
-        let cwd = session_root_status_path();
-        let AppOptions {
+        let boot = bootstrap_app_core(&session, options);
+        let AppCoreBootstrap {
+            session_id,
             theme_choice,
             theme_preference_path,
+            show_timestamp_gutter,
+            notifications_enabled,
             model_catalog,
             session_store,
             extensions,
             observe,
-            ..
-        } = options;
-        let active_session_home_managed = session_store.is_some();
-        let model_catalog = model_catalog.unwrap_or_else(|| {
-            crate::model_catalog::load_model_catalog(
-                crate::model_catalog::default_model_catalog_path().as_deref(),
-            )
-            .catalog
-        });
-        let theme = Theme::for_choice(theme_choice);
-        let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
-        status.session_id = Some(session_id.clone());
-        status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+            active_session_home_managed,
+            theme,
+            status,
+            initial_token_usage,
+            initial_context,
+        } = boot;
         Self {
             state: AppState::Idle {
                 session: Box::new(session),
             },
             permission_rx: channels.request_rx,
             reply_tx: channels.reply_tx,
-            bottom: BottomSurface::new(command_context(
-                &model_catalog,
-                &target.provider,
-                &target.model,
-                reasoning_effort,
-                theme_choice,
-                Some(&session_id),
-            )),
+            bottom: BottomSurface::new(initial_context),
             status,
             model_catalog,
             session_store,
             active_session_home_managed,
-            token_usage: TokenUsageSnapshot::default(),
+            token_usage: initial_token_usage,
             transcript: TranscriptState::default(),
-            visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner]),
+            visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner {
+                session_id: Some(session_id.clone()),
+            }]),
             visual_scroll_offset: 0,
             composer_navigation_width: 80,
             last_working_elapsed_secs: None,
             modal: None,
+            approval_selection: ApprovalOption::default(),
             quit_armed: None,
             notice: None,
             pending_terminal_clipboard: None,
             interrupted_guidance: false,
             in_flight_error: None,
-            tool_artifacts_expanded: false,
+            tool_output_expanded: false,
+            last_history_viewport: (0, 24),
             theme,
             theme_choice,
             theme_preference_path,
+            show_timestamp_gutter,
             editor: Box::<SystemExternalEditor>::default(),
             clipboard: Box::<SystemClipboard>::default(),
             pending_runs: VecDeque::new(),
+            code_swarm_models: load_code_swarm_models_startup(),
+            queued_inputs: VecDeque::new(),
+            queued_selection: None,
+            queue_auto_flush_paused: false,
+            empty_composer_ghost: None,
             in_flight_label: None,
+            in_flight_companion_name: None,
             in_flight_cancellable: false,
+            spinner_frame: 0,
+            spinner_last_tick: None,
+            current_phase_verb: None,
+            reasoning_stream_tail: String::new(),
+            reasoning_tail_locked: false,
             extensions,
             observe,
+            turn_event_start: 0,
+            last_turn_activity_at: None,
+            stall_notified: false,
+            terminal_focused: true,
+            notifications_enabled,
+            pending_notifications: VecDeque::new(),
         }
     }
 
     fn rebuild_bottom_surface(&mut self) {
-        let current_session_id = self.status.session_id.as_deref();
+        let (extension_items, extension_slash_commands) = self.current_extension_context();
+        let parts = CommandContextParts {
+            current_effort: self.current_reasoning_effort(),
+            current_theme: self.theme_choice,
+            current_session_id: self.status.session_id.clone(),
+            checkpoint_items: self.current_checkpoint_items(),
+            extension_items,
+            extension_slash_commands,
+            code_swarm_models: self.code_swarm_models.clone(),
+        };
         self.bottom.reset_context(command_context(
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
-            self.current_reasoning_effort(),
-            self.theme_choice,
-            current_session_id,
+            parts,
         ));
     }
 
     fn replace_bottom_surface_for_session(&mut self) {
-        let current_session_id = self.status.session_id.as_deref();
+        let (extension_items, extension_slash_commands) = self.current_extension_context();
+        let parts = CommandContextParts {
+            current_effort: self.current_reasoning_effort(),
+            current_theme: self.theme_choice,
+            current_session_id: self.status.session_id.clone(),
+            checkpoint_items: self.current_checkpoint_items(),
+            extension_items,
+            extension_slash_commands,
+            code_swarm_models: self.code_swarm_models.clone(),
+        };
         self.bottom = BottomSurface::new(command_context(
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
-            self.current_reasoning_effort(),
-            self.theme_choice,
-            current_session_id,
+            parts,
         ));
+    }
+
+    fn current_checkpoint_items(&self) -> Vec<crate::ui::commands::CheckpointItem> {
+        let AppState::Idle { session } = &self.state else {
+            return Vec::new();
+        };
+        session
+            .workspace_checkpoints()
+            .into_iter()
+            .map(|item| {
+                crate::ui::commands::CheckpointItem::new(
+                    item.event_id,
+                    item.action,
+                    item.path,
+                    item.ts,
+                )
+            })
+            .collect()
+    }
+
+    fn current_extension_context(
+        &self,
+    ) -> (
+        Vec<crate::ui::commands::ExtensionManagerItem>,
+        Vec<crate::ui::commands::ExtensionSlashCommand>,
+    ) {
+        let session_enabled = match &self.state {
+            AppState::Idle { session } => Some(session.extensions_enabled().clone()),
+            _ => None,
+        };
+        let items = list_extension_manager_items(session_enabled.as_ref());
+        let slash = crate::ui::commands::build_extension_slash_commands(&items);
+        (items, slash)
     }
 
     fn current_reasoning_effort(&self) -> ReasoningEffort {
@@ -600,6 +838,32 @@ impl AppCore {
             .as_deref()
             .and_then(ReasoningEffort::parse)
             .unwrap_or_default()
+    }
+
+    fn composer_snapshot(&self) -> ComposerSnapshot<'_> {
+        ComposerSnapshot::new(self.bottom.composer())
+            .with_queued(self.queued_composer_lines())
+            .with_empty_ghost(self.empty_composer_ghost)
+    }
+
+    fn queued_composer_lines(&self) -> Vec<QueuedComposerLine> {
+        let total = self.queued_inputs.len();
+        let selected = self.selected_queue_index();
+        self.queued_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, text)| QueuedComposerLine {
+                position: index + 1,
+                total,
+                text: text.clone(),
+                selected: Some(index) == selected,
+            })
+            .collect()
+    }
+
+    fn selected_queue_index(&self) -> Option<usize> {
+        let len = self.queued_inputs.len();
+        (len > 0).then(|| self.queued_selection.unwrap_or(len - 1).min(len - 1))
     }
 
     pub fn handle_input(&mut self, input: InputEvent) -> CoreEffect {
@@ -622,6 +886,7 @@ impl AppCore {
                 if self.is_in_flight_cancellable() {
                     interrupt_flag.store(true, Ordering::SeqCst);
                     self.interrupted_guidance = true;
+                    self.queue_auto_flush_paused = true;
                 } else {
                     // The interrupt is dropped, not deferred: extension
                     // commands do not observe the flag yet. Say so.
@@ -658,7 +923,41 @@ impl AppCore {
             changed = true;
             self.handle_turn_event(event);
         }
+        self.check_stall_notification();
         changed
+    }
+
+    pub fn set_terminal_focused(&mut self, focused: bool) {
+        self.terminal_focused = focused;
+    }
+
+    pub fn take_pending_notification(&mut self) -> Option<NotifyEvent> {
+        self.pending_notifications.pop_front()
+    }
+
+    fn queue_notification(&mut self, event: NotifyEvent) {
+        if !self.notifications_enabled || self.terminal_focused {
+            return;
+        }
+        if self.pending_notifications.back() == Some(&event) {
+            return;
+        }
+        self.pending_notifications.push_back(event);
+    }
+
+    fn note_turn_activity(&mut self) {
+        self.last_turn_activity_at = Some(Instant::now());
+        self.stall_notified = false;
+    }
+
+    pub(crate) fn exit_recap_lines(&self) -> Vec<self::turn_recap::ExitRecapLine> {
+        let session_id = self.status.session_id.as_deref().unwrap_or("e????");
+        let events = self.transcript.events();
+        self::turn_recap::exit_recap_lines(
+            session_id,
+            events.len(),
+            self::turn_recap::session_files_changed_count(events),
+        )
     }
 
     pub fn turn_in_flight(&self) -> bool {
@@ -674,6 +973,9 @@ impl AppCore {
             return CoreEffect::None;
         }
         if is_artifact_toggle_key(&key) {
+            if self.bottom.resume_picker_selected_session_id().is_some() {
+                return self.preview_resume_ledger_tail();
+            }
             return self.toggle_tool_artifact_expansion();
         }
         if let Some(effect) = self.handle_visual_scroll_key(&key) {
@@ -712,15 +1014,29 @@ impl AppCore {
                     CoreEffect::None
                 }
             }
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.unqueue_selected_input()
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_transcript_search()
+            }
             _ if !matches!(self.bottom.owner(), BottomOwner::Composer) => {
                 self.handle_surface_key(key)
             }
             KeyCode::Enter if enter_key_intent(&key) == Some(EnterKeyIntent::InsertNewline) => {
                 self.edit_composer_text(|draft| draft.insert_newline())
             }
-            KeyCode::Enter => self.turn_already_in_progress_notice(),
+            KeyCode::Enter => self.queue_composer_input(),
             _ if is_slash_command_key(&key) && self.bottom.composer().submit_text().is_empty() => {
                 self.bottom.open_palette();
+                CoreEffect::Render
+            }
+            KeyCode::Char('@') if self.should_open_mention_picker() => {
+                self.bottom.open_mention_picker(&self.status.cwd);
                 CoreEffect::Render
             }
             KeyCode::Char(ch) if text_entry_modifiers(key.modifiers) => {
@@ -728,9 +1044,11 @@ impl AppCore {
             }
             KeyCode::Backspace => self.edit_composer_text(|draft| draft.backspace()),
             KeyCode::Delete => self.edit_composer_text(|draft| draft.delete()),
+            KeyCode::Left if self.can_move_queued_selection() => self.move_queued_selection(-1),
+            KeyCode::Right if self.can_move_queued_selection() => self.move_queued_selection(1),
             KeyCode::Left => self.move_composer_cursor(|draft| draft.move_left()),
             KeyCode::Right => self.move_composer_cursor(|draft| draft.move_right()),
-            KeyCode::Up => self.move_composer_up_or_history(),
+            KeyCode::Up => self.recall_selected_queued_input(),
             KeyCode::Down => self.move_composer_down_or_history(),
             KeyCode::Home => self.move_composer_cursor(|draft| draft.move_home()),
             KeyCode::End => self.move_composer_cursor(|draft| draft.move_end()),
@@ -774,6 +1092,9 @@ impl AppCore {
     }
 
     fn handle_surface_key(&mut self, key: KeyEvent) -> CoreEffect {
+        if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
+            return self.handle_search_key(key);
+        }
         match key.code {
             KeyCode::Esc => {
                 let event = self.bottom.cancel();
@@ -795,17 +1116,149 @@ impl AppCore {
                 self.bottom.move_selection_up();
                 CoreEffect::Render
             }
+            KeyCode::Char(' ') if self.bottom.is_code_swarm_picker() => {
+                if let Some(event) = self.bottom.code_swarm_toggle() {
+                    return self.surface_event(event);
+                }
+                CoreEffect::None
+            }
+            KeyCode::Char(ch) if self.bottom.is_extension_manager() => {
+                if let Some(event) = self.bottom.extension_manager_key(ch) {
+                    return self.surface_event(event);
+                }
+                // Manager is not type-to-filter; ignore other chars.
+                CoreEffect::None
+            }
             KeyCode::Char(ch) => {
                 self.bottom.palette_insert(&ch.to_string());
+                if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
+                    self.refresh_search_matches();
+                }
                 CoreEffect::Render
             }
-            KeyCode::Backspace => self.edit_palette(BottomSurface::palette_backspace),
-            KeyCode::Delete => self.edit_palette(BottomSurface::palette_delete),
+            KeyCode::Backspace => {
+                // Issue #24: an empty code-swarm filter steps back to the
+                // slash palette rather than exiting outright.
+                if self.bottom.code_swarm_backspace_steps_back_to_palette() {
+                    return CoreEffect::Render;
+                }
+                // Issue #23: backspacing over the leading `/` with nothing
+                // else typed exits the palette (same as Esc) instead of the
+                // prior no-op clamp.
+                if self.bottom.palette_backspace_would_exit() {
+                    let event = self.bottom.cancel();
+                    return self.surface_event(event);
+                }
+                let effect = self.edit_palette(BottomSurface::palette_backspace);
+                if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
+                    self.refresh_search_matches();
+                }
+                effect
+            }
+            KeyCode::Delete => {
+                let effect = self.edit_palette(BottomSurface::palette_delete);
+                if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
+                    self.refresh_search_matches();
+                }
+                effect
+            }
             KeyCode::Left => self.edit_palette(BottomSurface::palette_move_left),
             KeyCode::Right => self.edit_palette(BottomSurface::palette_move_right),
             KeyCode::Home => self.edit_palette(BottomSurface::palette_move_home),
             KeyCode::End => self.edit_palette(BottomSurface::palette_move_end),
             _ => CoreEffect::None,
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> CoreEffect {
+        match key.code {
+            KeyCode::Esc => {
+                let event = self.bottom.cancel();
+                self.surface_event(event)
+            }
+            KeyCode::Enter => {
+                let previous = enter_key_intent(&key) == Some(EnterKeyIntent::InsertNewline);
+                if let Some(search) = self.bottom.search_mut() {
+                    if previous {
+                        search.previous_match();
+                    } else {
+                        search.next_match();
+                    }
+                }
+                self.scroll_to_current_search_match();
+                CoreEffect::Render
+            }
+            KeyCode::Char(ch)
+                if text_entry_modifiers(key.modifiers) || key.modifiers.is_empty() =>
+            {
+                self.bottom.palette_insert(&ch.to_string());
+                self.refresh_search_matches();
+                self.scroll_to_current_search_match();
+                CoreEffect::Render
+            }
+            KeyCode::Backspace => {
+                self.bottom.palette_backspace();
+                self.refresh_search_matches();
+                self.scroll_to_current_search_match();
+                CoreEffect::Render
+            }
+            KeyCode::Delete => {
+                self.bottom.palette_delete();
+                self.refresh_search_matches();
+                self.scroll_to_current_search_match();
+                CoreEffect::Render
+            }
+            KeyCode::Left => self.edit_palette(BottomSurface::palette_move_left),
+            KeyCode::Right => self.edit_palette(BottomSurface::palette_move_right),
+            KeyCode::Home => self.edit_palette(BottomSurface::palette_move_home),
+            KeyCode::End => self.edit_palette(BottomSurface::palette_move_end),
+            _ => CoreEffect::None,
+        }
+    }
+
+    fn refresh_search_matches(&mut self) {
+        let lines = self.search_haystack_lines();
+        if let Some(search) = self.bottom.search_mut() {
+            search.recompute(&lines);
+        }
+    }
+
+    fn search_haystack_lines(&self) -> Vec<String> {
+        // Plain text of finalized ledger history rows — the same set the
+        // visual canvas projects. Not live streaming markdown only.
+        let width = self.composer_navigation_width.max(40);
+        let items = self.visual_canvas.finalized_items();
+        let lines = crate::ui::text::with_timestamp_gutter(self.show_timestamp_gutter, || {
+            transcript::render_items_for_history(&items, &self.theme, width)
+        });
+        lines
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn scroll_to_current_search_match(&mut self) {
+        let Some(line_index) = self
+            .bottom
+            .search()
+            .and_then(|search| search.current_match())
+            .map(|m| m.line_index)
+        else {
+            return;
+        };
+        let total = self.search_haystack_lines().len();
+        let height = self.last_history_viewport.1.max(1);
+        // visual_scroll_offset is rows above the bottom-aligned tail.
+        let bottom_start = total.saturating_sub(height);
+        if line_index >= bottom_start {
+            self.visual_scroll_offset = 0;
+        } else {
+            self.visual_scroll_offset = bottom_start.saturating_sub(line_index);
         }
     }
 
@@ -829,9 +1282,15 @@ impl AppCore {
                 self.bottom.open_palette();
                 CoreEffect::Render
             }
+            KeyCode::Char('@') if self.should_open_mention_picker() => {
+                self.bottom.open_mention_picker(&self.status.cwd);
+                CoreEffect::Render
+            }
             KeyCode::Char(ch) => self.edit_composer_text(|draft| draft.insert_char(ch)),
             KeyCode::Backspace => self.edit_composer_text(|draft| draft.backspace()),
             KeyCode::Delete => self.edit_composer_text(|draft| draft.delete()),
+            KeyCode::Left if self.can_move_queued_selection() => self.move_queued_selection(-1),
+            KeyCode::Right if self.can_move_queued_selection() => self.move_queued_selection(1),
             KeyCode::Left => self.move_composer_cursor(|draft| draft.move_left()),
             KeyCode::Right => self.move_composer_cursor(|draft| draft.move_right()),
             KeyCode::Up => self.move_composer_up_or_history(),
@@ -840,6 +1299,19 @@ impl AppCore {
             KeyCode::End => self.move_composer_cursor(|draft| draft.move_end()),
             _ => CoreEffect::None,
         }
+    }
+
+    fn should_open_mention_picker(&self) -> bool {
+        // Open when `@` starts a token (start of draft or after whitespace).
+        let text = self.bottom.composer().render_text();
+        let cursor = self.bottom.composer().cursor_offset();
+        if cursor == 0 {
+            return true;
+        }
+        let units: Vec<char> = text.chars().collect();
+        units
+            .get(cursor.saturating_sub(1))
+            .is_some_and(|ch| ch.is_whitespace())
     }
 
     fn handle_control_key(&mut self, key: KeyEvent) -> Option<CoreEffect> {
@@ -863,9 +1335,26 @@ impl AppCore {
                 .submit_text()
                 .is_empty()
                 .then_some(CoreEffect::Quit),
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(self.unqueue_selected_input())
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(self.open_transcript_search())
+            }
             KeyCode::Esc => Some(CoreEffect::None),
             _ => None,
         }
+    }
+
+    fn open_transcript_search(&mut self) -> CoreEffect {
+        self.disarm_quit_notice();
+        self.bottom.open_search();
+        self.refresh_search_matches();
+        CoreEffect::Render
     }
 
     fn handle_enter(&mut self, intent: EnterKeyIntent) -> CoreEffect {
@@ -884,6 +1373,7 @@ impl AppCore {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
         }
+        self.empty_composer_ghost = None;
         self.bottom.edit_composer(|draft| {
             let _ = draft.insert_bracketed_paste(text);
         });
@@ -892,27 +1382,12 @@ impl AppCore {
 
     fn handle_modal_input(&mut self, input: InputEvent) -> CoreEffect {
         let InputEvent::Key(key) = input else {
-            return CoreEffect::None;
+            return self.handle_modal_composer_input(input);
         };
         if matches!(self.modal, Some(Modal::PatchApproval(_))) {
             return self.handle_patch_modal_key(key);
         }
-        match key.code {
-            KeyCode::Char('1') | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.reply_to_modal(PermissionReply::Allow)
-            }
-            KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.reply_to_modal(PermissionReply::Deny)
-            }
-            _ if modal_quit_key(&key) => {
-                self.reply_to_modal(PermissionReply::Deny);
-                CoreEffect::Quit
-            }
-            KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.reply_to_modal(PermissionReply::AllowAll)
-            }
-            _ => CoreEffect::None,
-        }
+        self.handle_approval_modal_key(key)
     }
 
     fn handle_help_input(&mut self, input: InputEvent) -> CoreEffect {
@@ -933,45 +1408,169 @@ impl AppCore {
     }
 
     fn handle_patch_modal_key(&mut self, key: KeyEvent) -> CoreEffect {
+        self.handle_approval_modal_key(key)
+    }
+
+    fn handle_approval_modal_key(&mut self, key: KeyEvent) -> CoreEffect {
+        // Hotkeys fire only when the composer draft is empty. Once the user
+        // starts typing a denial instruction, y/a/p/n insert text; only Esc
+        // (deny with the typed instruction) or a quit chord decide.
+        let draft_empty = self.bottom.composer().submit_text().is_empty();
         match key.code {
-            KeyCode::Char('1') | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.reply_to_modal(PermissionReply::Allow)
+            KeyCode::Up if draft_empty => self.move_approval_selection_up(),
+            KeyCode::Down if draft_empty => self.move_approval_selection_down(),
+            KeyCode::Enter
+                if draft_empty && enter_key_intent(&key) == Some(EnterKeyIntent::Submit) =>
+            {
+                self.reply_to_selected_approval()
             }
-            KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.reply_to_modal(PermissionReply::Deny)
+            KeyCode::Char('y') | KeyCode::Char('Y') if draft_empty => {
+                self.reply_to_modal(PermissionReply::AllowOnce)
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => self.expand_patch_modal(),
+            KeyCode::Char('a') | KeyCode::Char('A') if draft_empty => {
+                let prefix = self.modal_scope_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') if draft_empty => {
+                let prefix = self.modal_scope_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if draft_empty => self.reply_deny_from_modal(),
+            KeyCode::Esc => self.reply_deny_from_modal(),
             _ if modal_quit_key(&key) => {
+                // Quit path: bare deny only — do not queue a follow-up turn.
                 self.reply_to_modal(PermissionReply::Deny);
                 CoreEffect::Quit
             }
-            KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.reply_to_modal(PermissionReply::AllowAll)
+            _ => self.handle_modal_composer_key(key),
+        }
+    }
+
+    fn move_approval_selection_up(&mut self) -> CoreEffect {
+        self.approval_selection = self.approval_selection.previous();
+        CoreEffect::Render
+    }
+
+    fn move_approval_selection_down(&mut self) -> CoreEffect {
+        self.approval_selection = self.approval_selection.next();
+        CoreEffect::Render
+    }
+
+    fn reply_to_selected_approval(&mut self) -> CoreEffect {
+        match self.approval_selection {
+            ApprovalOption::AllowOnce => self.reply_to_modal(PermissionReply::AllowOnce),
+            ApprovalOption::AllowSession => {
+                let prefix = self.modal_scope_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
             }
+            ApprovalOption::AllowProject => {
+                let prefix = self.modal_scope_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
+            }
+            ApprovalOption::Deny => self.reply_deny_from_modal(),
+        }
+    }
+
+    fn modal_scope_prefix(&self) -> Option<String> {
+        let request = match &self.modal {
+            Some(Modal::Permission(request)) => request,
+            Some(Modal::PatchApproval(modal)) => &modal.request,
+            None | Some(Modal::Help) => return None,
+        };
+        patch_approval::derive_scope_prefix(request)
+    }
+
+    fn reply_deny_from_modal(&mut self) -> CoreEffect {
+        let draft = self.bottom.composer().submit_text();
+        if draft.trim().is_empty() {
+            self.empty_composer_ghost = Some(DENIED_COMPOSER_GHOST);
+            self.reply_to_modal(PermissionReply::Deny)
+        } else {
+            self.bottom.replace_composer_text("");
+            self.empty_composer_ghost = None;
+            // Front of queue: next user turn after the denied tool turn finishes.
+            self.queued_inputs.push_front(draft.clone());
+            self.queued_selection = Some(0);
+            self.reply_to_modal(PermissionReply::DenyWithInstruction(draft))
+        }
+    }
+
+    fn handle_modal_composer_input(&mut self, input: InputEvent) -> CoreEffect {
+        match input {
+            InputEvent::Paste(text) => {
+                self.empty_composer_ghost = None;
+                self.bottom.edit_composer(|draft| {
+                    let _ = draft.insert_bracketed_paste(&text);
+                });
+                CoreEffect::Render
+            }
+            InputEvent::Key(key) => self.handle_modal_composer_key(key),
+            InputEvent::Mouse(_) => CoreEffect::None,
+        }
+    }
+
+    fn handle_modal_composer_key(&mut self, key: KeyEvent) -> CoreEffect {
+        match key.code {
+            KeyCode::Enter if enter_key_intent(&key) == Some(EnterKeyIntent::InsertNewline) => {
+                self.edit_composer_text(|draft| draft.insert_newline())
+            }
+            KeyCode::Char(ch) if text_entry_modifiers(key.modifiers) => {
+                self.edit_composer_text(|draft| draft.insert_char(ch))
+            }
+            KeyCode::Backspace => self.edit_composer_text(|draft| draft.backspace()),
+            KeyCode::Delete => self.edit_composer_text(|draft| draft.delete()),
+            KeyCode::Left => self.move_composer_cursor(|draft| draft.move_left()),
+            KeyCode::Right => self.move_composer_cursor(|draft| draft.move_right()),
+            KeyCode::Home => self.move_composer_cursor(|draft| draft.move_home()),
+            KeyCode::End => self.move_composer_cursor(|draft| draft.move_end()),
             _ => CoreEffect::None,
         }
     }
 
-    fn expand_patch_modal(&mut self) -> CoreEffect {
-        let Some(Modal::PatchApproval(modal)) = &mut self.modal else {
-            return CoreEffect::None;
+    fn handle_submit(&mut self) -> CoreEffect {
+        // Mention segments submit as workspace-relative paths (file references
+        // in the user.message content). A dedicated context.slot.updated path
+        // is deferred until core exposes a non-extension slot writer — do not
+        // invent a parallel canvas channel here.
+        let prompt = self.bottom.composer().submit_text();
+        if prompt.trim().is_empty() {
+            return self.continue_queued_input();
+        }
+        let AppState::Idle { .. } = self.state else {
+            return self.queue_composer_input();
         };
-        modal.expanded = true;
+        self.visual_scroll_offset = 0;
+        self.queue_auto_flush_paused = false;
+        self.bottom.record_submission(&prompt);
+        let session = self.take_idle_session();
+        self.rebuild_bottom_surface();
+        self.spawn_turn(prompt, session);
         CoreEffect::Render
     }
 
-    fn handle_submit(&mut self) -> CoreEffect {
+    fn queue_composer_input(&mut self) -> CoreEffect {
         let prompt = self.bottom.composer().submit_text();
         if prompt.trim().is_empty() {
             return CoreEffect::None;
         }
+        self.queued_inputs.push_back(prompt);
+        self.queued_selection = self.queued_inputs.len().checked_sub(1);
+        self.bottom.replace_composer_text("");
+        self.notice = None;
+        CoreEffect::Render
+    }
+
+    fn continue_queued_input(&mut self) -> CoreEffect {
         let AppState::Idle { .. } = self.state else {
-            return self.turn_already_in_progress_notice();
+            return CoreEffect::None;
         };
+        let Some(prompt) = self.pop_next_queued_input() else {
+            return CoreEffect::None;
+        };
+        self.queue_auto_flush_paused = false;
         self.visual_scroll_offset = 0;
         self.bottom.record_submission(&prompt);
         let session = self.take_idle_session();
-        self.rebuild_bottom_surface();
         self.spawn_turn(prompt, session);
         CoreEffect::Render
     }
@@ -1009,16 +1608,25 @@ impl AppCore {
             started_at: Instant::now(),
         };
         self.in_flight_label = Some("turn".to_owned());
+        self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
+        self.current_phase_verb = None;
+        self.reasoning_stream_tail.clear();
+        self.reasoning_tail_locked = false;
+        self.spinner_frame = 0;
+        self.spinner_last_tick = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
+        self.turn_event_start = self.transcript.events().len();
+        self.note_turn_activity();
     }
 
     fn surface_event(&mut self, event: SurfaceEvent) -> CoreEffect {
         match event {
             SurfaceEvent::None => CoreEffect::Render,
             SurfaceEvent::Message(message) => self.notice_item(message),
+            SurfaceEvent::Notice(message) => self.teach_notice(message),
             SurfaceEvent::Action(action) => self.handle_command_action(action),
         }
     }
@@ -1032,10 +1640,17 @@ impl AppCore {
             CommandAction::CompactSession => self.compact_session(),
             CommandAction::ShowCompaction => self.show_compaction_status(),
             CommandAction::ExportSession { path } => self.export_session(path),
-            CommandAction::ExtensionRun { id, command, input } => {
-                self.extension_run(id, command, input)
-            }
+            CommandAction::ExtensionRun {
+                id,
+                command,
+                input,
+                raw_args,
+            } => self.extension_run(id, command, input, raw_args),
             CommandAction::CompanionRun { input } => self.companion_run(input),
+            CommandAction::CodeSwarmSaveModels { models } => self.code_swarm_save_models(models),
+            CommandAction::CodeSwarmReview { prompt, personas } => {
+                self.code_swarm_review(prompt, personas)
+            }
             CommandAction::ShowStatus => self.show_status(),
             CommandAction::Login { provider } => self.login_guidance(provider),
             CommandAction::Logout { provider } => self.logout_guidance(provider),
@@ -1043,9 +1658,18 @@ impl AppCore {
             CommandAction::SetPermissionMode { capability, mode } => {
                 self.set_permission_mode(capability, mode)
             }
+            CommandAction::OpenPermissions => self.open_permissions_picker(),
+            CommandAction::RevokeGrant {
+                capability,
+                pattern,
+                source,
+            } => self.revoke_grant(capability, pattern, source),
             CommandAction::ShowHelp { text } => self.summary_item(text),
             CommandAction::ResumeSession { session_id } => {
                 self.resume_session_from_picker(session_id)
+            }
+            CommandAction::RollbackCheckpoint { event_id } => {
+                self.rollback_workspace_checkpoint(event_id)
             }
             CommandAction::ScrollViewportToBottom => {
                 self.transcript.scroll_to_bottom();
@@ -1054,6 +1678,63 @@ impl AppCore {
             }
             CommandAction::CopyLastAssistantResponse => self.copy_last_assistant_response(),
             CommandAction::NameSession { name } => self.name_current_session(name),
+            CommandAction::ToggleTimestamps => self.toggle_timestamps(),
+            CommandAction::ShowDiff => self.show_session_diff(),
+            CommandAction::ShowUsage => self.show_session_usage(),
+            CommandAction::DagExport => self.dag_export(),
+            CommandAction::OpenExtensionManager => self.open_extension_manager(),
+            CommandAction::ExtensionToggle { id, enable } => self.toggle_extension(id, enable),
+            CommandAction::ExtensionDetails { id } => self.show_extension_details(id),
+            CommandAction::ExtensionRemove { id } => self.remove_extension(id),
+            CommandAction::ExtensionAdd { path } => self.add_extension(path),
+        }
+    }
+
+    fn toggle_timestamps(&mut self) -> CoreEffect {
+        self.show_timestamp_gutter = !self.show_timestamp_gutter;
+        if let Some(path) = self.theme_preference_path.as_deref() {
+            if let Err(error) =
+                model_preference::save_timestamps_preference(path, self.show_timestamp_gutter)
+            {
+                return self.teach_notice(format!(
+                    "timestamps {}; preference not saved: {error}",
+                    if self.show_timestamp_gutter {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                ));
+            }
+        }
+        // Faint confirmation line; also logged as a transcript notice item.
+        let message = if self.show_timestamp_gutter {
+            "timestamps shown".to_owned()
+        } else {
+            "timestamps hidden".to_owned()
+        };
+        self.teach_notice(message)
+    }
+
+    fn rollback_workspace_checkpoint(&mut self, event_id: String) -> CoreEffect {
+        let AppState::Idle { session } = &mut self.state else {
+            return self.notice_item("rollback waits for the active turn".to_owned());
+        };
+        let prior_len = session.events().len();
+        match session.restore_workspace_checkpoint(&event_id) {
+            Ok(outcome) => {
+                let new_events = session.events()[prior_len..].to_vec();
+                for event in new_events {
+                    self.transcript.push_event(event);
+                    self.queue_finalized_visual_output_for_latest_event();
+                }
+                self.rebuild_bottom_surface();
+                self.notice = Some(format!(
+                    "restored {} from checkpoint {}",
+                    outcome.path, outcome.checkpoint_event_id
+                ));
+                CoreEffect::Render
+            }
+            Err(error) => self.notice_item(format!("rollback failed: {error}")),
         }
     }
 
@@ -1094,200 +1775,21 @@ impl AppCore {
         self.status.model = active_target.model;
         self.status.session_id = Some(session_id.clone());
         self.status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
+        self.status.git_branch = detect_git_branch(&self.status.cwd);
         self.active_session_home_managed = true;
         self.replace_bottom_surface_for_session();
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
-        self.token_usage = TokenUsageSnapshot::default();
-        self.tool_artifacts_expanded = false;
+        self.token_usage.context_window_tokens = self.active_context_window_tokens();
+        self.tool_output_expanded = false;
         self.modal = None;
         self.quit_armed = None;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
+        self.clear_queued_inputs();
         self.notice = Some(format!("new session {session_id}"));
         CoreEffect::ReplayHistoryWithScrollbackPurge
-    }
-
-    fn set_reasoning_effort(&mut self, effort: ReasoningEffort) -> CoreEffect {
-        let AppState::Idle { session } = &mut self.state else {
-            return self.notice_item("reasoning effort waits for the active turn".to_owned());
-        };
-        match session.set_reasoning_effort(effort, "user") {
-            Ok(true) => {
-                self.status.reasoning_effort = Some(effort.as_str().to_owned());
-                self.rebuild_bottom_surface();
-                self.notice_item(format!("reasoning effort set to {}", effort.as_str()))
-            }
-            Ok(false) => self.notice_item(format!("reasoning effort already {}", effort.as_str())),
-            Err(error) => self.notice_item(format!("reasoning effort rejected: {error}")),
-        }
-    }
-
-    fn show_compaction_status(&mut self) -> CoreEffect {
-        let AppState::Idle { session } = &self.state else {
-            return self.notice_item("compaction status waits for the active turn".to_owned());
-        };
-        let policy = session.auto_compaction_policy();
-        let demoted = self.token_usage.demoted_items;
-        let retained = self
-            .token_usage
-            .canvas_retained_bytes
-            .map(|bytes| bytes.to_string())
-            .unwrap_or_else(|| "?".to_owned());
-        let limit = session
-            .context_limit_tokens()
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "unknown".to_owned());
-        let used = session
-            .latest_model_usage_used_tokens()
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "unknown".to_owned());
-        self.notice_item(format!(
-            "compaction tier={} budget_bytes={} retained_bytes={retained} demoted={demoted} limit_tokens={limit} used_tokens={used} reserve={}",
-            policy.tier.as_str(),
-            policy.budget_bytes,
-            session.compaction_reserve_tokens()
-        ))
-    }
-
-    fn compact_session(&mut self) -> CoreEffect {
-        let AppState::Idle { session } = &mut self.state else {
-            return self.notice_item("compaction waits for the active turn".to_owned());
-        };
-        let start = session.events().len();
-        let projection = heuristic_projection(session.events());
-        if session.try_compact(&projection) {
-            let new_events = session.events()[start..].to_vec();
-            for event in new_events {
-                self.transcript.push_event(event);
-                self.queue_finalized_visual_output_for_latest_event();
-            }
-            return self.notice_item("compacted eligible history".to_owned());
-        }
-        self.notice_item("nothing eligible to compact".to_owned())
-    }
-
-    fn export_session(&mut self, path: Option<String>) -> CoreEffect {
-        let (session_id, events) = match &self.state {
-            AppState::Idle { session } => {
-                (session.session_id().to_owned(), session.events().to_vec())
-            }
-            _ => return self.notice_item("export waits for the active turn".to_owned()),
-        };
-        let path = match path.map(PathBuf::from) {
-            Some(path) => path,
-            None => match self.default_export_path(&session_id) {
-                Ok(path) => path,
-                Err(error) => return self.notice_item(format!("export failed: {error}")),
-            },
-        };
-        let payload = serde_json::json!({
-            "session_id": session_id,
-            "provider": self.status.provider,
-            "model": self.status.model,
-            "reasoning_effort": self.current_reasoning_effort().as_str(),
-            "events": events,
-        });
-        match serde_json::to_vec_pretty(&payload)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| write_new_file(&path, &bytes).map_err(anyhow::Error::from))
-        {
-            Ok(()) => self.notice_item(format!("session exported to {}", path.display())),
-            Err(error) => self.notice_item(format!("export failed: {error}")),
-        }
-    }
-
-    fn extension_run(
-        &mut self,
-        id: String,
-        command: String,
-        input: serde_json::Value,
-    ) -> CoreEffect {
-        let request = match self.resolve_extension_run(id, command, input) {
-            Ok(request) => request,
-            Err(error) => return self.notice_item(format!("extension run failed: {error}")),
-        };
-        match std::mem::replace(&mut self.state, AppState::Empty) {
-            AppState::Idle { session } => {
-                self.spawn_extension_run(request, session);
-                CoreEffect::Render
-            }
-            state @ AppState::TurnInFlight { .. } => {
-                let label = request.label();
-                self.state = state;
-                self.pending_runs
-                    .push_back(PendingRunRequest::Extension(request));
-                self.notice = Some(format!("queued {label}"));
-                CoreEffect::Render
-            }
-            AppState::Empty => {
-                self.state = AppState::Empty;
-                self.notice_item("extension run needs an active session".to_owned())
-            }
-        }
-    }
-
-    fn resolve_extension_run(
-        &self,
-        id: String,
-        command: String,
-        input: serde_json::Value,
-    ) -> Result<ExtensionRunRequest> {
-        let descriptor =
-            bundled_descriptor_by_id(&id)?.ok_or_else(|| anyhow!("unknown extension id: {id}"))?;
-        let command_descriptor = descriptor
-            .command(&command)
-            .ok_or_else(|| anyhow!("unknown command for extension {id}: {command}"))?;
-        let bundled =
-            bundled_extension_by_id(&id).ok_or_else(|| anyhow!("unknown extension id: {id}"))?;
-        Ok(ExtensionRunRequest {
-            id,
-            command,
-            input,
-            extension: bundled.extension,
-            capabilities: command_descriptor.required_capabilities.clone(),
-        })
-    }
-
-    fn spawn_extension_run(
-        &mut self,
-        request: ExtensionRunRequest,
-        mut session: Box<Session<TuiDecider>>,
-    ) {
-        let (worker_tx, worker_rx) = mpsc::channel();
-        let worker_request = request.clone();
-        let label = request.label();
-        std::thread::spawn(move || {
-            let start = session.events().len();
-            let result = session.execute_extension_command(
-                worker_request.extension,
-                &worker_request.command,
-                worker_request.input.clone(),
-                worker_request.capabilities.iter().copied(),
-            );
-            let events = session.events()[start..].to_vec();
-            let outcome = match result {
-                Ok(output) => ExtensionOutcome::Complete(output),
-                Err(error) => ExtensionOutcome::Failed(error.to_string()),
-            };
-            let _ = worker_tx.send(TurnEvent::ExtensionDone {
-                request: worker_request,
-                outcome,
-                events,
-                session,
-            });
-        });
-        self.state = AppState::TurnInFlight {
-            worker_rx,
-            interrupt_flag: Arc::new(AtomicBool::new(false)),
-            started_at: Instant::now(),
-        };
-        self.in_flight_label = Some(label);
-        self.in_flight_cancellable = false;
-        self.last_working_elapsed_secs = None;
-        self.interrupted_guidance = false;
-        self.in_flight_error = None;
     }
 
     fn companion_run(&mut self, input: serde_json::Value) -> CoreEffect {
@@ -1342,22 +1844,11 @@ impl AppCore {
             started_at: Instant::now(),
         };
         self.in_flight_label = Some("companion run".to_owned());
+        self.in_flight_companion_name = Some(request.task.persona().to_owned());
         self.in_flight_cancellable = false;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
-    }
-
-    fn show_status(&mut self) -> CoreEffect {
-        let session = self.status.session_id.as_deref().unwrap_or("none");
-        self.summary_item(format!(
-            "session: {session}\nmodel: {}::{}\neffort: {}\ntheme: {} ({})",
-            self.status.provider,
-            self.status.model,
-            self.current_reasoning_effort().as_str(),
-            self.theme_choice.label(),
-            self.theme_choice.as_str()
-        ))
     }
 
     fn login_guidance(&mut self, provider: String) -> CoreEffect {
@@ -1372,166 +1863,6 @@ impl AppCore {
         ))
     }
 
-    fn set_theme(&mut self, choice: ThemeChoice) -> CoreEffect {
-        self.theme_choice = choice;
-        self.theme = Theme::for_choice(choice);
-        self.rebuild_bottom_surface();
-        match self
-            .theme_preference_path
-            .as_deref()
-            .map(|path| model_preference::save_theme_preference(path, choice.as_str()))
-        {
-            Some(Err(error)) => {
-                self.push_notice_item(format!("theme set; preference not saved: {error}"));
-            }
-            _ => {
-                self.push_notice_item(format!("theme set to {}", choice.as_str()));
-            }
-        }
-        CoreEffect::ThemeChanged
-    }
-
-    fn name_current_session(&mut self, name: String) -> CoreEffect {
-        let AppState::Idle { session } = &mut self.state else {
-            return self.notice_item("session naming waits for the active turn".to_owned());
-        };
-        let session_id = session.session_id().to_owned();
-        let result = session.rename_session(&name);
-        match result {
-            Ok(normalized) => {
-                self.rebuild_bottom_surface();
-                self.notice = match self.refresh_current_session_metadata(&session_id) {
-                    Ok(()) => Some(format!("session named {normalized}")),
-                    Err(error) => Some(format!(
-                        "session named {normalized}; metadata refresh failed: {error}"
-                    )),
-                };
-                CoreEffect::Render
-            }
-            Err(error) => self.notice_item(format!("session naming failed: {error}")),
-        }
-    }
-
-    fn resume_session_from_picker(&mut self, session_id: String) -> CoreEffect {
-        let current_session_id = match &self.state {
-            AppState::Idle { session } => session.session_id().to_owned(),
-            AppState::TurnInFlight { .. } => {
-                return self.notice_item("resume waits for the active turn".to_owned());
-            }
-            AppState::Empty => {
-                return self.notice_item("resume needs an active session".to_owned())
-            }
-        };
-        if current_session_id == session_id {
-            return self.notice_item(format!("already using session {session_id}"));
-        }
-
-        match self.build_tui_resume(&session_id) {
-            Ok(resume) => self.accept_tui_resume(session_id, resume),
-            Err(error) => self.notice_item(format!("resume failed: {error}")),
-        }
-    }
-
-    fn build_tui_resume(&mut self, session_id: &str) -> Result<TuiResume> {
-        let record = self
-            .session_store()?
-            .find_session(session_id)?
-            .ok_or_else(|| anyhow!("no session found with id {session_id}"))?;
-        let prefix = read_resume_prefix(record.events_path())?;
-        let root = std::env::current_dir().unwrap_or_else(|_| session_root_status_path());
-        let mut seed_config = crate::session_config(
-            root.clone(),
-            self.status.provider.clone(),
-            self.status.model.clone(),
-            session_id.to_owned(),
-        );
-        seed_config.extensions_enabled =
-            resolve_session_extensions(&seed_config.root, &self.extensions)?;
-        let observer = bundled_round_observer(&self.observe, &seed_config.extensions_enabled)?;
-        if let Some((observer_config, _)) = &observer {
-            seed_config.round_observer = Some(observer_config.clone());
-        }
-        let folded = fold_session(&seed_config, prefix)?;
-        let original = folded
-            .original_target
-            .as_ref()
-            .unwrap_or(&folded.active_target);
-        let mut config = crate::session_config(
-            root,
-            original.provider.clone(),
-            original.model.clone(),
-            session_id.to_owned(),
-        );
-        config.extensions_enabled = seed_config.extensions_enabled;
-        config.round_observer = seed_config.round_observer;
-        // Compaction window follows the active model after fold (post-switch).
-        config.provider = folded.active_target.provider.clone();
-        config.model = folded.active_target.model.clone();
-        crate::session_lifecycle::apply_catalog_context_limit(&mut config, &self.model_catalog);
-        let providers = crate::resume_provider_set(
-            folded
-                .original_target
-                .as_ref()
-                .unwrap_or(&folded.active_target),
-            &folded.active_target,
-            None,
-        )?;
-        let writer = ProvenanceWriter::new(record.events_path())?;
-        let (decider, channels) = TuiDecider::new();
-        let outcome =
-            resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
-        let mut session = outcome.session;
-        if let Some((_, extension)) = observer {
-            session.set_observer_extension(extension);
-        }
-        let events = session.events().to_vec();
-        Ok(TuiResume {
-            session,
-            channels,
-            events,
-            active_target: outcome.active_target,
-            display_label: session_resume_label(&record),
-            recovery_closure_appended: outcome.recovery_closure_appended,
-            warning_count: outcome.warnings.len(),
-        })
-    }
-
-    fn accept_tui_resume(&mut self, session_id: String, resume: TuiResume) -> CoreEffect {
-        let reasoning_effort = resume.session.reasoning_effort();
-        self.permission_rx = resume.channels.request_rx;
-        self.reply_tx = resume.channels.reply_tx;
-        self.state = AppState::Idle {
-            session: Box::new(resume.session),
-        };
-        self.status.provider = resume.active_target.provider.clone();
-        self.status.model = resume.active_target.model.clone();
-        self.status.session_id = Some(session_id.clone());
-        self.status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
-        self.active_session_home_managed = true;
-        self.replace_bottom_surface_for_session();
-        self.rebuild_transcript_from_events(&resume.events);
-        self.visual_scroll_offset = 0;
-        self.modal = None;
-        self.quit_armed = None;
-        self.last_working_elapsed_secs = None;
-        self.interrupted_guidance = false;
-        self.in_flight_error = None;
-        let display = resume.display_label.clone();
-        let mut notice = if display == "Untitled session" {
-            format!("resumed session {session_id}")
-        } else {
-            format!("resumed session {display}")
-        };
-        if resume.recovery_closure_appended {
-            notice.push_str("; recovery closure appended");
-        }
-        if resume.warning_count > 0 {
-            notice.push_str(&format!("; {} warning(s)", resume.warning_count));
-        }
-        self.notice = Some(notice);
-        CoreEffect::ReplayHistoryWithScrollbackPurge
-    }
-
     fn rebuild_transcript_from_events(&mut self, events: &[EventEnvelope]) {
         let mut transcript = TranscriptState::default();
         let mut token_usage = TokenUsageSnapshot::default();
@@ -1540,62 +1871,20 @@ impl AppCore {
             transcript.push_event(event.clone());
         }
         transcript.scroll_to_bottom();
-        let mut finalized = vec![TranscriptItem::Banner];
-        finalized.extend(transcript.items());
+        let mut finalized = vec![transcript::ProjectedEntry {
+            item: TranscriptItem::Banner {
+                session_id: self.status.session_id.clone(),
+            },
+            timing: None,
+        }];
+        // Restamp the whole rebuilt transcript from real event provenance
+        // (review v2 §6) rather than the blank gutter a plain items() +
+        // fresh push would produce.
+        let (timed_entries, clock_seed) = transcript.timed_items();
+        finalized.extend(timed_entries);
         self.transcript = transcript;
         self.token_usage = token_usage;
-        self.visual_canvas = VisualCanvasState::new(finalized);
-    }
-
-    fn switch_model(&mut self, provider: String, model: String) -> CoreEffect {
-        let AppState::Idle { session } = &mut self.state else {
-            return self.notice_item("model switch waits for the active turn".to_owned());
-        };
-        let context_limit = self
-            .model_catalog
-            .provider(&provider)
-            .and_then(|descriptor| {
-                descriptor
-                    .models()
-                    .find(|entry| entry.id() == model)
-                    .and_then(|entry| entry.context_window_tokens())
-            })
-            .and_then(euler_core::ContextLimitConfig::from_catalog_window);
-        match session.switch_model(&provider, &model, "user", context_limit) {
-            Ok(true) => self.accept_model_switch(provider, model, true),
-            Ok(false) => self.accept_model_switch(provider, model, false),
-            Err(error) => self.notice_item(format!("model switch rejected: {error}")),
-        }
-    }
-
-    fn accept_model_switch(
-        &mut self,
-        provider: String,
-        model: String,
-        switched: bool,
-    ) -> CoreEffect {
-        self.status.provider = provider.clone();
-        self.status.model = model.clone();
-        if switched {
-            self.token_usage = TokenUsageSnapshot::default();
-        }
-        self.rebuild_bottom_surface();
-        match model_preference::save_model_preference_to_default(&provider, &model) {
-            Ok(()) => self.notice_item(format!("model set to {provider}/{model}")),
-            Err(error) => self.notice_item(format!("model set; preference not saved: {error}")),
-        }
-    }
-
-    fn set_permission_mode(&mut self, capability: Capability, mode: ApprovalMode) -> CoreEffect {
-        let AppState::Idle { session } = &mut self.state else {
-            return self.notice_item("permission mode waits for the active turn".to_owned());
-        };
-        session.set_permission_mode(capability, mode);
-        self.notice_item(format!(
-            "permission {} set to {:?}",
-            capability.as_str(),
-            mode
-        ))
+        self.visual_canvas = VisualCanvasState::new_with_entries(finalized, clock_seed);
     }
 
     fn handle_ctrl_c(&mut self) -> CoreEffect {
@@ -1622,6 +1911,7 @@ impl AppCore {
         &mut self,
         edit: impl FnOnce(&mut super::composer::ComposerDraft),
     ) -> CoreEffect {
+        self.empty_composer_ghost = None;
         self.bottom.edit_composer(edit);
         CoreEffect::Render
     }
@@ -1646,9 +1936,59 @@ impl AppCore {
         CoreEffect::Render
     }
 
-    fn turn_already_in_progress_notice(&mut self) -> CoreEffect {
-        self.notice = Some("turn already in progress".to_owned());
+    fn recall_selected_queued_input(&mut self) -> CoreEffect {
+        let Some(index) = self.selected_queue_index() else {
+            return self.move_composer_up_or_history();
+        };
+        if !self.bottom.composer().submit_text().is_empty() {
+            return self.move_composer_up_or_history();
+        }
+        let Some(text) = self.queued_inputs.remove(index) else {
+            return CoreEffect::None;
+        };
+        self.bottom.replace_composer_text(&text);
+        self.normalize_queue_selection();
         CoreEffect::Render
+    }
+
+    fn unqueue_selected_input(&mut self) -> CoreEffect {
+        let Some(index) = self.selected_queue_index() else {
+            return CoreEffect::None;
+        };
+        self.queued_inputs.remove(index);
+        self.normalize_queue_selection();
+        CoreEffect::Render
+    }
+
+    fn can_move_queued_selection(&self) -> bool {
+        self.bottom.composer().submit_text().is_empty() && self.queued_inputs.len() > 1
+    }
+
+    fn move_queued_selection(&mut self, delta: isize) -> CoreEffect {
+        let Some(index) = self.selected_queue_index() else {
+            return CoreEffect::None;
+        };
+        let last = self.queued_inputs.len() - 1;
+        self.queued_selection = Some(index.saturating_add_signed(delta).min(last));
+        CoreEffect::Render
+    }
+
+    fn pop_next_queued_input(&mut self) -> Option<String> {
+        let prompt = self.queued_inputs.pop_front();
+        self.normalize_queue_selection();
+        prompt
+    }
+
+    fn normalize_queue_selection(&mut self) {
+        self.queued_selection = self
+            .selected_queue_index()
+            .or_else(|| self.queued_inputs.len().checked_sub(1));
+    }
+
+    fn clear_queued_inputs(&mut self) {
+        self.queued_inputs.clear();
+        self.queued_selection = None;
+        self.queue_auto_flush_paused = false;
     }
 
     fn edit_palette(&mut self, edit: impl FnOnce(&mut BottomSurface)) -> CoreEffect {
@@ -1656,17 +1996,24 @@ impl AppCore {
         CoreEffect::Render
     }
 
+    /// Issue #49: `ctrl+o` is a single global expand/collapse toggle, not a
+    /// per-cell targeting gesture. Per-cell "nearest to viewport center"
+    /// targeting had no honest input method once the mouse click path (#29)
+    /// was removed — it was an invisible heuristic with no visible affordance
+    /// to aim it. A global toggle is simple and predictable: one keystroke,
+    /// every foldable cell in the transcript expands or collapses together;
+    /// native scrollback and `ctrl+f` remain the navigation tools.
     fn toggle_tool_artifact_expansion(&mut self) -> CoreEffect {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
         }
         if !self
             .visual_canvas
-            .has_foldable_shell_artifact(TOOL_CALL_MAX_LINES)
+            .has_foldable_artifact(TOOL_CALL_MAX_LINES)
         {
             return CoreEffect::None;
         }
-        self.tool_artifacts_expanded = !self.tool_artifacts_expanded;
+        self.tool_output_expanded = !self.tool_output_expanded;
         self.visual_canvas.invalidate_history_cache();
         self.visual_scroll_offset = 0;
         CoreEffect::ReplayHistoryWithScrollbackPurge
@@ -1724,20 +2071,13 @@ impl AppCore {
             match self.permission_rx.try_recv() {
                 Ok(request) => {
                     self.drain_turn_events();
+                    self.approval_selection = ApprovalOption::default();
                     self.modal = Some(self.modal_for_request(request));
+                    self.queue_notification(NotifyEvent::ApprovalNeeded);
                     changed = true;
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
-        }
-        changed
-    }
-
-    fn drain_turn_events(&mut self) -> bool {
-        let mut changed = false;
-        while let Some(event) = self.next_turn_event() {
-            self.handle_turn_event(event);
-            changed = true;
         }
         changed
     }
@@ -1749,244 +2089,15 @@ impl AppCore {
         Modal::PatchApproval(PatchApprovalModal {
             preview: patch_approval::preview_from_events(self.transcript.events()),
             request,
-            expanded: false,
         })
     }
 
-    fn next_turn_event(&mut self) -> Option<TurnEvent> {
-        let AppState::TurnInFlight { worker_rx, .. } = &mut self.state else {
-            return None;
-        };
-        worker_rx.try_recv().ok()
-    }
-
-    fn handle_turn_event(&mut self, event: TurnEvent) {
-        match event {
-            TurnEvent::Event(event) => {
-                let is_tool_call = event.kind.as_str() == EventKind::TOOL_CALL;
-                self.record_in_flight_error(&event);
-                self.update_token_usage_from_event(&event);
-                self.transcript.push_event(event);
-                self.queue_finalized_visual_output_for_latest_event();
-                if is_tool_call {
-                    self.refresh_patch_modal_preview();
-                }
-            }
-            TurnEvent::TurnDone { outcome, session } => {
-                let elapsed = self.working_elapsed();
-                self.last_working_elapsed_secs = None;
-                self.handle_turn_outcome(outcome, elapsed);
-                self.accept_worker_session_or_continue(session);
-            }
-            TurnEvent::ExtensionDone {
-                request,
-                outcome,
-                events,
-                session,
-            } => {
-                let elapsed = self.working_elapsed();
-                for event in events {
-                    self.update_token_usage_from_event(&event);
-                    self.transcript.push_event(event);
-                    self.queue_finalized_visual_output_for_latest_event();
-                }
-                self.last_working_elapsed_secs = None;
-                self.handle_extension_outcome(&request, outcome, elapsed);
-                self.accept_worker_session_or_continue(session);
-            }
-            TurnEvent::CompanionDone {
-                request,
-                outcome,
-                events,
-                session,
-            } => {
-                let elapsed = self.working_elapsed();
-                for event in events {
-                    self.update_token_usage_from_event(&event);
-                    self.transcript.push_event(event);
-                    self.queue_finalized_visual_output_for_latest_event();
-                }
-                self.last_working_elapsed_secs = None;
-                self.handle_companion_outcome(&request, outcome, elapsed);
-                self.accept_worker_session_or_continue(session);
-            }
-        }
-    }
-
-    fn update_token_usage_from_event(&mut self, event: &EventEnvelope) {
-        let context_window_tokens = self.active_context_window_tokens();
-        update_token_usage(&mut self.token_usage, event, context_window_tokens);
-    }
-
     fn active_context_window_tokens(&self) -> Option<u64> {
-        self.model_catalog
-            .provider(&self.status.provider)
-            .and_then(|provider| {
-                provider
-                    .models()
-                    .find(|model| model.id() == self.status.model)
-            })
-            .and_then(|model| model.context_window_tokens())
-    }
-
-    fn accept_worker_session_or_continue(&mut self, session: Box<Session<TuiDecider>>) {
-        if self.active_session_home_managed {
-            let session_id = session.session_id().to_owned();
-            if let Err(error) = self.refresh_current_session_metadata(&session_id) {
-                self.notice = Some(format!("session metadata refresh failed: {error}"));
-            }
-        }
-        if let Some(request) = self.pending_runs.pop_front() {
-            match request {
-                PendingRunRequest::Extension(request) => self.spawn_extension_run(request, session),
-                PendingRunRequest::Companion(request) => self.spawn_companion_run(request, session),
-            }
-        } else {
-            self.state = AppState::Idle { session };
-            self.in_flight_label = None;
-            self.in_flight_cancellable = false;
-        }
-    }
-
-    fn handle_extension_outcome(
-        &mut self,
-        request: &ExtensionRunRequest,
-        outcome: ExtensionOutcome,
-        elapsed: Option<Duration>,
-    ) {
-        if let Some(duration) = elapsed.filter(|duration| *duration >= MIN_WORKED_DURATION) {
-            self.push_finalized_visual_item(TranscriptItem::WorkedDuration(format_live_elapsed(
-                duration,
-            )));
-        }
-        match outcome {
-            ExtensionOutcome::Complete(output) => {
-                let output = serde_json::to_string(&output).unwrap_or_else(|_| "null".to_owned());
-                self.push_finalized_visual_item(TranscriptItem::SessionSummary(format!(
-                    "extension {}.{} result: {output}",
-                    request.id, request.command
-                )));
-                self.notice = Some(format!(
-                    "extension {}.{} complete",
-                    request.id, request.command
-                ));
-            }
-            ExtensionOutcome::Failed(message) => {
-                self.push_finalized_visual_item(TranscriptItem::Error {
-                    source: format!("extension {}.{}", request.id, request.command),
-                    message: message.clone(),
-                });
-                self.notice = Some(format!(
-                    "extension {}.{} failed: {message}",
-                    request.id, request.command
-                ));
-            }
-        }
-    }
-
-    fn handle_companion_outcome(
-        &mut self,
-        _request: &CompanionRunRequest,
-        outcome: CompanionOutcome,
-        elapsed: Option<Duration>,
-    ) {
-        if let Some(duration) = elapsed.filter(|duration| *duration >= MIN_WORKED_DURATION) {
-            self.push_finalized_visual_item(TranscriptItem::WorkedDuration(format_live_elapsed(
-                duration,
-            )));
-        }
-        match outcome {
-            CompanionOutcome::Complete(result) => {
-                self.push_finalized_visual_item(TranscriptItem::SessionSummary(format!(
-                    "companion run result: {}",
-                    serde_json::to_string(&crate::companion_run::agent_result_json(&result))
-                        .unwrap_or_else(|_| "null".to_owned())
-                )));
-                self.notice = Some("companion run complete".to_owned());
-            }
-            CompanionOutcome::Failed(message) => {
-                self.push_finalized_visual_item(TranscriptItem::Error {
-                    source: "companion run".to_owned(),
-                    message: message.clone(),
-                });
-                self.notice = Some(format!("companion run failed: {message}"));
-            }
-        }
-    }
-
-    fn refresh_patch_modal_preview(&mut self) {
-        if !matches!(
-            self.modal,
-            Some(Modal::PatchApproval(PatchApprovalModal {
-                preview: PatchPreview::Fallback(_),
-                ..
-            }))
-        ) {
-            return;
-        }
-        let preview = patch_approval::preview_from_events(self.transcript.events());
-        if let Some(Modal::PatchApproval(modal)) = &mut self.modal {
-            modal.preview = preview;
-        }
-    }
-
-    fn record_in_flight_error(&mut self, event: &EventEnvelope) {
-        if !self.turn_in_flight() || event.kind.as_str() != EventKind::ERROR {
-            return;
-        }
-        let source = event
-            .payload
-            .get("source")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("error");
-        let message = event
-            .payload
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("turn failed");
-        self.in_flight_error = Some(format!("{source}: {message}"));
-        self.interrupted_guidance = false;
-    }
-
-    fn handle_turn_outcome(&mut self, outcome: TurnOutcome, elapsed: Option<Duration>) {
-        match outcome {
-            TurnOutcome::Complete => {
-                self.interrupted_guidance = false;
-                self.in_flight_error = None;
-                self.notice = None;
-            }
-            TurnOutcome::Cancelled => {
-                self.transcript.clear_transient_live_tail();
-                self.interrupted_guidance = false;
-                self.in_flight_error = None;
-                self.push_finalized_visual_item(TranscriptItem::Interrupted);
-                self.notice = None;
-            }
-            TurnOutcome::Failed(message) => {
-                self.interrupted_guidance = false;
-                self.in_flight_error = None;
-                self.transcript.clear_transient_live_tail();
-                if !self.last_event_is_error() {
-                    self.push_finalized_visual_item(TranscriptItem::Error {
-                        source: "run_turn".to_owned(),
-                        message,
-                    });
-                }
-                self.notice = None;
-            }
-        }
-        if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed >= MIN_WORKED_DURATION) {
-            self.push_finalized_visual_item(TranscriptItem::WorkedDuration(format_live_elapsed(
-                elapsed,
-            )));
-        }
-    }
-
-    fn last_event_is_error(&self) -> bool {
-        self.transcript
-            .events()
-            .last()
-            .is_some_and(|event| event.kind.as_str() == EventKind::ERROR)
+        context_window_tokens_for(
+            &self.model_catalog,
+            &self.status.provider,
+            &self.status.model,
+        )
     }
 
     fn mark_working_timer_dirty(&mut self) -> bool {
@@ -2001,14 +2112,51 @@ impl AppCore {
         true
     }
 
+    /// Advance the working HUD's spinner animation frame (issue #27). The
+    /// rendered glyph is a pure function of `spinner_frame` — a tick
+    /// counter, not `Instant::now()` read at render time — so it stays
+    /// testable without wall-clock assertions; only this scheduling check
+    /// (called from the periodic background poll, never from render) reads
+    /// the clock, exactly like the neighboring elapsed-seconds timer.
+    fn advance_spinner(&mut self) -> bool {
+        self.advance_spinner_at(Instant::now())
+    }
+
+    /// `now` is injected (rather than read internally) so tests can drive
+    /// the tick-scheduling boundary deterministically, without sleeping —
+    /// e.g. `Instant::now() - Duration::from_millis(100)` as the "last
+    /// tick" to force the next call to fire.
+    fn advance_spinner_at(&mut self, now: Instant) -> bool {
+        if !self.turn_in_flight() {
+            let was_animating = self.spinner_frame != 0 || self.spinner_last_tick.is_some();
+            self.spinner_frame = 0;
+            self.spinner_last_tick = None;
+            return was_animating;
+        }
+        match self.spinner_last_tick {
+            None => {
+                self.spinner_last_tick = Some(now);
+                false
+            }
+            Some(last) if now.duration_since(last) >= SPINNER_TICK_INTERVAL => {
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                self.spinner_last_tick = Some(now);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
     fn reply_to_modal(&mut self, reply: PermissionReply) -> CoreEffect {
         self.modal = None;
+        self.approval_selection = ApprovalOption::default();
         let _ = self.reply_tx.send(reply);
         CoreEffect::Render
     }
 
     fn deny_open_modal(&mut self) {
         if self.modal.take().is_some() {
+            self.approval_selection = ApprovalOption::default();
             let _ = self.reply_tx.send(PermissionReply::Deny);
         }
     }
@@ -2023,6 +2171,19 @@ impl AppCore {
             source: "ui".to_owned(),
             message,
         });
+    }
+
+    /// Muted, non-error informational line (review v2 §3/§6/§14.4) — no
+    /// glyph, no "ui:" source prefix, indented to the content column.
+    /// Consecutive `Notice` items stack directly without a separating blank
+    /// line (the renderer special-cases this run). Used for every neutral
+    /// confirmation/refusal (extension toggles, timestamps toggle,
+    /// code-swarm save/config lines, resume refusal, teach messages like the
+    /// disabled-extension notice) — none of these are failures, so none
+    /// should read as one.
+    fn teach_notice(&mut self, message: String) -> CoreEffect {
+        self.push_finalized_visual_item(TranscriptItem::Notice(message));
+        CoreEffect::Render
     }
 
     fn summary_item(&mut self, text: String) -> CoreEffect {
@@ -2041,41 +2202,94 @@ impl AppCore {
         }
     }
 
-    fn live_status_line(&self) -> Option<String> {
+    /// Working HUD content (issue #27), shared by the plain-text legacy
+    /// path (`live_status_line`) and the real styled render path
+    /// (`app::visual::push_visual_activity_block`). The interrupted/failed
+    /// cases are unstyled one-liners; the working case carries the spinner,
+    /// phase verb, and dim suffix as separate pieces so the real path can
+    /// color them independently (gold spinner, dim elapsed/hint).
+    fn working_hud_line(&self, width: u16) -> Option<HudLine> {
         if matches!(
             self.modal,
             Some(Modal::Permission(_) | Modal::PatchApproval(_))
         ) {
             return None;
         }
+        let interrupt = super::glyphs::interrupt();
         if self.interrupted_guidance {
-            return Some(
-                "■ Conversation interrupted - tell the model what to do differently.".to_owned(),
-            );
+            return Some(HudLine::Plain(format!(
+                "{interrupt} interrupted — tell euler what to do differently"
+            )));
         }
         if self.in_flight_error.is_some() {
-            return Some("■ Turn failed - waiting for cleanup.".to_owned());
+            return Some(HudLine::Plain(format!(
+                "{interrupt} turn failed — waiting for cleanup"
+            )));
         }
         let AppState::TurnInFlight { started_at, .. } = &self.state else {
             return None;
         };
+        let secs = started_at.elapsed().as_secs();
+        let spinner = super::glyphs::glyph_set().spinner(self.spinner_frame);
         let label = self.in_flight_label.as_deref().unwrap_or("turn");
         if !self.is_in_flight_cancellable() {
-            return Some(format!(
-                "◦ Running {label} ({} • not cancellable)",
-                format_live_elapsed(started_at.elapsed())
-            ));
+            return Some(HudLine::Working {
+                spinner,
+                verb: format!("running {label}"),
+                suffix: format!(" · {secs}s · not cancellable"),
+                reasoning_tail: Vec::new(),
+            });
         }
-        if label == "turn" {
-            return Some(format!(
-                "◦ Working ({} • esc to interrupt)",
-                format_live_elapsed(started_at.elapsed())
-            ));
+        let verb = if label == "turn" {
+            self.current_phase_verb
+                .clone()
+                .unwrap_or_else(|| "working".to_owned())
+        } else {
+            format!("working {label}")
+        };
+        let reasoning_tail = if verb == "thinking" {
+            self.reasoning_tail_lines(width)
+        } else {
+            Vec::new()
+        };
+        Some(HudLine::Working {
+            spinner,
+            verb,
+            suffix: format!(" · {secs}s · esc to interrupt"),
+            reasoning_tail,
+        })
+    }
+
+    /// #47: wraps the bounded streaming-reasoning tail to `width`, keeping
+    /// only the last 3 wrapped lines — the live line shows a readable
+    /// preview, not the full reasoning transcript.
+    fn reasoning_tail_lines(&self, width: u16) -> Vec<String> {
+        const MAX_WRAPPED_LINES: usize = 3;
+        if self.reasoning_stream_tail.is_empty() {
+            return Vec::new();
         }
-        Some(format!(
-            "◦ Working {label} ({} • esc to interrupt)",
-            format_live_elapsed(started_at.elapsed())
-        ))
+        let content_width = usize::from(width).saturating_sub(2).max(1);
+        let mut wrapped = crate::ui::text::wrap_text(&self.reasoning_stream_tail, content_width);
+        if wrapped.len() > MAX_WRAPPED_LINES {
+            wrapped = wrapped.split_off(wrapped.len() - MAX_WRAPPED_LINES);
+        }
+        wrapped
+    }
+
+    /// Plain-text flattening of `working_hud_line`, kept for the legacy
+    /// `#[cfg(test)]` Frame-based render scaffolding (render_tests_support_test.rs)
+    /// that predates the visual-canvas renderer and does not carry styled spans.
+    #[cfg(test)]
+    fn live_status_line(&self) -> Option<String> {
+        Some(match self.working_hud_line(80)? {
+            HudLine::Plain(text) => text,
+            HudLine::Working {
+                spinner,
+                verb,
+                suffix,
+                reasoning_tail: _,
+            } => format!("{spinner} {verb}{suffix}"),
+        })
     }
 
     fn working_elapsed_seconds(&self) -> Option<u64> {
@@ -2096,11 +2310,30 @@ impl AppCore {
         let Some(Modal::Permission(request)) = &self.modal else {
             return None;
         };
+        let scope_prefix = patch_approval::derive_scope_prefix(request);
         Some(TranscriptItem::PermissionAsk {
             capability: request.capability.as_str().to_owned(),
             reason: request.reason.clone(),
-            command: self.shell_command_for_permission(request),
+            command: self
+                .shell_command_for_permission(request)
+                .or_else(|| request.command.clone()),
+            prior_count: self.prior_permission_count(request, scope_prefix.as_deref()),
+            selected_option: self.approval_selection,
+            scope_prefix,
+            companion_name: self.in_flight_companion_name.clone(),
         })
+    }
+
+    fn prior_permission_count(
+        &self,
+        request: &PermissionRequest,
+        scope_prefix: Option<&str>,
+    ) -> usize {
+        transcript::prior_permission_allow_count(
+            self.transcript.events(),
+            request.capability.as_str(),
+            scope_prefix,
+        )
     }
 
     fn shell_command_for_permission(&self, request: &PermissionRequest) -> Option<String> {
@@ -2147,6 +2380,180 @@ impl AppCore {
 fn resolve_session_store() -> Result<SessionStore> {
     let home = EulerHome::resolve()?;
     Ok(SessionStore::new(home)?)
+}
+
+fn empty_command_context_parts(
+    current_effort: ReasoningEffort,
+    current_theme: ThemeChoice,
+    current_session_id: Option<String>,
+) -> CommandContextParts {
+    CommandContextParts {
+        current_effort,
+        current_theme,
+        current_session_id,
+        checkpoint_items: Vec::new(),
+        extension_items: Vec::new(),
+        extension_slash_commands: Vec::new(),
+        code_swarm_models: Vec::new(),
+    }
+}
+
+struct SessionDiffEntry {
+    path: String,
+    action: String,
+    diff: Option<String>,
+    truncated: bool,
+    truncation: String,
+    omitted_reason: Option<String>,
+}
+
+/// Latest `file.diff` per path for files this session touched (not full WT).
+fn session_attributed_diffs(events: &[EventEnvelope]) -> Vec<SessionDiffEntry> {
+    use std::collections::BTreeMap;
+    let mut latest: BTreeMap<String, SessionDiffEntry> = BTreeMap::new();
+    for event in events {
+        if event.kind.as_str() != EventKind::FILE_DIFF {
+            continue;
+        }
+        let path = event
+            .payload
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if path.is_empty() {
+            continue;
+        }
+        let action = event
+            .payload
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("modify")
+            .to_owned();
+        let diff = event
+            .payload
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let truncated = event
+            .payload
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let truncation = event
+            .payload
+            .get("truncation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let omitted_reason = event
+            .payload
+            .get("omitted_reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        latest.insert(
+            path.clone(),
+            SessionDiffEntry {
+                path,
+                action,
+                diff,
+                truncated,
+                truncation,
+                omitted_reason,
+            },
+        );
+    }
+    latest.into_values().collect()
+}
+
+fn count_diff_lines(diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+fn format_usage_from_snapshot(tokens: &TokenUsageSnapshot, status: &StatusSnapshot) -> String {
+    let mut lines = vec![
+        format!("usage · {}::{}", status.provider, status.model),
+        format!("  input:     {} tokens", tokens.input_tokens),
+        format!("  output:    {} tokens", tokens.output_tokens),
+    ];
+    if let Some(reasoning) = tokens.reasoning_tokens {
+        lines.push(format!("  reasoning: {reasoning} tokens"));
+    }
+    lines.push("  cost:      (catalog prices unavailable — tokens only)".to_owned());
+    lines.join("\n")
+}
+
+fn format_session_usage(
+    events: &[EventEnvelope],
+    status: &StatusSnapshot,
+    live: &TokenUsageSnapshot,
+) -> String {
+    use std::collections::BTreeMap;
+    #[derive(Default)]
+    struct Bucket {
+        input: u64,
+        output: u64,
+        reasoning: u64,
+        calls: u64,
+    }
+    let mut by_model: BTreeMap<(String, String), Bucket> = BTreeMap::new();
+    for event in events {
+        if event.kind.as_str() != EventKind::MODEL_RESULT {
+            continue;
+        }
+        let provider = event
+            .payload
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let model = event
+            .payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let usage = event.payload.get("usage").and_then(|v| v.as_object());
+        let input = usage
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output = usage
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let reasoning = usage
+            .and_then(|u| u.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let bucket = by_model.entry((provider, model)).or_default();
+        bucket.input += input;
+        bucket.output += output;
+        bucket.reasoning += reasoning;
+        bucket.calls += 1;
+    }
+    if by_model.is_empty() {
+        return format_usage_from_snapshot(live, status);
+    }
+    let mut lines = vec!["usage · session totals (no catalog prices)".to_owned()];
+    for ((provider, model), bucket) in by_model {
+        lines.push(format!("{provider}::{model} · {} call(s)", bucket.calls));
+        lines.push(format!("  input:     {} tokens", bucket.input));
+        lines.push(format!("  output:    {} tokens", bucket.output));
+        if bucket.reasoning > 0 {
+            lines.push(format!("  reasoning: {} tokens", bucket.reasoning));
+        }
+    }
+    lines.join("\n")
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

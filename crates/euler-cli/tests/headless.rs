@@ -2073,7 +2073,14 @@ fn extension_resolution_rejects_unknown_ids_and_malformed_project_file() {
 
     let project_home = isolated_home();
     let project_root = tempfile::tempdir().expect("project root");
-    let project_dir = project_root.path().join(".euler");
+    // Canonicalize: the binary reports the project file via its resolved cwd,
+    // and on macOS `TempDir::path()` is the `/var/…` symlink form of
+    // `/private/var/…`.
+    let project_root_path = project_root
+        .path()
+        .canonicalize()
+        .expect("canonical project root");
+    let project_dir = project_root_path.join(".euler");
     fs::create_dir(&project_dir).expect("project euler dir");
     let project_file = project_dir.join("extensions.json");
     fs::write(&project_file, r#"{"enable":["nope"]}"#).expect("project overlay");
@@ -2096,7 +2103,11 @@ fn extension_resolution_rejects_unknown_ids_and_malformed_project_file() {
 
     let malformed_home = isolated_home();
     let malformed_root = tempfile::tempdir().expect("malformed root");
-    let malformed_dir = malformed_root.path().join(".euler");
+    let malformed_root_path = malformed_root
+        .path()
+        .canonicalize()
+        .expect("canonical malformed root");
+    let malformed_dir = malformed_root_path.join(".euler");
     fs::create_dir(&malformed_dir).expect("malformed euler dir");
     let malformed_file = malformed_dir.join("extensions.json");
     fs::write(&malformed_file, "{").expect("malformed overlay");
@@ -2342,14 +2353,11 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
             concat!(
                 r#"{{"id":"code-swarm","display_name":"CodeSwarm Review","#,
                 r#""version":"{}","source_kind":"bundled","#,
-                r#""runtime_kind":"native-rust","capabilities":["provenance-read","#,
-                r#""artifact-write"],"commands":[{{"name":"review-brief","#,
-                r#""display_name":"Build CodeSwarm review briefs","#,
-                r#""summary":"Build review-only companion AgentTask briefs for the current session.","#,
-                r#""required_capabilities":[]}},{{"name":"review-report","#,
-                r#""display_name":"Write CodeSwarm review report","#,
-                r#""summary":"Consolidate CodeSwarm companion results into a review artifact.","#,
-                r#""required_capabilities":["provenance-read","artifact-write"]}}]}}"#,
+                r#""runtime_kind":"native-rust","capabilities":["agent-spawn","#,
+                r#""artifact-write"],"commands":[{{"name":"review","#,
+                r#""display_name":"Run CodeSwarm review","#,
+                r#""summary":"Run 1-5 review-only agents over the current session and write a consolidated review artifact.","#,
+                r#""required_capabilities":["agent-spawn","artifact-write"]}}]}}"#,
                 "\n"
             ),
             version
@@ -2908,6 +2916,70 @@ fn extension_cli_enable_run_and_disable_session_export() {
         .nth(1)
         .expect("disable line")
         .contains(r#""op":"disable""#));
+}
+
+#[test]
+fn extension_cli_code_swarm_review_validates_input_and_stays_live_only() {
+    // The review command validates input before any reviewer spawns, and the
+    // offline runner has no live session to spawn against — the run must fail
+    // with the honest spawn-unavailable error, not a hang or a phantom review.
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+
+    let mut seed = command_with_home(exe, &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn seed euler");
+    seed.stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"code swarm seed")
+        .expect("write seed stdin");
+    assert!(seed.wait_with_output().expect("wait seed").status.success());
+    let session_id = only_home_session_id(home.path());
+
+    let enabled = command_with_home(exe, &home)
+        .args(["extension", "enable", "code-swarm"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("extension enable code-swarm");
+    assert!(enabled.status.success());
+
+    let bad_model = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "code-swarm.review",
+            &session_id,
+            "--model",
+            "no-separator",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("code swarm review run with bad model");
+    assert!(!bad_model.status.success());
+    let stderr = String::from_utf8_lossy(&bad_model.stderr);
+    assert!(
+        stderr.contains("provider::model"),
+        "expected model target guidance, got: {stderr}"
+    );
+
+    let offline = command_with_home(exe, &home)
+        .args(["extension", "run", "code-swarm.review", &session_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("code swarm review offline run");
+    assert!(!offline.status.success());
+    let stderr = String::from_utf8_lossy(&offline.stderr);
+    assert!(
+        stderr.contains("agent spawn unavailable"),
+        "expected spawn-unavailable error from the offline host, got: {stderr}"
+    );
 }
 
 #[test]
@@ -4730,7 +4802,6 @@ fn extension_search_reports_linked_metadata_without_private_inventory_fields() {
         vec![
             "session-export",
             "causal-dag",
-            "code-swarm",
             "autoresearch",
             "maxproof",
             "example-extension"
@@ -5421,12 +5492,13 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
     let info_json: serde_json::Value = serde_json::from_slice(&info.stdout).expect("info json");
     assert_eq!(info_json["source_kind"], "linked");
     assert_eq!(info_json["status"], "needs-review");
-    // Canonicalize before starts_with: macOS tempdirs live behind the
-    // /var -> /private/var symlink and the binary reports canonical paths.
+    // Compare against the canonicalized tempdir: the binary canonicalizes
+    // linked paths, and on macOS `TempDir::path()` returns the `/var/…`
+    // symlink form of `/private/var/…`.
     let canonical_extension_dir = extension_dir
         .path()
         .canonicalize()
-        .expect("canonicalize extension dir");
+        .expect("canonical extension dir");
     assert!(info_json["source_path"]
         .as_str()
         .expect("linked source path")
@@ -5992,8 +6064,9 @@ fn concurrent_cli_writer_fails_with_session_locked_message() {
         log.file_name().expect("log filename").to_string_lossy()
     ));
     let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
 
-    let mut first = Command::new(exe)
+    let mut first = command_with_home(exe, &home)
         .arg("--provider")
         .arg("fixture")
         .arg("--provenance")
@@ -6015,7 +6088,7 @@ fn concurrent_cli_writer_fails_with_session_locked_message() {
 
     let second = if lock_ready {
         Some(
-            Command::new(exe)
+            command_with_home(exe, &home)
                 .arg("--provider")
                 .arg("fixture")
                 .arg("--provenance")
@@ -6221,8 +6294,9 @@ fn replay_missing_blob_exits_nonzero_and_names_blob() {
     let log = temp.path().join("events.jsonl");
     write_blob_reference_event(&log);
     let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
 
-    let output = Command::new(exe)
+    let output = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&log)
         .output()
@@ -6243,8 +6317,9 @@ fn replay_corrupted_blob_exits_nonzero_and_names_blob() {
     fs::create_dir_all(&blobs).expect("blob dir");
     fs::write(blobs.join(BLOB_HASH), "corrupt").expect("corrupt blob");
     let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
 
-    let output = Command::new(exe)
+    let output = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&log)
         .output()
@@ -6315,8 +6390,9 @@ fn concurrent_cli_resume_fails_with_session_locked_message() {
     );
     let lock = lock_path_for(&log);
     let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
 
-    let mut first = Command::new(exe)
+    let mut first = command_with_home(exe, &home)
         .arg("--resume")
         .arg(&log)
         .stdin(Stdio::piped())
@@ -6336,7 +6412,7 @@ fn concurrent_cli_resume_fails_with_session_locked_message() {
 
     let second = if lock_ready {
         Some(
-            Command::new(exe)
+            command_with_home(exe, &home)
                 .arg("--resume")
                 .arg(&log)
                 .stdin(Stdio::null())
@@ -6408,7 +6484,8 @@ fn replaying_permission_events_projects_transcript_to_stdout() {
     fs::write(&provenance, format!("{jsonl}\n")).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6439,7 +6516,8 @@ fn replay_warns_and_skips_unknown_event_kinds() {
     write_events(&provenance, &events);
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6481,7 +6559,8 @@ fn replay_ignores_truncated_final_jsonl_line() {
     fs::write(&provenance, jsonl).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6513,7 +6592,8 @@ fn replay_ignores_malformed_final_jsonl_line_without_trailing_newline() {
     fs::write(&provenance, jsonl).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6542,7 +6622,8 @@ fn replay_rejects_malformed_final_jsonl_line_with_trailing_newline() {
     fs::write(&provenance, jsonl).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6570,7 +6651,8 @@ fn replay_rejects_invalid_non_final_line_followed_by_trailing_whitespace() {
     fs::write(&provenance, jsonl).expect("write provenance");
 
     let exe = env!("CARGO_BIN_EXE_euler");
-    let replayed = Command::new(exe)
+    let home = isolated_home();
+    let replayed = command_with_home(exe, &home)
         .arg("--replay")
         .arg(&provenance)
         .output()
@@ -6578,6 +6660,603 @@ fn replay_rejects_invalid_non_final_line_followed_by_trailing_whitespace() {
 
     assert!(!replayed.status.success());
     assert!(String::from_utf8_lossy(&replayed.stderr).contains("invalid provenance line"));
+}
+
+/// Reconstruct the terminal's final state (scrollback + visible screen) from
+/// raw PTY bytes. Legit repaints overwrite in place; only real emissions
+/// survive here — so a line appearing twice means it was committed twice.
+fn pty_final_state_text(output: &[u8], rows: u16, cols: u16) -> String {
+    let mut parser = vt100::Parser::new(rows, cols, 5000);
+    parser.process(output);
+    // Clamp to the actual scrollback length.
+    parser.set_scrollback(usize::MAX);
+    let total_scrollback = parser.screen().scrollback();
+    let mut lines: Vec<String> = Vec::new();
+    let mut offset = total_scrollback;
+    loop {
+        parser.set_scrollback(offset);
+        let contents = parser.screen().contents();
+        let screen_rows: Vec<&str> = contents.lines().collect();
+        if offset == total_scrollback {
+            lines.extend(screen_rows.iter().map(|row| row.to_string()));
+        } else {
+            // Overlapping windows: keep only the rows that scrolled into view.
+            let new_rows = usize::from(rows).min(total_scrollback - offset + usize::from(rows));
+            let skip = screen_rows.len().saturating_sub(new_rows);
+            let _ = skip;
+            // Simpler: rebuild from scratch below.
+            lines.clear();
+            break;
+        }
+        if offset == 0 {
+            break;
+        }
+        offset = offset.saturating_sub(usize::from(rows));
+        if total_scrollback - offset < usize::from(rows) {
+            offset = 0;
+        }
+    }
+    if !lines.is_empty() {
+        let mut all_rows = extract_bridge_committed_rows(output);
+        all_rows.push(lines.join("\n"));
+        return all_rows.join("\n");
+    }
+    // Fallback path: walk row windows without overlap bookkeeping errors by
+    // stepping exactly one row at a time and keeping the top row of each view.
+    let mut rebuilt: Vec<String> = Vec::new();
+    let mut offset = total_scrollback;
+    loop {
+        parser.set_scrollback(offset);
+        let contents = parser.screen().contents();
+        let mut screen_rows = contents.lines();
+        if let Some(top) = screen_rows.next() {
+            rebuilt.push(top.to_string());
+        }
+        if offset == 0 {
+            // The remaining visible rows complete the picture.
+            rebuilt.extend(contents.lines().skip(1).map(|row| row.to_string()));
+            break;
+        }
+        offset -= 1;
+    }
+    let mut all_rows = extract_bridge_committed_rows(output);
+    all_rows.push(rebuilt.join("\n"));
+    all_rows.join("\n")
+}
+
+/// Committed rows written through the codex-style bridge contract
+/// (`ESC[1;Nr` … `ESC[r`, one row per `\r\n`). Real terminals push these into
+/// native scrollback when the region top is row 1; the vt100 crate discards
+/// them, so reconstruction captures them straight from the byte stream.
+fn extract_bridge_committed_rows(output: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(output);
+    let mut rows = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find("\u{1b}[1;") {
+        let after = &rest[start..];
+        let Some(region_close) = after.find('r') else {
+            break;
+        };
+        // Confirm this is a scroll-region set: ESC[1;<digits>r
+        // (the needle is ESC [ 1 ; — digits start at byte 4)
+        if region_close <= 4
+            || !after[4..region_close]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        {
+            rest = &rest[start + 4..];
+            continue;
+        }
+        let Some(end) = after.find("\u{1b}[r") else {
+            break;
+        };
+        let span = &after[region_close + 1..end];
+        // The bridge writes `ESC[row;1H` then rows separated by \r\n with
+        // only SGR styling in between. Ordinary viewport repaints also run
+        // inside scroll-region scopes but are full of cursor movement —
+        // reject any span chunk that still contains non-SGR control
+        // sequences after SGR stripping (false positives counted one
+        // "committed" copy per resize repaint).
+        let mut chunks = span.split("\r\n");
+        let header = chunks.next().unwrap_or_default();
+        let header_is_bridge_move = {
+            let stripped = strip_sgr(header);
+            let mut ok = stripped.starts_with('\u{1b}');
+            if ok {
+                let body = stripped
+                    .trim_start_matches('\u{1b}')
+                    .trim_start_matches('[');
+                ok = body
+                    .trim_end_matches('H')
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ch == ';')
+                    && body.ends_with('H');
+            }
+            ok || stripped.trim().is_empty()
+        };
+        if header_is_bridge_move {
+            for line in chunks {
+                let sgr_stripped = strip_erase_line(&strip_sgr(line));
+                if sgr_stripped.contains('\u{1b}') {
+                    // Cursor movement inside the span: not a bridge write.
+                    continue;
+                }
+                let plain = strip_ansi(line);
+                if !plain.trim().is_empty() {
+                    rows.push(plain);
+                }
+            }
+        }
+        rest = &after[end + 3..];
+    }
+    rows
+}
+
+/// Remove only SGR (`ESC[...m`) sequences, keeping other controls visible.
+fn strip_sgr(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(idx) = rest.find('\u{1b}') {
+        out.push_str(&rest[..idx]);
+        let tail = &rest[idx..];
+        if let Some(after_bracket) = tail.strip_prefix("\u{1b}[") {
+            if let Some(end) = after_bracket.find(|ch: char| ch.is_ascii_alphabetic()) {
+                let terminator = after_bracket.as_bytes()[end] as char;
+                if terminator == 'm' {
+                    rest = &after_bracket[end + 1..];
+                    continue;
+                }
+            }
+        }
+        // Not SGR: keep the ESC visible for the caller's rejection check.
+        out.push('\u{1b}');
+        rest = &tail['\u{1b}'.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remove erase-to-eol (`ESC[K`, `ESC[0K`) which bridge row writes use.
+fn strip_erase_line(text: &str) -> String {
+    text.replace("\u{1b}[K", "").replace("\u{1b}[0K", "")
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for control in chars.by_ref() {
+                    if control.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else if chars.peek() == Some(&']') {
+                chars.next();
+                for control in chars.by_ref() {
+                    if control == '\u{7}' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Final-state reconstruction across mid-session resizes: process each byte
+/// segment at its dimensions.
+fn pty_final_state_with_resizes(
+    output: &[u8],
+    initial: (u16, u16),
+    resizes: &[(usize, u16, u16)],
+) -> String {
+    let (mut rows, mut cols) = initial;
+    let mut parser = vt100::Parser::new(rows, cols, 5000);
+    let mut start = 0usize;
+    for (offset, new_rows, new_cols) in resizes {
+        parser.process(&output[start..*offset]);
+        parser.set_size(*new_rows, *new_cols);
+        start = *offset;
+        rows = *new_rows;
+        cols = *new_cols;
+    }
+    parser.process(&output[start..]);
+    let _ = (rows, cols);
+    parser.set_scrollback(usize::MAX);
+    let total_scrollback = parser.screen().scrollback();
+    let mut rebuilt: Vec<String> = Vec::new();
+    let mut offset = total_scrollback;
+    loop {
+        parser.set_scrollback(offset);
+        let contents = parser.screen().contents();
+        let mut screen_rows = contents.lines();
+        if let Some(top) = screen_rows.next() {
+            rebuilt.push(top.to_string());
+        }
+        if offset == 0 {
+            rebuilt.extend(contents.lines().skip(1).map(|row| row.to_string()));
+            break;
+        }
+        offset -= 1;
+    }
+    let mut all_rows = extract_bridge_committed_rows(output);
+    all_rows.push(rebuilt.join("\n"));
+    all_rows.join("\n")
+}
+
+#[test]
+fn tui_pty_resize_does_not_duplicate_committed_lines() {
+    // Regression target for the duplicate-line audit finding (P1): a terminal
+    // resize while history has been committed to native scrollback must not
+    // re-emit already-committed lines.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut events = Vec::new();
+    for paragraph in 1..=6 {
+        let sentence = format!(
+            "Paragraph {paragraph}: streaming content long enough to wrap and \
+             scroll so history rows land in native scrollback before resize."
+        );
+        for chunk in sentence.as_bytes().chunks(8) {
+            events.push(serde_json::json!({
+                "text_delta": String::from_utf8_lossy(chunk)
+            }));
+        }
+        events.push(serde_json::json!({"text_delta": "\n\n"}));
+    }
+    events.push(serde_json::json!({"finished": {"stop_reason": "completed"}}));
+    let second_response = serde_json::json!({"events": [
+        {"text_delta": "Post-resize response committed once."},
+        {"finished": {"stop_reason": "completed"}},
+    ]});
+    let script = write_fixture_script(
+        temp.path(),
+        "resize-stream.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": events}, second_response]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(
+        tui.wait_for_screen("· ctx"),
+        "initial TUI did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("overview please\r");
+    assert!(
+        tui.wait_for_screen("Paragraph 6:"),
+        "streamed response did not render:\n{}",
+        tui.screen_text()
+    );
+    // Resize after the turn completed and history is committed.
+    tui.resize(24, 100);
+    // Provoke a post-resize repaint + another committed event.
+    tui.write("second message\r");
+    std::thread::sleep(Duration::from_millis(600));
+    tui.quit();
+
+    let resizes = tui.resizes.clone();
+    let final_state = pty_final_state_with_resizes(&tui.output, (24, 80), &resizes);
+    let mut failures = Vec::new();
+    for paragraph in 1..=6 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = final_state
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .count();
+        if occurrences != 1 {
+            failures.push(format!("`{needle}` committed {occurrences}× (expected 1)"));
+        }
+    }
+    let banner_caption = final_state
+        .lines()
+        .filter(|line| line.contains("e^(iπ) + 1 = 0"))
+        .count();
+    if banner_caption != 1 {
+        failures.push(format!(
+            "banner caption committed {banner_caption}× (expected 1)"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "resize duplicated committed lines:\n{}\nFinal state:\n{final_state}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "diagnostic: set EULER_RAW_CAPTURE to a raw PTY byte file"]
+fn diag_reconstruct_final_state_from_capture() {
+    let path = std::env::var("EULER_RAW_CAPTURE").expect("EULER_RAW_CAPTURE");
+    let raw = fs::read(path).expect("raw capture");
+    let state = pty_final_state_text(&raw, 24, 80);
+    println!("=== FINAL STATE ===\n{state}\n=== END ===");
+    for needle in [
+        "e^(iπ) + 1 = 0",
+        "Looking at the repository",
+        "Here is an overview",
+        "overview please",
+    ] {
+        let count = state.lines().filter(|line| line.contains(needle)).count();
+        println!("COUNT {needle} -> {count}");
+    }
+}
+
+#[test]
+fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
+    // Review v2 §2/§8: after "allow for session", subsequent shell blocks
+    // must still render through the block renderer (header + fold), carry
+    // the dim `· session grant` tag instead of fresh decision records, and
+    // nothing may duplicate.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut responses = Vec::new();
+    for (id, cmd) in [
+        ("call-1", "echo alpha-one"),
+        ("call-2", "echo beta-two"),
+        ("call-3", "echo gamma-three"),
+    ] {
+        responses.push(serde_json::json!({"events": [
+            {"tool_call": {"id": id, "name": "run_shell", "input": {"command": cmd}}},
+            {"finished": {"stop_reason": "tool_use"}},
+        ]}));
+    }
+    responses.push(serde_json::json!({"events": [
+        {"text_delta": "ran all three."},
+        {"finished": {"stop_reason": "completed"}},
+    ]}));
+    let script = write_fixture_script(
+        temp.path(),
+        "grant-blocks.json",
+        &serde_json::json!({"version": 1, "responses": responses}).to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    tui.write("run the three commands\r");
+    // First shell call prompts; grant the session scope.
+    assert!(
+        tui.wait_for_screen("Run command?"),
+        "approval panel did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("a");
+    assert!(
+        tui.wait_for_screen("ran all three."),
+        "turn did not finish:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let final_state = pty_final_state_text(&tui.output, 24, 80);
+    let mut failures = Vec::new();
+    for cmd in ["echo alpha-one", "echo beta-two", "echo gamma-three"] {
+        let headers = final_state
+            .lines()
+            .filter(|line| line.contains(&format!("bash $ {cmd}")))
+            .count();
+        if headers != 1 {
+            failures.push(format!("`bash $ {cmd}` header appears {headers}× (want 1)"));
+        }
+    }
+    for output in ["alpha-one", "beta-two", "gamma-three"] {
+        let occurrences = final_state
+            .lines()
+            .filter(|line| {
+                line.contains(output) && !line.contains("bash $") && !line.contains("run the three")
+            })
+            .count();
+        if occurrences > 1 {
+            failures.push(format!("output `{output}` duplicated ({occurrences}×)"));
+        }
+    }
+    // Exactly one decision record; later runs tagged on the header instead.
+    let decisions = final_state
+        .lines()
+        .filter(|line| line.contains("allowed for session"))
+        .count();
+    if decisions != 1 {
+        failures.push(format!("decision records: {decisions} (want 1)"));
+    }
+    let grant_tags = final_state
+        .lines()
+        .filter(|line| line.contains("· session grant"))
+        .count();
+    if grant_tags != 2 {
+        failures.push(format!("session-grant header tags: {grant_tags} (want 2)"));
+    }
+    assert!(
+        failures.is_empty(),
+        "{}\nFinal state:\n{final_state}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
+    // Review v2 §11/§12: a drag (many resize ticks) appended one re-wrapped
+    // transcript copy to scrollback per width tick. With commit suspension
+    // during resize + item-boundary remap, a drag may leave at most the
+    // pre-resize copy plus one bounded partial-item re-emission — never a
+    // copy per tick.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut events = Vec::new();
+    for paragraph in 1..=6 {
+        let sentence = format!(
+            "Paragraph {paragraph}: content long enough to wrap and scroll so \
+             a resize drag has committed rows above the viewport to corrupt."
+        );
+        for chunk in sentence.as_bytes().chunks(8) {
+            events.push(serde_json::json!({
+                "text_delta": String::from_utf8_lossy(chunk)
+            }));
+        }
+        events.push(serde_json::json!({"text_delta": "\n\n"}));
+    }
+    events.push(serde_json::json!({"finished": {"stop_reason": "completed"}}));
+    let script = write_fixture_script(
+        temp.path(),
+        "drag-stream.json",
+        &serde_json::json!({"version": 1, "responses": [{"events": events}]}).to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    tui.write("overview please\r");
+    assert!(tui.wait_for_screen("Paragraph 6:"), "{}", tui.screen_text());
+    // Simulate a drag: many rapid width ticks in both directions.
+    for cols in [96, 92, 88, 84, 80, 76, 72, 76, 82, 90, 100] {
+        tui.resize(24, cols);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Quiescence so commits resume before quitting.
+    std::thread::sleep(Duration::from_millis(600));
+    tui.quit();
+
+    // Assert the MECHANISM from the raw byte stream (emulator-independent):
+    // scrollback (bridge) emissions must not happen per drag tick. Content
+    // committed before the drag stays put; after quiescence at most one
+    // bounded re-emission may occur.
+    let drag_start = tui.resizes.first().map(|(offset, _, _)| *offset).unwrap();
+    let drag_end = tui.resizes.last().map(|(offset, _, _)| *offset).unwrap();
+    let during: Vec<String> = extract_bridge_committed_rows(&tui.output[drag_start..drag_end]);
+    assert!(
+        during.is_empty(),
+        "bridge emissions during the drag ({}) — per-tick amplification:\n{}",
+        during.len(),
+        during.join("\n")
+    );
+    // Each paragraph may be bridge-committed at most twice in total
+    // (pre-drag copy + one bounded post-quiescence re-emission).
+    let all_rows = extract_bridge_committed_rows(&tui.output);
+    let mut failures = Vec::new();
+    for paragraph in 1..=6 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = all_rows.iter().filter(|row| row.contains(&needle)).count();
+        if occurrences > 2 {
+            failures.push(format!(
+                "`{needle}` bridge-committed {occurrences}× (want ≤2)"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{}\nBridge rows:\n{}",
+        failures.join("\n"),
+        all_rows.join("\n")
+    );
+}
+
+#[test]
+fn tui_pty_transcript_lines_commit_exactly_once() {
+    // Regression for the duplicate-line streaming repaint bug (Warm Spine
+    // implementation review, P1): the final terminal state — scrollback plus
+    // visible screen — must contain each transcript line exactly once, even
+    // when a long response streams in small deltas and scrolls the viewport.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut events = Vec::new();
+    for paragraph in 1..=6 {
+        let sentence = format!(
+            "Paragraph {paragraph}: here is an overview sentence that is long \
+             enough to wrap at eighty columns and scroll the viewport as it \
+             streams in small deltas."
+        );
+        for chunk in sentence.as_bytes().chunks(8) {
+            events.push(serde_json::json!({
+                "text_delta": String::from_utf8_lossy(chunk)
+            }));
+        }
+        events.push(serde_json::json!({"text_delta": "\n\n"}));
+    }
+    events.push(serde_json::json!({"finished": {"stop_reason": "completed"}}));
+    let script = write_fixture_script(
+        temp.path(),
+        "long-stream.json",
+        &serde_json::json!({"version": 1, "responses": [{"events": events}]}).to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(
+        tui.wait_for_screen("· ctx"),
+        "initial TUI did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("overview please\r");
+    assert!(
+        tui.wait_for_screen("Paragraph 6:"),
+        "streamed response did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let final_state = pty_final_state_text(&tui.output, 24, 80);
+    let mut failures = Vec::new();
+    for paragraph in 1..=6 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = final_state
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .count();
+        if occurrences != 1 {
+            failures.push(format!("`{needle}` committed {occurrences}× (expected 1)"));
+        }
+    }
+    let banner_caption = final_state
+        .lines()
+        .filter(|line| line.contains("e^(iπ) + 1 = 0"))
+        .count();
+    if banner_caption != 1 {
+        failures.push(format!(
+            "banner caption committed {banner_caption}× (expected 1)"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "duplicate-line repaint bug:\n{}\nFinal state:\n{final_state}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -6590,7 +7269,7 @@ fn tui_pty_submit_fixture_turn_and_quit() {
     );
 
     assert!(
-        tui.wait_for_screen("fixture/echo"),
+        tui.wait_for_screen("echo · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -6610,7 +7289,7 @@ fn tui_pty_without_provenance_writes_home_session_store() {
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
 
     assert!(
-        tui.wait_for_screen("fixture/echo"),
+        tui.wait_for_screen("echo · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -6634,7 +7313,7 @@ fn tui_name_session_updates_resume_picker_label() {
     let home = isolated_home();
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
     assert!(
-        tui.wait_for_screen("fixture/echo"),
+        tui.wait_for_screen("echo · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -6663,7 +7342,7 @@ fn tui_name_session_updates_resume_picker_label() {
     );
 
     let mut resumed = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
-    assert!(resumed.wait_for_screen("fixture/echo"));
+    assert!(resumed.wait_for_screen("echo · ctx"));
     resumed.write("/resume\r");
     assert!(
         resumed.wait_for_screen("dogfood session"),
@@ -6702,7 +7381,7 @@ fn tui_resume_picker_lists_home_sessions() {
     let saved_id = only_home_session_id(home.path());
 
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
-    assert!(tui.wait_for_screen("fixture/echo"));
+    assert!(tui.wait_for_screen("echo · ctx"));
     tui.write("/resume\r");
     assert!(
         tui.wait_for_screen("saved for picker"),
@@ -6721,14 +7400,26 @@ fn tui_resume_picker_lists_home_sessions() {
         tui.screen_text()
     );
     assert!(
+        tui.wait_for_screen("events replayed · model context folded to stubs"),
+        "resume boundary divider missing:\n{}",
+        tui.screen_text()
+    );
+    assert!(
         tui.wait_for_screen("user: saved for picker"),
         "resumed transcript was not rendered:\n{}",
         tui.screen_text()
     );
     tui.write("after tui resume\r");
+    // Fixture echo concatenates prior turns; the 9-cell ledger gutter can wrap
+    // the long assistant line, so match stable prefixes rather than one span.
     assert!(
-        tui.wait_for_screen("assistant: user: saved for picker user: after tui"),
+        tui.wait_for_screen("assistant: user: saved for picker"),
         "post-resume turn did not render:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.wait_for_screen("after tui"),
+        "post-resume user text did not render:\n{}",
         tui.screen_text()
     );
     tui.quit();
@@ -6810,6 +7501,8 @@ struct PtyHarness {
     rx: Receiver<Vec<u8>>,
     output: Vec<u8>,
     cursor_report_scan_offset: usize,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    resizes: Vec<(usize, u16, u16)>,
 }
 
 const PTY_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -6840,7 +7533,27 @@ impl PtyHarness {
             rx,
             output: Vec::new(),
             cursor_report_scan_offset: 0,
+            master: pty.master,
+            resizes: Vec::new(),
         }
+    }
+
+    /// Resize the PTY mid-session, recording the output offset so final-state
+    /// reconstruction can resize its emulator at the same point.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        // Drain pending output so the offset is accurate.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let _ = self.wait_for_stable_screen(Duration::from_millis(250), |_| false);
+        let _ = deadline;
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty resize");
+        self.resizes.push((self.output.len(), rows, cols));
     }
 
     fn write(&mut self, input: &str) {
@@ -6857,8 +7570,14 @@ impl PtyHarness {
             self.screen_text()
         );
         self.write("\x03");
+        // Loaded CI runners can take well past the standard 5s window to
+        // flush the armed notice through the PTY (observed on shared
+        // runners); use a generous ceiling here — this wait is on the exit
+        // path, so a fast local run never pays it.
         assert!(
-            self.wait_for_screen("press Ctrl+C again to quit"),
+            self.wait_for_stable_screen(Duration::from_secs(20), |screen| {
+                screen.contains("ctrl+c again to quit · session saved, /resume restores")
+            }),
             "TUI did not arm quit notice:\n{}",
             self.screen_text()
         );
@@ -6958,7 +7677,11 @@ impl PtyHarness {
     }
 
     fn screen_text(&self) -> String {
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        // Parse at a fixed oversize grid: every app row lands on its own
+        // emulator row regardless of mid-session resizes, which is all the
+        // contains()-based predicates need. (Feeding vt100 set_size() during
+        // a drag trips a subtract-overflow panic inside the crate.)
+        let mut parser = vt100::Parser::new(80, 260, 0);
         parser.process(&self.output);
         parser.screen().contents()
     }
@@ -7000,7 +7723,7 @@ fn screen_has_ready_composer(screen: &str) -> bool {
 }
 
 fn status_line_marks_ready_composer(line: &str) -> bool {
-    line.contains("Context") || line.contains("Canvas ")
+    line.contains("ctx ") || line.contains("canvas ")
 }
 
 impl Drop for PtyHarness {

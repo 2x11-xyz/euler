@@ -67,18 +67,14 @@ impl AppCore {
             frame.render_widget(Paragraph::new("  "), area);
             return;
         }
-        let snapshot = ComposerSnapshot::new(self.bottom.composer());
+        let snapshot = self.composer_snapshot();
         let options = ComposerRenderOptions::default();
         frame.render_widget(
             composer_widget(&snapshot, &self.theme, options.clone()),
             area,
         );
-        let cursor = cursor_position(
-            self.bottom.composer(),
-            area.width,
-            &options,
-            area.height as usize,
-        );
+        let cursor =
+            cursor_position_for_snapshot(&snapshot, area.width, &options, area.height as usize);
         if let Some(row) = cursor.visible_row {
             frame.set_cursor_position((area.x + cursor.column as u16, area.y + row as u16));
         }
@@ -116,7 +112,18 @@ impl AppCore {
             return;
         }
         if let Some(Modal::PatchApproval(modal)) = &self.modal {
-            chrome::render_patch_modal(frame, modal, &self.theme);
+            let prior_count = self.prior_permission_count(
+                &modal.request,
+                crate::ui::patch_approval::derive_scope_prefix(&modal.request).as_deref(),
+            );
+            chrome::render_patch_modal(
+                frame,
+                modal,
+                &self.status.cwd,
+                &self.theme,
+                prior_count,
+                self.approval_selection,
+            );
         }
     }
 
@@ -127,7 +134,7 @@ impl AppCore {
 
     #[cfg(test)]
     pub(super) fn composer_frame_height(&self, max: u16, width: u16) -> u16 {
-        let snapshot = ComposerSnapshot::new(self.bottom.composer());
+        let snapshot = self.composer_snapshot();
         desired_height_for_width(&snapshot, &ComposerRenderOptions::default(), width).min(max)
     }
 

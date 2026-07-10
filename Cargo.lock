@@ -524,11 +524,8 @@ dependencies = [
 name = "euler-extension-code-swarm"
 version = "0.1.1"
 dependencies = [
- "euler-agents",
- "euler-event",
  "euler-sdk",
  "serde_json",
- "tempfile",
 ]
 
 [[package]]

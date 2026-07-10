@@ -1,8 +1,5 @@
 use super::theme::Theme;
-use ratatui::{
-    style::{Color, Modifier, Style},
-    text::Span,
-};
+use ratatui::text::Span;
 use std::path::Path;
 
 pub(crate) const MAX_SYNTAX_DIFF_BYTES: usize = 48 * 1024;
@@ -77,6 +74,9 @@ pub(crate) fn highlight_diff_body(
     enabled: bool,
 ) -> Vec<Span<'static>> {
     let fallback = plain_diff_body_span(body, kind, theme);
+    if matches!(kind, DiffBodyKind::Delete) {
+        return vec![fallback];
+    }
     if !enabled || body.len() > MAX_SYNTAX_LINE_BYTES {
         return vec![fallback];
     }
@@ -91,14 +91,51 @@ pub(crate) fn highlight_diff_body(
 
     tokens
         .into_iter()
+        .map(|token| Span::styled(token.text, theme.scopes.syntax.style(token.kind)))
+        .collect()
+}
+
+pub(crate) fn highlight_markdown_code_line(
+    language_hint: &str,
+    body: &str,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let fallback = Span::styled(body.to_owned(), theme.scopes.markup.code);
+    if body.len() > MAX_SYNTAX_LINE_BYTES {
+        return vec![fallback];
+    }
+    let Some(language) = detect_language_hint(language_hint) else {
+        return vec![fallback];
+    };
+    let tokens = tokenize_line(body, language);
+    if tokens.is_empty() {
+        return vec![fallback];
+    }
+    tokens
+        .into_iter()
         .map(|token| {
-            let mut style = theme.scopes.syntax.style(token.kind);
-            if matches!(kind, DiffBodyKind::Delete) {
-                style = deleted_overlay(style, theme);
-            }
-            Span::styled(token.text, style)
+            Span::styled(
+                token.text,
+                theme
+                    .scopes
+                    .syntax
+                    .style(token.kind)
+                    .bg(theme.palette.surface),
+            )
         })
         .collect()
+}
+
+pub(crate) fn enclosing_symbol(path: &str, source: &str, line_number: usize) -> Option<String> {
+    if source.is_empty() || line_number == 0 {
+        return None;
+    }
+    let language = detect_language(path)?;
+    let lines = source.lines().take(line_number).collect::<Vec<_>>();
+    lines
+        .into_iter()
+        .rev()
+        .find_map(|line| symbol_from_line(line, language))
 }
 
 fn plain_diff_body_span(body: &str, kind: DiffBodyKind, theme: &Theme) -> Span<'static> {
@@ -108,40 +145,6 @@ fn plain_diff_body_span(body: &str, kind: DiffBodyKind, theme: &Theme) -> Span<'
         DiffBodyKind::Insert => theme.scopes.diff.inserted_body,
     };
     Span::styled(body.to_owned(), style)
-}
-
-fn deleted_overlay(style: Style, theme: &Theme) -> Style {
-    let mut output = style.add_modifier(Modifier::DIM);
-    if let Some(color) = style
-        .fg
-        .and_then(|fg| blend_toward(fg, theme.palette.muted, 42))
-    {
-        output = output.fg(theme.color_level.quantize(color));
-    }
-    output
-}
-
-fn blend_toward(source: Color, target: Color, target_percent: u16) -> Option<Color> {
-    let (sr, sg, sb) = rgb(source)?;
-    let (tr, tg, tb) = rgb(target)?;
-    let source_percent = 100_u16.saturating_sub(target_percent);
-    Some(Color::Rgb(
-        blend_channel(sr, tr, source_percent, target_percent),
-        blend_channel(sg, tg, source_percent, target_percent),
-        blend_channel(sb, tb, source_percent, target_percent),
-    ))
-}
-
-fn rgb(color: Color) -> Option<(u8, u8, u8)> {
-    match color {
-        Color::Rgb(red, green, blue) => Some((red, green, blue)),
-        _ => None,
-    }
-}
-
-fn blend_channel(source: u8, target: u8, source_percent: u16, target_percent: u16) -> u8 {
-    let value = (u16::from(source) * source_percent + u16::from(target) * target_percent) / 100;
-    value.min(u16::from(u8::MAX)) as u8
 }
 
 fn detect_language(path: &str) -> Option<Language> {
@@ -164,6 +167,124 @@ fn detect_language(path: &str) -> Option<Language> {
         "sh" | "bash" | "zsh" | "fish" => Some(Language::Shell),
         "toml" => Some(Language::Toml),
         _ => None,
+    }
+}
+
+fn detect_language_hint(hint: &str) -> Option<Language> {
+    let normalized = hint
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" => Some(Language::CLike),
+        "js" | "jsx" | "javascript" | "mjs" | "ts" | "tsx" | "typescript" => {
+            Some(Language::TypeScriptLike)
+        }
+        "json" => Some(Language::Json),
+        "py" | "python" => Some(Language::Python),
+        "rs" | "rust" => Some(Language::Rust),
+        "bash" | "fish" | "sh" | "shell" | "zsh" => Some(Language::Shell),
+        "toml" => Some(Language::Toml),
+        _ => None,
+    }
+}
+
+fn symbol_from_line(line: &str, language: Language) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with(['/', '#']) {
+        return None;
+    }
+    match language {
+        Language::Rust => rust_symbol(trimmed),
+        Language::Python => python_symbol(trimmed),
+        Language::TypeScriptLike => typescript_symbol(trimmed),
+        Language::CLike => c_like_symbol(trimmed),
+        Language::Shell => shell_symbol(trimmed),
+        Language::Json | Language::Toml => None,
+    }
+}
+
+fn rust_symbol(line: &str) -> Option<String> {
+    for marker in ["fn ", "struct ", "enum ", "impl ", "trait ", "mod "] {
+        if let Some(index) = line.find(marker) {
+            let name = consume_symbol_name(&line[index + marker.len()..]);
+            if !name.is_empty() {
+                return Some(format_symbol(marker.trim(), name));
+            }
+        }
+    }
+    None
+}
+
+fn python_symbol(line: &str) -> Option<String> {
+    for marker in ["def ", "class "] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            let name = consume_symbol_name(rest);
+            if !name.is_empty() {
+                return Some(format_symbol(marker.trim(), name));
+            }
+        }
+    }
+    None
+}
+
+fn typescript_symbol(line: &str) -> Option<String> {
+    for marker in ["function ", "class ", "interface ", "type "] {
+        if let Some(index) = line.find(marker) {
+            let name = consume_symbol_name(&line[index + marker.len()..]);
+            if !name.is_empty() {
+                return Some(format_symbol(marker.trim(), name));
+            }
+        }
+    }
+    line.find("=>").and_then(|arrow| {
+        let left = line[..arrow].trim_end();
+        let name = left
+            .rsplit(|ch: char| !(ch == '_' || ch.is_alphanumeric()))
+            .find(|part| !part.is_empty())?;
+        Some(format!("{name}()"))
+    })
+}
+
+fn c_like_symbol(line: &str) -> Option<String> {
+    let paren = line.find('(')?;
+    if line[..paren].contains('=') || line.ends_with(';') {
+        return None;
+    }
+    let name = line[..paren]
+        .rsplit(|ch: char| !(ch == '_' || ch.is_alphanumeric()))
+        .find(|part| !part.is_empty())?;
+    Some(format!("{name}()"))
+}
+
+fn shell_symbol(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("function ") {
+        let name = consume_symbol_name(rest);
+        if !name.is_empty() {
+            return Some(format!("{name}()"));
+        }
+    }
+    line.find("()")
+        .map(|index| line[..index].trim())
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{name}()"))
+}
+
+fn consume_symbol_name(text: &str) -> &str {
+    let text = text.trim_start_matches(|ch: char| ch == '<' || ch.is_whitespace());
+    let end = text
+        .find(|ch: char| !(ch == '_' || ch == '-' || ch.is_alphanumeric()))
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+fn format_symbol(kind: &str, name: &str) -> String {
+    if kind == "fn" || kind == "def" || kind == "function" {
+        format!("{name}()")
+    } else {
+        format!("{kind} {name}")
     }
 }
 

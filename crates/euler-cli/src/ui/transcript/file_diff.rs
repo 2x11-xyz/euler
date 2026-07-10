@@ -18,6 +18,7 @@ pub(super) struct FileDiffRender<'a> {
     pub(super) truncated: bool,
     pub(super) truncation: &'a str,
     pub(super) omitted_reason: Option<&'a str>,
+    pub(super) checkpoint_event_id: Option<&'a str>,
 }
 
 struct FileDiffRows {
@@ -33,6 +34,7 @@ struct ParsedFileDiff {
     removed: usize,
 }
 
+#[derive(Clone)]
 struct FileDiffRow {
     kind: FileDiffLineKind,
     old_line: Option<usize>,
@@ -45,13 +47,13 @@ pub(super) fn render_file_diff_cell(
     diff: FileDiffRender<'_>,
     theme: &Theme,
     width: u16,
-    _limit: usize,
+    limit: usize,
 ) {
     let path = file_change_path_label(diff.path);
     let action = file_change_action_label(diff.action);
     let (title, rows, footer) = match diff.diff {
         Some(diff_text) => {
-            let rows = file_diff_artifact_rows(diff_text, theme, diff.path);
+            let rows = file_diff_artifact_rows(diff_text, theme, diff.path, limit);
             (
                 file_diff_title(&path, &action, Some((rows.added, rows.removed))),
                 rows.rows,
@@ -67,10 +69,14 @@ pub(super) fn render_file_diff_cell(
             )
         }
     };
+    let checkpoint_suffix = diff
+        .checkpoint_event_id
+        .map(|event_id| format!("ckpt {event_id}"));
     push_artifact_cell(
         lines,
         ArtifactCellRender {
             title: &title,
+            title_suffix: checkpoint_suffix.as_deref(),
             rows: &rows,
             footer: &footer,
             style: theme.transcript.patch,
@@ -80,8 +86,13 @@ pub(super) fn render_file_diff_cell(
     );
 }
 
-fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str) -> FileDiffRows {
-    let parsed = parse_unified_diff(diff);
+pub(super) fn file_diff_is_foldable(diff: &str, limit: usize) -> bool {
+    let row_count = parse_unified_diff(diff).rows.len();
+    row_count > preview_cap(row_count, limit)
+}
+
+fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str, limit: usize) -> FileDiffRows {
+    let parsed = parse_unified_diff_for_path(diff, Some(path));
     let total_rows = parsed.rows.len();
     if total_rows == 0 {
         return FileDiffRows {
@@ -97,8 +108,8 @@ fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str) -> FileDiffRow
 
     let syntax_enabled = syntax::within_diff_budget(diff.len(), total_rows);
     let number_width = diff_line_number_width(&parsed.rows);
-    let rendered = parsed
-        .rows
+    let rows = bounded_preview_rows(parsed.rows, limit);
+    let rendered = rows
         .iter()
         .map(|row| file_diff_line(row, theme, path, syntax_enabled, number_width))
         .collect::<Vec<_>>();
@@ -110,15 +121,41 @@ fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str) -> FileDiffRow
     }
 }
 
+fn bounded_preview_rows(rows: Vec<FileDiffRow>, limit: usize) -> Vec<FileDiffRow> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let cap = preview_cap(rows.len(), limit);
+    if rows.len() <= cap {
+        return rows;
+    }
+    let visible = cap.saturating_sub(1).max(1);
+    let omitted = rows.len().saturating_sub(visible);
+    let mut out = rows.into_iter().take(visible).collect::<Vec<_>>();
+    out.push(muted_diff_row(format!(
+        "… {omitted} more lines · ctrl+o expand"
+    )));
+    out
+}
+
+fn preview_cap(row_count: usize, limit: usize) -> usize {
+    if limit == usize::MAX {
+        row_count
+    } else {
+        limit.min(crate::ui::patch_diff::DIFF_PREVIEW_ROWS + 1)
+    }
+}
+
 const MIN_LINE_NUMBER_WIDTH: usize = crate::ui::patch_diff::MIN_LINE_NUMBER_WIDTH;
 
 /// One relevant line number per row, Codex convention: the old-file number
 /// for deletions, the new-file number for insertions and context.
+/// Deliberate spec deviation for usability: deletion rows cite old-file lines.
 fn diff_row_line_number(row: &FileDiffRow) -> Option<usize> {
     match row.kind {
         FileDiffLineKind::Delete => row.old_line,
         FileDiffLineKind::Insert | FileDiffLineKind::Context => row.new_line,
-        FileDiffLineKind::Muted => None,
+        FileDiffLineKind::Hunk | FileDiffLineKind::Muted => None,
     }
 }
 
@@ -140,12 +177,15 @@ fn file_diff_line(
     number_width: usize,
 ) -> Line<'static> {
     let Some(number) = diff_row_line_number(row) else {
+        if matches!(row.kind, FileDiffLineKind::Hunk) {
+            return crate::ui::patch_diff::compact_hunk_row(number_width, row.body.clone(), theme);
+        }
         return crate::ui::patch_diff::compact_muted_row(number_width, row.body.clone(), theme);
     };
     let sign = match row.kind {
         FileDiffLineKind::Insert => "+",
         FileDiffLineKind::Delete => "-",
-        FileDiffLineKind::Context | FileDiffLineKind::Muted => " ",
+        FileDiffLineKind::Context | FileDiffLineKind::Hunk | FileDiffLineKind::Muted => " ",
     };
     crate::ui::patch_diff::compact_diff_row(
         number,
@@ -167,11 +207,16 @@ fn file_diff_line(
 enum FileDiffLineKind {
     Context,
     Delete,
+    Hunk,
     Insert,
     Muted,
 }
 
 fn parse_unified_diff(diff: &str) -> ParsedFileDiff {
+    parse_unified_diff_for_path(diff, None)
+}
+
+fn parse_unified_diff_for_path(diff: &str, path: Option<&str>) -> ParsedFileDiff {
     let rows = normalized_output_rows(diff);
     let mut parsed = ParsedFileDiff {
         rows: Vec::new(),
@@ -186,13 +231,19 @@ fn parse_unified_diff(diff: &str) -> ParsedFileDiff {
         if is_unified_file_header(&row) {
             continue;
         }
-        if let Some((old_start, new_start)) = parse_hunk_header(&row) {
+        if let Some(header) = parse_hunk_header(&row) {
             if saw_hunk && !parsed.rows.is_empty() {
                 parsed.rows.push(muted_diff_row("⋮".to_owned()));
             }
             saw_hunk = true;
-            old_line = old_start.max(1);
-            new_line = new_start.max(1);
+            old_line = header.old_start.max(1);
+            new_line = header.new_start.max(1);
+            parsed.rows.push(FileDiffRow {
+                kind: FileDiffLineKind::Hunk,
+                old_line: None,
+                new_line: None,
+                body: header.raw,
+            });
             continue;
         }
         if row.starts_with("\\ ") {
@@ -203,7 +254,87 @@ fn parse_unified_diff(diff: &str) -> ParsedFileDiff {
         }
         parsed.push_source_row(row, &mut old_line, &mut new_line, saw_hunk);
     }
+    if let Some(path) = path {
+        resolve_hunk_headers(&mut parsed.rows, path);
+    }
+    parsed.compact_context();
     parsed
+}
+
+struct ParsedHunkHeader {
+    old_start: usize,
+    new_start: usize,
+    function_context: Option<String>,
+    raw: String,
+}
+
+fn resolve_hunk_headers(rows: &mut [FileDiffRow], path: &str) {
+    let replacements = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| matches!(row.kind, FileDiffLineKind::Hunk))
+        .filter_map(|(index, row)| resolved_hunk_header(rows, index, path, &row.body))
+        .collect::<Vec<_>>();
+    for (index, header) in replacements {
+        rows[index].body = header;
+    }
+}
+
+fn resolved_hunk_header(
+    rows: &[FileDiffRow],
+    hunk_index: usize,
+    path: &str,
+    raw_header: &str,
+) -> Option<(usize, String)> {
+    let header = parse_hunk_header(raw_header)?;
+    let next_hunk = rows
+        .iter()
+        .enumerate()
+        .skip(hunk_index + 1)
+        .find(|(_, row)| matches!(row.kind, FileDiffLineKind::Hunk))
+        .map_or(rows.len(), |(index, _)| index);
+    let sources = hunk_sources(&rows[hunk_index + 1..next_hunk]);
+    let symbol = crate::ui::patch_diff::hunk_symbol(
+        path,
+        &sources.old,
+        &sources.new,
+        sources.old_lookup_line,
+        sources.new_lookup_line,
+        header.function_context.as_deref(),
+    )?;
+    Some((
+        hunk_index,
+        format!("@@ {symbol} · line {} @@", header.new_start),
+    ))
+}
+
+struct HunkSources {
+    old: String,
+    new: String,
+    old_lookup_line: usize,
+    new_lookup_line: usize,
+}
+
+fn hunk_sources(rows: &[FileDiffRow]) -> HunkSources {
+    let mut old_rows = Vec::new();
+    let mut new_rows = Vec::new();
+    for row in rows {
+        match row.kind {
+            FileDiffLineKind::Context => {
+                old_rows.push(row.body.as_str());
+                new_rows.push(row.body.as_str());
+            }
+            FileDiffLineKind::Delete => old_rows.push(row.body.as_str()),
+            FileDiffLineKind::Insert => new_rows.push(row.body.as_str()),
+            FileDiffLineKind::Hunk | FileDiffLineKind::Muted => {}
+        }
+    }
+    HunkSources {
+        old: old_rows.join("\n"),
+        new: new_rows.join("\n"),
+        old_lookup_line: old_rows.len().max(1),
+        new_lookup_line: new_rows.len().max(1),
+    }
 }
 
 fn muted_diff_row(body: String) -> FileDiffRow {
@@ -278,18 +409,66 @@ impl ParsedFileDiff {
             *new_line += 1;
         }
     }
+
+    fn compact_context(&mut self) {
+        let mut compacted = Vec::with_capacity(self.rows.len());
+        let mut index = 0;
+        while index < self.rows.len() {
+            if !matches!(self.rows[index].kind, FileDiffLineKind::Context) {
+                compacted.push(self.rows[index].clone());
+                index += 1;
+                continue;
+            }
+            let end = context_run_end(&self.rows, index);
+            push_context_run(&mut compacted, &self.rows, index, end);
+            index = end;
+        }
+        self.rows = compacted;
+    }
+}
+
+fn context_run_end(rows: &[FileDiffRow], start: usize) -> usize {
+    rows[start..]
+        .iter()
+        .position(|row| !matches!(row.kind, FileDiffLineKind::Context))
+        .map_or(rows.len(), |offset| start + offset)
+}
+
+fn push_context_run(output: &mut Vec<FileDiffRow>, rows: &[FileDiffRow], start: usize, end: usize) {
+    let run_len = end - start;
+    let edge = crate::ui::patch_diff::DIFF_PREVIEW_ROWS.min(2);
+    if run_len <= edge * 2 {
+        output.extend((start..end).map(|index| rows[index].clone()));
+        return;
+    }
+    output.extend((start..start + edge).map(|index| rows[index].clone()));
+    let omitted = run_len - (edge * 2);
+    let label = if omitted == 1 { "line" } else { "lines" };
+    output.push(muted_diff_row(format!("⋮ {omitted} unchanged {label}")));
+    output.extend((end - edge..end).map(|index| rows[index].clone()));
 }
 
 fn is_unified_file_header(row: &str) -> bool {
     row.starts_with("--- ") || row.starts_with("+++ ")
 }
 
-fn parse_hunk_header(row: &str) -> Option<(usize, usize)> {
+fn parse_hunk_header(row: &str) -> Option<ParsedHunkHeader> {
     let row = row.strip_prefix("@@ ")?;
     let mut parts = row.split_whitespace();
     let old_range = parts.next()?.strip_prefix('-')?;
     let new_range = parts.next()?.strip_prefix('+')?;
-    Some((parse_range_start(old_range)?, parse_range_start(new_range)?))
+    Some(ParsedHunkHeader {
+        old_start: parse_range_start(old_range)?,
+        new_start: parse_range_start(new_range)?,
+        function_context: hunk_function_context(row),
+        raw: format!("@@ {row}"),
+    })
+}
+
+fn hunk_function_context(row: &str) -> Option<String> {
+    let marker = row.find("@@")?;
+    let context = row[marker + 2..].trim();
+    (!context.is_empty()).then(|| context.to_owned())
 }
 
 fn parse_range_start(range: &str) -> Option<usize> {
@@ -300,7 +479,9 @@ fn file_diff_body_kind(kind: FileDiffLineKind) -> DiffBodyKind {
     match kind {
         FileDiffLineKind::Delete => DiffBodyKind::Delete,
         FileDiffLineKind::Insert => DiffBodyKind::Insert,
-        FileDiffLineKind::Context | FileDiffLineKind::Muted => DiffBodyKind::Context,
+        FileDiffLineKind::Context | FileDiffLineKind::Hunk | FileDiffLineKind::Muted => {
+            DiffBodyKind::Context
+        }
     }
 }
 
@@ -308,6 +489,7 @@ fn file_diff_line_style(kind: FileDiffLineKind, theme: &Theme) -> Style {
     match kind {
         FileDiffLineKind::Context => theme.scopes.diff.context,
         FileDiffLineKind::Delete => theme.scopes.diff.deleted,
+        FileDiffLineKind::Hunk => theme.scopes.diff.hunk,
         FileDiffLineKind::Insert => theme.scopes.diff.inserted,
         FileDiffLineKind::Muted => theme.transcript.muted,
     }
@@ -315,15 +497,15 @@ fn file_diff_line_style(kind: FileDiffLineKind, theme: &Theme) -> Style {
 
 fn file_diff_title(path: &str, action: &str, stats: Option<(usize, usize)>) -> String {
     match (action, stats) {
-        ("add", Some((added, _))) => format!("Added {path} (+{added})"),
+        ("add", Some((added, _))) => format!("write {path} · new · {added} lines"),
         ("delete", Some((_, removed))) => format!("Deleted {path} (-{removed})"),
         ("modify" | "update", Some((added, removed))) => {
-            format!("Edited {path} (+{added} -{removed})")
+            format!("edit {path} · +{added} −{removed}")
         }
         (_, Some((added, removed))) => format!("Changed {path} (+{added} -{removed})"),
-        ("add", None) => format!("Added {path}"),
+        ("add", None) => format!("write {path} · new"),
         ("delete", None) => format!("Deleted {path}"),
-        ("modify" | "update", None) => format!("Edited {path}"),
+        ("modify" | "update", None) => format!("edit {path}"),
         _ => format!("Changed {path}"),
     }
 }
@@ -385,7 +567,7 @@ mod tests {
         assert_eq!(line_text(&deleted), "   1 - old");
         assert_eq!(inserted.spans.len(), 4);
         assert_eq!(deleted.spans.len(), 4);
-        assert_eq!(inserted.spans[0].style, theme.scopes.diff.context);
+        assert_eq!(inserted.spans[0].style.fg, theme.scopes.diff.context.fg);
         assert_eq!(inserted.spans[1].content.as_ref(), "+");
         assert_eq!(inserted.spans[1].style, theme.scopes.diff.inserted);
         assert_eq!(inserted.spans[3].content.as_ref(), "new");
@@ -403,10 +585,10 @@ mod tests {
         let deleted = rendered_row("-old", &theme, "src/lib.rs", false);
 
         assert_eq!(inserted.spans[1].style, theme.scopes.diff.inserted);
-        assert_eq!(inserted.spans[1].style.bg, None);
+        assert_eq!(inserted.spans[1].style.bg, Some(theme.palette.added_tint));
         assert_eq!(inserted.spans[3].style, theme.scopes.diff.inserted_body);
         assert_eq!(deleted.spans[1].style, theme.scopes.diff.deleted);
-        assert_eq!(deleted.spans[1].style.bg, None);
+        assert_eq!(deleted.spans[1].style.bg, Some(theme.palette.removed_tint));
         assert_eq!(deleted.spans[3].style, theme.scopes.diff.deleted_body);
     }
 
@@ -420,7 +602,7 @@ mod tests {
             .map(|row| row.body.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(rendered, vec!["old", "new"]);
+        assert_eq!(rendered, vec!["@@ -1 +1 @@", "old", "new"]);
         assert_eq!(parsed.added, 1);
         assert_eq!(parsed.removed, 1);
     }
@@ -481,9 +663,12 @@ mod tests {
         assert_eq!(
             texts,
             vec![
+                "       @@ -1,2 +1,3 @@",
                 "   1   a", // context: new number
                 "   2 + b", // insert: new number
-                "   3   c", "     ⋮",   // explicit hunk gap
+                "   3   c",
+                "     ⋮", // explicit hunk gap
+                "       @@ -10,2 +11,2 @@",
                 "  11   d", // context after divergence: new number, not old 10
                 "  11 - e", // delete: old number
                 "  12 + f", // insert: new number
@@ -504,7 +689,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(width, 5);
-        assert_eq!(texts, vec!["99998   old", "99999 - gone", "99999 + kept"]);
+        assert_eq!(
+            texts,
+            vec![
+                "        @@ -99998,2 +99998,2 @@",
+                "99998   old",
+                "99999 - gone",
+                "99999 + kept",
+            ]
+        );
     }
 
     #[test]
@@ -520,6 +713,7 @@ mod tests {
         assert_eq!(
             numbers,
             vec![
+                (None, None),
                 (Some(1), Some(1)),
                 (Some(2), Some(2)), // blank context emitted as "" by some generators
                 (Some(3), None),
@@ -553,18 +747,15 @@ mod tests {
         assert!(inserted
             .spans
             .iter()
-            .any(|span| span.style == theme.scopes.syntax.keyword));
+            .any(|span| span.style.fg == theme.scopes.syntax.keyword.fg));
         assert!(inserted
             .spans
             .iter()
-            .any(|span| span.style == theme.scopes.syntax.macro_name));
+            .any(|span| span.style.fg == theme.scopes.syntax.macro_name.fg));
 
         assert_eq!(deleted.spans[1].style, theme.scopes.diff.deleted);
-        assert!(deleted.spans.len() > 4, "spans: {:?}", deleted.spans);
-        assert!(deleted.spans.iter().skip(3).any(|span| span
-            .style
-            .add_modifier
-            .contains(ratatui::style::Modifier::DIM)));
+        assert_eq!(deleted.spans.len(), 4, "spans: {:?}", deleted.spans);
+        assert_eq!(deleted.spans[3].style, theme.scopes.diff.deleted_body);
     }
 
     #[test]
@@ -574,7 +765,7 @@ mod tests {
 
         assert_eq!(inserted.spans.len(), 4);
         assert_eq!(inserted.spans[1].style, theme.scopes.diff.inserted);
-        assert_eq!(inserted.spans[2].style, theme.scopes.diff.context);
+        assert_eq!(inserted.spans[2].style.fg, theme.scopes.diff.context.fg);
         assert_eq!(inserted.spans[3].style, theme.scopes.diff.inserted_body);
     }
 
@@ -592,6 +783,7 @@ mod tests {
                 truncated: false,
                 truncation: "none",
                 omitted_reason: None,
+                checkpoint_event_id: None,
             },
             &theme,
             28,
@@ -600,7 +792,7 @@ mod tests {
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
         let joined = texts.join("\n");
 
-        assert!(joined.contains("│    1 +"), "joined: {joined:?}");
+        assert!(joined.contains("     1 +"), "joined: {joined:?}");
         assert!(!joined.contains(" | "), "joined: {joined:?}");
         assert!(joined.contains("printl"), "joined: {joined:?}");
         assert!(joined.contains("old l"), "joined: {joined:?}");
@@ -610,6 +802,42 @@ mod tests {
                 .all(|text| crate::ui::text::display_width(text) <= 28),
             "texts: {texts:?}"
         );
+    }
+
+    #[test]
+    fn file_diff_hunk_header_uses_symbol_from_hunk_body() {
+        let theme = Theme::default();
+        let mut lines = Vec::new();
+        render_file_diff_cell(
+            &mut lines,
+            FileDiffRender {
+                path: "src/lib.rs",
+                action: "modify",
+                origin: "apply_patch",
+                diff: Some(concat!(
+                    "--- a/src/lib.rs\n",
+                    "+++ b/src/lib.rs\n",
+                    "@@ -10,2 +10,3 @@\n",
+                    " fn calibrate() {\n",
+                    "+    assert!(true);\n",
+                    " }\n",
+                )),
+                truncated: false,
+                truncation: "none",
+                omitted_reason: None,
+                checkpoint_event_id: None,
+            },
+            &theme,
+            96,
+            10,
+        );
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            text.contains("@@ calibrate() · line 10 @@"),
+            "text: {text:?}"
+        );
+        assert!(!text.contains("@@ -10,2 +10,3 @@"), "text: {text:?}");
     }
 
     fn line_text(line: &Line<'_>) -> String {

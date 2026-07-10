@@ -205,7 +205,7 @@ fn unknown_or_oversized_lines_fall_back_to_plain_diff_style() {
 }
 
 #[test]
-fn deleted_highlight_keeps_syntax_spans_dimmed_not_flat_red() {
+fn deleted_highlight_is_uniform_dim_evidence_without_syntax() {
     let theme = Theme::default_light();
     let spans = highlight_diff_body(
         "src/main.rs",
@@ -214,17 +214,12 @@ fn deleted_highlight_keeps_syntax_spans_dimmed_not_flat_red() {
         &theme,
         true,
     );
-    assert!(spans.len() > 1);
-    assert!(spans
-        .iter()
-        .any(|span| span.style.add_modifier.contains(Modifier::DIM)));
-    assert!(spans
-        .iter()
-        .any(|span| span.style.fg != theme.scopes.diff.deleted.fg));
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].style, theme.scopes.diff.deleted_body);
 }
 
 #[test]
-fn deleted_highlight_dims_lower_color_levels_even_without_rgb_blend() {
+fn deleted_highlight_uses_deleted_body_at_lower_color_levels() {
     for color_level in [ColorLevel::Indexed256, ColorLevel::Basic16] {
         let theme = dark_theme_with(color_level);
         let spans = highlight_diff_body(
@@ -235,28 +230,7 @@ fn deleted_highlight_dims_lower_color_levels_even_without_rgb_blend() {
             true,
         );
 
-        assert!(spans.len() > 1);
-        assert!(spans
-            .iter()
-            .any(|span| span.style.add_modifier.contains(Modifier::DIM)));
-        assert!(spans
-            .iter()
-            .any(|span| span.style.fg != theme.scopes.diff.deleted.fg));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style, theme.scopes.diff.deleted_body);
     }
-}
-
-#[test]
-fn color_blend_respects_truecolor_only() {
-    assert_eq!(
-        blend_toward(Color::Rgb(100, 100, 100), Color::Rgb(200, 0, 0), 50),
-        Some(Color::Rgb(150, 50, 50))
-    );
-    assert_eq!(
-        blend_toward(Color::Indexed(1), Color::Rgb(200, 0, 0), 50),
-        None
-    );
-    assert_eq!(
-        ColorLevel::TrueColor.quantize(Color::Rgb(1, 2, 3)),
-        Color::Rgb(1, 2, 3)
-    );
 }

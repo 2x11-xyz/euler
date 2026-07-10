@@ -1,5 +1,9 @@
+use crate::ui::glyphs;
 use crate::ui::patch_diff::{self, PatchDisplay};
-use crate::ui::text::{display_width, wrap_text};
+use crate::ui::text::{
+    blank_gutter, content_width, display_width, is_ledger_gutter, tree_gutter_last,
+    tree_gutter_mid, wrap_text,
+};
 use crate::ui::theme::Theme;
 use ratatui::text::{Line, Span};
 
@@ -7,22 +11,36 @@ const OUTPUT_PREVIEW_HEAD_LINES: usize = 2;
 const OUTPUT_PREVIEW_TAIL_LINES: usize = 2;
 
 mod artifact;
+mod boundary;
+mod companion;
+mod permission;
 mod shell;
+mod tool_run;
 
 pub(super) use artifact::{
     artifact_output_rows, metadata_row, normalized_output_rows, plain_artifact_rows,
-    push_artifact_cell, sanitize_metadata_text, ArtifactCellRender,
+    push_artifact_cell, sanitize_metadata_text, ArtifactCellRender, ArtifactOutputRows,
+};
+
+pub(crate) use boundary::resume_boundary_decision_text;
+pub(super) use boundary::{
+    render_extension_result, render_interrupted, render_resume_boundary, render_turn_recap,
+    render_worked_duration, ExtensionResultRender, ResumeBoundaryRender,
+};
+
+pub(super) use companion::{render_companion_block, CompanionRender};
+
+pub(super) use permission::{
+    render_permission_ask, render_permission_decision, PermissionAskView, PermissionDecisionView,
 };
 
 pub(crate) use shell::normalized_shell_command;
 
-pub(super) struct ToolRunRender<'a> {
-    pub(super) command: &'a str,
-    pub(super) ok: bool,
-    pub(super) error: &'a str,
-    pub(super) output: &'a str,
-    pub(super) exit_code: Option<i64>,
-}
+pub(super) use tool_run::{
+    edit_failure_status, most_informative_line, render_tool_run, tool_failure_status, ToolRunRender,
+};
+
+use tool_run::promote_informative_row;
 
 pub(super) struct EditRender<'a> {
     pub(super) path: &'a str,
@@ -47,45 +65,13 @@ pub(super) struct FileChangeRender<'a> {
     pub(super) before_byte_len: Option<u64>,
     pub(super) after_byte_len: Option<u64>,
     pub(super) diff_redaction: &'a str,
+    pub(super) checkpoint_event_id: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
 struct CellPrefixes {
     first: &'static str,
     next: &'static str,
-}
-
-pub(super) fn render_tool_run(
-    lines: &mut Vec<Line<'static>>,
-    run: ToolRunRender<'_>,
-    theme: &Theme,
-    width: u16,
-    limit: usize,
-) {
-    let heading = if run.command.is_empty() {
-        "Ran".to_owned()
-    } else {
-        format!("Ran {}", run.command)
-    };
-    let style = if run.ok {
-        theme.transcript.tool
-    } else {
-        theme.transcript.tool_error
-    };
-    let output = artifact_output_rows(run.output, limit);
-    let rows = plain_artifact_rows(&output.rows, theme.transcript.muted);
-    let footer = tool_run_footer(run, output.total_rows, output.folded);
-    push_artifact_cell(
-        lines,
-        ArtifactCellRender {
-            title: &heading,
-            rows: &rows,
-            footer: &footer,
-            style,
-            width,
-        },
-        theme,
-    );
 }
 
 pub(super) fn render_edit_cell(
@@ -95,14 +81,18 @@ pub(super) fn render_edit_cell(
     width: u16,
     limit: usize,
 ) {
-    let heading = match diffstat(edit.old, edit.new) {
-        Some((added, removed)) => format!("Edited {} (+{added} -{removed})", edit.path),
-        None => format!("Edited {}", edit.path),
+    let heading = match (
+        patch_diff::action(edit.old, edit.new),
+        diffstat(edit.old, edit.new),
+    ) {
+        ("add", Some((added, _))) => format!("write {} · new · {added} lines", edit.path),
+        (_, Some((added, removed))) => format!("edit {} · +{added} −{removed}", edit.path),
+        _ => format!("edit {}", edit.path),
     };
     render_patch_cell(
         lines,
         PatchRender {
-            label: "Edited",
+            label: "edit",
             title: heading,
             path: edit.path,
             old: edit.old,
@@ -147,6 +137,7 @@ pub(super) fn render_patch_cell(
         lines,
         ArtifactCellRender {
             title: &patch.title,
+            title_suffix: None,
             rows: &body,
             footer: &footer,
             style: theme.transcript.patch,
@@ -165,6 +156,9 @@ pub(super) fn render_file_change_cell(
     let path = file_change_path_label(change.path);
     let action = file_change_action_label(change.action);
     let title = format!("File {} {path}", file_change_action_title(&action));
+    let checkpoint_suffix = change
+        .checkpoint_event_id
+        .map(|event_id| format!("ckpt {event_id}"));
     let mut rows = Vec::new();
     rows.push(metadata_row("action", &action, theme.transcript.muted));
     let origin = sanitize_metadata_text(change.origin);
@@ -200,6 +194,7 @@ pub(super) fn render_file_change_cell(
         lines,
         ArtifactCellRender {
             title: &title,
+            title_suffix: checkpoint_suffix.as_deref(),
             rows: &rows,
             footer: "metadata only",
             style: theme.transcript.patch,
@@ -207,134 +202,6 @@ pub(super) fn render_file_change_cell(
         },
         theme,
     );
-}
-
-pub(super) fn render_permission_decision(
-    lines: &mut Vec<Line<'static>>,
-    capability: &str,
-    decision: &str,
-    allowed: Option<bool>,
-    theme: &Theme,
-    width: u16,
-) {
-    let glyph = if allowed == Some(true) {
-        "✔ "
-    } else {
-        "✗ "
-    };
-    let state = match allowed {
-        Some(true) => "approved",
-        Some(false) if decision.contains("cancel") => "canceled",
-        Some(false) => "denied",
-        None => "decided",
-    };
-    let text = if capability.is_empty() {
-        format!("Permission {state}: {decision}")
-    } else {
-        format!("Permission {state}: {capability} ({decision})")
-    };
-    push_wrapped_with_prefix(
-        lines,
-        CellPrefixes {
-            first: glyph,
-            next: "  ",
-        },
-        &text,
-        theme.transcript.permission,
-        theme,
-        width,
-    );
-}
-
-pub(super) fn render_permission_ask(
-    lines: &mut Vec<Line<'static>>,
-    capability: &str,
-    reason: &str,
-    command: Option<&str>,
-    theme: &Theme,
-    width: u16,
-) {
-    let question = if command.is_some() {
-        "Would you like to run the following command?"
-    } else {
-        "Would you like to allow this request?"
-    };
-    push_permission_ask_line(lines, question, theme, width);
-    push_permission_ask_line(
-        lines,
-        &format!("Reason: {capability}: {reason}"),
-        theme,
-        width,
-    );
-    if let Some(command) = command.filter(|command| !command.is_empty()) {
-        push_permission_ask_line(lines, &format!("$ {command}"), theme, width);
-    }
-    lines.push(Line::from(""));
-    for option in [
-        "1. Yes, proceed (y)".to_owned(),
-        format!("2. Yes, and don't ask again for {capability} this session (a)"),
-        "3. No, and tell euler what to do differently (esc)".to_owned(),
-    ] {
-        push_permission_ask_line(lines, &option, theme, width);
-    }
-}
-
-fn push_permission_ask_line(lines: &mut Vec<Line<'static>>, text: &str, theme: &Theme, width: u16) {
-    push_wrapped_with_prefix(
-        lines,
-        CellPrefixes {
-            first: "  ",
-            next: "  ",
-        },
-        text,
-        theme.transcript.permission,
-        theme,
-        width,
-    );
-}
-
-pub(super) fn render_interrupted(lines: &mut Vec<Line<'static>>, theme: &Theme, width: u16) {
-    push_wrapped_with_prefix(
-        lines,
-        CellPrefixes {
-            first: "■ ",
-            next: "  ",
-        },
-        "Conversation interrupted - tell the model what to do differently.",
-        theme.transcript.control,
-        theme,
-        width,
-    );
-}
-
-pub(super) fn render_worked_duration(
-    lines: &mut Vec<Line<'static>>,
-    duration: &str,
-    theme: &Theme,
-    width: u16,
-) {
-    let label = format!("Worked for {duration}");
-    let text = format!(" {label} ");
-    let text_width = display_width(&text);
-    let width = usize::from(width).max(1);
-    let line = if width <= text_width {
-        label
-    } else {
-        let remaining = width - text_width;
-        let left = remaining / 2;
-        let right = remaining - left;
-        format!("{}{}{}", "─".repeat(left), text, "─".repeat(right))
-    };
-    lines.push(Line::from(Span::styled(line, theme.transcript.muted)));
-}
-
-pub(super) fn tool_failure_status(exit_code: Option<i64>, error: &str) -> String {
-    match (exit_code, error.is_empty()) {
-        (Some(code), true) => format!("failed with exit code {code}"),
-        (Some(code), false) => format!("failed with exit code {code}: {error}"),
-        (None, true) => "failed".to_owned(),
-        (None, false) => format!("failed: {error}"),
-    }
 }
 
 pub(super) fn tool_output_is_foldable(detail: &str, limit: usize) -> bool {
@@ -401,25 +268,6 @@ fn diff_redaction_label(diff_redaction: &str) -> String {
     diff_redaction
 }
 
-fn tool_run_footer(run: ToolRunRender<'_>, total_rows: usize, folded: bool) -> String {
-    let status = match (run.exit_code, run.ok) {
-        (Some(code), _) => format!("exit {code}"),
-        (None, true) => "done".to_owned(),
-        (None, false) if run.error.trim().is_empty() => "failed".to_owned(),
-        (None, false) => format!("failed: {}", run.error.trim()),
-    };
-    let line_label = if total_rows == 1 {
-        "1 line".to_owned()
-    } else {
-        format!("{total_rows} lines")
-    };
-    if folded {
-        format!("{status} · {line_label} · folded")
-    } else {
-        format!("{status} · {line_label}")
-    }
-}
-
 fn diffstat(old: Option<&str>, new: Option<&str>) -> Option<(usize, usize)> {
     let (old, new) = old.zip(new)?;
     let patch = diffy::create_patch(old, new);
@@ -465,12 +313,16 @@ pub(super) fn push_child_rows(
     width: u16,
 ) {
     for (index, row) in rows.iter().enumerate() {
-        let prefix = if index == 0 { "  └ " } else { "    " };
+        let prefix = if index + 1 == rows.len() {
+            tree_gutter_last()
+        } else {
+            tree_gutter_mid()
+        };
         push_wrapped_with_prefix(
             lines,
             CellPrefixes {
                 first: prefix,
-                next: "    ",
+                next: blank_gutter(),
             },
             row,
             style,
@@ -488,13 +340,50 @@ pub(super) fn push_bounded_children(
     width: u16,
     limit: usize,
 ) {
-    for (index, row) in bounded_preview_rows(detail, limit).iter().enumerate() {
-        let prefix = if index == 0 { "  └ " } else { "    " };
+    push_child_preview_rows(
+        lines,
+        &bounded_preview_rows(detail, limit),
+        style,
+        theme,
+        width,
+    );
+}
+
+pub(super) fn push_bounded_failure_children(
+    lines: &mut Vec<Line<'static>>,
+    detail: &str,
+    style: ratatui::style::Style,
+    theme: &Theme,
+    width: u16,
+    limit: usize,
+) {
+    push_child_preview_rows(
+        lines,
+        &bounded_failure_preview_rows(detail, limit),
+        style,
+        theme,
+        width,
+    );
+}
+
+fn push_child_preview_rows(
+    lines: &mut Vec<Line<'static>>,
+    rows: &[String],
+    style: ratatui::style::Style,
+    theme: &Theme,
+    width: u16,
+) {
+    for (index, row) in rows.iter().enumerate() {
+        let prefix = if index + 1 == rows.len() {
+            tree_gutter_last()
+        } else {
+            tree_gutter_mid()
+        };
         push_wrapped_with_prefix(
             lines,
             CellPrefixes {
                 first: prefix,
-                next: "    ",
+                next: blank_gutter(),
             },
             row,
             style,
@@ -532,6 +421,40 @@ fn bounded_preview_rows(detail: &str, limit: usize) -> Vec<String> {
     preview
 }
 
+fn bounded_failure_preview_rows(detail: &str, limit: usize) -> Vec<String> {
+    if detail.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let rows = output_rows_without_trailing_blanks(detail);
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    if rows.len() <= limit {
+        return promote_informative_row(rows.into_iter().map(str::to_owned).collect());
+    }
+    let informative = most_informative_line(detail).map(str::to_owned);
+    let tail_n = OUTPUT_PREVIEW_TAIL_LINES.min(rows.len());
+    let mut tail = rows[rows.len().saturating_sub(tail_n)..]
+        .iter()
+        .map(|row| (*row).to_owned())
+        .collect::<Vec<_>>();
+    let mut preview = Vec::new();
+    if let Some(line) = informative {
+        if !tail.iter().any(|row| row == &line) {
+            preview.push(line);
+        } else {
+            tail.retain(|row| row != &line);
+            preview.push(line);
+        }
+    }
+    let hidden = rows.len().saturating_sub(preview.len() + tail.len());
+    if hidden > 0 {
+        preview.push(format!("… +{hidden} lines omitted"));
+    }
+    preview.extend(tail);
+    preview
+}
+
 pub(super) fn output_rows_without_trailing_blanks(detail: &str) -> Vec<&str> {
     let mut rows = detail.lines().collect::<Vec<_>>();
     while rows.last().is_some_and(|row| row.trim().is_empty()) {
@@ -548,8 +471,20 @@ fn push_wrapped_with_prefix(
     theme: &Theme,
     width: u16,
 ) {
-    let body_width = usize::from(width)
-        .saturating_sub(display_width(prefixes.first).max(display_width(prefixes.next)))
+    let first_is_ledger = is_ledger_gutter(prefixes.first);
+    let next_is_ledger = is_ledger_gutter(prefixes.next);
+    let first_content = if first_is_ledger {
+        0
+    } else {
+        display_width(prefixes.first)
+    };
+    let next_content = if next_is_ledger {
+        0
+    } else {
+        display_width(prefixes.next)
+    };
+    let body_width = content_width(width)
+        .saturating_sub(first_content.max(next_content))
         .max(1);
     for (index, segment) in wrap_text(text, body_width).into_iter().enumerate() {
         let prefix = if index == 0 {
@@ -557,9 +492,89 @@ fn push_wrapped_with_prefix(
         } else {
             prefixes.next
         };
-        lines.push(Line::from(vec![
-            Span::styled(prefix.to_owned(), theme.transcript.gutter),
-            Span::styled(segment, style),
-        ]));
+        let is_ledger = if index == 0 {
+            first_is_ledger
+        } else {
+            next_is_ledger
+        };
+        let mut spans = Vec::with_capacity(3);
+        if !is_ledger {
+            spans.push(Span::styled(
+                blank_gutter().to_owned(),
+                theme.transcript.gutter,
+            ));
+        }
+        spans.push(Span::styled(prefix.to_owned(), theme.transcript.gutter));
+        spans.push(Span::styled(segment, style));
+        lines.push(Line::from(spans));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn most_informative_line_prefers_error_marker_over_later_noise() {
+        let output =
+            "compiling foo\nerror[E0308]: mismatched types\nnote: expected i32\n    Finished\n";
+        assert_eq!(
+            most_informative_line(output),
+            Some("error[E0308]: mismatched types")
+        );
+    }
+
+    #[test]
+    fn most_informative_line_matches_failed_panicked_and_fatal() {
+        assert_eq!(
+            most_informative_line("ok\nFAILED tests::broken\ntail"),
+            Some("FAILED tests::broken")
+        );
+        assert_eq!(
+            most_informative_line("start\nthread panicked at 'boom'\nend"),
+            Some("thread panicked at 'boom'")
+        );
+        assert_eq!(
+            most_informative_line("warn\nfatal: repository not found"),
+            Some("fatal: repository not found")
+        );
+    }
+
+    #[test]
+    fn most_informative_line_returns_none_without_markers() {
+        assert_eq!(most_informative_line("line one\nline two\n"), None);
+    }
+
+    #[test]
+    fn edit_failure_status_never_bare_failed() {
+        assert_eq!(
+            edit_failure_status(
+                "retry.rs",
+                "hunk 2/3 did not apply — file changed on disk since read"
+            ),
+            "edit retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"
+        );
+        assert_eq!(edit_failure_status("", ""), "edit ✗ no cause recorded");
+        assert_eq!(
+            edit_failure_status(
+                "lib.rs",
+                "replacement text matched 0 times; expected exactly one"
+            ),
+            "edit lib.rs ✗ replacement text matched 0 times; expected exactly one"
+        );
+    }
+
+    #[test]
+    fn tool_failure_status_uses_exit_glyph_and_never_bare_failed() {
+        assert_eq!(tool_failure_status(Some(2), ""), "✗ exit 2");
+        assert_eq!(tool_failure_status(Some(1), "boom"), "✗ exit 1: boom");
+        assert_eq!(
+            tool_failure_status(None, ""),
+            "✗ failed — no cause recorded"
+        );
+        assert_eq!(
+            tool_failure_status(None, "permission denied"),
+            "✗ permission denied"
+        );
     }
 }

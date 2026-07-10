@@ -1,5 +1,7 @@
 use super::super::{
-    commands::{theme_choices, CommandContext, EffortChoice, ModelChoice, ResumeItem},
+    commands::{
+        theme_choices, CheckpointItem, CommandContext, EffortChoice, ModelChoice, ResumeItem,
+    },
     event_loop::{InputEvent, UiEvent},
     status::TokenUsageSnapshot,
     theme::ThemeChoice,
@@ -14,6 +16,22 @@ use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Looks up the context window size (in tokens) for the given provider/model
+/// pair from the model catalog, if known. Used both mid-turn (via
+/// `update_token_usage`) and at session-start points so a fresh session shows
+/// `ctx 0%` instead of the `?` unknown fallback whenever the model's context
+/// window is known.
+pub(super) fn context_window_tokens_for(
+    model_catalog: &MergedModelCatalog,
+    provider: &str,
+    model: &str,
+) -> Option<u64> {
+    model_catalog
+        .provider(provider)
+        .and_then(|descriptor| descriptor.models().find(|entry| entry.id() == model))
+        .and_then(|entry| entry.context_window_tokens())
+}
 
 pub(super) fn update_token_usage(
     tokens: &mut TokenUsageSnapshot,
@@ -61,18 +79,28 @@ pub(super) fn read_terminal_event() -> Result<Option<UiEvent>> {
         CrosstermEvent::Mouse(mouse) => Some(UiEvent::Input(InputEvent::Mouse(mouse))),
         CrosstermEvent::Paste(text) => Some(UiEvent::Input(InputEvent::Paste(text))),
         CrosstermEvent::Resize(width, height) => Some(UiEvent::Resize { width, height }),
+        CrosstermEvent::FocusGained => Some(UiEvent::FocusChanged(true)),
+        CrosstermEvent::FocusLost => Some(UiEvent::FocusChanged(false)),
         _ => None,
     };
     Ok(event)
+}
+
+pub(super) struct CommandContextParts {
+    pub current_effort: ReasoningEffort,
+    pub current_theme: ThemeChoice,
+    pub current_session_id: Option<String>,
+    pub checkpoint_items: Vec<CheckpointItem>,
+    pub extension_items: Vec<super::super::commands::ExtensionManagerItem>,
+    pub extension_slash_commands: Vec<super::super::commands::ExtensionSlashCommand>,
+    pub code_swarm_models: Vec<String>,
 }
 
 pub(super) fn command_context(
     model_catalog: &MergedModelCatalog,
     provider: &str,
     model: &str,
-    current_effort: ReasoningEffort,
-    current_theme: ThemeChoice,
-    current_session_id: Option<&str>,
+    parts: CommandContextParts,
 ) -> CommandContext {
     // This is called when the bottom surface is rebuilt for session lifecycle
     // transitions, not during frame rendering or palette filtering.
@@ -81,9 +109,13 @@ pub(super) fn command_context(
     );
     CommandContext {
         model_choices: model_choices(model_catalog, &provider_config.registry, provider, model),
-        effort_choices: effort_choices(current_effort),
-        theme_choices: theme_choices(current_theme),
-        resume_items: resume_items_from_home(current_session_id),
+        effort_choices: effort_choices(parts.current_effort),
+        theme_choices: theme_choices(parts.current_theme),
+        resume_items: resume_items_from_home(parts.current_session_id.as_deref()),
+        checkpoint_items: parts.checkpoint_items,
+        extension_items: parts.extension_items,
+        extension_slash_commands: parts.extension_slash_commands,
+        code_swarm_models: parts.code_swarm_models,
     }
 }
 
@@ -219,11 +251,12 @@ fn resume_items_from_records_at(
             let mut item = ResumeItem::new(record.id().to_owned(), session_resume_label(&record));
             item.status = Some(relative_age(record.updated_at_ms(), now_ms));
             item.preview = Some(resume_detail(&record));
-            item.group = Some(
-                record
-                    .kind()
-                    .map_or_else(|| "unknown".to_owned(), |kind| kind.as_str().to_owned()),
-            );
+            // Spec §5.10 launch-kind group headers: interactive → tui, non-interactive → exec.
+            item.group = Some(match record.kind() {
+                Some(euler_core::SessionKind::Interactive) => "tui".to_owned(),
+                Some(euler_core::SessionKind::NonInteractive) => "exec".to_owned(),
+                None => "unknown".to_owned(),
+            });
             item
         })
         .collect()
@@ -270,6 +303,27 @@ fn now_unix_ms() -> u64 {
 
 pub(super) fn session_root_status_path() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// Detects the current git branch by reading `.git/HEAD` directly (no git2
+/// dependency, no subprocess). Returns the branch name for `ref:
+/// refs/heads/<name>`, the first 7 hex chars of the commit for a detached
+/// HEAD, or `None` if there is no readable `.git/HEAD`.
+pub(super) fn detect_git_branch(workspace_root: &std::path::Path) -> Option<String> {
+    let head_path = workspace_root.join(".git").join("HEAD");
+    let contents = std::fs::read_to_string(head_path).ok()?;
+    let contents = contents.trim();
+    if let Some(branch_ref) = contents.strip_prefix("ref: refs/heads/") {
+        if branch_ref.is_empty() {
+            return None;
+        }
+        return Some(branch_ref.to_owned());
+    }
+    let is_hex = !contents.is_empty() && contents.chars().all(|c| c.is_ascii_hexdigit());
+    if is_hex {
+        return Some(contents.chars().take(7).collect());
+    }
+    None
 }
 
 pub(super) fn merge_effects(left: CoreEffect, right: CoreEffect) -> CoreEffect {
@@ -412,5 +466,53 @@ mod tests {
         assert_eq!(relative_age(0, 3_600_000), "1h ago");
         assert_eq!(relative_age(0, 86_400_000), "1d ago");
         assert_eq!(relative_age(0, 900_000_000), "10d ago");
+    }
+
+    #[test]
+    fn detect_git_branch_reads_branch_ref() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir .git");
+        std::fs::write(
+            git_dir.join("HEAD"),
+            "ref: refs/heads/feat/warm-ledger-tui\n",
+        )
+        .expect("write HEAD");
+
+        assert_eq!(
+            detect_git_branch(temp.path()),
+            Some("feat/warm-ledger-tui".to_owned())
+        );
+    }
+
+    #[test]
+    fn detect_git_branch_reads_short_hash_when_detached() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir .git");
+        std::fs::write(
+            git_dir.join("HEAD"),
+            "1234567890abcdef1234567890abcdef12345678\n",
+        )
+        .expect("write HEAD");
+
+        assert_eq!(detect_git_branch(temp.path()), Some("1234567".to_owned()));
+    }
+
+    #[test]
+    fn detect_git_branch_returns_none_without_git_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        assert_eq!(detect_git_branch(temp.path()), None);
+    }
+
+    #[test]
+    fn detect_git_branch_returns_none_for_malformed_head() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir .git");
+        std::fs::write(git_dir.join("HEAD"), "not a valid head\n").expect("write HEAD");
+
+        assert_eq!(detect_git_branch(temp.path()), None);
     }
 }

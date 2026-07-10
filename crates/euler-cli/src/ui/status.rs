@@ -1,15 +1,34 @@
-use super::text::{display_width, truncate_display};
+use super::text::{display_width, truncate_display, truncate_display_left};
 use super::theme::Theme;
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::Style,
-    text::{Line, Span},
-    widgets::Widget,
-};
-use std::path::PathBuf;
+#[cfg(test)]
+use ratatui::{buffer::Buffer, layout::Rect, text::Line, widgets::Widget};
+use ratatui::{style::Style, text::Span};
+use std::path::{Path, PathBuf};
 
 const SEGMENT_GAP: &str = " · ";
+
+/// Short display form of a session id, for UI surfaces that only need a
+/// glanceable handle (banner, footer identity cluster, exit recap headline).
+/// A full ULID (26 chars) becomes `e` + its last 4 characters lowercased —
+/// the tail of a ULID varies fastest, so it's the most distinguishing sliver
+/// at a glance. Ids already at or under 5 chars (e.g. the `e????`/`e0000`
+/// no-session fallbacks) are returned unchanged. The full id always belongs
+/// in `/status` output and in copy-ready resume commands.
+pub fn short_session_id(id: &str) -> String {
+    if id.chars().count() <= 5 {
+        return id.to_owned();
+    }
+    // char-based tail: a malformed (non-ASCII) id must not panic the TUI.
+    let tail: String = id
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("e{}", tail.to_lowercase())
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TokenUsageSnapshot {
@@ -31,6 +50,9 @@ pub struct StatusSnapshot {
     pub reasoning_effort: Option<String>,
     pub cwd: PathBuf,
     pub git_branch: Option<String>,
+    /// Footer §13.5 / #46: the user-set `/name`, never the session id.
+    /// `None` until named — unnamed sessions show nothing in the footer.
+    pub session_name: Option<String>,
     pub extension_slots: StatusSlots,
 }
 
@@ -43,6 +65,7 @@ impl StatusSnapshot {
             reasoning_effort: None,
             cwd,
             git_branch: None,
+            session_name: None,
             extension_slots: StatusSlots::default(),
         }
     }
@@ -53,44 +76,61 @@ pub struct StatusSlots {
     labels: Vec<String>,
 }
 
-impl StatusSlots {
-    pub fn push_label(&mut self, label: impl Into<String>) {
-        self.labels.push(label.into());
-    }
-
-    fn has_renderable_labels(&self) -> bool {
-        self.labels.iter().any(|label| !label.is_empty())
-    }
-
-    fn renderable_labels(&self) -> impl Iterator<Item = &str> {
-        self.labels
-            .iter()
-            .map(String::as_str)
-            .filter(|label| !label.is_empty())
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnStatus {
     Idle,
     Running(String),
 }
 
+/// Footer v2 (Review v2 §15): two hard-edged clusters with empty space
+/// between — left flush-left (contextual hints, then `cwd (branch)`),
+/// right flush-right (`model · ctx N%` [+ session name once named]).
+/// Test-only: exercises the same span builder as the production
+/// `status_line_canvas` but flattens to plain text for easy assertions.
+#[cfg(test)]
 pub fn status_line_text(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
     turn: TurnStatus,
+    has_foldable: bool,
     width: u16,
 ) -> String {
-    let left = status_left_segment(snapshot, &turn);
-    let indent = status_indent(width);
-    let body_width = status_body_width(width, display_width(indent));
-    format!(
-        "{indent}{}",
-        join_status_halves(left, context_segment(tokens), body_width)
+    status_line_spans(
+        snapshot,
+        tokens,
+        turn,
+        has_foldable,
+        &Theme::default(),
+        width,
+    )
+    .iter()
+    .map(|span| span.content.as_ref())
+    .collect()
+}
+
+/// Production entry point: builds the fully-styled footer line (faint
+/// footer token throughout, branch parens one step brighter, ctx% keeping
+/// its threshold colors) for rendering onto the visual canvas.
+pub fn status_line_canvas(
+    snapshot: &StatusSnapshot,
+    tokens: &TokenUsageSnapshot,
+    turn: TurnStatus,
+    has_foldable: bool,
+    theme: &Theme,
+    width: u16,
+) -> super::visual_canvas::CanvasLine {
+    use super::visual_canvas::{CanvasLine, CanvasSpan, TextRole};
+    CanvasLine::from_spans(
+        status_line_spans(snapshot, tokens, turn, has_foldable, theme, width)
+            .into_iter()
+            .map(|span| {
+                CanvasSpan::styled_lossy(span.content.into_owned(), TextRole::Plain, span.style)
+            })
+            .collect(),
     )
 }
 
+#[cfg(test)]
 pub fn status_widget<'a>(snapshot: &'a StatusSnapshot, theme: &'a Theme) -> StatusWidget<'a> {
     StatusWidget {
         snapshot,
@@ -100,6 +140,7 @@ pub fn status_widget<'a>(snapshot: &'a StatusSnapshot, theme: &'a Theme) -> Stat
     }
 }
 
+#[cfg(test)]
 pub struct StatusWidget<'a> {
     snapshot: &'a StatusSnapshot,
     tokens: Option<&'a TokenUsageSnapshot>,
@@ -107,6 +148,7 @@ pub struct StatusWidget<'a> {
     theme: &'a Theme,
 }
 
+#[cfg(test)]
 impl<'a> StatusWidget<'a> {
     pub fn runtime(mut self, tokens: &'a TokenUsageSnapshot, turn: TurnStatus) -> Self {
         self.tokens = Some(tokens);
@@ -115,6 +157,7 @@ impl<'a> StatusWidget<'a> {
     }
 }
 
+#[cfg(test)]
 impl Widget for StatusWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let default_tokens;
@@ -125,10 +168,19 @@ impl Widget for StatusWidget<'_> {
                 &default_tokens
             }
         };
-        status_line(self.snapshot, tokens, self.turn, self.theme, area.width).render(area, buf);
+        Line::from(status_line_spans(
+            self.snapshot,
+            tokens,
+            self.turn,
+            false,
+            self.theme,
+            area.width,
+        ))
+        .render(area, buf);
     }
 }
 
+#[cfg(test)]
 pub fn context_segment(snapshot: &TokenUsageSnapshot) -> String {
     let mut base = match snapshot.context_window_tokens.filter(|window| *window > 0) {
         Some(window) => {
@@ -164,30 +216,6 @@ fn rounded_context_percent(input_tokens: u64, window: u64) -> u64 {
     u64::try_from(percent).unwrap_or(u64::MAX)
 }
 
-fn model_effort_segment(snapshot: &StatusSnapshot) -> String {
-    let model = compact_model_label(&snapshot.provider, &snapshot.model);
-    let target = if snapshot.provider.is_empty() && snapshot.model.is_empty() {
-        "?/?".to_owned()
-    } else if snapshot.provider.is_empty() {
-        model.to_owned()
-    } else {
-        format!("{}/{}", snapshot.provider, model)
-    };
-    let target = if display_width(&target) > 32 {
-        let mut truncated = truncate_display(&target, 31);
-        truncated.push('…');
-        truncated
-    } else {
-        target
-    };
-    let effort = snapshot
-        .reasoning_effort
-        .as_deref()
-        .filter(|effort| !effort.is_empty())
-        .unwrap_or("?");
-    format!("{target} {effort}")
-}
-
 fn compact_model_label<'a>(provider: &str, model: &'a str) -> &'a str {
     if provider == "anthropic" {
         model.strip_prefix("claude-").unwrap_or(model)
@@ -196,118 +224,194 @@ fn compact_model_label<'a>(provider: &str, model: &'a str) -> &'a str {
     }
 }
 
-fn status_left_segment(snapshot: &StatusSnapshot, turn: &TurnStatus) -> String {
-    let base = format!(
-        "{}{}{}",
-        model_effort_segment(snapshot),
-        SEGMENT_GAP,
-        cwd_segment(snapshot)
-    );
+fn status_hints(turn: &TurnStatus, has_foldable: bool) -> String {
     match turn {
-        TurnStatus::Idle => base,
-        TurnStatus::Running(label) => format!("{base}{SEGMENT_GAP}running {label}"),
+        TurnStatus::Idle if has_foldable => "/ commands · ctrl+o expand".to_owned(),
+        TurnStatus::Idle => "/ commands".to_owned(),
+        TurnStatus::Running(_) => "⏎ queue · esc interrupt now".to_owned(),
     }
 }
 
-fn cwd_segment(snapshot: &StatusSnapshot) -> String {
-    if snapshot.cwd.as_os_str().is_empty() {
+/// zsh/fish prompt convention: `~/code/euler (branch)`. Non-git directories
+/// render no parens at all. `home` is injected for hermetic testing — the
+/// production caller resolves it from `$HOME`.
+fn home_relative_path(cwd: &Path, home: Option<&Path>) -> String {
+    if cwd.as_os_str().is_empty() {
         return "?".to_owned();
     }
-    snapshot
-        .cwd
-        .file_name()
-        .map(|name| format!("/{}", name.to_string_lossy()))
-        .unwrap_or_else(|| "/".to_owned())
+    if let Some(home) = home.filter(|home| !home.as_os_str().is_empty() && *home != Path::new("/"))
+    {
+        if cwd == home {
+            return "~".to_owned();
+        }
+        if let Ok(rest) = cwd.strip_prefix(home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_owned();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    cwd.display().to_string()
 }
 
-fn join_status_halves(left: String, right: String, width: usize) -> String {
-    let left_width = display_width(&left);
-    let right_width = display_width(&right);
-    let gap_width = display_width(SEGMENT_GAP);
-    if left_width + right_width + gap_width <= width {
-        return format!("{left}{SEGMENT_GAP}{right}");
-    }
-    let right_room = gap_width + right_width;
-    if width > right_room {
-        let left = truncate_display(&left, width - right_room);
-        return format!("{left}{SEGMENT_GAP}{right}");
-    }
-    truncate_display(&right, width)
+fn cwd_display(cwd: &Path) -> String {
+    home_relative_path(cwd, std::env::var_os("HOME").map(PathBuf::from).as_deref())
 }
 
-fn status_line(
+fn identity_context_label(tokens: &TokenUsageSnapshot) -> String {
+    match identity_context_percent(tokens) {
+        Some(percent) => format!("ctx {percent}%"),
+        None => match (tokens.canvas_retained_bytes, tokens.canvas_budget_bytes) {
+            (Some(retained), Some(budget)) if budget > 0 => {
+                format!(
+                    "canvas {}KB/{}KB",
+                    retained.div_ceil(1024),
+                    budget.div_ceil(1024)
+                )
+            }
+            _ => "ctx ?%".to_owned(),
+        },
+    }
+}
+
+fn identity_context_percent(tokens: &TokenUsageSnapshot) -> Option<u64> {
+    tokens
+        .context_window_tokens
+        .filter(|window| *window > 0)
+        .map(|window| rounded_context_percent(tokens.input_tokens, window).min(99))
+}
+
+fn identity_context_style(tokens: &TokenUsageSnapshot, theme: &Theme) -> Style {
+    match identity_context_percent(tokens) {
+        Some(percent) if percent >= 85 => Style::default().fg(theme.palette.error),
+        Some(percent) if percent >= 70 => theme.status.cost,
+        _ => theme.status.faint,
+    }
+}
+
+/// Right cluster, flush-right: `model · ctx N%` [+ session name once named]
+/// [+ demoted-items note]. Branch no longer lives here (#48) — see the left
+/// cluster's `cwd (branch)` instead.
+fn identity_segment_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
-    turn: TurnStatus,
     theme: &Theme,
-    width: u16,
-) -> Line<'static> {
-    Line::from(status_line_spans(snapshot, tokens, turn, theme, width))
+) -> Vec<Span<'static>> {
+    let model = compact_model_label(&snapshot.provider, &snapshot.model);
+    let model = if model.is_empty() { "?" } else { model };
+    let ctx = identity_context_label(tokens);
+    let mut spans = vec![
+        Span::styled(format!("{model} · "), theme.status.faint),
+        Span::styled(ctx, identity_context_style(tokens, theme)),
+    ];
+    if let Some(name) = snapshot
+        .session_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    {
+        spans.push(Span::styled(format!(" · {name}"), theme.status.faint));
+    }
+    if tokens.demoted_items > 0 {
+        spans.push(Span::styled(
+            format!(" · {} demoted", tokens.demoted_items),
+            theme.status.faint,
+        ));
+    }
+    spans
+}
+
+/// Left cluster, flush-left: contextual hints, then `cwd (branch)` —
+/// zsh/fish prompt convention. Non-git directories render no parens. The
+/// directory is the first thing squeezed at narrow widths (§4): its budget
+/// is whatever's left after hints + branch + the right cluster + a 1-cell
+/// minimum gap, truncated from the left (`…/2x11/euler`).
+fn status_left_spans(
+    snapshot: &StatusSnapshot,
+    turn: &TurnStatus,
+    has_foldable: bool,
+    theme: &Theme,
+    right_width: usize,
+    body_width: usize,
+) -> Vec<Span<'static>> {
+    let hints = status_hints(turn, has_foldable);
+    let hints_prefix = format!("{hints}{SEGMENT_GAP}");
+    let path_full = cwd_display(&snapshot.cwd);
+    let branch_suffix = snapshot
+        .git_branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+        .map(|branch| format!(" ({branch})"));
+
+    let reserved = display_width(&hints_prefix)
+        + branch_suffix.as_deref().map(display_width).unwrap_or(0)
+        + 1 // minimum gap between clusters
+        + right_width;
+    let path_budget = body_width.saturating_sub(reserved);
+    let path = truncate_display_left(&path_full, path_budget);
+
+    let mut spans = vec![
+        Span::styled(hints_prefix, theme.status.faint),
+        Span::styled(path, theme.status.faint),
+    ];
+    if let Some(branch) = branch_suffix {
+        spans.push(Span::styled(branch, theme.status.branch));
+    }
+    spans
+}
+
+fn join_footer_span_clusters(
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let left_width = spans_width(&left);
+    let right_width = spans_width(&right);
+    if left_width + right_width <= width {
+        let gap = width - left_width - right_width;
+        let mut spans = left;
+        if gap > 0 {
+            spans.push(Span::raw(" ".repeat(gap)));
+        }
+        spans.extend(right);
+        return spans;
+    }
+
+    // The path is already squeezed to its minimum inside `status_left_spans`;
+    // this is the last-resort safety net so the line never overflows width.
+    if width > right_width {
+        let mut spans = truncate_spans(&left, width - right_width);
+        spans.extend(right);
+        return spans;
+    }
+
+    truncate_spans(&right, width)
 }
 
 fn status_line_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
     turn: TurnStatus,
+    has_foldable: bool,
     theme: &Theme,
     width: u16,
 ) -> Vec<Span<'static>> {
-    let left = vec![
-        Span::styled(model_effort_segment(snapshot), theme.status.model),
-        Span::styled(SEGMENT_GAP, theme.status.base),
-        Span::styled(cwd_segment(snapshot), theme.status.state),
-    ];
-    let left = status_spans_with_turn(left, turn, theme);
-    let right = vec![Span::styled(context_segment(tokens), theme.status.ctx)];
-    let indent = Span::styled(status_indent(width), theme.status.base);
-    let body_width = status_body_width(width, display_width(indent.content.as_ref()));
-    let mut spans = vec![indent];
-    spans.extend(join_status_span_halves(
-        left,
-        right,
-        body_width,
-        theme.status.base,
-    ));
-    spans
-}
-
-fn status_spans_with_turn(
-    mut left: Vec<Span<'static>>,
-    turn: TurnStatus,
-    theme: &Theme,
-) -> Vec<Span<'static>> {
-    if let TurnStatus::Running(label) = turn {
-        left.push(Span::styled(SEGMENT_GAP, theme.status.base));
-        left.push(Span::styled(format!("running {label}"), theme.status.state));
-    }
-    left
-}
-
-fn join_status_span_halves(
-    left: Vec<Span<'static>>,
-    right: Vec<Span<'static>>,
-    width: usize,
-    base: Style,
-) -> Vec<Span<'static>> {
-    let left_width = spans_width(&left);
+    let indent = status_indent(width);
+    let body_width = status_body_width(width, display_width(indent));
+    let right = identity_segment_spans(snapshot, tokens, theme);
     let right_width = spans_width(&right);
-    let gap_width = display_width(SEGMENT_GAP);
-    if left_width + right_width + gap_width <= width {
-        let mut spans = left;
-        spans.push(Span::styled(SEGMENT_GAP, base));
-        spans.extend(right);
-        return spans;
-    }
+    let left = status_left_spans(
+        snapshot,
+        &turn,
+        has_foldable,
+        theme,
+        right_width,
+        body_width,
+    );
 
-    let right_room = gap_width + right_width;
-    if width > right_room {
-        let mut spans = truncate_spans(&left, width - right_room);
-        spans.push(Span::styled(SEGMENT_GAP, base));
-        spans.extend(right);
-        return spans;
-    }
-
-    truncate_spans(&right, width)
+    let indent_span = Span::styled(indent, theme.status.faint);
+    let mut spans = vec![indent_span];
+    spans.extend(join_footer_span_clusters(left, right, body_width));
+    spans
 }
 
 fn status_indent(width: u16) -> &'static str {
@@ -364,36 +468,75 @@ mod tests {
         snapshot.git_branch = Some("main".to_owned());
         let tokens = TokenUsageSnapshot::default();
 
-        let full = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 120);
-        assert!(full.contains("openrouter/z-ai/glm-5.2"));
-        assert!(full.contains("extra-high"));
-        assert!(full.contains("/repo"));
-        assert!(full.contains("Context ?% used"));
+        let full = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
+        assert!(full.contains("/ commands"));
+        assert!(!full.contains("ctrl+o expand"));
+        assert!(full.contains("/tmp/repo (main)"));
+        assert!(full.contains("z-ai/glm-5.2 · ctx ?%"));
+        // Branch v2 (#48): lives beside the directory, never on the right.
+        assert!(!full.contains("ctx ?% · main"));
+        assert!(!full.contains("e???? ·"));
+        assert!(!full.contains("openrouter/z-ai/glm-5.2"));
+        assert!(!full.contains("extra-high"));
+        assert!(!full.contains("Context ?% used"));
         assert!(!full.contains("idle"));
         assert!(!full.contains("run"));
         assert!(!full.contains("--"));
+        // No `euler ·` prefix and no lingering middle-dot join between clusters.
+        assert!(!full.contains("euler ·"));
 
-        let narrow = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 18);
+        let narrow = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 18);
         assert!(display_width(&narrow) <= 18);
     }
 
+    /// #46: unnamed sessions show nothing extra; naming appends the name
+    /// to the right cluster; ids never appear in the footer.
     #[test]
-    fn statusline_uses_honest_placeholders() {
-        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
+    fn session_name_appears_only_once_named() {
+        let mut snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
+        snapshot.session_id = Some("01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned());
         let tokens = TokenUsageSnapshot::default();
 
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 80);
-        assert_eq!(rendered, "  fixture/echo ? · /repo · Context ?% used");
+        let unnamed = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
+        assert!(unnamed.ends_with("echo · ctx ?%"));
+        assert!(!unnamed.contains("01KW3Q6NN5A9R6E2EWZ7M3QW9T"));
+
+        snapshot.session_name = Some("research-branch".to_owned());
+        let named = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
+        assert!(named.ends_with("echo · ctx ?% · research-branch"));
+        assert!(!named.contains("01KW3Q6NN5A9R6E2EWZ7M3QW9T"));
     }
 
     #[test]
-    fn statusline_compacts_anthropic_model_and_cwd_for_footer_only() {
+    fn statusline_uses_honest_placeholders_and_omits_parens_without_a_branch() {
+        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
+        let tokens = TokenUsageSnapshot::default();
+
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 80);
+        assert!(rendered.starts_with("  / commands · /tmp/repo"));
+        assert!(!rendered.contains('('));
+        assert!(rendered.ends_with("echo · ctx ?%"));
+    }
+
+    #[test]
+    fn statusline_shows_ctrl_o_hint_only_when_foldable_artifact_exists() {
+        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
+        let tokens = TokenUsageSnapshot::default();
+
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, true, 80);
+        assert!(rendered.starts_with("  / commands · ctrl+o expand · /tmp/repo"));
+        assert!(rendered.ends_with("echo · ctx ?%"));
+    }
+
+    #[test]
+    fn statusline_compacts_anthropic_model_and_joins_branch_beside_cwd() {
         let mut snapshot = StatusSnapshot::new(
             "anthropic",
             "claude-fable-5",
             PathBuf::from("/home/user/projects/euler"),
         );
         snapshot.reasoning_effort = Some("medium".to_owned());
+        snapshot.git_branch = Some("fix/warm-spine-anchor".to_owned());
         let tokens = TokenUsageSnapshot {
             input_tokens: 120_000,
             output_tokens: 50_000,
@@ -405,12 +548,10 @@ mod tests {
             compaction_tier: None,
         };
 
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 120);
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
 
-        assert_eq!(
-            rendered,
-            "  anthropic/fable-5 medium · /euler · Context 12% used"
-        );
+        assert!(rendered.contains("/home/user/projects/euler (fix/warm-spine-anchor)"));
+        assert!(rendered.ends_with("fable-5 · ctx 12%"));
         assert_eq!(snapshot.model, "claude-fable-5");
     }
 
@@ -419,13 +560,35 @@ mod tests {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/"));
         let tokens = TokenUsageSnapshot::default();
 
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 80);
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 80);
 
-        assert_eq!(rendered, "  fixture/echo ? · / · Context ?% used");
+        assert!(rendered.starts_with("  / commands · /"));
+        assert!(rendered.ends_with("echo · ctx ?%"));
     }
 
     #[test]
-    fn statusline_names_running_extension_command() {
+    fn home_relative_path_contracts_the_home_prefix_to_a_tilde() {
+        let home = PathBuf::from("/Users/eli");
+
+        assert_eq!(
+            home_relative_path(&PathBuf::from("/Users/eli/code/euler"), Some(&home)),
+            "~/code/euler"
+        );
+        assert_eq!(home_relative_path(&home, Some(&home)), "~");
+        assert_eq!(
+            home_relative_path(&PathBuf::from("/var/tmp/euler"), Some(&home)),
+            "/var/tmp/euler"
+        );
+        assert_eq!(home_relative_path(&PathBuf::from(""), Some(&home)), "?");
+        // A root home dir is never treated as a meaningful prefix.
+        assert_eq!(
+            home_relative_path(&PathBuf::from("/etc"), Some(Path::new("/"))),
+            "/etc"
+        );
+    }
+
+    #[test]
+    fn statusline_shows_running_queue_and_interrupt_hints() {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
         let tokens = TokenUsageSnapshot::default();
 
@@ -433,36 +596,71 @@ mod tests {
             &snapshot,
             &tokens,
             TurnStatus::Running("extension causal-dag.catch-up".to_owned()),
+            false,
             120,
         );
 
-        assert!(rendered.contains("running extension causal-dag.catch-up"));
+        assert!(rendered.contains("⏎ queue · esc interrupt now"));
+        assert!(!rendered.contains("running extension causal-dag.catch-up"));
     }
 
     #[test]
-    fn statusline_spans_use_named_slot_styles_and_base_gaps() {
-        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
+    fn statusline_spans_use_faint_footer_token_and_brighter_branch() {
+        let mut snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
+        snapshot.git_branch = Some("main".to_owned());
         let tokens = TokenUsageSnapshot::default();
         let theme = Theme::default();
 
-        let spans = status_line_spans(&snapshot, &tokens, TurnStatus::Idle, &theme, 80);
+        let spans = status_line_spans(&snapshot, &tokens, TurnStatus::Idle, false, &theme, 80);
 
         assert!(spans
             .iter()
-            .any(|span| span.content.contains("fixture/echo") && span.style == theme.status.model));
+            .any(|span| span.content == "echo · " && span.style == theme.status.faint));
         assert!(spans
             .iter()
-            .any(|span| span.content.contains("/repo") && span.style == theme.status.state));
+            .any(|span| span.content == "ctx ?%" && span.style == theme.status.faint));
         assert!(spans
             .iter()
-            .any(|span| span.content == "Context ?% used" && span.style == theme.status.ctx));
+            .any(|span| span.content.contains("/repo") && span.style == theme.status.faint));
         assert!(spans
             .iter()
-            .any(|span| span.content == " · " && span.style == theme.status.base));
-        assert_eq!(theme.status.state.fg, Some(theme.palette.st_state));
-        assert_eq!(theme.status.model.fg, Some(theme.palette.st_model));
+            .any(|span| span.content == " (main)" && span.style == theme.status.branch));
+        assert_eq!(theme.status.faint.fg, Some(theme.palette.gutter));
+        assert_eq!(theme.status.branch.fg, Some(theme.palette.muted));
         assert_eq!(theme.status.cost.fg, Some(theme.palette.st_cost));
         assert_eq!(theme.status.ctx.fg, Some(theme.palette.st_ctx));
+    }
+
+    #[test]
+    fn statusline_ctx_percent_uses_attention_and_failure_thresholds() {
+        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
+        let theme = Theme::default();
+
+        assert_eq!(ctx_span_style(&snapshot, &theme, 69), theme.status.faint);
+        assert_eq!(ctx_span_style(&snapshot, &theme, 70), theme.status.cost);
+        assert_eq!(
+            ctx_span_style(&snapshot, &theme, 85),
+            Style::default().fg(theme.palette.error)
+        );
+    }
+
+    fn ctx_span_style(snapshot: &StatusSnapshot, theme: &Theme, percent: u64) -> Style {
+        let tokens = TokenUsageSnapshot {
+            input_tokens: percent,
+            output_tokens: 0,
+            reasoning_tokens: None,
+            context_window_tokens: Some(100),
+            demoted_items: 0,
+            canvas_retained_bytes: None,
+            canvas_budget_bytes: None,
+            compaction_tier: None,
+        };
+        let label = format!("ctx {percent}%");
+        status_line_spans(snapshot, &tokens, TurnStatus::Idle, false, theme, 120)
+            .into_iter()
+            .find(|span| span.content == label)
+            .unwrap_or_else(|| panic!("missing ctx span {label}"))
+            .style
     }
 
     #[test]
@@ -494,13 +692,13 @@ mod tests {
         );
         let tokens = TokenUsageSnapshot::default();
 
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 72);
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 72);
 
         assert!(display_width(&rendered) < 72);
-        assert!(rendered.contains("Context ?% used"));
+        assert!(rendered.contains("ctx ?%"));
 
         for width in 1..=10 {
-            let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, width);
+            let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, width);
             assert!(
                 display_width(&rendered) < usize::from(width),
                 "width {width} rendered {rendered:?}"
@@ -510,6 +708,7 @@ mod tests {
                 &snapshot,
                 &tokens,
                 TurnStatus::Idle,
+                false,
                 &Theme::default(),
                 width,
             );
@@ -518,6 +717,26 @@ mod tests {
                 "width {width} rendered spans {spans:?}"
             );
         }
+    }
+
+    /// Footer §4: at narrow widths the directory truncates from the left
+    /// (`…/2x11/euler`) before the hints, branch, or right cluster give up
+    /// any of their content.
+    #[test]
+    fn narrow_width_truncates_directory_before_anything_else() {
+        let mut snapshot =
+            StatusSnapshot::new("fixture", "echo", PathBuf::from("/Users/x/code/2x11/euler"));
+        snapshot.git_branch = Some("main".to_owned());
+        let tokens = TokenUsageSnapshot::default();
+
+        // Sized so the directory's budget is exactly 12 cells — enough for
+        // `…/2x11/euler` (the ellipsis plus the last 11 characters) and not
+        // one cell more.
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 49);
+
+        assert!(rendered.contains("/ commands · …/2x11/euler (main)"));
+        assert!(rendered.ends_with("echo · ctx ?%"));
+        assert!(display_width(&rendered) < 49);
     }
 
     #[test]

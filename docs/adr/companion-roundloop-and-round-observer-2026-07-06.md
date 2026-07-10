@@ -11,7 +11,7 @@ Status: accepted (Eli, 2026-07-06 - "the approved sequence").
 2. The causal-dag live experiment exposed the missing primitive: context
    slots fold from the in-process event stream, but nothing drives
    observation DURING a session. External processes cannot reach a running
-   session's memory. See docs/notes/subagent-wave-ledger-2026-07-05.md.
+   session's memory.
 
 ## Decision 1: companion loop adopts the RoundLoop seam
 

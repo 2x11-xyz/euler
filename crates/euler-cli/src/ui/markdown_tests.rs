@@ -61,8 +61,12 @@ fn renders_pipe_tables_and_unwraps_markdown_fenced_tables() {
     );
     let text = strings(lines);
     assert!(text.iter().any(|line| line.contains("A")));
-    assert!(text.iter().any(|line| line.contains('━')));
-    assert!(text.iter().any(|line| line.contains('─')));
+    assert_eq!(
+        text.iter().filter(|line| line.contains('─')).count(),
+        1,
+        "expected exactly one rule line under the header: {text:?}"
+    );
+    assert!(!text.iter().any(|line| line.contains('━')));
     assert!(text.iter().any(|line| line.contains("2222")));
     assert!(!text.iter().any(|line| line.contains('|')));
     assert!(!text.iter().any(|line| line.contains("```")));
@@ -90,7 +94,7 @@ fn two_column_tables_use_grid_until_width_is_too_narrow() {
     let source = "| Area | Purpose |\n|---|---|\n| CLI | Terminal transcript UX |\n";
 
     let wide = strings(render_agent_markdown(source, &theme, 44));
-    assert!(wide.iter().any(|line| line.contains('━')));
+    assert!(wide.iter().any(|line| line.contains('─')));
     assert!(wide.iter().any(|line| line.contains("CLI")));
 
     let narrow = strings(render_agent_markdown(source, &theme, 43));
@@ -98,7 +102,7 @@ fn two_column_tables_use_grid_until_width_is_too_narrow() {
     assert!(narrow
         .iter()
         .any(|line| line == "Purpose: Terminal transcript UX"));
-    assert!(!narrow.iter().any(|line| line.contains('━')));
+    assert!(!narrow.iter().any(|line| line.contains('─')));
 }
 
 #[test]
@@ -143,8 +147,12 @@ fn multi_column_tables_use_grid_at_wide_widths() {
     assert!(text
         .iter()
         .any(|line| line.contains("Core engine") && line.contains("euler-core")));
-    assert!(text.iter().any(|line| line.contains('━')));
-    assert!(text.iter().any(|line| line.contains('─')));
+    assert_eq!(
+        text.iter().filter(|line| line.contains('─')).count(),
+        1,
+        "expected exactly one rule line under the header: {text:?}"
+    );
+    assert!(!text.iter().any(|line| line.contains('━')));
     assert!(!text.iter().any(|line| line == "Layer: Event substrate"));
     assert!(
         text.iter().all(|line| display_width(line) <= 100),
@@ -162,7 +170,7 @@ fn five_column_tables_grid_only_when_width_is_sufficient() {
     assert!(wide
         .iter()
         .any(|line| line.contains("one") && line.contains("five")));
-    assert!(wide.iter().any(|line| line.contains('━')));
+    assert!(wide.iter().any(|line| line.contains('─')));
     assert!(!wide.iter().any(|line| line == "A: one"));
     assert!(
         wide.iter().all(|line| display_width(line) <= 110),
@@ -172,7 +180,7 @@ fn five_column_tables_grid_only_when_width_is_sufficient() {
     let narrow = strings(render_agent_markdown(source, &theme, 109));
     assert!(narrow.iter().any(|line| line == "A: one"));
     assert!(narrow.iter().any(|line| line == "E: five"));
-    assert!(!narrow.iter().any(|line| line.contains('━')));
+    assert!(!narrow.iter().any(|line| line.contains('─')));
     assert!(
         narrow.iter().all(|line| display_width(line) <= 109),
         "narrow five-column stack overflowed: {narrow:?}"
@@ -235,7 +243,7 @@ fn unwraps_tilde_markdown_fenced_tables() {
     );
     let text = strings(lines);
     assert!(text.iter().any(|line| line.contains("A")));
-    assert!(text.iter().any(|line| line.contains('━')));
+    assert!(text.iter().any(|line| line.contains('─')));
     assert!(!text.iter().any(|line| line.contains('|')));
     assert!(!text.iter().any(|line| line.contains("~~~")));
 }
@@ -341,4 +349,102 @@ fn table_v1_flattens_cell_styles_at_truncation_boundary() {
     assert!(!spans
         .iter()
         .any(|span| span.content.contains("code") && span.style == theme.scopes.markup.code));
+}
+
+#[test]
+fn grid_table_has_one_blank_line_between_data_rows_and_no_rule_above_or_below() {
+    // Review v2 §10/10b: only the header separator renders — nothing above
+    // the header, nothing after the last row — and one blank line separates
+    // each pair of data rows so wrapped cells still read as a single block.
+    let theme = Theme::default_dark();
+    let lines = strings(render_agent_markdown(
+        "| Layer | Responsibility |\n|---|---|\n| CLI | Terminal UX |\n| Core | Session loop |\n| Provider | LLM APIs |\n",
+        &theme,
+        60,
+    ));
+
+    assert_eq!(
+        lines.iter().filter(|line| line.contains('─')).count(),
+        1,
+        "exactly one rule (the header separator): {lines:?}"
+    );
+    assert!(
+        !lines[0].contains('─'),
+        "no rule above the header: {lines:?}"
+    );
+    assert!(
+        !lines.last().is_some_and(|line| line.contains('─')),
+        "no rule after the last row: {lines:?}"
+    );
+
+    let cli_row = lines
+        .iter()
+        .position(|line| line.contains("CLI"))
+        .expect("CLI row");
+    let core_row = lines
+        .iter()
+        .position(|line| line.contains("Core"))
+        .expect("Core row");
+    let provider_row = lines
+        .iter()
+        .position(|line| line.contains("Provider"))
+        .expect("Provider row");
+
+    assert_eq!(
+        lines[cli_row + 1].trim(),
+        "",
+        "a blank line separates the first two data rows: {lines:?}"
+    );
+    assert_eq!(core_row, cli_row + 2, "rows: {lines:?}");
+    assert_eq!(
+        lines[core_row + 1].trim(),
+        "",
+        "a blank line separates the next two data rows: {lines:?}"
+    );
+    assert_eq!(provider_row, core_row + 2, "rows: {lines:?}");
+}
+
+#[test]
+fn grid_table_header_is_cream_bold_and_first_column_is_dim() {
+    // Review v2 §10b: header text renders cream bold; the first column
+    // (a row label) renders dim, including in the header row's other
+    // columns which stay bold.
+    let theme = Theme::default_dark();
+    let lines = render_agent_markdown(
+        "| Layer | Responsibility |\n|---|---|\n| CLI | Terminal UX |\n",
+        &theme,
+        60,
+    );
+    let spans = all_spans(&lines);
+
+    let header_first_col = spans
+        .iter()
+        .find(|span| span.content.trim() == "Layer")
+        .expect("header first-column span");
+    assert_eq!(
+        header_first_col.style,
+        theme
+            .transcript
+            .assistant
+            .add_modifier(ratatui::style::Modifier::BOLD),
+        "header row stays cream bold across every column"
+    );
+
+    let body_first_col = spans
+        .iter()
+        .find(|span| span.content.trim() == "CLI")
+        .expect("body first-column span");
+    assert_eq!(
+        body_first_col.style, theme.transcript.muted,
+        "the first column reads as a row label — dim"
+    );
+
+    let body_second_col = spans
+        .iter()
+        .find(|span| span.content.contains("Terminal UX"))
+        .expect("body second-column span");
+    assert_eq!(
+        body_second_col.style, theme.transcript.assistant,
+        "non-first columns keep the plain body style"
+    );
 }

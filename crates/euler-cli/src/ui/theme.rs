@@ -93,7 +93,6 @@ impl Default for ThemeOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct Theme {
     pub palette: Palette,
     pub activity: ActivityTheme,
@@ -107,13 +106,25 @@ pub struct Theme {
     pub background: BackgroundMode,
 }
 
-#[allow(dead_code)]
 impl Theme {
     pub fn for_choice(choice: ThemeChoice) -> Self {
         match choice {
             ThemeChoice::GruvboxDark => Self::default_dark(),
             ThemeChoice::GruvboxLight => Self::default_light(),
+            ThemeChoice::WarmLedger => Self::warm_ledger(),
         }
+    }
+
+    pub fn warm_ledger() -> Self {
+        Self::warm_ledger_with(ThemeOptions {
+            color_level: ColorLevel::TrueColor,
+            background: BackgroundMode::Opaque(Color::Rgb(0x26, 0x23, 0x19)),
+        })
+    }
+
+    pub fn warm_ledger_with(options: ThemeOptions) -> Self {
+        let palette = PaletteSeed::warm_ledger().resolve(options);
+        Self::from_palette(palette, options)
     }
 
     pub fn default_dark() -> Self {
@@ -157,13 +168,16 @@ impl Default for Theme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct Palette {
     pub foreground: Color,
     pub background: Color,
     pub surface: Color,
     pub surface_high: Color,
     pub selection: Color,
+    pub hairline: Color,
+    pub composer_rule: Color,
+    pub user_rail: Color,
+    pub queued_rail: Color,
     pub added: Color,
     pub removed: Color,
     pub changed: Color,
@@ -185,18 +199,9 @@ pub struct Palette {
     pub st_ctx: Color,
 }
 
-#[allow(dead_code)]
 impl Palette {
-    pub fn default_dark() -> Self {
-        Self::default_dark_with(ThemeOptions::default_dark())
-    }
-
     pub fn default_dark_with(options: ThemeOptions) -> Self {
         PaletteSeed::default_dark().resolve(options)
-    }
-
-    pub fn default_light() -> Self {
-        Self::default_light_with(ThemeOptions::default_light())
     }
 
     pub fn default_light_with(options: ThemeOptions) -> Self {
@@ -211,9 +216,16 @@ struct PaletteSeed {
     surface: Color,
     surface_high: Color,
     selection: Color,
+    hairline: Color,
+    composer_rule: Color,
+    user_rail: Color,
+    queued_rail: Color,
     added: Color,
     removed: Color,
     changed: Color,
+    added_tint_pct: u8,
+    removed_tint_pct: u8,
+    changed_tint_pct: u8,
     muted: Color,
     warning: Color,
     error: Color,
@@ -237,9 +249,16 @@ impl PaletteSeed {
             surface: Color::Rgb(60, 56, 54),
             surface_high: Color::Rgb(80, 73, 69),
             selection: Color::Rgb(102, 92, 84),
+            hairline: Color::Rgb(80, 73, 69),
+            composer_rule: Color::Rgb(102, 92, 84),
+            user_rail: USER_RAIL_COLOR,
+            queued_rail: Color::Rgb(102, 92, 84),
             added: Color::Rgb(184, 187, 38),
             removed: Color::Rgb(251, 73, 52),
             changed: Color::Rgb(250, 189, 47),
+            added_tint_pct: 28,
+            removed_tint_pct: 28,
+            changed_tint_pct: 24,
             muted: Color::Rgb(168, 153, 132),
             warning: Color::Rgb(254, 128, 25),
             error: Color::Rgb(251, 73, 52),
@@ -263,9 +282,16 @@ impl PaletteSeed {
             surface: Color::Rgb(242, 229, 188),
             surface_high: Color::Rgb(235, 219, 178),
             selection: Color::Rgb(213, 196, 161),
+            hairline: Color::Rgb(213, 196, 161),
+            composer_rule: Color::Rgb(189, 174, 147),
+            user_rail: Color::Rgb(66, 123, 88),
+            queued_rail: Color::Rgb(189, 174, 147),
             added: Color::Rgb(121, 116, 14),
             removed: Color::Rgb(157, 0, 6),
             changed: Color::Rgb(181, 118, 20),
+            added_tint_pct: 28,
+            removed_tint_pct: 28,
+            changed_tint_pct: 24,
             muted: Color::Rgb(124, 111, 100),
             warning: Color::Rgb(175, 58, 3),
             error: Color::Rgb(157, 0, 6),
@@ -282,6 +308,40 @@ impl PaletteSeed {
         }
     }
 
+    /// Warm Ledger design-board reference palette (roles → existing slots).
+    fn warm_ledger() -> Self {
+        Self {
+            foreground: Color::Rgb(0xec, 0xe4, 0xcb),
+            background: Color::Rgb(0x26, 0x23, 0x19),
+            surface: Color::Rgb(0x1f, 0x1d, 0x15),
+            surface_high: Color::Rgb(0x38, 0x31, 0x1c),
+            selection: Color::Rgb(0x38, 0x31, 0x1c),
+            hairline: Color::Rgb(0x38, 0x34, 0x1f),
+            composer_rule: Color::Rgb(0x45, 0x3e, 0x26),
+            user_rail: Color::Rgb(0xb3, 0xa6, 0x7e),
+            queued_rail: Color::Rgb(0x6b, 0x63, 0x49),
+            added: Color::Rgb(0x9d, 0xb8, 0x77),
+            removed: Color::Rgb(0xc1, 0x55, 0x3f),
+            changed: Color::Rgb(0xd7, 0xa8, 0x3c),
+            added_tint_pct: 12,
+            removed_tint_pct: 12,
+            changed_tint_pct: 10,
+            muted: Color::Rgb(0x8b, 0x85, 0x70),
+            warning: Color::Rgb(0xd7, 0xa8, 0x3c),
+            error: Color::Rgb(0xc1, 0x55, 0x3f),
+            code: Color::Rgb(0xd7, 0xa8, 0x3c),
+            user: Color::Rgb(0x9d, 0xb8, 0x77),
+            assistant: Color::Rgb(0xec, 0xe4, 0xcb),
+            tool: Color::Rgb(0x4f, 0x8f, 0x8b),
+            gutter: Color::Rgb(0x5f, 0x58, 0x4a),
+            cursor: Color::Rgb(0xd7, 0xa8, 0x3c),
+            st_state: Color::Rgb(0x4f, 0x8f, 0x8b),
+            st_model: Color::Rgb(0xec, 0xe4, 0xcb),
+            st_cost: Color::Rgb(0xd7, 0xa8, 0x3c),
+            st_ctx: Color::Rgb(0x9d, 0xb8, 0x77),
+        }
+    }
+
     fn resolve(self, options: ThemeOptions) -> Palette {
         let background = options.background.resolved(self.background);
         let tint_base = self.background;
@@ -291,12 +351,31 @@ impl PaletteSeed {
             surface: surface_color(background, self.surface, options),
             surface_high: surface_color(background, self.surface_high, options),
             selection: self.quantize(self.selection, options),
+            hairline: self.quantize(self.hairline, options),
+            composer_rule: self.quantize(self.composer_rule, options),
+            user_rail: self.quantize(self.user_rail, options),
+            queued_rail: self.quantize(self.queued_rail, options),
             added: self.quantize(self.added, options),
             removed: self.quantize(self.removed, options),
             changed: self.quantize(self.changed, options),
-            added_tint: tint(tint_base, self.added, 28, options.color_level),
-            removed_tint: tint(tint_base, self.removed, 28, options.color_level),
-            changed_tint: tint(tint_base, self.changed, 24, options.color_level),
+            added_tint: tint(
+                tint_base,
+                self.added,
+                self.added_tint_pct,
+                options.color_level,
+            ),
+            removed_tint: tint(
+                tint_base,
+                self.removed,
+                self.removed_tint_pct,
+                options.color_level,
+            ),
+            changed_tint: tint(
+                tint_base,
+                self.changed,
+                self.changed_tint_pct,
+                options.color_level,
+            ),
             muted: self.quantize(self.muted, options),
             warning: self.quantize(self.warning, options),
             error: self.quantize(self.error, options),
@@ -319,7 +398,6 @@ impl PaletteSeed {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct ActivityTheme {
     pub status: Style,
     pub header: Style,
@@ -328,13 +406,11 @@ pub struct ActivityTheme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct BannerTheme {
     pub wordmark: Style,
     pub identity: Style,
 }
 
-#[allow(dead_code)]
 impl BannerTheme {
     fn from_palette(palette: &Palette) -> Self {
         // Brand rule: letterforms are one tone (theme foreground, no
@@ -348,41 +424,43 @@ impl BannerTheme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct ComposerTheme {
     pub rule: Style,
+    pub queued_rule: Style,
     pub text: Style,
+    pub placeholder: Style,
     pub overflow: Style,
     pub token_bar: Style,
 }
 
-#[allow(dead_code)]
 impl ComposerTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
-            rule: Style::default()
-                .fg(palette.user)
-                .add_modifier(Modifier::BOLD),
-            text: Style::default().fg(palette.foreground),
-            overflow: Style::default()
-                .fg(palette.warning)
-                .add_modifier(Modifier::BOLD),
-            token_bar: Style::default().fg(palette.muted),
+            rule: Style::default().fg(palette.user_rail),
+            queued_rule: Style::default().fg(palette.queued_rail),
+            text: Style::default().fg(palette.user),
+            placeholder: Style::default().fg(palette.muted),
+            overflow: Style::default().fg(palette.warning),
+            token_bar: Style::default().fg(palette.queued_rail),
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct StatusTheme {
     pub base: Style,
     pub state: Style,
     pub model: Style,
     pub cost: Style,
     pub ctx: Style,
+    /// Footer v2 (Review v2 §15): the whole footer's default faint token —
+    /// reuses the existing `gutter` role (Warm Ledger: `#5f584a`).
+    pub faint: Style,
+    /// Footer v2 §15: branch parens sit one step brighter than the rest of
+    /// the footer — reuses the existing `muted` role (Warm Ledger: `#8b8570`).
+    pub branch: Style,
 }
 
-#[allow(dead_code)]
 impl StatusTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
@@ -391,11 +469,12 @@ impl StatusTheme {
             model: Style::default().fg(palette.st_model),
             cost: Style::default().fg(palette.st_cost),
             ctx: Style::default().fg(palette.st_ctx),
+            faint: Style::default().fg(palette.gutter),
+            branch: Style::default().fg(palette.muted),
         }
     }
 }
 
-#[allow(dead_code)]
 impl ActivityTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
@@ -410,7 +489,6 @@ impl ActivityTheme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct TranscriptTheme {
     pub body: Style,
     pub user: Style,
@@ -424,15 +502,17 @@ pub struct TranscriptTheme {
     pub check: Style,
     pub control: Style,
     pub gutter: Style,
+    pub hairline: Style,
     pub muted: Style,
     pub added: Style,
     pub removed: Style,
     pub changed: Style,
     pub warning: Style,
     pub error: Style,
+    /// Read/reference/companion role (teal rail + companion headers).
+    pub companion: Style,
 }
 
-#[allow(dead_code)]
 impl TranscriptTheme {
     fn from_palette(palette: &Palette) -> Self {
         Self {
@@ -442,7 +522,9 @@ impl TranscriptTheme {
                 .add_modifier(Modifier::BOLD),
             assistant: Style::default().fg(palette.assistant),
             model: Style::default().fg(palette.muted),
-            reasoning: Style::default().fg(palette.changed),
+            reasoning: Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::ITALIC),
             tool: Style::default().fg(palette.tool),
             tool_error: Style::default()
                 .fg(palette.error)
@@ -454,6 +536,7 @@ impl TranscriptTheme {
             check: Style::default().fg(palette.tool),
             control: Style::default().fg(palette.muted),
             gutter: Style::default().fg(palette.gutter),
+            hairline: Style::default().fg(palette.hairline),
             muted: Style::default().fg(palette.muted),
             added: Style::default().fg(palette.added),
             removed: Style::default().fg(palette.removed),
@@ -462,6 +545,8 @@ impl TranscriptTheme {
             error: Style::default()
                 .fg(palette.error)
                 .add_modifier(Modifier::BOLD),
+            // Companion/read role reuses the tool/teal hue (semantic read/reference).
+            companion: Style::default().fg(palette.tool),
         }
     }
 }
@@ -505,7 +590,7 @@ impl MarkupScopes {
             strong: Style::default()
                 .fg(palette.foreground)
                 .add_modifier(Modifier::BOLD),
-            code: Style::default().fg(palette.code),
+            code: Style::default().fg(palette.tool).bg(palette.surface),
             link: Style::default()
                 .fg(palette.tool)
                 .add_modifier(Modifier::UNDERLINED),
@@ -530,17 +615,24 @@ pub struct DiffScopes {
 impl DiffScopes {
     fn from_palette(palette: &Palette) -> Self {
         Self {
-            inserted: Style::default().fg(palette.added),
-            inserted_body: Style::default().fg(palette.foreground),
-            deleted: Style::default().fg(palette.removed),
-            deleted_body: Style::default().fg(palette.muted),
+            inserted: Style::default().fg(palette.added).bg(palette.added_tint),
+            inserted_body: Style::default()
+                .fg(palette.foreground)
+                .bg(palette.added_tint),
+            deleted: Style::default()
+                .fg(palette.removed)
+                .bg(palette.removed_tint),
+            deleted_body: Style::default()
+                .fg(palette.muted)
+                .bg(palette.removed_tint)
+                .add_modifier(Modifier::DIM),
             changed: Style::default()
                 .fg(palette.changed)
                 .bg(palette.changed_tint),
             context: Style::default().fg(palette.muted),
             hunk: Style::default()
-                .fg(palette.tool)
-                .add_modifier(Modifier::BOLD),
+                .fg(palette.gutter)
+                .add_modifier(Modifier::ITALIC),
         }
     }
 }
@@ -568,20 +660,20 @@ impl SyntaxScopes {
         Self {
             plain: Style::default().fg(palette.foreground),
             comment: Style::default()
-                .fg(palette.muted)
+                .fg(palette.gutter)
                 .add_modifier(Modifier::ITALIC),
             keyword: Style::default().fg(palette.warning),
-            type_name: Style::default().fg(palette.changed),
-            function: Style::default().fg(palette.added),
+            type_name: Style::default().fg(palette.warning),
+            function: Style::default().fg(palette.tool),
             string: Style::default().fg(palette.added),
-            number: Style::default().fg(palette.changed),
-            constant: Style::default().fg(palette.changed),
+            number: Style::default().fg(palette.added),
+            constant: Style::default().fg(palette.added),
             variable: Style::default().fg(palette.foreground),
-            property: Style::default().fg(palette.tool),
+            property: Style::default().fg(palette.foreground),
             operator: Style::default().fg(palette.warning),
-            punctuation: Style::default().fg(palette.gutter),
+            punctuation: Style::default().fg(palette.foreground),
             macro_name: Style::default().fg(palette.tool),
-            attribute: Style::default().fg(palette.changed),
+            attribute: Style::default().fg(palette.warning),
         }
     }
 
@@ -798,91 +890,96 @@ mod tests {
     #[test]
     fn default_theme_still_builds() {
         let theme = Theme::default_dark();
+
         assert_eq!(theme, Theme::default());
         assert_eq!(theme.palette.foreground, Color::Rgb(235, 219, 178));
         assert_eq!(theme.palette.background, GRUVBOX_DARK_BACKGROUND);
         assert_eq!(theme.palette.surface, Color::Rgb(60, 56, 54));
         assert_eq!(theme.palette.surface_high, Color::Rgb(80, 73, 69));
+        assert_eq!(theme.palette.hairline, Color::Rgb(80, 73, 69));
+        assert_eq!(theme.palette.composer_rule, Color::Rgb(102, 92, 84));
+        assert_eq!(theme.palette.user_rail, USER_RAIL_COLOR);
+        assert_eq!(theme.palette.queued_rail, Color::Rgb(102, 92, 84));
         assert_eq!(theme.palette.cursor, Color::Rgb(235, 219, 178));
+        assert_eq!(theme.palette.added_tint, Color::Rgb(80, 81, 39));
+        assert_eq!(theme.palette.removed_tint, Color::Rgb(99, 49, 43));
+        assert_eq!(theme.palette.changed_tint, Color::Rgb(90, 75, 41));
         assert_eq!(theme.transcript.added.fg, Some(theme.palette.added));
         assert_eq!(theme.color_level, ColorLevel::TrueColor);
     }
 
     #[test]
-    fn default_dark_background_order_prefers_opaque() {
-        assert_eq!(
-            BackgroundMode::DEFAULT_DARK_BACKGROUNDS,
-            [
-                BackgroundMode::DEFAULT_DARK_OPAQUE,
-                BackgroundMode::DEFAULT_DARK_TRANSPARENT
-            ]
-        );
+    fn background_modes_resolve_by_theme() {
+        let default_order = [
+            BackgroundMode::DEFAULT_DARK_OPAQUE,
+            BackgroundMode::DEFAULT_DARK_TRANSPARENT,
+        ];
+        assert_eq!(BackgroundMode::DEFAULT_DARK_BACKGROUNDS, default_order);
         assert_eq!(
             ThemeOptions::default_dark().background,
             BackgroundMode::DEFAULT_DARK_OPAQUE
         );
-    }
 
-    #[test]
-    fn derived_colors_resolve_once_into_palette() {
-        let theme = Theme::default_dark_with(ThemeOptions {
-            color_level: ColorLevel::TrueColor,
-            background: BackgroundMode::Opaque(Color::Rgb(10, 20, 30)),
-        });
-
-        assert!(matches!(theme.palette.added_tint, Color::Rgb(_, _, _)));
-        assert_eq!(theme.scopes.diff.inserted.bg, None);
-        assert_eq!(theme.scopes.diff.deleted.bg, None);
-        assert_ne!(theme.palette.added_tint, theme.palette.added);
-    }
-
-    #[test]
-    fn transparent_backgrounds_use_reset() {
-        let theme = Theme::default_dark_with(ThemeOptions {
+        let transparent = Theme::default_dark_with(ThemeOptions {
             color_level: ColorLevel::TrueColor,
             background: BackgroundMode::Transparent,
         });
+        assert_eq!(transparent.palette.background, Color::Reset);
+        assert_eq!(transparent.surfaces.transcript.background, Color::Reset);
+        assert_eq!(transparent.surfaces.composer.base.bg, Some(Color::Reset));
 
-        assert_eq!(theme.palette.background, Color::Reset);
-        assert_eq!(theme.surfaces.transcript.background, Color::Reset);
-        assert_eq!(theme.surfaces.composer.base.bg, Some(Color::Reset));
-    }
-
-    #[test]
-    fn default_light_theme_uses_opaque_light_background() {
-        let theme = Theme::default_light();
-
+        let light = Theme::default_light();
         assert_eq!(
-            theme.background,
+            light.background,
             BackgroundMode::Opaque(GRUVBOX_LIGHT_BACKGROUND)
         );
-        assert_eq!(theme.palette.background, GRUVBOX_LIGHT_BACKGROUND);
-        assert_eq!(theme.palette.foreground, Color::Rgb(60, 56, 54));
-        assert_eq!(theme.palette.cursor, Color::Rgb(60, 56, 54));
-        assert_eq!(theme.palette.surface, Color::Rgb(242, 229, 188));
-        assert_eq!(theme.palette.code, Color::Rgb(175, 58, 3));
+        assert_eq!(light.palette.background, GRUVBOX_LIGHT_BACKGROUND);
+        assert_eq!(light.palette.foreground, Color::Rgb(60, 56, 54));
+        assert_eq!(light.palette.cursor, Color::Rgb(60, 56, 54));
+        assert_eq!(light.palette.surface, Color::Rgb(242, 229, 188));
+        assert_eq!(light.palette.hairline, Color::Rgb(213, 196, 161));
+        assert_eq!(light.palette.composer_rule, Color::Rgb(189, 174, 147));
+        assert_eq!(light.palette.user_rail, Color::Rgb(66, 123, 88));
+        assert_eq!(light.palette.queued_rail, Color::Rgb(189, 174, 147));
+        assert_eq!(light.palette.code, Color::Rgb(175, 58, 3));
         assert_eq!(
-            theme.surfaces.transcript.base.bg,
+            light.surfaces.transcript.base.bg,
             Some(GRUVBOX_LIGHT_BACKGROUND)
         );
-    }
 
-    #[test]
-    fn opaque_backgrounds_are_precomputed_per_surface() {
-        let theme = Theme::default_dark_with(ThemeOptions {
+        let opaque = Theme::default_dark_with(ThemeOptions {
             color_level: ColorLevel::TrueColor,
             background: BackgroundMode::Opaque(Color::Rgb(12, 14, 16)),
         });
-
-        assert_eq!(theme.palette.background, Color::Rgb(12, 14, 16));
+        assert_eq!(opaque.palette.background, Color::Rgb(12, 14, 16));
         assert_eq!(
-            theme.surfaces.transcript.base.bg,
+            opaque.surfaces.transcript.base.bg,
             Some(Color::Rgb(12, 14, 16))
         );
         assert!(matches!(
-            theme.surfaces.status.background,
+            opaque.surfaces.status.background,
             Color::Rgb(_, _, _)
         ));
+    }
+
+    #[test]
+    fn warm_ledger_theme_uses_calibrated_tokens_and_tints() {
+        let theme = Theme::warm_ledger();
+
+        assert_eq!(theme.palette.hairline, Color::Rgb(0x38, 0x34, 0x1f));
+        assert_eq!(theme.palette.composer_rule, Color::Rgb(0x45, 0x3e, 0x26));
+        assert_eq!(theme.palette.user_rail, Color::Rgb(0xb3, 0xa6, 0x7e));
+        assert_eq!(theme.palette.queued_rail, Color::Rgb(0x6b, 0x63, 0x49));
+        assert_eq!(theme.palette.added_tint, Color::Rgb(0x34, 0x34, 0x24));
+        assert_eq!(theme.palette.removed_tint, Color::Rgb(0x38, 0x29, 0x1d));
+        assert_eq!(theme.palette.changed_tint, Color::Rgb(0x37, 0x30, 0x1c));
+        assert_eq!(theme.transcript.hairline.fg, Some(theme.palette.hairline));
+        assert_eq!(theme.composer.rule.fg, Some(theme.palette.user_rail));
+        assert_eq!(
+            theme.composer.queued_rule.fg,
+            Some(theme.palette.queued_rail)
+        );
+        assert_eq!(theme.composer.token_bar.fg, Some(theme.palette.queued_rail));
     }
 
     #[test]
@@ -906,39 +1003,57 @@ mod tests {
     }
 
     #[test]
-    fn markup_inserted_and_deleted_scopes_are_available() {
-        let theme = Theme::default_dark();
-        assert_eq!(theme.scopes.markup.inserted.fg, Some(theme.palette.added));
-        assert_eq!(theme.scopes.markup.deleted.fg, Some(theme.palette.removed));
-        assert_eq!(theme.scopes.diff.hunk.fg, Some(theme.palette.tool));
-        assert_eq!(theme.scopes.diff.context.fg, Some(theme.palette.muted));
-        assert_eq!(theme.scopes.diff.inserted.fg, Some(theme.palette.added));
-        assert_eq!(theme.scopes.diff.inserted.bg, None);
-        assert_eq!(theme.scopes.diff.deleted.fg, Some(theme.palette.removed));
-        assert_eq!(theme.scopes.diff.deleted.bg, None);
-        assert_eq!(
-            theme.scopes.diff.inserted_body.fg,
-            Some(theme.palette.foreground)
-        );
-        assert_eq!(theme.scopes.diff.inserted_body.bg, None);
-        assert_eq!(theme.scopes.diff.deleted_body.fg, Some(theme.palette.muted));
-        assert_eq!(theme.scopes.diff.deleted_body.bg, None);
-    }
+    fn semantic_scopes_reference_palette_tokens() {
+        let dark = Theme::default_dark();
+        assert_eq!(dark.scopes.markup.inserted.fg, Some(dark.palette.added));
+        assert_eq!(dark.scopes.markup.deleted.fg, Some(dark.palette.removed));
+        assert_eq!(dark.scopes.diff.hunk.fg, Some(dark.palette.gutter));
+        assert_eq!(dark.scopes.diff.context.fg, Some(dark.palette.muted));
+        assert_eq!(dark.scopes.syntax.comment.fg, Some(dark.palette.gutter));
 
-    #[test]
-    fn light_and_dark_diff_marker_styles_are_sign_only() {
         for theme in [Theme::default_dark(), Theme::default_light()] {
             assert_eq!(theme.scopes.diff.inserted.fg, Some(theme.palette.added));
-            assert_eq!(theme.scopes.diff.inserted.bg, None);
+            assert_eq!(
+                theme.scopes.diff.inserted.bg,
+                Some(theme.palette.added_tint)
+            );
             assert_eq!(
                 theme.scopes.diff.inserted_body.fg,
                 Some(theme.palette.foreground)
             );
-            assert_eq!(theme.scopes.diff.inserted_body.bg, None);
+            assert_eq!(
+                theme.scopes.diff.inserted_body.bg,
+                Some(theme.palette.added_tint)
+            );
             assert_eq!(theme.scopes.diff.deleted.fg, Some(theme.palette.removed));
-            assert_eq!(theme.scopes.diff.deleted.bg, None);
+            assert_eq!(
+                theme.scopes.diff.deleted.bg,
+                Some(theme.palette.removed_tint)
+            );
             assert_eq!(theme.scopes.diff.deleted_body.fg, Some(theme.palette.muted));
-            assert_eq!(theme.scopes.diff.deleted_body.bg, None);
+            assert_eq!(
+                theme.scopes.diff.deleted_body.bg,
+                Some(theme.palette.removed_tint)
+            );
         }
+    }
+
+    #[test]
+    fn derived_colors_resolve_once_into_palette() {
+        let theme = Theme::default_dark_with(ThemeOptions {
+            color_level: ColorLevel::TrueColor,
+            background: BackgroundMode::Opaque(Color::Rgb(10, 20, 30)),
+        });
+
+        assert!(matches!(theme.palette.added_tint, Color::Rgb(_, _, _)));
+        assert_eq!(
+            theme.scopes.diff.inserted.bg,
+            Some(theme.palette.added_tint)
+        );
+        assert_eq!(
+            theme.scopes.diff.deleted.bg,
+            Some(theme.palette.removed_tint)
+        );
+        assert_ne!(theme.palette.added_tint, theme.palette.added);
     }
 }

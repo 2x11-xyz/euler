@@ -220,12 +220,7 @@ fn subagent_tiers_map_to_existing_approval_modes() {
 
 #[test]
 fn subagent_decider_denies_if_gate_still_asks() {
-    let request = PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool edit_file".to_owned(),
-        command: None,
-        path: None,
-    };
+    let request = PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned());
     let mut gate = euler_core::permissions::PermissionGate::new(SubagentDecider::new(
         AutoApproveTier::ReadOnly,
     ));

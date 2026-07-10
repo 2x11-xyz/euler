@@ -217,6 +217,20 @@ fn submit_text_and_wait(core: &mut AppCore, text: &str) {
     wait_for_idle(core);
 }
 
+fn submit_without_wait(core: &mut AppCore, text: &str) {
+    type_text(core, text);
+    core.handle_input(key(KeyCode::Enter));
+}
+
+fn user_messages(core: &AppCore) -> Vec<String> {
+    core.transcript
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .filter_map(|event| event.payload.get("content")?.as_str().map(str::to_owned))
+        .collect()
+}
+
 fn shell_artifact_with_lines(total: usize) -> TranscriptItem {
     TranscriptItem::ToolRun {
         command: "printf lines".to_owned(),
@@ -227,17 +241,7 @@ fn shell_artifact_with_lines(total: usize) -> TranscriptItem {
             .collect::<Vec<_>>()
             .join("\n"),
         exit_code: Some(0),
-    }
-}
-
-fn patch_artifact_with_lines(total: usize) -> TranscriptItem {
-    TranscriptItem::PatchApplied {
-        path: "src/lib.rs".to_owned(),
-        old: (1..=total)
-            .map(|index| format!("old {index}\n"))
-            .collect::<String>()
-            .into(),
-        new: "new\n".to_owned().into(),
+        grant_source: None,
     }
 }
 
@@ -255,28 +259,17 @@ fn screen_row(contents: &str, row: u16) -> &str {
 }
 
 fn fs_write_request() -> PermissionRequest {
-    PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool edit_file".to_owned(),
-        command: None,
-        path: None,
-    }
+    PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned())
 }
 
 fn apply_patch_request() -> PermissionRequest {
-    PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "tool apply_patch".to_owned(),
-        command: None,
-        path: None,
-    }
+    PermissionRequest::new(Capability::FsWrite, "tool apply_patch".to_owned())
 }
 
 fn patch_modal(preview: PatchPreview) -> Modal {
     Modal::PatchApproval(PatchApprovalModal {
         request: fs_write_request(),
         preview,
-        expanded: false,
     })
 }
 
@@ -289,14 +282,88 @@ fn diff_preview(old: &str, new: &str) -> PatchPreview {
 }
 
 #[test]
-fn submit_starts_in_flight_and_rejects_second_submit() {
+fn submit_starts_in_flight_and_second_submit_queues() {
     let mut core = core();
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
     assert!(core.turn_in_flight());
 
+    core.handle_input(key(KeyCode::Char('q')));
     core.handle_input(key(KeyCode::Enter));
-    assert_eq!(core.notice.as_deref(), Some("turn already in progress"));
+
+    assert!(core.notice.is_none());
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["q"]
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "");
+}
+
+#[test]
+fn queued_inputs_auto_flush_fifo_after_normal_completion() {
+    let mut core = core_with_provider(SlowEchoProvider);
+    submit_without_wait(&mut core, "first");
+    submit_without_wait(&mut core, "second");
+    submit_without_wait(&mut core, "third");
+
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["first", "second", "third"]);
+    assert!(core.queued_inputs.is_empty());
+}
+
+#[test]
+fn interrupt_keeps_queue_until_user_continues() {
+    let mut core = core_with_provider(SlowEchoProvider);
+    submit_without_wait(&mut core, "first");
+    submit_without_wait(&mut core, "queued");
+
+    core.handle_input(key(KeyCode::Esc));
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["queued"]
+    );
+    assert_eq!(user_messages(&core), ["first"]);
+
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["first", "queued"]);
+}
+
+#[test]
+fn queued_input_recall_and_unqueue_use_selected_or_last() {
+    let mut core = core_with_provider(SlowEchoProvider);
+    submit_without_wait(&mut core, "active");
+    submit_without_wait(&mut core, "one");
+    submit_without_wait(&mut core, "two");
+
+    assert_eq!(core.handle_input(key(KeyCode::Up)), CoreEffect::Render);
+    assert_eq!(core.bottom.composer().submit_text(), "two");
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["one"]
+    );
+
+    core.handle_input(key(KeyCode::Enter));
+    type_text(&mut core, "three");
+    core.handle_input(key(KeyCode::Enter));
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["one", "two", "three"]
+    );
+
+    core.handle_input(key(KeyCode::Left));
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["one", "three"]
+    );
 }
 
 #[test]
@@ -321,41 +388,49 @@ fn worker_completion_returns_idle() {
 }
 
 #[test]
-fn modal_input_replies_allow_deny_and_allow_all() {
+fn modal_input_replies_allow_deny_and_scoped() {
     for (code, reply) in [
-        (KeyCode::Char('1'), PermissionReply::Allow),
-        (KeyCode::Char('y'), PermissionReply::Allow),
-        (KeyCode::Char('3'), PermissionReply::Deny),
+        (KeyCode::Char('y'), PermissionReply::AllowOnce),
         (KeyCode::Char('n'), PermissionReply::Deny),
-        (KeyCode::Char('2'), PermissionReply::AllowAll),
-        (KeyCode::Char('a'), PermissionReply::AllowAll),
+        (
+            KeyCode::Char('a'),
+            PermissionReply::AllowSessionScope(String::new()),
+        ),
+        (
+            KeyCode::Char('p'),
+            PermissionReply::AllowProjectScope(String::new()),
+        ),
     ] {
         let mut core = core();
         let (reply_tx, reply_rx) = mpsc::channel();
         core.reply_tx = reply_tx;
-        core.modal = Some(Modal::Permission(PermissionRequest {
-            capability: Capability::FsWrite,
-            reason: "edit".to_owned(),
-            command: None,
-            path: None,
-        }));
+        core.modal = Some(Modal::Permission(PermissionRequest::new(
+            Capability::FsWrite,
+            "edit".to_owned(),
+        )));
         core.handle_input(key(code));
         assert_eq!(reply_rx.recv().expect("reply"), reply);
     }
 }
 
 #[test]
-fn patch_modal_option_two_uses_existing_session_capability_approval() {
+fn patch_modal_session_scope_uses_path_prefix_when_present() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+    core.modal = Some(Modal::PatchApproval(PatchApprovalModal {
+        request: fs_write_request().with_path("crates/euler-cli/src/lib.rs"),
+        preview: diff_preview("alpha\n", "beta\n"),
+    }));
 
-    let effect = core.handle_input(key(KeyCode::Char('2')));
+    let effect = core.handle_input(key(KeyCode::Char('a')));
 
     assert_eq!(effect, CoreEffect::Render);
     assert!(core.modal.is_none());
-    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::AllowAll);
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowSessionScope("crates".into())
+    );
 }
 
 #[test]
@@ -363,12 +438,10 @@ fn modal_ctrl_c_denies_and_quits() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "edit".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::FsWrite,
+        "edit".to_owned(),
+    )));
 
     let effect = core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
@@ -418,17 +491,22 @@ fn permission_modal_swallows_scrollback_keys_without_replying() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(Modal::Permission(PermissionRequest {
-        capability: Capability::FsWrite,
-        reason: "edit".to_owned(),
-        command: None,
-        path: None,
-    }));
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::FsWrite,
+        "edit".to_owned(),
+    )));
 
-    assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::None);
-    assert_eq!(
-        core.handle_input(modified_key(KeyCode::Up, KeyModifiers::CONTROL)),
-        CoreEffect::None
+    // PageUp/Ctrl+Up may move selection (Render) or be swallowed (None), but
+    // must never send a permission reply.
+    let page_up = core.handle_input(key(KeyCode::PageUp));
+    assert!(
+        matches!(page_up, CoreEffect::None | CoreEffect::Render),
+        "page up should not reply: {page_up:?}"
+    );
+    let ctrl_up = core.handle_input(modified_key(KeyCode::Up, KeyModifiers::CONTROL));
+    assert!(
+        matches!(ctrl_up, CoreEffect::None | CoreEffect::Render),
+        "ctrl+up should not reply: {ctrl_up:?}"
     );
 
     assert_eq!(core.transcript.scroll_offset(), 0);
@@ -602,6 +680,10 @@ fn ctrl_c_double_press_quits_when_idle() {
     let ctrl_c = modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
     assert_eq!(core.handle_input(ctrl_c.clone()), CoreEffect::Render);
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("ctrl+c again to quit · session saved, /resume restores")
+    );
     assert_eq!(core.handle_input(ctrl_c), CoreEffect::Quit);
 }
 
@@ -632,7 +714,10 @@ fn uppercase_ctrl_c_without_shift_arms_quit_and_does_not_copy() {
     );
 
     assert!(writes.lock().expect("clipboard lock").is_empty());
-    assert_eq!(core.notice.as_deref(), Some("press Ctrl+C again to quit"));
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("ctrl+c again to quit · session saved, /resume restores")
+    );
 }
 
 #[test]
@@ -657,7 +742,8 @@ fn escape_interrupts_in_flight_turn() {
     }
     assert!(core.notice.is_none());
     assert!(!core.interrupted_guidance);
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("Conversation interrupted"));
+    assert!(drain_finalized_visual_text(&mut core, 80)
+        .contains("interrupted — tell euler what to do differently"));
 }
 
 #[test]
@@ -851,8 +937,12 @@ fn composer_accepts_next_draft_edits_while_turn_is_in_flight() {
     assert_eq!(core.bottom.composer().submit_text(), "next\ndraft");
     assert!(core.turn_in_flight());
     assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
-    assert_eq!(core.notice.as_deref(), Some("turn already in progress"));
-    assert_eq!(core.bottom.composer().submit_text(), "next\ndraft");
+    assert!(core.notice.is_none());
+    assert_eq!(
+        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
+        ["next\ndraft"]
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "");
 }
 
 #[test]
@@ -1072,14 +1162,17 @@ fn modal_input_keeps_precedence_while_turn_is_in_flight() {
     };
     core.modal = Some(Modal::Permission(fs_write_request()));
 
-    assert_eq!(core.handle_input(key(KeyCode::Char('x'))), CoreEffect::None);
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('x'))),
+        CoreEffect::Render
+    );
     assert_eq!(
         core.handle_input(InputEvent::Paste("pasted".to_owned())),
-        CoreEffect::None
+        CoreEffect::Render
     );
 
     assert!(matches!(core.modal, Some(Modal::Permission(_))));
-    assert!(core.bottom.composer().submit_text().is_empty());
+    assert_eq!(core.bottom.composer().submit_text(), "xpasted");
 }
 
 #[test]
@@ -1168,7 +1261,7 @@ fn active_turn_frame_shows_working_state_and_next_draft() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(text.contains("◦ Working"), "frame: {text:?}");
+    assert!(text.contains("⠋ working"), "frame: {text:?}");
     assert!(text.contains("▌ next draft"), "frame: {text:?}");
 }
 
@@ -1198,7 +1291,7 @@ fn active_turn_live_transcript_prefix_is_committable() {
         .join("\n");
 
     assert!(text.contains("line one"), "frame: {text:?}");
-    assert!(text.contains("◦ Working"), "frame: {text:?}");
+    assert!(text.contains("⠋ working"), "frame: {text:?}");
     assert!(frame.committable_rows > 0);
     assert!(frame.committable_rows < frame.active_frame_lines.len());
 }
@@ -1321,7 +1414,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(folded.contains("8 hidden lines"), "folded: {folded:?}");
+    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
 
     assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::Render);
@@ -1332,7 +1425,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     );
     assert_eq!(core.visual_scroll_offset(), 0);
     let expanded = drain_finalized_visual_text(&mut core, 80);
-    assert!(!expanded.contains("hidden lines"), "expanded: {expanded:?}");
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
     assert_eq!(core.bottom.composer().submit_text(), "");
 
@@ -1341,11 +1434,51 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
         CoreEffect::ReplayHistoryWithScrollbackPurge
     );
     let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
+    assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
+}
+
+#[test]
+fn ctrl_o_expands_and_refolds_finalized_reasoning_items() {
+    // Review finding: the collapsed thought line advertises "ctrl+o expand"
+    // but ModelReasoning was not classified foldable, so ctrl+o never
+    // targeted it. Verify the toggle actually reaches a reasoning item.
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::ModelReasoning {
+        fidelity: "raw".to_owned(),
+        content: "First sentence stays short.\nSecond paragraph reveals much \
+                  more detail that only appears once ctrl+o expands the full thought."
+            .to_owned(),
+    });
+
+    let folded = drain_finalized_visual_text(&mut core, 80);
+    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
+    assert!(!folded.contains("Second paragraph"), "folded: {folded:?}");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let expanded = drain_finalized_visual_text(&mut core, 80);
     assert!(
-        refolded.contains("8 hidden lines"),
+        expanded.contains("ctrl+o collapse"),
+        "expanded: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("Second paragraph"),
+        "expanded: {expanded:?}"
+    );
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(refolded.contains("ctrl+o expand"), "refolded: {refolded:?}");
+    assert!(
+        !refolded.contains("Second paragraph"),
         "refolded: {refolded:?}"
     );
-    assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
 }
 
 #[test]
@@ -1360,11 +1493,11 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw folded");
     let folded = terminal.backend().screen_contents();
-    assert!(folded.contains("44 hidden lines"), "folded: {folded:?}");
+    assert!(folded.contains("44 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
     let folded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
-        folded_scrollback.contains("44 hidden lines"),
+        folded_scrollback.contains("44 more lines"),
         "folded summary should commit to native scrollback: {folded_scrollback:?}"
     );
 
@@ -1388,7 +1521,7 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw expanded");
     let expanded = terminal.backend().screen_contents();
-    assert!(!expanded.contains("hidden lines"), "expanded: {expanded:?}");
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 48"), "expanded: {expanded:?}");
     let expanded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
@@ -1416,14 +1549,11 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw refolded");
     let refolded = terminal.backend().screen_contents();
-    assert!(
-        refolded.contains("44 hidden lines"),
-        "refolded: {refolded:?}"
-    );
+    assert!(refolded.contains("44 more lines"), "refolded: {refolded:?}");
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
     let refolded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
-        refolded_scrollback.contains("44 hidden lines"),
+        refolded_scrollback.contains("44 more lines"),
         "refold replay should commit folded summary: {refolded_scrollback:?}"
     );
 }
@@ -1480,6 +1610,7 @@ fn live_file_diff_replaces_prior_patch_preview_for_same_path() {
         before_byte_len: None,
         after_byte_len: Some(20),
         diff_redaction: "omitted".to_owned(),
+        checkpoint_event_id: None,
     });
     core.push_finalized_visual_item(TranscriptItem::FileDiff {
         path: "src/lib.rs".to_owned(),
@@ -1489,6 +1620,7 @@ fn live_file_diff_replaces_prior_patch_preview_for_same_path() {
         truncated: false,
         truncation: String::new(),
         omitted_reason: None,
+        checkpoint_event_id: None,
     });
 
     let rendered = core
@@ -1599,17 +1731,43 @@ fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
     );
 }
 
+/// Issue #49: `ctrl+o` is a single global toggle — every foldable cell in a
+/// mixed transcript (tool run, reasoning, diff) expands together on the
+/// first press and collapses together on the second, with no per-cell
+/// targeting or invisible nearest-to-viewport heuristic.
 #[test]
-fn ctrl_o_expands_shell_artifacts_without_expanding_patch_cells() {
+fn ctrl_o_expands_all_foldable_artifacts_globally() {
     let mut core = core();
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
-    let patch_line = format!("old {}", TOOL_CALL_MAX_LINES + 10);
-    core.push_finalized_visual_item(patch_artifact_with_lines(TOOL_CALL_MAX_LINES + 14));
+    core.push_finalized_visual_item(TranscriptItem::ModelReasoning {
+        fidelity: "detailed".to_owned(),
+        content: "Weighing the tradeoffs between approach A and approach B. \
+            After a long deliberation the conclusion lands on approach B \
+            because it is the option that fully honors the unique reasoning marker."
+            .to_owned(),
+    });
+    core.push_finalized_visual_item(TranscriptItem::PatchApplied {
+        path: "src/lib.rs".to_owned(),
+        old: None,
+        new: Some(
+            (1..=20)
+                .map(|line| format!("added line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        ),
+    });
+    core.push_finalized_visual_item(shell_artifact_with_lines(14));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(folded.contains("8 hidden lines"), "folded: {folded:?}");
-    assert!(!folded.contains("bounded patch"), "folded: {folded:?}");
-    assert!(folded.contains(&patch_line), "folded: {folded:?}");
+    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("10 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
+    assert!(
+        !folded.contains("unique reasoning marker"),
+        "folded: {folded:?}"
+    );
+    assert!(!folded.contains("added line 15"), "folded: {folded:?}");
 
     assert_eq!(
         core.handle_input(ctrl_o()),
@@ -1617,16 +1775,34 @@ fn ctrl_o_expands_shell_artifacts_without_expanding_patch_cells() {
     );
     let expanded = drain_finalized_visual_text(&mut core, 80);
 
-    assert!(
-        !expanded.contains("8 hidden lines"),
-        "expanded: {expanded:?}"
-    );
+    // All foldable cells expand together — none remain collapsed.
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
     assert!(
-        !expanded.contains("bounded patch"),
+        expanded.contains("unique reasoning marker"),
         "expanded: {expanded:?}"
     );
-    assert!(expanded.contains(&patch_line), "expanded: {expanded:?}");
+    assert!(
+        expanded.contains("ctrl+o collapse"),
+        "expanded: {expanded:?}"
+    );
+    assert!(expanded.contains("added line 15"), "expanded: {expanded:?}");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("10 more lines"), "refolded: {refolded:?}");
+    assert!(
+        !refolded.contains("unique reasoning marker"),
+        "refolded: {refolded:?}"
+    );
+    assert!(
+        !refolded.contains("added line 15"),
+        "refolded: {refolded:?}"
+    );
 }
 
 #[test]
@@ -1637,7 +1813,22 @@ fn ctrl_o_without_foldable_artifact_is_noop_and_does_not_edit_composer() {
     assert_eq!(core.handle_input(ctrl_o()), CoreEffect::None);
 
     assert_eq!(core.bottom.composer().submit_text(), "");
-    assert!(!drain_finalized_visual_text(&mut core, 80).contains("hidden lines"));
+    assert!(!drain_finalized_visual_text(&mut core, 80).contains("more lines"));
+}
+
+#[test]
+fn footer_ctrl_o_hint_only_appears_when_a_foldable_artifact_exists() {
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::AssistantMessage("plain answer".to_owned()));
+
+    let without_fold = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(without_fold.contains("/ commands"));
+    assert!(!without_fold.contains("ctrl+o expand"));
+
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+
+    let with_fold = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(with_fold.contains("/ commands · ctrl+o expand"));
 }
 
 #[test]
@@ -1649,7 +1840,7 @@ fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     assert_eq!(modal_core.handle_input(ctrl_o()), CoreEffect::None);
     let modal_text = drain_finalized_visual_text(&mut modal_core, 80);
     assert!(
-        modal_text.contains("8 hidden lines"),
+        modal_text.contains("8 more lines"),
         "modal_text: {modal_text:?}"
     );
     assert!(matches!(modal_core.modal, Some(Modal::Permission(_))));
@@ -1661,7 +1852,7 @@ fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     assert_eq!(palette_core.handle_input(ctrl_o()), CoreEffect::None);
     let palette_text = drain_finalized_visual_text(&mut palette_core, 80);
     assert!(
-        palette_text.contains("8 hidden lines"),
+        palette_text.contains("8 more lines"),
         "palette_text: {palette_text:?}"
     );
     let BottomOwner::Palette(palette) = palette_core.bottom.owner() else {
@@ -1695,7 +1886,7 @@ fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!text.contains("hidden lines"), "text: {text:?}");
+    assert!(!text.contains("more lines"), "text: {text:?}");
     assert!(text.contains("line 3"), "text: {text:?}");
     assert!(core.turn_in_flight());
 
@@ -1713,7 +1904,7 @@ fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
     assert!(refolded.committable_rows > 0);
     assert!(refolded.committable_rows <= refolded.history_rows);
     assert!(
-        refolded_text.contains("hidden lines"),
+        refolded_text.contains("more lines"),
         "refolded_text: {refolded_text:?}"
     );
     assert!(core.turn_in_flight());
@@ -1933,6 +2124,42 @@ fn name_session_refreshes_metadata_after_durable_rename() {
         .expect("find session")
         .expect("session record");
     assert_eq!(refreshed.name(), Some("clean name"));
+
+    // #46: the footer picks up the name from the same render, no extra
+    // rebuild needed — and even though naming failed the metadata refresh
+    // in the sibling test above, the footer there still updates (asserted
+    // separately below) because it never depended on that refresh.
+    assert_eq!(core.status.session_name.as_deref(), Some("clean name"));
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(rendered.ends_with("echo · ctx ?% · clean name"));
+}
+
+#[test]
+fn name_session_updates_footer_immediately_even_if_metadata_refresh_fails() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    config.agent_id = "tui-test".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(record.events_path()).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    let alternate_home = EulerHome::from_root(temp.path().join(".other-euler")).expect("home");
+    core.session_store = Some(SessionStore::new(alternate_home).expect("alternate store"));
+
+    assert_eq!(core.status.session_name, None);
+    assert_eq!(
+        core.name_current_session("still named".to_owned()),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.status.session_name.as_deref(), Some("still named"));
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(rendered.ends_with("echo · ctx ?% · still named"));
 }
 
 #[test]
@@ -2065,6 +2292,65 @@ fn export_session_creates_private_files() {
 }
 
 #[test]
+fn export_session_omits_runtime_only_model_delta_and_stays_parent_closed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let out = temp.path().join("session.json");
+    let mut core = core();
+
+    // Drive a real turn through EchoProvider, which streams a TextDelta
+    // before finishing; this produces at least one model.delta event in
+    // session.events() (runtime-only, never persisted per
+    // docs/contracts/events.md).
+    for ch in "hello".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(&mut core);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should be idle");
+    };
+    assert!(
+        session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_DELTA),
+        "test setup should produce a model.delta event to filter"
+    );
+
+    assert_eq!(
+        core.export_session(Some(out.display().to_string())),
+        CoreEffect::Render
+    );
+
+    let exported: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out).expect("read export"))
+            .expect("export json");
+    let events = exported["events"].as_array().expect("events array").clone();
+    assert!(!events.is_empty());
+
+    let exported_ids: std::collections::BTreeSet<&str> = events
+        .iter()
+        .map(|event| event["id"].as_str().expect("event id"))
+        .collect();
+
+    for event in &events {
+        assert_ne!(
+            event["kind"].as_str(),
+            Some(EventKind::MODEL_DELTA),
+            "exported events must never include runtime-only model.delta"
+        );
+        if let Some(parent) = event["parent"].as_str() {
+            assert!(
+                exported_ids.contains(parent),
+                "exported event {:?} parents {parent:?}, which is missing from the export",
+                event["id"]
+            );
+        }
+    }
+}
+
+#[test]
 fn status_reports_session_id_while_turn_is_in_flight() {
     let mut core = core();
     let session_id = core.status.session_id.clone().expect("session id");
@@ -2181,12 +2467,39 @@ fn resume_picker_reports_empty_state_without_active_turn_language() {
         CoreEffect::Render
     );
 
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume needs an active session"));
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("resume needs an active session"));
+    assert!(
+        !text.contains("ui:"),
+        "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
+    );
+}
+
+#[test]
+fn resume_refusal_for_already_active_session_is_a_neutral_notice() {
+    let mut core = core();
+    let session_id = match &core.state {
+        AppState::Idle { session } => session.session_id().to_owned(),
+        _ => panic!("expected an idle session"),
+    };
+
+    assert_eq!(
+        core.resume_session_from_picker(session_id.clone()),
+        CoreEffect::Render
+    );
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains(&format!("already using session {session_id}")));
+    assert!(
+        !text.contains("ui:"),
+        "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
+    );
 }
 
 #[test]
 fn resume_picker_waits_while_turn_is_in_flight() {
     let mut core = core();
+    core.bottom.composer_mut().insert_text("keep this draft");
     let (_worker_tx, worker_rx) = std::sync::mpsc::channel();
     core.state = AppState::TurnInFlight {
         worker_rx,
@@ -2199,7 +2512,21 @@ fn resume_picker_waits_while_turn_is_in_flight() {
         CoreEffect::Render
     );
 
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume waits for the active turn"));
+    // Spec §5.10: faint notice above composer; input preserved (not a transcript error).
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("resume waits for the active turn")
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "keep this draft");
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        text.contains("resume waits for the active turn"),
+        "notice must render above composer: {text}"
+    );
+    assert!(
+        !text.contains("! ui: resume waits"),
+        "must not be a transcript error row: {text}"
+    );
 }
 
 #[test]
@@ -2223,17 +2550,120 @@ fn accepting_resume_purges_prior_native_scrollback() {
             events,
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "useful resumed name".to_owned(),
+            session_name: None,
             recovery_closure_appended: false,
             warning_count: 0,
+            events_replayed: 1,
         },
     );
 
     assert_eq!(effect, CoreEffect::ReplayHistoryWithScrollbackPurge);
-    assert_eq!(
-        core.notice.as_deref(),
-        Some("resumed session useful resumed name")
+    assert!(core.notice.is_none());
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("resumed content"), "text: {text}");
+    assert!(
+        text.contains("✓ resumed session useful resumed name"),
+        "text: {text}"
     );
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("resumed content"));
+    assert!(
+        text.contains("1 events replayed · model context folded to stubs"),
+        "text: {text}"
+    );
+}
+
+#[test]
+fn accepting_resume_restamps_replayed_history_when_timestamps_are_on() {
+    // Review v2 §6: a rebuild (resume, new session, rollback) must stamp
+    // every replayed event from its own provenance time — not leave the
+    // gutter blank until new events arrive.
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(".");
+    config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider);
+    let events = vec![event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "resumed content".into())]),
+    )];
+
+    core.accept_tui_resume(
+        "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned(),
+        TuiResume {
+            session,
+            channels,
+            events,
+            active_target: ModelTarget::new("fixture", "echo"),
+            display_label: "useful resumed name".to_owned(),
+            session_name: None,
+            recovery_closure_appended: false,
+            warning_count: 0,
+            events_replayed: 1,
+        },
+    );
+
+    let lines = core
+        .drain_finalized_visual_lines(80)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let row = lines
+        .iter()
+        .position(|line| line.contains("resumed content"))
+        .expect("replayed row");
+    let stamp: String = lines[row].chars().take(8).collect();
+    assert!(
+        looks_like_hh_mm_ss(&stamp),
+        "replayed history should be restamped, not blank: {:?}",
+        lines[row]
+    );
+}
+
+#[test]
+fn accepting_resume_boundary_includes_recovery_and_warnings() {
+    let mut core = core();
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(".");
+    config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider);
+
+    let effect = core.accept_tui_resume(
+        "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned(),
+        TuiResume {
+            session,
+            channels,
+            events: Vec::new(),
+            active_target: ModelTarget::new("fixture", "echo"),
+            display_label: "broken tail".to_owned(),
+            session_name: None,
+            recovery_closure_appended: true,
+            warning_count: 2,
+            events_replayed: 7,
+        },
+    );
+
+    assert_eq!(effect, CoreEffect::ReplayHistoryWithScrollbackPurge);
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        text.contains("✓ resumed session broken tail"),
+        "text: {text}"
+    );
+    assert!(text.contains("recovery closure appended"), "text: {text}");
+    assert!(text.contains("warnings"), "text: {text}");
+    assert!(text.contains("· 2"), "text: {text}");
+    assert!(
+        text.contains("7 events replayed · model context folded to stubs"),
+        "text: {text}"
+    );
 }
 
 #[test]
@@ -2448,7 +2878,7 @@ fn slash_palette_trailing_noise_correction_submits_visible_effort_argument() {
         panic!("palette should own surface");
     };
     assert_eq!(palette.input(), "/effort// large");
-    assert_eq!(palette.selected_token(), Some("/effort"));
+    assert_eq!(palette.selected_token(), Some("/effort".to_owned()));
 
     core.handle_input(key(KeyCode::Enter));
 
@@ -2548,7 +2978,7 @@ fn activity_live_status_is_gated_by_turn_state() {
     terminal
         .draw(|frame| core.render(frame))
         .expect("idle draw");
-    assert!(!terminal.backend().screen_contents().contains("◦ Working"));
+    assert!(!terminal.backend().screen_contents().contains("⠋ working"));
 
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -2560,8 +2990,419 @@ fn activity_live_status_is_gated_by_turn_state() {
         .draw(|frame| core.render(frame))
         .expect("in-flight draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("◦ Working (0s • esc to interrupt)"));
+    assert!(contents.contains("⠋ working · 0s · esc to interrupt"));
     assert!(contents.contains("▌"));
+}
+
+/// Issue #27: the spinner frame is a pure tick counter, advanced only by
+/// `advance_spinner` (the periodic background poll) never by reading
+/// `Instant::now()` fresh in render — so the animation is testable by
+/// injecting synthetic `now` values instead of sleeping.
+#[test]
+fn working_hud_spinner_advances_on_tick_not_wall_clock() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    let t0 = Instant::now();
+
+    // First call only seeds the schedule; no tick fires yet.
+    assert!(!core.advance_spinner_at(t0));
+    assert_eq!(core.spinner_frame, 0);
+
+    // Under the 90ms cadence: no advance.
+    assert!(!core.advance_spinner_at(t0 + Duration::from_millis(50)));
+    assert_eq!(core.spinner_frame, 0);
+
+    // At/after the cadence: advances exactly one frame.
+    assert!(core.advance_spinner_at(t0 + Duration::from_millis(90)));
+    assert_eq!(core.spinner_frame, 1);
+    assert!(!core.advance_spinner_at(t0 + Duration::from_millis(120)));
+    assert_eq!(core.spinner_frame, 1);
+    assert!(core.advance_spinner_at(t0 + Duration::from_millis(200)));
+    assert_eq!(core.spinner_frame, 2);
+}
+
+#[test]
+fn working_hud_spinner_resets_when_turn_ends() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    let t0 = Instant::now();
+    core.advance_spinner_at(t0);
+    core.advance_spinner_at(t0 + Duration::from_millis(90));
+    assert_eq!(core.spinner_frame, 1);
+
+    core.state = AppState::Empty;
+    assert!(core.advance_spinner());
+    assert_eq!(core.spinner_frame, 0);
+}
+
+/// Issue #27: the phase verb swaps in place as streamed tool-call/reasoning
+/// events arrive, with `run_shell` distinguishing bash from a test-runner
+/// invocation, and falls back to "working" before any such event lands.
+#[test]
+fn working_hud_phase_verb_reflects_streamed_turn_events() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    assert_eq!(core.current_phase_verb, None);
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("input", json!({"path": "src/lib.rs"})),
+        ]),
+    )));
+    assert_eq!(
+        core.current_phase_verb.as_deref(),
+        Some("reading src/lib.rs")
+    );
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-edit".into()),
+            ("name", "edit_file".into()),
+            ("input", json!({"path": "src/lib.rs"})),
+        ]),
+    )));
+    assert_eq!(
+        core.current_phase_verb.as_deref(),
+        Some("writing src/lib.rs")
+    );
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-bash".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "ls -la"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-test".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "cargo nextest run --workspace"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+
+    // A non-phase-carrying event (model delta) leaves the verb in place.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer".into())]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+}
+
+/// #47(a): while reasoning streams, the dim-italic reasoning text itself
+/// renders as continuation lines under the live `thinking · Ns` line.
+#[test]
+fn reasoning_stream_tail_renders_under_the_thinking_line() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "let me check the ".into()),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "call site first".into()),
+        ]),
+    )));
+
+    let frame = core.render_visual_canvas(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("let me check the call site first"), "{text}");
+
+    let reasoning_line = frame
+        .active_frame_lines
+        .iter()
+        .find(|line| line.plain_text().contains("let me check"))
+        .expect("reasoning continuation line present");
+    assert_eq!(
+        reasoning_line.spans[0].style,
+        core.theme.transcript.reasoning
+    );
+}
+
+/// #47(a): the tail clears the moment answer text starts streaming, and a
+/// late reasoning delta afterward must never reopen it.
+#[test]
+fn reasoning_stream_tail_clears_when_answer_text_starts_and_never_reopens() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "thinking...".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "thinking...");
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+
+    // A late reasoning delta (unusual, but must not reopen the tail).
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "too late".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+}
+
+/// #47(a): the tail also clears the moment the reasoning item finalizes
+/// (`MODEL_REASONING`), and it never survives past the turn's end.
+#[test]
+fn reasoning_stream_tail_clears_on_finalize_and_turn_end() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "thinking...".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "thinking...");
+
+    // A second `MODEL_REASONING` (e.g. a further reasoning round after a
+    // tool call) finalizes the current item and clears the live tail.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "final thought".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "one more round".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "one more round");
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+    assert_eq!(core.reasoning_stream_tail, "");
+}
+
+/// #47(a): the streamed tail is bounded (~400 chars) and truncates from the
+/// left on a char boundary — never splitting a multibyte glyph.
+#[test]
+fn reasoning_stream_tail_is_bounded_and_multibyte_safe() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+
+    // Push enough multibyte deltas to overflow the 400-char bound.
+    for _ in 0..30 {
+        core.handle_turn_event(TurnEvent::Event(event(
+            EventKind::MODEL_DELTA,
+            object([
+                ("kind", "reasoning".into()),
+                ("delta", "こんにちは世界 ".into()),
+            ]),
+        )));
+    }
+
+    assert!(core.reasoning_stream_tail.chars().count() <= 400);
+    assert!(
+        core.reasoning_stream_tail
+            .chars()
+            .all(|ch| ch != '\u{fffd}'),
+        "{:?}",
+        core.reasoning_stream_tail
+    );
+}
+
+#[test]
+fn working_hud_phase_verb_resets_when_a_new_turn_spawns() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    core.current_phase_verb = Some("thinking".to_owned());
+    core.spinner_frame = 3;
+
+    core.spawn_turn("next".to_owned(), session);
+
+    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(core.spinner_frame, 0);
+}
+
+#[test]
+fn working_hud_phase_verb_resets_when_the_turn_completes() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.current_phase_verb = Some("thinking".to_owned());
+    core.spinner_frame = 3;
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+
+    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(core.spinner_frame, 0);
+}
+
+/// Issue #27: the spinner is gold (the theme's warning token) and the
+/// elapsed/hint suffix is dim (muted) — both routed through `Theme`, not a
+/// hardcoded hex; the verb itself carries no explicit color.
+#[test]
+fn working_hud_canvas_line_uses_theme_tokens_for_spinner_and_suffix() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.theme = Theme::warm_ledger();
+
+    let frame = core.render_visual_canvas(80);
+    let activity_line = frame
+        .active_frame_lines
+        .iter()
+        .find(|line| line.plain_text().contains("working"))
+        .expect("activity line present");
+    assert_eq!(activity_line.spans.len(), 3);
+    assert_eq!(
+        activity_line.spans[0].style.fg,
+        Some(core.theme.palette.warning)
+    );
+    assert_eq!(activity_line.spans[1].style.fg, None);
+    assert_eq!(
+        activity_line.spans[2].style.fg,
+        Some(core.theme.palette.muted)
+    );
+}
+
+/// Issue #27: the HUD line sits directly above the composer with no blank
+/// line between them.
+#[test]
+fn working_hud_sits_directly_above_composer_with_no_blank_line() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    let frame = core.render_visual_canvas(80);
+    let lines = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let hud_row = lines
+        .iter()
+        .position(|line| line.contains("working"))
+        .expect("HUD row present");
+    let composer_row = lines
+        .iter()
+        .enumerate()
+        .skip(hud_row + 1)
+        .find(|(_, line)| line.starts_with('▌'))
+        .map(|(index, _)| index)
+        .expect("composer row present");
+    assert_eq!(
+        composer_row,
+        hud_row + 1,
+        "no blank row between the HUD and the composer: lines: {lines:?}"
+    );
 }
 
 #[test]
@@ -2581,10 +3422,8 @@ fn interrupted_live_status_replaces_working_affordance() {
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let contents = terminal.backend().screen_contents();
-    assert!(
-        contents.contains("■ Conversation interrupted - tell the model what to do differently.")
-    );
-    assert!(!contents.contains("◦ Working"));
+    assert!(contents.contains("■ interrupted — tell euler what to do differently"));
+    assert!(!contents.contains("⠋ working"));
 }
 
 #[test]
@@ -2609,12 +3448,12 @@ fn layout_renders_at_80_by_24_and_after_resize() {
     terminal.backend_mut().resize(120, 40);
     assert!(terminal.draw(|frame| core.render(frame)).is_ok());
     let resized = terminal.backend().screen_contents();
-    assert!(resized.contains("fixture/echo"));
-    assert!(resized.contains("Context ?% used"));
+    assert!(resized.contains("echo · ctx ?%"));
+    assert!(!resized.contains("Context ?% used"));
 }
 
 #[test]
-fn footer_context_is_unknown_before_first_model_result() {
+fn footer_context_is_zero_percent_at_fresh_session_with_known_window() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core_with_fixture_catalog(
         EchoProvider,
@@ -2625,7 +3464,21 @@ fn footer_context_is_unknown_before_first_model_result() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Context ?% used"));
+    assert!(contents.contains("ctx 0%"));
+    assert!(!contents.contains("ctx ?%"));
+    assert!(!contents.contains("Context ?% used"));
+}
+
+#[test]
+fn footer_context_is_unknown_when_model_window_is_unknown() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core =
+        core_with_fixture_catalog(EchoProvider, "echo", fixture_catalog_with_windows(&[]));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("ctx ?%"));
 }
 
 #[test]
@@ -2643,9 +3496,11 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     wait_for_idle(&mut core);
 
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    // Footer v2 (#48): two hard-edged clusters, empty middle, no branch on
+    // the right (there is none here — non-git fixture cwd) and no `?` fill.
     assert_eq!(
         rendered,
-        "  fixture/echo medium · /euler · Context 12% used"
+        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
     );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
@@ -2667,14 +3522,14 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  fixture/echo medium · /euler · Context 12% used"
+        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  fixture/other medium · /euler · Context ?% used"
+        format!("  / commands · /tmp/euler{}other · ctx ?%", " ".repeat(80))
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -2683,7 +3538,7 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  fixture/other medium · /euler · Context 13% used"
+        format!("  / commands · /tmp/euler{}other · ctx 13%", " ".repeat(79))
     );
 }
 
@@ -2696,16 +3551,76 @@ fn patch_approval_modal_renders_diff_and_prompt() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Would you like to apply this patch?"));
-    assert!(contents.contains("Reason: fs-write: tool edit_file"));
+    assert!(contents.contains("Edit file?"));
+    assert!(!contents.contains("Approval required"));
+    assert!(contents.contains("fs-write · cwd"));
     assert!(contents.contains("note.txt"));
     assert!(contents.contains("alpha"));
     assert!(contents.contains("beta"));
-    assert!(contents.contains("1. Yes, proceed (y)"));
-    assert!(contents.contains("2. Yes, and don't ask again for fs-write this session (a)"));
-    assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
-    assert!(contents.contains("r. Review expanded patch (r)"));
+    let visual = core
+        .visual_canvas_frame(80)
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        visual.contains("write scope note.txt"),
+        "visual: {visual:?}"
+    );
+    // v2.1 (§7b): unknown/zero fields are omitted, not padded with "ran-before 0×".
+    assert!(!visual.contains("ran-before"), "visual: {visual:?}");
+    assert!(contents.contains("y  Allow once"));
+    assert!(!contents.contains("(default selection)"));
+    assert!(contents.contains("a  Allow fs-write"));
+    assert!(contents.contains("p  Allow fs-write"));
+    assert!(contents.contains("n/esc  Deny"));
+    assert!(contents.contains("Deny with instructions"));
+    assert!(!contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
+}
+
+#[test]
+fn patch_approval_modal_has_blank_line_before_options_and_gold_selection() {
+    let mut core = core();
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    let lines = core
+        .visual_canvas_frame(80)
+        .active_frame_lines
+        .into_iter()
+        .collect::<Vec<_>>();
+    let plain = lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let options_row = plain
+        .iter()
+        .position(|line| line.contains("y  Allow once"))
+        .expect("options row present");
+    assert!(
+        plain[options_row - 1].trim().is_empty()
+            || plain[options_row - 1].trim_matches(['│', ' ']).is_empty(),
+        "a blank line should separate the command block from the options: {plain:?}"
+    );
+
+    let selected_style = lines[options_row]
+        .spans
+        .iter()
+        .find(|span| span.text.as_str().contains("Allow once"))
+        .expect("selected span")
+        .style;
+    assert_eq!(
+        selected_style.fg,
+        Some(core.theme.palette.warning),
+        "the default-selected option should use gold text"
+    );
+    assert_eq!(
+        selected_style.bg,
+        Some(core.theme.palette.selection),
+        "the default-selected option should use the select-bg token"
+    );
 }
 
 #[test]
@@ -2722,18 +3637,10 @@ fn patch_approval_modal_clears_full_rows_behind_modal() {
 
     let contents = terminal.backend().screen_contents();
     for (needle, expected) in [
-        (
-            "Would you like to apply this patch?",
-            "Would you like to apply this patch?",
-        ),
-        (
-            "Reason: fs-write: tool edit_file",
-            "Reason: fs-write: tool edit_file",
-        ),
-        (
-            "r. Review expanded patch (r)",
-            "r. Review expanded patch (r)",
-        ),
+        ("Edit file?", "Edit file?"),
+        ("fs-write · cwd", "fs-write · cwd"),
+        ("y  Allow once", "y  Allow once"),
+        ("n/esc  Deny", "n/esc  Deny"),
     ] {
         let line = contents
             .lines()
@@ -2744,7 +3651,7 @@ fn patch_approval_modal_clears_full_rows_behind_modal() {
 }
 
 #[test]
-fn patch_review_key_expands_diff_region() {
+fn patch_review_key_no_longer_expands_diff_region() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();
     let new = (0..40)
@@ -2756,22 +3663,20 @@ fn patch_review_key_expands_diff_region() {
     let normal = terminal.backend().screen_contents();
     assert!(!normal.contains("line 10"));
 
-    assert_eq!(
-        core.handle_input(key(KeyCode::Char('r'))),
-        CoreEffect::Render
-    );
+    // `r` is no longer an expand key; nearest-block ctrl+o owns expansion.
+    let _ = core.handle_input(key(KeyCode::Char('r')));
     terminal
         .draw(|frame| core.render(frame))
-        .expect("expanded draw");
+        .expect("draw after r");
 
-    let expanded = terminal.backend().screen_contents();
-    assert!(expanded.contains("line 10"));
+    let after = terminal.backend().screen_contents();
+    assert!(
+        !after.contains("line 10"),
+        "r must not expand patch modal: {after:?}"
+    );
     assert!(matches!(
         core.modal,
-        Some(Modal::PatchApproval(PatchApprovalModal {
-            expanded: true,
-            ..
-        }))
+        Some(Modal::PatchApproval(PatchApprovalModal { .. }))
     ));
 }
 
@@ -2837,8 +3742,8 @@ fn large_patch_modal_keeps_diff_bounded() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("bounded patch"));
-    assert!(contents.contains("3. No, and tell euler what to do differently (esc)"));
+    assert!(contents.contains("ctrl+o expand"));
+    assert!(contents.contains("n/esc  Deny"));
     assert!(!contents.contains("line 119"));
 }
 
@@ -3114,6 +4019,168 @@ fn drain_finalized_visual_text(core: &mut AppCore, width: u16) -> String {
         .join("\n")
 }
 
+#[test]
+fn ctrl_f_opens_read_only_transcript_search() {
+    let mut core = core();
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert!(matches!(core.bottom.owner(), BottomOwner::Search(_)));
+    let status = core.canvas_status_snapshot(80);
+    assert!(
+        status.line.plain_text().contains("find:"),
+        "search should replace footer hints: {}",
+        status.line.plain_text()
+    );
+
+    core.handle_input(key(KeyCode::Char('x')));
+    assert!(matches!(core.bottom.owner(), BottomOwner::Search(_)));
+    // Search must not clear fold state.
+    assert!(!core.tool_output_expanded);
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_eq!(core.visual_scroll_offset, 0);
+}
+
+#[test]
+fn timestamps_toggle_persists_and_logs_confirmation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let preference_path = temp.path().join("preferences.json");
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            theme_preference_path: Some(preference_path.clone()),
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+
+    assert!(core.show_timestamp_gutter);
+    assert_eq!(
+        core.handle_command_action(CommandAction::ToggleTimestamps),
+        CoreEffect::Render
+    );
+    assert!(!core.show_timestamp_gutter);
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        text.contains("timestamps hidden"),
+        "expected confirmation in transcript: {text}"
+    );
+    assert!(
+        !text.contains("ui:"),
+        "the /timestamps confirmation is a neutral notice, not a \"ui:\" error: {text}"
+    );
+    assert_eq!(
+        crate::model_preference::load_timestamps_preference(&preference_path),
+        crate::model_preference::TimestampsPreferenceLoad::Loaded(false)
+    );
+
+    assert_eq!(
+        core.handle_command_action(CommandAction::ToggleTimestamps),
+        CoreEffect::Render
+    );
+    assert!(core.show_timestamp_gutter);
+}
+
+#[test]
+fn toggled_on_timestamp_gutter_stamps_every_event_first_row() {
+    // Review v2 §6: the opt-in gutter must show every event's real
+    // provenance time, not a blank column — this is the production
+    // visual-canvas path (real EventEnvelope timestamps), not a bare
+    // TranscriptItem fixture.
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+    core.drain_finalized_visual_lines(80);
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::USER_MESSAGE,
+        object([("content", "hi".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "hello there".into())]),
+    )));
+
+    let lines = core
+        .drain_finalized_visual_lines(80)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let user_row = lines
+        .iter()
+        .position(|line| line.contains("hi"))
+        .expect("user row");
+    let answer_row = lines
+        .iter()
+        .position(|line| line.contains("hello there"))
+        .expect("answer row");
+
+    for (label, row) in [("user", user_row), ("answer", answer_row)] {
+        let line = &lines[row];
+        let stamp: String = line.chars().take(8).collect();
+        assert!(
+            looks_like_hh_mm_ss(&stamp),
+            "{label} row should stamp a real HH:MM:SS, not a blank gutter: {line:?}"
+        );
+    }
+}
+
+fn looks_like_hh_mm_ss(stamp: &str) -> bool {
+    let chars: Vec<char> = stamp.chars().collect();
+    chars.len() == 8
+        && chars[0].is_ascii_digit()
+        && chars[1].is_ascii_digit()
+        && chars[2] == ':'
+        && chars[3].is_ascii_digit()
+        && chars[4].is_ascii_digit()
+        && chars[5] == ':'
+        && chars[6].is_ascii_digit()
+        && chars[7].is_ascii_digit()
+}
+
+#[test]
+fn at_mention_inserts_path_token_into_composer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join("src")).expect("src");
+    std::fs::write(temp.path().join("src/lib.rs"), "fn x() {}").expect("write");
+    let mut core = core_with_provider_at(EchoProvider, temp.path());
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('@'))),
+        CoreEffect::Render
+    );
+    assert!(matches!(core.bottom.owner(), BottomOwner::Mention(_)));
+
+    // Narrow to the only file if needed, then confirm.
+    for ch in "lib".chars() {
+        core.handle_input(key(KeyCode::Char(ch)));
+    }
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    let text = core.bottom.composer().render_text();
+    assert!(
+        text.contains("lib.rs") || text.contains("@"),
+        "composer should show mention path: {text:?}"
+    );
+    assert!(
+        !core.bottom.composer().mentioned_paths().is_empty()
+            || core.bottom.composer().submit_text().contains("lib.rs"),
+        "mention should attach path for submit"
+    );
+}
+
 fn wait_for_patch_diff(core: &mut AppCore) {
     for _ in 0..100 {
         core.drain_background();
@@ -3151,4 +4218,37 @@ fn wait_for_idle(core: &mut AppCore) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("turn did not finish");
+}
+
+mod code_swarm_tests {
+    use crate::ui::app::code_swarm::code_swarm_review_input;
+
+    #[test]
+    fn review_input_carries_models_prompt_and_personas() {
+        let input = code_swarm_review_input(
+            vec!["fixture::echo".to_owned(), "fixture::alt".to_owned()],
+            Some("focus on the parser".to_owned()),
+            Some(vec!["safety".to_owned()]),
+        );
+
+        assert_eq!(
+            input,
+            serde_json::json!({
+                "models": ["fixture::echo", "fixture::alt"],
+                "prompt": "focus on the parser",
+                "reviewers": ["safety"],
+            })
+        );
+    }
+
+    #[test]
+    fn review_input_omits_blank_prompt_and_empty_personas() {
+        let input = code_swarm_review_input(
+            vec!["fixture::echo".to_owned()],
+            Some("   ".to_owned()),
+            Some(Vec::new()),
+        );
+
+        assert_eq!(input, serde_json::json!({"models": ["fixture::echo"]}));
+    }
 }
