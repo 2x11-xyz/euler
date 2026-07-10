@@ -1972,23 +1972,18 @@ fn resume_provider_set_with_custom(
             providers.insert_named(original.provider.clone(), original_provider);
         }
     }
+    // A resumed session must be able to /model-switch to any configured
+    // provider, exactly like a fresh TUI session (review v2 §14.5 — switches
+    // were rejected with "provider is not configured"). Auth stays lazy:
+    // invoking an un-credentialed provider still fails loudly at call time.
+    fill_provider_set(&mut providers, custom_providers);
     Ok(providers)
 }
 
-fn tui_provider_set(
-    active_provider_id: String,
-    active_provider: Box<dyn ModelProvider>,
-    custom_providers: &ProviderConfigRegistry,
-) -> ProviderSet {
-    let mut providers = ProviderSet::new();
-    providers.insert_named(active_provider_id.clone(), active_provider);
+/// Best-effort: add every builtin + custom provider not already present.
+fn fill_provider_set(providers: &mut ProviderSet, custom_providers: &ProviderConfigRegistry) {
     for descriptor in BUILTIN_PROVIDERS {
-        insert_tui_provider_if_missing(
-            &mut providers,
-            descriptor.id,
-            &active_provider_id,
-            custom_providers,
-        );
+        insert_provider_if_missing(providers, descriptor.id, custom_providers);
     }
     let mut custom_ids = custom_providers
         .providers()
@@ -1996,23 +1991,16 @@ fn tui_provider_set(
         .collect::<Vec<_>>();
     custom_ids.sort_unstable();
     for provider_id in custom_ids {
-        insert_tui_provider_if_missing(
-            &mut providers,
-            provider_id,
-            &active_provider_id,
-            custom_providers,
-        );
+        insert_provider_if_missing(providers, provider_id, custom_providers);
     }
-    providers
 }
 
-fn insert_tui_provider_if_missing(
+fn insert_provider_if_missing(
     providers: &mut ProviderSet,
     provider_id: &str,
-    active_provider_id: &str,
     custom_providers: &ProviderConfigRegistry,
 ) {
-    if provider_id == active_provider_id || providers.contains(provider_id) {
+    if providers.contains(provider_id) {
         return;
     }
     let Ok(provider) = provider_for_id(
@@ -2024,6 +2012,17 @@ fn insert_tui_provider_if_missing(
         return;
     };
     providers.insert_named(provider_id.to_owned(), provider);
+}
+
+fn tui_provider_set(
+    active_provider_id: String,
+    active_provider: Box<dyn ModelProvider>,
+    custom_providers: &ProviderConfigRegistry,
+) -> ProviderSet {
+    let mut providers = ProviderSet::new();
+    providers.insert_named(active_provider_id, active_provider);
+    fill_provider_set(&mut providers, custom_providers);
+    providers
 }
 
 fn invocation_target(run: &RunArgs) -> ModelTarget {
