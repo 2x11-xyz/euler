@@ -75,6 +75,43 @@ fn palette_confirm_on_code_swarm_opens_config_not_extension_run() {
 }
 
 #[test]
+fn palette_confirm_on_extension_entry_keeps_typed_arguments() {
+    // Review follow-up: selected extension entries dispatched only the bare
+    // token, silently dropping anything typed after the command — the run
+    // looked accepted while executing without its input.
+    let context = CommandContext {
+        extension_items: vec![crate::ui::commands::ExtensionManagerItem {
+            id: "code-swarm".to_owned(),
+            display_name: "CodeSwarm Review".to_owned(),
+            enabled: true,
+            bundled: true,
+            materialization: None,
+            version: "0.1.0".to_owned(),
+            commands: vec!["review-brief".to_owned(), "review-report".to_owned()],
+            capabilities: vec![],
+            audit_status: None,
+        }],
+        ..CommandContext::default()
+    };
+    let slash = crate::ui::commands::build_extension_slash_commands(&context.extension_items);
+    let mut context = context;
+    context.extension_slash_commands = slash;
+    let mut surface = BottomSurface::new(context);
+    surface.open_palette();
+    surface.palette_insert("review-brief {\"reviewers\":[\"tests\"]}");
+    match surface.confirm() {
+        SurfaceEvent::Action(CommandAction::ExtensionRun {
+            id, command, input, ..
+        }) => {
+            assert_eq!(id, "code-swarm");
+            assert_eq!(command, "review-brief");
+            assert_eq!(input, serde_json::json!({"reviewers": ["tests"]}));
+        }
+        other => panic!("expected extension run with input, got {other:?}"),
+    }
+}
+
+#[test]
 fn palette_confirm_on_disabled_extension_returns_muted_notice_every_time() {
     // Review v2 §14.4: selecting a disabled extension command from the
     // palette must teach (not error), and must teach again on every

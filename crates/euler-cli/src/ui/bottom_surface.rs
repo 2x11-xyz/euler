@@ -530,10 +530,13 @@ impl BottomSurface {
                 // surfaces (e.g. /code-swarm opening its config picker) and
                 // host-run extension commands both resolve there. Dispatching
                 // ExtensionRun directly sent surface markers like "swarm" to
-                // the host ("unknown command", review v2 §4).
+                // the host ("unknown command", review v2 §4). Use the full
+                // confirmation input, not the bare token — anything typed
+                // after the command (JSON input, --flags) must travel with
+                // it instead of being silently dropped.
                 let _ = command;
-                let token = entry.token.clone();
-                match dispatch_command(&token, &self.context) {
+                let input = palette.confirmation_input();
+                match dispatch_command(&input, &self.context) {
                     CommandEffect::Action(action) => return self.apply_action(action),
                     CommandEffect::Message(message) => {
                         self.composer = palette.saved_draft;
