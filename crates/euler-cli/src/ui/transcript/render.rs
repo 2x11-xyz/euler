@@ -215,6 +215,16 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     );
                 }
             }
+            TranscriptItem::ModelReasoningLive { elapsed } => {
+                push_wrapped(
+                    &mut lines,
+                    blank_gutter(),
+                    &format!("thinking · {elapsed}"),
+                    theme.transcript.reasoning,
+                    theme,
+                    width,
+                );
+            }
             TranscriptItem::ToolCall { name } => {
                 push_wrapped(
                     &mut lines,
@@ -707,7 +717,7 @@ fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)>
         | TranscriptItem::TurnSeparator
         | TranscriptItem::WorkedDuration(_)
         | TranscriptItem::TurnRecap { .. } => return None,
-        TranscriptItem::ModelReasoning { .. } => {
+        TranscriptItem::ModelReasoning { .. } | TranscriptItem::ModelReasoningLive { .. } => {
             (glyphs::thinking().to_owned(), theme.transcript.warning)
         }
         TranscriptItem::PermissionDecision { allowed, .. } => {

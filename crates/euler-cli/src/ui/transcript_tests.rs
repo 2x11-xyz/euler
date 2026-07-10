@@ -105,6 +105,88 @@ fn transcript_state_streams_live_tail_then_finalizes_without_duplicate() {
 }
 
 #[test]
+fn transcript_state_streams_live_thinking_line_until_text_arrives() {
+    let mut state = TranscriptState::default();
+    state.push_event(event_at(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "hmm".into())]),
+        "2026-07-05T00:00:00.000Z",
+    ));
+
+    assert_eq!(
+        state.live_mutable_items(),
+        vec![TranscriptItem::ModelReasoningLive {
+            elapsed: "0s".to_owned()
+        }]
+    );
+
+    state.push_event(event_at(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "deeper".into())]),
+        "2026-07-05T00:00:07.000Z",
+    ));
+
+    // Elapsed advances with the delta timestamps, not the local clock.
+    assert_eq!(
+        state.live_mutable_items(),
+        vec![TranscriptItem::ModelReasoningLive {
+            elapsed: "7s".to_owned()
+        }]
+    );
+
+    // First answer text ends the thinking phase; the streamed tail takes over.
+    state.push_event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer\n".into())]),
+    ));
+
+    assert_eq!(
+        state.live_items(),
+        vec![TranscriptItem::AssistantMessage("answer\n".to_owned())]
+    );
+}
+
+#[test]
+fn transcript_state_clears_live_thinking_on_finalized_reasoning_and_results() {
+    // Finalized thought item replaces the live line.
+    let mut state = TranscriptState::default();
+    state.push_event(event_at(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "hmm".into())]),
+        "2026-07-05T00:00:00.000Z",
+    ));
+    state.push_event(event(
+        EventKind::MODEL_REASONING,
+        object([("fidelity", "raw".into()), ("content", "hmm".into())]),
+    ));
+    assert!(state.live_mutable_items().is_empty());
+
+    // Tool-call rounds clear it too — no stale thinking line over tool rows.
+    let mut state = TranscriptState::default();
+    state.push_event(event_at(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "hmm".into())]),
+        "2026-07-05T00:00:00.000Z",
+    ));
+    state.push_event(event(
+        EventKind::MODEL_RESULT,
+        object([
+            ("content", "".into()),
+            (
+                "tool_calls",
+                serde_json::json!([
+                    {"id": "call-1", "name": "read_file", "input": {"path": "Cargo.toml"}}
+                ]),
+            ),
+        ]),
+    ));
+    assert!(state
+        .live_items()
+        .iter()
+        .all(|item| !matches!(item, TranscriptItem::ModelReasoningLive { .. })));
+}
+
+#[test]
 fn transcript_state_preserves_live_tail_across_tool_call_model_result() {
     let mut state = TranscriptState::default();
     state.push_event(event(
