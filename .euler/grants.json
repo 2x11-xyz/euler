@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "grants": [
+    {
+      "capability": "shell-exec",
+      "pattern": "ls"
+    }
+  ]
+}

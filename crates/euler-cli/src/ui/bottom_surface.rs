@@ -523,12 +523,24 @@ impl BottomSurface {
                         extension_id,
                     ));
                 }
-                return self.apply_action(CommandAction::ExtensionRun {
-                    id: extension_id.clone(),
-                    command: command.clone(),
-                    input: serde_json::Value::Object(serde_json::Map::new()),
-                    raw_args: None,
-                });
+                // Route through the same dispatch as typing the token: TUI-side
+                // surfaces (e.g. /code-swarm opening its config picker) and
+                // host-run extension commands both resolve there. Dispatching
+                // ExtensionRun directly sent surface markers like "swarm" to
+                // the host ("unknown command", review v2 §4).
+                let _ = command;
+                let token = entry.token.clone();
+                match dispatch_command(&token, &self.context) {
+                    CommandEffect::Action(action) => return self.apply_action(action),
+                    CommandEffect::Message(message) => {
+                        self.composer = palette.saved_draft;
+                        return SurfaceEvent::Message(message);
+                    }
+                    CommandEffect::OpenPicker(spec) => {
+                        self.open_picker_from_spec(spec, palette.saved_draft);
+                        return SurfaceEvent::None;
+                    }
+                }
             }
         }
         match dispatch_command(&palette.confirmation_input(), &self.context) {
@@ -1984,6 +1996,54 @@ mod tests {
             panic!("picker should own surface");
         };
         picker.items.iter().filter(|item| item.current).count()
+    }
+
+    #[test]
+    fn palette_confirm_on_code_swarm_opens_config_not_extension_run() {
+        // Review v2 §4: selecting /code-swarm from the palette must open the
+        // reviewer-model config, never dispatch a "swarm" command to the host.
+        let context = CommandContext {
+            model_choices: vec![
+                ModelChoice::new("openrouter", "z-ai/glm-5.2"),
+                ModelChoice::new("anthropic", "claude-sonnet-5"),
+            ],
+            extension_items: vec![crate::ui::commands::ExtensionManagerItem {
+                id: "code-swarm".to_owned(),
+                display_name: "CodeSwarm Review".to_owned(),
+                enabled: true,
+                bundled: true,
+                materialization: None,
+                version: "0.1.0".to_owned(),
+                commands: vec!["review-brief".to_owned(), "review-report".to_owned()],
+                capabilities: vec![],
+                audit_status: None,
+            }],
+            ..CommandContext::default()
+        };
+        let slash = crate::ui::commands::build_extension_slash_commands(&context.extension_items);
+        let mut context = context;
+        context.extension_slash_commands = slash;
+        let mut surface = BottomSurface::new(context);
+        surface.open_palette();
+        surface.palette_insert("code-swarm");
+        let event = surface.confirm();
+        assert_eq!(event, SurfaceEvent::None, "should open a picker, not act");
+        assert!(
+            surface.is_code_swarm_picker(),
+            "code-swarm config picker should own the surface"
+        );
+
+        // A real extension command still dispatches to the host.
+        let mut surface2 = BottomSurface::new(surface.context.clone());
+        surface2.open_palette();
+        surface2.palette_insert("review-brief");
+        match surface2.confirm() {
+            SurfaceEvent::Action(CommandAction::ExtensionRun { id, command, .. }) => {
+                assert_eq!(id, "code-swarm");
+                assert_eq!(command, "review-brief");
+            }
+            other => panic!("expected extension run, got {other:?}"),
+        }
     }
 
     #[test]
