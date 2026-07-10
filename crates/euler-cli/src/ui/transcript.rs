@@ -169,6 +169,10 @@ pub enum TranscriptItem {
         source: String,
         message: String,
     },
+    /// Plain muted, single-line notice: no glyph, no source prefix (review
+    /// v2 §14.4). Used for informational teach lines that are not errors —
+    /// e.g. the disabled-extension teach message.
+    Notice(String),
 }
 
 /// Running vs completed companion block (from agent.spawn / agent.result).

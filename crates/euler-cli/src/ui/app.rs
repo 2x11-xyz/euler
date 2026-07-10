@@ -1560,6 +1560,7 @@ impl AppCore {
         match event {
             SurfaceEvent::None => CoreEffect::Render,
             SurfaceEvent::Message(message) => self.notice_item(message),
+            SurfaceEvent::Notice(message) => self.teach_notice(message),
             SurfaceEvent::Action(action) => self.handle_command_action(action),
         }
     }
@@ -2117,6 +2118,15 @@ impl AppCore {
             source: "ui".to_owned(),
             message,
         });
+    }
+
+    /// Muted, non-error informational line (review v2 §14.4) — no glyph, no
+    /// "ui:" source prefix. Used for teach messages like the
+    /// disabled-extension notice, which should never read as an error and
+    /// should render every time the disabled command is invoked.
+    fn teach_notice(&mut self, message: String) -> CoreEffect {
+        self.push_finalized_visual_item(TranscriptItem::Notice(message));
+        CoreEffect::Render
     }
 
     fn summary_item(&mut self, text: String) -> CoreEffect {

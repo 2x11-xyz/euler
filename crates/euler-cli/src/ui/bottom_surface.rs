@@ -59,6 +59,9 @@ pub enum SurfaceEvent {
     None,
     Action(CommandAction),
     Message(String),
+    /// Muted, non-error informational line (review v2 §14.4) — routed to a
+    /// plain notice transcript item instead of the error-styled path.
+    Notice(String),
 }
 
 impl BottomSurface {
@@ -473,7 +476,7 @@ impl BottomSurface {
             {
                 if !enabled {
                     self.composer = palette.saved_draft;
-                    return SurfaceEvent::Message(super::commands::disabled_extension_teach(
+                    return SurfaceEvent::Notice(super::commands::disabled_extension_teach(
                         &entry.token,
                         extension_id,
                     ));
@@ -491,6 +494,10 @@ impl BottomSurface {
                         self.composer = palette.saved_draft;
                         return SurfaceEvent::Message(message);
                     }
+                    CommandEffect::Notice(message) => {
+                        self.composer = palette.saved_draft;
+                        return SurfaceEvent::Notice(message);
+                    }
                     CommandEffect::OpenPicker(spec) => {
                         self.open_picker_from_spec(spec, palette.saved_draft);
                         return SurfaceEvent::None;
@@ -503,6 +510,10 @@ impl BottomSurface {
             CommandEffect::Message(message) => {
                 self.composer = palette.saved_draft;
                 SurfaceEvent::Message(message)
+            }
+            CommandEffect::Notice(message) => {
+                self.composer = palette.saved_draft;
+                SurfaceEvent::Notice(message)
             }
             CommandEffect::OpenPicker(spec) => {
                 self.open_picker_from_spec(spec, palette.saved_draft);

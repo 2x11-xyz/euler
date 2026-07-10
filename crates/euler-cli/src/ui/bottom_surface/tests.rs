@@ -75,6 +75,44 @@ fn palette_confirm_on_code_swarm_opens_config_not_extension_run() {
 }
 
 #[test]
+fn palette_confirm_on_disabled_extension_returns_muted_notice_every_time() {
+    // Review v2 §14.4: selecting a disabled extension command from the
+    // palette must teach (not error), and must teach again on every
+    // subsequent selection — no "only once per session" gating.
+    let context = CommandContext {
+        extension_items: vec![crate::ui::commands::ExtensionManagerItem {
+            id: "code-swarm".to_owned(),
+            display_name: "CodeSwarm Review".to_owned(),
+            enabled: false,
+            bundled: true,
+            materialization: None,
+            version: "0.1.0".to_owned(),
+            commands: vec!["review-brief".to_owned(), "review-report".to_owned()],
+            capabilities: vec![],
+            audit_status: None,
+        }],
+        ..CommandContext::default()
+    };
+    let slash = crate::ui::commands::build_extension_slash_commands(&context.extension_items);
+    let mut context = context;
+    context.extension_slash_commands = slash;
+    let mut surface = BottomSurface::new(context);
+    let expected = SurfaceEvent::Notice(crate::ui::commands::disabled_extension_teach(
+        "/code-swarm",
+        "code-swarm",
+    ));
+
+    surface.open_palette();
+    surface.palette_insert("code-swarm");
+    assert_eq!(surface.confirm(), expected);
+
+    // Invoke the same disabled command again: still teaches, not silenced.
+    surface.open_palette();
+    surface.palette_insert("code-swarm");
+    assert_eq!(surface.confirm(), expected);
+}
+
+#[test]
 fn code_swarm_picker_defaults_to_first_three_checked() {
     let surface = code_swarm_picker_surface(Vec::new());
     assert_eq!(code_swarm_checked(&surface), 3);

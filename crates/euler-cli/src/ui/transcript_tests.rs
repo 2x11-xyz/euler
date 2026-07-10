@@ -582,7 +582,9 @@ fn tui_shell_run_uses_raw_command_label_without_semantic_prefix() {
     assert!(contents.contains("bash $ rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("• Ran Search"));
     assert!(!contents.contains("Search rg transcript"));
-    assert!(contents.contains("  transcript.rs:match"));
+    // Collapsed cells surface the sole output row as the `└ ` result line
+    // rather than a bare indented preview row (review v2 §14.2).
+    assert!(contents.contains("└ transcript.rs:match"));
 }
 
 #[test]
@@ -1587,6 +1589,222 @@ fn tool_artifact_cell_reports_failure_without_exit_code() {
     assert!(
         !texts.contains("failed: permission denied"),
         "texts: {texts:?}"
+    );
+}
+
+#[test]
+fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
+    let theme = Theme::default();
+    let output = (1..=DEFAULT_OUTPUT_LIMIT_LINES + 1)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let item = [TranscriptItem::ToolRun {
+        command: "printf lines".to_owned(),
+        ok: true,
+        error: String::new(),
+        output,
+        exit_code: Some(0),
+        grant_source: None,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&item, &theme, 80));
+    let joined = texts.join("\n");
+
+    // Exactly one `└ ` result line, carrying the first non-empty output row
+    // as the most-informative fallback (review v2 §14.2).
+    assert_eq!(
+        texts.iter().filter(|line| line.contains('└')).count(),
+        1,
+        "texts: {texts:?}"
+    );
+    assert!(joined.contains("└ line 1"), "texts: {texts:?}");
+    // Remaining preview rows sit two extra spaces deeper than the result
+    // line: result line body indent is 4 cells ("  " gutter pad + "└ "),
+    // continuation rows are 6 cells ("  " gutter pad + "  " extra indent).
+    let result_indent = texts
+        .iter()
+        .find(|line| line.contains("└ line 1"))
+        .map(|line| line.len() - line.trim_start().len())
+        .expect("result line present");
+    let continuation_indent = texts
+        .iter()
+        .find(|line| line.contains("more lines · ctrl+o expand"))
+        .map(|line| line.len() - line.trim_start().len())
+        .expect("continuation row present");
+    assert_eq!(continuation_indent, result_indent + 2, "texts: {texts:?}");
+}
+
+#[test]
+fn collapsed_tool_run_strips_leading_literal_exit_code_row() {
+    let theme = Theme::default();
+    let item = [TranscriptItem::ToolRun {
+        command: "printf leaked".to_owned(),
+        ok: true,
+        error: String::new(),
+        output: "exit 0\nreal output".to_owned(),
+        exit_code: Some(0),
+        grant_source: None,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&item, &theme, 80));
+    let joined = texts.join("\n");
+
+    assert!(joined.contains("└ real output"), "texts: {texts:?}");
+    assert!(
+        !texts
+            .iter()
+            .any(|line| line.trim_start().starts_with("exit 0")),
+        "exit code must not leak as an output row: {texts:?}"
+    );
+    // The footer still owns the exit status.
+    assert!(joined.contains("exit 0 · 1 line"), "texts: {texts:?}");
+}
+
+#[test]
+fn expanded_tool_run_keeps_full_output_without_result_line_prefix() {
+    let theme = Theme::default();
+    let output = (1..=DEFAULT_OUTPUT_LIMIT_LINES + 1)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let item = [TranscriptItem::ToolRun {
+        command: "printf lines".to_owned(),
+        ok: true,
+        error: String::new(),
+        output,
+        exit_code: Some(0),
+        grant_source: None,
+    }];
+
+    let expanded = line_texts(&render_items_for_history_with_limit(
+        &item,
+        &theme,
+        80,
+        usize::MAX,
+    ));
+    let joined = expanded.join("\n");
+
+    assert!(
+        !expanded.iter().any(|line| line.contains('└')),
+        "expanded cells render full output, not a result-line summary: {expanded:?}"
+    );
+    assert!(joined.contains("line 1"), "expanded: {joined:?}");
+    assert!(joined.contains("line 11"), "expanded: {joined:?}");
+}
+
+#[test]
+fn turn_recap_omits_files_line_when_no_files_changed() {
+    let theme = Theme::default();
+    let items = vec![TranscriptItem::TurnRecap {
+        summary: "0 files · ctx 5%".to_owned(),
+        files: None,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 80));
+
+    assert_eq!(
+        texts.iter().filter(|line| !line.trim().is_empty()).count(),
+        1,
+        "zero-file turn should render only the summary line: {texts:?}"
+    );
+    assert!(texts[0].contains("0 files · ctx 5%"), "texts: {texts:?}");
+}
+
+#[test]
+fn turn_recap_renders_faint_files_line_when_files_changed() {
+    let theme = Theme::default();
+    let items = vec![TranscriptItem::TurnRecap {
+        summary: "2 files · +3 −1 · ctx 5%".to_owned(),
+        files: Some("src/a.rs  src/b.rs".to_owned()),
+    }];
+
+    let lines = render_items_for_history(&items, &theme, 80);
+    let texts = line_texts(&lines);
+    let joined = texts.join("\n");
+
+    assert!(
+        joined.contains("2 files · +3 −1 · ctx 5%"),
+        "texts: {texts:?}"
+    );
+    assert!(joined.contains("src/a.rs  src/b.rs"), "texts: {texts:?}");
+
+    // The files line is the dimmer of the two rows (review v2 §14.3): the
+    // spec calls for a faint second line, and gutter is dimmer than muted.
+    let files_line = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("src/a.rs"))
+        })
+        .expect("files line present");
+    let files_style = files_line
+        .spans
+        .iter()
+        .find(|span| span.content.contains("src/a.rs"))
+        .map(|span| span.style)
+        .expect("files span present");
+    assert_eq!(
+        files_style, theme.transcript.gutter,
+        "files line should use the faint gutter style"
+    );
+}
+
+#[test]
+fn disabled_extension_notice_renders_muted_without_glyph_or_prefix() {
+    // Review v2 §14.4: the teach line must be a plain muted notice — no ✗,
+    // no red error style, no "ui:" source prefix.
+    let theme = Theme::default();
+    let message =
+        crate::ui::commands::disabled_extension_teach("/catch-up", "causal-dag").to_owned();
+    let items = vec![TranscriptItem::Notice(message.clone())];
+
+    let lines = render_items_for_history(&items, &theme, 80);
+    let texts = line_texts(&lines);
+    let joined = texts.join("\n");
+
+    assert!(joined.contains(&message), "texts: {texts:?}");
+    assert!(!joined.contains('✗'), "texts: {texts:?}");
+    assert!(!joined.contains("ui:"), "texts: {texts:?}");
+
+    let notice_span = lines
+        .iter()
+        .find_map(|line| {
+            line.spans
+                .iter()
+                .find(|span| span.content.contains("provided by"))
+        })
+        .expect("notice span present");
+    assert_eq!(
+        notice_span.style, theme.transcript.muted,
+        "teach line should render in the muted style, never the error style"
+    );
+    assert_ne!(
+        notice_span.style, theme.transcript.error,
+        "teach line must never use the red error style"
+    );
+}
+
+#[test]
+fn disabled_extension_notice_renders_every_entrance_without_dedup() {
+    // Review v2 §14.4: the teach line prints every time the disabled command
+    // is entered — typed, via palette, or via the extension run form — not
+    // just once per session.
+    let theme = Theme::default();
+    let message = crate::ui::commands::disabled_extension_teach("/dag", "causal-dag");
+    let items = vec![
+        TranscriptItem::Notice(message.clone()),
+        TranscriptItem::Notice(message.clone()),
+        TranscriptItem::Notice(message.clone()),
+    ];
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 80));
+    let occurrences = texts.iter().filter(|line| line.contains(&message)).count();
+
+    assert_eq!(
+        occurrences, 3,
+        "each entrance should render its own teach line, not be deduped: {texts:?}"
     );
 }
 

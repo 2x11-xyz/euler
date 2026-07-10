@@ -35,7 +35,7 @@ impl AppCore {
             }
         };
         if !enabled {
-            return self.notice_item(crate::ui::commands::disabled_extension_teach(
+            return self.teach_notice(crate::ui::commands::disabled_extension_teach(
                 "/dag",
                 "causal-dag",
             ));
