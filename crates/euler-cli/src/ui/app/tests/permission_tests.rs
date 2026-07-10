@@ -303,10 +303,13 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
         ]),
     ));
     core.bottom.composer_mut().insert_text("draft");
-    core.modal = Some(Modal::Permission(PermissionRequest::new(
+    // Real open path: the pre-existing draft is stashed, NOT consumed as an
+    // instruction (issue #60 — it used to disable hotkeys and leak into the
+    // deny reply).
+    core.open_permission_modal(PermissionRequest::new(
         Capability::ShellExec,
         "run command".to_owned(),
-    )));
+    ));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
@@ -315,14 +318,12 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
     assert!(!contents.contains("Approval required"));
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
-    assert_eq!(
-        reply_rx.recv().expect("reply"),
-        PermissionReply::DenyWithInstruction("draft".into())
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
+    assert!(
+        core.queued_inputs.is_empty(),
+        "stashed draft must not be queued as an instruction"
     );
-    assert_eq!(
-        core.queued_inputs.front().map(String::as_str),
-        Some("draft")
-    );
+    assert_eq!(core.bottom.composer().submit_text(), "draft");
     terminal.draw(|frame| core.render(frame)).expect("redraw");
 
     let restored = terminal.backend().screen_contents();
@@ -358,10 +359,10 @@ fn typed_permission_instruction_does_not_fire_hotkeys() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(Modal::Permission(PermissionRequest::new(
+    core.open_permission_modal(PermissionRequest::new(
         Capability::ShellExec,
         "tool run_shell".to_owned(),
-    )));
+    ));
 
     for code in [
         KeyCode::Char('w'),
@@ -400,6 +401,64 @@ fn empty_permission_instruction_keeps_y_hotkey() {
         CoreEffect::Render
     );
     assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::AllowOnce);
+}
+
+#[test]
+fn preexisting_draft_keeps_hotkeys_live_and_survives_the_decision() {
+    // Issue #60: an ask arriving while the composer held typed-but-unsent
+    // text wedged the panel — y/a/p/n dead, arrows dead, esc-only (which
+    // then consumed the unrelated draft as the deny instruction).
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.bottom.composer_mut().insert_text("also just saying hia");
+
+    core.open_permission_modal(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    ));
+
+    // Hotkeys are live because the panel's instruction input starts empty.
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('y'))),
+        CoreEffect::Render
+    );
+    assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::AllowOnce);
+    // The user's draft comes back untouched.
+    assert_eq!(core.bottom.composer().submit_text(), "also just saying hia");
+    assert!(core.queued_inputs.is_empty());
+}
+
+#[test]
+fn instruction_typed_inside_the_panel_denies_and_restores_the_stash() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.bottom.composer_mut().insert_text("pre-ask draft");
+    core.open_permission_modal(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    ));
+
+    for ch in ['u', 's', 'e', ' ', 'l', 's'] {
+        assert_eq!(
+            core.handle_input(key(KeyCode::Char(ch))),
+            CoreEffect::Render
+        );
+    }
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::DenyWithInstruction("use ls".into())
+    );
+    // The instruction queues as the next turn; the pre-ask draft returns to
+    // the composer.
+    assert_eq!(
+        core.queued_inputs.front().map(String::as_str),
+        Some("use ls")
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "pre-ask draft");
 }
 
 #[test]

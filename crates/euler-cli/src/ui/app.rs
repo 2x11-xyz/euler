@@ -176,6 +176,11 @@ pub struct AppCore {
     last_working_elapsed_secs: Option<u64>,
     modal: Option<Modal>,
     approval_selection: ApprovalOption,
+    /// Composer draft stashed while an approval modal owns the keyboard.
+    /// The panel's instruction input must start EMPTY: a pre-existing draft
+    /// (typed before the ask arrived) silently disabled the y/a/p/n hotkeys
+    /// and was consumed as the deny instruction (issue #60).
+    modal_stashed_draft: Option<String>,
     quit_armed: Option<Instant>,
     notice: Option<String>,
     pending_terminal_clipboard: Option<String>,
@@ -723,6 +728,7 @@ impl AppCore {
             last_working_elapsed_secs: None,
             modal: None,
             approval_selection: ApprovalOption::default(),
+            modal_stashed_draft: None,
             quit_armed: None,
             notice: None,
             pending_terminal_clipboard: None,
@@ -2071,8 +2077,7 @@ impl AppCore {
             match self.permission_rx.try_recv() {
                 Ok(request) => {
                     self.drain_turn_events();
-                    self.approval_selection = ApprovalOption::default();
-                    self.modal = Some(self.modal_for_request(request));
+                    self.open_permission_modal(request);
                     self.queue_notification(NotifyEvent::ApprovalNeeded);
                     changed = true;
                 }
@@ -2080,6 +2085,20 @@ impl AppCore {
             }
         }
         changed
+    }
+
+    /// Open the approval modal for a request. The panel's instruction input
+    /// starts EMPTY: any in-progress composer draft is stashed (and restored
+    /// after the decision) so the y/a/p/n hotkeys stay live and a stale
+    /// draft can never be consumed as the deny instruction (issue #60).
+    fn open_permission_modal(&mut self, request: PermissionRequest) {
+        self.approval_selection = ApprovalOption::default();
+        let draft = self.bottom.composer().submit_text();
+        if !draft.is_empty() {
+            self.modal_stashed_draft = Some(draft);
+            self.bottom.replace_composer_text("");
+        }
+        self.modal = Some(self.modal_for_request(request));
     }
 
     fn modal_for_request(&self, request: PermissionRequest) -> Modal {
@@ -2151,13 +2170,25 @@ impl AppCore {
         self.modal = None;
         self.approval_selection = ApprovalOption::default();
         let _ = self.reply_tx.send(reply);
+        self.restore_stashed_draft();
         CoreEffect::Render
+    }
+
+    /// Put back the composer draft that was in progress when the approval
+    /// modal opened. The instruction typed INSIDE the panel (if any) has
+    /// already been consumed by the reply path; the user's pre-ask draft
+    /// returns untouched.
+    fn restore_stashed_draft(&mut self) {
+        if let Some(draft) = self.modal_stashed_draft.take() {
+            self.bottom.replace_composer_text(&draft);
+        }
     }
 
     fn deny_open_modal(&mut self) {
         if self.modal.take().is_some() {
             self.approval_selection = ApprovalOption::default();
             let _ = self.reply_tx.send(PermissionReply::Deny);
+            self.restore_stashed_draft();
         }
     }
 
