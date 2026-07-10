@@ -3027,6 +3027,185 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
     assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
 }
 
+/// #47(a): while reasoning streams, the dim-italic reasoning text itself
+/// renders as continuation lines under the live `thinking · Ns` line.
+#[test]
+fn reasoning_stream_tail_renders_under_the_thinking_line() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "let me check the ".into()),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "call site first".into()),
+        ]),
+    )));
+
+    let frame = core.render_visual_canvas(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("let me check the call site first"), "{text}");
+
+    let reasoning_line = frame
+        .active_frame_lines
+        .iter()
+        .find(|line| line.plain_text().contains("let me check"))
+        .expect("reasoning continuation line present");
+    assert_eq!(
+        reasoning_line.spans[0].style,
+        core.theme.transcript.reasoning
+    );
+}
+
+/// #47(a): the tail clears the moment answer text starts streaming, and a
+/// late reasoning delta afterward must never reopen it.
+#[test]
+fn reasoning_stream_tail_clears_when_answer_text_starts_and_never_reopens() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "thinking...".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "thinking...");
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+
+    // A late reasoning delta (unusual, but must not reopen the tail).
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "too late".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+}
+
+/// #47(a): the tail also clears the moment the reasoning item finalizes
+/// (`MODEL_REASONING`), and it never survives past the turn's end.
+#[test]
+fn reasoning_stream_tail_clears_on_finalize_and_turn_end() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "thinking...".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "thinking...");
+
+    // A second `MODEL_REASONING` (e.g. a further reasoning round after a
+    // tool call) finalizes the current item and clears the live tail.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "final thought".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "one more round".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "one more round");
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+    assert_eq!(core.reasoning_stream_tail, "");
+}
+
+/// #47(a): the streamed tail is bounded (~400 chars) and truncates from the
+/// left on a char boundary — never splitting a multibyte glyph.
+#[test]
+fn reasoning_stream_tail_is_bounded_and_multibyte_safe() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+
+    // Push enough multibyte deltas to overflow the 400-char bound.
+    for _ in 0..30 {
+        core.handle_turn_event(TurnEvent::Event(event(
+            EventKind::MODEL_DELTA,
+            object([
+                ("kind", "reasoning".into()),
+                ("delta", "こんにちは世界 ".into()),
+            ]),
+        )));
+    }
+
+    assert!(core.reasoning_stream_tail.chars().count() <= 400);
+    assert!(
+        core.reasoning_stream_tail
+            .chars()
+            .all(|ch| ch != '\u{fffd}'),
+        "{:?}",
+        core.reasoning_stream_tail
+    );
+}
+
 #[test]
 fn working_hud_phase_verb_resets_when_a_new_turn_spawns() {
     let mut core = core();
