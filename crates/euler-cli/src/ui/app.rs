@@ -1105,6 +1105,11 @@ impl AppCore {
                 CoreEffect::Render
             }
             KeyCode::Backspace => {
+                // Issue #24: an empty code-swarm filter steps back to the
+                // slash palette rather than exiting outright.
+                if self.bottom.code_swarm_backspace_steps_back_to_palette() {
+                    return CoreEffect::Render;
+                }
                 // Issue #23: backspacing over the leading `/` with nothing
                 // else typed exits the palette (same as Esc) instead of the
                 // prior no-op clamp.

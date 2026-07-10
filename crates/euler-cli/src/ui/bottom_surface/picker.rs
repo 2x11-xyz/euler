@@ -163,6 +163,58 @@ impl ReplacementPicker {
         lines
     }
 
+    /// Whether the type-to-filter query is empty — issue #24: `⌫` on an
+    /// empty query steps back to the slash palette instead of exiting.
+    pub(super) fn query_is_empty(&self) -> bool {
+        self.query.is_empty()
+    }
+
+    /// Themed lines for the `/code-swarm` picker, matching the palette's
+    /// select-bar styling (issue #24): full-width select-token background +
+    /// warning-token (gold) text on the highlighted row.
+    pub(super) fn render_code_swarm_canvas_lines(
+        &self,
+        theme: &Theme,
+        width: u16,
+    ) -> Vec<CanvasLine> {
+        let checked = self.items.iter().filter(|item| item.current).count();
+        let mut lines = vec![CanvasLine::plain_lossy(truncate_display(
+            &format!(
+                "{}  ·  {checked} selected · 1–5  {}",
+                self.title,
+                self.position_indicator()
+            ),
+            usize::from(width),
+        ))];
+        if !self.query.is_empty() {
+            lines.push(CanvasLine::plain_lossy(truncate_display(
+                &format!(
+                    " / {}  ·  {} shown · esc clears filter",
+                    self.query,
+                    self.filtered_indices().len()
+                ),
+                usize::from(width),
+            )));
+        }
+        for (offset, item_index) in self.visible_item_indices().iter().enumerate() {
+            let selected = self.scroll_offset + offset == self.selected;
+            let item = &self.items[*item_index];
+            let marker = if selected { "›" } else { " " };
+            let checkbox = if item.current { "[x]" } else { "[ ]" };
+            let text = format!("{marker} {checkbox} {}", item.label);
+            lines.push(if selected {
+                select_bar_canvas_line(&text, width, theme)
+            } else {
+                CanvasLine::plain_lossy(truncate_display(&text, usize::from(width)))
+            });
+        }
+        lines.push(CanvasLine::plain_lossy(truncate_display(
+            &format!(" swarm runs {checked} models in parallel · space toggle · ⏎ save · ⌫ back · esc cancel · min 1 · max 5"),
+            usize::from(width),
+        )));
+        lines
+    }
+
     fn render_code_swarm_lines(&self, width: u16) -> Vec<String> {
         let checked = self.items.iter().filter(|item| item.current).count();
         let mut lines = vec![truncate_display(
@@ -194,7 +246,7 @@ impl ReplacementPicker {
             ));
         }
         lines.push(truncate_display(
-            &format!(" swarm runs {checked} models in parallel · space toggle · ⏎ save · esc cancel · min 1 · max 5"),
+            &format!(" swarm runs {checked} models in parallel · space toggle · ⏎ save · ⌫ back · esc cancel · min 1 · max 5"),
             usize::from(width),
         ));
         lines

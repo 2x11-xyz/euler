@@ -865,6 +865,53 @@ fn palette_selected_row_uses_full_width_select_bar_and_warning_text() {
     );
 }
 
+/// Issue #24: the `/code-swarm` checklist reuses the palette's select-bar
+/// styling on its highlighted row.
+#[test]
+fn code_swarm_picker_selected_row_uses_same_select_bar_styling() {
+    let surface = code_swarm_picker_surface(Vec::new());
+    let theme = Theme::warm_ledger();
+    let width = 40u16;
+
+    let lines = surface
+        .surface_canvas_lines(&theme, width)
+        .expect("picker lines");
+    let selected_line = &lines[1]; // title row, then first checklist row (selected).
+    assert_eq!(selected_line.spans.len(), 1);
+    let span = &selected_line.spans[0];
+    assert_eq!(span.style.fg, Some(theme.palette.warning));
+    assert_eq!(span.style.bg, Some(theme.palette.selection));
+}
+
+/// Issue #24: `⌫` steps back to the slash palette when the code-swarm
+/// picker's type-to-filter query is empty, restoring the composer draft
+/// that was present before `/` was originally typed.
+#[test]
+fn code_swarm_backspace_steps_back_to_palette_when_filter_is_empty() {
+    // Same path the app takes: composer -> palette -> code-swarm picker, so
+    // `saved_draft` threads through the picker back to the palette.
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.edit_composer(|draft| draft.insert_text("draft before slash"));
+    surface.open_palette();
+    let saved = surface.composer().clone();
+    surface.open_picker(PickerSpec::CodeSwarmModels {
+        choices: vec![ModelChoice::new("fixture", "echo")],
+        selected: Vec::new(),
+    });
+
+    assert!(surface.code_swarm_backspace_steps_back_to_palette());
+    assert!(matches!(surface.owner(), BottomOwner::Palette(_)));
+    assert_eq!(surface.composer(), &saved);
+}
+
+#[test]
+fn code_swarm_backspace_does_not_step_back_while_filter_has_text() {
+    let mut surface = code_swarm_picker_surface(Vec::new());
+    surface.palette_insert("gl");
+    assert!(!surface.code_swarm_backspace_steps_back_to_palette());
+    assert!(matches!(surface.owner(), BottomOwner::Picker(_)));
+}
+
 /// Issue #23: the typed `/` (and the rest of the query) stays green
 /// throughout, independent of the selected row's styling below it.
 #[test]
