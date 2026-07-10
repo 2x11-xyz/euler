@@ -253,6 +253,9 @@ fn restore_terminal_session_modes(output: &mut impl Write) -> io::Result<()> {
     output.flush()
 }
 
+/// Scrollback commits resume this long after the last resize notification.
+const RESIZE_COMMIT_QUIESCENCE: std::time::Duration = std::time::Duration::from_millis(400);
+
 pub(crate) struct InlineTerminal<B>
 where
     // Euler owns an inline, native-scrollback terminal surface. Keep this
