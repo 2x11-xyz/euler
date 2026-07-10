@@ -292,6 +292,13 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Write UTF-8 content to a workspace-relative path (used by `/rollback`).
+    pub fn write_workspace_file(&self, relative: &str, content: &str) -> Result<(), ToolError> {
+        let path = self.resolve_path(relative)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
     fn run_shell(&self, input: &Value) -> Result<ToolExecution, ToolError> {
         let command = required_str(input, "command")?;
         let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(DEFAULT_MAX_BYTES);
@@ -362,6 +369,16 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
 
     fn resolve_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
         self.resolve_path_inner(relative, false)
+    }
+
+    /// Canonicalized workspace-relative form of a model-supplied path, for
+    /// scope matching: `..` and symlinks resolved exactly as the write path
+    /// resolves them. `None` when the path cannot be resolved inside the
+    /// workspace - scoped grant matching then fails closed to the ask path.
+    pub fn workspace_relative_path(&self, relative: &str) -> Option<PathBuf> {
+        let canonical = self.resolve_path_inner(relative, false).ok()?;
+        let root = self.root.canonicalize().ok()?;
+        canonical.strip_prefix(&root).ok().map(Path::to_path_buf)
     }
 
     fn resolve_create_path(&self, relative: &str) -> Result<PathBuf, ToolError> {

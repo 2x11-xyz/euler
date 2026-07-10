@@ -2084,9 +2084,14 @@ fn extension_resolution_rejects_unknown_ids_and_malformed_project_file() {
         .expect("project unknown");
     assert!(!project.status.success());
     let project_stderr = String::from_utf8_lossy(&project.stderr);
+    // The binary reports the canonicalized overlay path (macOS tempdirs live
+    // behind the /var -> /private/var symlink).
+    let canonical_project_file = project_file
+        .canonicalize()
+        .expect("canonicalize project overlay path");
     assert!(project_stderr.contains(&format!(
         "unknown extension id in {}: nope; {valid}",
-        project_file.display()
+        canonical_project_file.display()
     )));
 
     let malformed_home = isolated_home();
@@ -2101,10 +2106,13 @@ fn extension_resolution_rejects_unknown_ids_and_malformed_project_file() {
         .output()
         .expect("malformed project");
     assert!(!malformed.status.success());
+    let canonical_malformed_file = malformed_file
+        .canonicalize()
+        .expect("canonicalize malformed overlay path");
     assert!(
         String::from_utf8_lossy(&malformed.stderr).contains(&format!(
             "malformed project extensions file {}",
-            malformed_file.display()
+            canonical_malformed_file.display()
         ))
     );
 
@@ -5413,10 +5421,16 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
     let info_json: serde_json::Value = serde_json::from_slice(&info.stdout).expect("info json");
     assert_eq!(info_json["source_kind"], "linked");
     assert_eq!(info_json["status"], "needs-review");
+    // Canonicalize before starts_with: macOS tempdirs live behind the
+    // /var -> /private/var symlink and the binary reports canonical paths.
+    let canonical_extension_dir = extension_dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize extension dir");
     assert!(info_json["source_path"]
         .as_str()
         .expect("linked source path")
-        .starts_with(extension_dir.path().to_string_lossy().as_ref()));
+        .starts_with(canonical_extension_dir.to_string_lossy().as_ref()));
     assert_eq!(info_json["requires_review"], serde_json::json!(true));
     assert_eq!(
         info_json["requires_execution_grant"],

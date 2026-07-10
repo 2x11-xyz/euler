@@ -223,6 +223,8 @@ fn subagent_decider_denies_if_gate_still_asks() {
     let request = PermissionRequest {
         capability: Capability::FsWrite,
         reason: "tool edit_file".to_owned(),
+        command: None,
+        path: None,
     };
     let mut gate = euler_core::permissions::PermissionGate::new(SubagentDecider::new(
         AutoApproveTier::ReadOnly,

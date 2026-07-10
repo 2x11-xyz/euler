@@ -52,4 +52,6 @@ fidelity the provider exposes (raw thinking, signed/encrypted items, or
 summaries). Euler is a research agent: reasoning chains are part of the
 reproducibility record. Large reasoning payloads are externalized as blobs
 like any other large payload. Reasoning events are subject to the same
-secret-taint rules as all provenance.
+secret-taint rules as all provenance. Recording opaque artifacts does not
+authorize core UI to render them; display policy is `docs/contracts/ui.md`
+and ADR 0007.

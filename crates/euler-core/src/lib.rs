@@ -6,11 +6,13 @@ use euler_event::EventEnvelope;
 pub mod apply_patch;
 pub mod auth_storage;
 pub mod canvas;
+pub mod checkpoints;
 pub mod compaction;
 mod diagnostics;
 pub mod extension_registry;
 pub mod extensions;
 pub mod file_diff;
+pub mod grants;
 pub mod home;
 pub mod permissions;
 pub mod provenance;
@@ -33,6 +35,10 @@ pub use canvas::{
     assemble_canvas, assemble_canvas_with_compaction, canvas_bytes, retention_stats,
     AutoCompactionPolicy, CanvasItem, CanvasRetentionStats, CanvasRole, CompactionTier,
     DEFAULT_CANVAS_BUDGET_BYTES,
+};
+pub use checkpoints::{
+    list_from_events as list_workspace_checkpoints, load_pre_image, store_pre_image,
+    WorkspaceCheckpointRef, MAX_WORKSPACE_CHECKPOINT_BYTES,
 };
 pub use compaction::{
     build_compaction_candidate, compact_tool_output, find_safe_boundary, heuristic_projection,
@@ -60,8 +66,14 @@ pub use file_diff::{
     ObservedFileChange, WorkspaceSnapshot, MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES,
     MAX_WORKSPACE_SNAPSHOT_FILE_BYTES, MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
 };
+pub use grants::{
+    ActiveGrant, GrantScope, ProjectGrantError, ProjectGrantStore, ScopePattern, ScopePatternError,
+    MAX_GRANT_COMMAND_BYTES, MAX_GRANT_INSTRUCTION_BYTES, MAX_SCOPE_PATTERN_BYTES,
+};
 pub use home::{EulerHome, EulerHomeError};
-pub use permissions::{ApprovalMode, DeciderVerdict, PermissionDecider};
+pub use permissions::{
+    ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,
+};
 pub use provenance::{
     query_provenance, read_provenance, ProvenancePage, ProvenanceQuery, ProvenanceQueryError,
     ProvenanceReadError, ProvenanceWriter, ProvenanceWriterError,
@@ -77,6 +89,7 @@ pub use session::{
     fold_model_target, fold_reasoning_effort, AgentReporter, AgentResultSummary, BackgroundAgent,
     BackgroundAgentPoll, BackgroundAgentReportDrain, ContextLimitConfig, ExtensionExecutionError,
     ModelTarget, RoundObserverConfig, Session, SessionConfig, SessionError,
+    WorkspaceRestoreOutcome,
 };
 pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};

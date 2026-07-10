@@ -4,8 +4,8 @@ use euler_core::permissions::{
 };
 use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, AutoCompactionPolicy, CanvasItem,
-    CompactionTier, ContextLimitConfig, ModelTarget, ProvenanceWriter, ReasoningEffort, Session,
-    SessionConfig, SessionError, ToolRegistry, WorkingStateProjection,
+    CompactionTier, ContextLimitConfig, GrantScope, ModelTarget, ProvenanceWriter, ReasoningEffort,
+    ScopePattern, Session, SessionConfig, SessionError, ToolRegistry, WorkingStateProjection,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{
@@ -809,6 +809,172 @@ fn allow_session_makes_second_use_session_allow_without_second_prompt() {
     assert_eq!(
         decisions[1].parent.as_deref(),
         Some(second_call.id.as_str())
+    );
+}
+
+#[test]
+fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
+    // Review v2 §8: a command covered by an existing scoped session grant
+    // runs under THAT decision — no new permission.decision event (recording
+    // "allowed once" misstated the grant), and the tool result carries a
+    // grant_source tag for the ledger header.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-second".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch second-ran"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(GrantScope::Session(
+            ScopePattern::new("touch").expect("pattern"),
+        ))]),
+    );
+
+    session.run_turn("run shell twice").expect("turn");
+
+    assert!(temp.path().join("first-ran").exists());
+    assert!(temp.path().join("second-ran").exists());
+    // One prompt, ONE decision — the second call is covered.
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        1
+    );
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_DECISION),
+        1
+    );
+    let results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert_eq!(payload_str(results[0], "grant_source"), None);
+    assert_eq!(payload_str(results[1], "grant_source"), Some("session"));
+}
+
+#[test]
+fn scoped_shell_grant_does_not_cover_compound_commands() {
+    // Execution is `sh -c`: a `touch` grant covering `touch a; <anything>`
+    // would authorize the whole line. Compound commands must re-ask.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-compound".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch second-ran; touch evil-ran"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![
+            DeciderVerdict::AllowScoped(GrantScope::Session(
+                ScopePattern::new("touch").expect("pattern"),
+            )),
+            DeciderVerdict::Deny,
+        ]),
+    );
+
+    session.run_turn("run shell twice").expect("turn");
+
+    assert!(temp.path().join("first-ran").exists());
+    // The compound command was NOT covered: it re-prompted and the scripted
+    // denial stopped it.
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        2
+    );
+    assert!(!temp.path().join("evil-ran").exists());
+    assert!(!temp.path().join("second-ran").exists());
+}
+
+#[test]
+fn scoped_fs_grant_does_not_cover_dotdot_or_symlink_escapes() {
+    // Scoped fs-write grants match the canonicalized workspace-relative
+    // path: `src/../escape.txt` and a symlink out of the granted subtree
+    // must fall back to the ask path.
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir(temp.path().join("src")).expect("src dir");
+    std::fs::write(temp.path().join("src/lib.rs"), "alpha").expect("seed lib");
+    std::fs::write(temp.path().join("outside.txt"), "alpha").expect("seed outside");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        temp.path().join("outside.txt"),
+        temp.path().join("src").join("link.txt"),
+    )
+    .expect("symlink");
+    let mut calls = vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-inside".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "src/lib.rs", "old": "alpha", "new": "beta"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-dotdot".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "src/../outside.txt", "old": "alpha", "new": "beta"}),
+        }]),
+    ];
+    let mut verdicts = vec![
+        DeciderVerdict::AllowScoped(GrantScope::Session(
+            ScopePattern::new("src").expect("pattern"),
+        )),
+        DeciderVerdict::Deny,
+    ];
+    calls.push(FixtureResponse::Assistant("done".to_owned()));
+    // A denial caches for the rest of the turn, so the symlink escape runs
+    // as its own turn to prove it re-prompts rather than being covered.
+    #[cfg(unix)]
+    {
+        calls.push(FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-symlink".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "src/link.txt", "old": "alpha", "new": "beta"}),
+        }]));
+        calls.push(FixtureResponse::Assistant("done again".to_owned()));
+        verdicts.push(DeciderVerdict::Deny);
+    }
+    let expected_prompts = verdicts.len();
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(calls),
+        ScriptedDecider::new(verdicts),
+    );
+
+    session.run_turn("edit files").expect("turn");
+    #[cfg(unix)]
+    session.run_turn("edit the symlink").expect("second turn");
+
+    // Covered write inside the granted subtree went through...
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("src/lib.rs")).expect("lib"),
+        "beta"
+    );
+    // ...but every escape re-prompted and the scripted denials stopped them.
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT) as usize,
+        expected_prompts
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("outside.txt")).expect("outside"),
+        "alpha"
     );
 }
 
@@ -3623,7 +3789,7 @@ impl PermissionDecider for ObservingDecider {
                 .any(|kind| kind == EventKind::PERMISSION_PROMPT),
             "permission prompt must be flushed before the decider returns: {observed:?}"
         );
-        self.verdict
+        self.verdict.clone()
     }
 }
 
@@ -4190,4 +4356,96 @@ fn tool_free_max_tokens_round_with_partial_text_still_completes() {
         count_kind(session.events(), EventKind::ASSISTANT_MESSAGE),
         1
     );
+}
+
+#[test]
+fn edit_file_modify_stores_workspace_checkpoint_and_rollback_restores() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let before = "prefix\nalpha\nsuffix\n";
+    let after = "prefix\nbeta\nsuffix\n";
+    fs::write(temp.path().join("note.txt"), before).expect("write fixture");
+    let log = temp.path().join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-edit".to_owned(),
+        name: "edit_file".to_owned(),
+        input: json!({"path": "note.txt", "old": "alpha", "new": "beta"}),
+    }])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+
+    let _ = session
+        .run_turn("edit")
+        .expect_err("provider ends after tools");
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("note.txt")).expect("read edited"),
+        after
+    );
+    let file_change = find_kind(session.events(), EventKind::FILE_CHANGE);
+    let checkpoint_id = file_change.id.clone();
+    let blob = payload_str(file_change, "pre_image_blob")
+        .expect("pre_image_blob")
+        .to_owned();
+    assert_eq!(blob, sha256_hex(before.as_bytes()));
+    let blob_path = temp.path().join(".euler").join("checkpoints").join(&blob);
+    assert_eq!(
+        fs::read_to_string(&blob_path).expect("read checkpoint blob"),
+        before
+    );
+    let prior_count = session.events().len();
+    let outcome = session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("restore");
+    assert_eq!(outcome.path, "note.txt");
+    assert_eq!(outcome.checkpoint_event_id, checkpoint_id);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("note.txt")).expect("restored"),
+        before
+    );
+    assert_eq!(session.events().len(), prior_count + 1);
+    let restore = session.events().last().expect("workspace.restore");
+    assert_eq!(restore.kind.as_str(), EventKind::WORKSPACE_RESTORE);
+    assert_eq!(payload_str(restore, "path"), Some("note.txt"));
+    assert_eq!(
+        payload_str(restore, "checkpoint_event_id"),
+        Some(checkpoint_id.as_str())
+    );
+    assert_eq!(payload_str(restore, "blob_sha256"), Some(blob.as_str()));
+    assert_eq!(restore.payload.get("restored"), Some(&json!(true)));
+    // Append-only: the original file.change stays intact with its pre_image.
+    let original = session
+        .events()
+        .iter()
+        .find(|event| event.id == checkpoint_id)
+        .expect("original checkpoint event");
+    assert_eq!(payload_str(original, "pre_image_blob"), Some(blob.as_str()));
+    assert_eq!(payload_str(original, "action"), Some("modify"));
+}
+
+#[test]
+fn edit_file_create_does_not_store_pre_image_checkpoint() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-create".to_owned(),
+        name: "edit_file".to_owned(),
+        input: json!({"path": "created.txt", "old": "", "new": "hello\n"}),
+    }])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(log).expect("provenance writer"));
+
+    let _ = session
+        .run_turn("create")
+        .expect_err("provider ends after tools");
+    let file_change = find_kind(session.events(), EventKind::FILE_CHANGE);
+    assert!(!file_change.payload.contains_key("pre_image_blob"));
+    assert!(session.workspace_checkpoints().is_empty());
 }

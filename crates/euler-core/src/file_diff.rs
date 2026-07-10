@@ -338,6 +338,16 @@ fn omission_reason(source: &FileDiffSource<'_>) -> Option<&'static str> {
     }
 }
 
+/// Whether a single file body is safe to retain as a workspace checkpoint
+/// pre-image. Reuses the `file.diff` binary / secret-like policy so skipped
+/// diffs and skipped checkpoints stay aligned.
+pub fn content_is_checkpoint_safe(path: &str, content: &str) -> bool {
+    !content.contains('\0')
+        && !unsupported_control(content)
+        && !secret_like_path(path)
+        && !secret_like_text(content, "")
+}
+
 fn unsupported_control(text: &str) -> bool {
     text.chars()
         .any(|ch| ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t')
@@ -352,17 +362,27 @@ fn secret_like_path(path: &str) -> bool {
         || path.ends_with(".key")
 }
 
+/// Heuristic, not a guarantee: substring needles over the lowercased text.
+/// Bare key names (not `key=` forms) so JSON/YAML/env spellings all hit;
+/// over-matching only withholds diff content, which is the safe direction.
 fn secret_like_text(before: &str, after: &str) -> bool {
     let text = format!("{before}\n{after}").to_ascii_lowercase();
     [
         "-----begin ",
-        "authorization: bearer ",
+        "authorization:",
         "api_key",
+        "apikey",
         "access_token",
+        "access_key",
         "refresh_token",
-        "password=",
-        "secret=",
+        "password",
+        "passwd",
+        "secret",
         "token=",
+        "\"token\"",
+        "private_key",
+        "client_id=",
+        "credential",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -516,4 +536,29 @@ fn optional_string(value: &Option<String>) -> Value {
     value
         .as_ref()
         .map_or(Value::Null, |value| value.clone().into())
+}
+
+#[cfg(test)]
+mod secret_detector_tests {
+    use super::secret_like_text;
+
+    #[test]
+    fn detector_catches_structured_and_env_spellings() {
+        // Review finding: `password=`-style needles missed JSON keys and
+        // AWS_SECRET_ACCESS_KEY entirely.
+        for text in [
+            "{\"password\": \"hunter2\"}",
+            "password: hunter2",
+            "AWS_SECRET_ACCESS_KEY=abc123",
+            "aws_access_key_id = AKIA...",
+            "{\"client_secret\": \"x\"}",
+            "PRIVATE_KEY=-----",
+            "apiKey: xyz",
+            "credentials.json contents",
+        ] {
+            assert!(secret_like_text(text, ""), "detector must flag: {text}");
+        }
+        assert!(!secret_like_text("fn max_tokens(&self) -> u64 { 42 }", ""));
+        assert!(!secret_like_text("let x = compute_totals();", ""));
+    }
 }

@@ -300,6 +300,8 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::ShellExec,
         reason: "tool run_shell".to_owned(),
+        command: None,
+        path: None,
     }));
     render_compact_frame(&mut terminal, &mut core);
     assert!(terminal

@@ -22,6 +22,8 @@ fn permission_prompt_renders_inline_with_command_body() {
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::ShellExec,
         reason: "tool run_shell".to_owned(),
+        command: None,
+        path: None,
     }));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
@@ -77,6 +79,8 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::ShellExec,
         reason: "tool run_shell".to_owned(),
+        command: None,
+        path: None,
     }));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
@@ -89,6 +93,8 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::FsWrite,
         reason: "tool edit_file".to_owned(),
+        command: None,
+        path: None,
     }));
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
@@ -105,6 +111,8 @@ fn non_patch_permission_uses_generic_inline_ask() {
     let request = PermissionRequest {
         capability: Capability::ShellExec,
         reason: "tool run_shell".to_owned(),
+        command: None,
+        path: None,
     };
     core.modal = Some(core.modal_for_request(request));
 
@@ -125,6 +133,8 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::ShellExec,
         reason: "tool run_shell".to_owned(),
+        command: None,
+        path: None,
     }));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
@@ -166,6 +176,8 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::FsWrite,
         reason: "tool edit_file".to_owned(),
+        command: None,
+        path: None,
     }));
 
     render_inline_frame(&mut terminal, &mut core);
@@ -241,6 +253,8 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::ShellExec,
         reason: "run command".to_owned(),
+        command: None,
+        path: None,
     }));
 
     terminal.draw(|frame| core.render(frame)).expect("draw");

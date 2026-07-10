@@ -5,6 +5,7 @@ use crate::canvas::{
     AutoCompactionPolicy, CompactionTier,
 };
 use crate::canvas::{render_context_slot, CanvasItem, CanvasRole};
+use crate::checkpoints::{self, list_from_events, WorkspaceCheckpointRef};
 use crate::compaction::{
     build_compaction_candidate, heuristic_projection, select_layer1_candidates, should_compact,
     validate_candidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
@@ -12,7 +13,10 @@ use crate::compaction::{
 use crate::file_diff::{
     file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
 };
-use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate, PermissionRequest};
+use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
+use crate::permissions::{
+    ApprovalMode, GrantDecision, GrantSource, PermissionDecider, PermissionGate, PermissionRequest,
+};
 use crate::provenance::ProvenanceWriter;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
@@ -57,7 +61,7 @@ const CONTEXT_LIMIT_MESSAGE: &str =
     "Session stopped because the context limit threshold was reached.";
 const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
-const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. For code and text file adds or updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff.";
+const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. For code and text file adds or updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff. Write plain prose without emoji or decorative symbols; the terminal ledger renders a fixed glyph vocabulary only.";
 const BACKGROUND_AGENT_PANIC_SUMMARY: &str = "background agent panicked";
 const BACKGROUND_AGENT_PANIC_ERROR: &str = "background-agent-panic";
 const BACKGROUND_AGENT_DISCONNECTED_SUMMARY: &str = "background agent disconnected";
@@ -136,6 +140,11 @@ pub struct SessionConfig {
     /// disables the observer entirely; a configured observer additionally
     /// requires [`Session::set_observer_extension`].
     pub round_observer: Option<RoundObserverConfig>,
+    /// User-home directory holding per-root project-grant consent stores.
+    /// `None` (default) disables project grants entirely: the repo-local
+    /// `.euler/grants.json` is repo-controlled content and must never become
+    /// authority without a matching user consent entry outside the repo.
+    pub project_grant_consent_dir: Option<PathBuf>,
 }
 
 impl SessionConfig {
@@ -158,6 +167,7 @@ impl SessionConfig {
             compaction_reserve_tokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
             round_observer: None,
+            project_grant_consent_dir: None,
         }
     }
 }
@@ -221,6 +231,21 @@ pub enum SessionError {
     InvalidCompanionTask(String),
     #[error("companion spawn requires provenance writer")]
     CompanionProvenanceUnavailable,
+    #[error("checkpoint not found: {event_id}")]
+    CheckpointNotFound { event_id: String },
+    #[error("checkpoint has no restorable pre-image: {event_id}")]
+    CheckpointMissingBlob { event_id: String },
+    #[error("checkpoint blob unavailable: {0}")]
+    CheckpointBlob(String),
+}
+
+/// Outcome of a successful workspace restore (`/rollback`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceRestoreOutcome {
+    pub event_id: String,
+    pub path: String,
+    pub checkpoint_event_id: String,
+    pub blob_sha256: String,
 }
 
 #[derive(Debug, Error)]
@@ -631,12 +656,17 @@ impl<D> Session<D> {
                 ("root", session_root_for_event(&config.root).into()),
             ]),
         ));
+        let mut permissions = PermissionGate::new(decider);
+        // Project grants are best-effort at open: missing file is empty; corrupt
+        // files leave the store unloaded so project writes fail closed.
+        let _ = permissions
+            .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         Self {
             config,
             active_target,
             providers,
             bus,
-            permissions: PermissionGate::new(decider),
+            permissions,
             tools,
             provenance: None,
             persisted_events: 0,
@@ -682,6 +712,22 @@ impl<D> Session<D> {
 
     pub fn extension_enabled(&self, id: &str) -> bool {
         self.config.extensions_enabled.contains(id)
+    }
+
+    /// Session-local enablement set (resolved at launch, mutable via TUI manager).
+    pub fn extensions_enabled(&self) -> &BTreeSet<String> {
+        &self.config.extensions_enabled
+    }
+
+    /// Enable or disable an extension for the remainder of this live session.
+    /// Does not persist to the user registry — callers own registry writes.
+    pub fn set_extension_enabled(&mut self, id: impl Into<String>, enabled: bool) {
+        let id = id.into();
+        if enabled {
+            self.config.extensions_enabled.insert(id);
+        } else {
+            self.config.extensions_enabled.remove(&id);
+        }
     }
 
     /// Compute the layer-1 compacted canvas for the current session state.
@@ -816,6 +862,21 @@ impl<D> Session<D> {
         self.permissions.set_mode(capability, mode);
     }
 
+    /// Active session + project grants for `/permissions` listing.
+    pub fn list_grants(&self) -> Vec<(GrantSource, ActiveGrant)> {
+        self.permissions.list_grants()
+    }
+
+    /// Revoke a session or project grant. Project revokes rewrite `.euler/grants.json`.
+    pub fn revoke_grant(
+        &mut self,
+        capability: Capability,
+        pattern: &ScopePattern,
+        source: GrantSource,
+    ) -> Result<usize, ProjectGrantError> {
+        self.permissions.revoke(capability, pattern, source)
+    }
+
     pub fn active_target(&self) -> &ModelTarget {
         &self.active_target
     }
@@ -877,12 +938,15 @@ impl<D> Session<D> {
     ) -> Self {
         let tools = ToolRegistry::new(config.root.clone());
         let persisted_events = events.len();
+        let mut permissions = PermissionGate::new(decider);
+        let _ = permissions
+            .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         Self {
             config,
             active_target,
             providers,
             bus: EventBus { events },
-            permissions: PermissionGate::new(decider),
+            permissions,
             tools,
             provenance: None,
             persisted_events,
@@ -1259,6 +1323,74 @@ impl<D: PermissionDecider> Session<D> {
         Ok(normalized)
     }
 
+    /// List restorable workspace checkpoints from this session's `file.change`
+    /// events (newest first). Used by `/rollback`.
+    pub fn workspace_checkpoints(&self) -> Vec<WorkspaceCheckpointRef> {
+        list_from_events(self.bus.events())
+    }
+
+    /// Restore one workspace file to the pre-image captured on a `file.change`
+    /// event. Appends a new `workspace.restore` ledger event; never rewrites
+    /// history.
+    pub fn restore_workspace_checkpoint(
+        &mut self,
+        checkpoint_event_id: &str,
+    ) -> Result<WorkspaceRestoreOutcome, SessionError> {
+        let checkpoint = self
+            .bus
+            .events()
+            .iter()
+            .find(|event| {
+                event.id == checkpoint_event_id && event.kind.as_str() == EventKind::FILE_CHANGE
+            })
+            .ok_or_else(|| SessionError::CheckpointNotFound {
+                event_id: checkpoint_event_id.to_owned(),
+            })?;
+        let path = checkpoint
+            .payload
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| SessionError::CheckpointMissingBlob {
+                event_id: checkpoint_event_id.to_owned(),
+            })?
+            .to_owned();
+        let blob_sha256 = checkpoint
+            .payload
+            .get("pre_image_blob")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| SessionError::CheckpointMissingBlob {
+                event_id: checkpoint_event_id.to_owned(),
+            })?
+            .to_owned();
+        let content = checkpoints::load_pre_image(self.config.root.as_path(), &blob_sha256)
+            .map_err(|error| SessionError::CheckpointBlob(error.to_string()))?;
+        self.tools
+            .write_workspace_file(&path, &content)
+            .map_err(SessionError::from)?;
+        let payload = object([
+            ("path", path.clone().into()),
+            ("checkpoint_event_id", checkpoint_event_id.to_owned().into()),
+            ("blob_sha256", blob_sha256.clone().into()),
+            ("restored", true.into()),
+        ]);
+        self.emit_control_event_required(EventKind::WORKSPACE_RESTORE, payload)?;
+        let event_id = self
+            .bus
+            .events()
+            .last()
+            .expect("workspace.restore just accepted")
+            .id
+            .clone();
+        Ok(WorkspaceRestoreOutcome {
+            event_id,
+            path,
+            checkpoint_event_id: checkpoint_event_id.to_owned(),
+            blob_sha256,
+        })
+    }
+
     pub fn run_turn(&mut self, user_message: &str) -> Result<Vec<EventEnvelope>, SessionError> {
         self.run_turn_with_sink(user_message, Arc::new(AtomicBool::new(false)), |_| {})
     }
@@ -1619,6 +1751,7 @@ impl<D: PermissionDecider> Session<D> {
         )?;
         sink.flush(self.bus.events());
 
+        let mut covered_grant_source: Option<crate::GrantSource> = None;
         if let Some(capability) = self
             .tools
             .required_capability_for_input(&call.name, &call.input)
@@ -1627,55 +1760,70 @@ impl<D: PermissionDecider> Session<D> {
                 self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
                 return Ok(());
             }
-            let request = PermissionRequest {
+            let mut request = permission_request_for_tool(
                 capability,
-                reason: self.tools.permission_reason(&call.name, &call.input),
-            };
+                &self.tools.permission_reason(&call.name, &call.input),
+                &call.name,
+                &call.input,
+            );
+            // Scoped fs-write grants match the canonicalized workspace-
+            // relative path (`..`/symlinks resolved exactly as the write
+            // resolves them), so `src/../Cargo.toml` or a symlink inside the
+            // granted subtree cannot borrow its grant. An unresolvable path
+            // clears the field: scoped grants then never match and the
+            // request falls back to the ask path.
+            if capability == Capability::FsWrite {
+                request.path = request
+                    .path
+                    .as_deref()
+                    .and_then(|path| self.tools.workspace_relative_path(&path.to_string_lossy()));
+            }
             let mode = self.permissions.mode(capability);
-            let prompt_id = if mode == ApprovalMode::Ask {
-                let prompt_id = self.emit(
-                    EventKind::PERMISSION_PROMPT,
-                    object([
-                        ("capability", capability.as_str().into()),
-                        ("reason", request.reason.clone().into()),
-                    ]),
-                )?;
-                sink.flush(self.bus.events());
-                Some(prompt_id)
+            // A request covered by an existing session/project grant runs
+            // under THAT decision: no prompt, and no fresh permission.decision
+            // event — recording "allowed once" here would misstate what the
+            // user actually granted (review v2 §8). The tool result carries a
+            // `grant_source` tag so the ledger can show `· session grant`.
+            covered_grant_source = if mode == ApprovalMode::Ask {
+                self.permissions.granted_source(&request)
             } else {
                 None
             };
-            let allowed = self.permissions.decide(&request, mode);
-            let mode_label = approval_mode_str(mode);
-            // An Ask that upgraded the gate to SessionAllow was an
-            // AllowSession verdict; record the session scope so resume can
-            // fold the grant (see the session-scope ADR).
-            let session_scoped = mode == ApprovalMode::Ask
-                && self.permissions.mode(capability) == ApprovalMode::SessionAllow;
-            let mut payload = object([
-                ("capability", capability.as_str().into()),
-                ("mode", mode_label.into()),
-                ("allowed", allowed.into()),
-                ("decision", permission_decision_str(allowed).into()),
-            ]);
-            if session_scoped {
-                payload.insert("scope".to_owned(), "session".into());
-            }
-            self.emit_with_parent(
-                EventKind::PERMISSION_DECISION,
-                payload,
-                Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
-            )?;
-            crate::diagnostics::permission_decision(
-                &self.config.session_id,
-                capability.as_str(),
-                mode_label,
-                allowed,
-            );
-            if !allowed {
-                turn_state.record_denial(capability);
-                self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
-                return Ok(());
+            if covered_grant_source.is_none() {
+                let needs_prompt = mode == ApprovalMode::Ask;
+                let prompt_id = if needs_prompt {
+                    let prompt_id = self.emit(
+                        EventKind::PERMISSION_PROMPT,
+                        object([
+                            ("capability", capability.as_str().into()),
+                            ("reason", request.reason.clone().into()),
+                        ]),
+                    )?;
+                    sink.flush(self.bus.events());
+                    Some(prompt_id)
+                } else {
+                    None
+                };
+                let decision = self.permissions.decide_detailed(&request, mode);
+                let allowed = decision.allowed();
+                let mode_label = approval_mode_str(mode);
+                let payload = permission_decision_payload(&decision, mode_label, mode);
+                self.emit_with_parent(
+                    EventKind::PERMISSION_DECISION,
+                    payload,
+                    Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
+                )?;
+                crate::diagnostics::permission_decision(
+                    &self.config.session_id,
+                    capability.as_str(),
+                    mode_label,
+                    allowed,
+                );
+                if !allowed {
+                    turn_state.record_denial(capability);
+                    self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
+                    return Ok(());
+                }
             }
         }
 
@@ -1721,9 +1869,10 @@ impl<D: PermissionDecider> Session<D> {
                         payload,
                         Some(patch_proposed_id),
                     )?;
+                    let pre_image_blob = maybe_store_pre_image(self.config.root.as_path(), &patch);
                     let file_change_id = self.emit_with_parent(
                         EventKind::FILE_CHANGE,
-                        file_change_payload(&call.id, &patch),
+                        file_change_payload(&call.id, &patch, pre_image_blob.as_deref()),
                         Some(patch_applied_id.clone()),
                     )?;
                     self.emit_with_parent(
@@ -1752,6 +1901,12 @@ impl<D: PermissionDecider> Session<D> {
                 ]);
                 if let Some(exit_code) = execution.exit_code {
                     payload.insert("exit_code".to_owned(), exit_code.into());
+                }
+                if let Some(source) = covered_grant_source {
+                    // Ran under an existing grant — the ledger shows a dim
+                    // `· session grant` on the tool header instead of a fresh
+                    // decision record (review v2 §8).
+                    payload.insert("grant_source".to_owned(), source.as_str().into());
                 }
                 self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
                 crate::diagnostics::tool_exec_end(
@@ -2251,8 +2406,12 @@ fn effective_stub_budget(
     configured_budget_bytes.min(token_proxy_budget)
 }
 
-fn file_change_payload(tool_call_id: &str, patch: &PatchEvents) -> JsonObject {
-    object([
+fn file_change_payload(
+    tool_call_id: &str,
+    patch: &PatchEvents,
+    pre_image_blob: Option<&str>,
+) -> JsonObject {
+    let mut payload = object([
         ("tool_call_id", tool_call_id.to_owned().into()),
         ("origin", patch.origin.into()),
         ("action", patch.action.into()),
@@ -2269,7 +2428,19 @@ fn file_change_payload(tool_call_id: &str, patch: &PatchEvents) -> JsonObject {
         ("before_byte_len", patch.before_byte_len.into()),
         ("after_byte_len", patch.after_byte_len.into()),
         ("diff_redaction", "omitted".into()),
-    ])
+    ]);
+    if let Some(hash) = pre_image_blob {
+        payload.insert("pre_image_blob".to_owned(), hash.into());
+    }
+    payload
+}
+
+pub(crate) fn maybe_store_pre_image(root: &std::path::Path, patch: &PatchEvents) -> Option<String> {
+    // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
+    if patch.action != "modify" || patch.before.is_empty() {
+        return None;
+    }
+    checkpoints::store_pre_image(root, &patch.path, &patch.before)
 }
 
 fn file_diff_payload(tool_call_id: &str, file_change_id: &str, patch: &PatchEvents) -> JsonObject {
@@ -2317,6 +2488,69 @@ fn permission_decision_str(allowed: bool) -> &'static str {
     } else {
         "denied"
     }
+}
+
+pub(crate) fn permission_request_for_tool(
+    capability: Capability,
+    reason: &str,
+    tool_name: &str,
+    input: &Value,
+) -> PermissionRequest {
+    let mut request = PermissionRequest::new(capability, reason.to_owned());
+    match tool_name {
+        "run_shell" => {
+            if let Some(command) = input.get("command").and_then(Value::as_str) {
+                request = request.with_command(command);
+            }
+        }
+        "edit_file" | "read_file" | "apply_patch" => {
+            if let Some(path) = input.get("path").and_then(Value::as_str) {
+                request = request.with_path(path);
+            }
+        }
+        _ => {}
+    }
+    request
+}
+
+/// Build a permission.decision payload including optional grant scope fields.
+pub(crate) fn permission_decision_payload(
+    decision: &GrantDecision,
+    mode_label: &str,
+    mode: ApprovalMode,
+) -> JsonObject {
+    let allowed = decision.allowed();
+    let mut payload = object([
+        ("capability", decision.capability.as_str().into()),
+        ("mode", mode_label.into()),
+        ("allowed", allowed.into()),
+        ("decision", permission_decision_str(allowed).into()),
+    ]);
+    if allowed {
+        // grant_scope is additive; keep legacy `scope: "session"` for unscoped
+        // session grants created under Ask so resume continues to fold
+        // capability-wide allows (see resume fold rules).
+        payload.insert(
+            "grant_scope".to_owned(),
+            decision.grant_scope_label().into(),
+        );
+        if let Some(pattern) = decision.grant_pattern() {
+            payload.insert("grant_pattern".to_owned(), pattern.into());
+        }
+        let unscoped_session_grant = mode == ApprovalMode::Ask
+            && matches!(
+                &decision.scope,
+                crate::grants::GrantScope::Session(p) if p.is_unscoped()
+            );
+        if unscoped_session_grant {
+            payload.insert("scope".to_owned(), "session".into());
+        }
+    } else if let Some(instruction) = decision.instruction.as_ref() {
+        if !instruction.is_empty() {
+            payload.insert("instruction".to_owned(), instruction.clone().into());
+        }
+    }
+    payload
 }
 
 pub fn fold_model_target(

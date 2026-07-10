@@ -258,6 +258,8 @@ fn fs_write_request() -> PermissionRequest {
     PermissionRequest {
         capability: Capability::FsWrite,
         reason: "tool edit_file".to_owned(),
+        command: None,
+        path: None,
     }
 }
 
@@ -265,6 +267,8 @@ fn apply_patch_request() -> PermissionRequest {
     PermissionRequest {
         capability: Capability::FsWrite,
         reason: "tool apply_patch".to_owned(),
+        command: None,
+        path: None,
     }
 }
 
@@ -332,6 +336,8 @@ fn modal_input_replies_allow_deny_and_allow_all() {
         core.modal = Some(Modal::Permission(PermissionRequest {
             capability: Capability::FsWrite,
             reason: "edit".to_owned(),
+            command: None,
+            path: None,
         }));
         core.handle_input(key(code));
         assert_eq!(reply_rx.recv().expect("reply"), reply);
@@ -360,6 +366,8 @@ fn modal_ctrl_c_denies_and_quits() {
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::FsWrite,
         reason: "edit".to_owned(),
+        command: None,
+        path: None,
     }));
 
     let effect = core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -413,6 +421,8 @@ fn permission_modal_swallows_scrollback_keys_without_replying() {
     core.modal = Some(Modal::Permission(PermissionRequest {
         capability: Capability::FsWrite,
         reason: "edit".to_owned(),
+        command: None,
+        path: None,
     }));
 
     assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::None);
