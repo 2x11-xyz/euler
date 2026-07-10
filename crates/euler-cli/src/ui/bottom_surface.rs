@@ -11,6 +11,10 @@ use euler_core::ApprovalMode;
 use euler_sdk::Capability;
 use std::path::Path;
 
+mod palette;
+
+pub use self::palette::CommandPalette;
+
 const DEFAULT_PICKER_VISIBLE_ROWS: usize = 6;
 const PALETTE_QUERY_PREFIX: &str = "\u{258c} ";
 
@@ -802,194 +806,6 @@ impl MentionPicker {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandPalette {
-    input: String,
-    cursor: usize,
-    selected: usize,
-    saved_draft: ComposerDraft,
-    /// Full core + extension list captured when the palette opened.
-    entries: Vec<PaletteEntry>,
-}
-
-impl CommandPalette {
-    fn new(saved_draft: ComposerDraft, entries: Vec<PaletteEntry>) -> Self {
-        Self {
-            input: "/".to_owned(),
-            cursor: 1,
-            selected: 0,
-            saved_draft,
-            entries,
-        }
-    }
-
-    pub fn input(&self) -> &str {
-        &self.input
-    }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    pub fn matches(&self) -> Vec<PaletteEntry> {
-        let needle = palette_filter_needle(&self.input);
-        self.entries
-            .iter()
-            .filter(|entry| palette_entry_matches(entry, &needle))
-            .cloned()
-            .collect()
-    }
-
-    pub fn selected_token(&self) -> Option<String> {
-        self.matches()
-            .get(self.selected)
-            .map(|entry| entry.token.clone())
-    }
-
-    pub fn selected_entry(&self) -> Option<PaletteEntry> {
-        self.matches().get(self.selected).cloned()
-    }
-
-    pub fn render_lines(&self, width: u16) -> Vec<String> {
-        let mut lines = vec![truncate_display(
-            &format!("{PALETTE_QUERY_PREFIX}{}", self.input),
-            usize::from(width),
-        )];
-        let matches = self.matches();
-        let match_count = matches.len();
-        let start = self.selected.saturating_sub(3);
-        let unfiltered = palette_filter_needle(&self.input).is_empty();
-        let mut shown_extensions_header = false;
-        for (index, entry) in matches.into_iter().enumerate().skip(start).take(4) {
-            if unfiltered && entry.is_extension() && !shown_extensions_header {
-                // EXTENSIONS group header (not selectable; does not count as a match row).
-                lines.push(truncate_display("EXTENSIONS", usize::from(width)));
-                shown_extensions_header = true;
-            }
-            lines.push(palette_entry_line(index == self.selected, &entry, width));
-        }
-        lines.push(truncate_display(
-            &format!(
-                "({}/{match_count})  Enter select  Tab complete  Esc close",
-                self.selected.saturating_add(1).min(match_count)
-            ),
-            usize::from(width),
-        ));
-        lines
-    }
-
-    fn cursor_target(&self, width: u16) -> (u16, u16) {
-        debug_assert!(self.cursor <= self.input.chars().count());
-        let input_prefix = self.input.chars().take(self.cursor).collect::<String>();
-        let raw_column = display_width(PALETTE_QUERY_PREFIX) + display_width(&input_prefix);
-        let max_column = usize::from(width.saturating_sub(1));
-        (
-            0,
-            u16::try_from(raw_column.min(max_column)).unwrap_or(u16::MAX),
-        )
-    }
-
-    fn insert_text(&mut self, text: &str) {
-        let byte_index = byte_index_for_char_offset(&self.input, self.cursor);
-        self.input.insert_str(byte_index, text);
-        self.cursor += text.chars().count();
-        self.clamp_selection();
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor <= 1 {
-            return;
-        }
-        let end = byte_index_for_char_offset(&self.input, self.cursor);
-        self.cursor -= 1;
-        let start = byte_index_for_char_offset(&self.input, self.cursor);
-        self.input.replace_range(start..end, "");
-        self.clamp_selection();
-    }
-
-    fn delete(&mut self) {
-        if self.cursor >= self.input.chars().count() {
-            return;
-        }
-        let start = byte_index_for_char_offset(&self.input, self.cursor);
-        let end = byte_index_for_char_offset(&self.input, self.cursor + 1);
-        self.input.replace_range(start..end, "");
-        self.clamp_selection();
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1).max(1);
-    }
-
-    fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.input.chars().count());
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = 1;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.input.chars().count();
-    }
-
-    fn move_down(&mut self) {
-        let len = self.matches().len();
-        if len > 0 {
-            self.selected = (self.selected + 1) % len;
-        }
-    }
-
-    fn move_up(&mut self) {
-        let len = self.matches().len();
-        if len > 0 {
-            self.selected = (self.selected + len - 1) % len;
-        }
-    }
-
-    fn autocomplete_selected(&mut self) {
-        let Some(token) = self.selected_token() else {
-            return;
-        };
-        self.input = replace_command_token(&self.input, &token);
-        self.move_end();
-        self.clamp_selection();
-    }
-
-    fn clamp_selection(&mut self) {
-        let len = self.matches().len();
-        if len == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = self.selected.min(len - 1);
-        }
-    }
-
-    fn confirmation_input(&self) -> String {
-        self.selected_token().map_or_else(
-            || self.input.clone(),
-            |token| replace_command_token(&self.input, &token),
-        )
-    }
-
-    fn line_count(&self) -> u16 {
-        let matches = self.matches();
-        let match_count = matches.len();
-        let start = self.selected.saturating_sub(3);
-        let unfiltered = palette_filter_needle(&self.input).is_empty();
-        let header = usize::from(
-            unfiltered
-                && matches
-                    .iter()
-                    .skip(start)
-                    .take(4)
-                    .any(PaletteEntry::is_extension),
-        );
-        let rows = 2 + match_count.saturating_sub(start).min(4) + header;
-        u16::try_from(rows).unwrap_or(u16::MAX)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplacementPicker {
     kind: PickerKind,
     title: String,
@@ -1736,36 +1552,6 @@ fn resume_items(items: Vec<ResumeItem>) -> Vec<PickerItem> {
         .collect()
 }
 
-fn palette_entry_line(selected: bool, entry: &PaletteEntry, width: u16) -> String {
-    let marker = if selected { ">" } else { " " };
-    let line = if entry.is_extension() {
-        // Faint teal ⋄ precedes extension tokens (color applied by themed render path
-        // when available; plain text keeps the glyph for no-color).
-        format!("{marker} ⋄ {}  {}", entry.token, entry.summary)
-    } else {
-        format!("{marker} {} {}", entry.token, entry.summary)
-    };
-    truncate_display(&line, usize::from(width))
-}
-
-fn palette_filter_needle(input: &str) -> String {
-    input
-        .split_whitespace()
-        .next()
-        .unwrap_or(input)
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .to_lowercase()
-}
-
-fn palette_entry_matches(entry: &PaletteEntry, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    let token = entry.token.trim_start_matches('/').to_lowercase();
-    token.starts_with(needle) || token.contains(needle)
-}
-
 impl TextPrompt {
     fn new(kind: TextPromptKind, title: impl Into<String>, saved_draft: ComposerDraft) -> Self {
         Self {
@@ -1954,12 +1740,6 @@ fn resume_item_matches(item: &PickerItem, query: &str) -> bool {
 
 fn display_label_search_text(label: &str) -> &str {
     label.split_once(" — ").map_or(label, |(base, _)| base)
-}
-
-fn replace_command_token(input: &str, token: &str) -> String {
-    let token_end = input.find(char::is_whitespace).unwrap_or(input.len());
-    let rest = &input[token_end..];
-    format!("{token}{rest}")
 }
 
 fn byte_index_for_char_offset(text: &str, offset: usize) -> usize {
