@@ -607,8 +607,18 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
         // the single owner of vertical rhythm; no other layer adds spacers
         // around history content.
         // Banner lines end with their own built-in blank; everything else
-        // gets the uniform one-blank separator here.
-        if first_line < lines.len() && !matches!(item, TranscriptItem::Banner { .. }) {
+        // gets the uniform one-blank separator here. Exception (review v2
+        // §3/§6): a run of consecutive `Notice` items stacks directly — no
+        // blank line between one notice and the next.
+        let next_is_notice_continuation = matches!(item, TranscriptItem::Notice(_))
+            && matches!(
+                entries.get(index + 1).map(|entry| &entry.item),
+                Some(TranscriptItem::Notice(_))
+            );
+        if first_line < lines.len()
+            && !matches!(item, TranscriptItem::Banner { .. })
+            && !next_is_notice_continuation
+        {
             lines.push(Line::default());
         }
         item_end_offsets.push(lines.len());

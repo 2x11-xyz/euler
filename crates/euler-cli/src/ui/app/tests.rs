@@ -2281,7 +2281,33 @@ fn resume_picker_reports_empty_state_without_active_turn_language() {
         CoreEffect::Render
     );
 
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume needs an active session"));
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("resume needs an active session"));
+    assert!(
+        !text.contains("ui:"),
+        "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
+    );
+}
+
+#[test]
+fn resume_refusal_for_already_active_session_is_a_neutral_notice() {
+    let mut core = core();
+    let session_id = match &core.state {
+        AppState::Idle { session } => session.session_id().to_owned(),
+        _ => panic!("expected an idle session"),
+    };
+
+    assert_eq!(
+        core.resume_session_from_picker(session_id.clone()),
+        CoreEffect::Render
+    );
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains(&format!("already using session {session_id}")));
+    assert!(
+        !text.contains("ui:"),
+        "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
+    );
 }
 
 #[test]
@@ -3342,6 +3368,10 @@ fn timestamps_toggle_persists_and_logs_confirmation() {
     assert!(
         text.contains("timestamps hidden"),
         "expected confirmation in transcript: {text}"
+    );
+    assert!(
+        !text.contains("ui:"),
+        "the /timestamps confirmation is a neutral notice, not a \"ui:\" error: {text}"
     );
     assert_eq!(
         crate::model_preference::load_timestamps_preference(&preference_path),

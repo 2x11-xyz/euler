@@ -1809,6 +1809,42 @@ fn disabled_extension_notice_renders_every_entrance_without_dedup() {
 }
 
 #[test]
+fn consecutive_notice_items_stack_without_separating_blank_lines() {
+    // Review v2 §3/§6: a run of Notice items (e.g. extension toggle
+    // confirmations firing back to back) reads as one stacked block, not one
+    // blank-separated event per line.
+    let theme = Theme::default();
+    let items = vec![
+        TranscriptItem::Notice("extension enabled: causal-dag".to_owned()),
+        TranscriptItem::Notice("extension enabled: code-swarm".to_owned()),
+        TranscriptItem::AssistantMessage("unrelated answer".to_owned()),
+    ];
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 80));
+    let first = texts
+        .iter()
+        .position(|line| line.contains("causal-dag"))
+        .expect("first notice present");
+    let second = texts
+        .iter()
+        .position(|line| line.contains("code-swarm"))
+        .expect("second notice present");
+    assert_eq!(
+        second,
+        first + 1,
+        "no blank line between consecutive notices: {texts:?}"
+    );
+
+    let after_second = texts
+        .get(second + 1)
+        .expect("a row follows the second notice");
+    assert!(
+        after_second.trim().is_empty(),
+        "a blank line still separates the notice run from the next item: {texts:?}"
+    );
+}
+
+#[test]
 fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
     let theme = Theme::default();
     let long_path = "crates/euler-cli/src/ui/transcript/very/deep/path/with spaces/cells.rs";

@@ -1630,7 +1630,7 @@ impl AppCore {
             if let Err(error) =
                 model_preference::save_timestamps_preference(path, self.show_timestamp_gutter)
             {
-                self.push_notice_item(format!(
+                return self.teach_notice(format!(
                     "timestamps {}; preference not saved: {error}",
                     if self.show_timestamp_gutter {
                         "shown"
@@ -1638,7 +1638,6 @@ impl AppCore {
                         "hidden"
                     }
                 ));
-                return CoreEffect::Render;
             }
         }
         // Faint confirmation line; also logged as a transcript notice item.
@@ -1647,7 +1646,7 @@ impl AppCore {
         } else {
             "timestamps hidden".to_owned()
         };
-        self.notice_item(message)
+        self.teach_notice(message)
     }
 
     fn rollback_workspace_checkpoint(&mut self, event_id: String) -> CoreEffect {
@@ -2120,10 +2119,14 @@ impl AppCore {
         });
     }
 
-    /// Muted, non-error informational line (review v2 §14.4) — no glyph, no
-    /// "ui:" source prefix. Used for teach messages like the
-    /// disabled-extension notice, which should never read as an error and
-    /// should render every time the disabled command is invoked.
+    /// Muted, non-error informational line (review v2 §3/§6/§14.4) — no
+    /// glyph, no "ui:" source prefix, indented to the content column.
+    /// Consecutive `Notice` items stack directly without a separating blank
+    /// line (the renderer special-cases this run). Used for every neutral
+    /// confirmation/refusal (extension toggles, timestamps toggle,
+    /// code-swarm save/config lines, resume refusal, teach messages like the
+    /// disabled-extension notice) — none of these are failures, so none
+    /// should read as one.
     fn teach_notice(&mut self, message: String) -> CoreEffect {
         self.push_finalized_visual_item(TranscriptItem::Notice(message));
         CoreEffect::Render
