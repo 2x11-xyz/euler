@@ -576,6 +576,18 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     width,
                 );
             }
+            TranscriptItem::Notice(message) => {
+                // No glyph, no source prefix — a plain muted line anchored
+                // by the default `•` spine bullet (review v2 §14.4).
+                push_wrapped(
+                    &mut lines,
+                    blank_gutter(),
+                    message,
+                    theme.transcript.muted,
+                    theme,
+                    width,
+                );
+            }
         }
 
         if first_line < lines.len() && is_meaningful_ledger_item(item) {

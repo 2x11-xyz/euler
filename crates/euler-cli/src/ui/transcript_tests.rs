@@ -1752,6 +1752,63 @@ fn turn_recap_renders_faint_files_line_when_files_changed() {
 }
 
 #[test]
+fn disabled_extension_notice_renders_muted_without_glyph_or_prefix() {
+    // Review v2 §14.4: the teach line must be a plain muted notice — no ✗,
+    // no red error style, no "ui:" source prefix.
+    let theme = Theme::default();
+    let message =
+        crate::ui::commands::disabled_extension_teach("/catch-up", "causal-dag").to_owned();
+    let items = vec![TranscriptItem::Notice(message.clone())];
+
+    let lines = render_items_for_history(&items, &theme, 80);
+    let texts = line_texts(&lines);
+    let joined = texts.join("\n");
+
+    assert!(joined.contains(&message), "texts: {texts:?}");
+    assert!(!joined.contains('✗'), "texts: {texts:?}");
+    assert!(!joined.contains("ui:"), "texts: {texts:?}");
+
+    let notice_span = lines
+        .iter()
+        .find_map(|line| {
+            line.spans
+                .iter()
+                .find(|span| span.content.contains("provided by"))
+        })
+        .expect("notice span present");
+    assert_eq!(
+        notice_span.style, theme.transcript.muted,
+        "teach line should render in the muted style, never the error style"
+    );
+    assert_ne!(
+        notice_span.style, theme.transcript.error,
+        "teach line must never use the red error style"
+    );
+}
+
+#[test]
+fn disabled_extension_notice_renders_every_entrance_without_dedup() {
+    // Review v2 §14.4: the teach line prints every time the disabled command
+    // is entered — typed, via palette, or via the extension run form — not
+    // just once per session.
+    let theme = Theme::default();
+    let message = crate::ui::commands::disabled_extension_teach("/dag", "causal-dag");
+    let items = vec![
+        TranscriptItem::Notice(message.clone()),
+        TranscriptItem::Notice(message.clone()),
+        TranscriptItem::Notice(message.clone()),
+    ];
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 80));
+    let occurrences = texts.iter().filter(|line| line.contains(&message)).count();
+
+    assert_eq!(
+        occurrences, 3,
+        "each entrance should render its own teach line, not be deduped: {texts:?}"
+    );
+}
+
+#[test]
 fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
     let theme = Theme::default();
     let long_path = "crates/euler-cli/src/ui/transcript/very/deep/path/with spaces/cells.rs";

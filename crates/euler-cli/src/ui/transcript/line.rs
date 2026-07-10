@@ -77,6 +77,7 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::ResumeBoundary { .. } => line_oriented_resume_boundary(item),
         super::TranscriptItem::Companion { .. } => line_oriented_companion(item),
         super::TranscriptItem::Error { source, message } => format!("error: {source}: {message}\n"),
+        super::TranscriptItem::Notice(message) => format!("notice: {message}\n"),
     }
 }
 
