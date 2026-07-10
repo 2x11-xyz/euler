@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::text::truncate_display;
 
 pub(in crate::ui::transcript) struct ToolRunRender<'a> {
     pub(in crate::ui::transcript) command: &'a str,
@@ -17,16 +18,6 @@ pub(in crate::ui::transcript) fn render_tool_run(
     width: u16,
     limit: usize,
 ) {
-    let mut heading = if run.command.is_empty() {
-        "bash".to_owned()
-    } else {
-        format!("bash $ {}", run.command)
-    };
-    if let Some(source) = run.grant_source {
-        // Provenance trace of an existing grant lives on the header (dim),
-        // not as a standalone decision record (review v2 §8).
-        heading.push_str(&format!(" · {source} grant"));
-    }
     let style = if run.ok {
         theme.transcript.tool
     } else {
@@ -45,7 +36,12 @@ pub(in crate::ui::transcript) fn render_tool_run(
         informative_output_rows(run.output, limit)
     };
     let rows = plain_artifact_rows(&output.rows, theme.transcript.muted);
-    let footer = tool_run_footer(run, output.total_rows, output.folded);
+    // The footer (status · line count · folded) is computed before the
+    // heading so the heading truncation below can reserve room for it — the
+    // metadata cluster must never itself get clipped by width-fitting
+    // (design review v3 §R3).
+    let footer = tool_run_footer(&run, output.total_rows, output.folded);
+    let heading = tool_run_heading(&run, width, &footer);
     push_artifact_cell(
         lines,
         ArtifactCellRender {
@@ -58,6 +54,41 @@ pub(in crate::ui::transcript) fn render_tool_run(
         },
         theme,
     );
+}
+
+const BASH_PREFIX: &str = "bash $ ";
+
+/// Bash header, command text truncated (not the metadata) so the trailing
+/// `· exit N · N lines · folded` cluster always renders intact at any width
+/// (design review v3 §R3) — the old width-fit truncated the whole header,
+/// sometimes clipping mid-metadata (`· 61 li`, `· exit` with no code). The
+/// command yields all its width to the metadata cluster, down to nothing
+/// (just an ellipsis) at extreme widths — a bare command reads worse than a
+/// tight one, but a corrupted metadata cluster reads as a lost exit code.
+fn tool_run_heading(run: &ToolRunRender<'_>, width: u16, footer: &str) -> String {
+    if run.command.is_empty() {
+        return "bash".to_owned();
+    }
+    let grant_suffix = run.grant_source.map(|source| format!(" · {source} grant"));
+    let available = content_width(width);
+    let reserved = display_width(BASH_PREFIX)
+        + grant_suffix.as_deref().map(display_width).unwrap_or(0)
+        + display_width(" · ")
+        + display_width(footer);
+    let command_budget = available.saturating_sub(reserved);
+    let command = if display_width(run.command) > command_budget {
+        let truncated = truncate_display(run.command, command_budget.saturating_sub(1));
+        format!("{truncated}…")
+    } else {
+        run.command.to_owned()
+    };
+    let mut heading = format!("{BASH_PREFIX}{command}");
+    if let Some(suffix) = grant_suffix {
+        // Provenance trace of an existing grant lives on the header (dim),
+        // not as a standalone decision record (review v2 §8).
+        heading.push_str(&suffix);
+    }
+    heading
 }
 
 pub(in crate::ui::transcript) fn tool_failure_status(
@@ -186,7 +217,7 @@ fn last_non_empty_line(output: &str) -> Option<&str> {
         .last()
 }
 
-fn tool_run_footer(run: ToolRunRender<'_>, total_rows: usize, folded: bool) -> String {
+fn tool_run_footer(run: &ToolRunRender<'_>, total_rows: usize, folded: bool) -> String {
     let cross = glyphs::cross();
     let status = match (run.exit_code, run.ok) {
         (Some(code), true) => format!("exit {code}"),

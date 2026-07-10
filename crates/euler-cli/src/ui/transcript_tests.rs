@@ -1712,6 +1712,51 @@ fn tool_artifact_cell_uses_available_width_for_long_command_title() {
 }
 
 #[test]
+fn tool_artifact_cell_truncates_command_not_metadata_at_narrow_widths() {
+    let theme = Theme::default();
+    let command =
+        "sed -n '1,220p' crates/euler-cli/src/ui/transcript/cells/tool_run.rs | rg 'fn ' -n";
+    let output = (1..=12)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let item = [TranscriptItem::ToolRun {
+        command: command.to_owned(),
+        ok: true,
+        error: String::new(),
+        output,
+        exit_code: Some(0),
+        grant_source: None,
+    }];
+
+    for width in [30u16, 40, 50, 60, 80] {
+        let texts = line_texts(&render_items_for_history(&item, &theme, width));
+        let title = &texts[0];
+
+        assert!(
+            display_width(title) <= usize::from(width),
+            "width {width}: title exceeds terminal width: {title:?}"
+        );
+        // The metadata cluster (`exit N · N lines · folded`) must always
+        // render intact — only the command text truncates, yielding all the
+        // way down to a bare `…` at extreme widths (design review v3 §R3).
+        // Below this width the metadata phrase itself is longer than the
+        // whole available line, which no amount of command truncation can
+        // fix; that residual clip is a physical limit, not this bug.
+        if width >= 40 {
+            assert!(
+                title.contains("exit 0 · 12 lines · folded"),
+                "width {width}: metadata cluster corrupted: {title:?}"
+            );
+        }
+        assert!(
+            !title.contains("· exit") || title.contains("exit 0"),
+            "width {width}: dangling '· exit' with no code: {title:?}"
+        );
+    }
+}
+
+#[test]
 fn tool_artifact_cell_keeps_minimum_width_at_tiny_widths() {
     let theme = Theme::default();
     let item = [TranscriptItem::ToolRun {
