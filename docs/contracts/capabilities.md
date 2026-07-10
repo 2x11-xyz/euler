@@ -94,6 +94,16 @@ config write: the approval that grants project scope **must** be recorded as a
 `permission.decision` event with `grant_scope: "project"` (and pattern when
 set). Silent project-config mutation is forbidden.
 
+The workspace file is repo-controlled content and is **never authority on its
+own**. A project grant is active only when it appears in BOTH the workspace
+file AND the user's consent store — a per-root file under the user-owned
+euler home (`<home>/project-grants/<sha256(canonical root)>.json`) written
+when the user approves the grant on this machine. A cloned repository that
+ships `.euler/grants.json` therefore grants nothing until this user approves
+each entry; deleting either side deactivates the grant. Sessions opened
+without a resolvable consent directory disable project grants entirely —
+reads and writes both fail closed.
+
 ### Revocation and listing
 
 Core exposes list and revoke APIs over session and project grant stores for

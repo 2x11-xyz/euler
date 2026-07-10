@@ -42,6 +42,11 @@ pub enum TranscriptItem {
         fidelity: String,
         content: String,
     },
+    /// Transient while the model reasons: elapsed streamed-reasoning time,
+    /// derived from delta event timestamps (never local wall clock).
+    ModelReasoningLive {
+        elapsed: String,
+    },
     ToolCall {
         name: String,
     },
@@ -320,6 +325,7 @@ pub struct TranscriptState {
     events: Vec<EventEnvelope>,
     live_tail: String,
     stream: MarkdownStreamCollector,
+    reasoning_live: Option<(DateTime<Local>, DateTime<Local>)>,
     scroll_offset: usize,
     auto_follow: bool,
 }
@@ -330,6 +336,7 @@ impl Default for TranscriptState {
             events: Vec::new(),
             live_tail: String::new(),
             stream: MarkdownStreamCollector::default(),
+            reasoning_live: None,
             scroll_offset: 0,
             auto_follow: true,
         }
@@ -345,6 +352,10 @@ impl TranscriptState {
             }
             EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::ERROR => {
                 self.clear_transient_live_tail();
+            }
+            // The finalized thought item replaces the live thinking line.
+            EventKind::MODEL_REASONING => {
+                self.reasoning_live = None;
             }
             _ => {}
         }
@@ -363,6 +374,7 @@ impl TranscriptState {
         if !self.live_tail.is_empty() {
             items.push(TranscriptItem::AssistantMessage(self.live_tail.clone()));
         }
+        items.extend(self.live_reasoning_item());
         items
     }
 
@@ -389,11 +401,13 @@ impl TranscriptState {
 
     #[cfg(test)]
     pub fn live_items(&self) -> Vec<TranscriptItem> {
-        if self.live_tail.is_empty() {
+        let mut items = if self.live_tail.is_empty() {
             Vec::new()
         } else {
             vec![TranscriptItem::AssistantMessage(self.live_tail.clone())]
-        }
+        };
+        items.extend(self.live_reasoning_item());
+        items
     }
 
     pub fn live_committed_items(&self) -> Vec<TranscriptItem> {
@@ -405,6 +419,9 @@ impl TranscriptState {
     }
 
     pub fn live_mutable_items(&self) -> Vec<TranscriptItem> {
+        if let Some(item) = self.live_reasoning_item() {
+            return vec![item];
+        }
         if let Some(source) = self.stream.mutable_source() {
             return vec![TranscriptItem::AssistantMessage(source)];
         }
@@ -440,9 +457,11 @@ impl TranscriptState {
     pub fn clear_transient_live_tail(&mut self) {
         self.live_tail.clear();
         self.stream.clear();
+        self.reasoning_live = None;
     }
 
     fn preserve_tool_call_live_tail(&mut self, event: &EventEnvelope) {
+        self.reasoning_live = None;
         if let Some(content) =
             payload_string(event, "content").filter(|content| !content.is_empty())
         {
@@ -454,25 +473,57 @@ impl TranscriptState {
     }
 
     fn push_delta(&mut self, event: &EventEnvelope) {
-        if event
+        match event
             .payload
             .get("kind")
             .and_then(serde_json::Value::as_str)
-            != Some("text")
         {
-            return;
-        }
-        if let Some(delta) = event
-            .payload
-            .get("delta")
-            .and_then(serde_json::Value::as_str)
-        {
-            self.stream.push_delta(delta);
-            let _ = self.stream.commit_complete_source();
-            if let Some(source) = self.stream.visible_source() {
-                self.live_tail = source;
+            // Reasoning streams as a transient thinking line; elapsed comes
+            // from the delta timestamps so the display stays event-driven.
+            // A reasoning delta arriving after answer text has already
+            // started streaming this round must not re-open the thinking
+            // line and suppress the in-progress answer (core allows
+            // reasoning -> text -> reasoning interleaving).
+            Some("reasoning") if !self.text_streamed_this_round() => {
+                if let Some(time) = parse_event_time(&event.ts) {
+                    let start = self.reasoning_live.map_or(time, |(start, _)| start);
+                    self.reasoning_live = Some((start, time));
+                }
             }
+            Some("text") => {
+                // First answer text ends the thinking phase.
+                self.reasoning_live = None;
+                if let Some(delta) = event
+                    .payload
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.stream.push_delta(delta);
+                    let _ = self.stream.commit_complete_source();
+                    if let Some(source) = self.stream.visible_source() {
+                        self.live_tail = source;
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// True once answer text has started streaming in the current round
+    /// (cleared by `clear_transient_live_tail`/`preserve_tool_call_live_tail`
+    /// at the next turn boundary). Used to stop a late reasoning delta from
+    /// re-opening the transient thinking line over already-visible text.
+    fn text_streamed_this_round(&self) -> bool {
+        self.stream.mutable_source().is_some()
+            || self.stream.committed_source().is_some()
+            || !self.live_tail.is_empty()
+    }
+
+    fn live_reasoning_item(&self) -> Option<TranscriptItem> {
+        let (start, last) = self.reasoning_live?;
+        Some(TranscriptItem::ModelReasoningLive {
+            elapsed: format_elapsed(start, last),
+        })
     }
 }
 
@@ -1102,6 +1153,10 @@ impl TranscriptItem {
                 rows,
                 ..
             } => !rows.is_empty() || output_limit_lines > 0,
+            // Finalized thought lines collapse to a one-line summary and
+            // advertise "ctrl+o expand" (see transcript/render.rs); they
+            // must be classified foldable for ctrl+o to target them.
+            Self::ModelReasoning { .. } => true,
             _ => false,
         }
     }

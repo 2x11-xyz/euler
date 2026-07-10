@@ -140,6 +140,11 @@ pub struct SessionConfig {
     /// disables the observer entirely; a configured observer additionally
     /// requires [`Session::set_observer_extension`].
     pub round_observer: Option<RoundObserverConfig>,
+    /// User-home directory holding per-root project-grant consent stores.
+    /// `None` (default) disables project grants entirely: the repo-local
+    /// `.euler/grants.json` is repo-controlled content and must never become
+    /// authority without a matching user consent entry outside the repo.
+    pub project_grant_consent_dir: Option<PathBuf>,
 }
 
 impl SessionConfig {
@@ -162,6 +167,7 @@ impl SessionConfig {
             compaction_reserve_tokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
             round_observer: None,
+            project_grant_consent_dir: None,
         }
     }
 }
@@ -653,7 +659,8 @@ impl<D> Session<D> {
         let mut permissions = PermissionGate::new(decider);
         // Project grants are best-effort at open: missing file is empty; corrupt
         // files leave the store unloaded so project writes fail closed.
-        let _ = permissions.load_project_grants(&config.root);
+        let _ = permissions
+            .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         Self {
             config,
             active_target,
@@ -932,7 +939,8 @@ impl<D> Session<D> {
         let tools = ToolRegistry::new(config.root.clone());
         let persisted_events = events.len();
         let mut permissions = PermissionGate::new(decider);
-        let _ = permissions.load_project_grants(&config.root);
+        let _ = permissions
+            .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         Self {
             config,
             active_target,
@@ -1752,12 +1760,24 @@ impl<D: PermissionDecider> Session<D> {
                 self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
                 return Ok(());
             }
-            let request = permission_request_for_tool(
+            let mut request = permission_request_for_tool(
                 capability,
                 &self.tools.permission_reason(&call.name, &call.input),
                 &call.name,
                 &call.input,
             );
+            // Scoped fs-write grants match the canonicalized workspace-
+            // relative path (`..`/symlinks resolved exactly as the write
+            // resolves them), so `src/../Cargo.toml` or a symlink inside the
+            // granted subtree cannot borrow its grant. An unresolvable path
+            // clears the field: scoped grants then never match and the
+            // request falls back to the ask path.
+            if capability == Capability::FsWrite {
+                request.path = request
+                    .path
+                    .as_deref()
+                    .and_then(|path| self.tools.workspace_relative_path(&path.to_string_lossy()));
+            }
             let mode = self.permissions.mode(capability);
             // A request covered by an existing session/project grant runs
             // under THAT decision: no prompt, and no fresh permission.decision

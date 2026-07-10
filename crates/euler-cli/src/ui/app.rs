@@ -48,10 +48,10 @@ use crossterm::event::{
 };
 use euler_core::permissions::PermissionRequest;
 use euler_core::{
-    fold_session, heuristic_projection, load_extension_package, read_resume_prefix,
-    resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, EulerHome,
-    ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
-    ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
+    event_is_runtime_only, fold_session, heuristic_projection, load_extension_package,
+    read_resume_prefix, resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode,
+    EulerHome, ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource,
+    ModelTarget, ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;

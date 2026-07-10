@@ -911,6 +911,16 @@ pub enum PersistDecision {
     RuntimeOnly,
 }
 
+/// Whether an event kind is runtime-only and must never be persisted or
+/// exported (e.g. `model.delta`; see `docs/contracts/persistence.md`).
+///
+/// Delegates to the same [`PersistPolicy::classify`] match used for
+/// provenance writes so callers (like `/export`) cannot drift from the
+/// persistence classifier.
+pub fn event_is_runtime_only(kind: &str) -> bool {
+    PersistPolicy.classify(kind) == PersistDecision::RuntimeOnly
+}
+
 fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")

@@ -75,8 +75,8 @@ pub use permissions::{
     ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,
 };
 pub use provenance::{
-    query_provenance, read_provenance, ProvenancePage, ProvenanceQuery, ProvenanceQueryError,
-    ProvenanceReadError, ProvenanceWriter, ProvenanceWriterError,
+    event_is_runtime_only, query_provenance, read_provenance, ProvenancePage, ProvenanceQuery,
+    ProvenanceQueryError, ProvenanceReadError, ProvenanceWriter, ProvenanceWriterError,
     DEFAULT_PROVENANCE_QUERY_BLOB_BYTE_LIMIT, DEFAULT_PROVENANCE_QUERY_EVENT_LIMIT,
     DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT,
 };
