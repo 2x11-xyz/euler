@@ -193,8 +193,11 @@ fn transient_notice_composer_and_status_are_separated_by_blank_rows() {
     assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
 }
 
+/// Issue #23: the slash palette renders fully inside the rail-bounded
+/// composer container — in the composer's own slot — so nothing renders
+/// below the footer/status line.
 #[test]
-fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() {
+fn slash_palette_renders_inside_composer_container_with_nothing_below_footer() {
     let mut core = core();
     core.drain_finalized_visual_lines(80);
 
@@ -210,22 +213,24 @@ fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() 
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
 
-    let prompt = lines
-        .iter()
-        .position(|line| line.starts_with('▌'))
-        .expect("prompt row");
     let status = lines
         .iter()
         .position(|line| line.contains("echo · ctx"))
         .expect("status row");
+    assert_eq!(
+        status,
+        lines.len() - 1,
+        "status/footer must be the last rendered line: lines: {lines:?}"
+    );
+
     let slash = lines
         .iter()
         .position(|line| line.trim() == "\u{258c} /")
         .expect("slash input row");
-
-    assert_eq!(status, prompt + 2, "lines: {lines:?}");
-    assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
-    assert_eq!(slash, status + 1, "lines: {lines:?}");
+    assert!(
+        slash < status,
+        "palette must render above the footer, not below it: lines: {lines:?}"
+    );
     assert_eq!(
         after.cursor,
         Some(CursorTarget {
@@ -953,7 +958,7 @@ fn tool_round_limit_finalizes_guidance_without_raw_session_failure() {
         .iter()
         .any(|row| row.contains("run_turn: model exceeded maximum tool rounds")));
     let screen = terminal.backend().screen_contents();
-    assert!(!screen.contains("⠧ working"));
+    assert!(!screen.contains("⠋ working"));
     assert!(!screen.contains("turn failed"));
     assert!(screen.contains("▌"));
 }
@@ -1040,7 +1045,7 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
     let failed_gap = terminal.backend().screen_contents();
     assert!(failed_gap.contains("provider: transport down"));
     assert!(failed_gap.contains("■ turn failed — waiting for cleanup"));
-    assert!(!failed_gap.contains("⠧ working"));
+    assert!(!failed_gap.contains("⠋ working"));
     assert!(
         !terminal
             .backend()
@@ -1062,7 +1067,7 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
     assert!(!history.contains("run_turn: transport down"));
     let done = terminal.backend().screen_contents();
     assert!(!done.contains("■ Turn failed"));
-    assert!(!done.contains("⠧ working"));
+    assert!(!done.contains("⠋ working"));
     assert!(done.contains("▌"));
 }
 
@@ -1092,7 +1097,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     )));
     render_compact_frame(&mut terminal, &mut core);
     let before_done = terminal.backend().screen_contents();
-    assert!(before_done.contains("⠧ working"));
+    assert!(before_done.contains("⠋ working"));
     assert!(!before_done.contains("■ Turn failed"));
 
     core.handle_turn_event(TurnEvent::TurnDone {
@@ -1106,7 +1111,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     assert!(history.contains("run_turn: transport down"));
     let done = terminal.backend().screen_contents();
     assert!(!done.contains("■ Turn failed"));
-    assert!(!done.contains("⠧ working"));
+    assert!(!done.contains("⠋ working"));
     assert!(done.contains("▌"));
 }
 

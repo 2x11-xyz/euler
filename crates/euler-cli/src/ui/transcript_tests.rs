@@ -1366,7 +1366,7 @@ fn vt100_long_tool_output_uses_head_tail_affordance() {
     assert!(contents.contains("  line 1"));
     assert!(contents.contains("  line 2"));
     assert!(contents.contains("8 more lines"));
-    assert!(contents.contains("ctrl+o expand"));
+    assert!(contents.contains("tap to expand"));
     assert!(contents.contains("  line 11"));
     assert!(contents.contains("  line 12"));
     assert!(!contents.contains("line 3"));
@@ -1474,7 +1474,7 @@ fn tool_artifact_cell_folds_only_above_threshold() {
     assert!(!exact.contains("more lines"), "exact: {exact:?}");
     assert!(exact.contains("line 10"), "exact: {exact:?}");
     assert!(overflow.contains("7 more lines"), "overflow: {overflow:?}");
-    assert!(overflow.contains("ctrl+o expand"), "overflow: {overflow:?}");
+    assert!(overflow.contains("tap to expand"), "overflow: {overflow:?}");
     assert!(!overflow.contains("line 3"), "overflow: {overflow:?}");
 }
 
@@ -1755,7 +1755,7 @@ fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
         .expect("result line present");
     let continuation_indent = texts
         .iter()
-        .find(|line| line.contains("more lines · ctrl+o expand"))
+        .find(|line| line.contains("more lines · tap to expand"))
         .map(|line| line.len() - line.trim_start().len())
         .expect("continuation row present");
     assert_eq!(continuation_indent, result_indent + 2, "texts: {texts:?}");
@@ -2099,7 +2099,7 @@ fn patch_artifact_is_not_controlled_by_shell_fold_limit() {
     assert_eq!(bounded, shell_expanded);
     let joined = bounded.join("\n");
     assert!(!joined.contains("bounded patch"), "bounded: {bounded:?}");
-    assert!(joined.contains("ctrl+o expand"), "bounded: {bounded:?}");
+    assert!(joined.contains("tap to expand"), "bounded: {bounded:?}");
     assert!(joined.contains("update · "), "bounded: {bounded:?}");
     assert!(joined.contains("visible rows"), "bounded: {bounded:?}");
 }
@@ -2128,7 +2128,7 @@ fn patch_proposed_artifact_is_not_controlled_by_shell_fold_limit() {
     assert_eq!(bounded, shell_expanded);
     let joined = bounded.join("\n");
     assert!(!joined.contains("bounded patch"), "bounded: {bounded:?}");
-    assert!(joined.contains("ctrl+o expand"), "bounded: {bounded:?}");
+    assert!(joined.contains("tap to expand"), "bounded: {bounded:?}");
     assert!(joined.contains("update · "), "bounded: {bounded:?}");
     assert!(joined.contains("visible rows"), "bounded: {bounded:?}");
 }
@@ -2535,7 +2535,7 @@ fn file_diff_ignores_shell_artifact_limit_and_renders_full_code() {
         !default.contains("hidden diff lines"),
         "default: {default:?}"
     );
-    assert!(default.contains("ctrl+o expand"), "default: {default:?}");
+    assert!(default.contains("tap to expand"), "default: {default:?}");
     assert!(!default.contains("line 11"), "default: {default:?}");
     assert!(expanded.contains("line 11"), "expanded: {expanded:?}");
     // Title row is `edit path · +N −M · action · lines · origin · truncated …`;
@@ -3009,7 +3009,7 @@ fn tui_long_tool_output_ignores_trailing_blanks_in_head_tail_preview() {
     let contents = rendered_screen(&events, &theme, 80, 16);
 
     assert!(contents.contains("8 more lines"));
-    assert!(contents.contains("ctrl+o expand"));
+    assert!(contents.contains("tap to expand"));
     assert!(contents.contains("  line 11"));
     assert!(contents.contains("  line 12"));
     assert!(!contents.contains("14 more lines"));
@@ -3185,7 +3185,7 @@ fn failed_tool_run_surfaces_informative_line_before_tail() {
         "first surfaced body line should be the informative match: {texts:?}"
     );
     assert!(
-        joined.contains("more lines · ctrl+o expand"),
+        joined.contains("more lines · tap to expand"),
         "fold marker should remain: {joined:?}"
     );
     assert!(
@@ -3254,7 +3254,7 @@ fn extension_result_renders_foldable_pretty_artifact() {
         "texts: {joined}"
     );
     assert!(
-        joined.contains("more lines · ctrl+o expand"),
+        joined.contains("more lines · tap to expand"),
         "texts: {joined}"
     );
     assert!(joined.contains("\"row_0\": 0"), "texts: {joined}");
@@ -3269,7 +3269,7 @@ fn extension_result_renders_foldable_pretty_artifact() {
     ));
     let expanded_joined = expanded.join("\n");
     assert!(expanded_joined.contains("\"row_20\": 20"));
-    assert!(!expanded_joined.contains("ctrl+o expand"));
+    assert!(!expanded_joined.contains("tap to expand"));
 }
 
 #[test]

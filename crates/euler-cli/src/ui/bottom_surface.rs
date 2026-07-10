@@ -5,10 +5,13 @@ use super::commands::{
 };
 use super::composer::ComposerDraft;
 use super::search::TranscriptSearch;
+use super::theme::Theme;
+use super::visual_canvas::{CanvasLine, CanvasSpan, TextRole};
 use super::workspace_files::{filter_workspace_files, list_workspace_files};
 use crate::ui::text::{display_width, truncate_display};
 use euler_core::ApprovalMode;
 use euler_sdk::Capability;
+use ratatui::style::Style;
 use std::path::Path;
 
 mod palette;
@@ -149,6 +152,24 @@ impl BottomSurface {
         }
     }
 
+    /// Themed variant of `surface_lines` used by the real render path: the
+    /// slash palette (issue #23) and the `/code-swarm` picker (issue #24)
+    /// carry an explicit selected-row style (full-width select-token
+    /// background, warning-token/gold text) that plain strings cannot
+    /// express. Every other surface keeps its plain rendering, wrapped
+    /// without added style.
+    pub fn surface_canvas_lines(&self, theme: &Theme, width: u16) -> Option<Vec<CanvasLine>> {
+        match &self.owner {
+            BottomOwner::Palette(palette) => Some(palette.render_canvas_lines(theme, width)),
+            BottomOwner::Picker(picker) if picker.kind == PickerKind::CodeSwarmModels => {
+                Some(picker.render_code_swarm_canvas_lines(theme, width))
+            }
+            _ => self
+                .surface_lines(width)
+                .map(|lines| lines.into_iter().map(CanvasLine::plain_lossy).collect()),
+        }
+    }
+
     #[cfg(test)]
     pub fn surface_line_count(&self) -> u16 {
         match &self.owner {
@@ -222,6 +243,30 @@ impl BottomSurface {
             &self.owner,
             BottomOwner::Picker(picker) if picker.kind == PickerKind::CodeSwarmModels
         )
+    }
+
+    /// Issue #23: backspacing over the leading `/` (nothing else typed)
+    /// exits the palette rather than being a no-op — the caller should
+    /// route to `cancel()` instead of `palette_backspace` when this is true.
+    pub fn palette_backspace_would_exit(&self) -> bool {
+        matches!(&self.owner, BottomOwner::Palette(palette) if palette.is_query_empty())
+    }
+
+    /// Issue #24: `⌫` on the `/code-swarm` picker with an empty type-to-filter
+    /// query steps back to the slash palette instead of exiting outright.
+    /// Returns `true` (and performs the transition) when that applies.
+    pub fn code_swarm_backspace_steps_back_to_palette(&mut self) -> bool {
+        let BottomOwner::Picker(picker) = &self.owner else {
+            return false;
+        };
+        if picker.kind != PickerKind::CodeSwarmModels || !picker.query_is_empty() {
+            return false;
+        }
+        let saved_draft = picker.saved_draft.clone();
+        self.composer = saved_draft.clone();
+        let entries = filter_palette_entries("/", &self.context);
+        self.owner = BottomOwner::Palette(CommandPalette::new(saved_draft, entries));
+        true
     }
 
     /// Handle manager-only keys: space toggle, a add, x remove. Enter uses confirm.
@@ -764,6 +809,25 @@ fn byte_index_for_char_offset(text: &str, offset: usize) -> usize {
     text.char_indices()
         .nth(offset)
         .map_or(text.len(), |(index, _)| index)
+}
+
+/// Full-width select-bar row shared by the slash palette (#23) and the
+/// `/code-swarm` picker (#24): selection-token background spans the whole
+/// row (padded, not just the text), warning-token (gold) text — no
+/// hardcoded hex, both colors route through `Theme`.
+pub(super) fn select_bar_canvas_line(text: &str, width: u16, theme: &Theme) -> CanvasLine {
+    let width = usize::from(width);
+    let truncated = truncate_display(text, width);
+    let padded_width = width.saturating_sub(display_width(&truncated));
+    let padded = format!("{truncated}{}", " ".repeat(padded_width));
+    let style = Style::default()
+        .fg(theme.palette.warning)
+        .bg(theme.palette.selection);
+    CanvasLine::from_spans(vec![CanvasSpan::styled_lossy(
+        padded,
+        TextRole::Plain,
+        style,
+    )])
 }
 
 #[cfg(test)]

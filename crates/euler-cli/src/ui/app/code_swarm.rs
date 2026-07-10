@@ -33,12 +33,15 @@ impl AppCore {
             })
             .transpose();
         self.rebuild_bottom_surface();
+        // Spec v2.1 §5c: dim provenance line, not a summary — this is a
+        // config confirmation, not a result. `teach_notice` already exists
+        // for exactly this class of neutral confirmation (extension
+        // toggles, timestamps, code-swarm config), so it stays a Notice
+        // rather than moving to SessionSummary.
         match persisted {
-            Ok(_) => self.teach_notice(format!(
-                "code-swarm → {count} models · saved as euler default"
-            )),
+            Ok(_) => self.teach_notice(format!("✓ code-swarm · {count} reviewers configured")),
             Err(error) => self.teach_notice(format!(
-                "code-swarm → {count} models · session only (save failed: {error})"
+                "✓ code-swarm · {count} reviewers configured · session only (save failed: {error})"
             )),
         }
     }

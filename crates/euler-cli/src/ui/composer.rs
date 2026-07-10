@@ -1,8 +1,14 @@
 use super::text::display_width;
 
-const DEFAULT_MAX_VISIBLE_LINES: usize = 5;
-// Collapse pasted input as soon as it exceeds the composer rows a user can scan.
-const LARGE_PASTE_LINE_LIMIT: usize = DEFAULT_MAX_VISIBLE_LINES;
+// Spec v2.1 §13.4/§13.8: raised from the prior 6-line cap so the 8-row
+// slash palette (which shares the composer's rail-bounded container) never
+// clips against the footer.
+const DEFAULT_MAX_VISIBLE_LINES: usize = 12;
+// Collapse pasted input as soon as it exceeds the rows a user can scan at a
+// glance. Deliberately independent of `DEFAULT_MAX_VISIBLE_LINES`: raising
+// the composer's scroll capacity should not change when a paste collapses
+// into a placeholder token.
+const LARGE_PASTE_LINE_LIMIT: usize = 5;
 const LARGE_PASTE_CHAR_LIMIT: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

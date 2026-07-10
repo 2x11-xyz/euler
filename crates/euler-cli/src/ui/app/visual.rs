@@ -1,5 +1,6 @@
 use super::*;
 use crate::ui::transcript;
+use ratatui::style::Style;
 
 impl AppCore {
     pub(super) fn queue_finalized_visual_output_for_latest_event(&mut self) {
@@ -124,18 +125,41 @@ impl AppCore {
         );
         self.push_visual_modal_block(width, &mut blocks);
         self.push_visual_permission_block(width, &mut blocks);
-        self.push_visual_activity_block(&mut blocks);
-        self.push_visual_transient_block(&mut blocks);
+        // Issue #27: the working HUD sits directly above the composer with
+        // no blank line between them. The transient-notice block always
+        // reserves a row (blank when there's no notice, for layout
+        // stability) — that blank placeholder would otherwise land between
+        // the HUD and the composer, so it's dropped whenever the HUD is
+        // active; a *real* notice (e.g. "resume waits for the active turn")
+        // still renders, directly below the HUD.
+        if self.push_visual_activity_block(&mut blocks) {
+            let notice = self.transient_notice_text();
+            if !notice.is_empty() {
+                push_visual_block(
+                    &mut blocks,
+                    VisualBlockRole::Notice,
+                    vec![CanvasLine::plain_lossy(notice)],
+                );
+            }
+        } else {
+            self.push_visual_transient_block(&mut blocks);
+        }
         // No spacer here: the transcript renderer ends every event batch
         // (banner included) with one blank line — it owns vertical rhythm.
-        self.push_visual_composer_block(composer, &mut blocks);
+        //
+        // Issue #23: an active bottom surface (slash palette, pickers, ...)
+        // renders fully inside the rail-bounded composer container — in the
+        // composer's own slot, directly above the footer — never appended
+        // after the status line. Only one of the two ever renders.
+        if !self.push_visual_bottom_surface_block(width, &mut blocks) {
+            self.push_visual_composer_block(composer, &mut blocks);
+        }
         push_visual_spacer_block(&mut blocks);
         push_visual_block(
             &mut blocks,
             VisualBlockRole::Status,
             vec![status.line.clone()],
         );
-        self.push_visual_bottom_surface_block(width, &mut blocks);
         blocks
     }
 
@@ -190,15 +214,37 @@ impl AppCore {
         );
     }
 
-    fn push_visual_activity_block(&self, blocks: &mut Vec<VisualBlock>) {
-        let Some(line) = self.live_status_line() else {
-            return;
+    /// Returns whether the HUD is active (and therefore was pushed), so the
+    /// caller can skip the transient-notice placeholder row that would
+    /// otherwise land between the HUD and the composer.
+    fn push_visual_activity_block(&self, blocks: &mut Vec<VisualBlock>) -> bool {
+        let Some(hud) = self.working_hud_line() else {
+            return false;
         };
-        push_visual_block(
-            blocks,
-            VisualBlockRole::Activity,
-            vec![CanvasLine::plain_lossy(line)],
-        );
+        let line = match hud {
+            HudLine::Plain(text) => CanvasLine::plain_lossy(text),
+            HudLine::Working {
+                spinner,
+                verb,
+                suffix,
+            } => CanvasLine::from_spans(vec![
+                // Gold (warning-token) spinner — routed through Theme, never
+                // a literal hex (issue #27).
+                CanvasSpan::styled_lossy(
+                    format!("{spinner} "),
+                    TextRole::Plain,
+                    Style::default().fg(self.theme.palette.warning),
+                ),
+                CanvasSpan::new_lossy(verb, TextRole::Plain),
+                CanvasSpan::styled_lossy(
+                    suffix,
+                    TextRole::Plain,
+                    Style::default().fg(self.theme.palette.muted),
+                ),
+            ]),
+        };
+        push_visual_block(blocks, VisualBlockRole::Activity, vec![line]);
+        true
     }
 
     fn push_visual_composer_block(
@@ -213,31 +259,36 @@ impl AppCore {
         });
     }
 
-    fn push_visual_bottom_surface_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) {
-        if let Some(lines) = self.bottom.surface_lines(width) {
-            let block = VisualBlock::new(
-                VisualBlockRole::BottomSurface,
-                lines.into_iter().map(CanvasLine::plain_lossy).collect(),
-            );
-            let block = match self.bottom.surface_cursor(width) {
-                Some((row, column)) => block.with_cursor(BlockCursor { row, column }),
-                None => block,
-            };
-            blocks.push(block);
-        }
+    /// Renders the active bottom surface (palette, pickers, ...) in place of
+    /// the composer. Returns whether a surface was active (and therefore
+    /// pushed) so the caller can fall back to the composer block.
+    fn push_visual_bottom_surface_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) -> bool {
+        let Some(lines) = self.bottom.surface_canvas_lines(&self.theme, width) else {
+            return false;
+        };
+        let block = VisualBlock::new(VisualBlockRole::BottomSurface, lines);
+        let block = match self.bottom.surface_cursor(width) {
+            Some((row, column)) => block.with_cursor(BlockCursor { row, column }),
+            None => block,
+        };
+        blocks.push(block);
+        true
     }
 
     fn push_visual_transient_block(&self, blocks: &mut Vec<VisualBlock>) {
-        let line = if self.modal.is_some() || self.permission_ask_item().is_some() {
-            String::new()
-        } else {
-            self.notice.clone().unwrap_or_default()
-        };
         push_visual_block(
             blocks,
             VisualBlockRole::Notice,
-            vec![CanvasLine::plain_lossy(line)],
+            vec![CanvasLine::plain_lossy(self.transient_notice_text())],
         );
+    }
+
+    fn transient_notice_text(&self) -> String {
+        if self.modal.is_some() || self.permission_ask_item().is_some() {
+            String::new()
+        } else {
+            self.notice.clone().unwrap_or_default()
+        }
     }
 
     fn apply_search_highlights(&self, lines: &mut [CanvasLine]) {
