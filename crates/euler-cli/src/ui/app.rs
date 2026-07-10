@@ -1883,10 +1883,11 @@ impl AppCore {
         // Restamp the whole rebuilt transcript from real event provenance
         // (review v2 §6) rather than the blank gutter a plain items() +
         // fresh push would produce.
-        finalized.extend(transcript.timed_items());
+        let (timed_entries, clock_seed) = transcript.timed_items();
+        finalized.extend(timed_entries);
         self.transcript = transcript;
         self.token_usage = token_usage;
-        self.visual_canvas = VisualCanvasState::new_with_entries(finalized);
+        self.visual_canvas = VisualCanvasState::new_with_entries(finalized, clock_seed);
     }
 
     fn handle_ctrl_c(&mut self) -> CoreEffect {

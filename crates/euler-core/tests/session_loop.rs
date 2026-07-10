@@ -4,9 +4,8 @@ use euler_core::permissions::{
 };
 use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, AutoCompactionPolicy, CanvasItem,
-    CompactionTier, ContextLimitConfig, GrantScope, ModelTarget, ProvenanceWriter,
-    ReasoningEffort, ScopePattern, Session, SessionConfig, SessionError, ToolRegistry,
-    WorkingStateProjection,
+    CompactionTier, ContextLimitConfig, GrantScope, ModelTarget, ProvenanceWriter, ReasoningEffort,
+    ScopePattern, Session, SessionConfig, SessionError, ToolRegistry, WorkingStateProjection,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{

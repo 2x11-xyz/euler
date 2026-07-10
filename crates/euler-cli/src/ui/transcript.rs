@@ -202,6 +202,17 @@ pub(crate) struct EventTiming {
     since_start: Option<String>,
 }
 
+#[cfg(test)]
+impl EventTiming {
+    pub(crate) fn since_previous_for_test(&self) -> Option<&str> {
+        self.since_previous.as_deref()
+    }
+
+    pub(crate) fn since_start_for_test(&self) -> Option<&str> {
+        self.since_start.as_deref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectedEntry {
     pub(crate) item: TranscriptItem,
@@ -359,15 +370,21 @@ impl TranscriptState {
     /// provenance time. Used to seed the visual canvas with honest
     /// timestamps on a full rebuild (resume, new session, rollback) instead
     /// of the blank gutter a plain `items()` + fresh push would produce.
-    pub(crate) fn timed_items(&self) -> Vec<ProjectedEntry> {
-        let mut entries = project_tui_entries(&self.events);
+    ///
+    /// Also returns the `TimingClock` as of the last stamped entry, so the
+    /// caller can reseed the visual canvas's own clock: without this, the
+    /// first item pushed after the rebuild would restart `since_start` at
+    /// ~0 and report `since_previous` as `None` instead of continuing the
+    /// session's real timeline.
+    pub(crate) fn timed_items(&self) -> (Vec<ProjectedEntry>, TimingClock) {
+        let (mut entries, clock) = project_tui_entries_with_clock(&self.events);
         if !self.live_tail.is_empty() {
             entries.push(ProjectedEntry {
                 item: TranscriptItem::AssistantMessage(self.live_tail.clone()),
                 timing: None,
             });
         }
-        entries
+        (entries, clock)
     }
 
     #[cfg(test)]
@@ -747,6 +764,12 @@ fn project_tui_items(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
 /// the synthetic `TurnSeparator`, carries its own event's time — no blank
 /// column, no restamping-from-toggle-point-forward.
 pub(crate) fn project_tui_entries(events: &[EventEnvelope]) -> Vec<ProjectedEntry> {
+    project_tui_entries_with_clock(events).0
+}
+
+/// Same as `project_tui_entries`, additionally returning the `TimingClock`
+/// as of the last stamped entry (see `TranscriptState::timed_items`).
+fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEntry>, TimingClock) {
     let mut calls = HashMap::new();
     let mut entries = Vec::new();
     let mut user_turns = 0usize;
@@ -791,7 +814,7 @@ pub(crate) fn project_tui_entries(events: &[EventEnvelope]) -> Vec<ProjectedEntr
             push_tui_entry(&mut entries, item, timing);
         }
     }
-    entries
+    (entries, clock)
 }
 
 fn project_tui_event_with_context(
