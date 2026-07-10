@@ -124,11 +124,8 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             limits
         };
         match item {
-            TranscriptItem::Banner { session_id } => {
-                lines.extend(super::super::banner::styled_lines_with_session(
-                    theme,
-                    session_id.as_deref(),
-                ));
+            TranscriptItem::Banner { .. } => {
+                lines.extend(super::super::banner::styled_lines(theme));
             }
             TranscriptItem::TurnSeparator => {
                 lines.push(Line::from(Span::styled(

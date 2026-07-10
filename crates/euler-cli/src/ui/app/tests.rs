@@ -1726,6 +1726,21 @@ fn ctrl_o_without_foldable_artifact_is_noop_and_does_not_edit_composer() {
 }
 
 #[test]
+fn footer_ctrl_o_hint_only_appears_when_a_foldable_artifact_exists() {
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::AssistantMessage("plain answer".to_owned()));
+
+    let without_fold = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(without_fold.contains("/ commands"));
+    assert!(!without_fold.contains("ctrl+o expand"));
+
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+
+    let with_fold = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(with_fold.contains("/ commands · ctrl+o expand"));
+}
+
+#[test]
 fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     let mut modal_core = core();
     modal_core.push_finalized_visual_item(shell_artifact_with_lines(12));
@@ -2800,10 +2815,7 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     wait_for_idle(&mut core);
 
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
-    assert_eq!(
-        rendered,
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · echo · ctx 12% · ?"
-    );
+    assert_eq!(rendered, "  / commands · euler · echo · ctx 12% · ?");
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
     assert_eq!(core.token_usage.reasoning_tokens, Some(500));
@@ -2824,14 +2836,14 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · echo · ctx 12% · ?"
+        "  / commands · euler · echo · ctx 12% · ?"
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · other · ctx ?% · ?"
+        "  / commands · euler · other · ctx ?% · ?"
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -2840,7 +2852,7 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · other · ctx 13% · ?"
+        "  / commands · euler · other · ctx 13% · ?"
     );
 }
 

@@ -263,7 +263,16 @@ impl AppCore {
             let indent = "  ";
             format!("{indent}{}", search.status_line())
         } else {
-            status_line_text(&self.status, &self.token_usage, self.turn_status(), width)
+            let has_foldable = self
+                .visual_canvas
+                .has_foldable_artifact(TOOL_CALL_MAX_LINES);
+            status_line_text(
+                &self.status,
+                &self.token_usage,
+                self.turn_status(),
+                has_foldable,
+                width,
+            )
         };
         CanvasStatusSnapshot::new(target, CanvasLine::styled_lossy(line, TextRole::Status))
     }
@@ -350,7 +359,6 @@ pub(super) fn render_finalized_visual_items_with_offsets(
     // so committed-row accounting slipped by one at the finalization seam).
     (ratatui_lines_to_canvas(lines), item_end_offsets)
 }
-
 
 pub(super) fn ratatui_lines_to_canvas(lines: Vec<Line<'static>>) -> Vec<CanvasLine> {
     lines

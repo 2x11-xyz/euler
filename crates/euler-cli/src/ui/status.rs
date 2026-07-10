@@ -88,9 +88,10 @@ pub fn status_line_text(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
     turn: TurnStatus,
+    has_foldable: bool,
     width: u16,
 ) -> String {
-    let left = status_left_segment(snapshot, &turn);
+    let left = status_left_segment(snapshot, &turn, has_foldable);
     let indent = status_indent(width);
     let body_width = status_body_width(width, display_width(indent));
     format!(
@@ -185,9 +186,10 @@ fn compact_model_label<'a>(provider: &str, model: &'a str) -> &'a str {
     }
 }
 
-fn status_left_segment(snapshot: &StatusSnapshot, turn: &TurnStatus) -> String {
+fn status_left_segment(snapshot: &StatusSnapshot, turn: &TurnStatus, has_foldable: bool) -> String {
     let hints = match turn {
-        TurnStatus::Idle => "⏎ send · / commands · ctrl+o expand".to_owned(),
+        TurnStatus::Idle if has_foldable => "/ commands · ctrl+o expand".to_owned(),
+        TurnStatus::Idle => "/ commands".to_owned(),
         TurnStatus::Running(_) => "⏎ queue · esc interrupt now".to_owned(),
     };
     let cwd = cwd_segment(snapshot);
@@ -195,12 +197,6 @@ fn status_left_segment(snapshot: &StatusSnapshot, turn: &TurnStatus) -> String {
 }
 
 fn identity_segment(snapshot: &StatusSnapshot, tokens: &TokenUsageSnapshot) -> String {
-    let session = snapshot
-        .session_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .map(short_session_id)
-        .unwrap_or_else(|| "e????".to_owned());
     let model = compact_model_label(&snapshot.provider, &snapshot.model);
     let model = if model.is_empty() { "?" } else { model };
     let ctx = identity_context_label(tokens);
@@ -209,7 +205,7 @@ fn identity_segment(snapshot: &StatusSnapshot, tokens: &TokenUsageSnapshot) -> S
         .as_deref()
         .filter(|branch| !branch.is_empty())
         .unwrap_or("?");
-    let mut right = format!("{session} · {model} · {ctx} · {branch}");
+    let mut right = format!("{model} · {ctx} · {branch}");
     if tokens.demoted_items > 0 {
         right.push_str(&format!(" · {} demoted", tokens.demoted_items));
     }
@@ -254,12 +250,6 @@ fn identity_segment_spans(
     tokens: &TokenUsageSnapshot,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
-    let session = snapshot
-        .session_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .map(short_session_id)
-        .unwrap_or_else(|| "e????".to_owned());
     let model = compact_model_label(&snapshot.provider, &snapshot.model);
     let model = if model.is_empty() { "?" } else { model };
     let ctx = identity_context_label(tokens);
@@ -273,7 +263,7 @@ fn identity_segment_spans(
         suffix.push_str(&format!(" · {} demoted", tokens.demoted_items));
     }
     vec![
-        Span::styled(format!("{session} · {model} · "), theme.status.model),
+        Span::styled(format!("{model} · "), theme.status.model),
         Span::styled(ctx, identity_context_style(tokens, theme)),
         Span::styled(suffix, theme.status.model),
     ]
@@ -313,7 +303,9 @@ fn status_line(
     theme: &Theme,
     width: u16,
 ) -> Line<'static> {
-    Line::from(status_line_spans(snapshot, tokens, turn, theme, width))
+    Line::from(status_line_spans(
+        snapshot, tokens, turn, false, theme, width,
+    ))
 }
 
 #[cfg(test)]
@@ -321,11 +313,12 @@ fn status_line_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
     turn: TurnStatus,
+    has_foldable: bool,
     theme: &Theme,
     width: u16,
 ) -> Vec<Span<'static>> {
     let left = vec![Span::styled(
-        status_left_segment(snapshot, &turn),
+        status_left_segment(snapshot, &turn, has_foldable),
         theme.status.state,
     )];
     let right = identity_segment_spans(snapshot, tokens, theme);
@@ -425,11 +418,13 @@ mod tests {
         snapshot.git_branch = Some("main".to_owned());
         let tokens = TokenUsageSnapshot::default();
 
-        let full = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 120);
-        assert!(full.contains("⏎ send · / commands · ctrl+o expand"));
+        let full = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
+        assert!(full.contains("/ commands"));
+        assert!(!full.contains("ctrl+o expand"));
         assert!(full.contains("repo"));
         assert!(!full.contains("/repo"));
-        assert!(full.contains("e???? · z-ai/glm-5.2 · ctx ?% · main"));
+        assert!(full.contains("z-ai/glm-5.2 · ctx ?% · main"));
+        assert!(!full.contains("e???? ·"));
         assert!(!full.contains("openrouter/z-ai/glm-5.2"));
         assert!(!full.contains("extra-high"));
         assert!(!full.contains("Context ?% used"));
@@ -437,7 +432,7 @@ mod tests {
         assert!(!full.contains("run"));
         assert!(!full.contains("--"));
 
-        let narrow = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 18);
+        let narrow = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 18);
         assert!(display_width(&narrow) <= 18);
     }
 
@@ -446,10 +441,19 @@ mod tests {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
         let tokens = TokenUsageSnapshot::default();
 
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 80);
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 80);
+        assert_eq!(rendered, "  / commands · repo · echo · ctx ?% · ?");
+    }
+
+    #[test]
+    fn statusline_shows_ctrl_o_hint_only_when_foldable_artifact_exists() {
+        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
+        let tokens = TokenUsageSnapshot::default();
+
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, true, 80);
         assert_eq!(
             rendered,
-            "  ⏎ send · / commands · ctrl+o expand · repo · e???? · echo · ctx ?% · ?"
+            "  / commands · ctrl+o expand · repo · echo · ctx ?% · ?"
         );
     }
 
@@ -472,12 +476,9 @@ mod tests {
             compaction_tier: None,
         };
 
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 120);
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
 
-        assert_eq!(
-            rendered,
-            "  ⏎ send · / commands · ctrl+o expand · euler · e???? · fable-5 · ctx 12% · ?"
-        );
+        assert_eq!(rendered, "  / commands · euler · fable-5 · ctx 12% · ?");
         assert_eq!(snapshot.model, "claude-fable-5");
     }
 
@@ -486,12 +487,9 @@ mod tests {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/"));
         let tokens = TokenUsageSnapshot::default();
 
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 80);
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 80);
 
-        assert_eq!(
-            rendered,
-            "  ⏎ send · / commands · ctrl+o expand · / · e???? · echo · ctx ?% · ?"
-        );
+        assert_eq!(rendered, "  / commands · / · echo · ctx ?% · ?");
     }
 
     #[test]
@@ -517,6 +515,7 @@ mod tests {
             &snapshot,
             &tokens,
             TurnStatus::Running("extension causal-dag.catch-up".to_owned()),
+            false,
             120,
         );
 
@@ -530,11 +529,11 @@ mod tests {
         let tokens = TokenUsageSnapshot::default();
         let theme = Theme::default();
 
-        let spans = status_line_spans(&snapshot, &tokens, TurnStatus::Idle, &theme, 80);
+        let spans = status_line_spans(&snapshot, &tokens, TurnStatus::Idle, false, &theme, 80);
 
         assert!(spans
             .iter()
-            .any(|span| span.content == "e???? · echo · " && span.style == theme.status.model));
+            .any(|span| span.content == "echo · " && span.style == theme.status.model));
         assert!(spans
             .iter()
             .any(|span| span.content == "ctx ?%" && span.style == theme.status.model));
@@ -578,7 +577,7 @@ mod tests {
             compaction_tier: None,
         };
         let label = format!("ctx {percent}%");
-        status_line_spans(snapshot, &tokens, TurnStatus::Idle, theme, 120)
+        status_line_spans(snapshot, &tokens, TurnStatus::Idle, false, theme, 120)
             .into_iter()
             .find(|span| span.content == label)
             .unwrap_or_else(|| panic!("missing ctx span {label}"))
@@ -614,13 +613,13 @@ mod tests {
         );
         let tokens = TokenUsageSnapshot::default();
 
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, 72);
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 72);
 
         assert!(display_width(&rendered) < 72);
         assert!(rendered.contains("ctx ?%"));
 
         for width in 1..=10 {
-            let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, width);
+            let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, width);
             assert!(
                 display_width(&rendered) < usize::from(width),
                 "width {width} rendered {rendered:?}"
@@ -630,6 +629,7 @@ mod tests {
                 &snapshot,
                 &tokens,
                 TurnStatus::Idle,
+                false,
                 &Theme::default(),
                 width,
             );

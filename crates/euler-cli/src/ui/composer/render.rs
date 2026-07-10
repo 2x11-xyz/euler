@@ -179,7 +179,7 @@ pub fn render_lines(
         width,
         draft_height,
         true,
-        snapshot.empty_ghost.unwrap_or(EMPTY_COMPOSER_GHOST),
+        snapshot.empty_ghost,
     ));
     lines
 }
@@ -194,8 +194,6 @@ pub enum ComposerLine {
         ghost: bool,
     },
 }
-
-const EMPTY_COMPOSER_GHOST: &str = "message euler · / commands";
 
 fn visible_queue_len(snapshot: &ComposerSnapshot<'_>, area_height: usize) -> usize {
     snapshot.queued.len().min(area_height.saturating_sub(1))
@@ -308,7 +306,7 @@ fn visible_draft_lines(
     width: u16,
     visible_height: usize,
     prompt_first_line: bool,
-    empty_ghost: &str,
+    empty_ghost: Option<&str>,
 ) -> Vec<ComposerLine> {
     let rows = visual_rows(draft, width);
     let empty_draft = draft.submit_text().is_empty();
@@ -336,7 +334,7 @@ fn visible_draft_lines(
                     prompt,
                 },
             );
-            if empty_draft {
+            if let Some(empty_ghost) = empty_ghost.filter(|_| empty_draft) {
                 if let ComposerLine::Draft {
                     text,
                     ghost,
