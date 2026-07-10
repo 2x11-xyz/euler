@@ -683,12 +683,59 @@ fn tui_read_tool_flow_uses_compact_result_without_raw_lifecycle_rows() {
     let contents = rendered_screen(&events, &theme, 80, 6);
 
     assert!(contents.contains("explore"));
-    assert!(contents.contains("Read README.md"));
+    assert!(contents.contains("read README.md"));
     assert!(!contents.contains("raw file contents"));
     assert!(!contents.contains("* Tool read_file"));
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("Tool read_file completed"));
     assert!(!contents.contains("Permission allowed"));
+}
+
+#[test]
+fn tui_read_tool_result_carries_line_count_result_data() {
+    let output = (1..=84)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let events = vec![
+        tool_call(
+            "call-read",
+            "read_file",
+            serde_json::json!({"path": "README.md"}),
+        ),
+        tool_result("call-read", "read_file", &output),
+    ];
+    let theme = Theme::default();
+
+    let contents = rendered_screen(&events, &theme, 80, 6);
+
+    // Lowercase verb, single space, per-step result data (design review v3
+    // §R3) — a single (non-coalesced) read keeps its line count.
+    assert!(contents.contains("read README.md · 84 lines"));
+}
+
+#[test]
+fn tui_explore_sub_verbs_render_lowercase_and_single_spaced() {
+    let events = vec![
+        tool_call("call-status", "git_status", serde_json::json!({})),
+        tool_result("call-status", "git_status", "nothing to commit"),
+        tool_call(
+            "call-read",
+            "read_file",
+            serde_json::json!({"path": "README.md"}),
+        ),
+        tool_result("call-read", "read_file", "hello\n"),
+    ];
+    let theme = Theme::default();
+
+    let contents = rendered_screen(&events, &theme, 80, 8);
+
+    // `git status`, not the old capitalized double-space alignment bug
+    // (`Git  status`).
+    assert!(contents.contains("git status"));
+    assert!(!contents.contains("Git"));
+    assert!(!contents.contains("git  status"));
+    assert!(contents.contains("read README.md · 1 line"));
 }
 
 #[test]
@@ -848,7 +895,7 @@ fn tui_exploration_coalesces_and_dedupes_read_labels() {
     let contents = rendered_screen(&events, &theme, 96, 10);
 
     assert_eq!(contents.matches("explore").count(), 1);
-    assert!(contents.contains("└ Read README.md, Cargo.toml"));
+    assert!(contents.contains("└ read README.md, Cargo.toml"));
     assert!(contents.contains("bash $ rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("Search rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("README raw content"));
@@ -879,7 +926,7 @@ fn tui_assistant_finalization_does_not_leave_stale_exploration_fragments() {
     let contents = rendered_screen(&events, &theme, 80, 8);
 
     assert!(contents.contains("explore"));
-    assert!(contents.contains("Read AGENTS.md"));
+    assert!(contents.contains("read AGENTS.md"));
     assert_eq!(contents.matches("final answer").count(), 1);
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("# raw agent instructions"));
