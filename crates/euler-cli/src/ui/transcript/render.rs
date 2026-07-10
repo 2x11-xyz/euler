@@ -733,12 +733,14 @@ fn aligned_exploration_row(verb: &str, detail: &str, verb_width: usize) -> Strin
 }
 
 /// v2 anchor spine: glyph + style for an event's first row (§1). `None`
-/// keeps the blank spine (user messages carry the ▌ rail instead; separators
-/// have no anchor).
+/// keeps the blank spine (separators have no anchor). Every anchor glyph —
+/// including the user-message rail — sits flush in this same slot (review
+/// v3 §R4); continuation rows for multi-line items that want the anchor
+/// repeated (the user rail) place it themselves at the identical column.
 fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)> {
     let anchor = match item {
-        TranscriptItem::UserMessage(_)
-        | TranscriptItem::Banner { .. }
+        TranscriptItem::UserMessage(_) => (glyphs::user_rail().to_owned(), theme.transcript.gutter),
+        TranscriptItem::Banner { .. }
         | TranscriptItem::TurnSeparator
         | TranscriptItem::WorkedDuration(_)
         | TranscriptItem::TurnRecap { .. } => return None,
@@ -1005,6 +1007,16 @@ fn push_wrapped(
     }
 }
 
+/// Renders a multi-line block whose anchor (the user-message rail) repeats
+/// on every physical row instead of just the first (review v3 §R4). The
+/// rail lives in the same gutter-width slot every other anchor glyph uses:
+/// the first row gets a `blank_gutter()` placeholder that the shared
+/// spine-anchor stamp (`stamp_first_line`) swaps for the rail — flush at
+/// column 0, exactly like `•`/`✓`/`✱`/etc — and continuation rows place the
+/// rail themselves, right-aligned into that identical gutter-width slot (so
+/// it lines up under the first row's rail even when the timestamp gutter is
+/// on). Content starts immediately after, at the same column every anchor
+/// uses.
 fn push_wrapped_with_continuation(
     lines: &mut Vec<Line<'static>>,
     content_prefixes: (&'static str, &'static str),
@@ -1013,22 +1025,20 @@ fn push_wrapped_with_continuation(
     theme: &Theme,
     width: u16,
 ) {
-    let (first_prefix, next_prefix) = content_prefixes;
-    let body_width = content_width(width)
-        .saturating_sub(display_width(first_prefix).max(display_width(next_prefix)))
-        .max(1);
+    let (_first_prefix, next_prefix) = content_prefixes;
+    let body_width = content_width(width).max(1);
     let mut first_segment = true;
     for raw_line in text.split('\n') {
         for segment in wrap_text(raw_line, body_width) {
-            let prefix = if first_segment {
-                first_prefix
+            let leading = if first_segment {
+                blank_gutter().to_owned()
             } else {
-                next_prefix
+                let pad = gutter_width().saturating_sub(display_width(next_prefix));
+                format!("{}{next_prefix}", " ".repeat(pad))
             };
             first_segment = false;
             lines.push(Line::from(vec![
-                Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
-                Span::styled(prefix.to_owned(), theme.transcript.gutter),
+                Span::styled(leading, theme.transcript.gutter),
                 Span::styled(segment, style),
             ]));
         }

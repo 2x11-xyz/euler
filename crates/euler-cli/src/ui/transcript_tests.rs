@@ -1266,16 +1266,23 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
     let theme = Theme::default();
     let contents = rendered_screen_with_limit(&events, &theme, 40, 16, 2);
     assert!(contents.contains("▌ alpha beta gamma"));
-    // The blank 2-cell spine precedes the rail; match the glyph.
+    // Review v3 §R4: the rail sits flush at column 0, like every other
+    // spine anchor — no leading blank gutter column ahead of it.
     let prompt_glyph_lines = contents
         .lines()
-        .filter(|line| line.contains("▌ "))
+        .filter(|line| line.contains('▌'))
         .collect::<Vec<_>>();
     assert_eq!(
         prompt_glyph_lines.len(),
         2,
         "expected continuous rail for each wrapped user prompt row, got {prompt_glyph_lines:?}"
     );
+    for line in &prompt_glyph_lines {
+        assert!(
+            line.starts_with("▌ "),
+            "rail must be flush at column 0: {line:?}"
+        );
+    }
     assert!(contents.contains("line one output"));
     assert!(contents.contains("line two output"));
     assert!(contents.contains("1 more lines"));
@@ -1322,6 +1329,43 @@ fn vt100_multiline_user_message_uses_continuous_rail_for_whole_block() {
     assert!(
         user_rows.len() >= 3,
         "expected explicit newline and soft-wrap continuations to keep the rail: {contents:?}"
+    );
+}
+
+// Review v3 §R4: every spine anchor — `▌ • ✓ ✱ ◆ ■ ↩` — sits flush at
+// column 0 with content at column 2. The user rail had drifted one anchor
+// slot to the right (a stray `blank_gutter()` ahead of the rail prefix).
+#[test]
+fn vt100_user_rail_sits_flush_at_column_zero_like_other_anchors() {
+    let events = vec![
+        event(
+            EventKind::USER_MESSAGE,
+            object([("content", "one\ntwo".into())]),
+        ),
+        event(
+            EventKind::CHECK_STARTED,
+            object([("name", "cargo test".into())]),
+        ),
+    ];
+    let theme = Theme::default();
+    let contents = rendered_screen_with_limit(&events, &theme, 40, 12, 2);
+
+    let rail_rows: Vec<&str> = contents.lines().filter(|line| line.contains('▌')).collect();
+    assert_eq!(rail_rows.len(), 2, "contents: {contents:?}");
+    for line in &rail_rows {
+        assert!(
+            line.starts_with("▌ "),
+            "rail must be flush at column 0, content at column 2: {line:?}"
+        );
+    }
+
+    let bullet_row = contents
+        .lines()
+        .find(|line| line.contains("Check started"))
+        .expect("check-started row");
+    assert!(
+        bullet_row.starts_with("• "),
+        "the default anchor also sits flush at column 0: {bullet_row:?}"
     );
 }
 
