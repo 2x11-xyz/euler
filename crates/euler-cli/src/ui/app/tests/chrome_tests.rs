@@ -88,7 +88,7 @@ fn empty_composer_prompt_has_breathing_room_above_statusline() {
     assert!(screen_row(&contents, areas.bottom.y).starts_with("▌ "));
     let status = screen_row(&contents, areas.status.y);
     assert!(status.starts_with("  / commands"));
-    assert!(status.contains(" · echo · ctx ?% · "));
+    assert!(status.trim_end().ends_with("echo · ctx ?%"));
     assert!(!status.contains("Context ?% used"));
 }
 

@@ -24,7 +24,7 @@ use super::metrics;
 use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPreview};
 #[cfg(test)]
 use super::status::status_widget;
-use super::status::{status_line_text, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
+use super::status::{status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
 use super::terminal::{self, PendingSignal, TerminalSession};
 use super::theme::{Theme, ThemeChoice};
 #[cfg(test)]

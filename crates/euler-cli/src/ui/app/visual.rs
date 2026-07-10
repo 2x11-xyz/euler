@@ -312,23 +312,27 @@ impl AppCore {
 
     pub(super) fn canvas_status_snapshot(&self, width: u16) -> CanvasStatusSnapshot {
         let target = format!("{}/{}", self.status.provider, self.status.model);
-        let line = if let Some(search) = self.bottom.search() {
+        if let Some(search) = self.bottom.search() {
             // Spec §5.4: search swaps the footer hint line for `find: · k/N`.
             let indent = "  ";
-            format!("{indent}{}", search.status_line())
-        } else {
-            let has_foldable = self
-                .visual_canvas
-                .has_foldable_artifact(TOOL_CALL_MAX_LINES);
-            status_line_text(
-                &self.status,
-                &self.token_usage,
-                self.turn_status(),
-                has_foldable,
-                width,
-            )
-        };
-        CanvasStatusSnapshot::new(target, CanvasLine::styled_lossy(line, TextRole::Status))
+            let line = format!("{indent}{}", search.status_line());
+            return CanvasStatusSnapshot::new(
+                target,
+                CanvasLine::styled_lossy(line, TextRole::Status),
+            );
+        }
+        let has_foldable = self
+            .visual_canvas
+            .has_foldable_artifact(TOOL_CALL_MAX_LINES);
+        let line = status_line_canvas(
+            &self.status,
+            &self.token_usage,
+            self.turn_status(),
+            has_foldable,
+            &self.theme,
+            width,
+        );
+        CanvasStatusSnapshot::new(target, line)
     }
 
     fn canvas_composer_snapshot(&self, width: u16) -> CanvasComposerSnapshot {

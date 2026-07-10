@@ -3186,7 +3186,12 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     wait_for_idle(&mut core);
 
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
-    assert_eq!(rendered, "  / commands · euler · echo · ctx 12% · ?");
+    // Footer v2 (#48): two hard-edged clusters, empty middle, no branch on
+    // the right (there is none here — non-git fixture cwd) and no `?` fill.
+    assert_eq!(
+        rendered,
+        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
+    );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
     assert_eq!(core.token_usage.reasoning_tokens, Some(500));
@@ -3207,14 +3212,14 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  / commands · euler · echo · ctx 12% · ?"
+        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  / commands · euler · other · ctx ?% · ?"
+        format!("  / commands · /tmp/euler{}other · ctx ?%", " ".repeat(80))
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -3223,7 +3228,7 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  / commands · euler · other · ctx 13% · ?"
+        format!("  / commands · /tmp/euler{}other · ctx 13%", " ".repeat(79))
     );
 }
 
