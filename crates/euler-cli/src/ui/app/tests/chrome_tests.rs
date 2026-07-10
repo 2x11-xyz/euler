@@ -727,6 +727,7 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
             error: String::new(),
             output: "exit 0\nfile".to_owned(),
             exit_code: Some(0),
+            grant_source: None,
         }],
         &theme,
         80,
@@ -755,6 +756,7 @@ fn finalized_tool_output_batch_separates_following_assistant_prose() {
         error: String::new(),
         output: "last tool output row".to_owned(),
         exit_code: Some(0),
+        grant_source: None,
     });
     render_compact_frame(&mut terminal, &mut core);
 

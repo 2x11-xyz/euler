@@ -61,6 +61,9 @@ pub enum TranscriptItem {
         error: String,
         output: String,
         exit_code: Option<i64>,
+        /// "session" / "project" when the run was covered by an existing
+        /// grant (dim `· session grant` on the header; no decision record).
+        grant_source: Option<String>,
     },
     Exploration {
         summaries: Vec<String>,
@@ -1316,6 +1319,7 @@ fn run_item_from_result(
             .payload
             .get("exit_code")
             .and_then(serde_json::Value::as_i64),
+        grant_source: payload_string(event, "grant_source"),
     })
 }
 

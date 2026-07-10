@@ -26,6 +26,8 @@ pub(super) struct ToolRunRender<'a> {
     pub(super) error: &'a str,
     pub(super) output: &'a str,
     pub(super) exit_code: Option<i64>,
+    /// "session" / "project" when covered by an existing grant.
+    pub(super) grant_source: Option<&'a str>,
 }
 
 pub(super) struct EditRender<'a> {
@@ -67,11 +69,16 @@ pub(super) fn render_tool_run(
     width: u16,
     limit: usize,
 ) {
-    let heading = if run.command.is_empty() {
+    let mut heading = if run.command.is_empty() {
         "bash".to_owned()
     } else {
         format!("bash $ {}", run.command)
     };
+    if let Some(source) = run.grant_source {
+        // Provenance trace of an existing grant lives on the header (dim),
+        // not as a standalone decision record (review v2 §8).
+        heading.push_str(&format!(" · {source} grant"));
+    }
     let style = if run.ok {
         theme.transcript.tool
     } else {

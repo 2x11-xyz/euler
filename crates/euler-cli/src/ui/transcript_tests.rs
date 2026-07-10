@@ -1233,6 +1233,7 @@ fn tui_tool_output_trims_trailing_blank_rows_before_rendering() {
         error: String::new(),
         output: "visible\n\n\n\n\n".to_owned(),
         exit_code: None,
+        grant_source: None,
     }];
 
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
@@ -1264,6 +1265,7 @@ fn tool_artifact_cell_handles_empty_output_without_fold_affordance() {
         error: String::new(),
         output: String::new(),
         exit_code: None,
+        grant_source: None,
     }];
 
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
@@ -1301,6 +1303,7 @@ fn tool_artifact_cell_folds_only_above_threshold() {
             error: String::new(),
             output: exact_output,
             exit_code: Some(0),
+            grant_source: None,
         }],
         &theme,
         80,
@@ -1313,6 +1316,7 @@ fn tool_artifact_cell_folds_only_above_threshold() {
             error: String::new(),
             output: overflowing_output,
             exit_code: Some(0),
+            grant_source: None,
         }],
         &theme,
         80,
@@ -1339,6 +1343,7 @@ fn tool_artifact_cell_expands_with_unbounded_limit() {
         error: String::new(),
         output,
         exit_code: Some(0),
+        grant_source: None,
     }];
 
     let folded = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -1373,6 +1378,7 @@ fn tool_artifact_flat_style_survives_fold_and_expand() {
         error: String::new(),
         output,
         exit_code: Some(0),
+        grant_source: None,
     }];
 
     let folded_lines = render_items_for_history(&item, &theme, 80);
@@ -1415,6 +1421,7 @@ fn tool_artifact_flat_style_handles_empty_output() {
         error: String::new(),
         output: String::new(),
         exit_code: Some(0),
+        grant_source: None,
     }];
 
     for (label, lines) in [
@@ -1443,6 +1450,7 @@ fn tool_artifact_cell_sanitizes_controls_tabs_and_bounds_width() {
         output: "\u{1b}[31mred\u{1b}[0m\twide 🧔‍♂\u{8}tail\u{202e}\u{200b}\u{2060}\u{feff}"
             .to_owned(),
         exit_code: Some(0),
+        grant_source: None,
     }];
 
     for width in [8, 12, 24, 80] {
@@ -1482,6 +1490,7 @@ fn tool_artifact_cell_uses_available_width_for_long_command_title() {
         error: String::new(),
         output: "done".to_owned(),
         exit_code: Some(0),
+        grant_source: None,
     }];
 
     let wide = line_texts(&render_items_for_history(&item, &theme, 120));
@@ -1513,6 +1522,7 @@ fn tool_artifact_cell_keeps_minimum_width_at_tiny_widths() {
         error: String::new(),
         output: "ok".to_owned(),
         exit_code: Some(0),
+        grant_source: None,
     }];
 
     for width in [0, 1, 2, 3] {
@@ -1541,6 +1551,7 @@ fn tool_artifact_cell_reports_failure_without_exit_code() {
         error: "permission denied".to_owned(),
         output: String::new(),
         exit_code: None,
+        grant_source: None,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -2732,6 +2743,7 @@ fn failed_tool_run_surfaces_informative_line_before_tail() {
         error: String::new(),
         output,
         exit_code: Some(101),
+        grant_source: None,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));

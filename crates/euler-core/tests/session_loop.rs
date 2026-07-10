@@ -4,8 +4,9 @@ use euler_core::permissions::{
 };
 use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, AutoCompactionPolicy, CanvasItem,
-    CompactionTier, ContextLimitConfig, ModelTarget, ProvenanceWriter, ReasoningEffort, Session,
-    SessionConfig, SessionError, ToolRegistry, WorkingStateProjection,
+    CompactionTier, ContextLimitConfig, GrantScope, ModelTarget, ProvenanceWriter,
+    ReasoningEffort, ScopePattern, Session, SessionConfig, SessionError, ToolRegistry,
+    WorkingStateProjection,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{
@@ -810,6 +811,57 @@ fn allow_session_makes_second_use_session_allow_without_second_prompt() {
         decisions[1].parent.as_deref(),
         Some(second_call.id.as_str())
     );
+}
+
+#[test]
+fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
+    // Review v2 §8: a command covered by an existing scoped session grant
+    // runs under THAT decision — no new permission.decision event (recording
+    // "allowed once" misstated the grant), and the tool result carries a
+    // grant_source tag for the ledger header.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-second".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch second-ran"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(GrantScope::Session(
+            ScopePattern::new("touch").expect("pattern"),
+        ))]),
+    );
+
+    session.run_turn("run shell twice").expect("turn");
+
+    assert!(temp.path().join("first-ran").exists());
+    assert!(temp.path().join("second-ran").exists());
+    // One prompt, ONE decision — the second call is covered.
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        1
+    );
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_DECISION),
+        1
+    );
+    let results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert_eq!(payload_str(results[0], "grant_source"), None);
+    assert_eq!(payload_str(results[1], "grant_source"), Some("session"));
 }
 
 #[test]
