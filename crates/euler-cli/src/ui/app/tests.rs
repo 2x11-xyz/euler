@@ -2091,6 +2091,42 @@ fn name_session_refreshes_metadata_after_durable_rename() {
         .expect("find session")
         .expect("session record");
     assert_eq!(refreshed.name(), Some("clean name"));
+
+    // #46: the footer picks up the name from the same render, no extra
+    // rebuild needed — and even though naming failed the metadata refresh
+    // in the sibling test above, the footer there still updates (asserted
+    // separately below) because it never depended on that refresh.
+    assert_eq!(core.status.session_name.as_deref(), Some("clean name"));
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(rendered.ends_with("echo · ctx ?% · clean name"));
+}
+
+#[test]
+fn name_session_updates_footer_immediately_even_if_metadata_refresh_fails() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    config.agent_id = "tui-test".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(record.events_path()).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    let alternate_home = EulerHome::from_root(temp.path().join(".other-euler")).expect("home");
+    core.session_store = Some(SessionStore::new(alternate_home).expect("alternate store"));
+
+    assert_eq!(core.status.session_name, None);
+    assert_eq!(
+        core.name_current_session("still named".to_owned()),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.status.session_name.as_deref(), Some("still named"));
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(rendered.ends_with("echo · ctx ?% · still named"));
 }
 
 #[test]
@@ -2422,6 +2458,7 @@ fn accepting_resume_purges_prior_native_scrollback() {
             events,
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "useful resumed name".to_owned(),
+            session_name: None,
             recovery_closure_appended: false,
             warning_count: 0,
             events_replayed: 1,
@@ -2474,6 +2511,7 @@ fn accepting_resume_restamps_replayed_history_when_timestamps_are_on() {
             events,
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "useful resumed name".to_owned(),
+            session_name: None,
             recovery_closure_appended: false,
             warning_count: 0,
             events_replayed: 1,
@@ -2514,6 +2552,7 @@ fn accepting_resume_boundary_includes_recovery_and_warnings() {
             events: Vec::new(),
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "broken tail".to_owned(),
+            session_name: None,
             recovery_closure_appended: true,
             warning_count: 2,
             events_replayed: 7,

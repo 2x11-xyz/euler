@@ -50,6 +50,9 @@ pub struct StatusSnapshot {
     pub reasoning_effort: Option<String>,
     pub cwd: PathBuf,
     pub git_branch: Option<String>,
+    /// Footer §13.5 / #46: the user-set `/name`, never the session id.
+    /// `None` until named — unnamed sessions show nothing in the footer.
+    pub session_name: Option<String>,
     pub extension_slots: StatusSlots,
 }
 
@@ -62,6 +65,7 @@ impl StatusSnapshot {
             reasoning_effort: None,
             cwd,
             git_branch: None,
+            session_name: None,
             extension_slots: StatusSlots::default(),
         }
     }
@@ -300,6 +304,13 @@ fn identity_segment_spans(
         Span::styled(format!("{model} · "), theme.status.faint),
         Span::styled(ctx, identity_context_style(tokens, theme)),
     ];
+    if let Some(name) = snapshot
+        .session_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    {
+        spans.push(Span::styled(format!(" · {name}"), theme.status.faint));
+    }
     if tokens.demoted_items > 0 {
         spans.push(Span::styled(
             format!(" · {} demoted", tokens.demoted_items),
@@ -476,6 +487,24 @@ mod tests {
 
         let narrow = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 18);
         assert!(display_width(&narrow) <= 18);
+    }
+
+    /// #46: unnamed sessions show nothing extra; naming appends the name
+    /// to the right cluster; ids never appear in the footer.
+    #[test]
+    fn session_name_appears_only_once_named() {
+        let mut snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
+        snapshot.session_id = Some("01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned());
+        let tokens = TokenUsageSnapshot::default();
+
+        let unnamed = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
+        assert!(unnamed.ends_with("echo · ctx ?%"));
+        assert!(!unnamed.contains("01KW3Q6NN5A9R6E2EWZ7M3QW9T"));
+
+        snapshot.session_name = Some("research-branch".to_owned());
+        let named = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
+        assert!(named.ends_with("echo · ctx ?% · research-branch"));
+        assert!(!named.contains("01KW3Q6NN5A9R6E2EWZ7M3QW9T"));
     }
 
     #[test]
