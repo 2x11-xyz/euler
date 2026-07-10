@@ -55,13 +55,6 @@ impl Default for ChatCompletionsOptions {
 }
 
 impl ChatCompletionsOptions {
-    pub(crate) fn openrouter() -> Self {
-        Self {
-            max_tokens_field: MaxTokensField::MaxTokens,
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn from_compat(compat: Option<&Value>) -> Self {
         let mut options = Self::default();
         let Some(compat) = compat.and_then(Value::as_object) else {
@@ -380,11 +373,6 @@ pub(crate) struct ChatCompletionsSseParser {
 }
 
 impl ChatCompletionsSseParser {
-    #[cfg(test)]
-    pub(crate) fn new(provider_label: impl Into<String>) -> Self {
-        Self::new_with_options(provider_label, ChatCompletionsOptions::default())
-    }
-
     pub(crate) fn new_with_options(
         provider_label: impl Into<String>,
         options: ChatCompletionsOptions,

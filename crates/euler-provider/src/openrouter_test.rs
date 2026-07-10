@@ -11,7 +11,10 @@ struct OpenRouterSseParser {
 impl OpenRouterSseParser {
     fn new() -> Self {
         Self {
-            inner: crate::chat_completions::ChatCompletionsSseParser::new("OpenRouter"),
+            inner: crate::chat_completions::ChatCompletionsSseParser::new_with_options(
+                "OpenRouter",
+                chat_completions_options(),
+            ),
         }
     }
 
@@ -197,10 +200,12 @@ fn stream_processes_choices_and_usage_in_same_payload() {
 }
 
 #[test]
-fn stream_ignores_reasoning_fields_by_default() {
+fn stream_maps_reasoning_field_to_reasoning_delta() {
     let mut parser = OpenRouterSseParser::new();
     let events = parser.feed(
-        br#"data: {"choices":[{"delta":{"reasoning":"think","reasoning_content":"think more","content":"answer"},"finish_reason":"stop"}]}
+        br#"data: {"choices":[{"delta":{"reasoning":"think"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}
 
 data: [DONE]
 
@@ -210,6 +215,9 @@ data: [DONE]
     assert_eq!(
         events,
         vec![
+            Ok(ModelStreamEvent::ReasoningDelta(
+                crate::ReasoningChunk::raw("think".to_owned())
+            )),
             Ok(ModelStreamEvent::TextDelta("answer".to_owned())),
             Ok(ModelStreamEvent::Finished {
                 stop_reason: StopReason::Completed,
@@ -217,6 +225,84 @@ data: [DONE]
             }),
         ]
     );
+}
+
+#[test]
+fn stream_maps_reasoning_content_field_to_reasoning_delta() {
+    let mut parser = OpenRouterSseParser::new();
+    let events = parser.feed(
+        br#"data: {"choices":[{"delta":{"reasoning_content":"thinking harder","content":"answer"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+    );
+
+    assert_eq!(
+        events,
+        vec![
+            Ok(ModelStreamEvent::ReasoningDelta(
+                crate::ReasoningChunk::raw("thinking harder".to_owned())
+            )),
+            Ok(ModelStreamEvent::TextDelta("answer".to_owned())),
+            Ok(ModelStreamEvent::Finished {
+                stop_reason: StopReason::Completed,
+                usage: None,
+            }),
+        ]
+    );
+}
+
+#[test]
+fn stream_reasoning_deltas_precede_text_deltas_in_ordering() {
+    let mut parser = OpenRouterSseParser::new();
+    let events = parser.feed(
+        br#"data: {"choices":[{"delta":{"reasoning":"step one"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"partial "},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"reasoning":"step two"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+    );
+
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|event| match event {
+            Ok(ModelStreamEvent::ReasoningDelta(_)) => "reasoning",
+            Ok(ModelStreamEvent::TextDelta(_)) => "text",
+            Ok(ModelStreamEvent::Finished { .. }) => "finished",
+            _ => "other",
+        })
+        .collect();
+
+    assert_eq!(
+        kinds,
+        vec!["reasoning", "text", "reasoning", "text", "finished"]
+    );
+}
+
+#[test]
+fn request_sends_openrouter_reasoning_field() {
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![ModelInputItem::Message {
+            role: ModelRole::User,
+            content: "hello".to_owned(),
+        }],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Large,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    assert_eq!(body["reasoning"], json!({"effort": "high"}));
 }
 
 #[test]
