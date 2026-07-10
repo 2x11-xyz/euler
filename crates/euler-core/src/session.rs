@@ -1743,6 +1743,7 @@ impl<D: PermissionDecider> Session<D> {
         )?;
         sink.flush(self.bus.events());
 
+        let mut covered_grant_source: Option<crate::GrantSource> = None;
         if let Some(capability) = self
             .tools
             .required_capability_for_input(&call.name, &call.input)
@@ -1758,40 +1759,51 @@ impl<D: PermissionDecider> Session<D> {
                 &call.input,
             );
             let mode = self.permissions.mode(capability);
-            // Prompt only when Ask and no matching scoped grant already covers this request.
-            let needs_prompt = mode == ApprovalMode::Ask && !self.permissions.is_granted(&request);
-            let prompt_id = if needs_prompt {
-                let prompt_id = self.emit(
-                    EventKind::PERMISSION_PROMPT,
-                    object([
-                        ("capability", capability.as_str().into()),
-                        ("reason", request.reason.clone().into()),
-                    ]),
-                )?;
-                sink.flush(self.bus.events());
-                Some(prompt_id)
+            // A request covered by an existing session/project grant runs
+            // under THAT decision: no prompt, and no fresh permission.decision
+            // event — recording "allowed once" here would misstate what the
+            // user actually granted (review v2 §8). The tool result carries a
+            // `grant_source` tag so the ledger can show `· session grant`.
+            covered_grant_source = if mode == ApprovalMode::Ask {
+                self.permissions.granted_source(&request)
             } else {
                 None
             };
-            let decision = self.permissions.decide_detailed(&request, mode);
-            let allowed = decision.allowed();
-            let mode_label = approval_mode_str(mode);
-            let payload = permission_decision_payload(&decision, mode_label, mode);
-            self.emit_with_parent(
-                EventKind::PERMISSION_DECISION,
-                payload,
-                Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
-            )?;
-            crate::diagnostics::permission_decision(
-                &self.config.session_id,
-                capability.as_str(),
-                mode_label,
-                allowed,
-            );
-            if !allowed {
-                turn_state.record_denial(capability);
-                self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
-                return Ok(());
+            if covered_grant_source.is_none() {
+                let needs_prompt = mode == ApprovalMode::Ask;
+                let prompt_id = if needs_prompt {
+                    let prompt_id = self.emit(
+                        EventKind::PERMISSION_PROMPT,
+                        object([
+                            ("capability", capability.as_str().into()),
+                            ("reason", request.reason.clone().into()),
+                        ]),
+                    )?;
+                    sink.flush(self.bus.events());
+                    Some(prompt_id)
+                } else {
+                    None
+                };
+                let decision = self.permissions.decide_detailed(&request, mode);
+                let allowed = decision.allowed();
+                let mode_label = approval_mode_str(mode);
+                let payload = permission_decision_payload(&decision, mode_label, mode);
+                self.emit_with_parent(
+                    EventKind::PERMISSION_DECISION,
+                    payload,
+                    Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
+                )?;
+                crate::diagnostics::permission_decision(
+                    &self.config.session_id,
+                    capability.as_str(),
+                    mode_label,
+                    allowed,
+                );
+                if !allowed {
+                    turn_state.record_denial(capability);
+                    self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
+                    return Ok(());
+                }
             }
         }
 
@@ -1869,6 +1881,12 @@ impl<D: PermissionDecider> Session<D> {
                 ]);
                 if let Some(exit_code) = execution.exit_code {
                     payload.insert("exit_code".to_owned(), exit_code.into());
+                }
+                if let Some(source) = covered_grant_source {
+                    // Ran under an existing grant — the ledger shows a dim
+                    // `· session grant` on the tool header instead of a fresh
+                    // decision record (review v2 §8).
+                    payload.insert("grant_source".to_owned(), source.as_str().into());
                 }
                 self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
                 crate::diagnostics::tool_exec_end(

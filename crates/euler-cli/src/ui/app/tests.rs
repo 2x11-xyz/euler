@@ -241,6 +241,7 @@ fn shell_artifact_with_lines(total: usize) -> TranscriptItem {
             .collect::<Vec<_>>()
             .join("\n"),
         exit_code: Some(0),
+        grant_source: None,
     }
 }
 

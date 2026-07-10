@@ -246,6 +246,25 @@ impl<D> PermissionGate<D> {
         out
     }
 
+    /// Which grant store covers this request, if any (session wins ties).
+    pub fn granted_source(&self, request: &PermissionRequest) -> Option<GrantSource> {
+        let command = request.command.as_deref();
+        let path = request.path.as_deref();
+        if self
+            .session_grants
+            .is_granted(request.capability, command, path)
+        {
+            return Some(GrantSource::Session);
+        }
+        if self
+            .project_grants
+            .is_granted(request.capability, command, path)
+        {
+            return Some(GrantSource::Project);
+        }
+        None
+    }
+
     pub fn is_granted(&self, request: &PermissionRequest) -> bool {
         let command = request.command.as_deref();
         let path = request.path.as_deref();

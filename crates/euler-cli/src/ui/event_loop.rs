@@ -146,10 +146,13 @@ impl EventLoop {
         }
 
         if let Some((width, height)) = self.pending_resize.take() {
-            // The resize action replays history and repaints the full canvas
-            // unconditionally, so a queued Render in the same batch would only
-            // paint the same frame twice. Consume the dirty state and re-arm
-            // the frame gate instead.
+            // Only the latest size in a batch matters (drag ticks coalesce
+            // here). The resize action re-renders the full canvas at the new
+            // width — scrollback commits stay suspended until the size is
+            // quiescent (terminal.rs RESIZE_COMMIT_QUIESCENCE) so a drag
+            // never appends re-wrapped copies per tick (review v2 §11/§12).
+            // A queued Render in the same batch would paint the same frame
+            // twice; consume the dirty state and re-arm the frame gate.
             let _ = self.dirty.take();
             self.next_frame_at = now + self.frame_interval;
             actions.push(UiAction::Resize { width, height });

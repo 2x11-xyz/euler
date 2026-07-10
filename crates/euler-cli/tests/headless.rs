@@ -6671,7 +6671,9 @@ fn pty_final_state_text(output: &[u8], rows: u16, cols: u16) -> String {
         }
     }
     if !lines.is_empty() {
-        return lines.join("\n");
+        let mut all_rows = extract_bridge_committed_rows(output);
+        all_rows.push(lines.join("\n"));
+        return all_rows.join("\n");
     }
     // Fallback path: walk row windows without overlap bookkeeping errors by
     // stepping exactly one row at a time and keeping the top row of each view.
@@ -6691,7 +6693,9 @@ fn pty_final_state_text(output: &[u8], rows: u16, cols: u16) -> String {
         }
         offset -= 1;
     }
-    rebuilt.join("\n")
+    let mut all_rows = extract_bridge_committed_rows(output);
+    all_rows.push(rebuilt.join("\n"));
+    all_rows.join("\n")
 }
 
 /// Committed rows written through the codex-style bridge contract
@@ -6721,15 +6725,72 @@ fn extract_bridge_committed_rows(output: &[u8]) -> Vec<String> {
             break;
         };
         let span = &after[region_close + 1..end];
-        for line in span.split("\r\n").skip(1) {
-            let plain = strip_ansi(line);
-            if !plain.trim().is_empty() {
-                rows.push(plain);
+        // The bridge writes `ESC[row;1H` then rows separated by \r\n with
+        // only SGR styling in between. Ordinary viewport repaints also run
+        // inside scroll-region scopes but are full of cursor movement —
+        // reject any span chunk that still contains non-SGR control
+        // sequences after SGR stripping (false positives counted one
+        // "committed" copy per resize repaint).
+        let mut chunks = span.split("\r\n");
+        let header = chunks.next().unwrap_or_default();
+        let header_is_bridge_move = {
+            let stripped = strip_sgr(header);
+            let mut ok = stripped.starts_with('\u{1b}');
+            if ok {
+                let body = stripped.trim_start_matches('\u{1b}').trim_start_matches('[');
+                ok = body
+                    .trim_end_matches('H')
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ch == ';')
+                    && body.ends_with('H');
+            }
+            ok || stripped.trim().is_empty()
+        };
+        if header_is_bridge_move {
+            for line in chunks {
+                let sgr_stripped = strip_erase_line(&strip_sgr(line));
+                if sgr_stripped.contains('\u{1b}') {
+                    // Cursor movement inside the span: not a bridge write.
+                    continue;
+                }
+                let plain = strip_ansi(line);
+                if !plain.trim().is_empty() {
+                    rows.push(plain);
+                }
             }
         }
         rest = &after[end + 3..];
     }
     rows
+}
+
+/// Remove only SGR (`ESC[...m`) sequences, keeping other controls visible.
+fn strip_sgr(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(idx) = rest.find('\u{1b}') {
+        out.push_str(&rest[..idx]);
+        let tail = &rest[idx..];
+        if let Some(after_bracket) = tail.strip_prefix("\u{1b}[") {
+            if let Some(end) = after_bracket.find(|ch: char| ch.is_ascii_alphabetic()) {
+                let terminator = after_bracket.as_bytes()[end] as char;
+                if terminator == 'm' {
+                    rest = &after_bracket[end + 1..];
+                    continue;
+                }
+            }
+        }
+        // Not SGR: keep the ESC visible for the caller's rejection check.
+        out.push('\u{1b}');
+        rest = &tail['\u{1b}'.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remove erase-to-eol (`ESC[K`, `ESC[0K`) which bridge row writes use.
+fn strip_erase_line(text: &str) -> String {
+    text.replace("\u{1b}[K", "").replace("\u{1b}[0K", "")
 }
 
 fn strip_ansi(text: &str) -> String {
@@ -6907,6 +6968,194 @@ fn diag_reconstruct_final_state_from_capture() {
         let count = state.lines().filter(|line| line.contains(needle)).count();
         println!("COUNT {needle} -> {count}");
     }
+}
+
+#[test]
+fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
+    // Review v2 §2/§8: after "allow for session", subsequent shell blocks
+    // must still render through the block renderer (header + fold), carry
+    // the dim `· session grant` tag instead of fresh decision records, and
+    // nothing may duplicate.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut responses = Vec::new();
+    for (id, cmd) in [
+        ("call-1", "echo alpha-one"),
+        ("call-2", "echo beta-two"),
+        ("call-3", "echo gamma-three"),
+    ] {
+        responses.push(serde_json::json!({"events": [
+            {"tool_call": {"id": id, "name": "run_shell", "input": {"command": cmd}}},
+            {"finished": {"stop_reason": "tool_use"}},
+        ]}));
+    }
+    responses.push(serde_json::json!({"events": [
+        {"text_delta": "ran all three."},
+        {"finished": {"stop_reason": "completed"}},
+    ]}));
+    let script = write_fixture_script(
+        temp.path(),
+        "grant-blocks.json",
+        &serde_json::json!({"version": 1, "responses": responses}).to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    tui.write("run the three commands\r");
+    // First shell call prompts; grant the session scope.
+    assert!(
+        tui.wait_for_screen("Run command?"),
+        "approval panel did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("a");
+    assert!(
+        tui.wait_for_screen("ran all three."),
+        "turn did not finish:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let final_state = pty_final_state_text(&tui.output, 24, 80);
+    let mut failures = Vec::new();
+    for cmd in ["echo alpha-one", "echo beta-two", "echo gamma-three"] {
+        let headers = final_state
+            .lines()
+            .filter(|line| line.contains(&format!("bash $ {cmd}")))
+            .count();
+        if headers != 1 {
+            failures.push(format!("`bash $ {cmd}` header appears {headers}× (want 1)"));
+        }
+    }
+    for output in ["alpha-one", "beta-two", "gamma-three"] {
+        let occurrences = final_state
+            .lines()
+            .filter(|line| line.contains(output) && !line.contains("bash $") && !line.contains("run the three"))
+            .count();
+        if occurrences > 1 {
+            failures.push(format!("output `{output}` duplicated ({occurrences}×)"));
+        }
+    }
+    // Exactly one decision record; later runs tagged on the header instead.
+    let decisions = final_state
+        .lines()
+        .filter(|line| line.contains("allowed for session"))
+        .count();
+    if decisions != 1 {
+        failures.push(format!("decision records: {decisions} (want 1)"));
+    }
+    let grant_tags = final_state
+        .lines()
+        .filter(|line| line.contains("· session grant"))
+        .count();
+    if grant_tags != 2 {
+        failures.push(format!("session-grant header tags: {grant_tags} (want 2)"));
+    }
+    assert!(
+        failures.is_empty(),
+        "{}\nFinal state:\n{final_state}",
+        failures.join("\n")
+    );
+}
+
+
+#[test]
+fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
+    // Review v2 §11/§12: a drag (many resize ticks) appended one re-wrapped
+    // transcript copy to scrollback per width tick. With commit suspension
+    // during resize + item-boundary remap, a drag may leave at most the
+    // pre-resize copy plus one bounded partial-item re-emission — never a
+    // copy per tick.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut events = Vec::new();
+    for paragraph in 1..=6 {
+        let sentence = format!(
+            "Paragraph {paragraph}: content long enough to wrap and scroll so \
+             a resize drag has committed rows above the viewport to corrupt."
+        );
+        for chunk in sentence.as_bytes().chunks(8) {
+            events.push(serde_json::json!({
+                "text_delta": String::from_utf8_lossy(chunk)
+            }));
+        }
+        events.push(serde_json::json!({"text_delta": "\n\n"}));
+    }
+    events.push(serde_json::json!({"finished": {"stop_reason": "completed"}}));
+    let script = write_fixture_script(
+        temp.path(),
+        "drag-stream.json",
+        &serde_json::json!({"version": 1, "responses": [{"events": events}]}).to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    tui.write("overview please\r");
+    assert!(
+        tui.wait_for_screen("Paragraph 6:"),
+        "{}",
+        tui.screen_text()
+    );
+    // Simulate a drag: many rapid width ticks in both directions.
+    for cols in [96, 92, 88, 84, 80, 76, 72, 76, 82, 90, 100] {
+        tui.resize(24, cols);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Quiescence so commits resume before quitting.
+    std::thread::sleep(Duration::from_millis(600));
+    tui.quit();
+
+    // Assert the MECHANISM from the raw byte stream (emulator-independent):
+    // scrollback (bridge) emissions must not happen per drag tick. Content
+    // committed before the drag stays put; after quiescence at most one
+    // bounded re-emission may occur.
+    let drag_start = tui.resizes.first().map(|(offset, _, _)| *offset).unwrap();
+    let drag_end = tui.resizes.last().map(|(offset, _, _)| *offset).unwrap();
+    let during: Vec<String> = extract_bridge_committed_rows(&tui.output[drag_start..drag_end]);
+    assert!(
+        during.is_empty(),
+        "bridge emissions during the drag ({}) — per-tick amplification:\n{}",
+        during.len(),
+        during.join("\n")
+    );
+    // Each paragraph may be bridge-committed at most twice in total
+    // (pre-drag copy + one bounded post-quiescence re-emission).
+    let all_rows = extract_bridge_committed_rows(&tui.output);
+    let mut failures = Vec::new();
+    for paragraph in 1..=6 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = all_rows
+            .iter()
+            .filter(|row| row.contains(&needle))
+            .count();
+        if occurrences > 2 {
+            failures.push(format!(
+                "`{needle}` bridge-committed {occurrences}× (want ≤2)"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{}\nBridge rows:\n{}",
+        failures.join("\n"),
+        all_rows.join("\n")
+    );
 }
 
 #[test]
@@ -7400,16 +7649,12 @@ impl PtyHarness {
     }
 
     fn screen_text(&self) -> String {
-        // Honor mid-session resizes: process each byte segment at the
-        // dimensions that were active when it was emitted.
-        let mut parser = vt100::Parser::new(24, 80, 0);
-        let mut start = 0usize;
-        for (offset, rows, cols) in &self.resizes {
-            parser.process(&self.output[start..*offset]);
-            parser.set_size(*rows, *cols);
-            start = *offset;
-        }
-        parser.process(&self.output[start..]);
+        // Parse at a fixed oversize grid: every app row lands on its own
+        // emulator row regardless of mid-session resizes, which is all the
+        // contains()-based predicates need. (Feeding vt100 set_size() during
+        // a drag trips a subtract-overflow panic inside the crate.)
+        let mut parser = vt100::Parser::new(80, 260, 0);
+        parser.process(&self.output);
         parser.screen().contents()
     }
 }
