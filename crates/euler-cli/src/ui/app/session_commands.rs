@@ -179,6 +179,11 @@ impl AppCore {
         let result = session.rename_session(&name);
         match result {
             Ok(normalized) => {
+                // Footer #46: the footer reads straight off `self.status` on
+                // every render, so set it here rather than waiting on the
+                // metadata refresh below — renaming updates the footer
+                // immediately even if the store refresh fails.
+                self.status.session_name = Some(normalized.clone());
                 self.rebuild_bottom_surface();
                 self.notice = match self.refresh_current_session_metadata(&session_id) {
                     Ok(()) => Some(format!("session named {normalized}")),

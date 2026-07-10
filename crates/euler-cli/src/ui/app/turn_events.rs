@@ -54,6 +54,8 @@ impl AppCore {
                 self.note_turn_activity();
                 self.record_in_flight_error(&event);
                 self.update_token_usage_from_event(&event);
+                self.update_phase_verb(&event);
+                self.update_reasoning_stream_tail(&event);
                 self.transcript.push_event(event);
                 self.queue_finalized_visual_output_for_latest_event();
                 if is_tool_call {
@@ -110,6 +112,70 @@ impl AppCore {
         update_token_usage(&mut self.token_usage, event, context_window_tokens);
     }
 
+    /// Working HUD phase verb (issue #27): thinking / exploring / reading X /
+    /// writing X / running bash / running tests, falling back to "working"
+    /// only when nothing more specific applies. Only reasoning and tool-call
+    /// events carry a new phase — other event kinds (streamed text deltas,
+    /// tool results) leave the verb in place so it swaps only when the phase
+    /// actually changes, not on every event.
+    fn update_phase_verb(&mut self, event: &EventEnvelope) {
+        match event.kind.as_str() {
+            EventKind::MODEL_REASONING => {
+                self.current_phase_verb = Some("thinking".to_owned());
+            }
+            EventKind::TOOL_CALL => {
+                self.current_phase_verb = Some(phase_verb_for_tool_call(event));
+            }
+            _ => {}
+        }
+    }
+
+    /// #47: accumulate a bounded tail of the reasoning text streaming under
+    /// the live thinking line. `MODEL_DELTA{kind: "reasoning"}` deltas append;
+    /// a `MODEL_DELTA{kind: "text"}` (answer text has started) or a
+    /// finalized `MODEL_REASONING` item clears it — the same moments the
+    /// live thinking line itself clears — so a late reasoning delta can
+    /// never reopen it once the answer has begun streaming.
+    fn update_reasoning_stream_tail(&mut self, event: &EventEnvelope) {
+        match event.kind.as_str() {
+            EventKind::MODEL_DELTA => {
+                let Some(kind) = event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return;
+                };
+                match kind {
+                    "reasoning" => {
+                        if self.reasoning_tail_locked {
+                            return;
+                        }
+                        if let Some(delta) = event
+                            .payload
+                            .get("delta")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            self.reasoning_stream_tail
+                                .push_str(&delta.replace('\n', " "));
+                            truncate_reasoning_tail_left(
+                                &mut self.reasoning_stream_tail,
+                                REASONING_STREAM_TAIL_MAX_CHARS,
+                            );
+                        }
+                    }
+                    "text" => {
+                        self.reasoning_stream_tail.clear();
+                        self.reasoning_tail_locked = true;
+                    }
+                    _ => {}
+                }
+            }
+            EventKind::MODEL_REASONING => self.reasoning_stream_tail.clear(),
+            _ => {}
+        }
+    }
+
     fn accept_worker_session_or_continue(
         &mut self,
         session: Box<Session<TuiDecider>>,
@@ -139,6 +205,11 @@ impl AppCore {
         self.in_flight_label = None;
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
+        self.current_phase_verb = None;
+        self.reasoning_stream_tail.clear();
+        self.reasoning_tail_locked = false;
+        self.spinner_frame = 0;
+        self.spinner_last_tick = None;
     }
 
     fn handle_extension_outcome(
@@ -307,4 +378,85 @@ impl AppCore {
             .last()
             .is_some_and(|event| event.kind.as_str() == EventKind::ERROR)
     }
+}
+
+/// Phase verb for a `tool.call` event, matching the tool taxonomy the
+/// transcript projector already uses (`tool_projection_from_call` /
+/// `exploration_summary_from_call` in transcript.rs): `run_shell` -> running
+/// bash (or running tests, judged from the command text — there is no
+/// dedicated "test" tool), `edit_file`/`apply_patch`/`write_file` -> writing
+/// X, `read_file` -> reading X, everything else exploration-shaped
+/// (`git_status`, `git_diff`, `list_files`, `search`) -> exploring.
+fn phase_verb_for_tool_call(event: &EventEnvelope) -> String {
+    let name = event
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let input = event.payload.get("input");
+    match name {
+        "run_shell" => {
+            let command = input
+                .and_then(|input| input.get("command"))
+                .and_then(serde_json::Value::as_str)
+                .map(super::transcript::normalized_shell_command)
+                .unwrap_or_default();
+            if is_test_runner_command(&command) {
+                "running tests".to_owned()
+            } else {
+                "running bash".to_owned()
+            }
+        }
+        "read_file" => tool_call_path(input)
+            .map(|path| format!("reading {path}"))
+            .unwrap_or_else(|| "reading".to_owned()),
+        "edit_file" | "apply_patch" | "apply-patch" | "write_file" => tool_call_path(input)
+            .map(|path| format!("writing {path}"))
+            .unwrap_or_else(|| "writing".to_owned()),
+        "git_status" | "git_diff" | "list_files" | "search" | "tool_result_get" => {
+            "exploring".to_owned()
+        }
+        _ => "working".to_owned(),
+    }
+}
+
+fn tool_call_path(input: Option<&serde_json::Value>) -> Option<&str> {
+    input
+        .and_then(|input| input.get("path"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Judged from the command text — there is no dedicated "test" tool, so a
+/// `run_shell` call reads as "running tests" when it plainly looks like one
+/// (deliberate heuristic, not exhaustive: matches common test-runner
+/// invocations from CLAUDE.md's own convention — `cargo nextest run` — plus
+/// other ecosystems' idiomatic commands).
+fn is_test_runner_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower
+        .split_whitespace()
+        .any(|token| token == "test" || token == "tests")
+        || ["nextest", "pytest", "jest", "vitest"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+}
+
+/// #47: bounded tail length for the live streaming-reasoning preview under
+/// the thinking HUD line — enough for a couple of wrapped lines at typical
+/// composer widths, never the full reasoning transcript.
+pub(super) const REASONING_STREAM_TAIL_MAX_CHARS: usize = 400;
+
+/// Keeps only the trailing `max_chars` characters of `tail`, dropping from
+/// the front. Operates on `char`s (never a byte index), so it can never
+/// split a multibyte glyph.
+fn truncate_reasoning_tail_left(tail: &mut String, max_chars: usize) {
+    let overflow = tail.chars().count().saturating_sub(max_chars);
+    if overflow == 0 {
+        return;
+    }
+    let byte_offset = tail
+        .char_indices()
+        .nth(overflow)
+        .map_or(tail.len(), |(index, _)| index);
+    tail.drain(..byte_offset);
 }

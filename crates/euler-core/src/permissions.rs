@@ -166,8 +166,13 @@ pub trait PermissionDecider {
 pub struct PermissionGate<D> {
     modes: BTreeMap<Capability, ApprovalMode>,
     session_grants: GrantList,
+    /// Active project grants: always the intersection of the workspace file
+    /// and the user consent store. Never populated from the repo file alone.
     project_grants: GrantList,
     project_store: Option<ProjectGrantStore>,
+    /// User-home consent store paired with `project_store`; both are set or
+    /// neither is. Repo-controlled grants activate only with matching consent.
+    consent_store: Option<ProjectGrantStore>,
     decider: D,
 }
 
@@ -182,6 +187,7 @@ impl<D> PermissionGate<D> {
             session_grants: GrantList::new(),
             project_grants: GrantList::new(),
             project_store: None,
+            consent_store: None,
             decider,
         }
     }
@@ -192,6 +198,7 @@ impl<D> PermissionGate<D> {
             session_grants: GrantList::new(),
             project_grants: GrantList::new(),
             project_store: None,
+            consent_store: None,
             decider,
         }
     }
@@ -223,12 +230,33 @@ impl<D> PermissionGate<D> {
         &mut self.decider
     }
 
-    /// Load project grants from `<root>/.euler/grants.json` and retain the store
-    /// for later project-grant writes.
-    pub fn load_project_grants(&mut self, root: impl AsRef<Path>) -> Result<(), ProjectGrantError> {
+    /// Load project grants for a workspace root. The repo-local
+    /// `<root>/.euler/grants.json` is repo-controlled content and never grants
+    /// on its own: only entries that also appear in this user's consent store
+    /// (one file per root under `consent_dir`, written when the user approves
+    /// a project grant) become active. Without a consent dir, project grants
+    /// are disabled entirely — reads and writes both fail closed.
+    pub fn load_project_grants(
+        &mut self,
+        root: impl AsRef<Path>,
+        consent_dir: Option<&Path>,
+    ) -> Result<(), ProjectGrantError> {
+        let Some(consent_dir) = consent_dir else {
+            self.project_grants = GrantList::new();
+            self.project_store = None;
+            self.consent_store = None;
+            return Ok(());
+        };
         let store = ProjectGrantStore::for_root(root.as_ref());
-        self.project_grants = store.load()?;
+        let consent = ProjectGrantStore::at_path(ProjectGrantStore::consent_path_for_root(
+            consent_dir,
+            root.as_ref(),
+        ));
+        let workspace = store.load()?;
+        let consented = consent.load()?;
+        self.project_grants = workspace.intersection(&consented);
         self.project_store = Some(store);
+        self.consent_store = Some(consent);
         Ok(())
     }
 
@@ -306,8 +334,15 @@ impl<D> PermissionGate<D> {
                     .project_store
                     .as_ref()
                     .ok_or(ProjectGrantError::NoStore)?;
-                let list = store.add(&grant)?;
-                self.project_grants = list;
+                let consent = self
+                    .consent_store
+                    .as_ref()
+                    .ok_or(ProjectGrantError::NoStore)?;
+                // Consent first: if the workspace write then fails, a stray
+                // consent entry grants nothing (intersection semantics).
+                let consented = consent.add(&grant)?;
+                let workspace = store.add(&grant)?;
+                self.project_grants = workspace.intersection(&consented);
                 Ok(())
             }
         }
@@ -321,20 +356,41 @@ impl<D> PermissionGate<D> {
         source: GrantSource,
     ) -> Result<usize, ProjectGrantError> {
         match source {
-            GrantSource::Session => Ok(self.session_grants.revoke(capability, pattern)),
+            GrantSource::Session => {
+                let removed = self.session_grants.revoke(capability, pattern);
+                // An unscoped session grant flipped the capability to
+                // SessionAllow; revoking it must also stop execution, not
+                // just remove the list entry. Ask is the safe restoration —
+                // the grant could only have been issued from a promptable
+                // mode.
+                if removed > 0
+                    && pattern.is_unscoped()
+                    && self.mode(capability) == ApprovalMode::SessionAllow
+                {
+                    self.set_mode(capability, ApprovalMode::Ask);
+                }
+                Ok(removed)
+            }
             GrantSource::Project => {
                 let store = self
                     .project_store
                     .as_ref()
                     .ok_or(ProjectGrantError::NoStore)?;
-                let list = store.revoke(capability, pattern)?;
+                let consent = self
+                    .consent_store
+                    .as_ref()
+                    .ok_or(ProjectGrantError::NoStore)?;
                 let removed = self
                     .project_grants
                     .as_slice()
                     .iter()
                     .filter(|g| g.capability == capability && g.pattern == *pattern)
                     .count();
-                self.project_grants = list;
+                // Workspace first: once it's gone the grant is inactive even
+                // if the consent revoke then fails.
+                let workspace = store.revoke(capability, pattern)?;
+                let consented = consent.revoke(capability, pattern)?;
+                self.project_grants = workspace.intersection(&consented);
                 Ok(removed)
             }
         }
@@ -492,11 +548,15 @@ mod tests {
     #[test]
     fn project_grant_persists_and_lists() {
         let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workspace");
+        let consent = temp.path().join("home");
+        std::fs::create_dir_all(&root).expect("root");
         let mut gate =
             PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
                 GrantScope::Project(ScopePattern::new("src").expect("pattern")),
             )]));
-        gate.load_project_grants(temp.path()).expect("load");
+        gate.load_project_grants(&root, Some(&consent))
+            .expect("load");
         let request =
             PermissionRequest::new(Capability::FsWrite, "tool edit_file").with_path("src/lib.rs");
         let decision = gate.decide_detailed(&request, ApprovalMode::Ask);
@@ -505,11 +565,115 @@ mod tests {
         assert_eq!(decision.grant_pattern(), Some("src"));
 
         let mut gate2 = PermissionGate::new(PanicDecider);
-        gate2.load_project_grants(temp.path()).expect("reload");
+        gate2
+            .load_project_grants(&root, Some(&consent))
+            .expect("reload");
         assert!(gate2.is_granted(&request));
         let listed = gate2.list_grants();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0, GrantSource::Project);
+    }
+
+    #[test]
+    fn preseeded_workspace_grants_file_grants_nothing_without_consent() {
+        // A cloned repo can ship `.euler/grants.json`; repo content must not
+        // become authority on its own.
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workspace");
+        let consent = temp.path().join("home");
+        std::fs::create_dir_all(&root).expect("root");
+        ProjectGrantStore::for_root(&root)
+            .add(&ActiveGrant::unscoped(Capability::ShellExec))
+            .expect("preseed workspace grants");
+
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_project_grants(&root, Some(&consent))
+            .expect("load");
+
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("rm -rf /");
+        assert!(gate.project_grants().is_empty());
+        assert!(!gate.is_granted(&request));
+        assert_eq!(gate.granted_source(&request), None);
+    }
+
+    #[test]
+    fn workspace_grants_added_after_consent_stay_inactive() {
+        // User consents to one grant; the repo file later grows an extra
+        // entry (tamper). Only the consented entry is active on reload.
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workspace");
+        let consent = temp.path().join("home");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut gate =
+            PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
+                GrantScope::Project(ScopePattern::new("cargo").expect("pattern")),
+            )]));
+        gate.load_project_grants(&root, Some(&consent))
+            .expect("load");
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(gate.decide(&request, ApprovalMode::Ask));
+
+        ProjectGrantStore::for_root(&root)
+            .add(&ActiveGrant::unscoped(Capability::FsWrite))
+            .expect("tamper workspace grants");
+
+        let mut gate2 = PermissionGate::new(PanicDecider);
+        gate2
+            .load_project_grants(&root, Some(&consent))
+            .expect("reload");
+        assert!(gate2.is_granted(&request));
+        let write = PermissionRequest::new(Capability::FsWrite, "tool edit_file")
+            .with_path("anything/at/all.rs");
+        assert!(!gate2.is_granted(&write));
+    }
+
+    #[test]
+    fn no_consent_dir_disables_project_grants_entirely() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("root");
+        ProjectGrantStore::for_root(&root)
+            .add(&ActiveGrant::unscoped(Capability::ShellExec))
+            .expect("preseed workspace grants");
+
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_project_grants(&root, None).expect("load");
+
+        assert!(gate.project_grants().is_empty());
+        // Writes fail closed too: no consent store means no project installs.
+        let result = gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::Project(ScopePattern::new("git").expect("pattern")),
+        );
+        assert!(matches!(result, Err(ProjectGrantError::NoStore)));
+    }
+
+    #[test]
+    fn revoking_unscoped_session_grant_restores_ask_mode() {
+        // Review finding: revoke only removed the list entry while the
+        // SessionAllow mode installed with the grant kept allowing.
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.set_mode(Capability::ShellExec, ApprovalMode::Ask);
+        gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::Session(ScopePattern::unscoped()),
+        )
+        .expect("install");
+        assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::SessionAllow);
+
+        gate.revoke(
+            Capability::ShellExec,
+            &ScopePattern::unscoped(),
+            GrantSource::Session,
+        )
+        .expect("revoke");
+
+        assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::Ask);
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(!gate.is_granted(&request));
     }
 
     #[test]

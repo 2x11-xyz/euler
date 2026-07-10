@@ -24,7 +24,7 @@ use super::metrics;
 use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPreview};
 #[cfg(test)]
 use super::status::status_widget;
-use super::status::{status_line_text, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
+use super::status::{status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
 use super::terminal::{self, PendingSignal, TerminalSession};
 use super::theme::{Theme, ThemeChoice};
 #[cfg(test)]
@@ -57,12 +57,11 @@ use euler_sdk::{Capability, Extension};
 use ratatui::backend::CrosstermBackend;
 #[cfg(test)]
 use ratatui::layout::Rect;
-use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::widgets::Paragraph;
 #[cfg(test)]
 use ratatui::Frame;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
@@ -74,6 +73,8 @@ use std::time::{Duration, Instant};
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
+/// Working HUD braille spinner cadence (issue #27, spec v2.1 §13.3: 80-100ms).
+const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(90);
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
 const DENIED_COMPOSER_GHOST: &str = "denied — tell euler what to do instead";
 
@@ -115,6 +116,25 @@ use self::support::{
     read_terminal_event, session_resume_label, session_root_status_path, update_token_usage,
     CommandContextParts,
 };
+
+/// Working HUD content, shared by the plain-text and styled render paths
+/// (issue #27). See `AppCore::working_hud_line`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum HudLine {
+    /// Unstyled one-liner (interrupted / turn-failed).
+    Plain(String),
+    /// Spinner glyph, phase verb, and dim suffix rendered as distinct spans.
+    Working {
+        spinner: &'static str,
+        verb: String,
+        suffix: String,
+        /// #47: already-wrapped continuation lines of the reasoning text
+        /// currently streaming, rendered dim italic under the spinner line.
+        /// Empty unless the phase is "thinking" and a fidelity-permitting
+        /// provider is streaming reasoning content.
+        reasoning_tail: Vec<String>,
+    },
+}
 
 pub struct App {
     terminal: CrosstermTerminal,
@@ -161,12 +181,14 @@ pub struct AppCore {
     pending_terminal_clipboard: Option<String>,
     interrupted_guidance: bool,
     in_flight_error: Option<String>,
-    /// Keys of foldable history items currently expanded (`history:{index}`).
-    expanded_artifact_keys: HashSet<String>,
-    /// Last known history viewport as `(top_row, height)` for nearest-block fold.
+    /// Global `ctrl+o` fold state (issue #49): one flag for every foldable
+    /// history item — no per-cell targeting, no invisible nearest-to-
+    /// viewport heuristic. All foldable cells expand together, and collapse
+    /// together on the next `ctrl+o`.
+    tool_output_expanded: bool,
+    /// Last known history viewport as `(top_row, height)`, used to position
+    /// search-match scrolling.
     last_history_viewport: (usize, usize),
-    /// Foldable item spans recorded on the last history render: `(key, start, end)`.
-    last_foldable_spans: Vec<(String, usize, usize)>,
     theme: Theme,
     theme_choice: ThemeChoice,
     theme_preference_path: Option<PathBuf>,
@@ -185,6 +207,25 @@ pub struct AppCore {
     /// Persona/name of the in-flight companion run, for approval panel tagging.
     in_flight_companion_name: Option<String>,
     in_flight_cancellable: bool,
+    /// Braille spinner animation frame (issue #27) — advanced by a tick
+    /// counter, never derived from `Instant::now()` at render time.
+    spinner_frame: usize,
+    /// Wall-clock anchor for the last spinner tick; only read outside
+    /// render, in the periodic background poll.
+    spinner_last_tick: Option<Instant>,
+    /// Current turn phase verb (thinking/exploring/reading X/writing X/
+    /// running bash/running tests), derived from streamed turn events.
+    /// `None` falls back to the generic "working" label.
+    current_phase_verb: Option<String>,
+    /// #47: a bounded tail of the reasoning text currently streaming under
+    /// the live `thinking · Ns` HUD line (readable-fidelity providers only).
+    /// Cleared the moment a text delta arrives, a `MODEL_REASONING` item
+    /// finalizes, or the turn ends — a late reasoning delta must never
+    /// reopen it once answer text has started.
+    reasoning_stream_tail: String,
+    /// Set once an answer text delta has streamed this turn; while set, a
+    /// late reasoning delta is ignored rather than reopening the tail.
+    reasoning_tail_locked: bool,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     turn_event_start: usize,
@@ -308,7 +349,14 @@ impl App {
                 PendingSignal::Terminate => TerminalSignal::Terminate,
             }));
         }
-        if self.core.drain_background() || self.core.mark_working_timer_dirty() {
+        // Three independent dirty checks — evaluated with `|` (not `||`) so
+        // a `true` earlier in the chain can never short-circuit a later
+        // one's bookkeeping (the spinner's tick-scheduling state in
+        // particular must advance every poll or its cadence drifts).
+        let background_dirty = self.core.drain_background();
+        let timer_dirty = self.core.mark_working_timer_dirty();
+        let spinner_dirty = self.core.advance_spinner();
+        if background_dirty | timer_dirty | spinner_dirty {
             self.request_render(RedrawLevel::Full);
         }
         self.emit_pending_notifications();
@@ -680,9 +728,8 @@ impl AppCore {
             pending_terminal_clipboard: None,
             interrupted_guidance: false,
             in_flight_error: None,
-            expanded_artifact_keys: HashSet::new(),
+            tool_output_expanded: false,
             last_history_viewport: (0, 24),
-            last_foldable_spans: Vec::new(),
             theme,
             theme_choice,
             theme_preference_path,
@@ -698,6 +745,11 @@ impl AppCore {
             in_flight_label: None,
             in_flight_companion_name: None,
             in_flight_cancellable: false,
+            spinner_frame: 0,
+            spinner_last_tick: None,
+            current_phase_verb: None,
+            reasoning_stream_tail: String::new(),
+            reasoning_tail_locked: false,
             extensions,
             observe,
             turn_event_start: 0,
@@ -1085,6 +1137,18 @@ impl AppCore {
                 CoreEffect::Render
             }
             KeyCode::Backspace => {
+                // Issue #24: an empty code-swarm filter steps back to the
+                // slash palette rather than exiting outright.
+                if self.bottom.code_swarm_backspace_steps_back_to_palette() {
+                    return CoreEffect::Render;
+                }
+                // Issue #23: backspacing over the leading `/` with nothing
+                // else typed exits the palette (same as Esc) instead of the
+                // prior no-op clamp.
+                if self.bottom.palette_backspace_would_exit() {
+                    let event = self.bottom.cancel();
+                    return self.surface_event(event);
+                }
                 let effect = self.edit_palette(BottomSurface::palette_backspace);
                 if matches!(self.bottom.owner(), BottomOwner::Search(_)) {
                     self.refresh_search_matches();
@@ -1163,7 +1227,7 @@ impl AppCore {
         // Plain text of finalized ledger history rows — the same set the
         // visual canvas projects. Not live streaming markdown only.
         let width = self.composer_navigation_width.max(40);
-        let items = self.visual_canvas.finalized_items().to_vec();
+        let items = self.visual_canvas.finalized_items();
         let lines = crate::ui::text::with_timestamp_gutter(self.show_timestamp_gutter, || {
             transcript::render_items_for_history(&items, &self.theme, width)
         });
@@ -1547,6 +1611,11 @@ impl AppCore {
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
+        self.current_phase_verb = None;
+        self.reasoning_stream_tail.clear();
+        self.reasoning_tail_locked = false;
+        self.spinner_frame = 0;
+        self.spinner_last_tick = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         self.turn_event_start = self.transcript.events().len();
@@ -1557,6 +1626,7 @@ impl AppCore {
         match event {
             SurfaceEvent::None => CoreEffect::Render,
             SurfaceEvent::Message(message) => self.notice_item(message),
+            SurfaceEvent::Notice(message) => self.teach_notice(message),
             SurfaceEvent::Action(action) => self.handle_command_action(action),
         }
     }
@@ -1626,7 +1696,7 @@ impl AppCore {
             if let Err(error) =
                 model_preference::save_timestamps_preference(path, self.show_timestamp_gutter)
             {
-                self.push_notice_item(format!(
+                return self.teach_notice(format!(
                     "timestamps {}; preference not saved: {error}",
                     if self.show_timestamp_gutter {
                         "shown"
@@ -1634,7 +1704,6 @@ impl AppCore {
                         "hidden"
                     }
                 ));
-                return CoreEffect::Render;
             }
         }
         // Faint confirmation line; also logged as a transcript notice item.
@@ -1643,7 +1712,7 @@ impl AppCore {
         } else {
             "timestamps hidden".to_owned()
         };
-        self.notice_item(message)
+        self.teach_notice(message)
     }
 
     fn rollback_workspace_checkpoint(&mut self, event_id: String) -> CoreEffect {
@@ -1712,8 +1781,7 @@ impl AppCore {
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
         self.token_usage.context_window_tokens = self.active_context_window_tokens();
-        self.expanded_artifact_keys.clear();
-        self.last_foldable_spans.clear();
+        self.tool_output_expanded = false;
         self.modal = None;
         self.quit_armed = None;
         self.last_working_elapsed_secs = None;
@@ -1803,13 +1871,20 @@ impl AppCore {
             transcript.push_event(event.clone());
         }
         transcript.scroll_to_bottom();
-        let mut finalized = vec![TranscriptItem::Banner {
-            session_id: self.status.session_id.clone(),
+        let mut finalized = vec![transcript::ProjectedEntry {
+            item: TranscriptItem::Banner {
+                session_id: self.status.session_id.clone(),
+            },
+            timing: None,
         }];
-        finalized.extend(transcript.items());
+        // Restamp the whole rebuilt transcript from real event provenance
+        // (review v2 §6) rather than the blank gutter a plain items() +
+        // fresh push would produce.
+        let (timed_entries, clock_seed) = transcript.timed_items();
+        finalized.extend(timed_entries);
         self.transcript = transcript;
         self.token_usage = token_usage;
-        self.visual_canvas = VisualCanvasState::new(finalized);
+        self.visual_canvas = VisualCanvasState::new_with_entries(finalized, clock_seed);
     }
 
     fn handle_ctrl_c(&mut self) -> CoreEffect {
@@ -1921,6 +1996,13 @@ impl AppCore {
         CoreEffect::Render
     }
 
+    /// Issue #49: `ctrl+o` is a single global expand/collapse toggle, not a
+    /// per-cell targeting gesture. Per-cell "nearest to viewport center"
+    /// targeting had no honest input method once the mouse click path (#29)
+    /// was removed — it was an invisible heuristic with no visible affordance
+    /// to aim it. A global toggle is simple and predictable: one keystroke,
+    /// every foldable cell in the transcript expands or collapses together;
+    /// native scrollback and `ctrl+f` remain the navigation tools.
     fn toggle_tool_artifact_expansion(&mut self) -> CoreEffect {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
@@ -1931,70 +2013,10 @@ impl AppCore {
         {
             return CoreEffect::None;
         }
-        self.refresh_foldable_spans(self.composer_navigation_width);
-        let Some(key) = self.nearest_foldable_key() else {
-            return CoreEffect::None;
-        };
-        if !self.expanded_artifact_keys.remove(&key) {
-            self.expanded_artifact_keys.insert(key);
-        }
+        self.tool_output_expanded = !self.tool_output_expanded;
         self.visual_canvas.invalidate_history_cache();
         self.visual_scroll_offset = 0;
         CoreEffect::ReplayHistoryWithScrollbackPurge
-    }
-
-    fn nearest_foldable_key(&self) -> Option<String> {
-        let spans = &self.last_foldable_spans;
-        if spans.is_empty() {
-            return None;
-        }
-        let (top, height) = self.last_history_viewport;
-        let height = height.max(1);
-        let center = top.saturating_add(height / 2);
-        let mut best: Option<(usize, usize, &str)> = None;
-        for (index, (key, start, end)) in spans.iter().enumerate() {
-            let mid = start.saturating_add(end.saturating_sub(*start) / 2);
-            let dist = mid.abs_diff(center);
-            let rank = (dist, spans.len() - 1 - index);
-            match best {
-                Some((best_dist, best_rev, _)) if rank >= (best_dist, best_rev) => {}
-                _ => best = Some((rank.0, rank.1, key.as_str())),
-            }
-        }
-        best.map(|(_, _, key)| key.to_owned())
-    }
-
-    fn refresh_foldable_spans(&mut self, width: u16) {
-        let items = self.visual_canvas.finalized_items().to_vec();
-        let theme = self.theme.clone();
-        let mut row = 0usize;
-        let mut spans = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            let key = transcript::artifact_key_for_index(index);
-            let limit = if self.expanded_artifact_keys.contains(&key) {
-                usize::MAX
-            } else {
-                TOOL_CALL_MAX_LINES
-            };
-            let line_count = transcript::render_items_for_history_with_limit(
-                std::slice::from_ref(item),
-                &theme,
-                width,
-                limit,
-            )
-            .len();
-            if item.is_foldable_artifact(TOOL_CALL_MAX_LINES) {
-                let end = row.saturating_add(line_count.saturating_sub(1));
-                spans.push((key, row, end));
-            }
-            row = row.saturating_add(line_count);
-        }
-        let height = self.last_history_viewport.1.max(1);
-        let top = row
-            .saturating_sub(height)
-            .saturating_sub(self.visual_scroll_offset);
-        self.last_history_viewport = (top, height);
-        self.last_foldable_spans = spans;
     }
 
     fn open_external_editor(&mut self) -> CoreEffect {
@@ -2090,6 +2112,41 @@ impl AppCore {
         true
     }
 
+    /// Advance the working HUD's spinner animation frame (issue #27). The
+    /// rendered glyph is a pure function of `spinner_frame` — a tick
+    /// counter, not `Instant::now()` read at render time — so it stays
+    /// testable without wall-clock assertions; only this scheduling check
+    /// (called from the periodic background poll, never from render) reads
+    /// the clock, exactly like the neighboring elapsed-seconds timer.
+    fn advance_spinner(&mut self) -> bool {
+        self.advance_spinner_at(Instant::now())
+    }
+
+    /// `now` is injected (rather than read internally) so tests can drive
+    /// the tick-scheduling boundary deterministically, without sleeping —
+    /// e.g. `Instant::now() - Duration::from_millis(100)` as the "last
+    /// tick" to force the next call to fire.
+    fn advance_spinner_at(&mut self, now: Instant) -> bool {
+        if !self.turn_in_flight() {
+            let was_animating = self.spinner_frame != 0 || self.spinner_last_tick.is_some();
+            self.spinner_frame = 0;
+            self.spinner_last_tick = None;
+            return was_animating;
+        }
+        match self.spinner_last_tick {
+            None => {
+                self.spinner_last_tick = Some(now);
+                false
+            }
+            Some(last) if now.duration_since(last) >= SPINNER_TICK_INTERVAL => {
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                self.spinner_last_tick = Some(now);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
     fn reply_to_modal(&mut self, reply: PermissionReply) -> CoreEffect {
         self.modal = None;
         self.approval_selection = ApprovalOption::default();
@@ -2116,6 +2173,19 @@ impl AppCore {
         });
     }
 
+    /// Muted, non-error informational line (review v2 §3/§6/§14.4) — no
+    /// glyph, no "ui:" source prefix, indented to the content column.
+    /// Consecutive `Notice` items stack directly without a separating blank
+    /// line (the renderer special-cases this run). Used for every neutral
+    /// confirmation/refusal (extension toggles, timestamps toggle,
+    /// code-swarm save/config lines, resume refusal, teach messages like the
+    /// disabled-extension notice) — none of these are failures, so none
+    /// should read as one.
+    fn teach_notice(&mut self, message: String) -> CoreEffect {
+        self.push_finalized_visual_item(TranscriptItem::Notice(message));
+        CoreEffect::Render
+    }
+
     fn summary_item(&mut self, text: String) -> CoreEffect {
         self.push_finalized_visual_item(TranscriptItem::SessionSummary(text));
         CoreEffect::Render
@@ -2132,7 +2202,13 @@ impl AppCore {
         }
     }
 
-    fn live_status_line(&self) -> Option<String> {
+    /// Working HUD content (issue #27), shared by the plain-text legacy
+    /// path (`live_status_line`) and the real styled render path
+    /// (`app::visual::push_visual_activity_block`). The interrupted/failed
+    /// cases are unstyled one-liners; the working case carries the spinner,
+    /// phase verb, and dim suffix as separate pieces so the real path can
+    /// color them independently (gold spinner, dim elapsed/hint).
+    fn working_hud_line(&self, width: u16) -> Option<HudLine> {
         if matches!(
             self.modal,
             Some(Modal::Permission(_) | Modal::PatchApproval(_))
@@ -2141,25 +2217,79 @@ impl AppCore {
         }
         let interrupt = super::glyphs::interrupt();
         if self.interrupted_guidance {
-            return Some(format!(
+            return Some(HudLine::Plain(format!(
                 "{interrupt} interrupted — tell euler what to do differently"
-            ));
+            )));
         }
         if self.in_flight_error.is_some() {
-            return Some(format!("{interrupt} turn failed — waiting for cleanup"));
+            return Some(HudLine::Plain(format!(
+                "{interrupt} turn failed — waiting for cleanup"
+            )));
         }
         let AppState::TurnInFlight { started_at, .. } = &self.state else {
             return None;
         };
         let secs = started_at.elapsed().as_secs();
+        let spinner = super::glyphs::glyph_set().spinner(self.spinner_frame);
         let label = self.in_flight_label.as_deref().unwrap_or("turn");
         if !self.is_in_flight_cancellable() {
-            return Some(format!("⠧ running {label} · {secs}s · not cancellable"));
+            return Some(HudLine::Working {
+                spinner,
+                verb: format!("running {label}"),
+                suffix: format!(" · {secs}s · not cancellable"),
+                reasoning_tail: Vec::new(),
+            });
         }
-        if label == "turn" {
-            return Some(format!("⠧ working · {secs}s · esc to interrupt"));
+        let verb = if label == "turn" {
+            self.current_phase_verb
+                .clone()
+                .unwrap_or_else(|| "working".to_owned())
+        } else {
+            format!("working {label}")
+        };
+        let reasoning_tail = if verb == "thinking" {
+            self.reasoning_tail_lines(width)
+        } else {
+            Vec::new()
+        };
+        Some(HudLine::Working {
+            spinner,
+            verb,
+            suffix: format!(" · {secs}s · esc to interrupt"),
+            reasoning_tail,
+        })
+    }
+
+    /// #47: wraps the bounded streaming-reasoning tail to `width`, keeping
+    /// only the last 3 wrapped lines — the live line shows a readable
+    /// preview, not the full reasoning transcript.
+    fn reasoning_tail_lines(&self, width: u16) -> Vec<String> {
+        const MAX_WRAPPED_LINES: usize = 3;
+        if self.reasoning_stream_tail.is_empty() {
+            return Vec::new();
         }
-        Some(format!("⠧ working {label} · {secs}s · esc to interrupt"))
+        let content_width = usize::from(width).saturating_sub(2).max(1);
+        let mut wrapped = crate::ui::text::wrap_text(&self.reasoning_stream_tail, content_width);
+        if wrapped.len() > MAX_WRAPPED_LINES {
+            wrapped = wrapped.split_off(wrapped.len() - MAX_WRAPPED_LINES);
+        }
+        wrapped
+    }
+
+    /// Plain-text flattening of `working_hud_line`, kept for the legacy
+    /// `#[cfg(test)]` Frame-based render scaffolding (render_tests_support_test.rs)
+    /// that predates the visual-canvas renderer and does not carry styled spans.
+    #[cfg(test)]
+    fn live_status_line(&self) -> Option<String> {
+        Some(match self.working_hud_line(80)? {
+            HudLine::Plain(text) => text,
+            HudLine::Working {
+                spinner,
+                verb,
+                suffix,
+                reasoning_tail: _,
+            } => format!("{spinner} {verb}{suffix}"),
+        })
     }
 
     fn working_elapsed_seconds(&self) -> Option<u64> {

@@ -13,12 +13,11 @@ use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
 use crate::ui::text::{
     blank_gutter, content_width, display_width, gutter_width, is_ledger_gutter, timestamp_gutter,
-    tree_gutter_pipe, wrap_text,
+    timestamp_gutter_shown, tree_gutter_pipe, wrap_text,
 };
 use crate::ui::theme::Theme;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TranscriptRenderLimits {
@@ -54,7 +53,7 @@ pub(super) fn render_projected_items(
     width: u16,
     limits: TranscriptRenderLimits,
 ) -> Vec<Line<'static>> {
-    render_projected_items_with_expansion(items, theme, width, limits, &HashSet::new())
+    render_projected_items_with_expansion(items, theme, width, limits, false)
 }
 
 pub(super) fn render_projected_items_with_expansion(
@@ -62,14 +61,14 @@ pub(super) fn render_projected_items_with_expansion(
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
-    expanded_artifact_keys: &HashSet<String>,
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     let entries: Vec<_> = items
         .iter()
         .cloned()
         .map(|item| ProjectedEntry { item, timing: None })
         .collect();
-    render_projected_entries_with_expansion(&entries, theme, width, limits, expanded_artifact_keys)
+    render_projected_entries_with_expansion(&entries, theme, width, limits, expanded)
 }
 
 #[cfg(test)]
@@ -79,7 +78,7 @@ pub(super) fn render_projected_entries(
     width: u16,
     limits: TranscriptRenderLimits,
 ) -> Vec<Line<'static>> {
-    render_projected_entries_with_expansion(entries, theme, width, limits, &HashSet::new())
+    render_projected_entries_with_expansion(entries, theme, width, limits, false)
 }
 
 pub(super) fn render_projected_entries_with_expansion(
@@ -87,14 +86,10 @@ pub(super) fn render_projected_entries_with_expansion(
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
-    expanded_artifact_keys: &HashSet<String>,
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     render_projected_entries_with_expansion_and_offsets(
-        entries,
-        theme,
-        width,
-        limits,
-        expanded_artifact_keys,
+        entries, theme, width, limits, expanded, true,
     )
     .0
 }
@@ -103,13 +98,23 @@ pub(super) fn render_projected_entries_with_expansion(
 /// cumulative end-row offset of each entry. Offsets let the terminal commit
 /// native scrollback at item boundaries so a width change can remap its
 /// committed prefix exactly (no lost rows, no duplicates).
+///
+/// `show_turn_footer` renders the trailing "elapsed since first event"
+/// footer when the last entry carries timing. That reads correctly for a
+/// single bounded batch (the CLI/test transcript widget); the visual
+/// canvas's incrementally growing whole-session history is never one batch,
+/// so it passes `false`.
+///
+/// `expanded` is the single global `ctrl+o` fold state (issue #49) — every
+/// foldable item in `entries` shares it; there is no per-item targeting.
 #[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
 pub(super) fn render_projected_entries_with_expansion_and_offsets(
     entries: &[ProjectedEntry],
     theme: &Theme,
     width: u16,
     limits: TranscriptRenderLimits,
-    expanded_artifact_keys: &HashSet<String>,
+    expanded: bool,
+    show_turn_footer: bool,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
     let mut item_end_offsets = Vec::with_capacity(entries.len());
@@ -117,18 +122,15 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
     for (index, entry) in entries.iter().enumerate() {
         let first_line = lines.len();
         let item = &entry.item;
-        let item_expanded = expanded_artifact_keys.contains(&super::artifact_key_for_index(index));
+        let item_expanded = expanded;
         let item_limits = if item_expanded {
             limits.expanded()
         } else {
             limits
         };
         match item {
-            TranscriptItem::Banner { session_id } => {
-                lines.extend(super::super::banner::styled_lines_with_session(
-                    theme,
-                    session_id.as_deref(),
-                ));
+            TranscriptItem::Banner { .. } => {
+                lines.extend(super::super::banner::styled_lines(theme));
             }
             TranscriptItem::TurnSeparator => {
                 lines.push(Line::from(Span::styled(
@@ -214,6 +216,16 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                         width,
                     );
                 }
+            }
+            TranscriptItem::ModelReasoningLive { elapsed } => {
+                push_wrapped(
+                    &mut lines,
+                    blank_gutter(),
+                    &format!("thinking · {elapsed}"),
+                    theme.transcript.reasoning,
+                    theme,
+                    width,
+                );
             }
             TranscriptItem::ToolCall { name } => {
                 push_wrapped(
@@ -576,6 +588,18 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     width,
                 );
             }
+            TranscriptItem::Notice(message) => {
+                // No glyph, no source prefix — a plain muted line anchored
+                // by the default `•` spine bullet (review v2 §14.4).
+                push_wrapped(
+                    &mut lines,
+                    blank_gutter(),
+                    message,
+                    theme.transcript.muted,
+                    theme,
+                    width,
+                );
+            }
         }
 
         if first_line < lines.len() && is_meaningful_ledger_item(item) {
@@ -583,13 +607,15 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             let anchor = spine_anchor(item, theme);
             stamp_first_line(&mut lines[first_line], &stamp, anchor.as_ref(), theme);
             if let Some(timing) = &entry.timing {
-                if !item_renders_inline_timing(item) {
+                if !item_renders_inline_timing(item) && timestamp_gutter_shown() {
                     append_timing(&mut lines[first_line], timing, theme, width);
                 }
             }
         } else if let Some(timing) = &entry.timing {
-            if let Some(line) = lines.get_mut(first_line) {
-                append_timing(line, timing, theme, width);
+            if timestamp_gutter_shown() {
+                if let Some(line) = lines.get_mut(first_line) {
+                    append_timing(line, timing, theme, width);
+                }
             }
         }
         // §1: separation is the spine plus one blank line — applied after
@@ -598,14 +624,27 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
         // the single owner of vertical rhythm; no other layer adds spacers
         // around history content.
         // Banner lines end with their own built-in blank; everything else
-        // gets the uniform one-blank separator here.
-        if first_line < lines.len() && !matches!(item, TranscriptItem::Banner { .. }) {
+        // gets the uniform one-blank separator here. Exception (review v2
+        // §3/§6): a run of consecutive `Notice` items stacks directly — no
+        // blank line between one notice and the next.
+        let next_is_notice_continuation = matches!(item, TranscriptItem::Notice(_))
+            && matches!(
+                entries.get(index + 1).map(|entry| &entry.item),
+                Some(TranscriptItem::Notice(_))
+            );
+        if first_line < lines.len()
+            && !matches!(item, TranscriptItem::Banner { .. })
+            && !next_is_notice_continuation
+        {
             lines.push(Line::default());
         }
         item_end_offsets.push(lines.len());
     }
 
-    if let Some(footer) = super::turn_footer(entries) {
+    if let Some(footer) = show_turn_footer
+        .then(|| super::turn_footer(entries))
+        .flatten()
+    {
         push_wrapped(
             &mut lines,
             blank_gutter(),
@@ -624,16 +663,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
 }
 
 fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {
-    // Live control chrome (permission ask panel, turn separators, worked
-    // banners) is not a ledger event: no timestamp stamp, no hairline.
-    !matches!(
-        item,
-        TranscriptItem::Banner { .. }
-            | TranscriptItem::TurnSeparator
-            | TranscriptItem::WorkedDuration(_)
-            | TranscriptItem::TurnRecap { .. }
-            | TranscriptItem::PermissionAsk { .. }
-    )
+    super::item_wants_timestamp(item)
 }
 
 fn item_renders_inline_timing(item: &TranscriptItem) -> bool {
@@ -645,8 +675,10 @@ fn item_renders_inline_timing(item: &TranscriptItem) -> bool {
 
 fn tool_group_header(label: &str, steps: usize, timing: Option<&EventTiming>) -> String {
     let mut parts = vec![label.to_owned(), step_count_label(steps)];
-    if let Some(elapsed) = timing.and_then(|timing| timing.since_previous.as_deref()) {
-        parts.push(elapsed.to_owned());
+    if timestamp_gutter_shown() {
+        if let Some(elapsed) = timing.and_then(|timing| timing.since_previous.as_deref()) {
+            parts.push(elapsed.to_owned());
+        }
     }
     parts.join(" · ")
 }
@@ -707,7 +739,7 @@ fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)>
         | TranscriptItem::TurnSeparator
         | TranscriptItem::WorkedDuration(_)
         | TranscriptItem::TurnRecap { .. } => return None,
-        TranscriptItem::ModelReasoning { .. } => {
+        TranscriptItem::ModelReasoning { .. } | TranscriptItem::ModelReasoningLive { .. } => {
             (glyphs::thinking().to_owned(), theme.transcript.warning)
         }
         TranscriptItem::PermissionDecision { allowed, .. } => {
@@ -1038,12 +1070,16 @@ mod tests {
             }),
         }];
 
-        let lines = render_projected_entries(
-            &entries,
-            &Theme::default(),
-            80,
-            TranscriptRenderLimits::default(),
-        );
+        // Exploration step-elapsed is a timing decoration, toggle-gated in
+        // the real app (review v2 §6); opt in here to exercise it directly.
+        let lines = crate::ui::text::with_timestamp_gutter(true, || {
+            render_projected_entries(
+                &entries,
+                &Theme::default(),
+                80,
+                TranscriptRenderLimits::default(),
+            )
+        });
         let text = plain_text(&lines);
 
         assert!(text.contains("explore · 2 steps · 6s"), "text: {text:?}");

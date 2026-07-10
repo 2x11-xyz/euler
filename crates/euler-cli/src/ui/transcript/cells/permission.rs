@@ -70,20 +70,23 @@ enum PermissionPanelRowStyle {
     Metadata,
     Body,
     Selected,
-    Hint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PermissionPanelRow {
     text: String,
     style: PermissionPanelRowStyle,
+    /// Faint text placed in the title row's right corner (capability · cwd),
+    /// replacing the old "Approval required · " label row (review v2 §7).
+    corner: Option<String>,
 }
 
 impl PermissionPanelRow {
-    fn title(text: impl Into<String>) -> Self {
+    fn title_with_corner(text: impl Into<String>, corner: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             style: PermissionPanelRowStyle::Title,
+            corner: Some(corner.into()),
         }
     }
 
@@ -91,6 +94,7 @@ impl PermissionPanelRow {
         Self {
             text: text.into(),
             style: PermissionPanelRowStyle::Metadata,
+            corner: None,
         }
     }
 
@@ -98,6 +102,7 @@ impl PermissionPanelRow {
         Self {
             text: text.into(),
             style: PermissionPanelRowStyle::Body,
+            corner: None,
         }
     }
 
@@ -105,13 +110,7 @@ impl PermissionPanelRow {
         Self {
             text: text.into(),
             style: PermissionPanelRowStyle::Selected,
-        }
-    }
-
-    fn hint(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            style: PermissionPanelRowStyle::Hint,
+            corner: None,
         }
     }
 }
@@ -122,10 +121,11 @@ pub(in crate::ui::transcript) fn render_permission_ask(
     theme: &Theme,
     width: u16,
 ) {
+    // v2.1 (§7b): bare `$ command`, no "command:" label.
     let preview = ask
         .command
         .filter(|command| !command.is_empty())
-        .map(|command| format!("command: $ {command}"))
+        .map(|command| format!("$ {command}"))
         .unwrap_or_else(|| format!("request: {}", ask.reason));
     let title = match ask.companion_name.filter(|name| !name.is_empty()) {
         Some(name) => format!(
@@ -136,19 +136,18 @@ pub(in crate::ui::transcript) fn render_permission_ask(
         None => crate::ui::patch_approval::approval_title(ask.capability).to_owned(),
     };
     let mut rows = vec![
-        PermissionPanelRow::title(title),
-        PermissionPanelRow::metadata(format!(
-            "Approval required · {} · cwd {}",
-            ask.capability,
-            current_cwd_label()
-        )),
+        PermissionPanelRow::title_with_corner(
+            title,
+            format!("{} · cwd {}", ask.capability, current_cwd_label()),
+        ),
         PermissionPanelRow::body(preview),
-        PermissionPanelRow::metadata(consequences_row(
-            ask.capability,
-            ask.scope_prefix,
-            ask.prior_count,
-        )),
     ];
+    if let Some(consequences) = consequences_row(ask.capability, ask.scope_prefix, ask.prior_count)
+    {
+        rows.push(PermissionPanelRow::metadata(consequences));
+    }
+    // v2.1 (§7b): a blank line separates the command block from the options.
+    rows.push(PermissionPanelRow::body(String::new()));
     rows.extend(
         crate::ui::patch_approval::approval_option_lines(
             ask.capability,
@@ -159,8 +158,6 @@ pub(in crate::ui::transcript) fn render_permission_ask(
         .map(|line| {
             if line.selected {
                 PermissionPanelRow::selected(line.text)
-            } else if line.hint {
-                PermissionPanelRow::hint(line.text)
             } else {
                 PermissionPanelRow::body(line.text)
             }
@@ -182,6 +179,15 @@ fn push_bordered_permission_panel(
         theme.transcript.permission,
     )));
     for row in rows {
+        if let Some(corner) = &row.corner {
+            lines.push(bordered_title_corner_line(
+                &row.text,
+                corner,
+                inner_width,
+                theme,
+            ));
+            continue;
+        }
         for segment in wrap_text(&row.text, inner_width) {
             push_permission_panel_row(lines, &segment, inner_width, row.style, theme);
         }
@@ -190,6 +196,42 @@ fn push_bordered_permission_panel(
         format!("╰{}╯", "─".repeat(panel_width.saturating_sub(2))),
         theme.transcript.permission,
     )));
+}
+
+/// Title row with capability · cwd faint in the right corner (review v2 §7):
+/// replaces the old "Approval required · " label row. Degrades gracefully —
+/// the corner is dropped first, then truncated, when the panel is too
+/// narrow to hold both.
+fn bordered_title_corner_line(
+    title: &str,
+    corner: &str,
+    inner_width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let title_width = display_width(title);
+    let gap = 2usize;
+    let corner_budget = inner_width.saturating_sub(title_width + gap);
+    let corner_text = if corner_budget == 0 {
+        String::new()
+    } else if display_width(corner) <= corner_budget {
+        corner.to_owned()
+    } else {
+        crate::ui::text::truncate_display(corner, corner_budget)
+    };
+    let used = title_width + display_width(&corner_text) + usize::from(!corner_text.is_empty());
+    let padding = inner_width.saturating_sub(used);
+    let title_style = permission_panel_row_style(PermissionPanelRowStyle::Title, theme);
+    let mut spans = vec![
+        Span::styled("│ ", theme.transcript.permission),
+        Span::styled(title.to_owned(), title_style),
+        Span::styled(" ".repeat(padding), title_style),
+    ];
+    if !corner_text.is_empty() {
+        spans.push(Span::styled(" ", title_style));
+        spans.push(Span::styled(corner_text, theme.transcript.muted));
+    }
+    spans.push(Span::styled(" │", theme.transcript.permission));
+    Line::from(spans)
 }
 
 fn push_permission_panel_row(
@@ -215,9 +257,12 @@ fn permission_panel_row_style(
 ) -> ratatui::style::Style {
     match style {
         PermissionPanelRowStyle::Title => theme.transcript.permission,
-        PermissionPanelRowStyle::Metadata | PermissionPanelRowStyle::Hint => theme.transcript.muted,
+        PermissionPanelRowStyle::Metadata => theme.transcript.muted,
         PermissionPanelRowStyle::Body => theme.transcript.body,
-        PermissionPanelRowStyle::Selected => theme.surfaces.transcript.selection,
+        // v2.1 (§7b): select-bg + gold text for the selected option.
+        PermissionPanelRowStyle::Selected => ratatui::style::Style::default()
+            .fg(theme.palette.warning)
+            .bg(theme.palette.selection),
     }
 }
 
@@ -248,20 +293,28 @@ fn compact_cwd_label(path: &str) -> String {
     format!("…{tail}")
 }
 
-fn consequences_row(capability: &str, scope_prefix: Option<&str>, prior_count: usize) -> String {
-    let write_scope = if capability == "fs-write" {
-        scope_prefix
-            .filter(|prefix| !prefix.trim().is_empty())
-            .unwrap_or("unknown")
-    } else {
-        "unknown"
-    };
-    let network = if capability == "network" {
-        "requested"
-    } else {
-        "unknown"
-    };
-    format!(
-        "consequences: write scope {write_scope} · network {network} · duration unknown · ran-before {prior_count}×"
-    )
+/// Only known fields render (review v2 §7b): omit the row entirely while
+/// every field is unknown, rather than pad it with "network unknown ·
+/// duration unknown" filler.
+fn consequences_row(
+    capability: &str,
+    scope_prefix: Option<&str>,
+    prior_count: usize,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if capability == "fs-write" {
+        if let Some(scope) = scope_prefix.filter(|prefix| !prefix.trim().is_empty()) {
+            parts.push(format!("write scope {scope}"));
+        }
+    }
+    if capability == "network" {
+        parts.push("network requested".to_owned());
+    }
+    if prior_count > 0 {
+        parts.push(format!("ran-before {prior_count}×"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("consequences: {}", parts.join(" · ")))
 }

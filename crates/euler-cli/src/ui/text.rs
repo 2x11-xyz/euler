@@ -203,6 +203,36 @@ pub(crate) fn truncate_display(text: &str, max_width: usize) -> String {
     output
 }
 
+/// Truncate from the left, keeping the tail and prefixing an ellipsis —
+/// footer §4: the directory truncates as `…/2x11/euler`, not `/tmp/2x1…`.
+/// Char-boundary safe (multibyte glyphs never get split).
+pub(crate) fn truncate_display_left(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    const ELLIPSIS: char = '…';
+    if max_width == 1 {
+        return ELLIPSIS.to_string();
+    }
+    let budget = max_width - 1;
+    let mut collected: Vec<char> = Vec::new();
+    let mut width = 0;
+    for ch in text.chars().rev() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + char_width > budget {
+            break;
+        }
+        collected.push(ch);
+        width += char_width;
+    }
+    collected.reverse();
+    let tail: String = collected.into_iter().collect();
+    format!("{ELLIPSIS}{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +258,25 @@ mod tests {
     #[test]
     fn truncate_display_respects_unicode_width_boundaries() {
         assert_eq!(truncate_display("ab\u{754c}cd", 4), "ab\u{754c}");
+    }
+
+    #[test]
+    fn truncate_display_left_keeps_tail_and_prefixes_ellipsis() {
+        assert_eq!(truncate_display_left("/2x11/euler", 7), "…/euler");
+        assert_eq!(truncate_display_left("short", 20), "short");
+        assert_eq!(truncate_display_left("short", 0), "");
+        assert_eq!(truncate_display_left("short", 1), "…");
+    }
+
+    #[test]
+    fn truncate_display_left_is_multibyte_safe_at_the_boundary() {
+        // Each CJK glyph is 2 display cells wide; the cut must land between
+        // whole characters, never inside one.
+        let text = "/repo/\u{754c}\u{754c}\u{754c}";
+        let truncated = truncate_display_left(text, 5);
+        assert!(truncated.chars().all(|ch| ch != '\u{fffd}'));
+        assert!(display_width(&truncated) <= 5);
+        assert!(truncated.starts_with('…'));
     }
 
     // v2 (§0/§1): timestamps are opt-in; the 2-cell anchor spine is the

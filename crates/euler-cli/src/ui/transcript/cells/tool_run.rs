@@ -32,7 +32,14 @@ pub(in crate::ui::transcript) fn render_tool_run(
     } else {
         theme.transcript.tool_error
     };
-    let output = if run.ok {
+    // `limit == usize::MAX` is how an explicitly-expanded (ctrl+o) cell is
+    // signaled by the renderer; anything else is a collapsed cell (review v2
+    // §14.2) and gets exactly one `└ ` result line instead of a raw output
+    // preview that can read as if the exit status leaked into the body.
+    let collapsed = limit != usize::MAX;
+    let output = if collapsed {
+        collapsed_tool_run_rows(run.output, run.ok, limit)
+    } else if run.ok {
         tool_run_output_rows(run.output, limit)
     } else {
         informative_output_rows(run.output, limit)
@@ -130,6 +137,62 @@ fn tool_run_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
     } else {
         artifact_output_rows(detail, limit)
     }
+}
+
+/// Collapsed-cell preview: exactly one `└ ` result line carrying the most
+/// informative output line (falling back to the first non-empty output
+/// line), with any remaining preview rows indented two extra spaces
+/// underneath it (review v2 §14.2, spec §0/§1).
+fn collapsed_tool_run_rows(detail: &str, ok: bool, limit: usize) -> ArtifactOutputRows {
+    let detail = strip_leading_exit_code_row(detail);
+    let base = if ok {
+        tool_run_output_rows(&detail, limit)
+    } else {
+        informative_output_rows(&detail, limit)
+    };
+    if base.total_rows == 0 {
+        return base;
+    }
+
+    let mut rows = base.rows;
+    let result_line = most_informative_line(&detail)
+        .map(str::to_owned)
+        .or_else(|| rows.iter().find(|row| !row.trim().is_empty()).cloned())
+        .unwrap_or_default();
+    if let Some(pos) = rows.iter().position(|row| *row == result_line) {
+        rows.remove(pos);
+    }
+
+    let mut preview = Vec::with_capacity(rows.len() + 1);
+    preview.push(format!("└ {result_line}"));
+    preview.extend(rows.into_iter().map(|row| format!("  {row}")));
+
+    ArtifactOutputRows {
+        rows: preview,
+        total_rows: base.total_rows,
+        folded: base.folded,
+    }
+}
+
+/// Shell output sometimes carries a literal leading "exit N" row ahead of
+/// the real output; the header already owns the exit status, so drop that
+/// row rather than let it masquerade as the first line of output.
+fn strip_leading_exit_code_row(detail: &str) -> std::borrow::Cow<'_, str> {
+    let mut lines = detail.splitn(2, '\n');
+    let Some(first) = lines.next() else {
+        return std::borrow::Cow::Borrowed(detail);
+    };
+    if is_leading_exit_code_row(first) {
+        std::borrow::Cow::Borrowed(lines.next().unwrap_or(""))
+    } else {
+        std::borrow::Cow::Borrowed(detail)
+    }
+}
+
+fn is_leading_exit_code_row(line: &str) -> bool {
+    line.trim()
+        .strip_prefix("exit ")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn informative_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {

@@ -422,6 +422,9 @@ pub enum CommandEffect {
     Action(CommandAction),
     OpenPicker(PickerSpec),
     Message(String),
+    /// Muted, non-error informational line (review v2 §14.4) — e.g. the
+    /// disabled-extension teach message. Never styled red, never prefixed.
+    Notice(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -811,7 +814,7 @@ fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffe
         .find(|item| item.id == "code-swarm")
         .is_some_and(|item| item.enabled);
     if !enabled {
-        return CommandEffect::Message(disabled_extension_teach("/code-swarm", "code-swarm"));
+        return CommandEffect::Notice(disabled_extension_teach("/code-swarm", "code-swarm"));
     }
     let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
         return CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
@@ -879,7 +882,7 @@ fn extension_slash_or_unknown(
         .find(|cmd| cmd.token == token)
     {
         if !cmd.enabled {
-            return CommandEffect::Message(disabled_extension_teach(&cmd.token, &cmd.extension_id));
+            return CommandEffect::Notice(disabled_extension_teach(&cmd.token, &cmd.extension_id));
         }
         // Arguments are never dropped: JSON parses here, `--flag` text is
         // parsed against the ArgSpec at resolve time, anything else is a
@@ -973,7 +976,7 @@ fn extension_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffec
     };
     if let Some(item) = context.extension_items.iter().find(|item| item.id == id) {
         if !item.enabled {
-            return CommandEffect::Message(disabled_extension_teach(
+            return CommandEffect::Notice(disabled_extension_teach(
                 &format!("/{id}.{command}"),
                 &id,
             ));
@@ -1479,7 +1482,7 @@ mod tests {
         let context = code_swarm_context(false);
         assert_eq!(
             dispatch_command("/code-swarm", &context),
-            CommandEffect::Message(disabled_extension_teach("/code-swarm", "code-swarm"))
+            CommandEffect::Notice(disabled_extension_teach("/code-swarm", "code-swarm"))
         );
 
         let cmds = build_extension_slash_commands(&context.extension_items);
@@ -1563,7 +1566,33 @@ mod tests {
         };
         assert_eq!(
             dispatch_command("/catch-up", &context),
-            CommandEffect::Message(disabled_extension_teach("/catch-up", "causal-dag"))
+            CommandEffect::Notice(disabled_extension_teach("/catch-up", "causal-dag"))
+        );
+    }
+
+    #[test]
+    fn disabled_extension_run_form_teaches_instead_of_running() {
+        // Third entrance (review v2 §14.4): `/extension run <ext>.<cmd>`.
+        let context = CommandContext {
+            extension_items: vec![ExtensionManagerItem {
+                id: "causal-dag".to_owned(),
+                display_name: "Causal DAG".to_owned(),
+                enabled: false,
+                bundled: true,
+                materialization: None,
+                version: "0.1.0".to_owned(),
+                commands: vec!["catch-up".to_owned()],
+                capabilities: vec![],
+                audit_status: None,
+            }],
+            ..CommandContext::default()
+        };
+        assert_eq!(
+            dispatch_command("/extension run causal-dag.catch-up", &context),
+            CommandEffect::Notice(disabled_extension_teach(
+                "/causal-dag.catch-up",
+                "causal-dag"
+            ))
         );
     }
 

@@ -1,5 +1,11 @@
 use super::*;
 
+/// Spec v2.1 §5/5b: 8 visible rows inside the rail-bounded composer
+/// container (raised from a prior 4 so the palette reads as a real menu,
+/// not a peek).
+const PALETTE_VISIBLE_ROWS: usize = 8;
+const PALETTE_LOOKBEHIND: usize = 3;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandPalette {
     input: String,
@@ -50,6 +56,12 @@ impl CommandPalette {
         self.matches().get(self.selected).cloned()
     }
 
+    /// Issue #23: backspacing over the leading `/` with nothing else typed
+    /// exits the palette (the caller checks this before calling `backspace`).
+    pub(super) fn is_query_empty(&self) -> bool {
+        self.input == "/"
+    }
+
     pub fn render_lines(&self, width: u16) -> Vec<String> {
         let mut lines = vec![truncate_display(
             &format!("{PALETTE_QUERY_PREFIX}{}", self.input),
@@ -57,10 +69,15 @@ impl CommandPalette {
         )];
         let matches = self.matches();
         let match_count = matches.len();
-        let start = self.selected.saturating_sub(3);
+        let start = self.selected.saturating_sub(PALETTE_LOOKBEHIND);
         let unfiltered = palette_filter_needle(&self.input).is_empty();
         let mut shown_extensions_header = false;
-        for (index, entry) in matches.into_iter().enumerate().skip(start).take(4) {
+        for (index, entry) in matches
+            .into_iter()
+            .enumerate()
+            .skip(start)
+            .take(PALETTE_VISIBLE_ROWS)
+        {
             if unfiltered && entry.is_extension() && !shown_extensions_header {
                 // EXTENSIONS group header (not selectable; does not count as a match row).
                 lines.push(truncate_display("EXTENSIONS", usize::from(width)));
@@ -76,6 +93,68 @@ impl CommandPalette {
             usize::from(width),
         ));
         lines
+    }
+
+    /// Themed render (issue #23): full-width select-bar + gold text on the
+    /// selected row, typed `/` (and the rest of the query) in green
+    /// throughout — both colors route through `Theme`, never a literal hex.
+    pub fn render_canvas_lines(&self, theme: &Theme, width: u16) -> Vec<CanvasLine> {
+        let mut lines = vec![self.query_canvas_line(theme, width)];
+        let matches = self.matches();
+        let match_count = matches.len();
+        let start = self.selected.saturating_sub(PALETTE_LOOKBEHIND);
+        let unfiltered = palette_filter_needle(&self.input).is_empty();
+        let mut shown_extensions_header = false;
+        for (index, entry) in matches
+            .into_iter()
+            .enumerate()
+            .skip(start)
+            .take(PALETTE_VISIBLE_ROWS)
+        {
+            if unfiltered && entry.is_extension() && !shown_extensions_header {
+                lines.push(CanvasLine::plain_lossy(truncate_display(
+                    "EXTENSIONS",
+                    usize::from(width),
+                )));
+                shown_extensions_header = true;
+            }
+            let selected = index == self.selected;
+            let text = palette_entry_line(selected, &entry, width);
+            lines.push(if selected {
+                select_bar_canvas_line(&text, width, theme)
+            } else {
+                CanvasLine::plain_lossy(text)
+            });
+        }
+        lines.push(CanvasLine::plain_lossy(truncate_display(
+            &format!(
+                "({}/{match_count})  Enter select  Tab complete  Esc close",
+                self.selected.saturating_add(1).min(match_count)
+            ),
+            usize::from(width),
+        )));
+        lines
+    }
+
+    fn query_canvas_line(&self, theme: &Theme, width: u16) -> CanvasLine {
+        let width = usize::from(width);
+        let prefix_width = display_width(PALETTE_QUERY_PREFIX);
+        let input_budget = width.saturating_sub(prefix_width);
+        let input_text = truncate_display(&self.input, input_budget);
+        CanvasLine::from_spans(vec![
+            CanvasSpan::styled_lossy(
+                PALETTE_QUERY_PREFIX.to_owned(),
+                TextRole::Plain,
+                Style::default(),
+            ),
+            // The typed "/" and query text stay green (the user/success
+            // role) throughout, independent of row selection below.
+            CanvasSpan::styled_lossy(
+                input_text,
+                TextRole::Plain,
+                Style::default().fg(theme.palette.added),
+            ),
+        ])
     }
 
     pub(super) fn cursor_target(&self, width: u16) -> (u16, u16) {
@@ -176,17 +255,17 @@ impl CommandPalette {
     pub(super) fn line_count(&self) -> u16 {
         let matches = self.matches();
         let match_count = matches.len();
-        let start = self.selected.saturating_sub(3);
+        let start = self.selected.saturating_sub(PALETTE_LOOKBEHIND);
         let unfiltered = palette_filter_needle(&self.input).is_empty();
         let header = usize::from(
             unfiltered
                 && matches
                     .iter()
                     .skip(start)
-                    .take(4)
+                    .take(PALETTE_VISIBLE_ROWS)
                     .any(PaletteEntry::is_extension),
         );
-        let rows = 2 + match_count.saturating_sub(start).min(4) + header;
+        let rows = 2 + match_count.saturating_sub(start).min(PALETTE_VISIBLE_ROWS) + header;
         u16::try_from(rows).unwrap_or(u16::MAX)
     }
 }

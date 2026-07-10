@@ -1,6 +1,11 @@
 use std::ffi::{OsStr, OsString};
 
-const UNICODE_SPINNER: &[&str] = &["\u{2827}"];
+// Issue #27: animated braille spinner (10 frames, cycled at 80-100ms by the
+// caller) — previously a single frozen glyph.
+const UNICODE_SPINNER: &[&str] = &[
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
 const ASCII_SPINNER: &[&str] = &["-", "\\", "|", "/"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,7 +310,18 @@ mod tests {
         assert_eq!(glyphs.user_rail(), "▌");
         assert_eq!(glyphs.user_rail_prefix(), "▌ ");
         assert_eq!(glyphs.thinking(), "✱");
-        assert_eq!(glyphs.spinner(0), "⠧");
+        // Issue #27: 10-frame animated braille spinner (never frozen).
+        assert_eq!(glyphs.spinner(0), "⠋");
+        assert_eq!(glyphs.spinner(1), "⠙");
+        assert_eq!(glyphs.spinner(2), "⠹");
+        assert_eq!(glyphs.spinner(3), "⠸");
+        assert_eq!(glyphs.spinner(4), "⠼");
+        assert_eq!(glyphs.spinner(5), "⠴");
+        assert_eq!(glyphs.spinner(6), "⠦");
+        assert_eq!(glyphs.spinner(7), "⠧");
+        assert_eq!(glyphs.spinner(8), "⠇");
+        assert_eq!(glyphs.spinner(9), "⠏");
+        assert_eq!(glyphs.spinner(10), "⠋", "frame index wraps around");
         assert_eq!(glyphs.check(), "✓");
         assert_eq!(glyphs.cross(), "✗");
         assert_eq!(glyphs.interrupt(), "■");

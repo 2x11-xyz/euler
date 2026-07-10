@@ -28,16 +28,17 @@ fn permission_prompt_renders_inline_with_command_body() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("Run command?"));
-    assert!(contents.contains("Approval required"));
+    assert!(!contents.contains("Approval required"));
     assert!(contents.contains("shell-exec · cwd"));
     assert!(contents.contains("$ cargo test"));
+    assert!(!contents.contains("command: $"));
     assert!(contents.contains("y  Allow once"));
-    assert!(contents.contains("Allow once (default selection)"));
+    assert!(!contents.contains("(default selection)"));
     assert!(contents.contains("a  Allow shell-exec for this session"));
     assert!(contents.contains("p  Allow shell-exec in this project"));
     assert!(contents.contains("n/esc  Deny"));
     assert!(contents.contains("Deny with instructions"));
-    assert!(contents.contains("hint: every decision is logged"));
+    assert!(!contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
     assert!(contents.contains("▌"));
     assert!(contents.contains("echo · ctx ?%"));
@@ -46,7 +47,7 @@ fn permission_prompt_renders_inline_with_command_body() {
 
     let rows = terminal.backend().screen_rows();
     assert!(
-        rows[row_containing(&rows, "Approval required")].starts_with("│ "),
+        rows[row_containing(&rows, "Run command?")].starts_with("│ "),
         "permission question should use bordered approval panel: {rows:?}"
     );
     assert!(
@@ -87,7 +88,7 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("Run command?"));
-    assert!(contents.contains("Approval required"));
+    assert!(!contents.contains("Approval required"));
     assert!(contents.contains("$ cargo test"));
 
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
@@ -101,7 +102,7 @@ fn permission_prompt_uses_newest_run_shell_despite_later_non_shell_call() {
     assert!(contents.contains("Edit file?"));
     assert!(contents.contains("fs-write · cwd"));
     assert!(!contents.contains("$ cargo test"));
-    assert!(contents.contains("Approval required"));
+    assert!(!contents.contains("Approval required"));
 }
 
 #[test]
@@ -115,7 +116,7 @@ fn non_patch_permission_uses_generic_inline_ask() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("Run command?"));
-    assert!(contents.contains("Approval required"));
+    assert!(!contents.contains("Approval required"));
     assert!(contents.contains("a  Allow shell-exec for this session"));
     assert!(contents.contains("p  Allow shell-exec in this project"));
     assert!(!contents.contains("Patch approval required"));
@@ -138,7 +139,49 @@ fn permission_panel_consequences_use_available_write_scope() {
         contents.contains("write scope src"),
         "contents: {contents:?}"
     );
-    assert!(contents.contains("ran-before 0×"), "contents: {contents:?}");
+    // v2.1 (§7b): unknown/zero fields are omitted, not padded with "ran-before 0×".
+    assert!(!contents.contains("ran-before"), "contents: {contents:?}");
+}
+
+#[test]
+fn inline_permission_ask_has_blank_line_before_options_and_gold_selection() {
+    let mut core = core();
+    core.modal = Some(Modal::Permission(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    )));
+
+    let lines = core.visual_canvas_frame(80).active_frame_lines;
+    let plain = lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let options_row = plain
+        .iter()
+        .position(|line| line.contains("y  Allow once"))
+        .expect("options row present");
+    assert!(
+        plain[options_row - 1].trim_matches(['│', ' ']).is_empty(),
+        "a blank line should separate the command block from the options: {plain:?}"
+    );
+
+    let selected_style = lines[options_row]
+        .spans
+        .iter()
+        .find(|span| span.text.as_str().contains("Allow once"))
+        .expect("selected span")
+        .style;
+    assert_eq!(
+        selected_style.fg,
+        Some(core.theme.palette.warning),
+        "the default-selected option should use gold text"
+    );
+    assert_eq!(
+        selected_style.bg,
+        Some(core.theme.palette.selection),
+        "the default-selected option should use the select-bg token"
+    );
 }
 
 #[test]
@@ -158,11 +201,11 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
     let two = row_containing(&rows, "a  Allow shell-exec");
     let three = row_containing(&rows, "p  Allow shell-exec");
     let four = row_containing(&rows, "n/esc  Deny");
-    let hint = row_containing(&rows, "hint: every decision is logged");
+    let border = row_containing(&rows, "╰");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
     assert!(one < two && two < three && three < four, "rows: {rows:?}");
-    assert!(four < hint && hint < prompt, "rows: {rows:?}");
+    assert!(four < border && border < prompt, "rows: {rows:?}");
     assert_eq!(
         status,
         prompt + 1,
@@ -195,11 +238,11 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
 
     let rows = terminal.backend().screen_rows();
     let three = row_containing(&rows, "n/esc  Deny");
-    let hint = row_containing(&rows, "hint: every decision is logged");
+    let border = row_containing(&rows, "╰");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
     assert_eq!(terminal.viewport_area().height, 9);
-    assert!(three < hint && hint < prompt, "rows: {rows:?}");
+    assert!(three < border && border < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
     assert!(
         !rows.iter().any(|row| row.contains("lower priority notice")),
@@ -269,7 +312,7 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("Run command?"));
-    assert!(contents.contains("Approval required"));
+    assert!(!contents.contains("Approval required"));
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
     assert_eq!(
@@ -283,7 +326,7 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
     terminal.draw(|frame| core.render(frame)).expect("redraw");
 
     let restored = terminal.backend().screen_contents();
-    assert!(!restored.contains("Approval required"));
+    assert!(!restored.contains("Run command?"));
     assert!(restored.contains("underlying transcript"));
     assert!(restored.contains("echo · ctx ?%"));
     assert!(!restored.contains("Context ?% used"));

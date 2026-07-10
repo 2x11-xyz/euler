@@ -35,7 +35,7 @@ impl AppCore {
             }
         };
         if !enabled {
-            return self.notice_item(crate::ui::commands::disabled_extension_teach(
+            return self.teach_notice(crate::ui::commands::disabled_extension_teach(
                 "/dag",
                 "causal-dag",
             ));
@@ -62,8 +62,7 @@ impl AppCore {
                 }
                 self.rebuild_bottom_surface();
                 let verb = if enable { "enabled" } else { "disabled" };
-                // Decision-record line in the ledger.
-                self.push_notice_item(format!("✓ extension {verb}: {id}"));
+                self.teach_notice(format!("extension {verb}: {id}"));
                 self.bottom.open_extension_manager();
                 CoreEffect::Render
             }
@@ -86,7 +85,7 @@ impl AppCore {
                     session.set_extension_enabled(&id, false);
                 }
                 self.rebuild_bottom_surface();
-                self.push_notice_item(format!("✓ extension removed: {id} · {message}"));
+                self.teach_notice(format!("extension removed: {id} · {message}"));
                 CoreEffect::Render
             }
             Err(error) => self.notice_item(format!("extension remove failed: {error}")),
@@ -100,11 +99,11 @@ impl AppCore {
                     session.set_extension_enabled(&report.id, true);
                 }
                 self.rebuild_bottom_surface();
-                self.push_notice_item(format!(
-                    "✓ extension installed · {} · enabled for session",
+                self.teach_notice(format!(
+                    "extension installed · {} · enabled for session",
                     report.id
                 ));
-                self.summary_item(report.steps_text());
+                self.teach_notice(report.steps_text());
                 CoreEffect::Render
             }
             Err(error) => self.notice_item(format!("extension add failed: {error}")),

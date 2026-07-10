@@ -112,7 +112,18 @@ impl AppCore {
             return;
         }
         if let Some(Modal::PatchApproval(modal)) = &self.modal {
-            chrome::render_patch_modal(frame, modal, &self.theme);
+            let prior_count = self.prior_permission_count(
+                &modal.request,
+                crate::ui::patch_approval::derive_scope_prefix(&modal.request).as_deref(),
+            );
+            chrome::render_patch_modal(
+                frame,
+                modal,
+                &self.status.cwd,
+                &self.theme,
+                prior_count,
+                self.approval_selection,
+            );
         }
     }
 

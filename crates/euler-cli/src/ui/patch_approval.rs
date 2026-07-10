@@ -6,8 +6,6 @@ use euler_core::permissions::PermissionRequest;
 use euler_core::{parse_single_file_apply_patch, ApplyPatchDocument};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::Capability;
-#[cfg(test)]
-use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::{layout::Rect, style::Style};
 use std::path::Path;
@@ -34,7 +32,6 @@ pub(crate) enum PatchPreview {
 pub(crate) struct ApprovalOptionLine {
     pub(crate) text: String,
     pub(crate) selected: bool,
-    pub(crate) hint: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -72,20 +69,23 @@ enum PanelRowStyle {
     Metadata,
     Body,
     Selected,
-    Hint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PanelRow {
     text: String,
     style: PanelRowStyle,
+    /// Faint text placed in the title row's right corner (capability · cwd),
+    /// replacing the old "Approval required · " label row (review v2 §7).
+    corner: Option<String>,
 }
 
 impl PanelRow {
-    fn title(text: impl Into<String>) -> Self {
+    fn title_with_corner(text: impl Into<String>, corner: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             style: PanelRowStyle::Title,
+            corner: Some(corner.into()),
         }
     }
 
@@ -93,6 +93,7 @@ impl PanelRow {
         Self {
             text: text.into(),
             style: PanelRowStyle::Metadata,
+            corner: None,
         }
     }
 
@@ -100,6 +101,7 @@ impl PanelRow {
         Self {
             text: text.into(),
             style: PanelRowStyle::Body,
+            corner: None,
         }
     }
 
@@ -107,23 +109,9 @@ impl PanelRow {
         Self {
             text: text.into(),
             style: PanelRowStyle::Selected,
+            corner: None,
         }
     }
-
-    fn hint(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            style: PanelRowStyle::Hint,
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) struct PatchModalAreas {
-    pub(crate) header: Rect,
-    pub(crate) diff: Rect,
-    pub(crate) prompt: Rect,
 }
 
 pub(crate) fn is_patch_permission(request: &PermissionRequest) -> bool {
@@ -154,38 +142,6 @@ pub(crate) fn modal_area(area: Rect) -> Rect {
     centered_rect(area, width, height)
 }
 
-#[cfg(test)]
-pub(crate) fn modal_chunks(area: Rect) -> PatchModalAreas {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(5),
-        ])
-        .split(area);
-    PatchModalAreas {
-        header: chunks[0],
-        diff: chunks[1],
-        prompt: chunks[2],
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn header_text(request: &PermissionRequest) -> String {
-    header_text_with_cwd(request, "unknown")
-}
-
-#[cfg(test)]
-pub(crate) fn header_text_with_cwd(request: &PermissionRequest, cwd: &str) -> String {
-    format!(
-        "{}\n{LEGACY_APPROVAL_LABEL} · {} · cwd {cwd}\n{}",
-        approval_title(request.capability.as_str()),
-        request.capability.as_str(),
-        request.reason
-    )
-}
-
 pub(crate) fn approval_title(capability: &str) -> &'static str {
     match capability {
         "shell-exec" => "Run command?",
@@ -205,16 +161,18 @@ pub(crate) fn panel_lines(
     let panel_width = width.clamp(8, 96);
     let body_width = usize::from(panel_width.saturating_sub(4)).max(1);
     // Compact preview only — full review is the transcript nearest-block fold.
-    // Keep this short enough that y/a/p/n + hint remain visible in a normal
-    // 24-row frame with composer + status.
+    // Keep this short enough that y/a/p/n remain visible in a normal 24-row
+    // frame with composer + status.
     let diff_area = Rect::new(0, 0, body_width as u16, 5);
     let mut content = vec![
-        PanelRow::title(approval_title(modal.request.capability.as_str())),
-        PanelRow::metadata(format!(
-            "{LEGACY_APPROVAL_LABEL} · {} · cwd {}",
-            modal.request.capability.as_str(),
-            cwd.display()
-        )),
+        PanelRow::title_with_corner(
+            approval_title(modal.request.capability.as_str()),
+            format!(
+                "{} · cwd {}",
+                modal.request.capability.as_str(),
+                cwd.display()
+            ),
+        ),
         PanelRow::body(modal.request.reason.clone()),
     ];
     content.extend(
@@ -229,10 +187,12 @@ pub(crate) fn panel_lines(
                 PanelRow::body(text)
             }),
     );
-    content.push(PanelRow::metadata(consequences_row(
-        &modal.preview,
-        prior_count,
-    )));
+    if let Some(consequences) = consequences_row(&modal.preview, prior_count) {
+        content.push(PanelRow::metadata(consequences));
+    }
+    // v2.1 (§7b): a blank line separates the command/preview block from the
+    // options list.
+    content.push(PanelRow::body(String::new()));
     content.extend(
         approval_option_lines(
             modal.request.capability.as_str(),
@@ -245,11 +205,21 @@ pub(crate) fn panel_lines(
     bordered_panel(content, panel_width, theme)
 }
 
-pub(crate) fn consequences_row(preview: &PatchPreview, prior_count: usize) -> String {
-    format!(
-        "consequences: write scope {} · network unknown · duration unknown · ran-before {prior_count}×",
-        write_scope(preview)
-    )
+/// Only known fields render (review v2 §7b): omit the row entirely while
+/// every field is unknown, rather than pad it with "network unknown ·
+/// duration unknown" filler.
+pub(crate) fn consequences_row(preview: &PatchPreview, prior_count: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(scope) = write_scope(preview) {
+        parts.push(format!("write scope {scope}"));
+    }
+    if prior_count > 0 {
+        parts.push(format!("ran-before {prior_count}×"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("consequences: {}", parts.join(" · ")))
 }
 
 /// Shell: first whitespace token of the live command. Edit: top-level
@@ -286,24 +256,6 @@ pub(crate) fn derive_edit_prefix(path: &Path) -> Option<String> {
     Some(first)
 }
 
-#[cfg(test)]
-pub(crate) fn options_text(request: &PermissionRequest) -> String {
-    approval_options_text(
-        request.capability.as_str(),
-        derive_scope_prefix(request).as_deref(),
-    )
-}
-
-/// Honest option labels: never show a prefix the gate will not grant.
-#[cfg(test)]
-pub(crate) fn approval_options_text(capability: &str, scope_prefix: Option<&str>) -> String {
-    approval_option_lines(capability, scope_prefix, ApprovalOption::AllowOnce)
-        .into_iter()
-        .map(|line| line.text)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Honest option labels: never show a prefix the gate will not grant.
 pub(crate) fn approval_option_lines(
     capability: &str,
@@ -321,11 +273,9 @@ pub(crate) fn approval_option_lines(
         ),
     };
     vec![
-        approval_option_line(
-            "y  Allow once (default selection)",
-            selected,
-            ApprovalOption::AllowOnce,
-        ),
+        // v2.1 (§7b): the selection bar (the `›` marker plus gold-on-select
+        // styling) marks the default now — no "(default selection)" text.
+        approval_option_line("y  Allow once", selected, ApprovalOption::AllowOnce),
         approval_option_line(&session_label, selected, ApprovalOption::AllowSession),
         approval_option_line(&project_label, selected, ApprovalOption::AllowProject),
         approval_option_line(
@@ -333,11 +283,6 @@ pub(crate) fn approval_option_lines(
             selected,
             ApprovalOption::Deny,
         ),
-        ApprovalOptionLine {
-            text: "hint: every decision is logged".to_owned(),
-            selected: false,
-            hint: true,
-        },
     ]
 }
 
@@ -351,15 +296,12 @@ fn approval_option_line(
     ApprovalOptionLine {
         text: format!("{marker} {label}"),
         selected,
-        hint: false,
     }
 }
 
 fn panel_row_for_option(line: ApprovalOptionLine) -> PanelRow {
     if line.selected {
         PanelRow::selected(line.text)
-    } else if line.hint {
-        PanelRow::hint(line.text)
     } else {
         PanelRow::body(line.text)
     }
@@ -426,10 +368,10 @@ fn fallback(message: &str) -> PatchPreview {
     PatchPreview::Fallback(message.to_owned())
 }
 
-fn write_scope(preview: &PatchPreview) -> String {
+fn write_scope(preview: &PatchPreview) -> Option<String> {
     match preview {
-        PatchPreview::Diff { path, .. } if !path.trim().is_empty() => path.clone(),
-        PatchPreview::Diff { .. } | PatchPreview::Fallback(_) => "unknown".to_owned(),
+        PatchPreview::Diff { path, .. } if !path.trim().is_empty() => Some(path.clone()),
+        PatchPreview::Diff { .. } | PatchPreview::Fallback(_) => None,
     }
 }
 
@@ -442,6 +384,15 @@ fn bordered_panel(content: Vec<PanelRow>, width: u16, theme: &Theme) -> Vec<Line
         theme.transcript.permission,
     )));
     for row in content {
+        if let Some(corner) = &row.corner {
+            lines.push(bordered_title_corner_line(
+                &row.text,
+                corner,
+                inner_width,
+                theme,
+            ));
+            continue;
+        }
         for segment in wrap_text(&row.text, inner_width) {
             lines.push(bordered_body_line(&segment, inner_width, theme, row.style));
         }
@@ -451,6 +402,42 @@ fn bordered_panel(content: Vec<PanelRow>, width: u16, theme: &Theme) -> Vec<Line
         theme.transcript.permission,
     )));
     lines
+}
+
+/// Title row with capability · cwd faint in the right corner (review v2 §7):
+/// replaces the old "Approval required · " label row. Degrades gracefully —
+/// the corner is dropped first, then truncated, when the panel is too
+/// narrow to hold both.
+fn bordered_title_corner_line(
+    title: &str,
+    corner: &str,
+    inner_width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let title_width = display_width(title);
+    let gap = 2usize;
+    let corner_budget = inner_width.saturating_sub(title_width + gap);
+    let corner_text = if corner_budget == 0 {
+        String::new()
+    } else if display_width(corner) <= corner_budget {
+        corner.to_owned()
+    } else {
+        crate::ui::text::truncate_display(corner, corner_budget)
+    };
+    let used = title_width + display_width(&corner_text) + usize::from(!corner_text.is_empty());
+    let padding = inner_width.saturating_sub(used);
+    let title_style = panel_row_style(PanelRowStyle::Title, theme);
+    let mut spans = vec![
+        Span::styled("│ ", theme.transcript.permission),
+        Span::styled(title.to_owned(), title_style),
+        Span::styled(" ".repeat(padding), title_style),
+    ];
+    if !corner_text.is_empty() {
+        spans.push(Span::styled(" ", title_style));
+        spans.push(Span::styled(corner_text, theme.transcript.muted));
+    }
+    spans.push(Span::styled(" │", theme.transcript.permission));
+    Line::from(spans)
 }
 
 fn bordered_body_line(
@@ -472,9 +459,13 @@ fn bordered_body_line(
 fn panel_row_style(style: PanelRowStyle, theme: &Theme) -> Style {
     match style {
         PanelRowStyle::Title => theme.transcript.permission,
-        PanelRowStyle::Metadata | PanelRowStyle::Hint => theme.transcript.muted,
+        PanelRowStyle::Metadata => theme.transcript.muted,
         PanelRowStyle::Body => theme.transcript.body,
-        PanelRowStyle::Selected => theme.surfaces.transcript.selection,
+        // v2.1 (§7b): select-bg + gold text for the selected option, not the
+        // generic surface-selection style (plain fg on select-bg).
+        PanelRowStyle::Selected => Style::default()
+            .fg(theme.palette.warning)
+            .bg(theme.palette.selection),
     }
 }
 

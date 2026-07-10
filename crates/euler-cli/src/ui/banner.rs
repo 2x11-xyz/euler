@@ -11,7 +11,6 @@
 //! per-span styled lines (`styled_lines`). Both are assembled from the same
 //! row source so they cannot drift.
 
-use super::status::short_session_id;
 use super::theme::Theme;
 #[cfg(test)]
 use ratatui::{
@@ -55,8 +54,8 @@ const CAPTION_MARGIN: usize = 2;
 const FIRST_WORDMARK_LINE: usize = 1;
 #[cfg(test)]
 const CAPTION_LINE: usize = FIRST_WORDMARK_LINE + WORDMARK_BODY.len() + 1;
-/// blank + wordmark rows + blank + caption + help + blank.
-const HEIGHT: u16 = WORDMARK_BODY.len() as u16 + 5;
+/// blank + wordmark rows + blank + caption + blank.
+const HEIGHT: u16 = WORDMARK_BODY.len() as u16 + 4;
 
 #[cfg(test)]
 pub fn height() -> u16 {
@@ -106,10 +105,6 @@ fn caption() -> String {
 /// Plain (uncolored) banner lines, flush-left. This is the no-color rendering
 /// and the shared layout skeleton for both display paths.
 pub fn render(_width: usize) -> Vec<String> {
-    render_with_session(None)
-}
-
-pub fn render_with_session(session_id: Option<&str>) -> Vec<String> {
     let mut lines = Vec::with_capacity(usize::from(HEIGHT));
     lines.push(String::new());
     for body in WORDMARK_BODY {
@@ -117,34 +112,17 @@ pub fn render_with_session(session_id: Option<&str>) -> Vec<String> {
     }
     lines.push(String::new());
     lines.push(caption());
-    lines.push(format!("  {}", session_help_line(session_id)));
     lines.push(String::new());
     lines
-}
-
-pub fn session_help_line(session_id: Option<&str>) -> String {
-    let id = session_id
-        .filter(|id| !id.is_empty())
-        .map(short_session_id)
-        .unwrap_or_else(|| "e0000".to_owned());
-    format!("new session {id} · resumable with /resume · / for commands")
 }
 
 /// Render the banner for the line-oriented CLI path as one newline-joined
 /// string, emitting SGR escapes when `color` allows (degradation:
 /// no color support → the mark prints in one tone).
 pub fn ansi_string(color: bool) -> String {
-    ansi_string_with_session(color, None)
-}
-
-pub fn ansi_string_with_session(color: bool, session_id: Option<&str>) -> String {
     if !color {
         let mut out = String::new();
-        let lines = match session_id {
-            Some(_) => render_with_session(session_id),
-            None => render(usize::MAX),
-        };
-        for line in lines {
+        for line in render(usize::MAX) {
             out.push_str(&line);
             out.push('\n');
         }
@@ -165,11 +143,6 @@ pub fn ansi_string_with_session(color: bool, session_id: Option<&str>) -> String
     out.push_str(&caption());
     out.push_str(SGR_RESET);
     out.push('\n');
-    out.push_str(SGR_DIM);
-    out.push_str("  ");
-    out.push_str(&session_help_line(session_id));
-    out.push_str(SGR_RESET);
-    out.push('\n');
     out.push('\n');
     out
 }
@@ -188,12 +161,7 @@ fn color_allowed() -> bool {
 
 /// Ratatui rendering: rail spans carry the brand slot colors; letterforms and
 /// caption take their tones from the theme.
-#[cfg(test)]
 pub fn styled_lines(theme: &Theme) -> Vec<Line<'static>> {
-    styled_lines_with_session(theme, None)
-}
-
-pub fn styled_lines_with_session(theme: &Theme, session_id: Option<&str>) -> Vec<Line<'static>> {
     let mut lines = Vec::with_capacity(usize::from(HEIGHT));
     lines.push(Line::from(""));
     for (row, body) in WORDMARK_BODY.iter().enumerate() {
@@ -205,10 +173,6 @@ pub fn styled_lines_with_session(theme: &Theme, session_id: Option<&str>) -> Vec
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(caption(), theme.banner.identity)));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", session_help_line(session_id)),
-        theme.banner.identity,
-    )));
     lines.push(Line::from(""));
     lines
 }
@@ -268,33 +232,18 @@ mod tests {
         for sgr in RAIL_SGR {
             assert!(out.contains(sgr), "rail SGR {sgr:?} present");
         }
-        assert!(out.contains(SGR_DIM), "caption/help are dim");
+        assert!(out.contains(SGR_DIM), "caption is dim");
         // Every escape is closed: count resets >= colored segments.
-        let opens = RAIL_SGR.len() + 2;
+        let opens = RAIL_SGR.len() + 1;
         assert_eq!(out.matches(SGR_RESET).count(), opens);
     }
 
     #[test]
-    fn banner_session_help_defaults_and_accepts_session_id() {
-        assert_eq!(
-            session_help_line(None),
-            "new session e0000 · resumable with /resume · / for commands"
-        );
-        assert_eq!(
-            session_help_line(Some("e1234")),
-            "new session e1234 · resumable with /resume · / for commands"
-        );
-        assert_eq!(
-            session_help_line(Some("01KX488KQ6DXYPYGB0FK7GFD4T")),
-            "new session efd4t · resumable with /resume · / for commands"
-        );
-        assert!(render(80).join("\n").contains("new session e0000"));
-        assert!(render_with_session(Some("e1234"))
-            .join("\n")
-            .contains("new session e1234"));
-        assert!(render_with_session(Some("01KX488KQ6DXYPYGB0FK7GFD4T"))
-            .join("\n")
-            .contains("new session efd4t"));
+    fn banner_has_no_orientation_line() {
+        let joined = plain().join("\n");
+        assert!(!joined.contains("new session"));
+        assert!(!joined.contains("resumable with /resume"));
+        assert!(!joined.contains("for commands"));
     }
 
     #[test]
@@ -352,7 +301,7 @@ mod tests {
         let contents = terminal.backend().screen_contents();
         assert!(contents.contains("██▄▄"));
         assert!(contents.contains("e^(iπ) + 1 = 0"));
-        assert!(contents.contains("new session e0000"));
+        assert!(!contents.contains("new session"));
         assert!(contents.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     }
 }

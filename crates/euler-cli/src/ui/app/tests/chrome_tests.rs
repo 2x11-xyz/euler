@@ -1,6 +1,17 @@
 use super::super::visual::render_finalized_visual_items_with_offsets;
 use super::*;
+use crate::ui::transcript::ProjectedEntry;
 use crate::ui::visual_canvas::CursorTarget;
+
+/// Test-only helper: wrap bare items as untimed entries for callers of
+/// `render_finalized_visual_items_with_offsets`, which (in production)
+/// always receives real per-item timing from the visual canvas.
+fn untimed_entries(items: Vec<TranscriptItem>) -> Vec<ProjectedEntry> {
+    items
+        .into_iter()
+        .map(|item| ProjectedEntry { item, timing: None })
+        .collect()
+}
 
 #[test]
 fn question_mark_help_overlay_is_global_only_for_idle_composer() {
@@ -76,8 +87,8 @@ fn empty_composer_prompt_has_breathing_room_above_statusline() {
     assert_eq!(areas.notice.height, 0);
     assert!(screen_row(&contents, areas.bottom.y).starts_with("▌ "));
     let status = screen_row(&contents, areas.status.y);
-    assert!(status.starts_with("  ⏎ send · / commands · ctrl+o expand"));
-    assert!(status.contains(" · echo · ctx ?% · "));
+    assert!(status.starts_with("  / commands"));
+    assert!(status.trim_end().ends_with("echo · ctx ?%"));
     assert!(!status.contains("Context ?% used"));
 }
 
@@ -182,8 +193,11 @@ fn transient_notice_composer_and_status_are_separated_by_blank_rows() {
     assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
 }
 
+/// Issue #23: the slash palette renders fully inside the rail-bounded
+/// composer container — in the composer's own slot — so nothing renders
+/// below the footer/status line.
 #[test]
-fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() {
+fn slash_palette_renders_inside_composer_container_with_nothing_below_footer() {
     let mut core = core();
     core.drain_finalized_visual_lines(80);
 
@@ -199,22 +213,24 @@ fn slash_palette_appends_below_prompt_and_status_without_moving_footer_prefix() 
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
 
-    let prompt = lines
-        .iter()
-        .position(|line| line.starts_with('▌'))
-        .expect("prompt row");
     let status = lines
         .iter()
         .position(|line| line.contains("echo · ctx"))
         .expect("status row");
+    assert_eq!(
+        status,
+        lines.len() - 1,
+        "status/footer must be the last rendered line: lines: {lines:?}"
+    );
+
     let slash = lines
         .iter()
         .position(|line| line.trim() == "\u{258c} /")
         .expect("slash input row");
-
-    assert_eq!(status, prompt + 2, "lines: {lines:?}");
-    assert!(lines[prompt + 1].is_empty(), "lines: {lines:?}");
-    assert_eq!(slash, status + 1, "lines: {lines:?}");
+    assert!(
+        slash < status,
+        "palette must render above the footer, not below it: lines: {lines:?}"
+    );
     assert_eq!(
         after.cursor,
         Some(CursorTarget {
@@ -309,7 +325,7 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     assert!(terminal
         .backend()
         .screen_contents()
-        .contains("Approval required"));
+        .contains("Run command?"));
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('y'))),
@@ -538,13 +554,13 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
 fn finalized_wrapped_prompt_uses_continuous_user_rail() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::UserMessage(
+        &untimed_entries(vec![TranscriptItem::UserMessage(
             "alpha beta gamma delta epsilon".to_owned(),
-        )],
+        )]),
         &theme,
         28,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -574,11 +590,11 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     let table = "| Layer | Responsibility | Repo location |\n|---|---|---|\n| CLI/TUI layer | User-facing command-line and Ratatui transcript composer status UX | euler-cli |\n";
 
     let narrow = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::AssistantMessage(table.to_owned())],
+        &untimed_entries(vec![TranscriptItem::AssistantMessage(table.to_owned())]),
         &theme,
         44,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -611,11 +627,11 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     );
 
     let wide = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::AssistantMessage(table.to_owned())],
+        &untimed_entries(vec![TranscriptItem::AssistantMessage(table.to_owned())]),
         &theme,
         100,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -692,15 +708,15 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
 fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[
+        &untimed_entries(vec![
             TranscriptItem::UserMessage("hi".to_owned()),
             TranscriptItem::AssistantMessage("Hi! How can I help?".to_owned()),
             TranscriptItem::WorkedDuration("5s".to_owned()),
-        ],
+        ]),
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -731,18 +747,18 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
 fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::ToolRun {
+        &untimed_entries(vec![TranscriptItem::ToolRun {
             command: "ls -la".to_owned(),
             ok: true,
             error: String::new(),
             output: "exit 0\nfile".to_owned(),
             exit_code: Some(0),
             grant_source: None,
-        }],
+        }]),
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
-        &std::collections::HashSet::new(),
+        false,
     )
     .0
     .iter()
@@ -942,7 +958,7 @@ fn tool_round_limit_finalizes_guidance_without_raw_session_failure() {
         .iter()
         .any(|row| row.contains("run_turn: model exceeded maximum tool rounds")));
     let screen = terminal.backend().screen_contents();
-    assert!(!screen.contains("⠧ working"));
+    assert!(!screen.contains("⠋ working"));
     assert!(!screen.contains("turn failed"));
     assert!(screen.contains("▌"));
 }
@@ -1029,7 +1045,7 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
     let failed_gap = terminal.backend().screen_contents();
     assert!(failed_gap.contains("provider: transport down"));
     assert!(failed_gap.contains("■ turn failed — waiting for cleanup"));
-    assert!(!failed_gap.contains("⠧ working"));
+    assert!(!failed_gap.contains("⠋ working"));
     assert!(
         !terminal
             .backend()
@@ -1051,7 +1067,7 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
     assert!(!history.contains("run_turn: transport down"));
     let done = terminal.backend().screen_contents();
     assert!(!done.contains("■ Turn failed"));
-    assert!(!done.contains("⠧ working"));
+    assert!(!done.contains("⠋ working"));
     assert!(done.contains("▌"));
 }
 
@@ -1081,7 +1097,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     )));
     render_compact_frame(&mut terminal, &mut core);
     let before_done = terminal.backend().screen_contents();
-    assert!(before_done.contains("⠧ working"));
+    assert!(before_done.contains("⠋ working"));
     assert!(!before_done.contains("■ Turn failed"));
 
     core.handle_turn_event(TurnEvent::TurnDone {
@@ -1095,7 +1111,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     assert!(history.contains("run_turn: transport down"));
     let done = terminal.backend().screen_contents();
     assert!(!done.contains("■ Turn failed"));
-    assert!(!done.contains("⠧ working"));
+    assert!(!done.contains("⠋ working"));
     assert!(done.contains("▌"));
 }
 
@@ -1668,7 +1684,7 @@ fn patch_approval_hides_completed_read_file_activity() {
         .draw(|frame| core.render(frame))
         .expect("patch approval draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Approval required"));
+    assert!(contents.contains("Edit file?"));
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("read_file completed"));
     assert!(!contents.contains("raw transcript source"));
@@ -1683,10 +1699,7 @@ fn patch_approval_remains_visible_and_active_when_question_mark_is_pressed() {
     terminal
         .draw(|frame| core.render(frame))
         .expect("draw before");
-    assert!(terminal
-        .backend()
-        .screen_contents()
-        .contains("Approval required"));
+    assert!(terminal.backend().screen_contents().contains("Edit file?"));
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('?'))),
@@ -1699,12 +1712,9 @@ fn patch_approval_remains_visible_and_active_when_question_mark_is_pressed() {
         .draw(|frame| core.render(frame))
         .expect("draw after");
     let contents = terminal.backend().screen_contents();
-    assert!(
-        contents.contains("Approval required"),
-        "contents:\n{contents}"
-    );
-    // Height-tight frames may clip the trailing hint line; the decision
-    // keys are the durable affordance that must remain visible.
+    assert!(contents.contains("Edit file?"), "contents:\n{contents}");
+    // Height-tight frames may clip the trailing rows; the decision keys are
+    // the durable affordance that must remain visible.
     assert!(
         contents.contains("y  Allow once") && contents.contains("n/esc  Deny"),
         "contents:\n{contents}"

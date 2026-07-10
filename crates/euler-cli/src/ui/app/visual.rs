@@ -1,26 +1,31 @@
 use super::*;
 use crate::ui::transcript;
+use ratatui::style::Style;
+use ratatui::text::Line;
 
 impl AppCore {
     pub(super) fn queue_finalized_visual_output_for_latest_event(&mut self) {
-        let Some(kind) = self
-            .transcript
-            .events()
-            .last()
-            .map(|event| event.kind.as_str().to_owned())
-        else {
+        let Some(event) = self.transcript.events().last() else {
             return;
         };
-        if kind == EventKind::MODEL_DELTA {
+        if event.kind.as_str() == EventKind::MODEL_DELTA {
             return;
         }
+        let ts = event.ts.clone();
         if let Some(item) = transcript::project_latest_event_for_ui(self.transcript.events()) {
-            self.push_finalized_visual_item(item);
+            self.push_finalized_visual_item_at(item, &ts);
         }
     }
 
     pub(super) fn push_finalized_visual_item(&mut self, item: TranscriptItem) {
         self.visual_canvas.push_finalized(item);
+    }
+
+    /// Push a finalized item stamped from its source event's real
+    /// provenance time (review v2 §6) rather than the wall-clock fallback
+    /// `push_finalized_visual_item` uses for synthetic UI items.
+    fn push_finalized_visual_item_at(&mut self, item: TranscriptItem, ts: &str) {
+        self.visual_canvas.push_finalized_with_ts(item, Some(ts));
     }
 
     pub(crate) fn set_committed_history_items(&mut self, committed: usize) {
@@ -48,7 +53,7 @@ impl AppCore {
         self.composer_navigation_width = width;
         let snapshot = self.visual_canvas_snapshot(width);
         let theme = self.theme.clone();
-        let expanded = self.expanded_artifact_keys.clone();
+        let expanded = self.tool_output_expanded;
         let show_ts = self.show_timestamp_gutter;
         let mut frame = self.visual_canvas.render(snapshot, |items, width| {
             crate::ui::text::with_timestamp_gutter(show_ts, || {
@@ -57,7 +62,7 @@ impl AppCore {
                     &theme,
                     width,
                     TOOL_CALL_MAX_LINES,
-                    &expanded,
+                    expanded,
                 )
             })
         });
@@ -68,7 +73,6 @@ impl AppCore {
         if self.turn_in_flight() && self.transcript.live_committed_items().is_empty() {
             frame.committable_rows = frame.committable_rows.min(frame.history_rows);
         }
-        self.refresh_foldable_spans(width);
         let height = self.last_history_viewport.1.max(1);
         let top = frame
             .history_rows
@@ -121,18 +125,41 @@ impl AppCore {
         );
         self.push_visual_modal_block(width, &mut blocks);
         self.push_visual_permission_block(width, &mut blocks);
-        self.push_visual_activity_block(&mut blocks);
-        self.push_visual_transient_block(&mut blocks);
+        // Issue #27: the working HUD sits directly above the composer with
+        // no blank line between them. The transient-notice block always
+        // reserves a row (blank when there's no notice, for layout
+        // stability) — that blank placeholder would otherwise land between
+        // the HUD and the composer, so it's dropped whenever the HUD is
+        // active; a *real* notice (e.g. "resume waits for the active turn")
+        // still renders, directly below the HUD.
+        if self.push_visual_activity_block(width, &mut blocks) {
+            let notice = self.transient_notice_text();
+            if !notice.is_empty() {
+                push_visual_block(
+                    &mut blocks,
+                    VisualBlockRole::Notice,
+                    vec![CanvasLine::plain_lossy(notice)],
+                );
+            }
+        } else {
+            self.push_visual_transient_block(&mut blocks);
+        }
         // No spacer here: the transcript renderer ends every event batch
         // (banner included) with one blank line — it owns vertical rhythm.
-        self.push_visual_composer_block(composer, &mut blocks);
+        //
+        // Issue #23: an active bottom surface (slash palette, pickers, ...)
+        // renders fully inside the rail-bounded composer container — in the
+        // composer's own slot, directly above the footer — never appended
+        // after the status line. Only one of the two ever renders.
+        if !self.push_visual_bottom_surface_block(width, &mut blocks) {
+            self.push_visual_composer_block(composer, &mut blocks);
+        }
         push_visual_spacer_block(&mut blocks);
         push_visual_block(
             &mut blocks,
             VisualBlockRole::Status,
             vec![status.line.clone()],
         );
-        self.push_visual_bottom_surface_block(width, &mut blocks);
         blocks
     }
 
@@ -187,15 +214,50 @@ impl AppCore {
         );
     }
 
-    fn push_visual_activity_block(&self, blocks: &mut Vec<VisualBlock>) {
-        let Some(line) = self.live_status_line() else {
-            return;
+    /// Returns whether the HUD is active (and therefore was pushed), so the
+    /// caller can skip the transient-notice placeholder row that would
+    /// otherwise land between the HUD and the composer.
+    fn push_visual_activity_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) -> bool {
+        let Some(hud) = self.working_hud_line(width) else {
+            return false;
         };
-        push_visual_block(
-            blocks,
-            VisualBlockRole::Activity,
-            vec![CanvasLine::plain_lossy(line)],
-        );
+        let lines = match hud {
+            HudLine::Plain(text) => vec![CanvasLine::plain_lossy(text)],
+            HudLine::Working {
+                spinner,
+                verb,
+                suffix,
+                reasoning_tail,
+            } => {
+                let mut lines = vec![CanvasLine::from_spans(vec![
+                    // Gold (warning-token) spinner — routed through Theme, never
+                    // a literal hex (issue #27).
+                    CanvasSpan::styled_lossy(
+                        format!("{spinner} "),
+                        TextRole::Plain,
+                        Style::default().fg(self.theme.palette.warning),
+                    ),
+                    CanvasSpan::new_lossy(verb, TextRole::Plain),
+                    CanvasSpan::styled_lossy(
+                        suffix,
+                        TextRole::Plain,
+                        Style::default().fg(self.theme.palette.muted),
+                    ),
+                ])];
+                // #47: dim italic continuation lines of the reasoning text
+                // currently streaming, directly under the thinking line.
+                lines.extend(reasoning_tail.into_iter().map(|text| {
+                    CanvasLine::from_spans(vec![CanvasSpan::styled_lossy(
+                        format!("  {text}"),
+                        TextRole::Plain,
+                        self.theme.transcript.reasoning,
+                    )])
+                }));
+                lines
+            }
+        };
+        push_visual_block(blocks, VisualBlockRole::Activity, lines);
+        true
     }
 
     fn push_visual_composer_block(
@@ -210,31 +272,36 @@ impl AppCore {
         });
     }
 
-    fn push_visual_bottom_surface_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) {
-        if let Some(lines) = self.bottom.surface_lines(width) {
-            let block = VisualBlock::new(
-                VisualBlockRole::BottomSurface,
-                lines.into_iter().map(CanvasLine::plain_lossy).collect(),
-            );
-            let block = match self.bottom.surface_cursor(width) {
-                Some((row, column)) => block.with_cursor(BlockCursor { row, column }),
-                None => block,
-            };
-            blocks.push(block);
-        }
+    /// Renders the active bottom surface (palette, pickers, ...) in place of
+    /// the composer. Returns whether a surface was active (and therefore
+    /// pushed) so the caller can fall back to the composer block.
+    fn push_visual_bottom_surface_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) -> bool {
+        let Some(lines) = self.bottom.surface_canvas_lines(&self.theme, width) else {
+            return false;
+        };
+        let block = VisualBlock::new(VisualBlockRole::BottomSurface, lines);
+        let block = match self.bottom.surface_cursor(width) {
+            Some((row, column)) => block.with_cursor(BlockCursor { row, column }),
+            None => block,
+        };
+        blocks.push(block);
+        true
     }
 
     fn push_visual_transient_block(&self, blocks: &mut Vec<VisualBlock>) {
-        let line = if self.modal.is_some() || self.permission_ask_item().is_some() {
-            String::new()
-        } else {
-            self.notice.clone().unwrap_or_default()
-        };
         push_visual_block(
             blocks,
             VisualBlockRole::Notice,
-            vec![CanvasLine::plain_lossy(line)],
+            vec![CanvasLine::plain_lossy(self.transient_notice_text())],
         );
+    }
+
+    fn transient_notice_text(&self) -> String {
+        if self.modal.is_some() || self.permission_ask_item().is_some() {
+            String::new()
+        } else {
+            self.notice.clone().unwrap_or_default()
+        }
     }
 
     fn apply_search_highlights(&self, lines: &mut [CanvasLine]) {
@@ -258,14 +325,27 @@ impl AppCore {
 
     pub(super) fn canvas_status_snapshot(&self, width: u16) -> CanvasStatusSnapshot {
         let target = format!("{}/{}", self.status.provider, self.status.model);
-        let line = if let Some(search) = self.bottom.search() {
+        if let Some(search) = self.bottom.search() {
             // Spec §5.4: search swaps the footer hint line for `find: · k/N`.
             let indent = "  ";
-            format!("{indent}{}", search.status_line())
-        } else {
-            status_line_text(&self.status, &self.token_usage, self.turn_status(), width)
-        };
-        CanvasStatusSnapshot::new(target, CanvasLine::styled_lossy(line, TextRole::Status))
+            let line = format!("{indent}{}", search.status_line());
+            return CanvasStatusSnapshot::new(
+                target,
+                CanvasLine::styled_lossy(line, TextRole::Status),
+            );
+        }
+        let has_foldable = self
+            .visual_canvas
+            .has_foldable_artifact(TOOL_CALL_MAX_LINES);
+        let line = status_line_canvas(
+            &self.status,
+            &self.token_usage,
+            self.turn_status(),
+            has_foldable,
+            &self.theme,
+            width,
+        );
+        CanvasStatusSnapshot::new(target, line)
     }
 
     fn canvas_composer_snapshot(&self, width: u16) -> CanvasComposerSnapshot {
@@ -331,18 +411,18 @@ fn push_visual_spacer_block(blocks: &mut Vec<VisualBlock>) {
 }
 
 pub(super) fn render_finalized_visual_items_with_offsets(
-    items: &[TranscriptItem],
+    entries: &[transcript::ProjectedEntry],
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
-    expanded_artifact_keys: &std::collections::HashSet<String>,
+    expanded: bool,
 ) -> (Vec<CanvasLine>, Vec<usize>) {
-    let (lines, item_end_offsets) = transcript::render_items_for_history_with_offsets(
-        items,
+    let (lines, item_end_offsets) = transcript::render_entries_for_history_with_offsets(
+        entries,
         theme,
         width,
         output_limit_lines,
-        expanded_artifact_keys,
+        expanded,
     );
     // v2: the renderer already separates every event with one blank line —
     // the old trailing-rhythm row would double it AND desync the live vs

@@ -1261,7 +1261,7 @@ fn active_turn_frame_shows_working_state_and_next_draft() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(text.contains("⠧ working"), "frame: {text:?}");
+    assert!(text.contains("⠋ working"), "frame: {text:?}");
     assert!(text.contains("▌ next draft"), "frame: {text:?}");
 }
 
@@ -1291,7 +1291,7 @@ fn active_turn_live_transcript_prefix_is_committable() {
         .join("\n");
 
     assert!(text.contains("line one"), "frame: {text:?}");
-    assert!(text.contains("⠧ working"), "frame: {text:?}");
+    assert!(text.contains("⠋ working"), "frame: {text:?}");
     assert!(frame.committable_rows > 0);
     assert!(frame.committable_rows < frame.active_frame_lines.len());
 }
@@ -1436,6 +1436,49 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     let refolded = drain_finalized_visual_text(&mut core, 80);
     assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
+}
+
+#[test]
+fn ctrl_o_expands_and_refolds_finalized_reasoning_items() {
+    // Review finding: the collapsed thought line advertises "ctrl+o expand"
+    // but ModelReasoning was not classified foldable, so ctrl+o never
+    // targeted it. Verify the toggle actually reaches a reasoning item.
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::ModelReasoning {
+        fidelity: "raw".to_owned(),
+        content: "First sentence stays short.\nSecond paragraph reveals much \
+                  more detail that only appears once ctrl+o expands the full thought."
+            .to_owned(),
+    });
+
+    let folded = drain_finalized_visual_text(&mut core, 80);
+    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
+    assert!(!folded.contains("Second paragraph"), "folded: {folded:?}");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let expanded = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        expanded.contains("ctrl+o collapse"),
+        "expanded: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("Second paragraph"),
+        "expanded: {expanded:?}"
+    );
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(refolded.contains("ctrl+o expand"), "refolded: {refolded:?}");
+    assert!(
+        !refolded.contains("Second paragraph"),
+        "refolded: {refolded:?}"
+    );
 }
 
 #[test]
@@ -1688,15 +1731,43 @@ fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
     );
 }
 
+/// Issue #49: `ctrl+o` is a single global toggle — every foldable cell in a
+/// mixed transcript (tool run, reasoning, diff) expands together on the
+/// first press and collapses together on the second, with no per-cell
+/// targeting or invisible nearest-to-viewport heuristic.
 #[test]
-fn ctrl_o_expands_only_nearest_foldable_artifact() {
+fn ctrl_o_expands_all_foldable_artifacts_globally() {
     let mut core = core();
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
+    core.push_finalized_visual_item(TranscriptItem::ModelReasoning {
+        fidelity: "detailed".to_owned(),
+        content: "Weighing the tradeoffs between approach A and approach B. \
+            After a long deliberation the conclusion lands on approach B \
+            because it is the option that fully honors the unique reasoning marker."
+            .to_owned(),
+    });
+    core.push_finalized_visual_item(TranscriptItem::PatchApplied {
+        path: "src/lib.rs".to_owned(),
+        old: None,
+        new: Some(
+            (1..=20)
+                .map(|line| format!("added line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        ),
+    });
     core.push_finalized_visual_item(shell_artifact_with_lines(14));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
     assert!(folded.contains("8 more lines"), "folded: {folded:?}");
     assert!(folded.contains("10 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
+    assert!(
+        !folded.contains("unique reasoning marker"),
+        "folded: {folded:?}"
+    );
+    assert!(!folded.contains("added line 15"), "folded: {folded:?}");
 
     assert_eq!(
         core.handle_input(ctrl_o()),
@@ -1704,14 +1775,34 @@ fn ctrl_o_expands_only_nearest_foldable_artifact() {
     );
     let expanded = drain_finalized_visual_text(&mut core, 80);
 
-    // Exactly one foldable expands (nearest to viewport center).
-    let still_folded = usize::from(expanded.contains("8 more lines"))
-        + usize::from(expanded.contains("10 more lines"));
-    assert_eq!(
-        still_folded, 1,
-        "exactly one artifact should remain folded: {expanded:?}"
-    );
+    // All foldable cells expand together — none remain collapsed.
+    assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
+    assert!(
+        expanded.contains("unique reasoning marker"),
+        "expanded: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("ctrl+o collapse"),
+        "expanded: {expanded:?}"
+    );
+    assert!(expanded.contains("added line 15"), "expanded: {expanded:?}");
+
+    assert_eq!(
+        core.handle_input(ctrl_o()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    let refolded = drain_finalized_visual_text(&mut core, 80);
+    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("10 more lines"), "refolded: {refolded:?}");
+    assert!(
+        !refolded.contains("unique reasoning marker"),
+        "refolded: {refolded:?}"
+    );
+    assert!(
+        !refolded.contains("added line 15"),
+        "refolded: {refolded:?}"
+    );
 }
 
 #[test]
@@ -1723,6 +1814,21 @@ fn ctrl_o_without_foldable_artifact_is_noop_and_does_not_edit_composer() {
 
     assert_eq!(core.bottom.composer().submit_text(), "");
     assert!(!drain_finalized_visual_text(&mut core, 80).contains("more lines"));
+}
+
+#[test]
+fn footer_ctrl_o_hint_only_appears_when_a_foldable_artifact_exists() {
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::AssistantMessage("plain answer".to_owned()));
+
+    let without_fold = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(without_fold.contains("/ commands"));
+    assert!(!without_fold.contains("ctrl+o expand"));
+
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+
+    let with_fold = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(with_fold.contains("/ commands · ctrl+o expand"));
 }
 
 #[test]
@@ -2018,6 +2124,42 @@ fn name_session_refreshes_metadata_after_durable_rename() {
         .expect("find session")
         .expect("session record");
     assert_eq!(refreshed.name(), Some("clean name"));
+
+    // #46: the footer picks up the name from the same render, no extra
+    // rebuild needed — and even though naming failed the metadata refresh
+    // in the sibling test above, the footer there still updates (asserted
+    // separately below) because it never depended on that refresh.
+    assert_eq!(core.status.session_name.as_deref(), Some("clean name"));
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(rendered.ends_with("echo · ctx ?% · clean name"));
+}
+
+#[test]
+fn name_session_updates_footer_immediately_even_if_metadata_refresh_fails() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    config.agent_id = "tui-test".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(record.events_path()).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    let alternate_home = EulerHome::from_root(temp.path().join(".other-euler")).expect("home");
+    core.session_store = Some(SessionStore::new(alternate_home).expect("alternate store"));
+
+    assert_eq!(core.status.session_name, None);
+    assert_eq!(
+        core.name_current_session("still named".to_owned()),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.status.session_name.as_deref(), Some("still named"));
+    let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(rendered.ends_with("echo · ctx ?% · still named"));
 }
 
 #[test]
@@ -2325,7 +2467,33 @@ fn resume_picker_reports_empty_state_without_active_turn_language() {
         CoreEffect::Render
     );
 
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume needs an active session"));
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("resume needs an active session"));
+    assert!(
+        !text.contains("ui:"),
+        "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
+    );
+}
+
+#[test]
+fn resume_refusal_for_already_active_session_is_a_neutral_notice() {
+    let mut core = core();
+    let session_id = match &core.state {
+        AppState::Idle { session } => session.session_id().to_owned(),
+        _ => panic!("expected an idle session"),
+    };
+
+    assert_eq!(
+        core.resume_session_from_picker(session_id.clone()),
+        CoreEffect::Render
+    );
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains(&format!("already using session {session_id}")));
+    assert!(
+        !text.contains("ui:"),
+        "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
+    );
 }
 
 #[test]
@@ -2382,6 +2550,7 @@ fn accepting_resume_purges_prior_native_scrollback() {
             events,
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "useful resumed name".to_owned(),
+            session_name: None,
             recovery_closure_appended: false,
             warning_count: 0,
             events_replayed: 1,
@@ -2403,6 +2572,62 @@ fn accepting_resume_purges_prior_native_scrollback() {
 }
 
 #[test]
+fn accepting_resume_restamps_replayed_history_when_timestamps_are_on() {
+    // Review v2 §6: a rebuild (resume, new session, rollback) must stamp
+    // every replayed event from its own provenance time — not leave the
+    // gutter blank until new events arrive.
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(".");
+    config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider);
+    let events = vec![event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "resumed content".into())]),
+    )];
+
+    core.accept_tui_resume(
+        "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned(),
+        TuiResume {
+            session,
+            channels,
+            events,
+            active_target: ModelTarget::new("fixture", "echo"),
+            display_label: "useful resumed name".to_owned(),
+            session_name: None,
+            recovery_closure_appended: false,
+            warning_count: 0,
+            events_replayed: 1,
+        },
+    );
+
+    let lines = core
+        .drain_finalized_visual_lines(80)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let row = lines
+        .iter()
+        .position(|line| line.contains("resumed content"))
+        .expect("replayed row");
+    let stamp: String = lines[row].chars().take(8).collect();
+    assert!(
+        looks_like_hh_mm_ss(&stamp),
+        "replayed history should be restamped, not blank: {:?}",
+        lines[row]
+    );
+}
+
+#[test]
 fn accepting_resume_boundary_includes_recovery_and_warnings() {
     let mut core = core();
     let (decider, channels) = TuiDecider::new();
@@ -2419,6 +2644,7 @@ fn accepting_resume_boundary_includes_recovery_and_warnings() {
             events: Vec::new(),
             active_target: ModelTarget::new("fixture", "echo"),
             display_label: "broken tail".to_owned(),
+            session_name: None,
             recovery_closure_appended: true,
             warning_count: 2,
             events_replayed: 7,
@@ -2752,7 +2978,7 @@ fn activity_live_status_is_gated_by_turn_state() {
     terminal
         .draw(|frame| core.render(frame))
         .expect("idle draw");
-    assert!(!terminal.backend().screen_contents().contains("⠧ working"));
+    assert!(!terminal.backend().screen_contents().contains("⠋ working"));
 
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -2764,8 +2990,419 @@ fn activity_live_status_is_gated_by_turn_state() {
         .draw(|frame| core.render(frame))
         .expect("in-flight draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("⠧ working · 0s · esc to interrupt"));
+    assert!(contents.contains("⠋ working · 0s · esc to interrupt"));
     assert!(contents.contains("▌"));
+}
+
+/// Issue #27: the spinner frame is a pure tick counter, advanced only by
+/// `advance_spinner` (the periodic background poll) never by reading
+/// `Instant::now()` fresh in render — so the animation is testable by
+/// injecting synthetic `now` values instead of sleeping.
+#[test]
+fn working_hud_spinner_advances_on_tick_not_wall_clock() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    let t0 = Instant::now();
+
+    // First call only seeds the schedule; no tick fires yet.
+    assert!(!core.advance_spinner_at(t0));
+    assert_eq!(core.spinner_frame, 0);
+
+    // Under the 90ms cadence: no advance.
+    assert!(!core.advance_spinner_at(t0 + Duration::from_millis(50)));
+    assert_eq!(core.spinner_frame, 0);
+
+    // At/after the cadence: advances exactly one frame.
+    assert!(core.advance_spinner_at(t0 + Duration::from_millis(90)));
+    assert_eq!(core.spinner_frame, 1);
+    assert!(!core.advance_spinner_at(t0 + Duration::from_millis(120)));
+    assert_eq!(core.spinner_frame, 1);
+    assert!(core.advance_spinner_at(t0 + Duration::from_millis(200)));
+    assert_eq!(core.spinner_frame, 2);
+}
+
+#[test]
+fn working_hud_spinner_resets_when_turn_ends() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    let t0 = Instant::now();
+    core.advance_spinner_at(t0);
+    core.advance_spinner_at(t0 + Duration::from_millis(90));
+    assert_eq!(core.spinner_frame, 1);
+
+    core.state = AppState::Empty;
+    assert!(core.advance_spinner());
+    assert_eq!(core.spinner_frame, 0);
+}
+
+/// Issue #27: the phase verb swaps in place as streamed tool-call/reasoning
+/// events arrive, with `run_shell` distinguishing bash from a test-runner
+/// invocation, and falls back to "working" before any such event lands.
+#[test]
+fn working_hud_phase_verb_reflects_streamed_turn_events() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    assert_eq!(core.current_phase_verb, None);
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("input", json!({"path": "src/lib.rs"})),
+        ]),
+    )));
+    assert_eq!(
+        core.current_phase_verb.as_deref(),
+        Some("reading src/lib.rs")
+    );
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-edit".into()),
+            ("name", "edit_file".into()),
+            ("input", json!({"path": "src/lib.rs"})),
+        ]),
+    )));
+    assert_eq!(
+        core.current_phase_verb.as_deref(),
+        Some("writing src/lib.rs")
+    );
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-bash".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "ls -la"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-test".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "cargo nextest run --workspace"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+
+    // A non-phase-carrying event (model delta) leaves the verb in place.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer".into())]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+}
+
+/// #47(a): while reasoning streams, the dim-italic reasoning text itself
+/// renders as continuation lines under the live `thinking · Ns` line.
+#[test]
+fn reasoning_stream_tail_renders_under_the_thinking_line() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "let me check the ".into()),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "call site first".into()),
+        ]),
+    )));
+
+    let frame = core.render_visual_canvas(80);
+    let text = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("let me check the call site first"), "{text}");
+
+    let reasoning_line = frame
+        .active_frame_lines
+        .iter()
+        .find(|line| line.plain_text().contains("let me check"))
+        .expect("reasoning continuation line present");
+    assert_eq!(
+        reasoning_line.spans[0].style,
+        core.theme.transcript.reasoning
+    );
+}
+
+/// #47(a): the tail clears the moment answer text starts streaming, and a
+/// late reasoning delta afterward must never reopen it.
+#[test]
+fn reasoning_stream_tail_clears_when_answer_text_starts_and_never_reopens() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "thinking...".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "thinking...");
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "text".into()), ("delta", "answer".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+
+    // A late reasoning delta (unusual, but must not reopen the tail).
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "too late".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+}
+
+/// #47(a): the tail also clears the moment the reasoning item finalizes
+/// (`MODEL_REASONING`), and it never survives past the turn's end.
+#[test]
+fn reasoning_stream_tail_clears_on_finalize_and_turn_end() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "thinking...".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "thinking...");
+
+    // A second `MODEL_REASONING` (e.g. a further reasoning round after a
+    // tool call) finalizes the current item and clears the live tail.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "final thought".into())]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "");
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "one more round".into()),
+        ]),
+    )));
+    assert_eq!(core.reasoning_stream_tail, "one more round");
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+    assert_eq!(core.reasoning_stream_tail, "");
+}
+
+/// #47(a): the streamed tail is bounded (~400 chars) and truncates from the
+/// left on a char boundary — never splitting a multibyte glyph.
+#[test]
+fn reasoning_stream_tail_is_bounded_and_multibyte_safe() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_REASONING,
+        object([("content", "hmm".into())]),
+    )));
+
+    // Push enough multibyte deltas to overflow the 400-char bound.
+    for _ in 0..30 {
+        core.handle_turn_event(TurnEvent::Event(event(
+            EventKind::MODEL_DELTA,
+            object([
+                ("kind", "reasoning".into()),
+                ("delta", "こんにちは世界 ".into()),
+            ]),
+        )));
+    }
+
+    assert!(core.reasoning_stream_tail.chars().count() <= 400);
+    assert!(
+        core.reasoning_stream_tail
+            .chars()
+            .all(|ch| ch != '\u{fffd}'),
+        "{:?}",
+        core.reasoning_stream_tail
+    );
+}
+
+#[test]
+fn working_hud_phase_verb_resets_when_a_new_turn_spawns() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    core.current_phase_verb = Some("thinking".to_owned());
+    core.spinner_frame = 3;
+
+    core.spawn_turn("next".to_owned(), session);
+
+    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(core.spinner_frame, 0);
+}
+
+#[test]
+fn working_hud_phase_verb_resets_when_the_turn_completes() {
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.current_phase_verb = Some("thinking".to_owned());
+    core.spinner_frame = 3;
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+
+    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(core.spinner_frame, 0);
+}
+
+/// Issue #27: the spinner is gold (the theme's warning token) and the
+/// elapsed/hint suffix is dim (muted) — both routed through `Theme`, not a
+/// hardcoded hex; the verb itself carries no explicit color.
+#[test]
+fn working_hud_canvas_line_uses_theme_tokens_for_spinner_and_suffix() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.theme = Theme::warm_ledger();
+
+    let frame = core.render_visual_canvas(80);
+    let activity_line = frame
+        .active_frame_lines
+        .iter()
+        .find(|line| line.plain_text().contains("working"))
+        .expect("activity line present");
+    assert_eq!(activity_line.spans.len(), 3);
+    assert_eq!(
+        activity_line.spans[0].style.fg,
+        Some(core.theme.palette.warning)
+    );
+    assert_eq!(activity_line.spans[1].style.fg, None);
+    assert_eq!(
+        activity_line.spans[2].style.fg,
+        Some(core.theme.palette.muted)
+    );
+}
+
+/// Issue #27: the HUD line sits directly above the composer with no blank
+/// line between them.
+#[test]
+fn working_hud_sits_directly_above_composer_with_no_blank_line() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    let frame = core.render_visual_canvas(80);
+    let lines = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let hud_row = lines
+        .iter()
+        .position(|line| line.contains("working"))
+        .expect("HUD row present");
+    let composer_row = lines
+        .iter()
+        .enumerate()
+        .skip(hud_row + 1)
+        .find(|(_, line)| line.starts_with('▌'))
+        .map(|(index, _)| index)
+        .expect("composer row present");
+    assert_eq!(
+        composer_row,
+        hud_row + 1,
+        "no blank row between the HUD and the composer: lines: {lines:?}"
+    );
 }
 
 #[test]
@@ -2786,7 +3423,7 @@ fn interrupted_live_status_replaces_working_affordance() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("■ interrupted — tell euler what to do differently"));
-    assert!(!contents.contains("⠧ working"));
+    assert!(!contents.contains("⠋ working"));
 }
 
 #[test]
@@ -2859,9 +3496,11 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     wait_for_idle(&mut core);
 
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
+    // Footer v2 (#48): two hard-edged clusters, empty middle, no branch on
+    // the right (there is none here — non-git fixture cwd) and no `?` fill.
     assert_eq!(
         rendered,
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · echo · ctx 12% · ?"
+        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
     );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
@@ -2883,14 +3522,14 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · echo · ctx 12% · ?"
+        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · other · ctx ?% · ?"
+        format!("  / commands · /tmp/euler{}other · ctx ?%", " ".repeat(80))
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -2899,7 +3538,7 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · other · ctx 13% · ?"
+        format!("  / commands · /tmp/euler{}other · ctx 13%", " ".repeat(79))
     );
 }
 
@@ -2913,7 +3552,7 @@ fn patch_approval_modal_renders_diff_and_prompt() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("Edit file?"));
-    assert!(contents.contains("Approval required"));
+    assert!(!contents.contains("Approval required"));
     assert!(contents.contains("fs-write · cwd"));
     assert!(contents.contains("note.txt"));
     assert!(contents.contains("alpha"));
@@ -2929,15 +3568,59 @@ fn patch_approval_modal_renders_diff_and_prompt() {
         visual.contains("write scope note.txt"),
         "visual: {visual:?}"
     );
-    assert!(visual.contains("ran-before 0×"), "visual: {visual:?}");
+    // v2.1 (§7b): unknown/zero fields are omitted, not padded with "ran-before 0×".
+    assert!(!visual.contains("ran-before"), "visual: {visual:?}");
     assert!(contents.contains("y  Allow once"));
-    assert!(contents.contains("Allow once (default selection)"));
+    assert!(!contents.contains("(default selection)"));
     assert!(contents.contains("a  Allow fs-write"));
     assert!(contents.contains("p  Allow fs-write"));
     assert!(contents.contains("n/esc  Deny"));
     assert!(contents.contains("Deny with instructions"));
-    assert!(contents.contains("hint: every decision is logged"));
+    assert!(!contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
+}
+
+#[test]
+fn patch_approval_modal_has_blank_line_before_options_and_gold_selection() {
+    let mut core = core();
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    let lines = core
+        .visual_canvas_frame(80)
+        .active_frame_lines
+        .into_iter()
+        .collect::<Vec<_>>();
+    let plain = lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let options_row = plain
+        .iter()
+        .position(|line| line.contains("y  Allow once"))
+        .expect("options row present");
+    assert!(
+        plain[options_row - 1].trim().is_empty()
+            || plain[options_row - 1].trim_matches(['│', ' ']).is_empty(),
+        "a blank line should separate the command block from the options: {plain:?}"
+    );
+
+    let selected_style = lines[options_row]
+        .spans
+        .iter()
+        .find(|span| span.text.as_str().contains("Allow once"))
+        .expect("selected span")
+        .style;
+    assert_eq!(
+        selected_style.fg,
+        Some(core.theme.palette.warning),
+        "the default-selected option should use gold text"
+    );
+    assert_eq!(
+        selected_style.bg,
+        Some(core.theme.palette.selection),
+        "the default-selected option should use the select-bg token"
+    );
 }
 
 #[test]
@@ -2955,12 +3638,9 @@ fn patch_approval_modal_clears_full_rows_behind_modal() {
     let contents = terminal.backend().screen_contents();
     for (needle, expected) in [
         ("Edit file?", "Edit file?"),
-        ("Approval required", "Approval required"),
         ("fs-write · cwd", "fs-write · cwd"),
-        (
-            "hint: every decision is logged",
-            "hint: every decision is logged",
-        ),
+        ("y  Allow once", "y  Allow once"),
+        ("n/esc  Deny", "n/esc  Deny"),
     ] {
         let line = contents
             .lines()
@@ -3357,7 +4037,7 @@ fn ctrl_f_opens_read_only_transcript_search() {
     core.handle_input(key(KeyCode::Char('x')));
     assert!(matches!(core.bottom.owner(), BottomOwner::Search(_)));
     // Search must not clear fold state.
-    assert!(core.expanded_artifact_keys.is_empty());
+    assert!(!core.tool_output_expanded);
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
     assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
@@ -3390,6 +4070,10 @@ fn timestamps_toggle_persists_and_logs_confirmation() {
         text.contains("timestamps hidden"),
         "expected confirmation in transcript: {text}"
     );
+    assert!(
+        !text.contains("ui:"),
+        "the /timestamps confirmation is a neutral notice, not a \"ui:\" error: {text}"
+    );
     assert_eq!(
         crate::model_preference::load_timestamps_preference(&preference_path),
         crate::model_preference::TimestampsPreferenceLoad::Loaded(false)
@@ -3400,6 +4084,70 @@ fn timestamps_toggle_persists_and_logs_confirmation() {
         CoreEffect::Render
     );
     assert!(core.show_timestamp_gutter);
+}
+
+#[test]
+fn toggled_on_timestamp_gutter_stamps_every_event_first_row() {
+    // Review v2 §6: the opt-in gutter must show every event's real
+    // provenance time, not a blank column — this is the production
+    // visual-canvas path (real EventEnvelope timestamps), not a bare
+    // TranscriptItem fixture.
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+    core.drain_finalized_visual_lines(80);
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::USER_MESSAGE,
+        object([("content", "hi".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "hello there".into())]),
+    )));
+
+    let lines = core
+        .drain_finalized_visual_lines(80)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let user_row = lines
+        .iter()
+        .position(|line| line.contains("hi"))
+        .expect("user row");
+    let answer_row = lines
+        .iter()
+        .position(|line| line.contains("hello there"))
+        .expect("answer row");
+
+    for (label, row) in [("user", user_row), ("answer", answer_row)] {
+        let line = &lines[row];
+        let stamp: String = line.chars().take(8).collect();
+        assert!(
+            looks_like_hh_mm_ss(&stamp),
+            "{label} row should stamp a real HH:MM:SS, not a blank gutter: {line:?}"
+        );
+    }
+}
+
+fn looks_like_hh_mm_ss(stamp: &str) -> bool {
+    let chars: Vec<char> = stamp.chars().collect();
+    chars.len() == 8
+        && chars[0].is_ascii_digit()
+        && chars[1].is_ascii_digit()
+        && chars[2] == ':'
+        && chars[3].is_ascii_digit()
+        && chars[4].is_ascii_digit()
+        && chars[5] == ':'
+        && chars[6].is_ascii_digit()
+        && chars[7].is_ascii_digit()
 }
 
 #[test]
