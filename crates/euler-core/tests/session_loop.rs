@@ -1078,7 +1078,9 @@ fn denied_shell_permission_records_decision_and_does_not_execute() {
             .and_then(serde_json::Value::as_bool),
         Some(false)
     );
-    assert_eq!(payload_str(result, "error"), Some("permission denied"));
+    assert!(
+        payload_str(result, "error").is_some_and(|error| error.starts_with("permission denied"))
+    );
     let assistant = session
         .events()
         .iter()
@@ -1131,7 +1133,13 @@ fn denied_shell_permission_short_circuits_same_capability_repeat_in_same_turn() 
             .and_then(serde_json::Value::as_bool),
         Some(false)
     );
-    assert_eq!(payload_str(repeated, "error"), Some("permission denied"));
+    let repeated_error = payload_str(repeated, "error").expect("repeated error");
+    assert!(repeated_error.starts_with("permission denied"));
+    // The auto-denied repeat teaches the model the denial is turn-scoped.
+    assert!(
+        repeated_error.contains("denied earlier this turn"),
+        "auto-denied result must teach turn scope: {repeated_error}"
+    );
     let assistant = find_kind(session.events(), EventKind::ASSISTANT_MESSAGE);
     assert_eq!(payload_str(assistant, "content"), Some("done"));
 }
@@ -1449,7 +1457,8 @@ fn denying_direct_apply_patch_writes_nothing() {
 
     assert_eq!(payload_str(prompt, "capability"), Some("fs-write"));
     assert_eq!(payload_str(prompt, "reason"), Some("tool apply_patch"));
-    assert_eq!(payload_str(tool_result, "error"), Some("permission denied"));
+    assert!(payload_str(tool_result, "error")
+        .is_some_and(|error| error.starts_with("permission denied")));
     assert!(!events
         .iter()
         .any(|event| event.kind.as_str() == EventKind::FILE_CHANGE));
@@ -1839,7 +1848,8 @@ fn denying_run_shell_apply_patch_intercept_writes_nothing() {
 
     assert_eq!(payload_str(prompt, "capability"), Some("fs-write"));
     assert_eq!(payload_str(prompt, "reason"), Some("tool apply_patch"));
-    assert_eq!(payload_str(tool_result, "error"), Some("permission denied"));
+    assert!(payload_str(tool_result, "error")
+        .is_some_and(|error| error.starts_with("permission denied")));
     assert!(!events
         .iter()
         .any(|event| event.kind.as_str() == EventKind::FILE_CHANGE));
