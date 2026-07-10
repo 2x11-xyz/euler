@@ -6737,7 +6737,9 @@ fn extract_bridge_committed_rows(output: &[u8]) -> Vec<String> {
             let stripped = strip_sgr(header);
             let mut ok = stripped.starts_with('\u{1b}');
             if ok {
-                let body = stripped.trim_start_matches('\u{1b}').trim_start_matches('[');
+                let body = stripped
+                    .trim_start_matches('\u{1b}')
+                    .trim_start_matches('[');
                 ok = body
                     .trim_end_matches('H')
                     .chars()
@@ -7038,7 +7040,9 @@ fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
     for output in ["alpha-one", "beta-two", "gamma-three"] {
         let occurrences = final_state
             .lines()
-            .filter(|line| line.contains(output) && !line.contains("bash $") && !line.contains("run the three"))
+            .filter(|line| {
+                line.contains(output) && !line.contains("bash $") && !line.contains("run the three")
+            })
             .count();
         if occurrences > 1 {
             failures.push(format!("output `{output}` duplicated ({occurrences}×)"));
@@ -7065,7 +7069,6 @@ fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
         failures.join("\n")
     );
 }
-
 
 #[test]
 fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
@@ -7107,11 +7110,7 @@ fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
     );
     assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
     tui.write("overview please\r");
-    assert!(
-        tui.wait_for_screen("Paragraph 6:"),
-        "{}",
-        tui.screen_text()
-    );
+    assert!(tui.wait_for_screen("Paragraph 6:"), "{}", tui.screen_text());
     // Simulate a drag: many rapid width ticks in both directions.
     for cols in [96, 92, 88, 84, 80, 76, 72, 76, 82, 90, 100] {
         tui.resize(24, cols);
@@ -7140,10 +7139,7 @@ fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
     let mut failures = Vec::new();
     for paragraph in 1..=6 {
         let needle = format!("Paragraph {paragraph}:");
-        let occurrences = all_rows
-            .iter()
-            .filter(|row| row.contains(&needle))
-            .count();
+        let occurrences = all_rows.iter().filter(|row| row.contains(&needle)).count();
         if occurrences > 2 {
             failures.push(format!(
                 "`{needle}` bridge-committed {occurrences}× (want ≤2)"
