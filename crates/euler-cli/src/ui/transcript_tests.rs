@@ -1935,6 +1935,42 @@ fn disabled_extension_notice_renders_every_entrance_without_dedup() {
 }
 
 #[test]
+fn consecutive_notice_items_stack_without_separating_blank_lines() {
+    // Review v2 §3/§6: a run of Notice items (e.g. extension toggle
+    // confirmations firing back to back) reads as one stacked block, not one
+    // blank-separated event per line.
+    let theme = Theme::default();
+    let items = vec![
+        TranscriptItem::Notice("extension enabled: causal-dag".to_owned()),
+        TranscriptItem::Notice("extension enabled: code-swarm".to_owned()),
+        TranscriptItem::AssistantMessage("unrelated answer".to_owned()),
+    ];
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 80));
+    let first = texts
+        .iter()
+        .position(|line| line.contains("causal-dag"))
+        .expect("first notice present");
+    let second = texts
+        .iter()
+        .position(|line| line.contains("code-swarm"))
+        .expect("second notice present");
+    assert_eq!(
+        second,
+        first + 1,
+        "no blank line between consecutive notices: {texts:?}"
+    );
+
+    let after_second = texts
+        .get(second + 1)
+        .expect("a row follows the second notice");
+    assert!(
+        after_second.trim().is_empty(),
+        "a blank line still separates the notice run from the next item: {texts:?}"
+    );
+}
+
+#[test]
 fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
     let theme = Theme::default();
     let long_path = "crates/euler-cli/src/ui/transcript/very/deep/path/with spaces/cells.rs";
@@ -3307,7 +3343,10 @@ fn vt100_renders_absolute_time_duration_and_turn_footer() {
     ];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 80, 6);
+    // Inline elapsed/turn-footer decorations are toggle-gated in the real
+    // app (review v2 §6); opt in here to exercise them directly.
+    let contents =
+        crate::ui::text::with_timestamp_gutter(true, || rendered_screen(&events, &theme, 80, 6));
 
     let start = local_hms("2026-06-20T14:32:07.000Z");
     let done = local_hms("2026-06-20T14:34:00.000Z");
@@ -3332,7 +3371,8 @@ fn vt100_skips_invalid_timestamps_without_breaking_transcript() {
     ];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 80, 6);
+    let contents =
+        crate::ui::text::with_timestamp_gutter(true, || rendered_screen(&events, &theme, 80, 6));
 
     assert!(contents.contains("bad time"));
     assert!(!contents.contains("not-a-time"));
@@ -3356,7 +3396,8 @@ fn vt100_clamps_out_of_order_timestamp_duration_to_zero() {
     ];
     let theme = Theme::default();
 
-    let contents = rendered_screen(&events, &theme, 80, 6);
+    let contents =
+        crate::ui::text::with_timestamp_gutter(true, || rendered_screen(&events, &theme, 80, 6));
 
     let earlier = local_hms("2026-06-20T14:32:07.000Z");
     assert!(contents.contains(&format!("earlier · +0s · {earlier}")));

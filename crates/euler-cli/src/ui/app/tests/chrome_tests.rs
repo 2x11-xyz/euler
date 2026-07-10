@@ -1,6 +1,17 @@
 use super::super::visual::render_finalized_visual_items_with_offsets;
 use super::*;
+use crate::ui::transcript::ProjectedEntry;
 use crate::ui::visual_canvas::CursorTarget;
+
+/// Test-only helper: wrap bare items as untimed entries for callers of
+/// `render_finalized_visual_items_with_offsets`, which (in production)
+/// always receives real per-item timing from the visual canvas.
+fn untimed_entries(items: Vec<TranscriptItem>) -> Vec<ProjectedEntry> {
+    items
+        .into_iter()
+        .map(|item| ProjectedEntry { item, timing: None })
+        .collect()
+}
 
 #[test]
 fn question_mark_help_overlay_is_global_only_for_idle_composer() {
@@ -76,7 +87,7 @@ fn empty_composer_prompt_has_breathing_room_above_statusline() {
     assert_eq!(areas.notice.height, 0);
     assert!(screen_row(&contents, areas.bottom.y).starts_with("▌ "));
     let status = screen_row(&contents, areas.status.y);
-    assert!(status.starts_with("  ⏎ send · / commands · ctrl+o expand"));
+    assert!(status.starts_with("  / commands"));
     assert!(status.contains(" · echo · ctx ?% · "));
     assert!(!status.contains("Context ?% used"));
 }
@@ -309,7 +320,7 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     assert!(terminal
         .backend()
         .screen_contents()
-        .contains("Approval required"));
+        .contains("Run command?"));
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('y'))),
@@ -538,9 +549,9 @@ fn finalized_prompt_and_answer_batches_keep_one_rhythm_row() {
 fn finalized_wrapped_prompt_uses_continuous_user_rail() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::UserMessage(
+        &untimed_entries(vec![TranscriptItem::UserMessage(
             "alpha beta gamma delta epsilon".to_owned(),
-        )],
+        )]),
         &theme,
         28,
         TOOL_CALL_MAX_LINES,
@@ -574,7 +585,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     let table = "| Layer | Responsibility | Repo location |\n|---|---|---|\n| CLI/TUI layer | User-facing command-line and Ratatui transcript composer status UX | euler-cli |\n";
 
     let narrow = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::AssistantMessage(table.to_owned())],
+        &untimed_entries(vec![TranscriptItem::AssistantMessage(table.to_owned())]),
         &theme,
         44,
         TOOL_CALL_MAX_LINES,
@@ -611,7 +622,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
     );
 
     let wide = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::AssistantMessage(table.to_owned())],
+        &untimed_entries(vec![TranscriptItem::AssistantMessage(table.to_owned())]),
         &theme,
         100,
         TOOL_CALL_MAX_LINES,
@@ -692,11 +703,11 @@ fn finalized_multi_column_table_stays_stacked_after_terminal_resize() {
 fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[
+        &untimed_entries(vec![
             TranscriptItem::UserMessage("hi".to_owned()),
             TranscriptItem::AssistantMessage("Hi! How can I help?".to_owned()),
             TranscriptItem::WorkedDuration("5s".to_owned()),
-        ],
+        ]),
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
@@ -731,14 +742,14 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
 fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
     let theme = Theme::default();
     let lines = render_finalized_visual_items_with_offsets(
-        &[TranscriptItem::ToolRun {
+        &untimed_entries(vec![TranscriptItem::ToolRun {
             command: "ls -la".to_owned(),
             ok: true,
             error: String::new(),
             output: "exit 0\nfile".to_owned(),
             exit_code: Some(0),
             grant_source: None,
-        }],
+        }]),
         &theme,
         80,
         TOOL_CALL_MAX_LINES,
@@ -1668,7 +1679,7 @@ fn patch_approval_hides_completed_read_file_activity() {
         .draw(|frame| core.render(frame))
         .expect("patch approval draw");
     let contents = terminal.backend().screen_contents();
-    assert!(contents.contains("Approval required"));
+    assert!(contents.contains("Edit file?"));
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("read_file completed"));
     assert!(!contents.contains("raw transcript source"));
@@ -1683,10 +1694,7 @@ fn patch_approval_remains_visible_and_active_when_question_mark_is_pressed() {
     terminal
         .draw(|frame| core.render(frame))
         .expect("draw before");
-    assert!(terminal
-        .backend()
-        .screen_contents()
-        .contains("Approval required"));
+    assert!(terminal.backend().screen_contents().contains("Edit file?"));
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('?'))),
@@ -1699,12 +1707,9 @@ fn patch_approval_remains_visible_and_active_when_question_mark_is_pressed() {
         .draw(|frame| core.render(frame))
         .expect("draw after");
     let contents = terminal.backend().screen_contents();
-    assert!(
-        contents.contains("Approval required"),
-        "contents:\n{contents}"
-    );
-    // Height-tight frames may clip the trailing hint line; the decision
-    // keys are the durable affordance that must remain visible.
+    assert!(contents.contains("Edit file?"), "contents:\n{contents}");
+    // Height-tight frames may clip the trailing rows; the decision keys are
+    // the durable affordance that must remain visible.
     assert!(
         contents.contains("y  Allow once") && contents.contains("n/esc  Deny"),
         "contents:\n{contents}"

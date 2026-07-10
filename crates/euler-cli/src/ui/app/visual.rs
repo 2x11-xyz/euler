@@ -3,24 +3,27 @@ use crate::ui::transcript;
 
 impl AppCore {
     pub(super) fn queue_finalized_visual_output_for_latest_event(&mut self) {
-        let Some(kind) = self
-            .transcript
-            .events()
-            .last()
-            .map(|event| event.kind.as_str().to_owned())
-        else {
+        let Some(event) = self.transcript.events().last() else {
             return;
         };
-        if kind == EventKind::MODEL_DELTA {
+        if event.kind.as_str() == EventKind::MODEL_DELTA {
             return;
         }
+        let ts = event.ts.clone();
         if let Some(item) = transcript::project_latest_event_for_ui(self.transcript.events()) {
-            self.push_finalized_visual_item(item);
+            self.push_finalized_visual_item_at(item, &ts);
         }
     }
 
     pub(super) fn push_finalized_visual_item(&mut self, item: TranscriptItem) {
         self.visual_canvas.push_finalized(item);
+    }
+
+    /// Push a finalized item stamped from its source event's real
+    /// provenance time (review v2 §6) rather than the wall-clock fallback
+    /// `push_finalized_visual_item` uses for synthetic UI items.
+    fn push_finalized_visual_item_at(&mut self, item: TranscriptItem, ts: &str) {
+        self.visual_canvas.push_finalized_with_ts(item, Some(ts));
     }
 
     pub(crate) fn set_committed_history_items(&mut self, committed: usize) {
@@ -263,7 +266,16 @@ impl AppCore {
             let indent = "  ";
             format!("{indent}{}", search.status_line())
         } else {
-            status_line_text(&self.status, &self.token_usage, self.turn_status(), width)
+            let has_foldable = self
+                .visual_canvas
+                .has_foldable_artifact(TOOL_CALL_MAX_LINES);
+            status_line_text(
+                &self.status,
+                &self.token_usage,
+                self.turn_status(),
+                has_foldable,
+                width,
+            )
         };
         CanvasStatusSnapshot::new(target, CanvasLine::styled_lossy(line, TextRole::Status))
     }
@@ -331,14 +343,14 @@ fn push_visual_spacer_block(blocks: &mut Vec<VisualBlock>) {
 }
 
 pub(super) fn render_finalized_visual_items_with_offsets(
-    items: &[TranscriptItem],
+    entries: &[transcript::ProjectedEntry],
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
     expanded_artifact_keys: &std::collections::HashSet<String>,
 ) -> (Vec<CanvasLine>, Vec<usize>) {
-    let (lines, item_end_offsets) = transcript::render_items_for_history_with_offsets(
-        items,
+    let (lines, item_end_offsets) = transcript::render_entries_for_history_with_offsets(
+        entries,
         theme,
         width,
         output_limit_lines,

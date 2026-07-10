@@ -34,11 +34,11 @@ impl AppCore {
             .transpose();
         self.rebuild_bottom_surface();
         match persisted {
-            Ok(_) => self.summary_item(format!(
-                "✓ code-swarm → {count} models · saved as euler default"
+            Ok(_) => self.teach_notice(format!(
+                "code-swarm → {count} models · saved as euler default"
             )),
-            Err(error) => self.summary_item(format!(
-                "✓ code-swarm → {count} models · session only (save failed: {error})"
+            Err(error) => self.teach_notice(format!(
+                "code-swarm → {count} models · session only (save failed: {error})"
             )),
         }
     }

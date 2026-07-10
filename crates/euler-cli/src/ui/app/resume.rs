@@ -21,11 +21,11 @@ impl AppCore {
                 return CoreEffect::Render;
             }
             AppState::Empty => {
-                return self.notice_item("resume needs an active session".to_owned())
+                return self.teach_notice("resume needs an active session".to_owned())
             }
         };
         if current_session_id == session_id {
-            return self.notice_item(format!("already using session {session_id}"));
+            return self.teach_notice(format!("already using session {session_id}"));
         }
 
         match self.build_tui_resume(&session_id) {

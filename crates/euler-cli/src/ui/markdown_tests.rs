@@ -350,3 +350,101 @@ fn table_v1_flattens_cell_styles_at_truncation_boundary() {
         .iter()
         .any(|span| span.content.contains("code") && span.style == theme.scopes.markup.code));
 }
+
+#[test]
+fn grid_table_has_one_blank_line_between_data_rows_and_no_rule_above_or_below() {
+    // Review v2 §10/10b: only the header separator renders — nothing above
+    // the header, nothing after the last row — and one blank line separates
+    // each pair of data rows so wrapped cells still read as a single block.
+    let theme = Theme::default_dark();
+    let lines = strings(render_agent_markdown(
+        "| Layer | Responsibility |\n|---|---|\n| CLI | Terminal UX |\n| Core | Session loop |\n| Provider | LLM APIs |\n",
+        &theme,
+        60,
+    ));
+
+    assert_eq!(
+        lines.iter().filter(|line| line.contains('─')).count(),
+        1,
+        "exactly one rule (the header separator): {lines:?}"
+    );
+    assert!(
+        !lines[0].contains('─'),
+        "no rule above the header: {lines:?}"
+    );
+    assert!(
+        !lines.last().is_some_and(|line| line.contains('─')),
+        "no rule after the last row: {lines:?}"
+    );
+
+    let cli_row = lines
+        .iter()
+        .position(|line| line.contains("CLI"))
+        .expect("CLI row");
+    let core_row = lines
+        .iter()
+        .position(|line| line.contains("Core"))
+        .expect("Core row");
+    let provider_row = lines
+        .iter()
+        .position(|line| line.contains("Provider"))
+        .expect("Provider row");
+
+    assert_eq!(
+        lines[cli_row + 1].trim(),
+        "",
+        "a blank line separates the first two data rows: {lines:?}"
+    );
+    assert_eq!(core_row, cli_row + 2, "rows: {lines:?}");
+    assert_eq!(
+        lines[core_row + 1].trim(),
+        "",
+        "a blank line separates the next two data rows: {lines:?}"
+    );
+    assert_eq!(provider_row, core_row + 2, "rows: {lines:?}");
+}
+
+#[test]
+fn grid_table_header_is_cream_bold_and_first_column_is_dim() {
+    // Review v2 §10b: header text renders cream bold; the first column
+    // (a row label) renders dim, including in the header row's other
+    // columns which stay bold.
+    let theme = Theme::default_dark();
+    let lines = render_agent_markdown(
+        "| Layer | Responsibility |\n|---|---|\n| CLI | Terminal UX |\n",
+        &theme,
+        60,
+    );
+    let spans = all_spans(&lines);
+
+    let header_first_col = spans
+        .iter()
+        .find(|span| span.content.trim() == "Layer")
+        .expect("header first-column span");
+    assert_eq!(
+        header_first_col.style,
+        theme
+            .transcript
+            .assistant
+            .add_modifier(ratatui::style::Modifier::BOLD),
+        "header row stays cream bold across every column"
+    );
+
+    let body_first_col = spans
+        .iter()
+        .find(|span| span.content.trim() == "CLI")
+        .expect("body first-column span");
+    assert_eq!(
+        body_first_col.style, theme.transcript.muted,
+        "the first column reads as a row label — dim"
+    );
+
+    let body_second_col = spans
+        .iter()
+        .find(|span| span.content.contains("Terminal UX"))
+        .expect("body second-column span");
+    assert_eq!(
+        body_second_col.style, theme.transcript.assistant,
+        "non-first columns keep the plain body style"
+    );
+}

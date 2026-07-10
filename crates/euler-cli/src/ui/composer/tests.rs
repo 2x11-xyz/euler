@@ -28,9 +28,9 @@ mod composer_tests {
             [ComposerLine::Draft {
                 prompt: true,
                 text,
-                ghost: true,
+                ghost: false,
                 ..
-            }] if text == "message euler · / commands"
+            }] if text.is_empty()
         ));
 
         let mut typed = ComposerDraft::new();
@@ -243,7 +243,7 @@ mod composer_tests {
         assert!(contents.contains("line6"));
         assert!(!contents.contains("line1"));
         let screen_lines = contents.lines().collect::<Vec<_>>();
-        assert!(screen_lines[usize::from(height)].contains("e???? · echo · ctx ?% · ?"));
+        assert!(screen_lines[usize::from(height)].contains("echo · ctx ?% · ?"));
         assert!(!screen_lines[usize::from(height)].contains("Context ?% used"));
     }
 

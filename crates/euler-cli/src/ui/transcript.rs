@@ -207,10 +207,63 @@ pub(crate) struct EventTiming {
     since_start: Option<String>,
 }
 
+#[cfg(test)]
+impl EventTiming {
+    pub(crate) fn since_previous_for_test(&self) -> Option<&str> {
+        self.since_previous.as_deref()
+    }
+
+    pub(crate) fn since_start_for_test(&self) -> Option<&str> {
+        self.since_start.as_deref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectedEntry {
     pub(crate) item: TranscriptItem,
     pub(crate) timing: Option<EventTiming>,
+}
+
+/// Running reference clock for stamping ledger rows: tracks the first and
+/// most recent stamped moment so each new stamp can report both its absolute
+/// time and its elapsed distance from those anchors. Shared by the bulk
+/// event-history projection and the incremental visual-canvas push path so
+/// both produce the same shape of `EventTiming`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TimingClock {
+    first: Option<DateTime<Local>>,
+    previous: Option<DateTime<Local>>,
+}
+
+impl TimingClock {
+    pub(crate) fn stamp(&mut self, current: DateTime<Local>) -> EventTiming {
+        let first_time = *self.first.get_or_insert(current);
+        let timing = EventTiming {
+            absolute: current.format("%H:%M:%S").to_string(),
+            since_previous: self.previous.map(|before| format_elapsed(before, current)),
+            since_start: Some(format_elapsed(first_time, current)),
+        };
+        self.previous = Some(current);
+        timing
+    }
+
+    pub(crate) fn stamp_at(&mut self, ts: &str) -> Option<EventTiming> {
+        parse_event_time(ts).map(|current| self.stamp(current))
+    }
+}
+
+/// Whether a ledger row should carry a timestamp gutter stamp. Live control
+/// chrome (permission ask panel, turn separators, worked banners, the
+/// banner itself) is not a ledger event: no timestamp, no hairline.
+pub(crate) fn item_wants_timestamp(item: &TranscriptItem) -> bool {
+    !matches!(
+        item,
+        TranscriptItem::Banner { .. }
+            | TranscriptItem::TurnSeparator
+            | TranscriptItem::WorkedDuration(_)
+            | TranscriptItem::TurnRecap { .. }
+            | TranscriptItem::PermissionAsk { .. }
+    )
 }
 
 pub(crate) fn artifact_key_for_index(index: usize) -> String {
@@ -323,6 +376,27 @@ impl TranscriptState {
         }
         items.extend(self.live_reasoning_item());
         items
+    }
+
+    /// Same projection as `items`, additionally reporting each item's real
+    /// provenance time. Used to seed the visual canvas with honest
+    /// timestamps on a full rebuild (resume, new session, rollback) instead
+    /// of the blank gutter a plain `items()` + fresh push would produce.
+    ///
+    /// Also returns the `TimingClock` as of the last stamped entry, so the
+    /// caller can reseed the visual canvas's own clock: without this, the
+    /// first item pushed after the rebuild would restart `since_start` at
+    /// ~0 and report `since_previous` as `None` instead of continuing the
+    /// session's real timeline.
+    pub(crate) fn timed_items(&self) -> (Vec<ProjectedEntry>, TimingClock) {
+        let (mut entries, clock) = project_tui_entries_with_clock(&self.events);
+        if !self.live_tail.is_empty() {
+            entries.push(ProjectedEntry {
+                item: TranscriptItem::AssistantMessage(self.live_tail.clone()),
+                timing: None,
+            });
+        }
+        (entries, clock)
     }
 
     #[cfg(test)]
@@ -627,7 +701,11 @@ pub(crate) fn render_items_for_history_with_limit(
 }
 
 /// History render that also reports each item's cumulative end-row offset
-/// (native-scrollback commit boundaries; see terminal.rs).
+/// (native-scrollback commit boundaries; see terminal.rs). Superseded in
+/// production by `render_entries_for_history_with_offsets` (which threads
+/// real timing instead of discarding it to `None`); kept for tests that
+/// exercise bare-item offsets/expansion without needing timing.
+#[cfg(test)]
 pub(crate) fn render_items_for_history_with_offsets(
     items: &[TranscriptItem],
     theme: &Theme,
@@ -646,6 +724,30 @@ pub(crate) fn render_items_for_history_with_offsets(
         width,
         TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
         expanded_artifact_keys,
+        true,
+    )
+}
+
+/// Like `render_items_for_history_with_offsets`, but the caller already has
+/// each item's real timing (the visual-canvas finalized history) instead of
+/// a bare item list — this is the path that actually stamps the timestamp
+/// gutter, since it never discards `entry.timing` to `None`. The trailing
+/// "elapsed since first event" turn footer is suppressed here: the visual
+/// canvas's history is the whole growing session, never one bounded batch.
+pub(crate) fn render_entries_for_history_with_offsets(
+    entries: &[ProjectedEntry],
+    theme: &Theme,
+    width: u16,
+    output_limit_lines: usize,
+    expanded_artifact_keys: &std::collections::HashSet<String>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    render::render_projected_entries_with_expansion_and_offsets(
+        entries,
+        theme,
+        width,
+        TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+        expanded_artifact_keys,
+        false,
     )
 }
 
@@ -700,11 +802,31 @@ fn project_live_event(event: &EventEnvelope) -> Option<TranscriptItem> {
 }
 
 fn project_tui_items(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
+    project_tui_entries(events)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect()
+}
+
+/// Same projection as `project_tui_items`, additionally reporting each
+/// item's real provenance time (from the source event's `ts`) as a running
+/// `TimingClock` stamp. This is the single source of truth for the
+/// opt-in timestamp gutter (review v2 §6): every projected item, other than
+/// the synthetic `TurnSeparator`, carries its own event's time — no blank
+/// column, no restamping-from-toggle-point-forward.
+pub(crate) fn project_tui_entries(events: &[EventEnvelope]) -> Vec<ProjectedEntry> {
+    project_tui_entries_with_clock(events).0
+}
+
+/// Same as `project_tui_entries`, additionally returning the `TimingClock`
+/// as of the last stamped entry (see `TranscriptState::timed_items`).
+fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEntry>, TimingClock) {
     let mut calls = HashMap::new();
-    let mut items = Vec::new();
+    let mut entries = Vec::new();
     let mut user_turns = 0usize;
     let mut child_agents: HashMap<String, String> = HashMap::new();
     let mut spawn_times: HashMap<String, String> = HashMap::new();
+    let mut clock = TimingClock::default();
     for (index, event) in events.iter().enumerate() {
         if event.kind.as_str() == EventKind::AGENT_SPAWN {
             if let Some(child) = payload_string(event, "child_agent_id") {
@@ -722,23 +844,28 @@ fn project_tui_items(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
         }
         if let Some(item) = model_result_fallback_item(event) {
             if !model_result_has_matching_assistant_message(events, index, &item) {
-                push_tui_item(&mut items, item);
+                let timing = clock.stamp_at(&event.ts);
+                push_tui_entry(&mut entries, item, timing);
             }
             continue;
         }
         let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
         if let Some(item) = project_tui_event_with_context_and_spawn_ts(event, &mut calls, spawn_ts)
         {
+            let timing = clock.stamp_at(&event.ts);
             if matches!(item, TranscriptItem::UserMessage(_)) {
                 if user_turns > 0 {
-                    items.push(TranscriptItem::TurnSeparator);
+                    entries.push(ProjectedEntry {
+                        item: TranscriptItem::TurnSeparator,
+                        timing: None,
+                    });
                 }
                 user_turns += 1;
             }
-            push_tui_item(&mut items, item);
+            push_tui_entry(&mut entries, item, timing);
         }
     }
-    items
+    (entries, clock)
 }
 
 fn project_tui_event_with_context(
@@ -842,6 +969,54 @@ fn push_tui_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) {
         }
     }
     items.push(item);
+}
+
+/// Same merge rules as `push_tui_item`, additionally carrying each entry's
+/// timing. On an Exploration/Companion merge, the entry keeps its most
+/// recent contributing timing (the block is still "live" as of that event).
+fn push_tui_entry(
+    entries: &mut Vec<ProjectedEntry>,
+    item: TranscriptItem,
+    timing: Option<EventTiming>,
+) {
+    if let TranscriptItem::Exploration { summaries } = item {
+        if let Some(ProjectedEntry {
+            item: TranscriptItem::Exploration {
+                summaries: existing,
+            },
+            timing: existing_timing,
+        }) = entries.last_mut()
+        {
+            for summary in summaries {
+                if !existing.contains(&summary) {
+                    existing.push(summary);
+                }
+            }
+            if timing.is_some() {
+                *existing_timing = timing;
+            }
+            return;
+        }
+        entries.push(ProjectedEntry {
+            item: TranscriptItem::Exploration { summaries },
+            timing,
+        });
+        return;
+    }
+    if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
+        if let Some(entry) = entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.item.companion_spawn_event_id() == Some(spawn_event_id.as_str()))
+        {
+            let _ = merge_companion_item(&mut entry.item, item);
+            if timing.is_some() {
+                entry.timing = timing;
+            }
+            return;
+        }
+    }
+    entries.push(ProjectedEntry { item, timing });
 }
 
 fn model_result_fallback_item(event: &EventEnvelope) -> Option<TranscriptItem> {
@@ -1459,84 +1634,13 @@ impl Widget for TranscriptItemsWidget<'_> {
 
 #[cfg(test)]
 fn project_timed_events(events: &[EventEnvelope]) -> Vec<ProjectedEntry> {
-    let mut first = None;
-    let mut previous = None;
-    let mut entries = Vec::new();
-    let mut calls = HashMap::new();
-    let mut spawn_times = HashMap::new();
-
-    for event in events {
-        if event.kind.as_str() == EventKind::AGENT_SPAWN {
-            spawn_times.insert(event.id.clone(), event.ts.clone());
-        }
-        let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
-        if let Some(item) = project_tui_event_with_context_and_spawn_ts(event, &mut calls, spawn_ts)
-        {
-            let time = parse_event_time(&event.ts);
-            let timing = time.map(|current| {
-                let first_time = *first.get_or_insert(current);
-                let timing = EventTiming {
-                    absolute: current.format("%H:%M:%S").to_string(),
-                    since_previous: previous.map(|before| format_elapsed(before, current)),
-                    since_start: Some(format_elapsed(first_time, current)),
-                };
-                previous = Some(current);
-                timing
-            });
-            push_projected_entry(&mut entries, item, timing);
-        }
-    }
-
-    entries
+    // The timed projection is now the production path (review v2 §6): the
+    // test widget uses the exact same projector the visual canvas uses, so
+    // there is only one implementation to keep honest.
+    project_tui_entries(events)
 }
 
-#[cfg(test)]
-fn push_projected_entry(
-    entries: &mut Vec<ProjectedEntry>,
-    item: TranscriptItem,
-    timing: Option<EventTiming>,
-) {
-    if let TranscriptItem::Exploration { summaries } = item {
-        if let Some(ProjectedEntry {
-            item: TranscriptItem::Exploration {
-                summaries: existing,
-            },
-            timing: existing_timing,
-        }) = entries.last_mut()
-        {
-            for summary in summaries {
-                if !existing.contains(&summary) {
-                    existing.push(summary);
-                }
-            }
-            if timing.is_some() {
-                *existing_timing = timing;
-            }
-            return;
-        }
-        entries.push(ProjectedEntry {
-            item: TranscriptItem::Exploration { summaries },
-            timing,
-        });
-        return;
-    }
-    if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
-        if let Some(entry) = entries
-            .iter_mut()
-            .rev()
-            .find(|entry| entry.item.companion_spawn_event_id() == Some(spawn_event_id.as_str()))
-        {
-            let _ = merge_companion_item(&mut entry.item, item);
-            if timing.is_some() {
-                entry.timing = timing;
-            }
-            return;
-        }
-    }
-    entries.push(ProjectedEntry { item, timing });
-}
-
-fn parse_event_time(ts: &str) -> Option<DateTime<Local>> {
+pub(crate) fn parse_event_time(ts: &str) -> Option<DateTime<Local>> {
     DateTime::parse_from_rfc3339(ts)
         .ok()
         .map(|time| time.with_timezone(&Local))

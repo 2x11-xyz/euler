@@ -1769,6 +1769,21 @@ fn ctrl_o_without_foldable_artifact_is_noop_and_does_not_edit_composer() {
 }
 
 #[test]
+fn footer_ctrl_o_hint_only_appears_when_a_foldable_artifact_exists() {
+    let mut core = core();
+    core.push_finalized_visual_item(TranscriptItem::AssistantMessage("plain answer".to_owned()));
+
+    let without_fold = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(without_fold.contains("/ commands"));
+    assert!(!without_fold.contains("ctrl+o expand"));
+
+    core.push_finalized_visual_item(shell_artifact_with_lines(12));
+
+    let with_fold = core.canvas_status_snapshot(120).line.plain_text();
+    assert!(with_fold.contains("/ commands · ctrl+o expand"));
+}
+
+#[test]
 fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     let mut modal_core = core();
     modal_core.push_finalized_visual_item(shell_artifact_with_lines(12));
@@ -2368,7 +2383,33 @@ fn resume_picker_reports_empty_state_without_active_turn_language() {
         CoreEffect::Render
     );
 
-    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume needs an active session"));
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("resume needs an active session"));
+    assert!(
+        !text.contains("ui:"),
+        "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
+    );
+}
+
+#[test]
+fn resume_refusal_for_already_active_session_is_a_neutral_notice() {
+    let mut core = core();
+    let session_id = match &core.state {
+        AppState::Idle { session } => session.session_id().to_owned(),
+        _ => panic!("expected an idle session"),
+    };
+
+    assert_eq!(
+        core.resume_session_from_picker(session_id.clone()),
+        CoreEffect::Render
+    );
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains(&format!("already using session {session_id}")));
+    assert!(
+        !text.contains("ui:"),
+        "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
+    );
 }
 
 #[test]
@@ -2442,6 +2483,61 @@ fn accepting_resume_purges_prior_native_scrollback() {
     assert!(
         text.contains("1 events replayed · model context folded to stubs"),
         "text: {text}"
+    );
+}
+
+#[test]
+fn accepting_resume_restamps_replayed_history_when_timestamps_are_on() {
+    // Review v2 §6: a rebuild (resume, new session, rollback) must stamp
+    // every replayed event from its own provenance time — not leave the
+    // gutter blank until new events arrive.
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(".");
+    config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider);
+    let events = vec![event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "resumed content".into())]),
+    )];
+
+    core.accept_tui_resume(
+        "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned(),
+        TuiResume {
+            session,
+            channels,
+            events,
+            active_target: ModelTarget::new("fixture", "echo"),
+            display_label: "useful resumed name".to_owned(),
+            recovery_closure_appended: false,
+            warning_count: 0,
+            events_replayed: 1,
+        },
+    );
+
+    let lines = core
+        .drain_finalized_visual_lines(80)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+    let row = lines
+        .iter()
+        .position(|line| line.contains("resumed content"))
+        .expect("replayed row");
+    let stamp: String = lines[row].chars().take(8).collect();
+    assert!(
+        looks_like_hh_mm_ss(&stamp),
+        "replayed history should be restamped, not blank: {:?}",
+        lines[row]
     );
 }
 
@@ -2902,10 +2998,7 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     wait_for_idle(&mut core);
 
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
-    assert_eq!(
-        rendered,
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · echo · ctx 12% · ?"
-    );
+    assert_eq!(rendered, "  / commands · euler · echo · ctx 12% · ?");
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
     assert_eq!(core.token_usage.reasoning_tokens, Some(500));
@@ -2926,14 +3019,14 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · echo · ctx 12% · ?"
+        "  / commands · euler · echo · ctx 12% · ?"
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · other · ctx ?% · ?"
+        "  / commands · euler · other · ctx ?% · ?"
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -2942,7 +3035,7 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        "  ⏎ send · / commands · ctrl+o expand · euler · esion · other · ctx 13% · ?"
+        "  / commands · euler · other · ctx 13% · ?"
     );
 }
 
@@ -2956,7 +3049,7 @@ fn patch_approval_modal_renders_diff_and_prompt() {
 
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("Edit file?"));
-    assert!(contents.contains("Approval required"));
+    assert!(!contents.contains("Approval required"));
     assert!(contents.contains("fs-write · cwd"));
     assert!(contents.contains("note.txt"));
     assert!(contents.contains("alpha"));
@@ -2972,15 +3065,59 @@ fn patch_approval_modal_renders_diff_and_prompt() {
         visual.contains("write scope note.txt"),
         "visual: {visual:?}"
     );
-    assert!(visual.contains("ran-before 0×"), "visual: {visual:?}");
+    // v2.1 (§7b): unknown/zero fields are omitted, not padded with "ran-before 0×".
+    assert!(!visual.contains("ran-before"), "visual: {visual:?}");
     assert!(contents.contains("y  Allow once"));
-    assert!(contents.contains("Allow once (default selection)"));
+    assert!(!contents.contains("(default selection)"));
     assert!(contents.contains("a  Allow fs-write"));
     assert!(contents.contains("p  Allow fs-write"));
     assert!(contents.contains("n/esc  Deny"));
     assert!(contents.contains("Deny with instructions"));
-    assert!(contents.contains("hint: every decision is logged"));
+    assert!(!contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
+}
+
+#[test]
+fn patch_approval_modal_has_blank_line_before_options_and_gold_selection() {
+    let mut core = core();
+    core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));
+
+    let lines = core
+        .visual_canvas_frame(80)
+        .active_frame_lines
+        .into_iter()
+        .collect::<Vec<_>>();
+    let plain = lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let options_row = plain
+        .iter()
+        .position(|line| line.contains("y  Allow once"))
+        .expect("options row present");
+    assert!(
+        plain[options_row - 1].trim().is_empty()
+            || plain[options_row - 1].trim_matches(['│', ' ']).is_empty(),
+        "a blank line should separate the command block from the options: {plain:?}"
+    );
+
+    let selected_style = lines[options_row]
+        .spans
+        .iter()
+        .find(|span| span.text.as_str().contains("Allow once"))
+        .expect("selected span")
+        .style;
+    assert_eq!(
+        selected_style.fg,
+        Some(core.theme.palette.warning),
+        "the default-selected option should use gold text"
+    );
+    assert_eq!(
+        selected_style.bg,
+        Some(core.theme.palette.selection),
+        "the default-selected option should use the select-bg token"
+    );
 }
 
 #[test]
@@ -2998,12 +3135,9 @@ fn patch_approval_modal_clears_full_rows_behind_modal() {
     let contents = terminal.backend().screen_contents();
     for (needle, expected) in [
         ("Edit file?", "Edit file?"),
-        ("Approval required", "Approval required"),
         ("fs-write · cwd", "fs-write · cwd"),
-        (
-            "hint: every decision is logged",
-            "hint: every decision is logged",
-        ),
+        ("y  Allow once", "y  Allow once"),
+        ("n/esc  Deny", "n/esc  Deny"),
     ] {
         let line = contents
             .lines()
@@ -3433,6 +3567,10 @@ fn timestamps_toggle_persists_and_logs_confirmation() {
         text.contains("timestamps hidden"),
         "expected confirmation in transcript: {text}"
     );
+    assert!(
+        !text.contains("ui:"),
+        "the /timestamps confirmation is a neutral notice, not a \"ui:\" error: {text}"
+    );
     assert_eq!(
         crate::model_preference::load_timestamps_preference(&preference_path),
         crate::model_preference::TimestampsPreferenceLoad::Loaded(false)
@@ -3443,6 +3581,70 @@ fn timestamps_toggle_persists_and_logs_confirmation() {
         CoreEffect::Render
     );
     assert!(core.show_timestamp_gutter);
+}
+
+#[test]
+fn toggled_on_timestamp_gutter_stamps_every_event_first_row() {
+    // Review v2 §6: the opt-in gutter must show every event's real
+    // provenance time, not a blank column — this is the production
+    // visual-canvas path (real EventEnvelope timestamps), not a bare
+    // TranscriptItem fixture.
+    let mut core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            show_timestamp_gutter: Some(true),
+            ..AppOptions::default()
+        },
+    );
+    core.drain_finalized_visual_lines(80);
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::USER_MESSAGE,
+        object([("content", "hi".into())]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "hello there".into())]),
+    )));
+
+    let lines = core
+        .drain_finalized_visual_lines(80)
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect::<Vec<_>>();
+
+    let user_row = lines
+        .iter()
+        .position(|line| line.contains("hi"))
+        .expect("user row");
+    let answer_row = lines
+        .iter()
+        .position(|line| line.contains("hello there"))
+        .expect("answer row");
+
+    for (label, row) in [("user", user_row), ("answer", answer_row)] {
+        let line = &lines[row];
+        let stamp: String = line.chars().take(8).collect();
+        assert!(
+            looks_like_hh_mm_ss(&stamp),
+            "{label} row should stamp a real HH:MM:SS, not a blank gutter: {line:?}"
+        );
+    }
+}
+
+fn looks_like_hh_mm_ss(stamp: &str) -> bool {
+    let chars: Vec<char> = stamp.chars().collect();
+    chars.len() == 8
+        && chars[0].is_ascii_digit()
+        && chars[1].is_ascii_digit()
+        && chars[2] == ':'
+        && chars[3].is_ascii_digit()
+        && chars[4].is_ascii_digit()
+        && chars[5] == ':'
+        && chars[6].is_ascii_digit()
+        && chars[7].is_ascii_digit()
 }
 
 #[test]

@@ -6956,13 +6956,13 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
             failures.push(format!("`{needle}` committed {occurrences}× (expected 1)"));
         }
     }
-    let orientation = final_state
+    let banner_caption = final_state
         .lines()
-        .filter(|line| line.contains("resumable with /resume"))
+        .filter(|line| line.contains("e^(iπ) + 1 = 0"))
         .count();
-    if orientation != 1 {
+    if banner_caption != 1 {
         failures.push(format!(
-            "orientation line committed {orientation}× (expected 1)"
+            "banner caption committed {banner_caption}× (expected 1)"
         ));
     }
     assert!(
@@ -6980,7 +6980,7 @@ fn diag_reconstruct_final_state_from_capture() {
     let state = pty_final_state_text(&raw, 24, 80);
     println!("=== FINAL STATE ===\n{state}\n=== END ===");
     for needle in [
-        "new session",
+        "e^(iπ) + 1 = 0",
         "Looking at the repository",
         "Here is an overview",
         "overview please",
@@ -7235,13 +7235,13 @@ fn tui_pty_transcript_lines_commit_exactly_once() {
             failures.push(format!("`{needle}` committed {occurrences}× (expected 1)"));
         }
     }
-    let orientation = final_state
+    let banner_caption = final_state
         .lines()
-        .filter(|line| line.contains("resumable with /resume"))
+        .filter(|line| line.contains("e^(iπ) + 1 = 0"))
         .count();
-    if orientation != 1 {
+    if banner_caption != 1 {
         failures.push(format!(
-            "orientation line committed {orientation}× (expected 1)"
+            "banner caption committed {banner_caption}× (expected 1)"
         ));
     }
     assert!(
