@@ -307,7 +307,10 @@ impl ReviewReportInput {
         // `accepts_session_id: true`; accepting it is part of that contract.
         // The query targets the host-selected session, so the value itself
         // is informational here.
-        reject_unknown_fields(object, &["limit", "scan_limit", "after_event_id", "session_id"])?;
+        reject_unknown_fields(
+            object,
+            &["limit", "scan_limit", "after_event_id", "session_id"],
+        )?;
         let _ = optional_string(object, "session_id")?;
         Ok(Self {
             limit: parse_positive_usize(object, "limit", DEFAULT_REPORT_LIMIT)?,

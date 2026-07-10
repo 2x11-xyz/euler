@@ -351,7 +351,6 @@ pub(super) fn render_finalized_visual_items_with_offsets(
     (ratatui_lines_to_canvas(lines), item_end_offsets)
 }
 
-
 pub(super) fn ratatui_lines_to_canvas(lines: Vec<Line<'static>>) -> Vec<CanvasLine> {
     lines
         .into_iter()
