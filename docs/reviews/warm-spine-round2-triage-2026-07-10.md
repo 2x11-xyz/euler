@@ -104,10 +104,13 @@ the spine PR grows too large.
   locked by tui_pty_session_grant_keeps_tool_blocks_well_formed). The old
   mid-flow decision event was the prime suspect for the malformed pairing.
   NEEDS Eli dogfood confirmation with a real provider before closing.
-- B1 OPEN (the deep one): replace resize commit accounting with
-  coalesce + re-wrap-from-logical-lines + repaint-in-place, never append to
-  scrollback on resize. Supersedes the item-remap approach. Verify with the
-  PTY drag test (multi-step resize) + AppleScript real-terminal harness.
+- B1 FIXED+pushed: commits suspend on resize, resume after 400ms quiescence;
+  events coalesce per batch; item remap emits uncommitted rows once at final
+  width. PTY drag test locks: zero scrollback emissions during the drag,
+  <=2 total commits per line (byte-stream assertion, emulator-independent).
+  Old-width rows already in native scrollback stay as-is (physically
+  unrewritable). AppleScript real-terminal validation still recommended
+  before closing in dogfood.
 
 ## Execution order
 1. B1–B5 on feat/warm-ledger-tui (B1 is the deep one; B2–B4 are contained).
