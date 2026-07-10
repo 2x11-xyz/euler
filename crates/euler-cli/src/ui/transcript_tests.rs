@@ -1363,12 +1363,15 @@ fn vt100_long_tool_output_uses_head_tail_affordance() {
     let contents = rendered_screen(&events, &theme, 80, 16);
 
     assert!(contents.contains("bash $ printf lines"));
-    assert!(contents.contains("  line 1"));
-    assert!(contents.contains("  line 2"));
+    // No test-summary/error/count signal, so the collapsed `└ ` result line
+    // falls back to the last non-empty line rather than the first (design
+    // review v3 §R3); head/tail preview rows sit underneath it.
+    assert!(contents.contains("└ line 12"));
+    assert!(contents.contains("line 1"));
+    assert!(contents.contains("line 2"));
     assert!(contents.contains("8 more lines"));
     assert!(contents.contains("ctrl+o expand"));
-    assert!(contents.contains("  line 11"));
-    assert!(contents.contains("  line 12"));
+    assert!(contents.contains("line 11"));
     assert!(!contents.contains("line 3"));
 }
 
@@ -1721,7 +1724,8 @@ fn tool_artifact_cell_reports_failure_without_exit_code() {
 #[test]
 fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
     let theme = Theme::default();
-    let output = (1..=DEFAULT_OUTPUT_LIMIT_LINES + 1)
+    let last_line = DEFAULT_OUTPUT_LIMIT_LINES + 1;
+    let output = (1..=last_line)
         .map(|index| format!("line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1737,20 +1741,22 @@ fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    // Exactly one `└ ` result line, carrying the first non-empty output row
-    // as the most-informative fallback (review v2 §14.2).
+    // Exactly one `└ ` result line. With no test-summary/error/count signal
+    // (spec §0/§1, design review v3 §R3), the last non-empty output row is
+    // the fallback — it usually reads as more conclusive than the first.
     assert_eq!(
         texts.iter().filter(|line| line.contains('└')).count(),
         1,
         "texts: {texts:?}"
     );
-    assert!(joined.contains("└ line 1"), "texts: {texts:?}");
+    let result_marker = format!("└ line {last_line}");
+    assert!(joined.contains(&result_marker), "texts: {texts:?}");
     // Remaining preview rows sit two extra spaces deeper than the result
     // line: result line body indent is 4 cells ("  " gutter pad + "└ "),
     // continuation rows are 6 cells ("  " gutter pad + "  " extra indent).
     let result_indent = texts
         .iter()
-        .find(|line| line.contains("└ line 1"))
+        .find(|line| line.contains(&result_marker))
         .map(|line| line.len() - line.trim_start().len())
         .expect("result line present");
     let continuation_indent = texts
@@ -1759,6 +1765,58 @@ fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
         .map(|line| line.len() - line.trim_start().len())
         .expect("continuation row present");
     assert_eq!(continuation_indent, result_indent + 2, "texts: {texts:?}");
+}
+
+#[test]
+fn collapsed_tool_run_result_line_prefers_test_summary_over_first_line() {
+    let theme = Theme::default();
+    let item = [TranscriptItem::ToolRun {
+        command: "cargo test".to_owned(),
+        ok: true,
+        error: String::new(),
+        output: "running 3 tests\ntest foo ... ok\ntest result: ok. 3 passed; 0 failed\n"
+            .to_owned(),
+        exit_code: Some(0),
+        grant_source: None,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&item, &theme, 96));
+    let joined = texts.join("\n");
+
+    assert_eq!(
+        texts.iter().filter(|line| line.contains('└')).count(),
+        1,
+        "texts: {texts:?}"
+    );
+    assert!(
+        joined.contains("└ test result: ok. 3 passed; 0 failed"),
+        "texts: {texts:?}"
+    );
+    assert!(!joined.contains("└ running 3 tests"), "texts: {texts:?}");
+}
+
+#[test]
+fn collapsed_tool_run_result_line_prefers_match_count_over_first_line() {
+    let theme = Theme::default();
+    let item = [TranscriptItem::ToolRun {
+        command: "rg -c foo".to_owned(),
+        ok: true,
+        error: String::new(),
+        output: "src/lib.rs:3\nsrc/main.rs:5\n8 matches\n".to_owned(),
+        exit_code: Some(0),
+        grant_source: None,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&item, &theme, 96));
+    let joined = texts.join("\n");
+
+    assert_eq!(
+        texts.iter().filter(|line| line.contains('└')).count(),
+        1,
+        "texts: {texts:?}"
+    );
+    assert!(joined.contains("└ 8 matches"), "texts: {texts:?}");
+    assert!(!joined.contains("└ src/lib.rs:3"), "texts: {texts:?}");
 }
 
 #[test]
@@ -3008,10 +3066,14 @@ fn tui_long_tool_output_ignores_trailing_blanks_in_head_tail_preview() {
     let theme = Theme::default();
     let contents = rendered_screen(&events, &theme, 80, 16);
 
+    // No test-summary/error/count signal in this output, so the collapsed
+    // `└ ` result line falls back to the last non-empty line (trailing
+    // blanks ignored) rather than the first (design review v3 §R3).
+    assert!(contents.contains("└ line 12"));
     assert!(contents.contains("8 more lines"));
     assert!(contents.contains("ctrl+o expand"));
-    assert!(contents.contains("  line 11"));
-    assert!(contents.contains("  line 12"));
+    assert!(contents.contains("line 1"));
+    assert!(contents.contains("line 11"));
     assert!(!contents.contains("14 more lines"));
 }
 

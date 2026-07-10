@@ -91,21 +91,99 @@ pub(in crate::ui::transcript) fn edit_failure_status(path: &str, error: &str) ->
     }
 }
 
-/// First output line worth surfacing from a completed command, if any.
+/// Most informative output line worth surfacing from a completed command, if
+/// any. Scored heuristic (design review v3 §R3, spec §0/§1): test summaries
+/// outrank error/panic lines, which outrank count/total rows; ties keep the
+/// earliest match. Callers that need a line unconditionally (e.g. the
+/// collapsed `└ ` result row) fall back to the last non-empty line, then the
+/// first, when nothing scores above zero.
 pub(in crate::ui::transcript) fn most_informative_line(output: &str) -> Option<&str> {
-    output_rows_without_trailing_blanks(output)
-        .into_iter()
-        .find(|line| is_informative_line(line))
+    let mut best: Option<(&str, u32)> = None;
+    for line in output_rows_without_trailing_blanks(output) {
+        let score = line_score(line);
+        if score == 0 {
+            continue;
+        }
+        let outranks_current = match best {
+            Some((_, best_score)) => score > best_score,
+            None => true,
+        };
+        if outranks_current {
+            best = Some((line, score));
+        }
+    }
+    best.map(|(line, _)| line)
 }
 
 fn is_informative_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("error[")
+    line_score(line) > 0
+}
+
+/// Priority tiers, highest first: test-run summaries, error/panic lines
+/// (error weighted over warning), then count/total summary rows. Zero means
+/// no signal at all.
+fn line_score(line: &str) -> u32 {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    // Tier 1: test-run summaries — the most conclusive signal a collapsed
+    // command can surface.
+    if lower.contains("test result:") {
+        return 400;
+    }
+    if trimmed.contains("FAILED") || has_count_token(&lower, &["passed", "failed"]) {
+        return 380;
+    }
+
+    // Tier 2: error / panic lines outrank warnings.
+    if lower.contains("error[")
         || lower.contains("error:")
-        || lower.contains("test result:")
-        || lower.contains("failed")
         || lower.contains("panicked")
         || lower.contains("fatal")
+    {
+        return 300;
+    }
+    if lower.contains("warning:") {
+        return 250;
+    }
+
+    // Tier 3: counts / totals — grep/ripgrep/wc-style summary rows, e.g.
+    // "42 matches" or a trailing "136152 total".
+    if has_count_token(&lower, &["total", "totals"])
+        || has_count_token(&lower, &["lines", "line"])
+        || has_count_token(&lower, &["matches", "match"])
+    {
+        return 200;
+    }
+
+    0
+}
+
+/// True if some whitespace-delimited token in `line` is a bare integer
+/// immediately followed by one of `words` (surrounding punctuation ignored),
+/// e.g. "9 passed" or "136152 total".
+fn has_count_token(line: &str, words: &[&str]) -> bool {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    tokens.windows(2).any(|pair| {
+        let num = pair[0].trim_matches(|ch: char| !ch.is_ascii_digit());
+        if num.is_empty() || !num.chars().all(|ch| ch.is_ascii_digit()) {
+            return false;
+        }
+        let word = pair[1].trim_matches(|ch: char| !ch.is_ascii_alphabetic());
+        words.contains(&word)
+    })
+}
+
+/// Last non-empty output line, ignoring trailing blank rows — usually more
+/// conclusive than the first line for output with no strong signal (e.g. an
+/// `ls`-style listing).
+fn last_non_empty_line(output: &str) -> Option<&str> {
+    output_rows_without_trailing_blanks(output)
+        .into_iter()
+        .last()
 }
 
 fn tool_run_footer(run: ToolRunRender<'_>, total_rows: usize, folded: bool) -> String {
@@ -156,6 +234,7 @@ fn collapsed_tool_run_rows(detail: &str, ok: bool, limit: usize) -> ArtifactOutp
 
     let mut rows = base.rows;
     let result_line = most_informative_line(&detail)
+        .or_else(|| last_non_empty_line(&detail))
         .map(str::to_owned)
         .or_else(|| rows.iter().find(|row| !row.trim().is_empty()).cloned())
         .unwrap_or_default();

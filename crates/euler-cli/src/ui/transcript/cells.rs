@@ -546,6 +546,29 @@ mod tests {
     }
 
     #[test]
+    fn most_informative_line_prefers_test_summary_over_other_signals() {
+        let output = "running 3 tests\ntest foo ... ok\ntest result: ok. 3 passed; 0 failed\n";
+        assert_eq!(
+            most_informative_line(output),
+            Some("test result: ok. 3 passed; 0 failed")
+        );
+    }
+
+    #[test]
+    fn most_informative_line_picks_trailing_match_count_over_earlier_rows() {
+        let output = "src/lib.rs:3:match\nsrc/main.rs:5:match\n8 matches\n";
+        assert_eq!(most_informative_line(output), Some("8 matches"));
+    }
+
+    #[test]
+    fn most_informative_line_returns_none_for_ls_style_listing() {
+        // No test summary, error/panic marker, or count/total row — the
+        // caller (collapsed `└ ` selection) is responsible for falling back
+        // to the last non-empty line in this case.
+        assert_eq!(most_informative_line("Cargo.toml\nsrc\ntarget\n"), None);
+    }
+
+    #[test]
     fn edit_failure_status_never_bare_failed() {
         assert_eq!(
             edit_failure_status(
