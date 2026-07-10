@@ -29,6 +29,10 @@ pub struct AgentResultSummary {
     pub child_agent_id: String,
     pub spawn_event_id: String,
     pub result_event_id: String,
+    /// Resolved child target as the spawn event recorded it (inherited
+    /// targets are resolved before recording).
+    pub provider: String,
+    pub model: String,
     pub result: AgentResult,
 }
 
@@ -101,6 +105,8 @@ impl<D: PermissionDecider> Session<D> {
         self.persist_new_events()?;
 
         let mut spawned = self.record_companion_spawn(&task, &target, &writer)?;
+        let resolved_provider = target.provider.clone();
+        let resolved_model = target.model.clone();
         let result = {
             let mut loop_ = CompanionLoop::new(
                 self,
@@ -118,6 +124,8 @@ impl<D: PermissionDecider> Session<D> {
             child_agent_id: spawned.child_agent_id().to_owned(),
             spawn_event_id: spawned.spawn_event_id().to_owned(),
             result_event_id,
+            provider: resolved_provider,
+            model: resolved_model,
             result,
         })
     }

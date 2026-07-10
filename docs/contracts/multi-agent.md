@@ -114,9 +114,11 @@ Extensions gain the authority to run child agents through one SDK method:
 - **Provenance unchanged**: the host records the same `agent.spawn` /
   `agent.result` pair the session companion path records, authored by the
   parent session envelope agent. The returned `AgentOutcome` carries the
-  result payload plus the spawn/result event ids so extensions can cite
-  provenance without re-querying it. Provenance remains the record; this
-  method removes the need to use it as the transport.
+  result payload plus the spawn/result event ids, the child agent id, and
+  the resolved child target (inherited targets come back resolved, exactly
+  as the spawn event recorded them) so extensions can cite provenance
+  without re-querying it. Provenance remains the record; this method
+  removes the need to use it as the transport.
 - **Budgets**: the task's `AgentBudget` is recorded as today and enforced to
   the extent the child session loop enforces budgets; accounting/escrow
   remain future work.

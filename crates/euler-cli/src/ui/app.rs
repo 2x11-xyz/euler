@@ -1,4 +1,4 @@
-use self::code_swarm::{load_code_swarm_models_startup, CodeSwarmRun};
+use self::code_swarm::load_code_swarm_models_startup;
 use self::extension_runs::{list_extension_manager_items, ExtensionOutcome, ExtensionRunRequest};
 use self::notify::{NotifyEvent, STALL_THRESHOLD};
 #[cfg(test)]
@@ -176,8 +176,6 @@ pub struct AppCore {
     pending_runs: VecDeque<PendingRunRequest>,
     /// Saved /code-swarm reviewer model set (provider::model), session copy.
     code_swarm_models: Vec<String>,
-    /// Active /code-swarm orchestration: brief -> companions -> report.
-    code_swarm_run: Option<CodeSwarmRun>,
     queued_inputs: VecDeque<String>,
     queued_selection: Option<usize>,
     queue_auto_flush_paused: bool,
@@ -693,7 +691,6 @@ impl AppCore {
             clipboard: Box::<SystemClipboard>::default(),
             pending_runs: VecDeque::new(),
             code_swarm_models: load_code_swarm_models_startup(),
-            code_swarm_run: None,
             queued_inputs: VecDeque::new(),
             queued_selection: None,
             queue_auto_flush_paused: false,

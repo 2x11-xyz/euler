@@ -224,6 +224,10 @@ pub struct AgentOutcome {
     pub output: String,
     /// Failure detail when `ok` is false, exactly as provenance recorded it.
     pub error: Option<String>,
+    /// Resolved child target as the spawn event recorded it (inherited
+    /// targets are resolved before recording).
+    pub provider: String,
+    pub model: String,
     pub child_agent_id: String,
     pub spawn_event_id: String,
     pub result_event_id: String,

@@ -56,6 +56,8 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
             summary: summary.result.summary().to_owned(),
             output: summary.result.output().unwrap_or_default().to_owned(),
             error: summary.result.error().map(str::to_owned),
+            provider: summary.provider,
+            model: summary.model,
             child_agent_id: summary.child_agent_id,
             spawn_event_id: summary.spawn_event_id,
             result_event_id: summary.result_event_id,
