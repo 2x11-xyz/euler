@@ -864,6 +864,121 @@ fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
 }
 
 #[test]
+fn scoped_shell_grant_does_not_cover_compound_commands() {
+    // Execution is `sh -c`: a `touch` grant covering `touch a; <anything>`
+    // would authorize the whole line. Compound commands must re-ask.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-compound".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch second-ran; touch evil-ran"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![
+            DeciderVerdict::AllowScoped(GrantScope::Session(
+                ScopePattern::new("touch").expect("pattern"),
+            )),
+            DeciderVerdict::Deny,
+        ]),
+    );
+
+    session.run_turn("run shell twice").expect("turn");
+
+    assert!(temp.path().join("first-ran").exists());
+    // The compound command was NOT covered: it re-prompted and the scripted
+    // denial stopped it.
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        2
+    );
+    assert!(!temp.path().join("evil-ran").exists());
+    assert!(!temp.path().join("second-ran").exists());
+}
+
+#[test]
+fn scoped_fs_grant_does_not_cover_dotdot_or_symlink_escapes() {
+    // Scoped fs-write grants match the canonicalized workspace-relative
+    // path: `src/../escape.txt` and a symlink out of the granted subtree
+    // must fall back to the ask path.
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir(temp.path().join("src")).expect("src dir");
+    std::fs::write(temp.path().join("src/lib.rs"), "alpha").expect("seed lib");
+    std::fs::write(temp.path().join("outside.txt"), "alpha").expect("seed outside");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        temp.path().join("outside.txt"),
+        temp.path().join("src").join("link.txt"),
+    )
+    .expect("symlink");
+    let mut calls = vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-inside".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "src/lib.rs", "old": "alpha", "new": "beta"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-dotdot".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "src/../outside.txt", "old": "alpha", "new": "beta"}),
+        }]),
+    ];
+    let mut verdicts = vec![
+        DeciderVerdict::AllowScoped(GrantScope::Session(
+            ScopePattern::new("src").expect("pattern"),
+        )),
+        DeciderVerdict::Deny,
+    ];
+    calls.push(FixtureResponse::Assistant("done".to_owned()));
+    // A denial caches for the rest of the turn, so the symlink escape runs
+    // as its own turn to prove it re-prompts rather than being covered.
+    #[cfg(unix)]
+    {
+        calls.push(FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-symlink".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "src/link.txt", "old": "alpha", "new": "beta"}),
+        }]));
+        calls.push(FixtureResponse::Assistant("done again".to_owned()));
+        verdicts.push(DeciderVerdict::Deny);
+    }
+    let expected_prompts = verdicts.len();
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(calls),
+        ScriptedDecider::new(verdicts),
+    );
+
+    session.run_turn("edit files").expect("turn");
+    #[cfg(unix)]
+    session.run_turn("edit the symlink").expect("second turn");
+
+    // Covered write inside the granted subtree went through...
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("src/lib.rs")).expect("lib"),
+        "beta"
+    );
+    // ...but every escape re-prompted and the scripted denials stopped them.
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT) as usize,
+        expected_prompts
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("outside.txt")).expect("outside"),
+        "alpha"
+    );
+}
+
+#[test]
 fn fs_read_tools_share_required_capability() {
     let registry = ToolRegistry::new(".");
 

@@ -371,6 +371,16 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
         self.resolve_path_inner(relative, false)
     }
 
+    /// Canonicalized workspace-relative form of a model-supplied path, for
+    /// scope matching: `..` and symlinks resolved exactly as the write path
+    /// resolves them. `None` when the path cannot be resolved inside the
+    /// workspace - scoped grant matching then fails closed to the ask path.
+    pub fn workspace_relative_path(&self, relative: &str) -> Option<PathBuf> {
+        let canonical = self.resolve_path_inner(relative, false).ok()?;
+        let root = self.root.canonicalize().ok()?;
+        canonical.strip_prefix(&root).ok().map(Path::to_path_buf)
+    }
+
     fn resolve_create_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
         self.resolve_path_inner(relative, true)
     }
