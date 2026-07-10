@@ -12,10 +12,11 @@ use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
 use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
 use crate::ui::text::{
-    blank_gutter, content_width, display_width, gutter_width, hairline_content, is_ledger_gutter,
-    timestamp_gutter, tree_gutter_pipe, wrap_text,
+    blank_gutter, content_width, display_width, gutter_width, is_ledger_gutter, timestamp_gutter,
+    tree_gutter_pipe, wrap_text,
 };
 use crate::ui::theme::Theme;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::collections::HashSet;
 
@@ -111,7 +112,6 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
     let mut item_end_offsets = Vec::with_capacity(entries.len());
-    let content_cols = content_width(width);
 
     for (index, entry) in entries.iter().enumerate() {
         let first_line = lines.len();
@@ -190,10 +190,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     push_wrapped(
                         &mut lines,
                         blank_gutter(),
-                        &format!(
-                            "{} {label} for {elapsed} · ctrl+o collapse",
-                            glyphs::thinking()
-                        ),
+                        &format!("{label} for {elapsed} · ctrl+o collapse"),
                         theme.transcript.reasoning,
                         theme,
                         width,
@@ -448,8 +445,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     &mut lines,
                     blank_gutter(),
                     &format!(
-                        "{} reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact",
-                        glyphs::revert()
+                        "reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact"
                     ),
                     theme.transcript.muted,
                     theme,
@@ -572,7 +568,8 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 push_wrapped(
                     &mut lines,
                     blank_gutter(),
-                    &format!("! {source}: {message}"),
+                    // The ✗ lives in the spine anchor (§1).
+                    &format!("{source}: {message}"),
                     theme.transcript.error,
                     theme,
                     width,
@@ -582,17 +579,27 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
 
         if first_line < lines.len() && is_meaningful_ledger_item(item) {
             let stamp = timestamp_gutter(entry.timing.as_ref().map(|tm| tm.absolute.as_str()));
-            stamp_first_line(&mut lines[first_line], &stamp, theme);
+            let anchor = spine_anchor(item, theme);
+            stamp_first_line(&mut lines[first_line], &stamp, anchor.as_ref(), theme);
             if let Some(timing) = &entry.timing {
                 if !item_renders_inline_timing(item) {
                     append_timing(&mut lines[first_line], timing, theme, width);
                 }
             }
-            push_hairline(&mut lines, theme, content_cols);
         } else if let Some(timing) = &entry.timing {
             if let Some(line) = lines.get_mut(first_line) {
                 append_timing(line, timing, theme, width);
             }
+        }
+        // §1: separation is the spine plus one blank line — applied after
+        // every rendered event (dividers and recaps included) so batches
+        // always end separated from whatever renders below. The renderer is
+        // the single owner of vertical rhythm; no other layer adds spacers
+        // around history content.
+        // Banner lines end with their own built-in blank; everything else
+        // gets the uniform one-blank separator here.
+        if first_line < lines.len() && !matches!(item, TranscriptItem::Banner { .. }) {
+            lines.push(Line::default());
         }
         item_end_offsets.push(lines.len());
     }
@@ -689,38 +696,75 @@ fn aligned_exploration_row(verb: &str, detail: &str, verb_width: usize) -> Strin
     }
 }
 
-fn stamp_first_line(line: &mut Line<'static>, stamp: &str, theme: &Theme) {
-    if stamp.is_empty() && gutter_width() == 0 {
-        // Timestamp column hidden: leave content unprefixed.
-        return;
-    }
-    if line.spans.first().is_some_and(|span| {
-        let width = display_width(span.content.as_ref());
-        width == gutter_width() || (gutter_width() == 0 && width == 0)
-    }) {
-        if stamp.is_empty() {
-            return;
+/// v2 anchor spine: glyph + style for an event's first row (§1). `None`
+/// keeps the blank spine (user messages carry the ▌ rail instead; separators
+/// have no anchor).
+fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)> {
+    let anchor = match item {
+        TranscriptItem::UserMessage(_)
+        | TranscriptItem::Banner { .. }
+        | TranscriptItem::TurnSeparator
+        | TranscriptItem::WorkedDuration(_)
+        | TranscriptItem::TurnRecap { .. } => return None,
+        TranscriptItem::ModelReasoning { .. } => {
+            (glyphs::thinking().to_owned(), theme.transcript.warning)
         }
-        line.spans[0] = Span::styled(stamp.to_owned(), theme.transcript.gutter);
-        return;
-    }
-    if stamp.is_empty() {
-        return;
-    }
-    line.spans
-        .insert(0, Span::styled(stamp.to_owned(), theme.transcript.gutter));
+        TranscriptItem::PermissionDecision { allowed, .. } => {
+            if allowed.unwrap_or(false) {
+                (glyphs::check().to_owned(), theme.transcript.added)
+            } else {
+                (glyphs::cross().to_owned(), theme.transcript.removed)
+            }
+        }
+        TranscriptItem::ResumeBoundary { .. } => {
+            (glyphs::check().to_owned(), theme.transcript.added)
+        }
+        TranscriptItem::Companion { .. } => (
+            glyphs::companion_glyph().to_owned(),
+            theme.transcript.companion,
+        ),
+        TranscriptItem::WorkspaceRestore { .. } => {
+            (glyphs::revert().to_owned(), theme.transcript.added)
+        }
+        TranscriptItem::Interrupted => (glyphs::interrupt().to_owned(), theme.transcript.warning),
+        TranscriptItem::Error { .. } => (glyphs::cross().to_owned(), theme.transcript.error),
+        _ => (glyphs::bullet().to_owned(), theme.transcript.gutter),
+    };
+    Some(anchor)
 }
 
-fn push_hairline(lines: &mut Vec<Line<'static>>, theme: &Theme, content_cols: usize) {
-    let hairline = Span::styled(hairline_content(content_cols), theme.transcript.hairline);
-    if blank_gutter().is_empty() {
-        lines.push(Line::from(vec![hairline]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
-            hairline,
-        ]));
+/// Stamp an event's first row: `[HH:MM:SS ]` (when the gutter is opted in)
+/// followed by the 2-cell spine anchor. Continuation rows keep the blank
+/// prefix from `blank_gutter()`.
+fn stamp_first_line(
+    line: &mut Line<'static>,
+    stamp: &str,
+    anchor: Option<&(String, Style)>,
+    theme: &Theme,
+) {
+    let prefix_width = gutter_width();
+    let has_prefix = line
+        .spans
+        .first()
+        .is_some_and(|span| display_width(span.content.as_ref()) == prefix_width);
+    if !has_prefix {
+        return;
     }
+    let mut spans = Vec::with_capacity(2);
+    if !stamp.is_empty() {
+        spans.push(Span::styled(stamp.to_owned(), theme.transcript.gutter));
+    }
+    match anchor {
+        Some((glyph, style)) => {
+            let pad = crate::ui::text::SPINE_WIDTH.saturating_sub(display_width(glyph));
+            spans.push(Span::styled(format!("{glyph}{}", " ".repeat(pad)), *style));
+        }
+        None => spans.push(Span::styled(
+            crate::ui::text::BLANK_SPINE.to_owned(),
+            theme.transcript.gutter,
+        )),
+    }
+    line.spans.splice(0..1, spans);
 }
 
 fn render_assistant_prose(content: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
@@ -830,9 +874,9 @@ fn push_bounded_detail(
 }
 
 fn reasoning_summary(label: &str, content: &str, elapsed: &str) -> String {
+    // The ✱ lives in the spine anchor (§1).
     format!(
-        "{} {label} for {elapsed} — {} · ctrl+o expand",
-        glyphs::thinking(),
+        "{label} for {elapsed} — {} · ctrl+o expand",
         reasoning_gist(content)
     )
 }

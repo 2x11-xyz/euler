@@ -123,7 +123,8 @@ impl AppCore {
         self.push_visual_permission_block(width, &mut blocks);
         self.push_visual_activity_block(&mut blocks);
         self.push_visual_transient_block(&mut blocks);
-        push_visual_spacer_block(&mut blocks);
+        // No spacer here: the transcript renderer ends every event batch
+        // (banner included) with one blank line — it owns vertical rhythm.
         self.push_visual_composer_block(composer, &mut blocks);
         push_visual_spacer_block(&mut blocks);
         push_visual_block(
@@ -308,7 +309,21 @@ fn push_visual_block(blocks: &mut Vec<VisualBlock>, role: VisualBlockRole, lines
     }
 }
 
+/// One blank spacer row — but only when the preceding content doesn't
+/// already end blank (the transcript renderer owns event rhythm and ends
+/// every batch with a blank line; doubling it makes canyons).
 fn push_visual_spacer_block(blocks: &mut Vec<VisualBlock>) {
+    let previous_ends_blank = blocks
+        .last()
+        .and_then(|block| block.lines.last())
+        .is_some_and(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.text.as_str().trim().is_empty())
+        });
+    if previous_ends_blank {
+        return;
+    }
     blocks.push(VisualBlock::new(
         VisualBlockRole::Spacer,
         vec![CanvasLine::plain_lossy("")],
@@ -322,35 +337,20 @@ pub(super) fn render_finalized_visual_items_with_offsets(
     output_limit_lines: usize,
     expanded_artifact_keys: &std::collections::HashSet<String>,
 ) -> (Vec<CanvasLine>, Vec<usize>) {
-    let (lines, mut item_end_offsets) = transcript::render_items_for_history_with_offsets(
+    let (lines, item_end_offsets) = transcript::render_items_for_history_with_offsets(
         items,
         theme,
         width,
         output_limit_lines,
         expanded_artifact_keys,
     );
-    let mut lines = ratatui_lines_to_canvas(lines);
-    if finalized_batch_needs_trailing_rhythm(items) {
-        lines.push(CanvasLine::plain_lossy(""));
-        // The rhythm row belongs to the last item's committed region.
-        if let Some(last) = item_end_offsets.last_mut() {
-            *last += 1;
-        }
-    }
-    (lines, item_end_offsets)
+    // v2: the renderer already separates every event with one blank line —
+    // the old trailing-rhythm row would double it AND desync the live vs
+    // finalized row layouts (the live prefix never carried the rhythm row,
+    // so committed-row accounting slipped by one at the finalization seam).
+    (ratatui_lines_to_canvas(lines), item_end_offsets)
 }
 
-fn finalized_batch_needs_trailing_rhythm(items: &[TranscriptItem]) -> bool {
-    matches!(
-        items.last(),
-        Some(
-            TranscriptItem::UserMessage(_)
-                | TranscriptItem::AssistantMessage(_)
-                | TranscriptItem::WorkedDuration(_)
-                | TranscriptItem::TurnRecap { .. }
-        )
-    )
-}
 
 pub(super) fn ratatui_lines_to_canvas(lines: Vec<Line<'static>>) -> Vec<CanvasLine> {
     lines

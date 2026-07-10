@@ -483,8 +483,11 @@ fn tui_history_suppresses_routine_allow_permission_rows() {
 
     assert!(!contents.contains("allowed once · fs-read"));
     assert!(!contents.contains("allowed once · artifact-write"));
-    assert!(contents.contains("✗ denied · shell-exec (denied)"));
-    assert!(contents.contains("✗ denied · network (denied)"));
+    // v2 (§2/audit S3): the ✗ is the spine anchor; the dim record text has
+    // no redundant "(denied)" suffix.
+    assert!(contents.contains("✗ denied · shell-exec"));
+    assert!(contents.contains("✗ denied · network"));
+    assert!(!contents.contains("(denied)"));
 }
 
 #[test]
@@ -512,7 +515,9 @@ fn tui_permission_decisions_render_approved_and_canceled_notices() {
     let contents = rendered_screen(&events, &theme, 80, 6);
 
     assert!(contents.contains("✓ allowed once · shell-exec"));
-    assert!(contents.contains("✗ Permission canceled: fs-write (canceled)"));
+    // v2 (§2/audit S3): ✗ anchor + dim record text, no "(canceled)" suffix.
+    assert!(contents.contains("✗ permission canceled · fs-write"));
+    assert!(!contents.contains("(canceled)"));
 }
 
 #[test]
@@ -975,7 +980,17 @@ fn markdown_assistant_tui_projection_preserves_line_oriented_invariants() {
     let contents = rendered_screen(&events, &theme, 80, 6);
     assert!(contents.contains("bold"));
     assert!(contents.contains("item"));
-    assert!(!contents.contains("• bold"));
+    // v2: a `•` at column 0 is the spine anchor (the event's first line
+    // starts with "bold" here); markdown list items keep their literal `-`
+    // marker and must never be re-bulleted with the anchor glyph.
+    for line in contents.lines() {
+        if line.trim_start().starts_with("• ") {
+            assert!(
+                line.starts_with("• "),
+                "anchor glyph must only appear at column 0: {line:?}"
+            );
+        }
+    }
     assert!(contents.contains("- item"));
     assert!(!contents.contains("**bold**"));
 }
@@ -1101,7 +1116,11 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
     let events = vec![
         event(
             EventKind::USER_MESSAGE,
-            object([("content", "alpha beta gamma delta epsilon".into())]),
+            // Long enough to wrap the 38-cell spine-mode content column.
+            object([(
+                "content",
+                "alpha beta gamma delta epsilon zeta eta theta iota".into(),
+            )]),
         ),
         event(
             EventKind::TOOL_RESULT,
@@ -1119,7 +1138,7 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
     let theme = Theme::default();
     let contents = rendered_screen_with_limit(&events, &theme, 40, 16, 2);
     assert!(contents.contains("▌ alpha beta gamma"));
-    // Timestamp stamp or blank gutter may precede the rail; match the glyph.
+    // The blank 2-cell spine precedes the rail; match the glyph.
     let prompt_glyph_lines = contents
         .lines()
         .filter(|line| line.contains("▌ "))
@@ -1137,11 +1156,12 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
         let trimmed = line.trim_start();
         assert!(
-            line.starts_with("         ")
-                || line.starts_with("       └ ")
-                || line.starts_with("       ├ ")
+            // v2 spine: blank 2-cell spine (also covers the "  └ "/"  ├ "
+            // tree gutters and continuation pads), a `•` anchor at column 0,
+            // the user rail, rules, or digit-prefixed diff rows.
+            line.starts_with("  ")
+                || line.starts_with("• ")
                 || line.contains("▌ ")
-                || trimmed.starts_with("• ")
                 || trimmed.starts_with("bash")
                 || line.contains("─")
                 || line.chars().next().is_some_and(|ch| ch.is_ascii_digit()),
@@ -1527,15 +1547,21 @@ fn tool_artifact_cell_keeps_minimum_width_at_tiny_widths() {
 
     for width in [0, 1, 2, 3] {
         let texts = line_texts(&render_items_for_history(&item, &theme, width));
-        // title + body + hairline; gutter is fixed 9 cells, body floor is 4.
+        // title + body + blank separator; the 2-cell spine is the fixed
+        // gutter and the artifact body floor is 4 cells.
         assert_eq!(texts.len(), 3, "width {width}: {texts:?}");
-        for text in &texts {
+        assert_eq!(
+            texts.last().map(String::as_str),
+            Some(""),
+            "artifact should end with the blank separator row: {texts:?}"
+        );
+        for text in texts.iter().filter(|text| !text.is_empty()) {
             assert!(
-                display_width(text) >= crate::ui::text::TIMESTAMP_GUTTER_WIDTH,
-                "tiny-width artifact rows keep the ledger gutter floor: {text:?} in {texts:?}"
+                display_width(text) >= crate::ui::text::SPINE_WIDTH + 2,
+                "tiny-width artifact rows keep the spine floor: {text:?} in {texts:?}"
             );
             assert!(
-                display_width(text) <= crate::ui::text::TIMESTAMP_GUTTER_WIDTH + 4,
+                display_width(text) <= crate::ui::text::SPINE_WIDTH + 4,
                 "tiny-width artifact rows stay near the minimum flat width: {text:?} in {texts:?}"
             );
         }
@@ -1576,11 +1602,10 @@ fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
 
     for width in [12, 24, 64, 96] {
         let texts = line_texts(&render_items_for_history(&item, &theme, width));
-        let budget = usize::from(width).max(crate::ui::text::TIMESTAMP_GUTTER_WIDTH + 4);
+        let budget = usize::from(width).max(crate::ui::text::SPINE_WIDTH + 4);
         assert!(
-            texts
-                .first()
-                .is_some_and(|line| line.trim_start().starts_with("Pat")),
+            // v2: the title row starts with the `•` spine anchor.
+            texts.first().is_some_and(|line| line.starts_with("• Pat")),
             "width {width}: {texts:?}"
         );
         for text in &texts {
@@ -1627,10 +1652,19 @@ fn patch_proposed_artifact_uses_boxed_title_and_not_old_child_rows() {
         "hunk header missing: {texts:?}"
     );
     assert_no_box_chars(&texts);
+    // v2: `• Patch proposed` at column 0 is the spine-anchored title row;
+    // an old-style parent row would carry a `*` glyph or sit indented
+    // behind a gutter.
     assert!(
-        !joined.contains("* Patch proposed") && !joined.contains("• Patch proposed"),
+        !joined.contains("* Patch proposed"),
         "old parent row leaked: {texts:?}"
     );
+    for line in texts.iter().filter(|line| line.contains("Patch proposed")) {
+        assert!(
+            line.starts_with("• Patch proposed"),
+            "patch title must be the anchored cell title: {line:?}"
+        );
+    }
     assert!(
         !joined.contains("  └ @@"),
         "old child row leaked: {texts:?}"
@@ -1748,14 +1782,16 @@ fn patch_applied_artifact_keeps_exact_render_shape() {
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 48));
 
+    // v2 anchor spine shape: `•` anchor + title at column 0, diff body rows
+    // padded inside the cell, one blank separator row (hairlines are gone).
     assert_eq!(
         texts,
         vec![
-            "         edit src/lib.rs · +1 −1 · update · 3 vi",
-            "                  @@ -1 +1 @@                   ",
-            "              1 - a                             ",
-            "              1 + b                             ",
-            "         ───────────────────────────────────────",
+            "• edit src/lib.rs · +1 −1 · update · 3 visible r",
+            "           @@ -1 +1 @@                          ",
+            "       1 - a                                    ",
+            "       1 + b                                    ",
+            "",
         ]
     );
 }
@@ -2487,9 +2523,11 @@ fn final_assistant_prose_uses_two_space_gutter_across_markdown_shapes() {
 
     assert!(texts.len() > 4, "texts: {texts:?}");
     for text in texts.iter().filter(|line| !line.trim().is_empty()) {
-        // blank 9-cell ledger gutter, or hairline under the block
+        // v2 (§1/§2): the event's first row carries the `•` anchor spine;
+        // continuation rows keep the plain two-space pad. Hairlines are
+        // gone — no dedicated separator alternative to check for anymore.
         assert!(
-            text.starts_with("         ") || text.contains("─"),
+            text.starts_with("• ") || text.starts_with("  "),
             "assistant prose line missing gutter: {text:?} in {texts:?}"
         );
     }
@@ -2536,10 +2574,12 @@ fn worked_separator_degrades_to_single_bare_label_at_narrow_widths() {
     let equal = line_texts(&render_items_for_history(&item, &theme, label.len() as u16));
     let wide = line_texts(&render_items_for_history(&item, &theme, 32));
 
-    assert_eq!(below, vec![label]);
-    assert_eq!(equal, vec![label]);
-    assert_eq!(wide.len(), 1);
+    // Uniform event rhythm: every rendered event ends with one blank row.
+    assert_eq!(below, vec![label, ""]);
+    assert_eq!(equal, vec![label, ""]);
+    assert_eq!(wide.len(), 2);
     assert!(wide[0].contains(label));
+    assert!(wide[1].is_empty());
     assert!(wide[0].contains('─'));
 }
 
@@ -2753,11 +2793,11 @@ fn failed_tool_run_surfaces_informative_line_before_tail() {
         joined.contains("✗ exit 101"),
         "failure verb should be loud: {joined:?}"
     );
-    // Body rows are blank-gutter + two-space pad; title rows share the gutter
-    // prefix so filter on the body pad after the 9-cell gutter.
+    // Body rows are blank 2-cell spine + two-space pad; the title row carries
+    // the `•` anchor at column 0, so filter on the 4-space body indent.
     let body: Vec<_> = texts
         .iter()
-        .filter(|line| line.starts_with("           ") && !line.trim().is_empty())
+        .filter(|line| line.starts_with("    ") && !line.trim().is_empty())
         .collect();
     assert!(
         body.first()
@@ -2854,14 +2894,18 @@ fn extension_result_renders_foldable_pretty_artifact() {
 
 #[test]
 fn hairline_uses_dedicated_theme_token_not_gutter() {
-    // Warm Ledger separates the hairline tone (#38341f) from the faint
-    // timestamp/gutter tone (#5f584a); the hairline row must consume the
-    // dedicated token so event separators stay darker than timestamps.
+    // v2 (§1/§3): per-event hairlines are gone — one blank line separates
+    // events instead. The only rules left in the flow are turn dividers and
+    // the markdown h1/h2 underline (§4), which still consume the dedicated
+    // hairline token so they stay darker than the faint timestamp/gutter
+    // tone (#5f584a vs #38341f) rather than reusing it.
     let theme = Theme::warm_ledger();
     assert_ne!(theme.palette.hairline, theme.palette.gutter);
 
     let lines = render_items_for_history(
-        &[TranscriptItem::UserMessage("hairline probe".to_owned())],
+        &[TranscriptItem::AssistantMessage(
+            "# Heading\n\nbody text".to_owned(),
+        )],
         &theme,
         80,
     );
@@ -2873,13 +2917,13 @@ fn hairline_uses_dedicated_theme_token_not_gutter() {
         .collect();
     assert!(
         !hairline_span_styles.is_empty(),
-        "expected a hairline row under the user message"
+        "expected an h1 underline row under the markdown heading: {lines:?}"
     );
     assert!(
         hairline_span_styles
             .iter()
             .all(|fg| *fg == Some(theme.palette.hairline)),
-        "hairline rows must use palette.hairline, got: {hairline_span_styles:?}"
+        "h1 underline rows must use palette.hairline, got: {hairline_span_styles:?}"
     );
 }
 

@@ -53,3 +53,83 @@ target; SUPERSEDED frame is v1 — do not implement from it.
 - Audit items riding on the spine: decision-record color/wording (S3),
   explore tree alignment polish (verify post-spine), recap placement under
   the Worked divider (S3 recap item).
+
+
+## Progress (window 2)
+- DONE steps 1-3 core: text.rs spine layer (SPINE_WIDTH=2, BLANK_SPINE,
+  gutter default OFF, tree gutters indent at content column, ts gutter =
+  9 cells returned separately), glyphs.rs bullet accessor (with consumer),
+  render.rs spine_anchor(item)->glyph+style + stamp_first_line rewritten
+  (ts + 2-cell anchor spliced into first-row prefix), per-event hairlines
+  replaced by one blank Line, push_hairline/hairline_content deleted.
+- NEXT (A2): cells still render their own leading glyphs -> double-glyph
+  rows. Strip inline glyph prefixes from: render_permission_decision (✓/✗),
+  reasoning collapsed/expanded lines (✱), render_interrupted (■),
+  workspace-restore row (↩), companion header (◆), error rows (!/✗),
+  resume boundary (✓) — the spine anchor now carries the glyph; text starts
+  dim at the content column. Decision records: drop "({decision})" suffix
+  (audit S3), text dim not gold.
+- THEN: re-baseline the 88 failing euler-cli tests (layout assertions:
+  9-space indents gone, hairline expectations -> blank lines, anchors at
+  col 0). Check PTY tests. THEN steps 4-6 (artifact • + └ result line,
+  timestamps opt-in already default-off but /timestamps flip + prefs load
+  in main.rs needs check, composer flush-left + F27).
+
+
+## Progress (window 3)
+- A2 COMPLETE: all inline glyphs relocated to the spine anchor (decisions,
+  thinking, interrupt, revert, companion headers, errors, resume boundary).
+- Timestamps default OFF at all layers (text.rs thread-local, app.rs,
+  main.rs). Emoji discouragement in core SYSTEM_INSTRUCTIONS.
+- Adversarial re-baseline round 1 found 4 real bugs (all fixed, ac91041):
+  is_ledger_gutter spine widths; app default (already fixed); companion
+  header rail+glyph duplication; resume boundary missing anchor.
+  92 failures -> 14. Round 2 running (remaining ~13 re-baselines; PTY
+  commit-exactly-once failure to be triaged as possible bug).
+- SSH key for github dropped from agent; push via
+  `git push https://github.com/2x11-xyz/euler.git <branch>` (gh token).
+- REMAINING: A3 └ result-line pairing (hold until re-baseline lands);
+  approval-panel label cleanup (S4); composer flush-left verify + startup
+  hug-bottom (S1); recap placement under Worked divider (S3); §9
+  degradation order re-check (ts gutter drop applies only when opted in);
+  final PTY + workspace gate; merge to feat/warm-ledger-tui.
+
+
+## Open bug (the ONE remaining failure): spine-mode one-row commit drop
+Test: tui_pty_transcript_lines_commit_exactly_once (headless.rs). Agent
+bisect: passes @7f4393e, fails from 6246c3c (timestamps default off) —
+latent spine-mode bug, previously masked by the 11-col gutter.
+Evidence: banner block + user message bridge-committed (7 rows); Paragraph
+1's FIRST physical row is in neither bridge rows nor vt100 scrollback;
+its wrap-continuations onward are intact. Exactly one row is overwritten
+uncommitted at the first commit boundary after the user message.
+Rhythm-row removal (this commit) did NOT fix it.
+Debug plan: re-add the EULER_DEBUG_COMMITS file logging to terminal.rs
+([commit] rows/items/commit_until/offsets + [emit] first-row text; see
+git log for the earlier diagnostic shapes), run the failing test, and
+compare committed_active_rows against where Paragraph 1's first row sits
+in frame.active_frame_lines. Suspects: live_committed prefix rows vs
+finalized re-render shifting by one (stamp/anchor divergence between the
+LiveTranscript block path at app/visual.rs:86-100 and the History path),
+or active_row_count trimming trailing blanks while commit_until counts
+them (visual_canvas.rs active_row_count vs Line::default separator).
+
+
+## Rhythm ownership (window 3 conclusion — read before continuing)
+Current pushed state: 887/890 (3 red: PTY commit-drop + 2 chrome rhythm
+tests asserting the removed trailing-rhythm row).
+Attempted: uniform per-event blank after EVERY item (incl. WorkedDuration)
+— made it worse (blank canyons: the app-visual layer pushes its own Spacer
+blocks between blocks; double ownership).
+DECISION NEEDED next window: make vertical rhythm single-owner.
+Options: (a) renderer owns it — per-event blank stays meaningful-only,
+batch-trailing gap comes from the LAST item too (special-case last entry),
+and delete the app-visual Spacer between History/Live blocks; (b) visual
+layer owns it — remove renderer blanks, spacers everywhere. (a) preserves
+live/finalized identity (the PTY commit-drop's likely root cause) — do (a),
+then re-run tui_pty_transcript_lines_commit_exactly_once, then the 2 chrome
+tests define the correct expectations (one blank between events, one after
+the batch, never two).
+Also remember: worked_separator_degrades_* and repeated_finalized_writes_*
+were the tests distinguishing the attempts — use them as the calibration
+pair.

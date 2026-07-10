@@ -212,8 +212,10 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let providers = tui_provider_set(run.provider_id.clone(), run.provider, &run.custom_providers);
     let preference_path = model_preference::default_model_preference_path();
     let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
+    // v2 Warm Spine: timestamps are opt-in (§5.5); the anchor spine carries
+    // the ledger by default.
     let show_timestamp_gutter =
-        load_timestamps_preference(preference_path.as_deref()).unwrap_or(true);
+        load_timestamps_preference(preference_path.as_deref()).unwrap_or(false);
     let notifications_enabled =
         load_notifications_preference(preference_path.as_deref()).unwrap_or(true);
     let mut session = Session::new_with_providers(live_session.config, providers, decider)

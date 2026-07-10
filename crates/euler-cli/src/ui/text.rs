@@ -1,27 +1,34 @@
 use std::cell::Cell;
 use unicode_width::UnicodeWidthChar;
 
-/// Fixed Warm Ledger timestamp column: `HH:MM:SS` + trailing space (9 cells).
+/// v2 anchor spine: a fixed 2-cell column at the left edge — event-type glyph
+/// plus one space on an event's first row, two spaces on continuations.
+pub(crate) const SPINE_WIDTH: usize = 2;
+pub(crate) const BLANK_SPINE: &str = "  ";
+
+/// Optional `/timestamps` gutter (§5.5): `HH:MM:SS` + space, rendered beside
+/// the spine (whole column shifts right together).
 pub(crate) const TIMESTAMP_GUTTER_WIDTH: usize = 9;
 
-const BLANK_GUTTER: &str = "         "; // 9 spaces
-                                        // 7 spaces + glyph + space = 9 (box-drawing glyphs are width 1)
-const TREE_GUTTER_LAST: &str = "       └ ";
-const TREE_GUTTER_MID: &str = "       ├ ";
-const TREE_GUTTER_PIPE: &str = "       | ";
-// Compact nesting when the timestamp column is hidden (content widens).
-const TREE_GUTTER_LAST_NARROW: &str = "└ ";
-const TREE_GUTTER_MID_NARROW: &str = "├ ";
-const TREE_GUTTER_PIPE_NARROW: &str = "| ";
+const BLANK_GUTTER: &str = "           "; // 9 (timestamps) + 2 (spine)
+const TREE_GUTTER_LAST: &str = "         └ ";
+const TREE_GUTTER_MID: &str = "         ├ ";
+const TREE_GUTTER_PIPE: &str = "         | ";
+// Spine-only nesting: children indent inside the parent at the content column.
+const TREE_GUTTER_LAST_NARROW: &str = "  └ ";
+const TREE_GUTTER_MID_NARROW: &str = "  ├ ";
+const TREE_GUTTER_PIPE_NARROW: &str = "  | ";
 
 thread_local! {
-    static SHOW_TIMESTAMP_GUTTER: Cell<bool> = const { Cell::new(true) };
+    // v2: timestamps are opt-in; the spine carries the ledger (§1).
+    static SHOW_TIMESTAMP_GUTTER: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run `f` with the timestamp gutter column shown or hidden.
 ///
-/// When hidden, ledger gutters collapse so the content column widens; hairlines
-/// and nesting glyphs remain. Default (and outside this scope) is shown.
+/// When hidden (the default), only the 2-cell anchor spine prefixes content;
+/// nesting glyphs indent at the content column. Opting in adds the 9-cell
+/// timestamp column beside the spine.
 pub(crate) fn with_timestamp_gutter<T>(show: bool, f: impl FnOnce() -> T) -> T {
     SHOW_TIMESTAMP_GUTTER.with(|cell| {
         let previous = cell.replace(show);
@@ -37,9 +44,9 @@ pub(crate) fn timestamp_gutter_shown() -> bool {
 
 pub(crate) fn gutter_width() -> usize {
     if timestamp_gutter_shown() {
-        TIMESTAMP_GUTTER_WIDTH
+        TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
     } else {
-        0
+        SPINE_WIDTH
     }
 }
 
@@ -51,7 +58,7 @@ pub(crate) fn blank_gutter() -> &'static str {
     if timestamp_gutter_shown() {
         BLANK_GUTTER
     } else {
-        ""
+        BLANK_SPINE
     }
 }
 
@@ -83,6 +90,8 @@ pub(crate) fn timestamp_gutter(absolute: Option<&str>) -> String {
     if !timestamp_gutter_shown() {
         return String::new();
     }
+    // The 2 spine cells are appended by the caller's anchor stamping; this
+    // returns only the 9-cell timestamp column.
     match absolute {
         Some(ts) if display_width(ts) == 8 => {
             let mut out = String::with_capacity(TIMESTAMP_GUTTER_WIDTH);
@@ -105,12 +114,8 @@ pub(crate) fn timestamp_gutter(absolute: Option<&str>) -> String {
                 out
             }
         }
-        None => BLANK_GUTTER.to_owned(),
+        None => " ".repeat(TIMESTAMP_GUTTER_WIDTH),
     }
-}
-
-pub(crate) fn hairline_content(content_cols: usize) -> String {
-    "─".repeat(content_cols.max(1))
 }
 
 pub(crate) fn new_events_pill_text(new_events: usize) -> Option<String> {
@@ -124,10 +129,11 @@ const _: fn(usize) -> Option<String> = new_events_pill_text;
 pub(crate) fn is_ledger_gutter(gutter: &str) -> bool {
     let width = display_width(gutter);
     if timestamp_gutter_shown() {
-        width == TIMESTAMP_GUTTER_WIDTH
+        // Timestamp column + spine cells, or a tree prefix at that width.
+        width == TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
     } else {
-        // Hidden timestamp column: blank (0) or compact tree prefixes.
-        width == 0
+        // Spine-only mode: the 2-cell spine or compact tree prefixes.
+        width == SPINE_WIDTH
             || gutter == TREE_GUTTER_LAST_NARROW
             || gutter == TREE_GUTTER_MID_NARROW
             || gutter == TREE_GUTTER_PIPE_NARROW
@@ -224,30 +230,58 @@ mod tests {
         assert_eq!(truncate_display("ab\u{754c}cd", 4), "ab\u{754c}");
     }
 
+    // v2 (§0/§1): timestamps are opt-in; the 2-cell anchor spine is the
+    // default ledger prefix. `/timestamps` widens the column by 9 cells
+    // beside the spine — it does not replace it.
     #[test]
-    fn timestamp_gutter_is_nine_cells() {
-        assert_eq!(display_width(&timestamp_gutter(Some("14:32:07"))), 9);
-        assert_eq!(timestamp_gutter(Some("14:32:07")), "14:32:07 ");
-        assert_eq!(display_width(blank_gutter()), 9);
-        assert_eq!(display_width(tree_gutter_last()), 9);
-        assert_eq!(display_width(tree_gutter_mid()), 9);
-        assert_eq!(display_width(tree_gutter_pipe()), 9);
-        assert_eq!(timestamp_gutter(None), blank_gutter());
+    fn timestamp_gutter_opt_in_adds_nine_cells_beside_the_spine() {
+        with_timestamp_gutter(true, || {
+            assert_eq!(display_width(&timestamp_gutter(Some("14:32:07"))), 9);
+            assert_eq!(timestamp_gutter(Some("14:32:07")), "14:32:07 ");
+            assert_eq!(gutter_width(), TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH);
+            assert_eq!(
+                display_width(blank_gutter()),
+                TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
+            );
+            assert_eq!(
+                display_width(tree_gutter_last()),
+                TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
+            );
+            assert_eq!(
+                display_width(tree_gutter_mid()),
+                TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
+            );
+            assert_eq!(
+                display_width(tree_gutter_pipe()),
+                TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
+            );
+            assert_eq!(timestamp_gutter(None), " ".repeat(TIMESTAMP_GUTTER_WIDTH));
+        });
+        // Restored to the default (hidden) gutter once the closure returns.
+        assert_eq!(gutter_width(), SPINE_WIDTH);
     }
 
     #[test]
-    fn hidden_timestamp_gutter_widens_content() {
-        with_timestamp_gutter(false, || {
-            assert_eq!(gutter_width(), 0);
-            assert_eq!(blank_gutter(), "");
-            assert_eq!(timestamp_gutter(Some("14:32:07")), "");
-            assert_eq!(content_width(80), 80);
-            assert_eq!(tree_gutter_last(), "└ ");
-            assert!(is_ledger_gutter(""));
-            assert!(is_ledger_gutter("└ "));
+    fn default_gutter_is_the_two_cell_anchor_spine() {
+        assert_eq!(gutter_width(), SPINE_WIDTH);
+        assert_eq!(blank_gutter(), BLANK_SPINE);
+        assert_eq!(timestamp_gutter(Some("14:32:07")), "");
+        assert_eq!(content_width(80), 78);
+        assert_eq!(tree_gutter_last(), "  └ ");
+        assert_eq!(tree_gutter_mid(), "  ├ ");
+        assert!(is_ledger_gutter(BLANK_SPINE));
+        assert!(!is_ledger_gutter(""));
+        assert!(is_ledger_gutter("  └ "));
+        assert!(is_ledger_gutter("  ├ "));
+
+        with_timestamp_gutter(true, || {
+            assert_eq!(
+                content_width(80),
+                80 - (TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH)
+            );
         });
-        assert_eq!(gutter_width(), TIMESTAMP_GUTTER_WIDTH);
-        assert_eq!(content_width(80), 71);
+        // Unaffected by a closure that has already returned.
+        assert_eq!(content_width(80), 78);
     }
 
     #[test]
