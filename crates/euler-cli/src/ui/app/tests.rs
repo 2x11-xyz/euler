@@ -2943,6 +2943,58 @@ fn model_switch_error_renders_as_ui_notice() {
     assert!(rendered.contains("missing"));
 }
 
+// Review v3 §R5(a): the recap and its `── Worked for Ns ──` divider are one
+// unit — a turn too short to earn a divider must not leave an orphaned
+// recap line either (observed live after error-only turns that finished
+// under MIN_WORKED_DURATION).
+#[test]
+fn turn_recap_never_renders_without_its_worked_divider() {
+    let mut core = core();
+    core.transcript.push_event(event(
+        EventKind::FILE_DIFF,
+        object([("path", "src/lib.rs".into()), ("diff", "+line\n".into())]),
+    ));
+
+    core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(1)));
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        !text.contains("Worked for"),
+        "elapsed under MIN_WORKED_DURATION should suppress the divider: {text:?}"
+    );
+    // The recap would otherwise report the one changed file; its absence
+    // (distinct from the persistent footer's own "ctx" token) confirms no
+    // orphaned recap line rendered.
+    assert!(
+        !text.contains("1 file"),
+        "recap must not render without its divider: {text:?}"
+    );
+}
+
+// Review v3 §R5(b): empty-turn suppression. A turn that changed 0 files,
+// moved context by less than ~1%, and ran no tests renders the divider
+// (there was elapsed time worth naming) but not the recap line itself.
+#[test]
+fn empty_turn_suppresses_recap_line_but_keeps_the_divider() {
+    let mut core = core();
+    core.token_usage.context_window_tokens = Some(100_000);
+    core.turn_start_input_tokens = core.token_usage.input_tokens;
+
+    core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(10)));
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        text.contains("Worked for"),
+        "an elapsed turn still earns its divider: {text:?}"
+    );
+    // "0 files" is the recap's own distinctive token (the footer's "ctx N%"
+    // token alone isn't distinctive enough — it renders every turn).
+    assert!(
+        !text.contains("0 files"),
+        "0 files, negligible ctx move, and no tests must suppress the recap line: {text:?}"
+    );
+}
+
 #[test]
 fn cancel_outcome_clears_transient_live_tail_before_next_turn() {
     let mut core = core();
