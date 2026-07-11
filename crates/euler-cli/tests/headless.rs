@@ -6848,6 +6848,45 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+/// Post-purge byte segment, the (rows, cols) size at the cut, and the
+/// resizes inside the segment rebased to it.
+struct PostPurgeSegment<'a> {
+    segment: &'a [u8],
+    size: (u16, u16),
+    resizes: Vec<(usize, u16, u16)>,
+}
+
+/// A debounced post-resize replay purges euler-emitted scrollback (ESC[3J)
+/// and re-emits the transcript once at the settled width (issue #38). The
+/// FINAL state is therefore everything from the last purge onward; bridge
+/// rows and vt100 scrollback before it were erased on the real terminal.
+fn pty_post_purge_segment<'a>(
+    output: &'a [u8],
+    initial: (u16, u16),
+    resizes: &[(usize, u16, u16)],
+) -> PostPurgeSegment<'a> {
+    let cut = output
+        .windows(4)
+        .rposition(|window| window == b"\x1b[3J")
+        .map(|at| at + 4)
+        .unwrap_or(0);
+    let size_at_cut = resizes
+        .iter()
+        .take_while(|(offset, _, _)| *offset <= cut)
+        .last()
+        .map_or(initial, |(_, rows, cols)| (*rows, *cols));
+    let remaining: Vec<(usize, u16, u16)> = resizes
+        .iter()
+        .filter(|(offset, _, _)| *offset > cut)
+        .map(|(offset, rows, cols)| (offset - cut, *rows, *cols))
+        .collect();
+    PostPurgeSegment {
+        segment: &output[cut..],
+        size: size_at_cut,
+        resizes: remaining,
+    }
+}
+
 /// Final-state reconstruction across mid-session resizes: process each byte
 /// segment at its dimensions.
 fn pty_final_state_with_resizes(
@@ -6855,28 +6894,37 @@ fn pty_final_state_with_resizes(
     initial: (u16, u16),
     resizes: &[(usize, u16, u16)],
 ) -> String {
-    // A debounced post-resize replay purges euler-emitted scrollback
-    // (ESC[3J) and re-emits the transcript once at the settled width
-    // (issue #38). The FINAL state is therefore everything from the last
-    // purge onward; bridge rows and vt100 scrollback before it were erased
-    // on the real terminal.
-    let last_purge = output
-        .windows(4)
-        .rposition(|window| window == b"\x1b[3J")
-        .map(|at| at + 4);
-    if let Some(cut) = last_purge {
-        let size_at_cut = resizes
-            .iter()
-            .take_while(|(offset, _, _)| *offset <= cut)
-            .last()
-            .map_or(initial, |(_, rows, cols)| (*rows, *cols));
-        let remaining: Vec<(usize, u16, u16)> = resizes
-            .iter()
-            .filter(|(offset, _, _)| *offset > cut)
-            .map(|(offset, rows, cols)| (offset - cut, *rows, *cols))
-            .collect();
-        return pty_final_state_with_resizes(&output[cut..], size_at_cut, &remaining);
-    }
+    let cut = pty_post_purge_segment(output, initial, resizes);
+    let mut all_rows = extract_bridge_committed_rows(cut.segment);
+    all_rows.push(pty_rebuild_emulator_state(
+        cut.segment,
+        cut.size,
+        &cut.resizes,
+    ));
+    all_rows.join("\n")
+}
+
+/// Emulator-only final state (scrollback + screen) after the last purge —
+/// no raw bridge-byte extraction. Bridge extraction counts every committed
+/// row the app WROTE, even rows whose physical placement a real terminal
+/// then lost (e.g. a scroll-region insert that scrolled blank rows into
+/// scrollback while the viewport draw overpainted the inserted rows).
+/// Assertions about what a user can actually still SEE after the settled
+/// replay must use this.
+fn pty_emulator_final_state(
+    output: &[u8],
+    initial: (u16, u16),
+    resizes: &[(usize, u16, u16)],
+) -> String {
+    let cut = pty_post_purge_segment(output, initial, resizes);
+    pty_rebuild_emulator_state(cut.segment, cut.size, &cut.resizes)
+}
+
+fn pty_rebuild_emulator_state(
+    output: &[u8],
+    initial: (u16, u16),
+    resizes: &[(usize, u16, u16)],
+) -> String {
     let (mut rows, mut cols) = initial;
     let mut parser = vt100::Parser::new(rows, cols, 5000);
     let mut start = 0usize;
@@ -6906,9 +6954,32 @@ fn pty_final_state_with_resizes(
         }
         offset -= 1;
     }
-    let mut all_rows = extract_bridge_committed_rows(output);
-    all_rows.push(rebuilt.join("\n"));
-    all_rows.join("\n")
+    rebuilt.join("\n")
+}
+
+/// The visible screen rows (no scrollback) after the last scrollback purge,
+/// parsed at the size in effect at that point.
+fn pty_final_screen_rows(
+    output: &[u8],
+    initial: (u16, u16),
+    resizes: &[(usize, u16, u16)],
+) -> Vec<String> {
+    let cut = pty_post_purge_segment(output, initial, resizes);
+    // The settled purge follows the final resize by design (450ms trailing
+    // debounce), so the post-purge segment is parsed at one fixed size.
+    assert!(
+        cut.resizes.is_empty(),
+        "resize delivered after the settled purge — reconstruction size would be wrong"
+    );
+    let (rows, cols) = cut.size;
+    let mut parser = vt100::Parser::new(rows, cols, 5000);
+    parser.process(cut.segment);
+    parser
+        .screen()
+        .contents()
+        .lines()
+        .map(|row| row.to_string())
+        .collect()
 }
 
 #[test]
@@ -7247,6 +7318,313 @@ fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
         "{}\nBridge rows:\n{}",
         failures.join("\n"),
         all_rows.join("\n")
+    );
+}
+
+/// Streams `count` wrapping paragraphs plus a finished event into a fixture
+/// script and returns the `--provider-option` value for it.
+fn wrapping_paragraph_script(dir: &Path, name: &str, count: usize) -> String {
+    let mut events = Vec::new();
+    for paragraph in 1..=count {
+        let sentence = format!(
+            "Paragraph {paragraph}: content long enough to wrap and scroll so \
+             history rows land in native scrollback before the repaint."
+        );
+        for chunk in sentence.as_bytes().chunks(8) {
+            events.push(serde_json::json!({
+                "text_delta": String::from_utf8_lossy(chunk)
+            }));
+        }
+        events.push(serde_json::json!({"text_delta": "\n\n"}));
+    }
+    events.push(serde_json::json!({"finished": {"stop_reason": "completed"}}));
+    let script = write_fixture_script(
+        dir,
+        name,
+        &serde_json::json!({"version": 1, "responses": [{"events": events}]}).to_string(),
+    );
+    format!("event-script={}", path_str(&script))
+}
+
+#[test]
+fn tui_pty_theme_switch_replay_keeps_history_head_reachable() {
+    // Resize/repaint dogfood repro 1: switching themes runs a purge+replay;
+    // everything that was above the fold (banner, greeting, first user
+    // message) must still exist in the emulator's scrollback afterwards.
+    // The old replay re-committed the head rows through the scroll-region
+    // bridge, which scrolled BLANK rows (the screen had just been cleared)
+    // into scrollback while the viewport draw overpainted the rows the
+    // bridge wrote — the head of the session became an unreachable void.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let script_option = wrapping_paragraph_script(temp.path(), "theme-replay.json", 6);
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    tui.write("overview please\r");
+    assert!(tui.wait_for_screen("Paragraph 6:"), "{}", tui.screen_text());
+
+    tui.write("/theme light\r");
+    assert!(
+        tui.wait_for_screen("theme set to"),
+        "theme switch did not run:\n{}",
+        tui.screen_text()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    tui.quit();
+
+    let state = pty_emulator_final_state(&tui.output, (24, 80), &[]);
+    let mut failures = Vec::new();
+    for needle in ["e^(iπ) + 1 = 0", "overview please"] {
+        let occurrences = state.lines().filter(|line| line.contains(needle)).count();
+        if occurrences != 1 {
+            failures.push(format!(
+                "`{needle}` reachable {occurrences}× after theme replay (want 1)"
+            ));
+        }
+    }
+    for paragraph in 1..=6 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = state.lines().filter(|line| line.contains(&needle)).count();
+        if occurrences != 1 {
+            failures.push(format!(
+                "`{needle}` reachable {occurrences}× after theme replay (want 1)"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "theme replay destroyed or duplicated history:\n{}\nFinal emulator state:\n{state}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn tui_pty_grow_settles_top_anchored_with_nothing_below_footer() {
+    // Resize/repaint dogfood repro 3: grow the window mid-session. After the
+    // settled replay: content that fits the taller screen is top-anchored,
+    // the footer is the LAST painted row (no stray transcript below it), and
+    // no line of the session exists twice. The old code clamped the viewport
+    // to the startup height and re-committed head rows through the
+    // scroll-region bridge, which painted a degraded duplicate of the
+    // session head BELOW the live footer.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let script_option = wrapping_paragraph_script(temp.path(), "grow-settle.json", 8);
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    tui.write("overview please\r");
+    assert!(tui.wait_for_screen("Paragraph 8:"), "{}", tui.screen_text());
+
+    // Grow both dimensions well past the startup size; PTY resize delivery
+    // is slow (~300ms ticks), so allow the 450ms debounce to settle after.
+    tui.resize(60, 132);
+    std::thread::sleep(Duration::from_millis(1200));
+    // Harvest the settled frame and remember where it ends: the quit path
+    // prints the exit recap BELOW the app frame by design, which must not
+    // count against the "nothing below the footer" assertion.
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    let settled_len = tui.output.len();
+    tui.quit();
+
+    let resizes = tui.resizes.clone();
+    let state = pty_emulator_final_state(&tui.output[..settled_len], (24, 80), &resizes);
+    let mut failures = Vec::new();
+    for paragraph in 1..=8 {
+        let needle = format!("Paragraph {paragraph}:");
+        let occurrences = state.lines().filter(|line| line.contains(&needle)).count();
+        if occurrences != 1 {
+            failures.push(format!(
+                "`{needle}` present {occurrences}× after settled grow (want 1)"
+            ));
+        }
+    }
+    let banner = state
+        .lines()
+        .filter(|line| line.contains("e^(iπ) + 1 = 0"))
+        .count();
+    if banner != 1 {
+        failures.push(format!("banner caption present {banner}× (want 1)"));
+    }
+
+    let screen = pty_final_screen_rows(&tui.output[..settled_len], (24, 80), &resizes);
+    // At 60 rows the whole session fits: the banner must be on the visible
+    // screen, top-anchored (the old stale-height clamp left it in scrollback
+    // or duplicated below the footer).
+    let banner_row = screen.iter().position(|row| row.contains("e^(iπ) + 1 = 0"));
+    // The caption is the 7th banner row; top-anchored content puts it in the
+    // top handful of screen rows.
+    match banner_row {
+        None => failures.push("banner caption not on the settled screen".to_owned()),
+        Some(row) if row > 8 => {
+            failures.push(format!(
+                "banner caption at screen row {row} — content is not top-anchored"
+            ));
+        }
+        Some(_) => {}
+    }
+    // The bottom chrome (composer rail then status line) is the LAST painted
+    // content: no transcript row may appear below it (the old code painted a
+    // degraded copy of the session head below the live footer after a grow).
+    match screen
+        .iter()
+        .rposition(|row| row.trim_start().starts_with('▌'))
+    {
+        None => failures.push("composer rail not on the settled screen".to_owned()),
+        Some(composer_row) => {
+            for (offset, row) in screen[composer_row + 1..].iter().enumerate() {
+                let trimmed = row.trim();
+                let is_status_row = trimmed.contains(" · ");
+                if !trimmed.is_empty() && !is_status_row {
+                    failures.push(format!(
+                        "non-chrome row {} below the composer: {row:?}",
+                        composer_row + 1 + offset
+                    ));
+                }
+                if trimmed.contains("Paragraph") || trimmed.contains("e^(iπ)") {
+                    failures.push(format!(
+                        "transcript content below the composer at row {}: {row:?}",
+                        composer_row + 1 + offset
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "settled grow left a corrupted frame:\n{}\nScreen:\n{}\nEmulator state:\n{state}",
+        failures.join("\n"),
+        screen.join("\n")
+    );
+}
+
+#[test]
+fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
+    // Resize/repaint dogfood repros 2/4/5: a ctrl+o fold toggle triggers a
+    // purge+replay. Toggling right after a resize (before the debounced
+    // settled replay has run) must not consume stale geometry, and the
+    // toggle's own replay must not turn the rows above the fold into a
+    // void. Covers: expand -> collapse in a stable window, and resize ->
+    // immediate toggle as the first repaint after the size change.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let tool_output = "for i in $(seq 1 30); do echo tool-line-$i; done";
+    let responses = serde_json::json!({"version": 1, "responses": [
+        {"events": [
+            {"tool_call": {"id": "call-1", "name": "run_shell", "input": {"command": tool_output}}},
+            {"finished": {"stop_reason": "tool_use"}},
+        ]},
+        {"events": [
+            {"text_delta": "Ran the generator; thirty lines of output captured for the fold.\n\n"},
+            {"text_delta": "Summary paragraph one long enough to wrap at the narrowed width and keep the collapsed transcript taller than the screen.\n\n"},
+            {"text_delta": "Summary paragraph two long enough to wrap at the narrowed width and keep the collapsed transcript taller than the screen.\n\n"},
+            {"text_delta": "Summary paragraph three long enough to wrap at the narrowed width and keep the collapsed transcript taller than the screen."},
+            {"finished": {"stop_reason": "completed"}},
+        ]},
+    ]});
+    let script = write_fixture_script(temp.path(), "fold-replay.json", &responses.to_string());
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    tui.write("generate lines\r");
+    assert!(
+        tui.wait_for_screen("Run command?"),
+        "approval panel did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("a");
+    assert!(
+        tui.wait_for_screen("thirty lines of output captured"),
+        "turn did not finish:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.wait_for_screen("ctrl+o expand"),
+        "fold affordance missing:\n{}",
+        tui.screen_text()
+    );
+
+    // Expand (replay 1): hidden middle output rows become visible.
+    tui.write("\x0f");
+    assert!(
+        tui.wait_for_screen("tool-line-15"),
+        "expand did not reveal folded output:\n{}",
+        tui.screen_text()
+    );
+    // Collapse (replay 2) in a stable window — repro 2's every-time case.
+    tui.write("\x0f");
+    assert!(
+        tui.wait_for_screen("ctrl+o expand"),
+        "collapse did not restore the fold affordance:\n{}",
+        tui.screen_text()
+    );
+
+    // Narrow the window and IMMEDIATELY toggle: the toggle's replay is the
+    // first repaint after the size change (repro 4). Then let the debounced
+    // settled replay run too.
+    tui.resize(24, 72);
+    tui.write("\x0f");
+    assert!(
+        tui.wait_for_screen("tool-line-15"),
+        "post-resize expand did not reveal folded output:\n{}",
+        tui.screen_text()
+    );
+    std::thread::sleep(Duration::from_millis(1200));
+    // Final collapse so the settled state is compact: the vt100 test
+    // emulator cannot page scrollback deeper than one screen height, and
+    // the void being asserted on is exactly the head of the transcript.
+    tui.write("\x0f");
+    assert!(
+        tui.wait_for_screen("ctrl+o expand"),
+        "final collapse did not restore the fold affordance:\n{}",
+        tui.screen_text()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    tui.quit();
+
+    let resizes = tui.resizes.clone();
+    let state = pty_emulator_final_state(&tui.output, (24, 80), &resizes);
+    let mut failures = Vec::new();
+    for needle in [
+        "e^(iπ) + 1 = 0",
+        "generate lines",
+        "thirty lines of output captured",
+        "more lines · ctrl+o expand",
+    ] {
+        let occurrences = state.lines().filter(|line| line.contains(needle)).count();
+        if occurrences != 1 {
+            failures.push(format!(
+                "`{needle}` reachable {occurrences}× after fold replays (want 1)"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "fold-toggle replays corrupted history:\n{}\nFinal emulator state:\n{state}",
+        failures.join("\n")
     );
 }
 

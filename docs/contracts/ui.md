@@ -163,6 +163,32 @@ trade-off, not an oversight: it is strictly better than the fossil-copy
 corruption it replaces, but it does mean a user who resizes their terminal
 loses pre-euler scrollback history.
 
+Full-repaint invariants (settled-resize replay, `ctrl+o` fold toggle, theme
+switch, resume — anything that clears the surface and rebuilds it):
+
+- **Live geometry.** A repaint reads the terminal's live dimensions at the
+  moment it runs; a resize event only updates the cached size and schedules
+  the repaint. No repaint may consume dimensions older than the most recent
+  resize event already drained.
+- **Fresh anchor.** The anchor is recomputed from scratch: content shorter
+  than the screen with nothing committed above is top-anchored (the
+  session-start layout); otherwise the bottom chrome pins to the screen
+  bottom.
+- **Every row painted.** Rows the repaint does not cover are painted with
+  the theme background — never left as terminal-default voids.
+- **Re-emission prints through the screen.** After the clear, the committed
+  history prefix is re-emitted by printing rows through the screen so they
+  physically flow into native scrollback. The scroll-region linefeed bridge
+  is only valid incrementally, when the region above the bottom band still
+  holds the previously committed rows; used right after a clear it scrolls
+  blank rows into scrollback while the viewport draw overpaints the rows it
+  wrote, destroying the history head.
+- **Theme switch history policy.** A theme switch is a full-repaint
+  consumer: the whole region repaints and history is re-emitted in the new
+  theme. History above the fold must remain reachable in scrollback after
+  the switch — old-theme cells are acceptable, a purged-to-void history is
+  not.
+
 > **Owner-acceptance pending (real-terminal dogfood).** This mechanism is
 > PTY-tested (see the drag-resize test in `tests/headless.rs`) but has not
 > yet been hands-on validated by the owner in real terminal emulators
