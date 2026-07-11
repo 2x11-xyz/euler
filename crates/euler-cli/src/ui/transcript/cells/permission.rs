@@ -20,6 +20,7 @@ pub(in crate::ui::transcript) fn render_permission_decision(
     let scope_label = match (view.allowed, view.grant_scope) {
         (Some(true), Some("session")) => "allowed for session",
         (Some(true), Some("project")) => "allowed for project",
+        (Some(true), Some("user")) => "allowed always (user rule)",
         (Some(true), _) => "allowed once",
         _ => "",
     };
@@ -59,6 +60,9 @@ pub(in crate::ui::transcript) struct PermissionAskView<'a> {
     pub(in crate::ui::transcript) reason: &'a str,
     pub(in crate::ui::transcript) command: Option<&'a str>,
     pub(in crate::ui::transcript) scope_prefix: Option<&'a str>,
+    /// `Some` only when the durable `u  Allow <prefix> * always` option is
+    /// offerable (simple shell command + loaded user store).
+    pub(in crate::ui::transcript) user_rule_prefix: Option<&'a str>,
     pub(in crate::ui::transcript) prior_count: usize,
     pub(in crate::ui::transcript) selected_option: crate::ui::patch_approval::ApprovalOption,
     pub(in crate::ui::transcript) companion_name: Option<&'a str>,
@@ -152,6 +156,7 @@ pub(in crate::ui::transcript) fn render_permission_ask(
         crate::ui::patch_approval::approval_option_lines(
             ask.capability,
             ask.scope_prefix,
+            ask.user_rule_prefix,
             ask.selected_option,
         )
         .into_iter()

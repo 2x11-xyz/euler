@@ -79,7 +79,8 @@ pub enum DeciderVerdict {
     Allow,
     AllowSession,
     Deny,
-    /// Explicit scoped grant (once / session-prefix / project-prefix).
+    /// Explicit scoped grant (once / session-prefix / project-prefix /
+    /// user-prefix).
     AllowScoped(GrantScope),
     /// Deny and return guidance text for a follow-up user turn.
     DenyWithInstruction(String),
@@ -129,7 +130,7 @@ impl DeciderVerdict {
 
 /// Structured permission outcome: allow with a grant scope, or deny with optional guidance.
 ///
-/// - Allow: `instruction` is `None`; `scope` is Once / Session / Project.
+/// - Allow: `instruction` is `None`; `scope` is Once / Session / Project / User.
 /// - Deny: `instruction` is `Some` (empty string means bare deny); `scope` is `Once` (no grant).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GrantDecision {
@@ -196,6 +197,11 @@ pub struct PermissionGate<D> {
     /// User-home consent store paired with `project_store`; both are set or
     /// neither is. Repo-controlled grants activate only with matching consent.
     consent_store: Option<ProjectGrantStore>,
+    /// User-level durable grants (prefix rules) loaded from the euler home.
+    /// Single-store authority — no consent intersection — because the file is
+    /// user-authored in the user-owned home and never repo-controlled.
+    user_grants: GrantList,
+    user_store: Option<ProjectGrantStore>,
     decider: D,
 }
 
@@ -211,6 +217,8 @@ impl<D> PermissionGate<D> {
             project_grants: GrantList::new(),
             project_store: None,
             consent_store: None,
+            user_grants: GrantList::new(),
+            user_store: None,
             decider,
         }
     }
@@ -222,6 +230,8 @@ impl<D> PermissionGate<D> {
             project_grants: GrantList::new(),
             project_store: None,
             consent_store: None,
+            user_grants: GrantList::new(),
+            user_store: None,
             decider,
         }
     }
@@ -283,6 +293,34 @@ impl<D> PermissionGate<D> {
         Ok(())
     }
 
+    /// Load user-level durable grants from `<user_dir>/user-grants.json`.
+    /// `None` disables user grants entirely — reads and writes both fail
+    /// closed. No consent intersection applies: the store is user-authored in
+    /// the user-owned euler home and never repo-controlled (see
+    /// [`ProjectGrantStore::user_grants_path`]).
+    pub fn load_user_grants(&mut self, user_dir: Option<&Path>) -> Result<(), ProjectGrantError> {
+        let Some(user_dir) = user_dir else {
+            self.user_grants = GrantList::new();
+            self.user_store = None;
+            return Ok(());
+        };
+        let store = ProjectGrantStore::at_path(ProjectGrantStore::user_grants_path(user_dir));
+        match store.load() {
+            Ok(grants) => {
+                self.user_grants = grants;
+                self.user_store = Some(store);
+                Ok(())
+            }
+            Err(error) => {
+                // Corrupt store: grant nothing and keep writes fail-closed
+                // rather than clobber the file the user could still inspect.
+                self.user_grants = GrantList::new();
+                self.user_store = None;
+                Err(error)
+            }
+        }
+    }
+
     pub fn session_grants(&self) -> &[ActiveGrant] {
         self.session_grants.as_slice()
     }
@@ -291,10 +329,23 @@ impl<D> PermissionGate<D> {
         self.project_grants.as_slice()
     }
 
-    /// All active grants (session first, then project) for `/permissions` listing.
+    pub fn user_grants(&self) -> &[ActiveGrant] {
+        self.user_grants.as_slice()
+    }
+
+    /// Whether a user grant store is loaded (a user grant dir was configured
+    /// and readable). Surfaces gate the "always" approval option on this.
+    pub fn user_rules_enabled(&self) -> bool {
+        self.user_store.is_some()
+    }
+
+    /// All active grants (session, then project, then user) for
+    /// `/permissions` listing.
     pub fn list_grants(&self) -> Vec<(GrantSource, ActiveGrant)> {
         let mut out = Vec::with_capacity(
-            self.session_grants.as_slice().len() + self.project_grants.as_slice().len(),
+            self.session_grants.as_slice().len()
+                + self.project_grants.as_slice().len()
+                + self.user_grants.as_slice().len(),
         );
         for grant in self.session_grants.iter() {
             out.push((GrantSource::Session, grant.clone()));
@@ -302,10 +353,14 @@ impl<D> PermissionGate<D> {
         for grant in self.project_grants.iter() {
             out.push((GrantSource::Project, grant.clone()));
         }
+        for grant in self.user_grants.iter() {
+            out.push((GrantSource::User, grant.clone()));
+        }
         out
     }
 
-    /// Which grant store covers this request, if any (session wins ties).
+    /// Which grant store covers this request, if any (narrowest lifetime wins
+    /// ties: session, then project, then user).
     pub fn granted_source(&self, request: &PermissionRequest) -> Option<GrantSource> {
         let command = request.command_for_matching();
         let path = request.path.as_deref();
@@ -321,17 +376,17 @@ impl<D> PermissionGate<D> {
         {
             return Some(GrantSource::Project);
         }
+        if self
+            .user_grants
+            .is_granted(request.capability, command, path)
+        {
+            return Some(GrantSource::User);
+        }
         None
     }
 
     pub fn is_granted(&self, request: &PermissionRequest) -> bool {
-        let command = request.command_for_matching();
-        let path = request.path.as_deref();
-        self.session_grants
-            .is_granted(request.capability, command, path)
-            || self
-                .project_grants
-                .is_granted(request.capability, command, path)
+        self.granted_source(request).is_some()
     }
 
     /// Install a grant. Project grants require a loaded project store and are
@@ -366,6 +421,14 @@ impl<D> PermissionGate<D> {
                 let consented = consent.add(&grant)?;
                 let workspace = store.add(&grant)?;
                 self.project_grants = workspace.intersection(&consented);
+                Ok(())
+            }
+            GrantScope::User(pattern) => {
+                let grant = ActiveGrant::new(capability, pattern);
+                let store = self.user_store.as_ref().ok_or(ProjectGrantError::NoStore)?;
+                // Persist first; the in-memory list only reflects what the
+                // durable store actually holds.
+                self.user_grants = store.add(&grant)?;
                 Ok(())
             }
         }
@@ -416,6 +479,19 @@ impl<D> PermissionGate<D> {
                 self.project_grants = workspace.intersection(&consented);
                 Ok(removed)
             }
+            GrantSource::User => {
+                let store = self.user_store.as_ref().ok_or(ProjectGrantError::NoStore)?;
+                let removed = self
+                    .user_grants
+                    .as_slice()
+                    .iter()
+                    .filter(|g| g.capability == capability && g.pattern == *pattern)
+                    .count();
+                // Durable first: the in-memory list only reflects what the
+                // store still holds after the rewrite.
+                self.user_grants = store.revoke(capability, pattern)?;
+                Ok(removed)
+            }
         }
     }
 }
@@ -425,6 +501,9 @@ impl<D> PermissionGate<D> {
 pub enum GrantSource {
     Session,
     Project,
+    /// Durable user-level rule under the euler home — covers every session
+    /// in every project.
+    User,
 }
 
 impl GrantSource {
@@ -432,6 +511,7 @@ impl GrantSource {
         match self {
             Self::Session => "session",
             Self::Project => "project",
+            Self::User => "user",
         }
     }
 }
@@ -472,11 +552,12 @@ impl<D: PermissionDecider> PermissionGate<D> {
                 let verdict = self.decider.decide(request);
                 let decision = verdict.as_grant_decision(request.capability);
                 if decision.allowed() {
-                    // Project persist failure: still allow this once; do not claim project grant.
+                    // Durable-store persist failure (project or user): still
+                    // allow this once; never claim a grant that did not land.
                     if let Err(_err) =
                         self.install_grant(request.capability, decision.scope.clone())
                     {
-                        if matches!(decision.scope, GrantScope::Project(_)) {
+                        if matches!(decision.scope, GrantScope::Project(_) | GrantScope::User(_)) {
                             return GrantDecision::allow(request.capability, GrantScope::Once);
                         }
                     }
@@ -678,12 +759,21 @@ mod tests {
         // Review finding (#66): the metachar/token checks ran on the
         // 4 KiB-bounded command while execution ran the full string — a `;`
         // past the bound inherited the scoped grant.
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
         let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_user_grants(Some(&home)).expect("load");
         gate.install_grant(
             Capability::ShellExec,
             GrantScope::Session(ScopePattern::new("cargo").expect("pattern")),
         )
         .expect("install");
+        // Durable user prefix rules must be equally unreachable.
+        gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::User(ScopePattern::new("cargo").expect("pattern")),
+        )
+        .expect("install user rule");
 
         let mut long = String::from("cargo test --features ");
         long.push_str(&"a".repeat(crate::grants::MAX_GRANT_COMMAND_BYTES));
@@ -776,5 +866,95 @@ mod tests {
         // Grant exists, but AlwaysDeny mode still denies.
         assert!(gate.is_granted(&request));
         assert!(!gate.decide(&request, ApprovalMode::AlwaysDeny));
+    }
+
+    #[test]
+    fn user_rule_persists_and_covers_fresh_gate() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let mut gate =
+            PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
+                GrantScope::User(ScopePattern::new("cargo").expect("pattern")),
+            )]));
+        gate.load_user_grants(Some(&home)).expect("load");
+        assert!(gate.user_rules_enabled());
+
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test -q");
+        let decision = gate.decide_detailed(&request, ApprovalMode::Ask);
+        assert!(decision.allowed());
+        assert_eq!(decision.scope.as_str(), "user");
+        assert_eq!(decision.grant_pattern(), Some("cargo"));
+        assert!(home.join("user-grants.json").exists());
+
+        // A FRESH gate loading the same home covers any identical-token
+        // command — that is what "always" means.
+        let mut gate2 = PermissionGate::new(PanicDecider);
+        gate2.load_user_grants(Some(&home)).expect("reload");
+        let other = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo build --release");
+        assert_eq!(gate2.granted_source(&other), Some(GrantSource::User));
+        assert!(gate2.decide(&other, ApprovalMode::Ask));
+        // Compound lines are never covered by a prefix rule.
+        let compound = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test; rm -rf ~");
+        assert!(!gate2.is_granted(&compound));
+        let listed = gate2.list_grants();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, GrantSource::User);
+    }
+
+    #[test]
+    fn revoking_user_rule_removes_it_durably() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let pattern = ScopePattern::new("cargo").expect("pattern");
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_user_grants(Some(&home)).expect("load");
+        gate.install_grant(Capability::ShellExec, GrantScope::User(pattern.clone()))
+            .expect("install");
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(gate.is_granted(&request));
+
+        assert_eq!(
+            gate.revoke(Capability::ShellExec, &pattern, GrantSource::User)
+                .expect("revoke"),
+            1
+        );
+        assert!(!gate.is_granted(&request));
+
+        // Durable: a fresh gate sees the revoked store, not the old rule.
+        let mut gate2 = PermissionGate::new(PanicDecider);
+        gate2.load_user_grants(Some(&home)).expect("reload");
+        assert!(!gate2.is_granted(&request));
+        assert!(gate2.list_grants().is_empty());
+    }
+
+    #[test]
+    fn no_user_dir_disables_user_rules_entirely() {
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_user_grants(None).expect("load");
+        assert!(!gate.user_rules_enabled());
+        // Writes fail closed: no user dir means no durable installs.
+        let result = gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::User(ScopePattern::new("git").expect("pattern")),
+        );
+        assert!(matches!(result, Err(ProjectGrantError::NoStore)));
+
+        // A user-scoped verdict without a store still allows once — the
+        // decision never claims a durable rule that did not land.
+        let mut gate =
+            PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
+                GrantScope::User(ScopePattern::new("cargo").expect("pattern")),
+            )]));
+        gate.load_user_grants(None).expect("load");
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        let decision = gate.decide_detailed(&request, ApprovalMode::Ask);
+        assert!(decision.allowed());
+        assert_eq!(decision.scope, GrantScope::Once);
+        assert!(gate.user_grants().is_empty());
     }
 }

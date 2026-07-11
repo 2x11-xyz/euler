@@ -1503,6 +1503,45 @@ fn tui_tool_output_trims_trailing_blank_rows_before_rendering() {
 }
 
 #[test]
+fn tool_run_header_tags_covering_grant_source() {
+    // A run covered by an existing grant carries the provenance tag on the
+    // header (review v2 §8); durable user rules read `· user rule`, never
+    // the odd "user grant".
+    let theme = Theme::default();
+    let items = vec![
+        TranscriptItem::ToolRun {
+            command: "cargo test".to_owned(),
+            ok: true,
+            error: String::new(),
+            output: "ok".to_owned(),
+            exit_code: Some(0),
+            grant_source: Some("user".to_owned()),
+        },
+        TranscriptItem::ToolRun {
+            command: "cargo build".to_owned(),
+            ok: true,
+            error: String::new(),
+            output: "ok".to_owned(),
+            exit_code: Some(0),
+            grant_source: Some("session".to_owned()),
+        },
+    ];
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 80));
+    let joined = texts.join("\n");
+
+    assert!(
+        joined.contains("bash $ cargo test · user rule"),
+        "texts: {texts:?}"
+    );
+    assert!(!joined.contains("user grant"), "texts: {texts:?}");
+    assert!(
+        joined.contains("bash $ cargo build · session grant"),
+        "texts: {texts:?}"
+    );
+}
+
+#[test]
 fn tool_artifact_cell_handles_empty_output_without_fold_affordance() {
     let theme = Theme::default();
     let items = vec![TranscriptItem::ToolRun {

@@ -68,7 +68,11 @@ fn tool_run_heading(run: &ToolRunRender<'_>, width: u16, footer: &str) -> String
     if run.command.is_empty() {
         return "bash".to_owned();
     }
-    let grant_suffix = run.grant_source.map(|source| format!(" · {source} grant"));
+    // Durable user prefix rules read as `· user rule`, not "user grant".
+    let grant_suffix = run.grant_source.map(|source| match source {
+        "user" => " · user rule".to_owned(),
+        _ => format!(" · {source} grant"),
+    });
     let available = content_width(width);
     let reserved = display_width(BASH_PREFIX)
         + grant_suffix.as_deref().map(display_width).unwrap_or(0)

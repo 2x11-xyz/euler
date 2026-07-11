@@ -19,6 +19,10 @@ pub enum PermissionReply {
     AllowOnce,
     AllowSessionScope(String),
     AllowProjectScope(String),
+    /// Durable user rule ("always"). Unlike session/project scopes, empty is
+    /// never honest here — the panel only offers `u` with a derived prefix —
+    /// so an empty pattern falls back to allow-once, not unscoped.
+    AllowUserScope(String),
     Deny,
     DenyWithInstruction(String),
 }
@@ -62,6 +66,17 @@ impl PermissionDecider for TuiDecider {
                 Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::Project(pattern)),
                 Err(_) => DeciderVerdict::Allow,
             },
+            PermissionReply::AllowUserScope(pattern) => {
+                if pattern.is_empty() {
+                    // A user rule is never unscoped: empty would broaden a
+                    // prefix rule to the whole capability forever.
+                    return DeciderVerdict::Allow;
+                }
+                match ScopePattern::new(pattern) {
+                    Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::User(pattern)),
+                    Err(_) => DeciderVerdict::Allow,
+                }
+            }
             PermissionReply::Deny => DeciderVerdict::Deny,
             PermissionReply::DenyWithInstruction(text) => DeciderVerdict::DenyWithInstruction(text),
         }
@@ -126,6 +141,45 @@ mod tests {
                 ScopePattern::new("src").expect("pattern")
             ))
         );
+    }
+
+    #[test]
+    fn decide_maps_user_scope_and_never_broadens_it() {
+        let (mut decider, channels) = TuiDecider::new();
+        let handle = thread::spawn(move || {
+            let user = decider.decide(&request());
+            let empty = decider.decide(&request());
+            let control = decider.decide(&request());
+            (user, empty, control)
+        });
+
+        let _ = channels.request_rx.recv().expect("request");
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowUserScope("cargo".into()))
+            .expect("reply");
+        let _ = channels.request_rx.recv().expect("request");
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowUserScope(String::new()))
+            .expect("reply");
+        let _ = channels.request_rx.recv().expect("request");
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowUserScope("cargo\u{0001}".into()))
+            .expect("reply");
+
+        let (user, empty, control) = handle.join().expect("join");
+        assert_eq!(
+            user,
+            DeciderVerdict::AllowScoped(GrantScope::User(
+                ScopePattern::new("cargo").expect("pattern")
+            ))
+        );
+        // Empty would be an unscoped ("whole capability forever") rule and
+        // invalid patterns must not broaden either: both degrade to once.
+        assert_eq!(empty, DeciderVerdict::Allow);
+        assert_eq!(control, DeciderVerdict::Allow);
     }
 
     #[test]

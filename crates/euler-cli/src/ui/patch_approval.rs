@@ -40,24 +40,32 @@ pub(crate) enum ApprovalOption {
     AllowOnce,
     AllowSession,
     AllowProject,
+    /// Durable user rule ("always"): only reachable when the panel offers it
+    /// (`user_available`) — hidden for unscoped/compound asks and when the
+    /// session has no user grant store.
+    AllowUser,
     Deny,
 }
 
 impl ApprovalOption {
-    pub(crate) fn previous(self) -> Self {
+    pub(crate) fn previous(self, user_available: bool) -> Self {
         match self {
             Self::AllowOnce => Self::AllowOnce,
             Self::AllowSession => Self::AllowOnce,
             Self::AllowProject => Self::AllowSession,
+            Self::AllowUser => Self::AllowProject,
+            Self::Deny if user_available => Self::AllowUser,
             Self::Deny => Self::AllowProject,
         }
     }
 
-    pub(crate) fn next(self) -> Self {
+    pub(crate) fn next(self, user_available: bool) -> Self {
         match self {
             Self::AllowOnce => Self::AllowSession,
             Self::AllowSession => Self::AllowProject,
+            Self::AllowProject if user_available => Self::AllowUser,
             Self::AllowProject => Self::Deny,
+            Self::AllowUser => Self::Deny,
             Self::Deny => Self::Deny,
         }
     }
@@ -197,6 +205,9 @@ pub(crate) fn panel_lines(
         approval_option_lines(
             modal.request.capability.as_str(),
             derive_scope_prefix(&modal.request).as_deref(),
+            // Patch approval is fs-write only; durable user rules are
+            // shell-command prefix rules and never apply here.
+            None,
             selected_option,
         )
         .into_iter()
@@ -250,6 +261,27 @@ pub(crate) fn derive_shell_prefix(command: &str) -> Option<String> {
     command_first_token(command).map(str::to_owned)
 }
 
+/// Prefix for the durable user-rule option (`u  Allow cargo * always`).
+///
+/// User rules are command-prefix rules over the parsed first token, so the
+/// option is honest only for a `shell-exec` ask whose command is a single
+/// simple invocation: compound lines (control operators, substitution,
+/// redirection) are never covered by prefix grants and must keep re-asking
+/// until the safe-command composition lands (capabilities contract, #78).
+/// Callers additionally gate on the session having a loaded user store.
+pub(crate) fn derive_user_rule_prefix(request: &PermissionRequest) -> Option<String> {
+    if request.capability != Capability::ShellExec || request.command_truncated {
+        // A truncated command may hide metacharacters past the bound; never
+        // offer a durable rule the gate would refuse to honor.
+        return None;
+    }
+    let command = request.command.as_deref()?;
+    if !shell_command_is_simple(command) {
+        return None;
+    }
+    derive_shell_prefix(command)
+}
+
 pub(crate) fn derive_edit_prefix(path: &Path) -> Option<String> {
     let raw = path.to_string_lossy();
     let normalized = raw
@@ -270,9 +302,13 @@ pub(crate) fn derive_edit_prefix(path: &Path) -> Option<String> {
 }
 
 /// Honest option labels: never show a prefix the gate will not grant.
+/// `user_rule_prefix` is `Some` only when a durable user rule is offerable
+/// (simple shell command with a derivable prefix AND a loaded user store) —
+/// the `u` row is omitted entirely otherwise.
 pub(crate) fn approval_option_lines(
     capability: &str,
     scope_prefix: Option<&str>,
+    user_rule_prefix: Option<&str>,
     selected: ApprovalOption,
 ) -> Vec<ApprovalOptionLine> {
     let (session_label, project_label) = match scope_prefix.filter(|p| !p.is_empty()) {
@@ -289,18 +325,26 @@ pub(crate) fn approval_option_lines(
             format!("p  Allow {capability} in this project"),
         ),
     };
-    vec![
+    let mut lines = vec![
         // v2.1 (§7b): the selection bar (the `›` marker plus gold-on-select
         // styling) marks the default now — no "(default selection)" text.
         approval_option_line("y  Allow once", selected, ApprovalOption::AllowOnce),
         approval_option_line(&session_label, selected, ApprovalOption::AllowSession),
         approval_option_line(&project_label, selected, ApprovalOption::AllowProject),
-        approval_option_line(
-            "n/esc  Deny with instructions",
+    ];
+    if let Some(prefix) = user_rule_prefix.filter(|p| !p.is_empty()) {
+        lines.push(approval_option_line(
+            &format!("u  Allow {prefix} * always"),
             selected,
-            ApprovalOption::Deny,
-        ),
-    ]
+            ApprovalOption::AllowUser,
+        ));
+    }
+    lines.push(approval_option_line(
+        "n/esc  Deny with instructions",
+        selected,
+        ApprovalOption::Deny,
+    ));
+    lines
 }
 
 fn approval_option_line(

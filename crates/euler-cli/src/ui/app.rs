@@ -185,6 +185,9 @@ pub struct AppCore {
     model_catalog: MergedModelCatalog,
     session_store: Option<SessionStore>,
     active_session_home_managed: bool,
+    /// Whether the session loaded a durable user grant store; gates the
+    /// `u  Allow <prefix> * always` approval option (absent = store inert).
+    user_rules_enabled: bool,
     token_usage: TokenUsageSnapshot,
     transcript: TranscriptState,
     visual_canvas: VisualCanvasState,
@@ -656,6 +659,7 @@ struct AppCoreBootstrap {
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     active_session_home_managed: bool,
+    user_rules_enabled: bool,
     theme: Theme,
     status: StatusSnapshot,
     initial_token_usage: TokenUsageSnapshot,
@@ -667,6 +671,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
     let target = session.active_target().clone();
     let reasoning_effort = session.reasoning_effort();
     let session_id = session.session_id().to_owned();
+    let user_rules_enabled = session.user_rules_enabled();
     let cwd = session_root_status_path();
     let AppOptions {
         theme_choice,
@@ -726,6 +731,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         extensions,
         observe,
         active_session_home_managed,
+        user_rules_enabled,
         theme,
         status,
         initial_token_usage,
@@ -757,6 +763,7 @@ impl AppCore {
             extensions,
             observe,
             active_session_home_managed,
+            user_rules_enabled,
             theme,
             status,
             initial_token_usage,
@@ -775,6 +782,7 @@ impl AppCore {
             model_catalog,
             session_store,
             active_session_home_managed,
+            user_rules_enabled,
             token_usage: initial_token_usage,
             transcript: TranscriptState::default(),
             visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner {
@@ -1509,6 +1517,15 @@ impl AppCore {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
             }
+            // `u` decides only when the panel actually offers the durable
+            // user rule; otherwise it falls through and types into the
+            // composer like any other character.
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if draft_empty && self.modal_user_rule_prefix().is_some() =>
+            {
+                let prefix = self.modal_user_rule_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowUserScope(prefix))
+            }
             KeyCode::Char('n') | KeyCode::Char('N') if draft_empty => self.reply_deny_from_modal(),
             KeyCode::Esc => self.reply_deny_from_modal(),
             _ if modal_quit_key(&key) => {
@@ -1521,12 +1538,16 @@ impl AppCore {
     }
 
     fn move_approval_selection_up(&mut self) -> CoreEffect {
-        self.approval_selection = self.approval_selection.previous();
+        self.approval_selection = self
+            .approval_selection
+            .previous(self.modal_user_rule_prefix().is_some());
         CoreEffect::Render
     }
 
     fn move_approval_selection_down(&mut self) -> CoreEffect {
-        self.approval_selection = self.approval_selection.next();
+        self.approval_selection = self
+            .approval_selection
+            .next(self.modal_user_rule_prefix().is_some());
         CoreEffect::Render
     }
 
@@ -1541,17 +1562,39 @@ impl AppCore {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
             }
+            ApprovalOption::AllowUser => {
+                // Unreachable without an offered prefix (navigation skips the
+                // hidden row); an empty pattern degrades to allow-once at the
+                // decider boundary rather than broadening.
+                let prefix = self.modal_user_rule_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowUserScope(prefix))
+            }
             ApprovalOption::Deny => self.reply_deny_from_modal(),
         }
     }
 
     fn modal_scope_prefix(&self) -> Option<String> {
-        let request = match &self.modal {
-            Some(Modal::Permission(request)) => request,
-            Some(Modal::PatchApproval(modal)) => &modal.request,
-            None | Some(Modal::Help) => return None,
-        };
+        let request = self.modal_permission_request()?;
         patch_approval::derive_scope_prefix(request)
+    }
+
+    /// Prefix for the `u  Allow <prefix> * always` option: present only when
+    /// the session has a loaded user grant store AND the ask is a simple
+    /// shell command with a derivable first token.
+    fn modal_user_rule_prefix(&self) -> Option<String> {
+        if !self.user_rules_enabled {
+            return None;
+        }
+        let request = self.modal_permission_request()?;
+        patch_approval::derive_user_rule_prefix(request)
+    }
+
+    fn modal_permission_request(&self) -> Option<&PermissionRequest> {
+        match &self.modal {
+            Some(Modal::Permission(request)) => Some(request),
+            Some(Modal::PatchApproval(modal)) => Some(&modal.request),
+            None | Some(Modal::Help) => None,
+        }
     }
 
     fn reply_deny_from_modal(&mut self) -> CoreEffect {
@@ -2435,6 +2478,7 @@ impl AppCore {
             prior_count: self.prior_permission_count(request, scope_prefix.as_deref()),
             selected_option: self.approval_selection,
             scope_prefix,
+            user_rule_prefix: self.modal_user_rule_prefix(),
             companion_name: self.in_flight_companion_name.clone(),
         })
     }

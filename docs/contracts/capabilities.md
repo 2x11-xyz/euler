@@ -66,8 +66,8 @@ stderr — visible, never silent.
 ## Scoped Grants
 
 Capability modes are the coarse gate. **Scoped grants** sit above `ask`: when a
-request matches an active session or project grant, the gate allows it without
-re-prompting. `always-deny` still denies even if a grant exists.
+request matches an active session, project, or user grant, the gate allows it
+without re-prompting. `always-deny` still denies even if a grant exists.
 `session-allow` remains capability-wide and does not require a grant match.
 
 Grant lifetime and pattern:
@@ -77,6 +77,7 @@ Grant lifetime and pattern:
 | `once` | this request only | none |
 | `session` | current session | optional `ScopePattern` |
 | `project` | workspace project config | optional `ScopePattern` |
+| `user` | every session, every project (durable) | `ScopePattern` (prefix rule) |
 
 `ScopePattern` is an opaque bounded string:
 
@@ -95,6 +96,7 @@ A decider may return:
 - allow once (`once`);
 - allow session-scoped (`session` + pattern, possibly unscoped);
 - allow project-scoped (`project` + pattern);
+- allow user-scoped (`user` + pattern — a durable prefix rule);
 - deny;
 - deny with **instruction** text — guidance the UI passes back as a user turn.
 
@@ -119,12 +121,49 @@ each entry; deleting either side deactivates the grant. Sessions opened
 without a resolvable consent directory disable project grants entirely —
 reads and writes both fail closed.
 
+### User rules (durable prefix rules)
+
+User rules are the "don't ask again for commands starting with `cargo`"
+tier: they persist across sessions AND projects, in a single store at
+`<home>/user-grants.json` under the user-owned euler home (same atomic-write
+and 0600 discipline as the other grant stores). Unlike project grants they
+need **no consent intersection** — the store is user-authored in the user's
+own home and is never repo-controlled content, so there is no second party
+whose entries could preseed authority. Sessions opened without a resolvable
+user grant dir disable user rules entirely — reads and writes both fail
+closed.
+
+Installing a user rule is an explicit durable-config write and **must** be
+recorded as a `permission.decision` event with `grant_scope: "user"` (and
+the pattern). Silent user-store mutation is forbidden.
+
+Pattern semantics for `shell-exec` are a **command prefix over the parsed
+first token** of a simple command line — a rule `cargo` covers any command
+whose first token is `cargo`, exactly as session/project token scopes match
+today, and therefore never covers a compound line (control operators,
+substitution, redirection fall back to ask; see the simple-command gate).
+Per-segment composition across compound commands — a prefix rule covering a
+compound iff every segment is safe or prefix-covered — is a follow-up that
+lands with the safe-command analysis (issue #78); until then compound
+commands always re-ask.
+
+A run covered by an existing user rule executes under that original
+decision: no fresh `permission.decision` event, and the tool result carries
+`grant_source: "user"` so the ledger can tag the run `· user rule`.
+
+The approval panel offers the rule as `u  Allow <prefix> * always`,
+alongside once/session/project — and only when it is honest: a prefix must
+derive from a simple shell command AND the session must hold a loaded user
+store. Unscoped or compound asks never show the option, and a session
+without a resolvable user grant dir hides it entirely.
+
 ### Revocation and listing
 
-Core exposes list and revoke APIs over session and project grant stores for
-surfaces such as `/permissions`. Revoking a project grant rewrites
-`.euler/grants.json`. Child-agent capability attenuation remains exact flat
-subset semantics; scoped grants do not change child capability sets.
+Core exposes list and revoke APIs over session, project, and user grant
+stores for surfaces such as `/permissions`. Revoking a project grant rewrites
+`.euler/grants.json`; revoking a user rule rewrites `<home>/user-grants.json`.
+Child-agent capability attenuation remains exact flat subset semantics;
+scoped grants do not change child capability sets.
 
 `provenance-read` gates host-mediated bounded provenance queries. It is not
 raw filesystem read access. The v0 pull-based event feed uses this same
