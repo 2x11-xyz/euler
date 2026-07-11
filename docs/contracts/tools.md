@@ -29,6 +29,13 @@ the context-engineering principle above.
 | `run_shell` | ShellExec | Workspace root; timeout bounds |
 | `git_status` / `git_diff` | FsRead | Short workspace git views |
 | `tool_result_get` | FsRead | Rehydrate a demoted/compacted tool result from the **current session** by `event_id` (required); optional `max_bytes`. Session-local only. |
+| `code_swarm_review` | AgentSpawn | Session-level review gate: fans out the persisted CodeSwarm reviewer set in parallel and returns per-reviewer findings for the calling agent to adjudicate. No required args; optional `focus`, `personas`, `models` (one-off override), `max_tokens`. Advertised only in the root session when the `code-swarm` extension is wired and enabled; companions never see it (depth one). Config store, resolution chain, result shape, and failure honesty: multi-agent contract. |
+
+`code_swarm_review` is not executed by the `ToolRegistry`: it is a
+session-level tool intercepted after the ordinary permission gate, because
+its execution spawns child agents through the session. It rides the same
+`tool.call` / `permission.*` / `tool.result` provenance shape as every
+other tool.
 
 When canvas stubs show `event <id>` (and optional `handle event:…` / `blob:…`
 metadata), prefer `tool_result_get` with that event id over re-running the
