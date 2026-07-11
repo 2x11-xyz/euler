@@ -2080,10 +2080,19 @@ fn name_session_reports_metadata_refresh_failure_after_durable_rename() {
         CoreEffect::Render
     );
 
-    let notice = core.notice.as_deref().expect("notice");
-    assert!(notice.starts_with("session named honest name; metadata refresh failed:"));
+    // Routed through the shared spine notice (review v4 dogfood), not the
+    // transient `self.notice` banner: same treatment as `theme set to …`,
+    // anchored on the spine rather than rendering flush at column 0.
+    let notice = drain_finalized_visual_text(&mut core, 80);
+    // Pin the `•` spine anchor (review v2 §14.4): the bug rendered this
+    // notice flush at column 0 with no bullet, unlike every other setting
+    // confirmation.
+    assert!(
+        notice.contains("\u{2022} session named honest name; metadata refresh failed:"),
+        "notice: {notice:?}"
+    );
     assert!(notice.contains("session not found"));
-    assert!(!notice.starts_with("session naming failed:"));
+    assert!(!notice.contains("session naming failed:"));
     let events = read_resume_prefix(record.events_path()).expect("events");
     let rename = events
         .iter()
@@ -2119,7 +2128,14 @@ fn name_session_refreshes_metadata_after_durable_rename() {
         CoreEffect::Render
     );
 
-    assert_eq!(core.notice.as_deref(), Some("session named clean name"));
+    // Routed through the shared spine notice (review v4 dogfood): same
+    // treatment as `theme set to …`, not the transient `self.notice` banner.
+    // Pin the `•` spine anchor — the bug rendered this flush at column 0.
+    let notice = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        notice.contains("\u{2022} session named clean name"),
+        "notice: {notice:?}"
+    );
     let refreshed = store
         .find_session(record.id())
         .expect("find session")

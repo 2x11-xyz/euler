@@ -189,12 +189,19 @@ impl AppCore {
                 // immediately even if the store refresh fails.
                 self.status.session_name = Some(normalized.clone());
                 self.rebuild_bottom_surface();
-                self.notice = match self.refresh_current_session_metadata(&session_id) {
-                    Ok(()) => Some(format!("session named {normalized}")),
-                    Err(error) => Some(format!(
-                        "session named {normalized}; metadata refresh failed: {error}"
-                    )),
+                let message = match self.refresh_current_session_metadata(&session_id) {
+                    Ok(()) => format!("session named {normalized}"),
+                    Err(error) => {
+                        format!("session named {normalized}; metadata refresh failed: {error}")
+                    }
                 };
+                // Route through the shared spine notice (review v4 dogfood):
+                // this used to set `self.notice` directly, which renders as
+                // a transient bottom-surface banner flush at column 0 with
+                // no `•` anchor — unlike every other setting confirmation
+                // (e.g. `theme set to …`), which lives on the spine via
+                // `push_notice_item`.
+                self.push_notice_item(message);
                 CoreEffect::Render
             }
             Err(error) => self.error_item(format!("session naming failed: {error}")),
