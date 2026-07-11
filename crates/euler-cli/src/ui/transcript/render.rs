@@ -888,7 +888,7 @@ fn push_bounded_detail(
     let mut omitted_count = 0;
 
     for raw_line in output_rows_without_trailing_blanks(detail) {
-        let wrapped = wrap_text(raw_line, content_width(width));
+        let wrapped = wrap_text(raw_line, gutter_relative_width(width, render.gutter));
         for segment in wrapped {
             if rendered_count < limit {
                 push_wrapped_segment(lines, render.gutter, segment, render.style, theme);
@@ -1002,9 +1002,25 @@ fn push_wrapped(
         is_ledger_gutter(gutter),
         "invalid ledger gutter: {gutter:?}"
     );
-    for segment in wrap_text(text, content_width(width)) {
+    // Wrap at the actual prefix width, not the generic 2-/11-cell gutter:
+    // tree-nested content (`tree_gutter_pipe`/`_last`/`_mid` in narrow mode)
+    // is wider than the plain spine, and reusing `content_width` here would
+    // let every physical row run 2 cells past the terminal edge — the
+    // overflow that resize exposed as a stale fragment at column 0 outside
+    // the rail.
+    let body_width = gutter_relative_width(width, gutter);
+    for segment in wrap_text(text, body_width) {
         push_wrapped_segment(lines, gutter, segment, style, theme);
     }
+}
+
+/// Content width for a line prefixed by `gutter`, reserving exactly the
+/// columns that prefix will occupy (rather than assuming the plain spine's
+/// `gutter_width()`).
+fn gutter_relative_width(width: u16, gutter: &str) -> usize {
+    usize::from(width)
+        .saturating_sub(display_width(gutter))
+        .max(1)
 }
 
 /// Renders a multi-line block whose anchor (the user-message rail) repeats
@@ -1127,6 +1143,64 @@ mod tests {
                 && !text.contains("line 1"),
             "text: {text:?}"
         );
+    }
+
+    #[test]
+    fn expanded_thinking_body_rewraps_inside_the_rail_on_resize() {
+        // Regression: the pipe-rail gutter (`tree_gutter_pipe`, 4 cells wide
+        // in narrow/no-timestamp mode) was wrapped using the generic
+        // 2-cell `content_width`, so every physical row ran 2 cells past
+        // the terminal edge. On repaint at a narrower width the stale
+        // overflow showed up as a fragment spilling to column 0, outside
+        // the rail. Wrapping must key off the gutter actually rendered.
+        let content = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu".to_owned();
+        let item = TranscriptItem::ModelReasoning {
+            fidelity: String::new(),
+            content: content.clone(),
+        };
+
+        for width in [60_u16, 28_u16] {
+            let lines = render_projected_items_with_expansion(
+                std::slice::from_ref(&item),
+                &Theme::default(),
+                width,
+                TranscriptRenderLimits::default(),
+                true,
+            );
+
+            let pipe = tree_gutter_pipe();
+            let mut body_words = Vec::new();
+            for line in &lines {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                // No physical row — header or body — may run past the
+                // rendered width: that overflow is exactly what spilled a
+                // stale fragment to column 0 outside the rail on resize.
+                assert!(
+                    display_width(&text) <= usize::from(width),
+                    "line {text:?} exceeds width {width} at rendered width"
+                );
+                // Body rows are identified by their gutter span (emitted by
+                // `push_wrapped_segment`) being the pipe rail exactly; every
+                // one of them must carry it — none may land bare at column 0.
+                let is_body_row = line
+                    .spans
+                    .first()
+                    .is_some_and(|s| s.content.as_ref() == pipe);
+                if is_body_row {
+                    body_words.push(text.trim_start_matches(pipe).trim().to_owned());
+                }
+            }
+            assert!(
+                body_words.len() > 1,
+                "expected the body to wrap across multiple rail rows at width {width}"
+            );
+            let reassembled = body_words.join(" ");
+            assert_eq!(
+                reassembled.split_whitespace().collect::<Vec<_>>(),
+                content.split_whitespace().collect::<Vec<_>>(),
+                "rewrapped body at width {width} must reproduce the full content with no words lost"
+            );
+        }
     }
 
     fn plain_text(lines: &[Line<'_>]) -> String {
