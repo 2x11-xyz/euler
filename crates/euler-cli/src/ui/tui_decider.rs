@@ -19,6 +19,10 @@ pub enum PermissionReply {
     AllowOnce,
     AllowSessionScope(String),
     AllowProjectScope(String),
+    /// Durable user rule ("always"). Unlike session/project scopes, empty is
+    /// never honest here — the panel only offers `u` with a derived prefix —
+    /// so an empty pattern falls back to allow-once, not unscoped.
+    AllowUserScope(String),
     Deny,
     DenyWithInstruction(String),
 }
@@ -62,6 +66,17 @@ impl PermissionDecider for TuiDecider {
                 Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::Project(pattern)),
                 Err(_) => DeciderVerdict::Allow,
             },
+            PermissionReply::AllowUserScope(pattern) => {
+                if pattern.is_empty() {
+                    // A user rule is never unscoped: empty would broaden a
+                    // prefix rule to the whole capability forever.
+                    return DeciderVerdict::Allow;
+                }
+                match ScopePattern::new(pattern) {
+                    Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::User(pattern)),
+                    Err(_) => DeciderVerdict::Allow,
+                }
+            }
             PermissionReply::Deny => DeciderVerdict::Deny,
             PermissionReply::DenyWithInstruction(text) => DeciderVerdict::DenyWithInstruction(text),
         }

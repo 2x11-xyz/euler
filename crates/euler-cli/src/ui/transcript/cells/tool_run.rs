@@ -6,7 +6,7 @@ pub(in crate::ui::transcript) struct ToolRunRender<'a> {
     pub(in crate::ui::transcript) error: &'a str,
     pub(in crate::ui::transcript) output: &'a str,
     pub(in crate::ui::transcript) exit_code: Option<i64>,
-    /// "session" / "project" when covered by an existing grant.
+    /// "session" / "project" / "user" when covered by an existing grant.
     pub(in crate::ui::transcript) grant_source: Option<&'a str>,
 }
 
@@ -24,8 +24,12 @@ pub(in crate::ui::transcript) fn render_tool_run(
     };
     if let Some(source) = run.grant_source {
         // Provenance trace of an existing grant lives on the header (dim),
-        // not as a standalone decision record (review v2 §8).
-        heading.push_str(&format!(" · {source} grant"));
+        // not as a standalone decision record (review v2 §8). Durable user
+        // rules read as `· user rule`, not the odd "user grant".
+        match source {
+            "user" => heading.push_str(" · user rule"),
+            _ => heading.push_str(&format!(" · {source} grant")),
+        }
     }
     let style = if run.ok {
         theme.transcript.tool

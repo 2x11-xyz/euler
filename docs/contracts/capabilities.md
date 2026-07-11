@@ -151,6 +151,12 @@ A run covered by an existing user rule executes under that original
 decision: no fresh `permission.decision` event, and the tool result carries
 `grant_source: "user"` so the ledger can tag the run `· user rule`.
 
+The approval panel offers the rule as `u  Allow <prefix> * always`,
+alongside once/session/project — and only when it is honest: a prefix must
+derive from a simple shell command AND the session must hold a loaded user
+store. Unscoped or compound asks never show the option, and a session
+without a resolvable user grant dir hides it entirely.
+
 ### Revocation and listing
 
 Core exposes list and revoke APIs over session, project, and user grant

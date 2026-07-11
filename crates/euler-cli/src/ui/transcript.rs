@@ -65,8 +65,9 @@ pub enum TranscriptItem {
         error: String,
         output: String,
         exit_code: Option<i64>,
-        /// "session" / "project" when the run was covered by an existing
-        /// grant (dim `· session grant` on the header; no decision record).
+        /// "session" / "project" / "user" when the run was covered by an
+        /// existing grant (dim `· session grant` / `· user rule` on the
+        /// header; no decision record).
         grant_source: Option<String>,
     },
     Exploration {
@@ -82,6 +83,9 @@ pub enum TranscriptItem {
         command: Option<String>,
         /// Honest scope prefix for `a`/`p` labels; `None` → unscoped labels.
         scope_prefix: Option<String>,
+        /// Prefix for the durable `u  Allow <prefix> * always` option;
+        /// `None` hides the row (unscoped/compound ask or no user store).
+        user_rule_prefix: Option<String>,
         /// Prior allowed decisions for this capability / scope in the session.
         prior_count: usize,
         /// Currently highlighted approval option; defaults to allow-once.
