@@ -1808,9 +1808,13 @@ impl<D: PermissionDecider> Session<D> {
             // check sits before grant coverage so the ledger attributes the
             // run to the analysis, not to an unrelated grant. It never
             // applies under always-deny, and a denial earlier this turn
-            // still short-circuits above.
+            // still short-circuits above. A TRUNCATED command is never
+            // analyzed: the bounded prefix could parse as safe while
+            // `sh -c` runs the full string (security review, #66 class) —
+            // decomposing a truncated command is decomposing a lie.
             static_safe = mode == ApprovalMode::Ask
                 && capability == Capability::ShellExec
+                && !request.command_truncated
                 && request
                     .command
                     .as_deref()

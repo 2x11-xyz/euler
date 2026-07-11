@@ -1168,6 +1168,40 @@ fn redirect_command_is_never_covered_or_auto_approved() {
 }
 
 #[test]
+fn truncated_command_is_never_statically_safe() {
+    // Security review (#66 class): the static-safe check reads the
+    // 4 KiB-bounded request command while `sh -c` runs the full string.
+    // A safe-looking bounded prefix (`ls aaa…`) hiding a compound payload
+    // past the bound must fall to the ask path, never auto-approve.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut long = String::from("ls ");
+    long.push_str(&"a".repeat(5 * 1024));
+    long.push_str(" ; touch evil-file");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-truncated".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({ "command": long }),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Deny]),
+    );
+
+    session.run_turn("run shell").expect("turn");
+
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        1,
+        "truncated command must reach the ask path"
+    );
+    assert!(!temp.path().join("evil-file").exists());
+}
+
+#[test]
 fn scoped_fs_grant_does_not_cover_dotdot_or_symlink_escapes() {
     // Scoped fs-write grants match the canonicalized workspace-relative
     // path: `src/../escape.txt` and a symlink out of the granted subtree
