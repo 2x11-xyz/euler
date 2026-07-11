@@ -1034,9 +1034,11 @@ fn user_rule_records_scope_and_covers_a_fresh_session() {
 }
 
 #[test]
-fn scoped_shell_grant_does_not_cover_compound_commands() {
-    // Execution is `sh -c`: a `touch` grant covering `touch a; <anything>`
-    // would authorize the whole line. Compound commands must re-ask.
+fn scoped_shell_grant_covers_compound_when_every_segment_granted_or_safe() {
+    // Issue #78: coverage is segment-aware. After a `touch` session grant,
+    // `touch a && touch b` and `touch c && ls` run under that grant (every
+    // segment granted or statically safe) with no fresh prompt or decision
+    // record.
     let temp = tempfile::tempdir().expect("temp dir");
     let provider = ScriptedProvider::new(vec![
         FixtureResponse::ToolCalls(vec![ToolCall {
@@ -1047,7 +1049,59 @@ fn scoped_shell_grant_does_not_cover_compound_commands() {
         FixtureResponse::ToolCalls(vec![ToolCall {
             id: "call-compound".to_owned(),
             name: "run_shell".to_owned(),
-            input: json!({"command": "touch second-ran; touch evil-ran"}),
+            input: json!({"command": "touch second-ran && touch third-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-mixed".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch fourth-ran && ls"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(GrantScope::Session(
+            ScopePattern::new("touch").expect("pattern"),
+        ))]),
+    );
+
+    session.run_turn("run shell three times").expect("turn");
+
+    for file in ["first-ran", "second-ran", "third-ran", "fourth-ran"] {
+        assert!(temp.path().join(file).exists(), "missing {file}");
+    }
+    // One prompt, one decision — the compound calls ran under the grant.
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        1
+    );
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_DECISION),
+        1
+    );
+    for call_id in ["call-compound", "call-mixed"] {
+        let result = event_for_tool(session.events(), EventKind::TOOL_RESULT, call_id);
+        assert_eq!(payload_str(result, "grant_source"), Some("session"));
+    }
+}
+
+#[test]
+fn scoped_shell_grant_does_not_cover_ungranted_unsafe_segment() {
+    // A `touch` grant must not authorize `touch a && mkdir evil`: the
+    // mkdir segment is neither granted nor statically safe, so the
+    // compound re-asks and the scripted denial stops the whole line.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-compound".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch second-ran && mkdir evil-dir"}),
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
@@ -1065,14 +1119,52 @@ fn scoped_shell_grant_does_not_cover_compound_commands() {
     session.run_turn("run shell twice").expect("turn");
 
     assert!(temp.path().join("first-ran").exists());
-    // The compound command was NOT covered: it re-prompted and the scripted
-    // denial stopped it.
     assert_eq!(
         count_kind(session.events(), EventKind::PERMISSION_PROMPT),
         2
     );
-    assert!(!temp.path().join("evil-ran").exists());
+    assert!(!temp.path().join("evil-dir").exists());
     assert!(!temp.path().join("second-ran").exists());
+}
+
+#[test]
+fn redirect_command_is_never_covered_or_auto_approved() {
+    // `ls > file` is not statically analyzable: it must neither
+    // auto-approve as static-safe nor ride an existing scoped grant — it
+    // still asks, and the scripted denial stops it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-redirect".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "ls > listing.txt"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![
+            DeciderVerdict::AllowScoped(GrantScope::Session(
+                ScopePattern::new("touch").expect("pattern"),
+            )),
+            DeciderVerdict::Deny,
+        ]),
+    );
+
+    session.run_turn("run shell twice").expect("turn");
+
+    assert!(temp.path().join("first-ran").exists());
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        2
+    );
+    assert!(!temp.path().join("listing.txt").exists());
 }
 
 #[test]

@@ -138,14 +138,12 @@ recorded as a `permission.decision` event with `grant_scope: "user"` (and
 the pattern). Silent user-store mutation is forbidden.
 
 Pattern semantics for `shell-exec` are a **command prefix over the parsed
-first token** of a simple command line — a rule `cargo` covers any command
-whose first token is `cargo`, exactly as session/project token scopes match
-today, and therefore never covers a compound line (control operators,
-substitution, redirection fall back to ask; see the simple-command gate).
-Per-segment composition across compound commands — a prefix rule covering a
-compound iff every segment is safe or prefix-covered — is a follow-up that
-lands with the safe-command analysis (issue #78); until then compound
-commands always re-ask.
+first token** — a rule `cargo` covers any command whose first token is
+`cargo`, exactly as session/project token scopes match. Coverage composes
+per segment (issue #78, see "Static command safety"): a prefix rule covers
+a compound command iff it parses into plain segments and every segment is
+either statically safe or prefix-covered. Unparseable commands (redirects,
+substitution, subshells) are never covered and always re-ask.
 
 A run covered by an existing user rule executes under that original
 decision: no fresh `permission.decision` event, and the tool result carries
@@ -206,6 +204,21 @@ standalone-record-per-call noise is exactly what covered grants eliminated
 (review v2 §8). Instead the `tool.result` carries `static_safe: true` and
 the tool header shows a dim `· safe` tag, matching the covered-grant
 `· session grant` header treatment.
+
+**Segment-aware grant coverage.** Scoped `shell-exec` grant matching uses
+the same segment analysis: a command is covered iff it parses into plain
+segments and EVERY segment either has a granted first token or is
+statically safe — with at least one segment actually matching a granted
+token (an all-safe command is attributed to the static-safe path, never to
+an unrelated grant). Tokens pool within one store: `cargo test && npm run
+lint` is covered when the session store (or the project store) grants both
+`cargo` and `npm`; a compound whose segments straddle the two stores falls
+back to ask so the ledger's single `grant_source` tag stays honest.
+Unparseable commands are never covered. The approval panel offers a token
+scope only when the gate could actually grant it for the live command:
+when every non-statically-safe segment shares one first token, that token
+is offered; otherwise (distinct unsafe tokens, unparseable command) only
+allow-once / unscoped / deny are offered.
 
 ### Revocation and listing
 

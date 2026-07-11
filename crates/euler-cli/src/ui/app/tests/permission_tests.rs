@@ -502,6 +502,34 @@ fn user_rule_option_absent_without_user_store() {
 }
 
 #[test]
+fn compound_command_with_one_unsafe_token_offers_that_token_scope() {
+    // Issue #78: coverage is segment-aware, so the panel may offer a token
+    // scope for a parseable compound command when every unsafe segment
+    // shares one first token — a `cargo` grant really covers this rerun.
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+            .with_command("cargo test && cargo clippy"),
+    ));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("a  Allow cargo * for this session"));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('a'))),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowSessionScope("cargo".into())
+    );
+}
+
+#[test]
 fn user_rule_option_hidden_for_compound_and_unscoped_asks() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();
@@ -524,6 +552,54 @@ fn user_rule_option_hidden_for_compound_and_unscoped_asks() {
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let contents = terminal.backend().screen_contents();
     assert!(!contents.contains("* always"), "contents: {contents}");
+}
+
+#[test]
+fn compound_command_with_distinct_unsafe_tokens_offers_unscoped_only() {
+    // No single token grant can cover `cargo test && curl evil`, so
+    // offering one would be dishonest (issue #61): fall back to the
+    // capability-wide labels and an unscoped reply.
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+            .with_command("cargo test && curl evil"),
+    ));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("a  Allow shell-exec for this session"));
+    assert!(!contents.contains("Allow cargo *"));
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('a'))),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowSessionScope(String::new())
+    );
+}
+
+#[test]
+fn unparseable_command_offers_unscoped_only() {
+    // Redirects make a command not statically analyzable: no scoped grant
+    // can ever cover it, so no token scope may be offered (issue #61).
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let (reply_tx, _reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.modal = Some(Modal::Permission(
+        PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+            .with_command("ls > listing.txt"),
+    ));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("a  Allow shell-exec for this session"));
+    assert!(!contents.contains("Allow ls *"));
 }
 
 #[test]

