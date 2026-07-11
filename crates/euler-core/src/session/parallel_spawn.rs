@@ -1,4 +1,4 @@
-//! Parallel reviewer fan-out (multi-agent contract v0.2, ADR 0011).
+//! Parallel reviewer fan-out (multi-agent contract v0.2, ADR 0012).
 //!
 //! Phase-split execution: all provenance appends stay on the calling
 //! session thread; worker threads only invoke the provider and drain its
@@ -45,7 +45,7 @@ struct WorkerOutcome {
 impl<D: PermissionDecider> Session<D> {
     /// Run a batch of single-round, tool-free, empty-capability reviewer
     /// briefs concurrently. Outcomes return in task order; every event is
-    /// appended on this thread in task order (ADR 0011).
+    /// appended on this thread in task order (ADR 0012).
     pub fn spawn_reviewers_parallel(
         &mut self,
         tasks: Vec<AgentTask>,

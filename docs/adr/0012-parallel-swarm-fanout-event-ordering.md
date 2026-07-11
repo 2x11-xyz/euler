@@ -1,4 +1,4 @@
-# ADR 0011: Parallel CodeSwarm Fan-Out and Deterministic Event Ordering
+# ADR 0012: Parallel CodeSwarm Fan-Out and Deterministic Event Ordering
 
 ## Status
 
