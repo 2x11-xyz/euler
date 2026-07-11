@@ -1000,6 +1000,28 @@ fn tool_call_input_is_redacted_in_the_ledger() {
     );
     assert!(!input.contains("sk-or-v1-abcd"), "token shape: {input}");
     assert!(input.contains("[redacted-secret]"));
+
+    // The same input rides the adjacent model.result.tool_calls array — it
+    // must be redacted there too, or the secret merely moves one event over.
+    let model_result = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_RESULT
+                && event
+                    .payload
+                    .get("tool_calls")
+                    .and_then(|calls| calls.as_array())
+                    .is_some_and(|calls| !calls.is_empty())
+        })
+        .expect("model.result with tool calls");
+    let mr = serde_json::to_string(&model_result.payload["tool_calls"]).expect("tool_calls json");
+    assert!(
+        !mr.contains("registered-secret-value-42"),
+        "model.result: {mr}"
+    );
+    assert!(!mr.contains("sk-or-v1-abcd"), "model.result shape: {mr}");
+    assert!(mr.contains("[redacted-secret]"));
 }
 
 #[test]

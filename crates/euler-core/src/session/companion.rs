@@ -494,10 +494,12 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             .tool_calls
             .iter()
             .map(|call| {
+                let mut input = call.input.clone();
+                self.redactor.redact_value(&mut input);
                 json!({
                     "id": call.id,
                     "name": call.name,
-                    "input": call.input,
+                    "input": input,
                 })
             })
             .collect::<Vec<_>>();

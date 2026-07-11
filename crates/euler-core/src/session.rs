@@ -2295,10 +2295,15 @@ impl<D: PermissionDecider> Session<D> {
         let calls = tool_calls
             .iter()
             .map(|call| {
+                // model.result carries the same tool-call inputs as the
+                // tool.call event; redact the persisted copy here too or the
+                // secret merely moves one event over (secrets contract).
+                let mut input = call.input.clone();
+                self.redactor.redact_value(&mut input);
                 json!({
                     "id": call.id,
                     "name": call.name,
-                    "input": call.input,
+                    "input": input,
                 })
             })
             .collect::<Vec<_>>();
