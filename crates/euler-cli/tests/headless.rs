@@ -662,7 +662,14 @@ fn models_command_without_local_catalog_prints_built_ins_without_session_store()
 
     assert_eq!(
         provider_ids,
-        vec!["anthropic", "chatgpt", "fixture", "openai", "openrouter"]
+        vec![
+            "anthropic",
+            "chatgpt",
+            "fixture",
+            "openai",
+            "openrouter",
+            "xai"
+        ]
     );
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
     assert!(
@@ -7436,6 +7443,7 @@ const BLOB_HASH: &str = "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6d
 const ANTHROPIC_API_KEY_SENTINEL: &str = "euler-secret-boundary-anthropic-api-key-2315";
 const OPENAI_API_KEY_SENTINEL: &str = "euler-secret-boundary-openai-api-key-2315";
 const OPENROUTER_API_KEY_SENTINEL: &str = "euler-secret-boundary-openrouter-api-key-2315";
+const XAI_API_KEY_SENTINEL: &str = "euler-secret-boundary-xai-api-key-2315";
 const EULER_AUTH_FILE_PATH_SENTINEL: &str = "euler-secret-boundary-auth-file-path-2315";
 const EULER_CUSTOM_API_KEY_SENTINEL: &str = "euler-secret-boundary-custom-api-key-2315";
 const AWS_SECRET_ACCESS_KEY_SENTINEL: &str = "euler-secret-boundary-aws-secret-access-key-2315";
@@ -7472,6 +7480,7 @@ impl SecretFixture {
                 SecretSentinel::new("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY_SENTINEL),
                 SecretSentinel::new("OPENAI_API_KEY", OPENAI_API_KEY_SENTINEL),
                 SecretSentinel::new("OPENROUTER_API_KEY", OPENROUTER_API_KEY_SENTINEL),
+                SecretSentinel::new("XAI_API_KEY", XAI_API_KEY_SENTINEL),
                 SecretSentinel::new("EULER_AUTH_FILE", path_str(&auth_file)),
                 SecretSentinel::new("EULER_AUTH_FILE path marker", EULER_AUTH_FILE_PATH_SENTINEL),
                 SecretSentinel::new("EULER_CUSTOM_API_KEY", EULER_CUSTOM_API_KEY_SENTINEL),
@@ -8048,6 +8057,7 @@ fn command_with_secret_env(
         .env("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY_SENTINEL)
         .env("OPENAI_API_KEY", OPENAI_API_KEY_SENTINEL)
         .env("OPENROUTER_API_KEY", OPENROUTER_API_KEY_SENTINEL)
+        .env("XAI_API_KEY", XAI_API_KEY_SENTINEL)
         .env("EULER_AUTH_FILE", &secrets.auth_file)
         .env("EULER_CUSTOM_API_KEY", EULER_CUSTOM_API_KEY_SENTINEL)
         .env("AWS_SECRET_ACCESS_KEY", AWS_SECRET_ACCESS_KEY_SENTINEL)

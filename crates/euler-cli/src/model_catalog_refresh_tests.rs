@@ -18,7 +18,8 @@ fn translates_tool_call_models_to_overlay_schema() {
         r#"{
           "anthropic":{"models":{"claude-sonnet-5":{"id":"claude-sonnet-5","name":"Claude Sonnet 5","reasoning":true,"tool_call":true,"limit":{"context":1000000,"output":128000}},"claude-text-only":{"id":"claude-text-only","name":"Claude Text","reasoning":false,"tool_call":false,"limit":{"context":200000,"output":8192}}}},
           "openai":{"models":{"gpt-5.5":{"id":"gpt-5.5","name":"GPT-5.5","reasoning":true,"tool_call":true,"limit":{"context":1050000,"output":128000}},"bad":{"id":"bad","name":"Bad","tool_call":true}}},
-          "openrouter":{"models":{"z-ai/glm-5.2":{"id":"z-ai/glm-5.2","name":"GLM-5.2","reasoning":true,"tool_call":true,"limit":{"context":1024000,"output":128000}}}}
+          "openrouter":{"models":{"z-ai/glm-5.2":{"id":"z-ai/glm-5.2","name":"GLM-5.2","reasoning":true,"tool_call":true,"limit":{"context":1024000,"output":128000}}}},
+          "xai":{"models":{"grok-4.3":{"id":"grok-4.3","name":"Grok 4.3","reasoning":true,"tool_call":true,"limit":{"context":1000000,"output":30000}}}}
         }"#,
     )
     .expect("translate");
@@ -40,6 +41,11 @@ fn translates_tool_call_models_to_overlay_schema() {
         overlay["providers"]["openrouter"]["models"][0]["id"],
         "z-ai/glm-5.2"
     );
+    assert_eq!(overlay["providers"]["xai"]["models"][0]["id"], "grok-4.3");
+    assert_eq!(
+        overlay["providers"]["xai"]["default_model"],
+        DEFAULT_XAI_MODEL
+    );
     assert!(warnings
         .iter()
         .any(|warning| warning.contains("reasoning is missing")));
@@ -58,7 +64,8 @@ fn refresh_overlay_round_trips_through_merged_catalog_without_warnings() {
         r#"{
           "anthropic":{"models":{"claude-sonnet-5":{"id":"claude-sonnet-5","name":"Claude Sonnet 5","reasoning":true,"tool_call":true,"limit":{"context":1000000,"output":128000}}}},
           "openai":{"models":{"gpt-5.5":{"id":"gpt-5.5","name":"GPT-5.5","reasoning":true,"tool_call":true,"limit":{"context":1050000,"output":128000}}}},
-          "openrouter":{"models":{"z-ai/glm-5.2":{"id":"z-ai/glm-5.2","name":"GLM-5.2","reasoning":true,"tool_call":true,"limit":{"context":1024000,"output":128000}}}}
+          "openrouter":{"models":{"z-ai/glm-5.2":{"id":"z-ai/glm-5.2","name":"GLM-5.2","reasoning":true,"tool_call":true,"limit":{"context":1024000,"output":128000}}}},
+          "xai":{"models":{"grok-4.3":{"id":"grok-4.3","name":"Grok 4.3","reasoning":true,"tool_call":true,"limit":{"context":1000000,"output":30000}}}}
         }"#,
     )
     .expect("translate");
@@ -78,6 +85,11 @@ fn refresh_overlay_round_trips_through_merged_catalog_without_warnings() {
         .expect("chatgpt")
         .models()
         .any(|model| model.id() == "gpt-5.5"));
+    assert!(catalog
+        .provider("xai")
+        .expect("xai")
+        .models()
+        .any(|model| model.id() == "grok-4.3"));
 }
 
 #[test]
