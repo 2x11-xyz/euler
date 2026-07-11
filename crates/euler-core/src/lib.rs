@@ -14,6 +14,7 @@ pub mod extension_registry;
 pub mod extensions;
 pub mod file_diff;
 pub mod grants;
+pub mod guardian;
 pub mod home;
 pub mod permissions;
 pub mod provenance;
@@ -71,6 +72,7 @@ pub use grants::{
     ActiveGrant, GrantScope, ProjectGrantError, ProjectGrantStore, ScopePattern, ScopePatternError,
     MAX_GRANT_COMMAND_BYTES, MAX_GRANT_INSTRUCTION_BYTES, MAX_SCOPE_PATTERN_BYTES,
 };
+pub use guardian::PermissionReviewer;
 pub use home::{EulerHome, EulerHomeError};
 pub use permissions::{
     ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,

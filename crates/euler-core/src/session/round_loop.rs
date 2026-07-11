@@ -54,6 +54,11 @@ pub(crate) enum RoundOutcome<T = ()> {
 #[derive(Default)]
 pub(crate) struct TurnState {
     denied_capabilities: BTreeSet<Capability>,
+    /// Guardian circuit-breaker state (ADR 0011): consecutive guardian
+    /// denials this turn. Guardian denials do not poison the capability for
+    /// the turn (each ask is re-reviewed); the breaker bounds the thrash.
+    consecutive_guardian_denials: u32,
+    guardian_interrupted: bool,
 }
 
 impl TurnState {
@@ -63,6 +68,24 @@ impl TurnState {
 
     pub(crate) fn denied(&self, capability: Capability) -> bool {
         self.denied_capabilities.contains(&capability)
+    }
+
+    /// Record one guardian denial; returns the consecutive-denial count.
+    pub(crate) fn record_guardian_denial(&mut self) -> u32 {
+        self.consecutive_guardian_denials = self.consecutive_guardian_denials.saturating_add(1);
+        self.consecutive_guardian_denials
+    }
+
+    pub(crate) fn reset_guardian_denials(&mut self) {
+        self.consecutive_guardian_denials = 0;
+    }
+
+    pub(crate) fn mark_guardian_interrupted(&mut self) {
+        self.guardian_interrupted = true;
+    }
+
+    pub(crate) fn guardian_interrupted(&self) -> bool {
+        self.guardian_interrupted
     }
 }
 
