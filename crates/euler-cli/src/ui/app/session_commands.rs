@@ -7,7 +7,7 @@ impl AppCore {
         };
         let diffs = session_attributed_diffs(session.events());
         if diffs.is_empty() {
-            return self.summary_item("no session-attributed file changes yet".to_owned());
+            return self.notice_item("no session-attributed file changes yet".to_owned());
         }
         let mut header = format!("session diff · {} file(s)", diffs.len());
         let mut total_added = 0usize;
@@ -39,10 +39,10 @@ impl AppCore {
         let AppState::Idle { session } = &self.state else {
             // Fall back to live snapshot when a turn is in flight.
             let text = format_usage_from_snapshot(&self.token_usage, &self.status);
-            return self.summary_item(text);
+            return self.notice_item(text);
         };
         let text = format_session_usage(session.events(), &self.status, &self.token_usage);
-        self.summary_item(text)
+        self.notice_item(text)
     }
 
     pub(super) fn set_reasoning_effort(&mut self, effort: ReasoningEffort) -> CoreEffect {
@@ -56,7 +56,7 @@ impl AppCore {
                 self.notice_item(format!("reasoning effort set to {}", effort.as_str()))
             }
             Ok(false) => self.notice_item(format!("reasoning effort already {}", effort.as_str())),
-            Err(error) => self.notice_item(format!("reasoning effort rejected: {error}")),
+            Err(error) => self.error_item(format!("reasoning effort rejected: {error}")),
         }
     }
 
@@ -121,7 +121,7 @@ impl AppCore {
             Some(path) => path,
             None => match self.default_export_path(&session_id) {
                 Ok(path) => path,
-                Err(error) => return self.notice_item(format!("export failed: {error}")),
+                Err(error) => return self.error_item(format!("export failed: {error}")),
             },
         };
         let payload = serde_json::json!({
@@ -136,13 +136,13 @@ impl AppCore {
             .and_then(|bytes| write_new_file(&path, &bytes).map_err(anyhow::Error::from))
         {
             Ok(()) => self.notice_item(format!("session exported to {}", path.display())),
-            Err(error) => self.notice_item(format!("export failed: {error}")),
+            Err(error) => self.error_item(format!("export failed: {error}")),
         }
     }
 
     pub(super) fn show_status(&mut self) -> CoreEffect {
         let session = self.status.session_id.as_deref().unwrap_or("none");
-        self.summary_item(format!(
+        self.notice_item(format!(
             "session: {session}\nmodel: {}::{}\neffort: {}\ntheme: {} ({})",
             self.status.provider,
             self.status.model,
@@ -154,7 +154,11 @@ impl AppCore {
 
     pub(super) fn set_theme(&mut self, choice: ThemeChoice) -> CoreEffect {
         self.theme_choice = choice;
-        self.theme = Theme::for_choice(choice);
+        // #64: carry forward the color level detected at startup — switching
+        // themes must not silently reintroduce truecolor SGR on a terminal
+        // that can't render it.
+        let color_level = self.theme.color_level;
+        self.theme = Theme::for_choice_with_color_level(choice, color_level);
         self.rebuild_bottom_surface();
         match self
             .theme_preference_path
@@ -162,7 +166,7 @@ impl AppCore {
             .map(|path| model_preference::save_theme_preference(path, choice.as_str()))
         {
             Some(Err(error)) => {
-                self.push_notice_item(format!("theme set; preference not saved: {error}"));
+                self.push_error_item(format!("theme set; preference not saved: {error}"));
             }
             _ => {
                 self.push_notice_item(format!("theme set to {}", choice.as_str()));
@@ -185,15 +189,22 @@ impl AppCore {
                 // immediately even if the store refresh fails.
                 self.status.session_name = Some(normalized.clone());
                 self.rebuild_bottom_surface();
-                self.notice = match self.refresh_current_session_metadata(&session_id) {
-                    Ok(()) => Some(format!("session named {normalized}")),
-                    Err(error) => Some(format!(
-                        "session named {normalized}; metadata refresh failed: {error}"
-                    )),
+                let message = match self.refresh_current_session_metadata(&session_id) {
+                    Ok(()) => format!("session named {normalized}"),
+                    Err(error) => {
+                        format!("session named {normalized}; metadata refresh failed: {error}")
+                    }
                 };
+                // Route through the shared spine notice (review v4 dogfood):
+                // this used to set `self.notice` directly, which renders as
+                // a transient bottom-surface banner flush at column 0 with
+                // no `•` anchor — unlike every other setting confirmation
+                // (e.g. `theme set to …`), which lives on the spine via
+                // `push_notice_item`.
+                self.push_notice_item(message);
                 CoreEffect::Render
             }
-            Err(error) => self.notice_item(format!("session naming failed: {error}")),
+            Err(error) => self.error_item(format!("session naming failed: {error}")),
         }
     }
 
@@ -214,7 +225,7 @@ impl AppCore {
         match session.switch_model(&provider, &model, "user", context_limit) {
             Ok(true) => self.accept_model_switch(provider, model, true),
             Ok(false) => self.accept_model_switch(provider, model, false),
-            Err(error) => self.notice_item(format!("model switch rejected: {error}")),
+            Err(error) => self.error_item(format!("model switch rejected: {error}")),
         }
     }
 
@@ -235,7 +246,7 @@ impl AppCore {
         self.rebuild_bottom_surface();
         match model_preference::save_model_preference_to_default(&provider, &model) {
             Ok(()) => self.notice_item(format!("model set to {provider}/{model}")),
-            Err(error) => self.notice_item(format!("model set; preference not saved: {error}")),
+            Err(error) => self.error_item(format!("model set; preference not saved: {error}")),
         }
     }
 
@@ -278,7 +289,7 @@ impl AppCore {
         let pattern = match ScopePattern::new(pattern) {
             Ok(pattern) => pattern,
             Err(error) => {
-                return self.notice_item(format!("invalid grant pattern: {error}"));
+                return self.error_item(format!("invalid grant pattern: {error}"));
             }
         };
         match session.revoke_grant(capability, &pattern, source) {
@@ -302,7 +313,7 @@ impl AppCore {
                     pattern.as_str()
                 }
             )),
-            Err(error) => self.notice_item(format!("revoke failed: {error}")),
+            Err(error) => self.error_item(format!("revoke failed: {error}")),
         }
     }
 }

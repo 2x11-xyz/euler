@@ -18,6 +18,10 @@ pub struct TurnRecap {
 pub enum TestStatus {
     Pass,
     Fail,
+    /// A test-looking shell command ran but neither a parseable
+    /// runner summary nor a usable exit code was available to
+    /// classify it. Must never render as if it passed.
+    Unknown,
 }
 
 impl TestStatus {
@@ -25,6 +29,7 @@ impl TestStatus {
         match self {
             Self::Pass => "tests pass",
             Self::Fail => "tests failed",
+            Self::Unknown => "tests unknown",
         }
     }
 }
@@ -163,15 +168,17 @@ pub fn detect_test_status(events: &[EventEnvelope]) -> Option<TestStatus> {
                 if let Some(status) = parse_test_summary(output) {
                     last = Some(status);
                 } else {
-                    let ok = event
-                        .payload
-                        .get("ok")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    last = Some(if ok {
-                        TestStatus::Pass
-                    } else {
-                        TestStatus::Fail
+                    // `ok` on a run_shell result only reflects whether the
+                    // shell itself executed successfully — a test command
+                    // can run fine and still report failing tests via a
+                    // nonzero exit code. Classify off the exit code, not
+                    // `ok`, and fall back to Unknown (never a silent Pass)
+                    // when the exit code isn't available.
+                    let exit_code = event.payload.get("exit_code").and_then(|v| v.as_i64());
+                    last = Some(match exit_code {
+                        Some(0) => TestStatus::Pass,
+                        Some(_) => TestStatus::Fail,
+                        None => TestStatus::Unknown,
                     });
                 }
             }
@@ -183,11 +190,55 @@ pub fn detect_test_status(events: &[EventEnvelope]) -> Option<TestStatus> {
 
 fn looks_test_like(command: &str, output: &str) -> bool {
     let cmd = command.to_ascii_lowercase();
-    if cmd.contains("cargo test")
-        || cmd.contains("cargo nextest")
-        || cmd.contains("nextest run")
-        || cmd.contains("pytest")
-        || cmd.contains("python -m pytest")
+    // Runners with per-runner summary parsing (see parse_test_summary) plus
+    // runners that are merely recognized so they fall through to the
+    // exit-code-based Pass/Fail/Unknown classification in
+    // `detect_test_status` instead of having their turn recap silently
+    // suppressed by turn_events.rs's "no tests ran" check.
+    const TEST_COMMAND_NEEDLES: &[&str] = &[
+        "cargo test",
+        "cargo nextest",
+        "nextest run",
+        "pytest",
+        "python -m pytest",
+        "go test",
+        "npm test",
+        "npm run test",
+        "yarn test",
+        "yarn run test",
+        "pnpm test",
+        "pnpm run test",
+        "bun test",
+        "bun run test",
+        "npx jest",
+        "yarn jest",
+        "pnpm jest",
+        "bun jest",
+        "npx vitest",
+        "yarn vitest",
+        "pnpm vitest",
+        "bun vitest",
+        "make test",
+        "make check",
+        "ctest",
+        "swift test",
+    ];
+    if TEST_COMMAND_NEEDLES
+        .iter()
+        .any(|needle| cmd.contains(needle))
+    {
+        return true;
+    }
+    // Direct invocations (e.g. `jest --ci`, `./node_modules/.bin/vitest run`)
+    // where the runner binary is the invoked program rather than reached via
+    // a package-manager `run`/`test` subcommand.
+    if cmd
+        .split(&[' ', '&', '|', ';'][..])
+        .filter(|tok| !tok.is_empty())
+        .any(|tok| {
+            let bin = tok.rsplit('/').next().unwrap_or(tok);
+            bin == "jest" || bin == "vitest"
+        })
     {
         return true;
     }
@@ -205,6 +256,9 @@ pub fn parse_test_summary(output: &str) -> Option<TestStatus> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        if let Some(status) = parse_go_test_line(trimmed) {
+            return Some(status);
         }
         let lower = trimmed.to_ascii_lowercase();
         if lower.contains("test result:") {
@@ -233,6 +287,20 @@ pub fn parse_test_summary(output: &str) -> Option<TestStatus> {
         }
     }
     None
+}
+
+/// Parses `go test`'s per-package summary lines, e.g. `ok  <pkg>  0.123s`
+/// or `FAIL  <pkg>  0.045s` (fields tab-separated), or a bare `FAIL`. The
+/// runner's case (lowercase `ok`, uppercase `FAIL`) is significant, so this
+/// is matched before the line is lowercased for the generic parsers.
+fn parse_go_test_line(trimmed: &str) -> Option<TestStatus> {
+    let mut fields = trimmed.splitn(2, ['\t', ' ']);
+    let first = fields.next()?;
+    match first {
+        "ok" => Some(TestStatus::Pass),
+        "FAIL" => Some(TestStatus::Fail),
+        _ => None,
+    }
 }
 
 fn classify_passed_failed_line(lower: &str) -> Option<TestStatus> {
@@ -382,6 +450,94 @@ mod tests {
             "1 file · +2 −1 · tests pass · ctx 12%"
         );
         assert_eq!(recap.files_line().as_deref(), Some("src/a.rs"));
+    }
+
+    #[test]
+    fn ok_true_with_nonzero_exit_code_is_fail_not_pass() {
+        // euler-core's run_shell sets `ok: true` for successful *execution*
+        // even when the shell command itself exited nonzero (e.g. `cargo
+        // test` ran fine but found failing tests). The recap must classify
+        // off exit_code, not `ok`, when no summary line is parseable.
+        let events = vec![
+            event(
+                EventKind::TOOL_CALL,
+                object([
+                    ("id", "c1".into()),
+                    ("name", "run_shell".into()),
+                    ("input", json!({"command": "cargo test -q"})),
+                ]),
+            ),
+            event(
+                EventKind::TOOL_RESULT,
+                object([
+                    ("id", "c1".into()),
+                    ("name", "run_shell".into()),
+                    ("ok", true.into()),
+                    ("exit_code", 101.into()),
+                    ("output", "some unparseable output".into()),
+                ]),
+            ),
+        ];
+        assert_eq!(detect_test_status(&events), Some(TestStatus::Fail));
+    }
+
+    #[test]
+    fn go_test_invocation_is_recognized_and_not_suppressed() {
+        let events = vec![event(
+            EventKind::TOOL_CALL,
+            object([
+                ("id", "c1".into()),
+                ("name", "run_shell".into()),
+                ("input", json!({"command": "go test ./..."})),
+            ]),
+        )];
+        let mut events = events;
+        events.push(event(
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", "c1".into()),
+                ("name", "run_shell".into()),
+                ("ok", true.into()),
+                ("exit_code", 0.into()),
+                ("output", "ok  \tgithub.com/foo/bar\t0.123s".into()),
+            ]),
+        ));
+        let status = detect_test_status(&events);
+        assert_eq!(
+            status,
+            Some(TestStatus::Pass),
+            "go test invocation must not be suppressed and must show Pass"
+        );
+
+        // Also verify the turn recap surfaces (isn't suppressed as "no
+        // tests ran") for a real turn_recap_from_events call.
+        let recap = turn_recap_from_events(&events, 0, Some(10));
+        assert!(recap.test_status.is_some());
+        assert_eq!(recap.summary_line(), "0 files · tests pass · ctx 10%");
+    }
+
+    #[test]
+    fn missing_exit_code_and_unparseable_output_is_unknown_not_pass() {
+        let events = vec![
+            event(
+                EventKind::TOOL_CALL,
+                object([
+                    ("id", "c1".into()),
+                    ("name", "run_shell".into()),
+                    ("input", json!({"command": "make test"})),
+                ]),
+            ),
+            event(
+                EventKind::TOOL_RESULT,
+                object([
+                    ("id", "c1".into()),
+                    ("name", "run_shell".into()),
+                    ("ok", true.into()),
+                    ("output", "running make targets...".into()),
+                ]),
+            ),
+        ];
+        assert_eq!(detect_test_status(&events), Some(TestStatus::Unknown));
     }
 
     #[test]

@@ -304,8 +304,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 );
             }
             TranscriptItem::Exploration { summaries } => {
-                let rows =
-                    exploration_detail_rows(&super::coalesced_exploration_summaries(summaries));
+                let rows = super::coalesced_exploration_summaries(summaries);
                 let header = tool_group_header("explore", rows.len(), entry.timing.as_ref());
                 push_cell_parent(&mut lines, &header, theme.transcript.tool, theme, width);
                 push_child_rows(&mut lines, &rows, theme.transcript.muted, theme, width);
@@ -524,10 +523,13 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 );
             }
             TranscriptItem::SessionSummary(summary) => {
+                // No `* Summary:` plumbing label (#53): say the thing
+                // plainly, muted, bullet-anchored like any other neutral
+                // event — no stray asterisk.
                 push_wrapped(
                     &mut lines,
                     blank_gutter(),
-                    &format!("* Summary: {summary}"),
+                    summary,
                     theme.transcript.control,
                     theme,
                     width,
@@ -695,51 +697,15 @@ fn step_count_label(steps: usize) -> String {
     }
 }
 
-fn exploration_detail_rows(rows: &[String]) -> Vec<String> {
-    let parsed = rows
-        .iter()
-        .map(|row| split_exploration_row(row))
-        .collect::<Vec<_>>();
-    let verb_width = parsed
-        .iter()
-        .map(|(verb, _)| verb.chars().count())
-        .max()
-        .unwrap_or(0);
-    parsed
-        .into_iter()
-        .map(|(verb, detail)| aligned_exploration_row(&verb, &detail, verb_width))
-        .collect()
-}
-
-fn split_exploration_row(row: &str) -> (String, String) {
-    for (prefix, verb) in [
-        ("Read ", "Read"),
-        ("Git ", "Git"),
-        ("List ", "List"),
-        ("Search ", "Search"),
-    ] {
-        if let Some(detail) = row.strip_prefix(prefix) {
-            return (verb.to_owned(), detail.to_owned());
-        }
-    }
-    ("Tool".to_owned(), row.to_owned())
-}
-
-fn aligned_exploration_row(verb: &str, detail: &str, verb_width: usize) -> String {
-    if detail.is_empty() {
-        verb.to_owned()
-    } else {
-        format!("{verb:<width$} {detail}", width = verb_width)
-    }
-}
-
 /// v2 anchor spine: glyph + style for an event's first row (§1). `None`
-/// keeps the blank spine (user messages carry the ▌ rail instead; separators
-/// have no anchor).
+/// keeps the blank spine (separators have no anchor). Every anchor glyph —
+/// including the user-message rail — sits flush in this same slot (review
+/// v3 §R4); continuation rows for multi-line items that want the anchor
+/// repeated (the user rail) place it themselves at the identical column.
 fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)> {
     let anchor = match item {
-        TranscriptItem::UserMessage(_)
-        | TranscriptItem::Banner { .. }
+        TranscriptItem::UserMessage(_) => (glyphs::user_rail().to_owned(), theme.transcript.gutter),
+        TranscriptItem::Banner { .. }
         | TranscriptItem::TurnSeparator
         | TranscriptItem::WorkedDuration(_)
         | TranscriptItem::TurnRecap { .. } => return None,
@@ -887,7 +853,7 @@ fn push_bounded_detail(
     let mut omitted_count = 0;
 
     for raw_line in output_rows_without_trailing_blanks(detail) {
-        let wrapped = wrap_text(raw_line, content_width(width));
+        let wrapped = wrap_text(raw_line, gutter_relative_width(width, render.gutter));
         for segment in wrapped {
             if rendered_count < limit {
                 push_wrapped_segment(lines, render.gutter, segment, render.style, theme);
@@ -1001,11 +967,37 @@ fn push_wrapped(
         is_ledger_gutter(gutter),
         "invalid ledger gutter: {gutter:?}"
     );
-    for segment in wrap_text(text, content_width(width)) {
+    // Wrap at the actual prefix width, not the generic 2-/11-cell gutter:
+    // tree-nested content (`tree_gutter_pipe`/`_last`/`_mid` in narrow mode)
+    // is wider than the plain spine, and reusing `content_width` here would
+    // let every physical row run 2 cells past the terminal edge — the
+    // overflow that resize exposed as a stale fragment at column 0 outside
+    // the rail.
+    let body_width = gutter_relative_width(width, gutter);
+    for segment in wrap_text(text, body_width) {
         push_wrapped_segment(lines, gutter, segment, style, theme);
     }
 }
 
+/// Content width for a line prefixed by `gutter`, reserving exactly the
+/// columns that prefix will occupy (rather than assuming the plain spine's
+/// `gutter_width()`).
+fn gutter_relative_width(width: u16, gutter: &str) -> usize {
+    usize::from(width)
+        .saturating_sub(display_width(gutter))
+        .max(1)
+}
+
+/// Renders a multi-line block whose anchor (the user-message rail) repeats
+/// on every physical row instead of just the first (review v3 §R4). The
+/// rail lives in the same gutter-width slot every other anchor glyph uses:
+/// the first row gets a `blank_gutter()` placeholder that the shared
+/// spine-anchor stamp (`stamp_first_line`) swaps for the rail — flush at
+/// column 0, exactly like `•`/`✓`/`✱`/etc — and continuation rows place the
+/// rail themselves, right-aligned into that identical gutter-width slot (so
+/// it lines up under the first row's rail even when the timestamp gutter is
+/// on). Content starts immediately after, at the same column every anchor
+/// uses.
 fn push_wrapped_with_continuation(
     lines: &mut Vec<Line<'static>>,
     content_prefixes: (&'static str, &'static str),
@@ -1014,22 +1006,20 @@ fn push_wrapped_with_continuation(
     theme: &Theme,
     width: u16,
 ) {
-    let (first_prefix, next_prefix) = content_prefixes;
-    let body_width = content_width(width)
-        .saturating_sub(display_width(first_prefix).max(display_width(next_prefix)))
-        .max(1);
+    let (_first_prefix, next_prefix) = content_prefixes;
+    let body_width = content_width(width).max(1);
     let mut first_segment = true;
     for raw_line in text.split('\n') {
         for segment in wrap_text(raw_line, body_width) {
-            let prefix = if first_segment {
-                first_prefix
+            let leading = if first_segment {
+                blank_gutter().to_owned()
             } else {
-                next_prefix
+                let pad = gutter_width().saturating_sub(display_width(next_prefix));
+                format!("{}{next_prefix}", " ".repeat(pad))
             };
             first_segment = false;
             lines.push(Line::from(vec![
-                Span::styled(blank_gutter().to_owned(), theme.transcript.gutter),
-                Span::styled(prefix.to_owned(), theme.transcript.gutter),
+                Span::styled(leading, theme.transcript.gutter),
                 Span::styled(segment, style),
             ]));
         }
@@ -1065,7 +1055,10 @@ mod tests {
     fn exploration_group_header_carries_steps_elapsed_and_tree_children() {
         let entries = vec![ProjectedEntry {
             item: TranscriptItem::Exploration {
-                summaries: vec!["Read Cargo.toml".to_owned(), "Git diff".to_owned()],
+                summaries: vec![
+                    "read Cargo.toml · 12 lines".to_owned(),
+                    "git diff".to_owned(),
+                ],
             },
             timing: Some(EventTiming {
                 absolute: "12:00:06".to_owned(),
@@ -1086,15 +1079,24 @@ mod tests {
         });
         let text = plain_text(&lines);
 
+        // Lowercase verbs, single space, per-step result data (design review
+        // v3 §R3) — not the old capitalized, double-spaced alignment bug.
         assert!(text.contains("explore · 2 steps · 6s"), "text: {text:?}");
-        assert!(text.contains("├ Read Cargo.toml"), "text: {text:?}");
-        assert!(text.contains("└ Git  diff"), "text: {text:?}");
-        assert!(!text.contains("└ Read Cargo.toml"), "text: {text:?}");
-        assert!(!text.contains("├ Git  diff"), "text: {text:?}");
+        assert!(
+            text.contains("├ read Cargo.toml · 12 lines"),
+            "text: {text:?}"
+        );
+        assert!(text.contains("└ git diff"), "text: {text:?}");
+        assert!(!text.contains("└ read Cargo.toml"), "text: {text:?}");
+        assert!(!text.contains("├ git diff"), "text: {text:?}");
+        assert!(!text.contains("git  diff"), "text: {text:?}");
     }
 
     #[test]
-    fn successful_shell_output_promotes_informative_result_line() {
+    fn successful_shell_output_keeps_summary_tail_in_head_tail_preview() {
+        // v4 amendment: the collapsed preview is the literal head + tail of
+        // the buffer in buffer order — test summaries live in the tail, so
+        // they stay visible without any informative-line promotion.
         let item = TranscriptItem::ToolRun {
             command: "cargo test".to_owned(),
             ok: true,
@@ -1114,11 +1116,72 @@ mod tests {
         let text = plain_text(&lines);
 
         assert!(
-            text.contains("test result: ok. 12 passed; 0 failed")
+            text.contains("└ line 1")
+                && text.contains("line 2")
+                && text.contains("… 2 more lines · ctrl+o expand")
+                && text.contains("test result: ok. 12 passed; 0 failed")
                 && text.contains("tail 2")
-                && !text.contains("line 1"),
+                && !text.contains("line 3"),
             "text: {text:?}"
         );
+    }
+
+    #[test]
+    fn expanded_thinking_body_rewraps_inside_the_rail_on_resize() {
+        // Regression: the pipe-rail gutter (`tree_gutter_pipe`, 4 cells wide
+        // in narrow/no-timestamp mode) was wrapped using the generic
+        // 2-cell `content_width`, so every physical row ran 2 cells past
+        // the terminal edge. On repaint at a narrower width the stale
+        // overflow showed up as a fragment spilling to column 0, outside
+        // the rail. Wrapping must key off the gutter actually rendered.
+        let content = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu".to_owned();
+        let item = TranscriptItem::ModelReasoning {
+            fidelity: String::new(),
+            content: content.clone(),
+        };
+
+        for width in [60_u16, 28_u16] {
+            let lines = render_projected_items_with_expansion(
+                std::slice::from_ref(&item),
+                &Theme::default(),
+                width,
+                TranscriptRenderLimits::default(),
+                true,
+            );
+
+            let pipe = tree_gutter_pipe();
+            let mut body_words = Vec::new();
+            for line in &lines {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                // No physical row — header or body — may run past the
+                // rendered width: that overflow is exactly what spilled a
+                // stale fragment to column 0 outside the rail on resize.
+                assert!(
+                    display_width(&text) <= usize::from(width),
+                    "line {text:?} exceeds width {width} at rendered width"
+                );
+                // Body rows are identified by their gutter span (emitted by
+                // `push_wrapped_segment`) being the pipe rail exactly; every
+                // one of them must carry it — none may land bare at column 0.
+                let is_body_row = line
+                    .spans
+                    .first()
+                    .is_some_and(|s| s.content.as_ref() == pipe);
+                if is_body_row {
+                    body_words.push(text.trim_start_matches(pipe).trim().to_owned());
+                }
+            }
+            assert!(
+                body_words.len() > 1,
+                "expected the body to wrap across multiple rail rows at width {width}"
+            );
+            let reassembled = body_words.join(" ");
+            assert_eq!(
+                reassembled.split_whitespace().collect::<Vec<_>>(),
+                content.split_whitespace().collect::<Vec<_>>(),
+                "rewrapped body at width {width} must reproduce the full content with no words lost"
+            );
+        }
     }
 
     fn plain_text(lines: &[Line<'_>]) -> String {

@@ -66,15 +66,15 @@ impl AppCore {
                 self.bottom.open_extension_manager();
                 CoreEffect::Render
             }
-            Err(error) => self.notice_item(format!("extension toggle failed: {error}")),
+            Err(error) => self.error_item(format!("extension toggle failed: {error}")),
         }
     }
 
     pub(super) fn show_extension_details(&mut self, id: String) -> CoreEffect {
         let (items, _) = self.current_extension_context();
         match items.into_iter().find(|item| item.id == id) {
-            Some(item) => self.summary_item(item.details_text()),
-            None => self.notice_item(format!("unknown extension: {id}")),
+            Some(item) => self.notice_item(item.details_text()),
+            None => self.error_item(format!("unknown extension: {id}")),
         }
     }
 
@@ -88,7 +88,7 @@ impl AppCore {
                 self.teach_notice(format!("extension removed: {id} · {message}"));
                 CoreEffect::Render
             }
-            Err(error) => self.notice_item(format!("extension remove failed: {error}")),
+            Err(error) => self.error_item(format!("extension remove failed: {error}")),
         }
     }
 
@@ -106,7 +106,7 @@ impl AppCore {
                 self.teach_notice(report.steps_text());
                 CoreEffect::Render
             }
-            Err(error) => self.notice_item(format!("extension add failed: {error}")),
+            Err(error) => self.error_item(format!("extension add failed: {error}")),
         }
     }
 
@@ -119,7 +119,7 @@ impl AppCore {
     ) -> CoreEffect {
         let request = match self.resolve_extension_run(id, command, input, raw_args) {
             Ok(request) => request,
-            Err(error) => return self.notice_item(format!("extension run failed: {error}")),
+            Err(error) => return self.error_item(format!("extension run failed: {error}")),
         };
         match std::mem::replace(&mut self.state, AppState::Empty) {
             AppState::Idle { session } => {

@@ -167,7 +167,7 @@ Rules, enforced at load with warnings for anything malformed:
   `$` or `!` as `$$` / `$!`). Resolved secrets are tainted values, redacted
   from logs and provenance by construction.
 - Built-in provider ids (`chatgpt`, `anthropic`, `openai`, `openrouter`,
-  `fixture`) are reserved and cannot be overridden.
+  `xai`, `fixture`) are reserved and cannot be overridden.
 - Optional per-model entries under `"models"` can declare
   `context_window_tokens`, `max_output_tokens`, `supports_tools`, and
   `supports_reasoning`.

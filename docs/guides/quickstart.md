@@ -23,13 +23,14 @@ euler login --provider chatgpt
 euler auth status
 ```
 
-Anthropic, OpenAI (API key), and OpenRouter use environment variables, not
-`euler login`:
+Anthropic, OpenAI (API key), OpenRouter, and xAI use environment variables,
+not `euler login`:
 
 ```sh
 export ANTHROPIC_API_KEY='...'
 export OPENAI_API_KEY='...'
 export OPENROUTER_API_KEY='...'
+export XAI_API_KEY='...'
 euler auth status
 ```
 

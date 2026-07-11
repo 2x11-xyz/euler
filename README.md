@@ -139,7 +139,6 @@ extensions rely on live in [docs/contracts/](docs/contracts/).
   export, rendering
 - [Design contracts](docs/contracts/): canvas, provenance, tools,
   capabilities, multi-agent, secrets
-- [Known issues](docs/known-issues.md): current defects and limitations
 - [Roadmap](docs/roadmap.md): where this is going
 
 ## Status
@@ -147,8 +146,8 @@ extensions rely on live in [docs/contracts/](docs/contracts/).
 v0.1.0 is nascent and moving fast. The core loop, providers, permissions,
 provenance, and bundled extensions work today and are exercised daily by fleets
 of Euler agents building Euler. Interfaces may still shift; the provenance
-schema is versioned. Rough edges are documented in
-[known issues](docs/known-issues.md).
+schema is versioned. Rough edges are tracked as
+[GitHub issues](https://github.com/2x11-xyz/euler/issues).
 
 ## License
 

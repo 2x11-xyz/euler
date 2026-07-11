@@ -731,12 +731,59 @@ fn tui_read_tool_flow_uses_compact_result_without_raw_lifecycle_rows() {
     let contents = rendered_screen(&events, &theme, 80, 6);
 
     assert!(contents.contains("explore"));
-    assert!(contents.contains("Read README.md"));
+    assert!(contents.contains("read README.md"));
     assert!(!contents.contains("raw file contents"));
     assert!(!contents.contains("* Tool read_file"));
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("Tool read_file completed"));
     assert!(!contents.contains("Permission allowed"));
+}
+
+#[test]
+fn tui_read_tool_result_carries_line_count_result_data() {
+    let output = (1..=84)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let events = vec![
+        tool_call(
+            "call-read",
+            "read_file",
+            serde_json::json!({"path": "README.md"}),
+        ),
+        tool_result("call-read", "read_file", &output),
+    ];
+    let theme = Theme::default();
+
+    let contents = rendered_screen(&events, &theme, 80, 6);
+
+    // Lowercase verb, single space, per-step result data (design review v3
+    // §R3) — a single (non-coalesced) read keeps its line count.
+    assert!(contents.contains("read README.md · 84 lines"));
+}
+
+#[test]
+fn tui_explore_sub_verbs_render_lowercase_and_single_spaced() {
+    let events = vec![
+        tool_call("call-status", "git_status", serde_json::json!({})),
+        tool_result("call-status", "git_status", "nothing to commit"),
+        tool_call(
+            "call-read",
+            "read_file",
+            serde_json::json!({"path": "README.md"}),
+        ),
+        tool_result("call-read", "read_file", "hello\n"),
+    ];
+    let theme = Theme::default();
+
+    let contents = rendered_screen(&events, &theme, 80, 8);
+
+    // `git status`, not the old capitalized double-space alignment bug
+    // (`Git  status`).
+    assert!(contents.contains("git status"));
+    assert!(!contents.contains("Git"));
+    assert!(!contents.contains("git  status"));
+    assert!(contents.contains("read README.md · 1 line"));
 }
 
 #[test]
@@ -896,7 +943,7 @@ fn tui_exploration_coalesces_and_dedupes_read_labels() {
     let contents = rendered_screen(&events, &theme, 96, 10);
 
     assert_eq!(contents.matches("explore").count(), 1);
-    assert!(contents.contains("└ Read README.md, Cargo.toml"));
+    assert!(contents.contains("└ read README.md, Cargo.toml"));
     assert!(contents.contains("bash $ rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("Search rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("README raw content"));
@@ -927,7 +974,7 @@ fn tui_assistant_finalization_does_not_leave_stale_exploration_fragments() {
     let contents = rendered_screen(&events, &theme, 80, 8);
 
     assert!(contents.contains("explore"));
-    assert!(contents.contains("Read AGENTS.md"));
+    assert!(contents.contains("read AGENTS.md"));
     assert_eq!(contents.matches("final answer").count(), 1);
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("# raw agent instructions"));
@@ -1314,20 +1361,30 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
     let theme = Theme::default();
     let contents = rendered_screen_with_limit(&events, &theme, 40, 16, 2);
     assert!(contents.contains("▌ alpha beta gamma"));
-    // The blank 2-cell spine precedes the rail; match the glyph.
+    // Review v3 §R4: the rail sits flush at column 0, like every other
+    // spine anchor — no leading blank gutter column ahead of it.
     let prompt_glyph_lines = contents
         .lines()
-        .filter(|line| line.contains("▌ "))
+        .filter(|line| line.contains('▌'))
         .collect::<Vec<_>>();
     assert_eq!(
         prompt_glyph_lines.len(),
         2,
         "expected continuous rail for each wrapped user prompt row, got {prompt_glyph_lines:?}"
     );
+    for line in &prompt_glyph_lines {
+        assert!(
+            line.starts_with("▌ "),
+            "rail must be flush at column 0: {line:?}"
+        );
+    }
+    // Five rows fit inside the head+tail preview budget (2 + 3), so the
+    // whole output renders with no fold marker even at a tiny row limit.
     assert!(contents.contains("line one output"));
     assert!(contents.contains("line two output"));
-    assert!(contents.contains("1 more lines"));
+    assert!(contents.contains("line three output"));
     assert!(contents.contains("line five output"));
+    assert!(!contents.contains("more lines"));
 
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
         let trimmed = line.trim_start();
@@ -1373,6 +1430,43 @@ fn vt100_multiline_user_message_uses_continuous_rail_for_whole_block() {
     );
 }
 
+// Review v3 §R4: every spine anchor — `▌ • ✓ ✱ ◆ ■ ↩` — sits flush at
+// column 0 with content at column 2. The user rail had drifted one anchor
+// slot to the right (a stray `blank_gutter()` ahead of the rail prefix).
+#[test]
+fn vt100_user_rail_sits_flush_at_column_zero_like_other_anchors() {
+    let events = vec![
+        event(
+            EventKind::USER_MESSAGE,
+            object([("content", "one\ntwo".into())]),
+        ),
+        event(
+            EventKind::CHECK_STARTED,
+            object([("name", "cargo test".into())]),
+        ),
+    ];
+    let theme = Theme::default();
+    let contents = rendered_screen_with_limit(&events, &theme, 40, 12, 2);
+
+    let rail_rows: Vec<&str> = contents.lines().filter(|line| line.contains('▌')).collect();
+    assert_eq!(rail_rows.len(), 2, "contents: {contents:?}");
+    for line in &rail_rows {
+        assert!(
+            line.starts_with("▌ "),
+            "rail must be flush at column 0, content at column 2: {line:?}"
+        );
+    }
+
+    let bullet_row = contents
+        .lines()
+        .find(|line| line.contains("Check started"))
+        .expect("check-started row");
+    assert!(
+        bullet_row.starts_with("• "),
+        "the default anchor also sits flush at column 0: {bullet_row:?}"
+    );
+}
+
 #[test]
 fn vt100_blank_multiline_user_message_keeps_continuous_rail() {
     let events = vec![event(
@@ -1411,12 +1505,16 @@ fn vt100_long_tool_output_uses_head_tail_affordance() {
     let contents = rendered_screen(&events, &theme, 80, 16);
 
     assert!(contents.contains("bash $ printf lines"));
-    assert!(contents.contains("  line 1"));
-    assert!(contents.contains("  line 2"));
-    assert!(contents.contains("8 more lines"));
+    // Head+tail preview (v4 spec amendment): the literal first two and last
+    // three buffer rows in buffer order, elbow on the first, fold marker
+    // carrying the hidden count in between.
+    assert!(contents.contains("└ line 1"));
+    assert!(contents.contains("line 2"));
+    assert!(contents.contains("7 more lines"));
     assert!(contents.contains("ctrl+o expand"));
-    assert!(contents.contains("  line 11"));
-    assert!(contents.contains("  line 12"));
+    assert!(contents.contains("line 10"));
+    assert!(contents.contains("line 11"));
+    assert!(contents.contains("line 12"));
     assert!(!contents.contains("line 3"));
 }
 
@@ -1566,7 +1664,8 @@ fn tool_artifact_cell_folds_only_above_threshold() {
 
     assert!(!exact.contains("more lines"), "exact: {exact:?}");
     assert!(exact.contains("line 10"), "exact: {exact:?}");
-    assert!(overflow.contains("7 more lines"), "overflow: {overflow:?}");
+    // 11 rows fold to head 2 + tail 3: 11 − 5 = 6 hidden.
+    assert!(overflow.contains("6 more lines"), "overflow: {overflow:?}");
     assert!(overflow.contains("ctrl+o expand"), "overflow: {overflow:?}");
     assert!(!overflow.contains("line 3"), "overflow: {overflow:?}");
 }
@@ -1597,7 +1696,7 @@ fn tool_artifact_cell_expands_with_unbounded_limit() {
     ))
     .join("\n");
 
-    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("7 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
     assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
@@ -1760,6 +1859,52 @@ fn tool_artifact_cell_uses_available_width_for_long_command_title() {
 }
 
 #[test]
+fn tool_artifact_cell_truncates_command_not_metadata_at_narrow_widths() {
+    let theme = Theme::default();
+    let command =
+        "sed -n '1,220p' crates/euler-cli/src/ui/transcript/cells/tool_run.rs | rg 'fn ' -n";
+    let output = (1..=12)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let item = [TranscriptItem::ToolRun {
+        command: command.to_owned(),
+        ok: true,
+        error: String::new(),
+        output,
+        exit_code: Some(0),
+        grant_source: None,
+        static_safe: false,
+    }];
+
+    for width in [30u16, 40, 50, 60, 80] {
+        let texts = line_texts(&render_items_for_history(&item, &theme, width));
+        let title = &texts[0];
+
+        assert!(
+            display_width(title) <= usize::from(width),
+            "width {width}: title exceeds terminal width: {title:?}"
+        );
+        // The metadata cluster (`exit N · N lines · folded`) must always
+        // render intact — only the command text truncates, yielding all the
+        // way down to a bare `…` at extreme widths (design review v3 §R3).
+        // Below this width the metadata phrase itself is longer than the
+        // whole available line, which no amount of command truncation can
+        // fix; that residual clip is a physical limit, not this bug.
+        if width >= 40 {
+            assert!(
+                title.contains("exit 0 · 12 lines · folded"),
+                "width {width}: metadata cluster corrupted: {title:?}"
+            );
+        }
+        assert!(
+            !title.contains("· exit") || title.contains("exit 0"),
+            "width {width}: dangling '· exit' with no code: {title:?}"
+        );
+    }
+}
+
+#[test]
 fn tool_artifact_cell_keeps_minimum_width_at_tiny_widths() {
     let theme = Theme::default();
     let item = [TranscriptItem::ToolRun {
@@ -1819,9 +1964,10 @@ fn tool_artifact_cell_reports_failure_without_exit_code() {
 }
 
 #[test]
-fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
+fn collapsed_tool_run_previews_head_and_tail_in_buffer_order() {
     let theme = Theme::default();
-    let output = (1..=DEFAULT_OUTPUT_LIMIT_LINES + 1)
+    let last_line = DEFAULT_OUTPUT_LIMIT_LINES + 1;
+    let output = (1..=last_line)
         .map(|index| format!("line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1838,22 +1984,49 @@ fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    // Exactly one `└ ` result line, carrying the first non-empty output row
-    // as the most-informative fallback (review v2 §14.2).
+    // Head+tail preview (v4 spec amendment): one `└ ` elbow on the FIRST
+    // buffer row — never a selected/rotated line — then the rest of the
+    // head, the fold marker, and the literal last three rows, all in
+    // buffer order.
     assert_eq!(
         texts.iter().filter(|line| line.contains('└')).count(),
         1,
         "texts: {texts:?}"
     );
-    assert!(joined.contains("└ line 1"), "texts: {texts:?}");
-    // Remaining preview rows sit two extra spaces deeper than the result
-    // line: result line body indent is 4 cells ("  " gutter pad + "└ "),
-    // continuation rows are 6 cells ("  " gutter pad + "  " extra indent).
+    let row_index = |needle: &str| {
+        texts
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("row {needle:?} missing: {texts:?}"))
+    };
+    let head_first = row_index("└ line 1");
+    let head_second = row_index("line 2");
+    let marker = row_index("more lines · ctrl+o expand");
+    let tail_first = row_index(&format!("line {}", last_line - 2));
+    let tail_mid = row_index(&format!("line {}", last_line - 1));
+    let tail_last = row_index(&format!("line {last_line}"));
+    assert!(
+        head_first < head_second
+            && head_second < marker
+            && marker < tail_first
+            && tail_first < tail_mid
+            && tail_mid < tail_last,
+        "preview must keep buffer order: {texts:?}"
+    );
+    // The fold marker carries the hidden count: total − head − tail.
+    let hidden = last_line - 5;
+    assert!(
+        joined.contains(&format!("… {hidden} more lines · ctrl+o expand")),
+        "texts: {texts:?}"
+    );
+    // Sibling preview rows sit two extra spaces deeper than the elbow row:
+    // elbow body indent is 4 cells ("  " gutter pad + "└ "), continuation
+    // rows are 6 cells ("  " gutter pad + "  " alignment indent).
     let result_indent = texts
         .iter()
         .find(|line| line.contains("└ line 1"))
         .map(|line| line.len() - line.trim_start().len())
-        .expect("result line present");
+        .expect("elbow line present");
     let continuation_indent = texts
         .iter()
         .find(|line| line.contains("more lines · ctrl+o expand"))
@@ -1863,30 +2036,198 @@ fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
 }
 
 #[test]
-fn collapsed_tool_run_strips_leading_literal_exit_code_row() {
+fn collapsed_tool_run_keeps_test_summary_visible_in_tail() {
+    // The one-selected-informative-line rule is withdrawn (v4 amendment):
+    // the tail of the buffer is where test summaries live, and the head+tail
+    // preview keeps them visible without reordering anything.
     let theme = Theme::default();
     let item = [TranscriptItem::ToolRun {
-        command: "printf leaked".to_owned(),
+        command: "cargo test".to_owned(),
         ok: true,
         error: String::new(),
-        output: "exit 0\nreal output".to_owned(),
+        output: "running 3 tests\ntest foo ... ok\ntest result: ok. 3 passed; 0 failed\n"
+            .to_owned(),
         exit_code: Some(0),
         grant_source: None,
         static_safe: false,
     }];
 
-    let texts = line_texts(&render_items_for_history(&item, &theme, 80));
+    let texts = line_texts(&render_items_for_history(&item, &theme, 96));
+    let joined = texts.join("\n");
+
+    // Three rows fit whole: elbow on the literal first row, summary last.
+    assert!(joined.contains("└ running 3 tests"), "texts: {texts:?}");
+    assert!(
+        joined.contains("test result: ok. 3 passed; 0 failed"),
+        "texts: {texts:?}"
+    );
+    assert!(!joined.contains("more lines"), "texts: {texts:?}");
+    let first = texts
+        .iter()
+        .position(|line| line.contains("running 3 tests"))
+        .expect("head row");
+    let summary = texts
+        .iter()
+        .position(|line| line.contains("test result:"))
+        .expect("summary row");
+    assert!(first < summary, "buffer order preserved: {texts:?}");
+}
+
+#[test]
+fn collapsed_tool_run_short_output_renders_whole_without_marker() {
+    let theme = Theme::default();
+    let item = [TranscriptItem::ToolRun {
+        command: "rg -c foo".to_owned(),
+        ok: true,
+        error: String::new(),
+        output: "src/lib.rs:3\nsrc/main.rs:5\n8 matches\n".to_owned(),
+        exit_code: Some(0),
+        grant_source: None,
+        static_safe: false,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&item, &theme, 96));
+    let joined = texts.join("\n");
+
+    assert!(joined.contains("└ src/lib.rs:3"), "texts: {texts:?}");
+    assert!(joined.contains("src/main.rs:5"), "texts: {texts:?}");
+    assert!(joined.contains("8 matches"), "texts: {texts:?}");
+    assert!(!joined.contains("more lines"), "texts: {texts:?}");
+    assert!(!joined.contains("folded"), "texts: {texts:?}");
+}
+
+/// Project run_shell tool events into transcript items (the real ingest
+/// seam, `run_item_from_result`), for tests that pin ingest normalization
+/// rather than view behavior.
+fn projected_tool_run_items(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
+    super::transcript::project_tui_entries(events)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect()
+}
+
+#[test]
+fn ingest_strips_leading_literal_exit_code_row_for_both_views() {
+    let theme = Theme::default();
+    let events = vec![
+        tool_call(
+            "call-leak",
+            "run_shell",
+            serde_json::json!({"command": "printf leaked"}),
+        ),
+        tool_result_with_exit("call-leak", "run_shell", "exit 0\nreal output", true, 0),
+    ];
+    let items = projected_tool_run_items(&events);
+
+    for (label, texts) in [
+        (
+            "collapsed",
+            line_texts(&render_items_for_history(&items, &theme, 80)),
+        ),
+        (
+            "expanded",
+            line_texts(&render_items_for_history_with_limit(
+                &items,
+                &theme,
+                80,
+                usize::MAX,
+            )),
+        ),
+    ] {
+        let joined = texts.join("\n");
+        assert!(joined.contains("real output"), "{label}: {texts:?}");
+        assert!(
+            !texts
+                .iter()
+                .any(|line| line.trim_start().starts_with("exit 0")),
+            "{label}: exit code must not leak as an output row: {texts:?}"
+        );
+        // The header still owns the exit status, and both views count the
+        // same normalized buffer.
+        assert!(joined.contains("exit 0 · 1 line"), "{label}: {texts:?}");
+    }
+}
+
+#[test]
+fn ingest_strips_signed_annotated_timeout_exit_row() {
+    // Matches euler-core::tools::ShellExecutor::run_shell's real timeout
+    // header verbatim (crates/euler-core/src/tools.rs): a signed exit code
+    // followed by a parenthesized annotation, not just an unsigned "exit N".
+    let theme = Theme::default();
+    let output = "exit -1 (command timed out after 5000 ms and was killed; \
+pass timeout_ms up to 600000 for longer runs)\nreal output"
+        .to_owned();
+    let events = vec![
+        tool_call(
+            "call-timeout",
+            "run_shell",
+            serde_json::json!({"command": "sleep 999"}),
+        ),
+        tool_result_with_exit("call-timeout", "run_shell", &output, false, -1),
+    ];
+    let items = projected_tool_run_items(&events);
+
+    let texts = line_texts(&render_items_for_history(&items, &theme, 96));
     let joined = texts.join("\n");
 
     assert!(joined.contains("└ real output"), "texts: {texts:?}");
     assert!(
         !texts
             .iter()
-            .any(|line| line.trim_start().starts_with("exit 0")),
-        "exit code must not leak as an output row: {texts:?}"
+            .any(|line| line.trim_start().starts_with("exit -1")),
+        "signed annotated exit row must not leak as an output row: {texts:?}"
     );
-    // The footer still owns the exit status.
-    assert!(joined.contains("exit 0 · 1 line"), "texts: {texts:?}");
+    assert!(joined.contains("exit -1 · 1 line"), "texts: {texts:?}");
+}
+
+#[test]
+fn collapsed_and_expanded_views_agree_on_line_count_after_ingest() {
+    // Owner dogfood v4: the header said "66 lines" expanded but "65 lines"
+    // folded because the collapsed view stripped the leaked `exit 0` row
+    // while the expanded view rendered it. Normalizing once at ingest makes
+    // both views count the same stored buffer.
+    let theme = Theme::default();
+    let body = (1..=65)
+        .map(|index| format!("row {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let events = vec![
+        tool_call(
+            "call-count",
+            "run_shell",
+            serde_json::json!({"command": "find ."}),
+        ),
+        tool_result_with_exit(
+            "call-count",
+            "run_shell",
+            &format!("exit 0\n{body}"),
+            true,
+            0,
+        ),
+    ];
+    let items = projected_tool_run_items(&events);
+
+    let collapsed = line_texts(&render_items_for_history(&items, &theme, 80)).join("\n");
+    let expanded = line_texts(&render_items_for_history_with_limit(
+        &items,
+        &theme,
+        80,
+        usize::MAX,
+    ))
+    .join("\n");
+
+    assert!(
+        collapsed.contains("exit 0 · 65 lines"),
+        "collapsed: {collapsed:?}"
+    );
+    assert!(
+        expanded.contains("exit 0 · 65 lines"),
+        "expanded: {expanded:?}"
+    );
+    assert!(
+        !expanded.contains("66 lines"),
+        "expanded must not count the stripped exit row: {expanded:?}"
+    );
 }
 
 #[test]
@@ -3111,11 +3452,15 @@ fn tui_long_tool_output_ignores_trailing_blanks_in_head_tail_preview() {
     let theme = Theme::default();
     let contents = rendered_screen(&events, &theme, 80, 16);
 
-    assert!(contents.contains("8 more lines"));
+    // Trailing blank rows are ignored: the head+tail preview counts and
+    // slices the 12 real rows, not the 18 raw ones.
+    assert!(contents.contains("└ line 1"));
+    assert!(contents.contains("7 more lines"));
     assert!(contents.contains("ctrl+o expand"));
-    assert!(contents.contains("  line 11"));
-    assert!(contents.contains("  line 12"));
-    assert!(!contents.contains("14 more lines"));
+    assert!(contents.contains("line 10"));
+    assert!(contents.contains("line 11"));
+    assert!(contents.contains("line 12"));
+    assert!(!contents.contains("13 more lines"));
 }
 
 #[test]
@@ -3248,11 +3593,14 @@ fn vt100_failed_tool_with_exit_code_and_empty_error_has_no_dangling_colon() {
 }
 
 #[test]
-fn failed_tool_run_surfaces_informative_line_before_tail() {
+fn failed_tool_run_previews_head_and_tail_in_buffer_order() {
+    // v4 amendment: failures use the same head+tail preview as successes —
+    // no informative-line promotion. The loud failure signal lives in the
+    // header (`✗ exit N`), and the tail keeps the conclusive final rows.
     let theme = Theme::default();
     let output = (1..=12)
         .map(|index| {
-            if index == 5 {
+            if index == 12 {
                 "error[E0425]: cannot find value `x`".to_owned()
             } else {
                 format!("line {index}")
@@ -3284,17 +3632,16 @@ fn failed_tool_run_surfaces_informative_line_before_tail() {
         .filter(|line| line.starts_with("    ") && !line.trim().is_empty())
         .collect();
     assert!(
-        body.first()
-            .is_some_and(|line| line.contains("error[E0425]: cannot find value `x`")),
-        "first surfaced body line should be the informative match: {texts:?}"
+        body.first().is_some_and(|line| line.contains("└ line 1")),
+        "first surfaced body line is the literal first buffer row: {texts:?}"
     );
     assert!(
         joined.contains("more lines · ctrl+o expand"),
         "fold marker should remain: {joined:?}"
     );
     assert!(
-        joined.contains("line 11") && joined.contains("line 12"),
-        "summary tail should remain: {joined:?}"
+        joined.contains("line 11") && joined.contains("error[E0425]: cannot find value `x`"),
+        "tail keeps the conclusive final rows: {joined:?}"
     );
 }
 
@@ -3585,6 +3932,25 @@ fn tool_result(id: &str, name: &str, output: &str) -> EventEnvelope {
             ("name", name.to_owned().into()),
             ("ok", true.into()),
             ("output", output.to_owned().into()),
+        ]),
+    )
+}
+
+fn tool_result_with_exit(
+    id: &str,
+    name: &str,
+    output: &str,
+    ok: bool,
+    exit_code: i64,
+) -> EventEnvelope {
+    event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", id.to_owned().into()),
+            ("name", name.to_owned().into()),
+            ("ok", ok.into()),
+            ("output", output.to_owned().into()),
+            ("exit_code", exit_code.into()),
         ]),
     )
 }

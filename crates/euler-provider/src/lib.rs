@@ -12,6 +12,7 @@ pub mod openai;
 pub mod openrouter;
 pub mod provider_config;
 pub mod sse;
+pub mod xai;
 
 #[cfg(test)]
 mod conformance_tests;
@@ -504,6 +505,27 @@ impl ProviderSet {
 
     pub fn contains(&self, provider: &str) -> bool {
         self.providers.contains_key(provider)
+    }
+
+    /// Configured AND authenticated: `validate_auth` succeeds today. This is
+    /// a live credential check (env var / token file presence, not a network
+    /// call) so it is cheap enough to run when populating a picker.
+    pub fn is_authenticated(&self, provider: &str) -> bool {
+        self.providers
+            .get(provider)
+            .is_some_and(|provider| provider.validate_auth().is_ok())
+    }
+
+    /// Every configured provider id whose `validate_auth` succeeds today —
+    /// the same predicate as [`Self::is_authenticated`], enumerated so
+    /// callers that lose access to the set (e.g. while a session is checked
+    /// out onto a worker thread) can keep a last-known snapshot.
+    pub fn authenticated_provider_ids(&self) -> std::collections::BTreeSet<String> {
+        self.providers
+            .iter()
+            .filter(|(_, provider)| provider.validate_auth().is_ok())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     pub fn reasoning_effort(&self, provider: &str, model: &str) -> Option<&str> {

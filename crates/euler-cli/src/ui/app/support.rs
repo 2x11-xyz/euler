@@ -15,6 +15,7 @@ use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Looks up the context window size (in tokens) for the given provider/model
@@ -100,6 +101,7 @@ pub(super) fn command_context(
     model_catalog: &MergedModelCatalog,
     provider: &str,
     model: &str,
+    authenticated_providers: &BTreeSet<String>,
     parts: CommandContextParts,
 ) -> CommandContext {
     // This is called when the bottom surface is rebuilt for session lifecycle
@@ -107,8 +109,23 @@ pub(super) fn command_context(
     let provider_config = provider_config_runtime::load_provider_config(
         provider_config_runtime::default_provider_config_path().as_deref(),
     );
+    let model_choices = model_choices(model_catalog, &provider_config.registry, provider, model);
+    // The reviewer-model picker must not offer a target that will burn a
+    // spawn slot to discover it isn't authenticated (#58): filter to
+    // providers `validate_auth` accepted when the session was last Idle.
+    // The general `/model` picker keeps the full list — switching to an
+    // unauthenticated provider there is a normal way to be prompted to
+    // /login. The caller passes a cached snapshot so rebuilds while the
+    // session is checked out onto the worker thread (mid-turn, after
+    // submission) never shrink the picker to empty.
+    let code_swarm_model_choices = model_choices
+        .iter()
+        .filter(|choice| authenticated_providers.contains(&choice.provider))
+        .cloned()
+        .collect();
     CommandContext {
-        model_choices: model_choices(model_catalog, &provider_config.registry, provider, model),
+        model_choices,
+        code_swarm_model_choices,
         effort_choices: effort_choices(parts.current_effort),
         theme_choices: theme_choices(parts.current_theme),
         resume_items: resume_items_from_home(parts.current_session_id.as_deref()),

@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 /// Options shared by `run`, `tui`, and `exec` (consumed by `RawArgsParser`
 /// and applied through `build_run_args`).
 const SESSION_OPTIONS: &str = "  \
---provider <id>            chatgpt|openai|anthropic|openrouter|fixture|<custom>
+--provider <id>            chatgpt|openai|anthropic|openrouter|xai|fixture|<custom>
   --model <name>             Model id (default: the provider's default model)
   --provider-option <k=v>    Provider-specific option (repeatable)
   --extensions <ids|none>    Comma-separated extension ids to enable

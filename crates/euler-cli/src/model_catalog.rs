@@ -476,7 +476,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             provider_ids,
-            vec!["anthropic", "chatgpt", "fixture", "openai", "openrouter"]
+            vec![
+                "anthropic",
+                "chatgpt",
+                "fixture",
+                "openai",
+                "openrouter",
+                "xai"
+            ]
         );
         assert!(output.find("\"a-model\"") < output.find("\"z-model\""));
     }
@@ -552,6 +559,7 @@ mod tests {
                 "fixture",
                 "openai",
                 "openrouter",
+                "xai",
                 "local-a",
                 "local-b"
             ]
@@ -685,7 +693,7 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         let value: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
         assert!(stderr.is_empty(), "{stderr}");
-        assert_eq!(value["providers"].as_array().expect("providers").len(), 5);
+        assert_eq!(value["providers"].as_array().expect("providers").len(), 6);
     }
 
     #[test]
