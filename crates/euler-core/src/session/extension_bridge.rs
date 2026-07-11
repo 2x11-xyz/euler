@@ -68,17 +68,50 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
             .map_err(spawn_failed)?;
         let summary = session.spawn_companion(agent_task).map_err(spawn_failed)?;
         self.spawned.set(self.spawned.get() + 1);
-        Ok(AgentOutcome {
-            ok: summary.result.ok(),
-            summary: summary.result.summary().to_owned(),
-            output: summary.result.output().unwrap_or_default().to_owned(),
-            error: summary.result.error().map(str::to_owned),
-            provider: summary.provider,
-            model: summary.model,
-            child_agent_id: summary.child_agent_id,
-            spawn_event_id: summary.spawn_event_id,
-            result_event_id: summary.result_event_id,
-        })
+        Ok(outcome_from_summary(summary))
+    }
+
+    /// Concurrent batch (multi-agent contract v0.2): the whole batch is
+    /// checked against the remaining per-command quota before any event is
+    /// emitted, queued extension events publish before the first spawn, and
+    /// outcomes return in task order.
+    fn spawn_agents(
+        &self,
+        tasks: Vec<SpawnAgentTask>,
+    ) -> Result<Vec<AgentOutcome>, ExtensionError> {
+        if self.spawned.get().saturating_add(tasks.len()) > MAX_SPAWNS_PER_COMMAND {
+            return Err(ExtensionError::Message(format!(
+                "agent spawn quota exhausted: one command may run at most {MAX_SPAWNS_PER_COMMAND} agents"
+            )));
+        }
+        let agent_tasks = tasks
+            .into_iter()
+            .map(convert_spawn_task)
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch_len = agent_tasks.len();
+        let mut session = self.session.borrow_mut();
+        session
+            .publish_queued_extension_events(&self.queue)
+            .map_err(spawn_failed)?;
+        let summaries = session
+            .spawn_reviewers_parallel(agent_tasks, &std::sync::atomic::AtomicBool::new(false))
+            .map_err(spawn_failed)?;
+        self.spawned.set(self.spawned.get() + batch_len);
+        Ok(summaries.into_iter().map(outcome_from_summary).collect())
+    }
+}
+
+fn outcome_from_summary(summary: super::AgentResultSummary) -> AgentOutcome {
+    AgentOutcome {
+        ok: summary.result.ok(),
+        summary: summary.result.summary().to_owned(),
+        output: summary.result.output().unwrap_or_default().to_owned(),
+        error: summary.result.error().map(str::to_owned),
+        provider: summary.provider,
+        model: summary.model,
+        child_agent_id: summary.child_agent_id,
+        spawn_event_id: summary.spawn_event_id,
+        result_event_id: summary.result_event_id,
     }
 }
 

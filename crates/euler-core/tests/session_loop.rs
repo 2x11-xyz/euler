@@ -15,7 +15,6 @@ use euler_provider::{
 use euler_sdk::Capability;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4369,13 +4368,13 @@ fn has_subsequence(actual: &[String], expected: &[&str]) -> bool {
 }
 
 struct RawStreamProvider {
-    events: RefCell<Option<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+    events: Mutex<Option<Vec<Result<ModelStreamEvent, ProviderError>>>>,
 }
 
 impl RawStreamProvider {
     fn new(events: Vec<Result<ModelStreamEvent, ProviderError>>) -> Self {
         Self {
-            events: RefCell::new(Some(events)),
+            events: Mutex::new(Some(events)),
         }
     }
 }
@@ -4388,7 +4387,8 @@ impl ModelProvider for RawStreamProvider {
     fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         let events = self
             .events
-            .borrow_mut()
+            .lock()
+            .expect("event slot")
             .take()
             .ok_or_else(|| ProviderError::transport("raw stream provider exhausted"))?;
         Ok(Box::new(events.into_iter()))
@@ -4396,7 +4396,7 @@ impl ModelProvider for RawStreamProvider {
 }
 
 struct CountingStreamProvider {
-    events: RefCell<Option<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+    events: Mutex<Option<Vec<Result<ModelStreamEvent, ProviderError>>>>,
     next_count: Arc<AtomicUsize>,
 }
 
@@ -4406,7 +4406,7 @@ impl CountingStreamProvider {
         next_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            events: RefCell::new(Some(events)),
+            events: Mutex::new(Some(events)),
             next_count,
         }
     }
@@ -4420,7 +4420,8 @@ impl ModelProvider for CountingStreamProvider {
     fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         let events = self
             .events
-            .borrow_mut()
+            .lock()
+            .expect("event slot")
             .take()
             .ok_or_else(|| ProviderError::transport("counting provider exhausted"))?;
         Ok(Box::new(CountingStream {
@@ -4447,9 +4448,8 @@ impl Iterator for CountingStream {
 
 struct CapturingProvider {
     name: &'static str,
-    // RefCell is intentionally enough for the Send-only provider contract:
     // providers move between threads but are not shared concurrently.
-    streams: RefCell<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+    streams: Mutex<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
     requests: RequestLog,
 }
 
@@ -4461,7 +4461,7 @@ impl CapturingProvider {
     ) -> Self {
         Self {
             name,
-            streams: RefCell::new(streams.into()),
+            streams: Mutex::new(streams.into()),
             requests,
         }
     }
@@ -4476,7 +4476,8 @@ impl ModelProvider for CapturingProvider {
         request_log_guard(&self.requests).push(request);
         let events = self
             .streams
-            .borrow_mut()
+            .lock()
+            .expect("stream queue")
             .pop_front()
             .ok_or_else(|| ProviderError::transport("capturing provider exhausted"))?;
         Ok(Box::new(events.into_iter()))
@@ -4484,7 +4485,7 @@ impl ModelProvider for CapturingProvider {
 }
 
 struct FlakyThenScriptedProvider {
-    failures: RefCell<Vec<ProviderError>>,
+    failures: Mutex<Vec<ProviderError>>,
     inner: ScriptedProvider,
     invokes: Arc<AtomicUsize>,
 }
@@ -4496,7 +4497,7 @@ impl FlakyThenScriptedProvider {
         invokes: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            failures: RefCell::new(failures),
+            failures: Mutex::new(failures),
             inner,
             invokes,
         }
@@ -4510,8 +4511,9 @@ impl ModelProvider for FlakyThenScriptedProvider {
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         self.invokes.fetch_add(1, Ordering::Relaxed);
-        if !self.failures.borrow().is_empty() {
-            return Err(self.failures.borrow_mut().remove(0));
+        let mut failures = self.failures.lock().expect("failure queue");
+        if !failures.is_empty() {
+            return Err(failures.remove(0));
         }
         self.inner.invoke(request)
     }

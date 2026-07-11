@@ -1,93 +1,107 @@
 use super::*;
+use crate::code_swarm_config;
+use euler_core::{SwarmConfig, SwarmConfigStore};
 
+/// Startup view of the persisted reviewer set for picker preselection and
+/// the palette context: the contract chain's persisted tiers (project, then
+/// user). Read errors surface at run time, not at startup.
 pub(super) fn load_code_swarm_models_startup() -> Vec<String> {
-    let Some(path) = crate::model_preference::default_model_preference_path() else {
-        return Vec::new();
-    };
-    match crate::model_preference::load_code_swarm_models_preference(&path) {
-        crate::model_preference::CodeSwarmModelsLoad::Loaded(models) => models,
-        _ => Vec::new(),
-    }
+    code_swarm_config::resolved_targets_for_display(&code_swarm_config::workspace_root())
+        .map(|(targets, _tier)| targets)
+        .unwrap_or_default()
 }
 
 impl AppCore {
-    pub(super) fn code_swarm_save_models(&mut self, models: Vec<String>) -> CoreEffect {
+    /// Persist the picker selection to one tier of the swarm config store
+    /// (project by default; `--user` for the user-global tier).
+    pub(super) fn code_swarm_save_models(
+        &mut self,
+        models: Vec<String>,
+        user_tier: bool,
+    ) -> CoreEffect {
         let count = models.len();
+        let config = match SwarmConfig::from_targets(&models, None) {
+            Ok(config) => config,
+            Err(error) => return self.notice_item(format!("code-swarm save failed: {error}")),
+        };
+        let (store, tier_label) = match self.code_swarm_store(user_tier) {
+            Ok(store) => store,
+            Err(message) => return self.notice_item(message),
+        };
+        // Cache feeds the picker preselection and the palette context; the
+        // run path re-reads the stores so external edits still win.
         self.code_swarm_models = models;
-        let persisted = crate::model_preference::default_model_preference_path()
-            .map(|path| {
-                crate::model_preference::save_code_swarm_models_preference(
-                    &path,
-                    &self.code_swarm_models,
-                )
-            })
-            .transpose();
         self.rebuild_bottom_surface();
         // Spec v2.1 §5c: dim provenance line, not a summary — this is a
-        // config confirmation, not a result. `teach_notice` already exists
-        // for exactly this class of neutral confirmation (extension
-        // toggles, timestamps, code-swarm config), so it stays a Notice
-        // rather than moving to SessionSummary.
-        match persisted {
-            Ok(_) => self.teach_notice(format!("✓ code-swarm · {count} reviewers configured")),
-            Err(error) => self.teach_notice(format!(
-                "✓ code-swarm · {count} reviewers configured · session only (save failed: {error})"
+        // config confirmation, not a result.
+        match store.save(&config) {
+            Ok(()) => self.teach_notice(format!(
+                "✓ code-swarm · {count} reviewers configured · {tier_label} tier"
             )),
+            Err(error) => self.notice_item(format!("code-swarm save failed: {error}")),
         }
     }
 
-    /// Reviewer model set for a swarm run: saved selection, else the first
-    /// three catalog entries (the picker's default of 3).
-    fn code_swarm_effective_models(&self) -> Vec<String> {
-        if !self.code_swarm_models.is_empty() {
-            return self.code_swarm_models.clone();
+    /// `/code-swarm clear [--user]` — remove one tier's persisted config.
+    pub(super) fn code_swarm_clear(&mut self, user_tier: bool) -> CoreEffect {
+        let (store, tier_label) = match self.code_swarm_store(user_tier) {
+            Ok(store) => store,
+            Err(message) => return self.notice_item(message),
+        };
+        let outcome = store.clear();
+        self.code_swarm_models = load_code_swarm_models_startup();
+        self.rebuild_bottom_surface();
+        match outcome {
+            Ok(true) => self.teach_notice(format!("✓ code-swarm · {tier_label} tier cleared")),
+            Ok(false) => {
+                self.teach_notice(format!("code-swarm · no {tier_label}-tier config to clear"))
+            }
+            Err(error) => self.notice_item(format!("code-swarm clear failed: {error}")),
         }
-        self.bottom
-            .context()
-            .model_choices
-            .iter()
-            .take(3)
-            .map(|choice| format!("{}::{}", choice.provider, choice.model))
-            .collect()
+    }
+
+    fn code_swarm_store(
+        &self,
+        user_tier: bool,
+    ) -> Result<(SwarmConfigStore, &'static str), String> {
+        if user_tier {
+            let path = code_swarm_config::user_config_path().ok_or_else(|| {
+                "code-swarm user tier unavailable: the euler home cannot be resolved (set HOME \
+                 or EULER_HOME)"
+                    .to_owned()
+            })?;
+            Ok((SwarmConfigStore::at_path(path), "user"))
+        } else {
+            Ok((
+                SwarmConfigStore::for_project_root(code_swarm_config::workspace_root()),
+                "project",
+            ))
+        }
     }
 
     /// `/code-swarm review` — one extension command; the extension
-    /// self-orchestrates its reviewers through `HostApi::spawn_agent`.
+    /// self-orchestrates its reviewers through `HostApi::spawn_agents`.
+    /// Reviewer targets ride the shared resolution chain inside
+    /// `extension_run`'s code-swarm seam; this path never guesses models.
     pub(super) fn code_swarm_review(
         &mut self,
         prompt: Option<String>,
         personas: Option<Vec<String>>,
     ) -> CoreEffect {
-        let models = self.code_swarm_effective_models();
-        if models.is_empty() {
-            return self.notice_item(
-                "no reviewer models available — /code-swarm to pick, /login for providers"
-                    .to_owned(),
-            );
-        }
-        self.notice = Some(format!(
-            "code-swarm: reviewing with {} agents",
-            models.len()
-        ));
         self.extension_run(
             "code-swarm".to_owned(),
             "review".to_owned(),
-            code_swarm_review_input(models, prompt, personas),
+            code_swarm_review_input(prompt, personas),
             None,
         )
     }
 }
 
 pub(super) fn code_swarm_review_input(
-    models: Vec<String>,
     prompt: Option<String>,
     personas: Option<Vec<String>>,
 ) -> serde_json::Value {
     let mut input = serde_json::Map::new();
-    input.insert(
-        "models".to_owned(),
-        serde_json::Value::Array(models.into_iter().map(serde_json::Value::String).collect()),
-    );
     if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
         input.insert("prompt".to_owned(), serde_json::Value::String(prompt));
     }

@@ -15,7 +15,11 @@ fn code_swarm_picker_surface(selected: Vec<String>) -> BottomSurface {
         ModelChoice::new("google", "gemini-3-pro"),
         ModelChoice::new("fixture", "echo"),
     ];
-    surface.open_picker(PickerSpec::CodeSwarmModels { choices, selected });
+    surface.open_picker(PickerSpec::CodeSwarmModels {
+        choices,
+        selected,
+        user_tier: false,
+    });
     surface
 }
 
@@ -198,7 +202,8 @@ fn code_swarm_toggle_enforces_cap_and_confirm_enforces_min() {
 
     // Save collects exactly the checked set.
     match surface.confirm() {
-        SurfaceEvent::Action(CommandAction::CodeSwarmSaveModels { models }) => {
+        SurfaceEvent::Action(CommandAction::CodeSwarmSaveModels { models, user_tier }) => {
+            assert!(!user_tier, "default save targets the project tier");
             assert_eq!(models.len(), 5);
             assert!(models.contains(&"mistral::large-3".to_owned()));
             assert!(!models.contains(&"fixture::echo".to_owned()));
@@ -934,6 +939,7 @@ fn code_swarm_backspace_steps_back_to_palette_when_filter_is_empty() {
     surface.open_picker(PickerSpec::CodeSwarmModels {
         choices: vec![ModelChoice::new("fixture", "echo")],
         selected: Vec::new(),
+        user_tier: false,
     });
 
     assert!(surface.code_swarm_backspace_steps_back_to_palette());

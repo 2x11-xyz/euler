@@ -65,12 +65,12 @@ struct CompanionLoop<'a, D> {
     tokens: u64,
 }
 
-struct ParentedAppender<'a> {
-    writer: &'a Arc<crate::provenance::ProvenanceWriter>,
-    bus: &'a mut crate::EventBus,
-    persisted_events: &'a mut usize,
-    session_id: &'a str,
-    agent_id: &'a str,
+pub(super) struct ParentedAppender<'a> {
+    pub(super) writer: &'a Arc<crate::provenance::ProvenanceWriter>,
+    pub(super) bus: &'a mut crate::EventBus,
+    pub(super) persisted_events: &'a mut usize,
+    pub(super) session_id: &'a str,
+    pub(super) agent_id: &'a str,
 }
 
 struct ModelResultRecord<'a> {
@@ -137,7 +137,10 @@ impl<D: PermissionDecider> Session<D> {
         })
     }
 
-    fn resolve_companion_target(&self, task: &AgentTask) -> Result<ModelTarget, SessionError> {
+    pub(super) fn resolve_companion_target(
+        &self,
+        task: &AgentTask,
+    ) -> Result<ModelTarget, SessionError> {
         let provider = inherit_if_empty(task.provider(), &self.active_target.provider);
         let model = inherit_if_empty(task.model(), &self.active_target.model);
         let target = ModelTarget::new(provider, model);
@@ -155,7 +158,7 @@ impl<D: PermissionDecider> Session<D> {
         Ok(target)
     }
 
-    fn record_companion_spawn(
+    pub(super) fn record_companion_spawn(
         &mut self,
         task: &AgentTask,
         target: &ModelTarget,
@@ -815,7 +818,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
 }
 
 impl ParentedAppender<'_> {
-    fn append(
+    pub(super) fn append(
         &mut self,
         kind: &'static str,
         payload: JsonObject,
@@ -855,7 +858,7 @@ fn inherit_if_empty(value: &str, inherited: &str) -> String {
     }
 }
 
-fn companion_success(content: String) -> AgentResult {
+pub(super) fn companion_success(content: String) -> AgentResult {
     if content.len() > euler_agents::MAX_OUTPUT_BYTES {
         return companion_failure("companion output exceeds 64KiB");
     }
@@ -864,7 +867,7 @@ fn companion_success(content: String) -> AgentResult {
         .expect("bounded companion success result should be valid")
 }
 
-fn companion_failure(error: impl AsRef<str>) -> AgentResult {
+pub(super) fn companion_failure(error: impl AsRef<str>) -> AgentResult {
     AgentResult::failure(
         COMPANION_FAILURE_SUMMARY,
         error.as_ref(),
@@ -873,7 +876,7 @@ fn companion_failure(error: impl AsRef<str>) -> AgentResult {
     .expect("companion failure text should be bounded")
 }
 
-fn usage_payload(usage: Option<&Usage>) -> Value {
+pub(super) fn usage_payload(usage: Option<&Usage>) -> Value {
     match usage {
         Some(usage) => {
             let mut value = object([

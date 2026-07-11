@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Mutex;
 
 #[test]
 fn plain_multi_turn_non_streamed_resume_equivalence() {
@@ -1321,14 +1322,14 @@ impl PermissionDecider for CountingDecider {
 
 struct NamedStreamProvider {
     name: &'static str,
-    streams: RefCell<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+    streams: Mutex<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
 }
 
 impl NamedStreamProvider {
     fn new(name: &'static str, streams: Vec<Vec<Result<ModelStreamEvent, ProviderError>>>) -> Self {
         Self {
             name,
-            streams: RefCell::new(streams.into()),
+            streams: Mutex::new(streams.into()),
         }
     }
 }
@@ -1341,7 +1342,8 @@ impl ModelProvider for NamedStreamProvider {
     fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         let events = self
             .streams
-            .borrow_mut()
+            .lock()
+            .expect("stream queue")
             .pop_front()
             .ok_or_else(|| ProviderError::transport("named stream provider exhausted"))?;
         Ok(Box::new(events.into_iter()))

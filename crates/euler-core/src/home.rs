@@ -8,6 +8,7 @@ use thiserror::Error;
 const DEFAULT_HOME_CHILD: &str = ".euler";
 const AUTH_FILE: &str = "auth.json";
 const PREFERENCES_FILE: &str = "preferences.json";
+const CODE_SWARM_CONFIG_FILE: &str = "code-swarm.json";
 const SESSIONS_DIR: &str = "sessions";
 const EXTENSIONS_DIR: &str = "extensions";
 
@@ -56,6 +57,11 @@ impl EulerHome {
 
     pub fn preferences_path(&self) -> PathBuf {
         self.root.join(PREFERENCES_FILE)
+    }
+
+    /// User-global CodeSwarm reviewer config (swarm contract, user tier).
+    pub fn code_swarm_config_path(&self) -> PathBuf {
+        self.root.join(CODE_SWARM_CONFIG_FILE)
     }
 
     pub fn sessions_dir(&self) -> PathBuf {

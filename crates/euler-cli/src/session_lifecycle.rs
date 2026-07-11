@@ -146,6 +146,11 @@ pub(crate) fn session_config(
     let euler_home = EulerHome::resolve()
         .ok()
         .map(|home| home.root().to_path_buf());
+    // User-tier code-swarm reviewer config (data, not authorization): the
+    // resolution chain falls back here when the project tier is absent.
+    config.code_swarm_user_config_path = EulerHome::resolve()
+        .ok()
+        .map(|home| home.code_swarm_config_path());
     config.project_grant_consent_dir = euler_home.clone();
     config.user_grant_dir = euler_home;
     config

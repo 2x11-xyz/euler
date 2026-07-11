@@ -350,6 +350,19 @@ pub trait HostApi {
             "agent spawn unavailable on this host".to_owned(),
         ))
     }
+    /// Run a batch of child agents concurrently and return their outcomes
+    /// in task order (multi-agent contract v0.2). Batch tasks must be
+    /// single-round, tool-free, empty-capability briefs; the whole batch
+    /// counts against the per-command spawn quota up front. Hosts without
+    /// live spawn support reject the call.
+    fn spawn_agents(
+        &self,
+        _tasks: Vec<SpawnAgentTask>,
+    ) -> Result<Vec<AgentOutcome>, ExtensionError> {
+        Err(ExtensionError::Message(
+            "batch agent spawn unavailable on this host".to_owned(),
+        ))
+    }
     fn load_event_feed_checkpoint(
         &self,
         name: &str,

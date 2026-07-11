@@ -13,7 +13,6 @@ use euler_provider::{
 };
 use euler_sdk::Capability;
 use serde_json::json;
-use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -510,7 +509,7 @@ fn find_tool_result<'a>(events: &'a [EventEnvelope], call_id: &str) -> &'a Event
 struct SecretHoldingProvider {
     name: &'static str,
     secret: String,
-    streams: RefCell<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+    streams: Mutex<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
 }
 
 impl SecretHoldingProvider {
@@ -522,7 +521,7 @@ impl SecretHoldingProvider {
         Self {
             name,
             secret: secret.to_owned(),
-            streams: RefCell::new(streams.into()),
+            streams: Mutex::new(streams.into()),
         }
     }
 }
@@ -539,7 +538,8 @@ impl ModelProvider for SecretHoldingProvider {
         );
         let events = self
             .streams
-            .borrow_mut()
+            .lock()
+            .expect("stream queue")
             .pop_front()
             .ok_or_else(|| ProviderError::transport("secret holding provider exhausted"))?;
         Ok(Box::new(events.into_iter()))
@@ -566,9 +566,8 @@ impl ModelProvider for SecretFailingProvider<'_> {
 
 struct CapturingProvider {
     name: &'static str,
-    // RefCell is intentionally enough for the Send-only provider contract:
     // providers move between threads but are not shared concurrently.
-    streams: RefCell<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+    streams: Mutex<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
 }
 
@@ -580,7 +579,7 @@ impl CapturingProvider {
     ) -> Self {
         Self {
             name,
-            streams: RefCell::new(streams.into()),
+            streams: Mutex::new(streams.into()),
             requests,
         }
     }
@@ -595,7 +594,8 @@ impl ModelProvider for CapturingProvider {
         self.requests.lock().expect("requests lock").push(request);
         let events = self
             .streams
-            .borrow_mut()
+            .lock()
+            .expect("stream queue")
             .pop_front()
             .ok_or_else(|| ProviderError::transport("capturing provider exhausted"))?;
         Ok(Box::new(events.into_iter()))

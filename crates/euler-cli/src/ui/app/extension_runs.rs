@@ -117,10 +117,23 @@ impl AppCore {
         input: serde_json::Value,
         raw_args: Option<String>,
     ) -> CoreEffect {
-        let request = match self.resolve_extension_run(id, command, input, raw_args) {
+        let mut request = match self.resolve_extension_run(id, command, input, raw_args) {
             Ok(request) => request,
             Err(error) => return self.error_item(format!("extension run failed: {error}")),
         };
+        // code-swarm.review rides the shared resolution chain: explicit
+        // --model flags win; otherwise the persisted project/user config
+        // fills in the reviewer set; neither is the honest unconfigured
+        // error — never a guessed model list (swarm contract).
+        if request.id == "code-swarm" && request.command == "review" {
+            match crate::code_swarm_config::apply_config_to_review_input(
+                &crate::code_swarm_config::workspace_root(),
+                request.input,
+            ) {
+                Ok(input) => request.input = input,
+                Err(error) => return self.notice_item(error),
+            }
+        }
         match std::mem::replace(&mut self.state, AppState::Empty) {
             AppState::Idle { session } => {
                 self.spawn_extension_run(request, session);

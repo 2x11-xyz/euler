@@ -37,6 +37,8 @@ pub struct ReplacementPicker {
     pub(super) saved_draft: ComposerDraft,
     /// Read-only ledger-tail lines for the selected resume row (`ctrl+o`).
     resume_preview: Option<Vec<String>>,
+    /// `/code-swarm --user`: route the checklist save to the user tier.
+    pub(super) code_swarm_user_tier: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +75,13 @@ pub struct PickerRenderedRow {
 
 impl ReplacementPicker {
     pub fn from_spec(spec: PickerSpec, saved_draft: ComposerDraft, visible_rows: usize) -> Self {
+        let code_swarm_user_tier = matches!(
+            &spec,
+            PickerSpec::CodeSwarmModels {
+                user_tier: true,
+                ..
+            }
+        );
         let (kind, title, items) = picker_parts(spec);
         let mut picker = Self {
             kind,
@@ -84,6 +93,7 @@ impl ReplacementPicker {
             visible_rows: visible_rows.max(1),
             saved_draft,
             resume_preview: None,
+            code_swarm_user_tier,
         };
         picker.ensure_selected_visible();
         picker
@@ -606,9 +616,17 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             "Extensions".to_owned(),
             extension_manager_items(items),
         ),
-        PickerSpec::CodeSwarmModels { choices, selected } => (
+        PickerSpec::CodeSwarmModels {
+            choices,
+            selected,
+            user_tier,
+        } => (
             PickerKind::CodeSwarmModels,
-            "/code-swarm · reviewer models".to_owned(),
+            if user_tier {
+                "/code-swarm · reviewer models · user tier".to_owned()
+            } else {
+                "/code-swarm · reviewer models · project tier".to_owned()
+            },
             code_swarm_model_items(choices, &selected),
         ),
     }
@@ -637,7 +655,10 @@ fn code_swarm_model_items(choices: Vec<ModelChoice>, selected: &[String]) -> Vec
                 current: checked,
                 // Placeholder: confirm_picker collects the checked set and
                 // dispatches one CodeSwarmSaveModels for the whole picker.
-                action: CommandAction::CodeSwarmSaveModels { models: vec![] },
+                action: CommandAction::CodeSwarmSaveModels {
+                    models: vec![],
+                    user_tier: false,
+                },
             }
         })
         .collect()

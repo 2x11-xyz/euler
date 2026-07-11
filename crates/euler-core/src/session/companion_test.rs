@@ -7,7 +7,6 @@ use euler_agents::{AgentBudget, MAX_OUTPUT_BYTES};
 use euler_provider::{
     FixtureResponse, ModelProvider, ProviderStream, ScriptedProvider, StopReason, ToolCall,
 };
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -632,7 +631,7 @@ fn companion_rejected_error_is_never_retried() {
 }
 
 struct FlakyThenScriptedProvider {
-    failures: RefCell<Vec<ProviderError>>,
+    failures: Mutex<Vec<ProviderError>>,
     inner: ScriptedProvider,
     invokes: Arc<AtomicUsize>,
 }
@@ -644,7 +643,7 @@ impl FlakyThenScriptedProvider {
         invokes: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            failures: RefCell::new(failures),
+            failures: Mutex::new(failures),
             inner,
             invokes,
         }
@@ -658,8 +657,9 @@ impl ModelProvider for FlakyThenScriptedProvider {
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         self.invokes.fetch_add(1, Ordering::Relaxed);
-        if !self.failures.borrow().is_empty() {
-            return Err(self.failures.borrow_mut().remove(0));
+        let mut failures = self.failures.lock().expect("failure queue");
+        if !failures.is_empty() {
+            return Err(failures.remove(0));
         }
         self.inner.invoke(request)
     }
@@ -1153,14 +1153,15 @@ impl BudgetRound {
 /// Plays scripted rounds while capturing each request's max_output_tokens,
 /// so tests can assert the provider-side cap round by round.
 struct BudgetRoundProvider {
-    rounds: RefCell<std::collections::VecDeque<BudgetRound>>,
+    // Mutex, not RefCell: ModelProvider requires Sync for parallel fan-out.
+    rounds: Mutex<std::collections::VecDeque<BudgetRound>>,
     captured_caps: Arc<Mutex<Vec<Option<u64>>>>,
 }
 
 impl BudgetRoundProvider {
     fn new(rounds: Vec<BudgetRound>, captured_caps: Arc<Mutex<Vec<Option<u64>>>>) -> Self {
         Self {
-            rounds: RefCell::new(rounds.into()),
+            rounds: Mutex::new(rounds.into()),
             captured_caps,
         }
     }
@@ -1178,7 +1179,8 @@ impl ModelProvider for BudgetRoundProvider {
             .push(request.max_output_tokens);
         let round = self
             .rounds
-            .borrow_mut()
+            .lock()
+            .expect("rounds")
             .pop_front()
             .expect("unscripted companion round");
         let usage = Usage {

@@ -114,6 +114,16 @@ summary, output, error, or schema strings. Extensions must not pass secrets to
 this API. Core still keeps these provenance/control events out of model canvas
 assembly unless a future canvas contract explicitly admits them.
 
+## Live Agent Spawn (v0.1) and Parallel Batch Spawn (v0.2)
+
+`HostApi::spawn_agent(task) -> AgentOutcome` runs one child agent to
+completion within the command execution (capability `agent-spawn`; depth
+one; per-command quota). `HostApi::spawn_agents(tasks) -> Vec<AgentOutcome>`
+runs a batch of single-round, tool-free, empty-capability child briefs
+**concurrently** and returns outcomes in task order under the same gate and
+quota. Determinism, event ordering, and failure honesty for both live in the
+multi-agent contract; hosts without live spawn support reject both calls.
+
 ## Context Slot Update v0
 
 `HostApi::update_context_slot(slot, content)` appends a canonical

@@ -140,6 +140,152 @@ Observer, companion, peer, adversarial remain extension compositions; core
 still never knows those words — `spawn_agent` is mechanism, the pattern
 lives in the extension.
 
+## Parallel extension spawn (v0.2)
+
+`HostApi::spawn_agents(tasks) -> Vec<AgentOutcome>` runs a batch of child
+agents **concurrently** and returns their outcomes **in task order**. It is
+the batch sibling of `spawn_agent`, built for reviewer fan-out (issue #32);
+`spawn_agent` remains the one-child path.
+
+- **Same gate**: requires `agent-spawn` on the invoking command; the host
+  rejects the call otherwise.
+- **Quota up front**: the whole batch counts against the same
+  per-command-execution `MAX_SPAWNS_PER_COMMAND` (16) quota as sequential
+  spawns. A batch that would exceed the remaining quota is rejected before
+  any event is emitted. The quota is per command execution (and per
+  `code_swarm_review` tool invocation) — never cumulative across a session,
+  so checkpoint-loop workflows that call the review gate repeatedly do not
+  starve.
+- **Review-brief children only (v0.2)**: batch tasks must be single-round,
+  tool-free briefs — `max_turns = 1`, `max_tool_calls = 0`, and an empty
+  capability set. A task with a tool budget or a non-empty capability
+  envelope is rejected before any event is emitted. Parallel tool-running
+  children remain future work; their permission prompts cannot be
+  multiplexed honestly today.
+- **Deterministic provenance (replay invariant)**: worker threads never
+  append events. All provenance appends happen on the invoking session
+  thread, in two phases. Phase one, per task in batch order:
+  `agent.spawn`, `canvas.snapshot`, `model.call`. Phase two, joining
+  workers **in batch order** regardless of completion order: the task's
+  round events (`model.reasoning*`, `model.result`, `assistant.message` on
+  success, `error` on provider failure) and its terminal `agent.result`.
+  Event order is a pure function of the batch order — never of provider
+  completion timing — so fixture-driven logs replay deterministically.
+- **Shared canvas snapshot**: every batch child reviews the same parent
+  canvas, assembled once before the first spawn event. Later batch
+  children do not see earlier batch children's events.
+- **Parent chain intact**: queued extension events are published into the
+  bus before the batch's first spawn event, exactly as the sequential
+  spawn path publishes before each spawn.
+- Failure honesty is per child: a provider failure or budget exhaustion
+  yields that child's failure `agent.result`; other children are
+  unaffected, and the batch call still returns all outcomes.
+
+Providers must be shareable across worker threads (`ModelProvider` is
+`Send + Sync`); each worker owns only its provider stream and buffers its
+round data for the session thread to record.
+
+## CodeSwarm review: persisted config and the review gate tool
+
+CodeSwarm review is one orchestration (the bundled `code-swarm` extension's
+`review` command, fanning out through `spawn_agents`) with several entry
+points: the TUI `/review` slash command, the headless `extension_run
+code-swarm.review {...}` control line under `euler run`, and the
+model-facing `code_swarm_review` tool. All entry points resolve reviewer
+targets through one chain.
+
+### Persisted reviewer config (two tiers)
+
+Reviewer configuration persists as **data, not authorization** — spawning
+always rides the `agent-spawn` permission machinery unchanged.
+
+- **Project tier**: `<workspace root>/.euler/code-swarm.json`.
+- **User tier**: `<euler home>/code-swarm.json` (normally
+  `~/.euler/code-swarm.json`).
+
+File format (version 1):
+
+```json
+{
+  "version": 1,
+  "reviewers": [
+    { "target": "provider::model", "persona": "correctness" }
+  ],
+  "max_tokens": 8192
+}
+```
+
+- `reviewers`: 1–5 entries; `target` is `provider::model` (both parts
+  required); `persona` is an optional reviewer-charter label consumed by
+  the orchestration (unknown personas fail honestly at run time).
+- `max_tokens`: optional default per-reviewer **output**-token budget.
+
+Unlike project permission grants, this file needs no consent-store pairing:
+it grants nothing. A repo-shipped config can only choose which reviewers a
+swarm *the user already authorized* would use, and the resolved targets are
+recorded on each `agent.spawn` event.
+
+### Resolution chain (every entry point, verbatim)
+
+1. Explicit models on the invocation (CLI/TUI flags, or tool-call override
+   args) — wins outright when present; one-shot, never mutates the stores.
+2. Otherwise the persisted project-tier config.
+3. Otherwise the persisted user-global config.
+4. Otherwise the honest unconfigured failure: the error names both
+   remediation paths — the TUI picker (`/code-swarm`) and the explicit
+   one-off model flags — and never dead-ends the user.
+
+A malformed config file at a tier is an error, not a silent fall-through to
+the next tier. Headless runs read the same project store the TUI wrote
+(derived from the run's workspace root).
+
+### `/code-swarm` configuration surface (TUI)
+
+`/code-swarm` opens the searchable, authenticated-only reviewer model
+picker; the selection (1–5 targets) persists to the **project tier** by
+default, or the user tier with `/code-swarm --user`. `/code-swarm clear
+[--user]` removes the tier's config. `/review` runs the swarm: bare
+`/review` uses the persisted chain; explicit `--model` flags are a one-off
+override.
+
+### `code_swarm_review` (model-facing tool)
+
+A session-level tool advertised **only** to the root session when the
+`code-swarm` extension is wired and enabled — companions never see it
+(depth one). It is a stage-agnostic review gate: plans, diffs, analyses,
+drafts — the optional focus prompt carries the subject.
+
+- **No required arguments.** Optional: `focus` (bounded string carried into
+  every reviewer brief), `personas` (reviewer charter names), `models`
+  (`provider::model` one-shot override — only when the user explicitly
+  named targets; the tool must not guess providers), `max_tokens`.
+- **Gate**: `Capability::AgentSpawn` through the ordinary tool permission
+  machinery (prompt/grant/deny; covered grants do not re-prompt, so
+  repeated checkpoint-loop calls pay no repeat approval). The extension
+  execution it delegates to additionally carries `artifact-write` for the
+  host-mediated consolidated report, mirroring the round-observer's
+  manifest-grant precedent.
+- **Result (honest and complete, no adjudication)**: the tool result
+  carries the K-of-N succeeded summary, the consolidated review artifact
+  reference (relative path + persisted event id), and one block per
+  reviewer: resolved `provider::model`, persona, ok/error, and that
+  reviewer's **findings text bounded to 16 KiB per reviewer** — truncation
+  appends an explicit marker pointing at the artifact, which always holds
+  the full text. The tool performs no voting, filtering, or judgment;
+  adjudication belongs to the calling agent.
+- **Failure honesty**: every failure the tool can emit names the failure
+  and the concrete next action (run `/code-swarm`, pass explicit
+  `models`, enable the extension, …). Unconfigured is a failed tool
+  result, not a guessed provider (the round-3 lesson).
+
+### Headless auto-approve tiers
+
+`euler exec --auto-approve` tiers set `agent-spawn` to session-allow in
+**both** tiers (`read-only` and `trusted-local`): batch children are
+tool-free review briefs, and any capability-holding child's own tool calls
+remain gated by the parent's tier-configured modes, so allowing spawn
+cannot escalate beyond the tier.
+
 ## Guardian permission reviewer (ADR 0011)
 
 The guardian is a **core permissions feature that reuses the companion

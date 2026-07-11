@@ -24,7 +24,6 @@ mod provider_config_test;
 mod scripted_provider_test;
 
 use serde_json::Value;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
@@ -425,7 +424,11 @@ impl std::error::Error for ProviderError {}
 
 pub type ProviderStream = Box<dyn Iterator<Item = Result<ModelStreamEvent, ProviderError>> + Send>;
 
-pub trait ModelProvider: Send {
+/// `Sync` is required so a `ProviderSet` can be shared across the parallel
+/// reviewer fan-out's worker threads (multi-agent contract v0.2). Providers
+/// are stateless request adapters; scripted/test providers use `Mutex` for
+/// their queues.
+pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn validate_auth(&self) -> Result<(), ProviderError> {
         Ok(())
@@ -579,14 +582,14 @@ pub enum FixtureResponse {
 
 #[derive(Debug)]
 pub struct ScriptedProvider {
-    responses: RefCell<VecDeque<FixtureResponse>>,
+    responses: std::sync::Mutex<VecDeque<FixtureResponse>>,
     reasoning_effort: Option<String>,
 }
 
 impl ScriptedProvider {
     pub fn new(responses: Vec<FixtureResponse>) -> Self {
         Self {
-            responses: RefCell::new(responses.into()),
+            responses: std::sync::Mutex::new(responses.into()),
             reasoning_effort: None,
         }
     }
@@ -607,7 +610,12 @@ impl ModelProvider for ScriptedProvider {
     }
 
     fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
-        let Some(response) = self.responses.borrow_mut().pop_front() else {
+        let Some(response) = self
+            .responses
+            .lock()
+            .expect("scripted provider queue")
+            .pop_front()
+        else {
             return Err(ProviderError::transport("scripted provider exhausted"));
         };
         let events = match response {
