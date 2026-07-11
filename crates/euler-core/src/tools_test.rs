@@ -516,7 +516,8 @@ fn apply_patch_malformed_later_hunk_fails_without_writing() {
 
     assert!(matches!(
         error,
-        ToolError::InvalidPatch("empty update hunk")
+        ToolError::InvalidPatch(message)
+            if message.contains("every `@@` hunk must change something")
     ));
     assert_eq!(
         fs::read_to_string(temp.path().join("note.txt")).expect("unchanged file"),
