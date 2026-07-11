@@ -2038,6 +2038,227 @@ mod terminal_tests {
             .collect()
     }
 
+    #[test]
+    fn history_replay_recommit_prints_rows_into_scrollback_not_bridge() {
+        // Resize/repaint dogfood repros 1/2/5: after `reset_for_history_replay`
+        // cleared the screen, re-committing the head rows through the
+        // scroll-region bridge scrolled BLANK rows into scrollback while the
+        // viewport draw overpainted the rows the bridge wrote — the session
+        // head (banner, greeting) became a void above the fold. The replay
+        // re-commit must PRINT rows through the screen so they physically
+        // land in native scrollback.
+        let backend = VT100Backend::new(40, 6);
+        let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
+        terminal.set_linefeed_history_insert_enabled(true);
+        let frame = VisualCanvasFrame {
+            active_frame_lines: vec![
+                CanvasLine::plain("head-one"),
+                CanvasLine::plain("head-two"),
+                CanvasLine::plain("head-three"),
+                CanvasLine::plain("head-four"),
+                CanvasLine::plain("tail-one"),
+                CanvasLine::plain("tail-two"),
+                CanvasLine::plain("tail-three"),
+                CanvasLine::plain("tail-four"),
+                CanvasLine::plain("▌ prompt"),
+                CanvasLine::plain("status"),
+            ],
+            cursor: None,
+            required_height: 10,
+            history_rows: 8,
+            history_item_offsets: Vec::new(),
+            prefer_stable_height: false,
+            committable_rows: 8,
+            pinned_rows: 0,
+        };
+        // (The vt100 test emulator does not implement ESC[3J, so keep the
+        // pre-replay state commit-free: the assertions below reconstruct
+        // post-purge scrollback, which on a real terminal starts empty.)
+        terminal
+            .reset_for_history_replay(true)
+            .expect("reset for replay");
+        terminal.backend_mut().clear_raw_output();
+        terminal.draw_visual_frame(&frame).expect("replay draw");
+
+        let raw = terminal.backend().raw_output().to_vec();
+        assert!(
+            !raw.windows(b"\x1b[1;6r".len())
+                .any(|window| window == b"\x1b[1;6r"),
+            "replay re-commit must not use the scroll-region bridge: {raw:?}"
+        );
+        let scrollback = terminal.backend().scrollback_rows();
+        for needle in ["head-one", "head-two", "head-three", "head-four"] {
+            assert_eq!(
+                scrollback
+                    .iter()
+                    .filter(|row| row.contains(needle))
+                    .count(),
+                1,
+                "replayed head row {needle:?} must land in native scrollback exactly once: {scrollback:?}"
+            );
+        }
+        let screen = terminal.backend().screen_rows();
+        assert!(
+            screen.iter().any(|row| row.contains("status")),
+            "footer must be on screen after replay: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn screen_height_change_reanchors_viewport_instead_of_keeping_old_top() {
+        // Resize/repaint dogfood repro 3: a repaint that consumes a new
+        // screen height must recompute its anchor. Content shorter than the
+        // screen with nothing committed top-anchors (session-start math);
+        // otherwise the active region's bottom pins to the screen bottom —
+        // never the old top offset with a void above/below.
+        let backend = VT100Backend::new(30, 6);
+        let mut terminal = InlineTerminal::new(backend, u16::MAX).expect("inline terminal");
+        let short_frame = VisualCanvasFrame {
+            active_frame_lines: vec![
+                CanvasLine::plain("greeting"),
+                CanvasLine::plain("▌ prompt"),
+                CanvasLine::plain("status"),
+            ],
+            cursor: None,
+            required_height: 3,
+            history_rows: 1,
+            history_item_offsets: Vec::new(),
+            prefer_stable_height: false,
+            committable_rows: 0,
+            pinned_rows: 2,
+        };
+        terminal.draw_visual_frame(&short_frame).expect("draw");
+        assert_eq!(terminal.viewport_area(), Rect::new(0, 0, 30, 3));
+
+        // Grow taller with nothing committed and content still short:
+        // top-anchor, full width, no stale-height clamp.
+        terminal.backend_mut().resize(30, 12);
+        terminal
+            .draw_visual_frame(&short_frame)
+            .expect("draw after grow");
+        assert_eq!(
+            terminal.viewport_area(),
+            Rect::new(0, 0, 30, 3),
+            "short content must stay top-anchored after growing the screen"
+        );
+
+        // Tall content is not clamped to any stale height: the viewport can
+        // cover the whole live screen.
+        let tall_frame = VisualCanvasFrame {
+            active_frame_lines: (0..20)
+                .map(|index| CanvasLine::plain(format!("row-{index}")))
+                .collect(),
+            cursor: None,
+            required_height: 20,
+            history_rows: 18,
+            history_item_offsets: Vec::new(),
+            prefer_stable_height: false,
+            committable_rows: 0,
+            pinned_rows: 2,
+        };
+        terminal.draw_visual_frame(&tall_frame).expect("tall draw");
+        let area = terminal.viewport_area();
+        assert_eq!(
+            (area.height, area.bottom()),
+            (12, 12),
+            "tall content must fill the live screen height: {area:?}"
+        );
+    }
+
+    #[test]
+    fn grow_taller_bottom_anchors_committed_session_footer_to_screen_bottom() {
+        let backend = VT100Backend::new(30, 6);
+        // A deliberately small active-height cap models a session whose
+        // active region is smaller than the screen while history is
+        // committed above it.
+        let mut terminal = InlineTerminal::new(backend, 4).expect("inline terminal");
+        terminal
+            .draw_visual_frame(&VisualCanvasFrame {
+                active_frame_lines: (0..8)
+                    .map(|index| CanvasLine::plain(format!("row-{index}")))
+                    .collect(),
+                cursor: None,
+                required_height: 8,
+                history_rows: 6,
+                history_item_offsets: Vec::new(),
+                prefer_stable_height: false,
+                committable_rows: 6,
+                pinned_rows: 2,
+            })
+            .expect("commit history");
+
+        terminal.backend_mut().resize(30, 12);
+        terminal
+            .draw_visual_frame(&VisualCanvasFrame {
+                active_frame_lines: (0..8)
+                    .map(|index| CanvasLine::plain(format!("row-{index}")))
+                    .collect(),
+                cursor: None,
+                required_height: 8,
+                history_rows: 6,
+                history_item_offsets: Vec::new(),
+                prefer_stable_height: false,
+                committable_rows: 6,
+                pinned_rows: 2,
+            })
+            .expect("draw after grow");
+
+        let area = terminal.viewport_area();
+        assert_eq!(
+            area.bottom(),
+            12,
+            "with committed history the active region's bottom must pin to \
+             the live screen bottom after a height change: {area:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_fill_spans_paint_via_erase_not_literal_spaces() {
+        // Buffer-hygiene: artifact cards pad body rows to the card edge.
+        // Printing that padding as literal spaces bakes it into the
+        // terminal's stored rows; reflowing terminals then rejoin the space
+        // run into logical lines on the next width change. Fill must go out
+        // as ECH (erase characters, BCE-colored blank cells), which reflow
+        // drops.
+        let backend = VT100Backend::new(30, 3);
+        let mut terminal = InlineTerminal::new(backend, 3).expect("inline terminal");
+        terminal
+            .draw_visual_frame(&VisualCanvasFrame {
+                active_frame_lines: vec![
+                    CanvasLine::from_spans(vec![
+                        CanvasSpan::new("artifact-body", TextRole::Plain),
+                        CanvasSpan::new("        ", TextRole::Plain),
+                    ]),
+                    CanvasLine::plain("status"),
+                ],
+                cursor: None,
+                required_height: 2,
+                history_rows: 0,
+                history_item_offsets: Vec::new(),
+                prefer_stable_height: false,
+                committable_rows: 0,
+                pinned_rows: 0,
+            })
+            .expect("draw padded row");
+
+        let raw = terminal.backend().raw_output().to_vec();
+        assert!(
+            raw.windows(b"\x1b[8X\x1b[8C".len())
+                .any(|window| window == b"\x1b[8X\x1b[8C"),
+            "trailing fill must be painted with ECH, not printed spaces: {raw:?}"
+        );
+        assert!(
+            !raw.windows(b"artifact-body        ".len())
+                .any(|window| window == b"artifact-body        ".as_slice()),
+            "literal padding spaces must not be written after content: {raw:?}"
+        );
+        let screen = terminal.backend().screen_rows();
+        assert!(
+            screen.iter().any(|row| row.contains("artifact-body")),
+            "content still renders: {screen:?}"
+        );
+    }
+
     fn row_containing(rows: &[String], needle: &str) -> usize {
         rows.iter()
             .position(|row| row.contains(needle))

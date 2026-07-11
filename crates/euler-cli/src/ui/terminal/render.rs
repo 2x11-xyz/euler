@@ -174,22 +174,28 @@ pub(super) fn write_canvas_row<W>(
 where
     W: Write,
 {
-    // Always materialize every cell in the row. Otherwise xterm-compatible
-    // terminals can expose default/stale backgrounds in blank row segments.
+    // Erase the row with the theme background selected FIRST: erase honors
+    // BCE, so every cell of the row carries theme colors without printing
+    // filler cells. Padding the remainder with literal spaces (the previous
+    // approach) baked render-time padding into the terminal's stored rows —
+    // reflowing terminals then rejoined those space runs into logical lines
+    // on the next width change (resize dogfood: an output line re-rendered
+    // with a massive run of spaces padded to the OLD width) — and a row
+    // padded to a stale width auto-wraps at the real terminal edge,
+    // scrolling content past the footer. Buffers and terminal rows must hold
+    // raw logical lines; backgrounds are erase-time state, not characters.
     queue_clear_until_new_line(writer, background)?;
-    let used_width = match line {
+    if let Some(line) = line {
         // Clip the line to the row width before printing: bytes past the
         // last column would auto-wrap, and on the bottom screen row —
         // routine after a terminal resize narrows the screen under existing
         // content — auto-wrap physically scrolls the terminal, pushing rows
         // (banner, transcript) off-screen and corrupting the repaint.
-        Some(line) => match wrap_canvas_line(line, width).first() {
-            Some(clipped) => write_canvas_line(writer, clipped, foreground, background)?,
-            None => 0,
-        },
-        None => 0,
-    };
-    queue_fill_row_remainder(writer, width, used_width, foreground, background)
+        if let Some(clipped) = wrap_canvas_line(line, width).first() {
+            write_canvas_line(writer, clipped, foreground, background)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn queue_clear_until_new_line<W>(
@@ -295,32 +301,48 @@ pub(super) fn write_canvas_line<W>(
 where
     W: Write,
 {
+    // The row's trailing space run is background fill (artifact cards pad
+    // their body rows to the card edge), not content. Paint it with ECH
+    // (erase characters, which honors BCE) instead of printing literal
+    // spaces: printed spaces become stored characters in native scrollback,
+    // and reflowing terminals rejoin them into logical lines on the next
+    // width change — a row committed in a huge window then re-renders with a
+    // massive baked-in space run after narrowing. Erased cells are blank
+    // cells; reflow drops them. (Buffers hold raw logical lines; padding is
+    // render-time only.) Computed at char level because span merging during
+    // wrapping can fold a fill span into its content neighbor.
+    let mut content_len: Vec<usize> = line
+        .spans
+        .iter()
+        .map(|span| span.text.as_str().len())
+        .collect();
+    for (index, span) in line.spans.iter().enumerate().rev() {
+        let trimmed = span.text.as_str().trim_end_matches(' ');
+        content_len[index] = trimmed.len();
+        if !trimmed.is_empty() {
+            break;
+        }
+    }
     let mut width = 0;
-    for span in &line.spans {
+    for (index, span) in line.spans.iter().enumerate() {
         queue_span_style(writer, canvas_span_style(span), foreground, background)?;
-        queue!(writer, Print(span.text.as_str()))?;
-        width += display_width(span.text.as_str());
+        let text = span.text.as_str();
+        let (content, fill) = text.split_at(content_len[index]);
+        if !content.is_empty() {
+            queue!(writer, Print(content))?;
+            width += display_width(content);
+        }
+        if !fill.is_empty() {
+            // Spaces are one cell each. ECH paints without moving the
+            // cursor; CUF advances past the painted cells so a following
+            // fill span starts in place.
+            let cells = fill.len();
+            write!(writer, "\x1b[{cells}X\x1b[{cells}C")?;
+            width += cells;
+        }
     }
     queue!(writer, SetAttribute(Attribute::Reset), ResetColor)?;
     Ok(width)
-}
-
-pub(super) fn queue_fill_row_remainder<W>(
-    writer: &mut W,
-    width: usize,
-    used_width: usize,
-    foreground: RatatuiColor,
-    background: RatatuiColor,
-) -> io::Result<()>
-where
-    W: Write,
-{
-    let fill_width = width.saturating_sub(used_width);
-    if fill_width == 0 {
-        return Ok(());
-    }
-    queue_span_style(writer, Style::default(), foreground, background)?;
-    queue!(writer, Print(" ".repeat(fill_width)))
 }
 
 pub(super) fn canvas_span_style(span: &CanvasSpan) -> Style {

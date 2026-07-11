@@ -137,12 +137,6 @@ impl EventLoop {
             actions.push(UiAction::FocusChanged(focused));
         }
 
-        if !self.pending_input.is_empty() {
-            actions.push(UiAction::InputBatch(std::mem::take(
-                &mut self.pending_input,
-            )));
-        }
-
         if let Some((width, height)) = self.pending_resize.take() {
             // Only the latest size in a batch matters (drag ticks coalesce
             // here). The resize action re-renders the full canvas at the new
@@ -151,9 +145,22 @@ impl EventLoop {
             // never appends re-wrapped copies per tick (review v2 §11/§12).
             // A queued Render in the same batch would paint the same frame
             // twice; consume the dirty state and re-arm the frame gate.
+            //
+            // Geometry drains BEFORE input: a repaint triggered by an input
+            // in the same batch (e.g. a ctrl+o fold toggle mid-drag) must
+            // never run against dimensions older than a resize event that
+            // was already read — the stale-by-one repaint from the resize
+            // dogfood (repro 4: the first repaint after a size change
+            // consumed the pre-resize geometry; the next was always right).
             let _ = self.dirty.take();
             self.next_frame_at = now + self.frame_interval;
             actions.push(UiAction::Resize { width, height });
+        }
+
+        if !self.pending_input.is_empty() {
+            actions.push(UiAction::InputBatch(std::mem::take(
+                &mut self.pending_input,
+            )));
         }
 
         if now >= self.next_frame_at && self.dirty.any_stale() {
