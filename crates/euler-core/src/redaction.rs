@@ -26,7 +26,12 @@ const MIN_TOKEN_TAIL: usize = 12;
 
 /// Environment variables whose values are secret-tainted when present.
 /// Mirrors the env-scrub list in `tools.rs` — both lists must grow together.
-const SECRET_ENV_NAMES: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"];
+const SECRET_ENV_NAMES: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+];
 
 /// Credential prefixes redacted by shape. Each entry is (prefix, charset).
 const TOKEN_PREFIXES: &[&str] = &[
