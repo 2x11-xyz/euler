@@ -8,9 +8,9 @@
 
 use super::companion::{companion_failure, companion_success, usage_payload, ParentedAppender};
 use super::{
-    canvas_snapshot_payload, context_budget_exhausted, model_input_item, used_tokens,
-    AgentResultSummary, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo,
-    RoundOutcome, Session, SessionError, SYSTEM_INSTRUCTIONS,
+    canvas_snapshot_payload, context_budget_exhausted, model_input_item, AgentResultSummary,
+    ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session,
+    SessionError, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::assemble_canvas;
 use crate::permissions::PermissionDecider;
@@ -278,7 +278,15 @@ fn record_reviewer_round(
         Some(model_call_id.to_owned()),
     )?;
 
-    let tokens = data.usage.as_ref().map(used_tokens).unwrap_or(0);
+    // Budget counts OUTPUT tokens only (#58): reviewers ingest the whole
+    // parent canvas as input, so counting input would exhaust every real
+    // review's budget on round one — the sequential companion loop uses the
+    // same output-only accounting.
+    let tokens = data
+        .usage
+        .as_ref()
+        .map(|usage| usage.output_tokens)
+        .unwrap_or(0);
     if task.budget().max_tokens().is_some_and(|max| tokens > max) {
         return Ok(companion_failure("budget exhausted: max_tokens"));
     }
@@ -340,6 +348,13 @@ fn validate_reviewer_brief(task: &AgentTask) -> Result<(), SessionError> {
     if !task.capabilities().is_empty() {
         return Err(SessionError::InvalidCompanionTask(
             "parallel reviewer tasks must not carry capabilities".to_owned(),
+        ));
+    }
+    if task.budget().max_tokens() == Some(0) {
+        // A zero output budget can never produce a round: fail honestly
+        // before any provider call, mirroring the sequential precheck.
+        return Err(SessionError::InvalidCompanionTask(
+            "parallel reviewer tasks must budget at least one output token".to_owned(),
         ));
     }
     Ok(())

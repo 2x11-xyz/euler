@@ -3,7 +3,10 @@ use crate::permissions::ScriptedDecider;
 use crate::ProvenanceWriter;
 use euler_agents::AgentBudget;
 use euler_event::EventEnvelope;
-use euler_provider::{FixtureResponse, ModelProvider, ProviderSet, ScriptedProvider, StopReason};
+use euler_provider::{
+    FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ProviderSet,
+    ProviderStream, ScriptedProvider, StopReason, Usage,
+};
 use serde_json::json;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -387,4 +390,103 @@ fn token_budget_exhaustion_fails_the_reviewer_honestly() {
         summaries[0].result.error(),
         Some("budget exhausted: max_tokens")
     );
+}
+
+/// Emits scripted usage so budget tests can pin the accounting basis.
+struct UsageScriptProvider {
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl ModelProvider for UsageScriptProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        Ok(Box::new(
+            vec![
+                Ok(ModelStreamEvent::TextDelta("findings".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: Some(Usage {
+                        input_tokens: self.input_tokens,
+                        output_tokens: self.output_tokens,
+                        cached_tokens: Some(0),
+                        reasoning_tokens: Some(0),
+                    }),
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+fn usage_task(max_tokens: u64) -> AgentTask {
+    AgentTask::new(
+        "review the work in this session",
+        "code-swarm-correctness",
+        "p1",
+        "m1",
+    )
+    .expect("task")
+    .with_budget(AgentBudget::new(Some(1), Some(0), Some(max_tokens)).expect("budget"))
+}
+
+#[test]
+fn budget_counts_output_tokens_not_input() {
+    // #58: reviewers ingest the whole parent canvas as INPUT — counting
+    // input against max_tokens would exhaust every real review on round
+    // one. The sequential companion loop counts output only; parallel must
+    // agree.
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        UsageScriptProvider {
+            input_tokens: 50_000,
+            output_tokens: 100,
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    let results = session
+        .spawn_reviewers_parallel(vec![usage_task(8_192)], &AtomicBool::new(false))
+        .expect("batch");
+    assert!(
+        results[0].result.ok(),
+        "input tokens must not count against the output budget: {:?}",
+        results[0].result
+    );
+}
+
+#[test]
+fn budget_fails_when_output_exceeds_cap() {
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        UsageScriptProvider {
+            input_tokens: 0,
+            output_tokens: 9_000,
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    let results = session
+        .spawn_reviewers_parallel(vec![usage_task(8_192)], &AtomicBool::new(false))
+        .expect("batch");
+    assert!(!results[0].result.ok());
+    assert!(format!("{:?}", results[0].result).contains("budget exhausted: max_tokens"));
+}
+
+#[test]
+fn zero_output_budget_is_rejected_before_any_call() {
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        UsageScriptProvider {
+            input_tokens: 0,
+            output_tokens: 1,
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    let error = session
+        .spawn_reviewers_parallel(vec![usage_task(0)], &AtomicBool::new(false))
+        .expect_err("zero budget");
+    assert!(error.to_string().contains("at least one output token"));
+    assert!(batch_events(session.events()).is_empty());
 }
