@@ -1859,12 +1859,18 @@ impl<D: PermissionDecider> Session<D> {
     where
         F: FnMut(&EventEnvelope),
     {
+        // The tool executes on the raw `call`; only the persisted copy of the
+        // input is redacted — a secret the model echoed into an argument must
+        // not reach the ledger or replay into a later model call via the
+        // canvas (secrets contract, "provenance payloads").
+        let mut recorded_input = call.input.clone();
+        self.redactor.redact_value(&mut recorded_input);
         let tool_call_event_id = self.emit_with_parent(
             EventKind::TOOL_CALL,
             object([
                 ("id", call.id.clone().into()),
                 ("name", call.name.clone().into()),
-                ("input", call.input.clone()),
+                ("input", recorded_input),
             ]),
             Some(model_result_id),
         )?;

@@ -244,13 +244,16 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     /// adapt to, exactly as in the parent session loop; it never terminates
     /// the companion. Budgets bound the loop.
     fn execute_tool_call(&mut self, call: ToolCall) -> Result<(), SessionError> {
+        // Redact the persisted input copy; the tool runs on the raw `call`.
+        let mut recorded_input = call.input.clone();
+        self.redactor.redact_value(&mut recorded_input);
         let tool_call_event_id = self
             .append(
                 EventKind::TOOL_CALL,
                 object([
                     ("id", call.id.clone().into()),
                     ("name", call.name.clone().into()),
-                    ("input", call.input.clone()),
+                    ("input", recorded_input),
                 ]),
                 None,
             )?

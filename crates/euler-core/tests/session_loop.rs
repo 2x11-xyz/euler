@@ -963,6 +963,46 @@ fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
 }
 
 #[test]
+fn tool_call_input_is_redacted_in_the_ledger() {
+    // A secret the model echoes into a tool ARGUMENT (write_file content, a
+    // shell command, a patch body) must not persist raw in the tool.call
+    // event — it would survive in the ledger and replay into the next model
+    // call via the canvas. The tool still executes on the raw input.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-shell".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({
+                "command": "printf 'token=registered-secret-value-42 shape=sk-or-v1-abcdefghijklmnop'",
+            }),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    session.add_redacted_secret("registered-secret-value-42");
+
+    session.run_turn("run it").expect("turn");
+
+    let call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .expect("tool call");
+    let input = serde_json::to_string(&call.payload["input"]).expect("input json");
+    assert!(
+        !input.contains("registered-secret-value-42"),
+        "known value: {input}"
+    );
+    assert!(!input.contains("sk-or-v1-abcd"), "token shape: {input}");
+    assert!(input.contains("[redacted-secret]"));
+}
+
+#[test]
 fn tool_output_redacts_known_values_and_token_shapes() {
     // Issue #56 incident repro: a granted shell command read a secret store;
     // the raw key must never reach the tool result (canvas + ledger).

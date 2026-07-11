@@ -93,6 +93,35 @@ impl SecretRedactor {
         }
     }
 
+    /// Redact every string leaf of a JSON value in place. Tool-call inputs
+    /// are arbitrary provider-authored JSON (`{command}`, `{path, content}`,
+    /// a patch envelope) persisted to the ledger and replayed into later
+    /// model calls via the canvas — a secret the model echoes into an input
+    /// must not survive there any more than one in a tool result (secrets
+    /// contract, "provenance payloads"). Object keys are left untouched;
+    /// only values are redacted.
+    pub fn redact_value(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => {
+                let redacted = self.redact(text);
+                if &redacted != text {
+                    *text = redacted;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.redact_value(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (_key, val) in map.iter_mut() {
+                    self.redact_value(val);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Redact known values and known token shapes from `text`.
     pub fn redact(&self, text: &str) -> String {
         let mut out = self
@@ -146,7 +175,39 @@ fn redact_token_shapes(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+
+    #[test]
+    fn redact_value_recurses_string_leaves_only() {
+        let mut redactor = SecretRedactor::new();
+        redactor.add_value("registered-secret-value-42");
+        let mut value = json!({
+            "path": "src/config.rs",
+            "content": "let key = \"registered-secret-value-42\";",
+            "nested": ["plain", "sk-or-v1-abcdefghijklmnopqrstuvwx"],
+            "count": 7
+        });
+        redactor.redact_value(&mut value);
+        assert_eq!(value["path"], "src/config.rs");
+        assert!(!value["content"]
+            .as_str()
+            .unwrap()
+            .contains("registered-secret-value-42"));
+        assert!(value["content"]
+            .as_str()
+            .unwrap()
+            .contains("[redacted-secret]"));
+        // token shape caught inside a nested array
+        assert!(!value["nested"][1]
+            .as_str()
+            .unwrap()
+            .contains("sk-or-v1-abcd"));
+        // non-string leaves and keys untouched
+        assert_eq!(value["count"], 7);
+        assert!(value.as_object().unwrap().contains_key("content"));
+    }
 
     #[test]
     fn known_values_are_replaced_everywhere() {
