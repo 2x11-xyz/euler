@@ -226,6 +226,11 @@ pub(crate) fn consequences_row(preview: &PatchPreview, prior_count: usize) -> Op
 /// workspace-relative directory. Returns `None` when derivation is not possible
 /// (caller falls back to unscoped and labels honestly).
 pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String> {
+    if request.command_truncated {
+        // A truncated command can never satisfy scoped matching (the full
+        // string may differ past the bound) — offer only unscoped options.
+        return None;
+    }
     match request.capability {
         Capability::ShellExec => request.command.as_deref().and_then(derive_shell_prefix),
         Capability::FsWrite => request.path.as_deref().and_then(derive_edit_prefix),
