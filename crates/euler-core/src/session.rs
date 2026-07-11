@@ -725,7 +725,7 @@ impl<D> Session<D> {
         // User rules follow the same discipline: missing file is empty;
         // corrupt files leave the store unloaded (reads and writes fail closed).
         let _ = permissions.load_user_grants(config.user_grant_dir.as_deref());
-        Self {
+        let session = Self {
             config,
             active_target,
             providers,
@@ -741,7 +741,25 @@ impl<D> Session<D> {
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
             code_swarm_extension: None,
-        }
+        };
+        session.install_provider_secret_sink();
+        session
+    }
+
+    /// Wire request-time secret resolution into this session's redactor:
+    /// any value a provider resolves while building a request (custom
+    /// provider `$ENV` / `!command` / literal api_key and header secrets)
+    /// registers with the redactor before the request departs, so a later
+    /// echo of it — in tool output, a provider error body, a context slot —
+    /// is masked (secrets contract: "any value resolved through this
+    /// contract is secret-tainted"). Re-run after replacing the redactor;
+    /// the sink captures a clone of the CURRENT one.
+    fn install_provider_secret_sink(&self) {
+        let redactor = self.redactor.clone();
+        self.providers
+            .install_resolved_secret_sink(Arc::new(move |value| {
+                redactor.add_value(value);
+            }));
     }
 
     pub fn into_fresh_session(self, session_id: impl Into<String>, decider: D) -> Self {
@@ -757,6 +775,9 @@ impl<D> Session<D> {
         // runtime-resolved) carry into the fresh session — /new must not
         // silently drop redaction back to env-only (review finding on #56).
         fresh.redactor = redactor;
+        // Re-point the provider secret sink at the carried redactor: the
+        // constructor above bound it to the from_env one just replaced.
+        fresh.install_provider_secret_sink();
         // The code-swarm wiring is launch configuration, not session state:
         // a fresh session in the same process keeps the review-gate tool.
         fresh.code_swarm_extension = code_swarm_extension;
@@ -1052,7 +1073,7 @@ impl<D> Session<D> {
         let _ = permissions
             .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         let _ = permissions.load_user_grants(config.user_grant_dir.as_deref());
-        Self {
+        let session = Self {
             config,
             active_target,
             providers,
@@ -1069,7 +1090,9 @@ impl<D> Session<D> {
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
             code_swarm_extension: None,
-        }
+        };
+        session.install_provider_secret_sink();
+        session
     }
 }
 
@@ -2347,9 +2370,12 @@ impl<D: PermissionDecider> Session<D> {
         error: &ProviderError,
         model_call_id: String,
     ) -> Result<String, SessionError> {
+        // Provider error text can echo request fragments (HTTP error bodies
+        // quote what was sent); redact before it reaches the ledger and the
+        // canvas (secrets contract, "error messages").
         let mut payload = object([
             ("source", "provider".into()),
-            ("message", error.to_string().into()),
+            ("message", self.redactor.redact(&error.to_string()).into()),
         ]);
         payload.insert("category".to_owned(), error.category().as_str().into());
         self.emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))

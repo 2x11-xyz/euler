@@ -218,11 +218,25 @@ impl<D: PermissionDecider> Session<D> {
                 session_id: &session_id,
                 agent_id: &child_agent_id,
             };
-            if let Some((payload, parent)) = outcome.buffered_error {
+            if let Some((mut payload, parent)) = outcome.buffered_error {
+                // Workers buffer the raw provider error (they carry no
+                // redactor); this session-thread append is the emission
+                // site, so redact here — provider HTTP error bodies can
+                // echo request fragments (secrets contract).
+                self.redactor
+                    .redact_payload_fields(&mut payload, &["message"]);
                 appender.append(EventKind::ERROR, payload, Some(parent))?;
             }
             match outcome.round {
-                Err(error) => companion_failure(error.to_string()),
+                // The worker's terminal error carries the raw provider
+                // message (HTTP error bodies can echo request fragments —
+                // secrets contract). This failure string becomes the
+                // agent.result error field and AgentOutcome.error, and from
+                // there the code-swarm tool output and consolidated
+                // artifact; redacting at this conversion point makes every
+                // downstream sink inherit it. Reviewer findings (success
+                // output) are model cognition and stay faithful.
+                Err(error) => companion_failure(self.redactor.redact(&error.to_string())),
                 Ok(data) => {
                     record_reviewer_round(&mut appender, &target, &model_call_id, &data, &task)?
                 }

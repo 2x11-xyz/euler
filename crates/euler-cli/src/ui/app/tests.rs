@@ -2476,6 +2476,27 @@ fn theme_action_reports_preference_save_failure_without_reverting_theme() {
 }
 
 #[test]
+fn launch_auth_file_override_threads_into_the_core_for_resume_seeding() {
+    // Secrets contract seeding gap: in-app resume re-seeds secret redaction
+    // and must consult the SAME `--auth-file` the launch used — before this
+    // threading, build_tui_resume fell back to the default auth store and
+    // silently dropped the override's credential values from redaction.
+    let core = core_with_provider_model_options_at(
+        EchoProvider,
+        "echo",
+        ".",
+        AppOptions {
+            auth_file: Some(PathBuf::from("/tmp/custom-auth.json")),
+            ..AppOptions::default()
+        },
+    );
+    assert_eq!(
+        core.auth_file.as_deref(),
+        Some(std::path::Path::new("/tmp/custom-auth.json"))
+    );
+}
+
+#[test]
 fn resume_picker_reports_empty_state_without_active_turn_language() {
     let mut core = core();
     core.state = AppState::Empty;

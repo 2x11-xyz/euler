@@ -1695,6 +1695,53 @@ fn extensions_context_slot_update_writes_namespaced_event_and_deduplicates() {
 }
 
 #[test]
+fn extensions_context_slot_content_is_redacted_at_emission() {
+    // F6: slot content replays into every later model round via the canvas;
+    // a secret injected through an extension must be masked at the emission
+    // chokepoint so the ledger and all replays inherit it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-123";
+    let session_dir = temp.path().join("sessions").join(session_id);
+    fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let redactor = crate::redaction::SecretRedactor::new();
+    redactor.add_value("known-slot-secret-value-11");
+    let mut host = ExtensionHost::with_artifact_writer(
+        &log,
+        session_id,
+        "agent-1",
+        Arc::clone(&writer),
+        [Capability::ContextSlot],
+    )
+    .with_redactor(redactor);
+    host.register_extension(&extension(
+        "slot-ext",
+        vec![Capability::ContextSlot],
+        vec![("slot", context_slot_command)],
+    ))
+    .expect("register");
+
+    let shaped = format!("sk-or-v1-{}", "abcdefghijklmnop");
+    host.execute_command(
+        "slot",
+        json!({"slot": "main", "content": format!("key known-slot-secret-value-11 and {shaped}")}),
+    )
+    .expect("slot update");
+
+    let events = read_provenance(&log).expect("events");
+    let slots = events_of_kind(&events, EventKind::CONTEXT_SLOT_UPDATED);
+    assert_eq!(slots.len(), 1);
+    let content = slots[0].payload["content"].as_str().expect("content");
+    assert!(!content.contains("known-slot-secret-value-11"), "{content}");
+    assert!(!content.contains(&shaped), "{content}");
+    assert!(content.contains("[redacted-secret]"), "{content}");
+}
+
+#[test]
 fn extensions_context_slot_capability_and_validation_fail_without_slot_event() {
     let temp = tempfile::tempdir().expect("temp dir");
     let session_id = "session-123";

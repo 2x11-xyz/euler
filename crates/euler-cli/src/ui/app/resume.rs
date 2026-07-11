@@ -129,7 +129,10 @@ impl AppCore {
         let outcome =
             resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
         let mut session = outcome.session;
-        crate::session_lifecycle::seed_secret_redaction(&mut session, None);
+        // Seed from the SAME credential store the launch used: a `--auth-file`
+        // override must not silently fall back to the default auth file on
+        // in-app resume, or its values drop out of redaction.
+        crate::session_lifecycle::seed_secret_redaction(&mut session, self.auth_file.as_deref());
         if let Some((_, extension)) = observer {
             session.set_observer_extension(extension);
         }

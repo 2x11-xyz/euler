@@ -46,6 +46,42 @@ fn custom_provider_posts_openai_chat_completions_request() {
 }
 
 #[test]
+fn custom_provider_reports_resolved_secrets_to_installed_sink() {
+    // Secrets contract: any value resolved through the secret-spec syntax is
+    // secret-tainted AT RESOLUTION TIME — the host's sink must see the
+    // api_key and every header value during invoke, before the request is
+    // sent, so the redactor knows them from the first moment they exist.
+    let (base_url, _request_rx) = spawn_sse_server();
+    let provider = CustomOpenAiProvider::from_config(custom_config(
+        &base_url,
+        Some("literal-api-key-secret-1"),
+        [("x-secret", "literal-header-secret-2")],
+    ))
+    .expect("custom provider");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink_seen = std::sync::Arc::clone(&seen);
+    provider.set_resolved_secret_sink(std::sync::Arc::new(move |value: &str| {
+        sink_seen.lock().expect("sink lock").push(value.to_owned());
+    }));
+
+    provider
+        .invoke(model_request("custom-model"))
+        .expect("invoke")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stream");
+
+    let seen = seen.lock().expect("seen lock").clone();
+    assert!(
+        seen.contains(&"literal-api-key-secret-1".to_owned()),
+        "api_key not reported: {seen:?}"
+    );
+    assert!(
+        seen.contains(&"literal-header-secret-2".to_owned()),
+        "header secret not reported: {seen:?}"
+    );
+}
+
+#[test]
 fn custom_provider_omits_stream_usage_when_disabled() {
     let (base_url, request_rx) = spawn_sse_server();
     let provider = CustomOpenAiProvider::from_config(custom_config_with_compat(

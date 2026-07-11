@@ -47,9 +47,14 @@ const TOKEN_PREFIXES: &[&str] = &[
     "AIza",
 ];
 
+/// Clones SHARE one value set: the session hands clones to companion loops,
+/// the extension host, and provider secret sinks, and a value registered at
+/// runtime through any handle (e.g. a custom provider resolving an
+/// `x-secret` at request time, possibly on a reviewer worker thread) must be
+/// visible to every emission site immediately.
 #[derive(Clone, Debug, Default)]
 pub struct SecretRedactor {
-    values: Vec<String>,
+    values: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl SecretRedactor {
@@ -59,7 +64,7 @@ impl SecretRedactor {
 
     /// Seed from the configured secret environment variables.
     pub fn from_env() -> Self {
-        let mut redactor = Self::new();
+        let redactor = Self::new();
         for name in SECRET_ENV_NAMES {
             if let Ok(value) = std::env::var(name) {
                 redactor.add_value(value);
@@ -69,11 +74,20 @@ impl SecretRedactor {
     }
 
     /// Add a known secret value (auth-file credential, resolved `x-secret`).
-    /// Short values are ignored — see `MIN_VALUE_LEN`.
-    pub fn add_value(&mut self, value: impl Into<String>) {
+    /// Short values are ignored — see `MIN_VALUE_LEN`. Shared: every clone
+    /// of this redactor observes the addition.
+    pub fn add_value(&self, value: impl Into<String>) {
         let value = value.into();
-        if value.len() >= MIN_VALUE_LEN && !self.values.contains(&value) {
-            self.values.push(value);
+        if value.len() < MIN_VALUE_LEN {
+            return;
+        }
+        let mut values = self.values.write().unwrap_or_else(|poison| {
+            // A panic mid-push cannot corrupt Vec<String> contents; losing
+            // redaction values to poisoning would be the unsafe direction.
+            poison.into_inner()
+        });
+        if !values.contains(&value) {
+            values.push(value);
         }
     }
 
@@ -95,8 +109,11 @@ impl SecretRedactor {
 
     /// Redact known values and known token shapes from `text`.
     pub fn redact(&self, text: &str) -> String {
-        let mut out = self
+        let values = self
             .values
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = values
             .iter()
             .fold(text.to_owned(), |acc, value| acc.replace(value, REDACTED));
         out = redact_token_shapes(&out);
@@ -150,15 +167,27 @@ mod tests {
 
     #[test]
     fn known_values_are_replaced_everywhere() {
-        let mut redactor = SecretRedactor::new();
+        let redactor = SecretRedactor::new();
         redactor.add_value("sup3r-secret-value-123");
         let out = redactor.redact("a sup3r-secret-value-123 b sup3r-secret-value-123");
         assert_eq!(out, format!("a {REDACTED} b {REDACTED}"));
     }
 
     #[test]
+    fn clones_share_the_value_set() {
+        // The session hands redactor clones to companion loops, the
+        // extension host, and provider secret sinks; a value registered at
+        // request time through any handle must reach every emission site.
+        let redactor = SecretRedactor::new();
+        let handle = redactor.clone();
+        handle.add_value("runtime-resolved-secret-1");
+        let out = redactor.redact("a runtime-resolved-secret-1 b");
+        assert_eq!(out, format!("a {REDACTED} b"));
+    }
+
+    #[test]
     fn short_values_are_not_registered() {
-        let mut redactor = SecretRedactor::new();
+        let redactor = SecretRedactor::new();
         redactor.add_value("short");
         assert_eq!(redactor.redact("a short b"), "a short b");
     }

@@ -253,6 +253,103 @@ impl ModelProvider for ProbeHandle {
     }
 }
 
+struct RejectingProvider {
+    message: String,
+}
+
+impl ModelProvider for RejectingProvider {
+    fn name(&self) -> &'static str {
+        "rejecting"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        Err(ProviderError::rejected(self.message.clone()))
+    }
+}
+
+#[test]
+fn buffered_worker_provider_error_is_redacted_before_append() {
+    // F8: workers buffer the raw provider error for the session thread to
+    // append in batch order — that append is the emission site, and provider
+    // HTTP error bodies can echo request fragments (secrets contract).
+    let shaped = format!("sk-or-v1-{}", "abcdefghijklmnop");
+    let mut providers = ProviderSet::new();
+    providers.insert_named(
+        "rejecting",
+        RejectingProvider {
+            message: format!("HTTP 400: request echoed known-reviewer-secret-88 and {shaped}"),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.add_redacted_secret("known-reviewer-secret-88");
+    let tasks = vec![reviewer_task("rejecting", "m1", "code-swarm-correctness")];
+
+    let summaries = session
+        .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+        .expect("batch");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    let message = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == "error")
+        .expect("buffered error event")
+        .payload["message"]
+        .as_str()
+        .expect("message")
+        .to_owned();
+    assert!(!message.contains("known-reviewer-secret-88"), "{message}");
+    assert!(!message.contains(&shaped), "{message}");
+    assert!(message.contains("[redacted-secret]"), "{message}");
+}
+
+#[test]
+fn reviewer_provider_failure_result_carries_redacted_error() {
+    // The redacted buffered error EVENT is not the only escape path: the
+    // raw ProviderError was also stringified into the AgentResult failure
+    // text, which agent.result serializes unchanged and every AgentOutcome
+    // consumer (code-swarm tool output, consolidated artifact) reuses.
+    // Redaction must happen at that string-conversion point too.
+    let shaped = format!("sk-or-v1-{}", "abcdefghijklmnop");
+    let mut providers = ProviderSet::new();
+    providers.insert_named(
+        "rejecting",
+        RejectingProvider {
+            message: format!("HTTP 401: request echoed known-reviewer-secret-63 and {shaped}"),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.add_redacted_secret("known-reviewer-secret-63");
+    let tasks = vec![reviewer_task("rejecting", "m1", "code-swarm-correctness")];
+
+    let summaries = session
+        .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+        .expect("batch");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    let error = summaries[0].result.error().expect("failure error");
+    assert!(!error.contains("known-reviewer-secret-63"), "{error}");
+    assert!(!error.contains(&shaped), "{error}");
+    assert!(error.contains("[redacted-secret]"), "{error}");
+    let result_error = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == "agent.result")
+        .expect("agent.result event")
+        .payload["error"]
+        .as_str()
+        .expect("agent.result error")
+        .to_owned();
+    assert!(
+        !result_error.contains("known-reviewer-secret-63"),
+        "{result_error}"
+    );
+    assert!(!result_error.contains(&shaped), "{result_error}");
+    assert!(result_error.contains("[redacted-secret]"), "{result_error}");
+}
+
 #[test]
 fn provider_invocations_actually_overlap() {
     let probe = ConcurrencyProbeProvider::new(3);

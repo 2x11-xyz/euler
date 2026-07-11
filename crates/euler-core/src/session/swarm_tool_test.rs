@@ -86,7 +86,12 @@ impl ExtensionCommand for FakeReviewCommand {
         let record = host.write_artifact(ArtifactWrite {
             display_name: "CodeSwarm Review".to_owned(),
             media_type: "application/vnd.euler.code-swarm.review.v1+json".to_owned(),
-            bytes: serde_json::to_vec(&json!({"reviewers": outcomes.len()})).expect("bytes"),
+            // Mirrors the real extension's consolidated report: per-reviewer
+            // error and findings taken verbatim from the AgentOutcome.
+            bytes: serde_json::to_vec(
+                &json!({"reviewers": outcomes.iter().map(outcome_json).collect::<Vec<_>>()}),
+            )
+            .expect("bytes"),
             source_event_ids: outcomes
                 .iter()
                 .map(|outcome| outcome.result_event_id.clone())
@@ -136,16 +141,23 @@ fn harness(
     main_script: Vec<FixtureResponse>,
     reviewers: &[(&str, Vec<FixtureResponse>)],
 ) -> Harness {
+    let mut providers = ProviderSet::new();
+    for (name, script) in reviewers {
+        providers.insert_named((*name).to_owned(), ScriptedProvider::new(script.clone()));
+    }
+    harness_with_providers(main_script, providers)
+}
+
+fn harness_with_providers(
+    main_script: Vec<FixtureResponse>,
+    mut providers: ProviderSet,
+) -> Harness {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("workspace");
     std::fs::create_dir_all(&root).expect("workspace root");
     let log = temp.path().join("events.jsonl");
     let writer = ProvenanceWriter::new(&log).expect("writer");
-    let mut providers = ProviderSet::new();
     providers.insert_named("fixture".to_owned(), ScriptedProvider::new(main_script));
-    for (name, script) in reviewers {
-        providers.insert_named((*name).to_owned(), ScriptedProvider::new(script.clone()));
-    }
     let mut config = SessionConfig::new(&root);
     config.session_id = "session-swarm-tool".to_owned();
     config.provider = "fixture".to_owned();
@@ -233,6 +245,104 @@ fn tool_call_with_project_config_spawns_reviewers_and_returns_honest_summary() {
         .filter(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
         .count();
     assert_eq!(spawns, 2, "one spawn per configured reviewer");
+}
+
+#[test]
+fn failed_reviewer_error_is_redacted_but_findings_stay_faithful() {
+    // Provider-error propagation: a reviewer whose provider fails with a
+    // credential-echoing HTTP body reaches the tool result and consolidated
+    // artifact through the AgentResult failure string, so the redaction at
+    // that conversion point must show up in both sinks. A SUCCESSFUL
+    // reviewer's findings are the reviewer model's own cognition and must
+    // survive verbatim even when token-shaped (owner decision: provenance
+    // keeps cognition faithful; only entry text is redacted).
+    struct RejectingProvider {
+        message: String,
+    }
+    impl euler_provider::ModelProvider for RejectingProvider {
+        fn name(&self) -> &'static str {
+            "rejecting"
+        }
+        fn invoke(
+            &self,
+            _request: ProviderModelRequest,
+        ) -> Result<euler_provider::ProviderStream, euler_provider::ProviderError> {
+            Err(euler_provider::ProviderError::rejected(
+                self.message.clone(),
+            ))
+        }
+    }
+    // Token-shaped fixtures assembled at runtime (repo convention: no
+    // credential-shaped literal in the source tree).
+    let leaked = format!("sk-or-v1-{}", "abcdefghijklmnop");
+    let faithful = format!("sk-or-v1-{}", "reviewerquoted456");
+    let mut providers = ProviderSet::new();
+    providers.insert_named(
+        "good",
+        ScriptedProvider::new(vec![FixtureResponse::Assistant(format!(
+            "finding: rotate the leaked key {faithful}"
+        ))]),
+    );
+    providers.insert_named(
+        "bad",
+        RejectingProvider {
+            message: format!("HTTP 401: request echoed known-swarm-secret-17 and {leaked}"),
+        },
+    );
+    let mut harness = harness_with_providers(
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(json!({"focus": "the diff"}))]),
+            FixtureResponse::Assistant("adjudicated".to_owned()),
+        ],
+        providers,
+    );
+    harness.session.add_redacted_secret("known-swarm-secret-17");
+    write_project_config(&harness.root, &["good::m1", "bad::m2"]);
+
+    harness.session.run_turn("review my diff").expect("turn");
+
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].payload["ok"],
+        json!(true),
+        "tool failed: {:?}",
+        results[0].payload["error"]
+    );
+    let output = results[0].payload["output"]
+        .as_str()
+        .expect("output")
+        .to_owned();
+    assert!(
+        output.contains("1/2 reviewers succeeded"),
+        "honest K-of-N summary, got: {output}"
+    );
+    // The failure text (external provider HTTP body) is redacted...
+    assert!(!output.contains("known-swarm-secret-17"), "{output}");
+    assert!(!output.contains(&leaked), "{output}");
+    assert!(output.contains("[redacted-secret]"), "{output}");
+    // ...but the successful reviewer's findings stay verbatim, token shape
+    // and all: model cognition is never redacted.
+    assert!(output.contains(&faithful), "{output}");
+
+    // The consolidated artifact reads the same AgentOutcome fields and must
+    // inherit the redacted failure text while keeping findings faithful.
+    let artifact_dir = harness
+        ._temp
+        .path()
+        .join("extensions")
+        .join("code-swarm")
+        .join("artifacts");
+    let entry = std::fs::read_dir(&artifact_dir)
+        .expect("artifact dir")
+        .next()
+        .expect("one artifact")
+        .expect("dir entry");
+    let artifact = std::fs::read_to_string(entry.path()).expect("artifact bytes");
+    assert!(!artifact.contains("known-swarm-secret-17"), "{artifact}");
+    assert!(!artifact.contains(&leaked), "{artifact}");
+    assert!(artifact.contains("[redacted-secret]"), "{artifact}");
+    assert!(artifact.contains(&faithful), "{artifact}");
 }
 
 #[test]

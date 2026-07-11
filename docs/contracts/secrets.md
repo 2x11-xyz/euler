@@ -93,8 +93,7 @@ an explicit **scrub** operation that removes the value from every surface
 (provenance, blobs, checkpoints, sidecars, projections) on demand. Default
 is faithful; scrub is opt-in.
 
-Tool output redaction is implemented in two layers at the tool-result
-emission chokepoint (before the canvas and the ledger both):
+Redaction is implemented in two layers:
 
 1. **Known values** — secret environment variables read at session start,
    stored auth credentials, and any value the host registers at runtime are
@@ -105,6 +104,54 @@ emission chokepoint (before the canvas and the ledger both):
    secrets file. This layer is a heuristic, not a guarantee: novel token
    formats pass through, and over-matching costs only a masked token, which
    is the safe direction.
+
+### Known-value seeding sources
+
+Every path a credential can enter euler must register it with the session
+redactor the moment it exists:
+
+- configured secret environment variables, at session construction;
+- stored auth-file credentials (including a `--auth-file` override), at
+  launch, exec, CLI resume, AND in-app resume;
+- custom-provider secrets (`$ENV` / `!command` / literal api_key and header
+  values), reported by the provider at request-time resolution through the
+  resolved-secret sink the session installs — before the request that
+  carries them departs;
+- values the host registers explicitly at runtime.
+
+Redactor handles share one value set: a value registered on any thread
+(e.g. during a parallel-reviewer provider call) is visible to every
+emission site immediately.
+
+### Emission chokepoints
+
+Redaction applies where text that arrived from OUTSIDE the model is
+persisted to the ledger (and from there replays into model context):
+
+- `tool.result` output and error — root session and companion loop (a
+  tool read in external data; the `code_swarm_review` result is reviewer
+  cognition and stays faithful);
+- `patch.proposed` / `patch.applied` old/new content and `file.diff` diff
+  fields;
+- provider `error` messages (HTTP error bodies can echo request
+  fragments) — root session, companion loop, and the parallel-reviewer
+  buffered append;
+- `agent.result` error / failure text (provider-error propagation): a
+  provider failure is also stringified into the agent failure result, and
+  it is redacted at that conversion point — in the companion loop and the
+  parallel-reviewer outcome recording — so the `agent.result` event,
+  `AgentOutcome`, the `code_swarm_review` tool result, and the consolidated
+  review artifact all inherit the redacted text. Only the ERROR field:
+  success output and reviewer findings stay faithful;
+- `context.slot.updated` content (extension-injected text that replays
+  into every later round).
+
+Model-authored text (`model.result` content, `model.reasoning`,
+`assistant.message`, agent result success output, reviewer findings, and
+the guardian's rationale) and model-authored tool-call arguments are NOT
+redaction chokepoints: provenance keeps model cognition faithful.
+Secrets are caught where they enter (tool results, provider errors,
+extension content) rather than by rewriting what the model said.
 
 ## Non-Goals
 

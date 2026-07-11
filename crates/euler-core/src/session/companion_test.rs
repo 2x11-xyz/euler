@@ -46,6 +46,107 @@ fn companion_tool_output_is_redacted() {
 }
 
 #[test]
+fn companion_provider_error_message_is_redacted() {
+    // F8: the companion loop has its own provider-error emission site; it
+    // must apply the same redaction chokepoint as the parent session.
+    struct RejectingProvider {
+        message: String,
+    }
+    impl ModelProvider for RejectingProvider {
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+        fn invoke(
+            &self,
+            _request: euler_provider::ModelRequest,
+        ) -> Result<ProviderStream, euler_provider::ProviderError> {
+            Err(euler_provider::ProviderError::rejected(
+                self.message.clone(),
+            ))
+        }
+    }
+    let shaped = format!("sk-or-v1-{}", "abcdefghijklmnop");
+    let (_temp, _log, mut session) = session_with_provider(
+        RejectingProvider {
+            message: format!("HTTP 400: echoed known-companion-secret-99 and {shaped}"),
+        },
+        ScriptedDecider::new(Vec::new()),
+    );
+    session.add_redacted_secret("known-companion-secret-99");
+
+    let summary = session
+        .spawn_companion(task_with_caps([]))
+        .expect("companion records a failure result");
+    assert!(!summary.result.ok());
+
+    let message = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::ERROR)
+        .expect("companion provider error event")
+        .payload["message"]
+        .as_str()
+        .expect("message")
+        .to_owned();
+    assert!(!message.contains("known-companion-secret-99"), "{message}");
+    assert!(!message.contains(&shaped), "{message}");
+    assert!(message.contains("[redacted-secret]"), "{message}");
+}
+
+#[test]
+fn companion_provider_failure_result_carries_redacted_error() {
+    // The redacted error EVENT is not the only escape path: the raw
+    // ProviderError was also stringified into the AgentResult failure text,
+    // which agent.result serializes unchanged and every AgentOutcome
+    // consumer (code-swarm tool output, consolidated artifact) reuses.
+    // Redaction must happen at that string-conversion point too.
+    struct RejectingProvider {
+        message: String,
+    }
+    impl ModelProvider for RejectingProvider {
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+        fn invoke(
+            &self,
+            _request: euler_provider::ModelRequest,
+        ) -> Result<ProviderStream, euler_provider::ProviderError> {
+            Err(euler_provider::ProviderError::rejected(
+                self.message.clone(),
+            ))
+        }
+    }
+    let shaped = format!("sk-or-v1-{}", "abcdefghijklmnop");
+    let (_temp, _log, mut session) = session_with_provider(
+        RejectingProvider {
+            message: format!("HTTP 401: request echoed known-companion-secret-42 and {shaped}"),
+        },
+        ScriptedDecider::new(Vec::new()),
+    );
+    session.add_redacted_secret("known-companion-secret-42");
+
+    let summary = session
+        .spawn_companion(task_with_caps([]))
+        .expect("companion records a failure result");
+
+    assert!(!summary.result.ok());
+    let error = summary.result.error().expect("failure error");
+    assert!(!error.contains("known-companion-secret-42"), "{error}");
+    assert!(!error.contains(&shaped), "{error}");
+    assert!(error.contains("[redacted-secret]"), "{error}");
+    let result_error = only_event(session.events(), EventKind::AGENT_RESULT).payload["error"]
+        .as_str()
+        .expect("agent.result error")
+        .to_owned();
+    assert!(
+        !result_error.contains("known-companion-secret-42"),
+        "{result_error}"
+    );
+    assert!(!result_error.contains(&shaped), "{result_error}");
+    assert!(result_error.contains("[redacted-secret]"), "{result_error}");
+}
+
+#[test]
 #[cfg(unix)]
 fn companion_scoped_fs_grant_does_not_cover_symlink_escapes() {
     // Twin of the root-session canonicalization test (security audit): the

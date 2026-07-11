@@ -2,10 +2,11 @@
 
 use crate::auth::SecretString;
 use crate::provider_config::{ApiFamily, CustomProviderConfig};
-use crate::{ModelProvider, ModelRequest, ProviderError, ProviderStream};
+use crate::{ModelProvider, ModelRequest, ProviderError, ProviderStream, ResolvedSecretSink};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use url::Url;
 
 #[derive(Clone)]
@@ -13,6 +14,12 @@ pub struct CustomOpenAiProvider {
     config: CustomProviderConfig,
     endpoint: String,
     label: String,
+    /// Host observer for request-time secret resolution: every resolved
+    /// api_key / header value is reported so the host can secret-taint it
+    /// (register it for redaction) the moment it exists. Shared across
+    /// clones; interior mutability because installation happens after the
+    /// provider is boxed into a `ProviderSet`.
+    secret_sink: Arc<Mutex<Option<ResolvedSecretSink>>>,
 }
 
 impl CustomOpenAiProvider {
@@ -25,8 +32,20 @@ impl CustomOpenAiProvider {
                     config,
                     endpoint,
                     label,
+                    secret_sink: Arc::new(Mutex::new(None)),
                 })
             }
+        }
+    }
+
+    fn report_resolved_secret(&self, value: &SecretString) {
+        let sink = self
+            .secret_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(sink) = sink {
+            sink(value.expose());
         }
     }
 }
@@ -58,6 +77,13 @@ impl ModelProvider for CustomOpenAiProvider {
             validate_secret_spec(value, &self.config.id, &format!("headers.{name}"))?;
         }
         Ok(())
+    }
+
+    fn set_resolved_secret_sink(&self, sink: ResolvedSecretSink) {
+        *self
+            .secret_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
     }
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
@@ -118,6 +144,9 @@ impl CustomOpenAiProvider {
                 ProviderError::auth(format!("{} api_key is required", self.label))
             })?;
             let api_key = resolve_secret_spec(api_key, &self.config.id, "api_key")?;
+            // Secret-taint at resolution time: the host registers the value
+            // for redaction before the request that carries it is even sent.
+            self.report_resolved_secret(&api_key);
             headers.insert(
                 "Authorization".to_owned(),
                 SecretString::new(format!("Bearer {}", api_key.expose())),
@@ -126,6 +155,7 @@ impl CustomOpenAiProvider {
         }
         for (name, value) in &self.config.headers {
             let value = resolve_secret_spec(value, &self.config.id, &format!("headers.{name}"))?;
+            self.report_resolved_secret(&value);
             headers.insert(name.clone(), value.clone());
             secrets.push(value);
         }
