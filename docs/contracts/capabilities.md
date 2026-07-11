@@ -49,6 +49,33 @@ A capability decision is one of:
 
 Permission prompts and decisions are session events and are recorded in provenance. Privileged secret/config edits always require explicit approval even if broader write access was granted.
 
+## Permission reviewer (guardian)
+
+The session has one **permission reviewer** for uncovered `ask` decisions:
+`user` (default — the configured decider, e.g. the TUI approval panel) or
+`guardian` (ADR 0011). With `guardian`, an uncovered ask is reviewed by a
+flag-gated companion agent spawned with an **empty capability set** and a
+one-round, zero-tool budget, on the same decision channel the human would
+use. Rules (normative; enforced in code, not only in the guardian prompt):
+
+- Verdict shape: `{risk_level: low|medium|high|critical, user_authorization:
+  unknown|low|medium|high, outcome: allow|deny|abstain, rationale}`.
+- Thresholds: low/medium risk → allow; high risk → allow only when
+  `user_authorization` ≥ medium; critical → deny, not overridable.
+- Fail closed: guardian spawn failure, companion failure, or an unparseable
+  verdict is a deny.
+- `abstain` falls back to the configured decider (the human). `deny` is
+  final for the ask; it never falls back.
+- Guardian allows are once-scoped; the guardian never installs session or
+  project grants. Requests covered by existing grants run under those grants
+  and are not guardian-reviewed.
+- Denials inject guidance into the failed tool result telling the model not
+  to work around the block. Three consecutive guardian denials in one turn
+  interrupt the turn (circuit breaker).
+- Every guardian decision is a `permission.decision` event tagged
+  `decision_source: "guardian"` with the verdict fields (events contract);
+  automated decisions are always distinguishable from user decisions.
+
 ## Extension capability approval
 
 A command descriptor's `required_capabilities` is a *declaration*, never a
