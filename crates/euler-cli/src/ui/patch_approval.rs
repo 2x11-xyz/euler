@@ -237,6 +237,11 @@ pub(crate) fn consequences_row(preview: &PatchPreview, prior_count: usize) -> Op
 /// workspace-relative directory. Returns `None` when derivation is not possible
 /// (caller falls back to unscoped and labels honestly).
 pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String> {
+    if request.command_truncated {
+        // A truncated command can never satisfy scoped matching (the full
+        // string may differ past the bound) — offer only unscoped options.
+        return None;
+    }
     match request.capability {
         Capability::ShellExec => request.command.as_deref().and_then(derive_shell_prefix),
         Capability::FsWrite => request.path.as_deref().and_then(derive_edit_prefix),
@@ -257,7 +262,9 @@ pub(crate) fn derive_shell_prefix(command: &str) -> Option<String> {
 /// until the safe-command composition lands (capabilities contract, #78).
 /// Callers additionally gate on the session having a loaded user store.
 pub(crate) fn derive_user_rule_prefix(request: &PermissionRequest) -> Option<String> {
-    if request.capability != Capability::ShellExec {
+    if request.capability != Capability::ShellExec || request.command_truncated {
+        // A truncated command may hide metacharacters past the bound; never
+        // offer a durable rule the gate would refuse to honor.
         return None;
     }
     let command = request.command.as_deref()?;

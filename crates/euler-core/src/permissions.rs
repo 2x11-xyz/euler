@@ -19,6 +19,12 @@ pub struct PermissionRequest {
     pub reason: String,
     /// Optional shell command line (bounded) for scope matching / derivation.
     pub command: Option<String>,
+    /// True when `command` was truncated to the retention bound. A truncated
+    /// command must never satisfy SCOPED grant matching: the metacharacter
+    /// and token checks would run on a prefix while execution runs the full
+    /// string — a `;` past the bound would inherit the grant (review
+    /// finding on #66). Display still uses the bounded text.
+    pub command_truncated: bool,
     /// Optional workspace-relative path for fs-write scope matching / derivation.
     pub path: Option<PathBuf>,
 }
@@ -29,13 +35,30 @@ impl PermissionRequest {
             capability,
             reason: reason.into(),
             command: None,
+            command_truncated: false,
             path: None,
         }
     }
 
     pub fn with_command(mut self, command: impl Into<String>) -> Self {
-        self.command = bound_command(&command.into());
+        let full = command.into();
+        self.command = bound_command(&full);
+        self.command_truncated = self
+            .command
+            .as_deref()
+            .is_some_and(|bounded| bounded.len() < full.trim().len());
         self
+    }
+
+    /// Command text for SCOPED grant matching: `None` when the stored text
+    /// was truncated, so scoped grants fall back to the ask path (unscoped
+    /// grants are capability-wide and unaffected).
+    fn command_for_matching(&self) -> Option<&str> {
+        if self.command_truncated {
+            None
+        } else {
+            self.command.as_deref()
+        }
     }
 
     pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
@@ -339,7 +362,7 @@ impl<D> PermissionGate<D> {
     /// Which grant store covers this request, if any (narrowest lifetime wins
     /// ties: session, then project, then user).
     pub fn granted_source(&self, request: &PermissionRequest) -> Option<GrantSource> {
-        let command = request.command.as_deref();
+        let command = request.command_for_matching();
         let path = request.path.as_deref();
         if self
             .session_grants
@@ -729,6 +752,53 @@ mod tests {
             GrantScope::Project(ScopePattern::new("git").expect("pattern")),
         );
         assert!(matches!(result, Err(ProjectGrantError::NoStore)));
+    }
+
+    #[test]
+    fn truncated_commands_never_satisfy_scoped_grants() {
+        // Review finding (#66): the metachar/token checks ran on the
+        // 4 KiB-bounded command while execution ran the full string — a `;`
+        // past the bound inherited the scoped grant.
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_user_grants(Some(&home)).expect("load");
+        gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::Session(ScopePattern::new("cargo").expect("pattern")),
+        )
+        .expect("install");
+        // Durable user prefix rules must be equally unreachable.
+        gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::User(ScopePattern::new("cargo").expect("pattern")),
+        )
+        .expect("install user rule");
+
+        let mut long = String::from("cargo test --features ");
+        long.push_str(&"a".repeat(crate::grants::MAX_GRANT_COMMAND_BYTES));
+        long.push_str(" ; touch evil");
+        let request =
+            PermissionRequest::new(Capability::ShellExec, "tool run_shell").with_command(&long);
+        assert!(request.command_truncated);
+        assert!(
+            !gate.is_granted(&request),
+            "truncated command must fall back to the ask path"
+        );
+        assert_eq!(gate.granted_source(&request), None);
+
+        // Unscoped grants are capability-wide and unaffected by truncation.
+        gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::Session(ScopePattern::unscoped()),
+        )
+        .expect("install unscoped");
+        assert!(gate.is_granted(&request));
+
+        // Non-truncated commands keep working.
+        let short = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(!short.command_truncated);
     }
 
     #[test]
