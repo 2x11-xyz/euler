@@ -13,6 +13,8 @@ const SESSION_OPTIONS: &str = "  \
   --extensions <ids|none>    Comma-separated extension ids to enable
   --observe <extension-id>   Run that bundled extension's round observer
   --observe-cadence <n>      Observer cadence in driver rounds (default: 8)
+  --permission-reviewer <r>  user or guardian: who reviews permission asks
+                             (default: user)
   --auth-file <path>         Read credentials from <path>
   --provenance <path>        Write a standalone provenance log to <path>
                              instead of the home session store

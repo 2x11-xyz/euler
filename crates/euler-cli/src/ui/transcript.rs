@@ -103,6 +103,11 @@ pub enum TranscriptItem {
         allowed: Option<bool>,
         grant_scope: Option<String>,
         instruction: Option<String>,
+        /// `Some("guardian")` when an automated reviewer decided (ADR 0011);
+        /// `None` means the user decided.
+        decision_source: Option<String>,
+        /// Guardian rationale, rendered as a dim follow-up line.
+        rationale: Option<String>,
     },
     PatchProposed {
         path: String,
@@ -626,6 +631,8 @@ fn project_event_with_checkpoints(
                 .and_then(serde_json::Value::as_bool),
             grant_scope: payload_string(event, "grant_scope"),
             instruction: payload_string(event, "instruction"),
+            decision_source: payload_string(event, "decision_source"),
+            rationale: payload_string(event, "rationale"),
         }),
         EventKind::PATCH_PROPOSED => Some(project_patch(event, true)),
         EventKind::PATCH_APPLIED => Some(project_patch(event, false)),

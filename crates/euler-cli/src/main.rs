@@ -3,8 +3,8 @@ use anyhow::{anyhow, Result};
 use euler_core::permissions::{DeciderVerdict, PermissionRequest};
 use euler_core::{
     fold_session, read_provenance, read_resume_prefix, resume_session_from_folded_prefix,
-    CompactionTier, ModelTarget, PermissionDecider, ProvenanceWriter, Session, SessionConfig,
-    SessionKind,
+    CompactionTier, ModelTarget, PermissionDecider, PermissionReviewer, ProvenanceWriter, Session,
+    SessionConfig, SessionKind,
 };
 use euler_event::EventKind;
 use euler_provider::anthropic::AnthropicProvider;
@@ -174,6 +174,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.session_kind = SessionKind::Interactive;
+    apply_permission_reviewer(&mut live_session.config, &run);
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
@@ -200,6 +201,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.session_kind = SessionKind::Interactive;
+    apply_permission_reviewer(&mut live_session.config, &run);
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
@@ -267,6 +269,7 @@ fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
         provenance,
     )?;
     live_session.config.session_kind = SessionKind::NonInteractive;
+    apply_permission_reviewer(&mut live_session.config, &exec.run);
     apply_catalog_context_limit(&mut live_session.config, &exec.run.model_catalog);
     apply_exec_config(
         &mut live_session.config,
@@ -346,6 +349,14 @@ impl ExecConfigOverrides {
             compaction_budget_bytes: run.compaction_budget_bytes,
             reasoning_effort: run.reasoning_effort,
         }
+    }
+}
+
+/// Route uncovered permission asks to the guardian reviewer when the
+/// `--permission-reviewer guardian` flag was given (ADR 0011; default: user).
+fn apply_permission_reviewer(config: &mut SessionConfig, run: &RunArgs) {
+    if let Some(reviewer) = run.permission_reviewer {
+        config.permission_reviewer = reviewer;
     }
 }
 
@@ -440,6 +451,7 @@ where
         .to_owned();
     let root = std::env::current_dir()?;
     let mut config = session_config(root, run.provider_id.clone(), run.model.clone(), session_id);
+    apply_permission_reviewer(&mut config, &run);
     config.extensions_enabled = resolve_session_extensions(&config.root, &run.extensions)?;
     configure(&mut config);
     let observer = bundled_round_observer(&run.observe, &config.extensions_enabled)?;
@@ -853,6 +865,7 @@ struct RunArgs {
     auto_compaction: Option<CompactionTier>,
     compaction_budget_bytes: Option<usize>,
     reasoning_effort: Option<ReasoningEffort>,
+    permission_reviewer: Option<PermissionReviewer>,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     linefeed_history_insert: bool,
@@ -1143,6 +1156,7 @@ struct RawArgs {
     auto_compaction: Option<CompactionTier>,
     compaction_budget_bytes: Option<usize>,
     reasoning_effort: Option<ReasoningEffort>,
+    permission_reviewer: Option<PermissionReviewer>,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     login: bool,
@@ -1211,6 +1225,7 @@ impl RawArgsParser {
                 auto_compaction: None,
                 compaction_budget_bytes: None,
                 reasoning_effort: None,
+                permission_reviewer: None,
                 extensions: ExtensionSelection::default(),
                 observe: ObserveOptions::default(),
                 login: false,
@@ -1284,6 +1299,7 @@ impl RawArgsParser {
             "--auto-compaction" => self.parse_auto_compaction(args),
             "--compaction-budget-bytes" => self.parse_compaction_budget_bytes(args),
             "--reasoning-effort" => self.parse_reasoning_effort(args),
+            "--permission-reviewer" => self.parse_permission_reviewer(args),
             "--extensions" => self.parse_extensions(args),
             "--observe" => self.parse_observe(args),
             "--observe-cadence" => self.parse_observe_cadence(args),
@@ -1617,6 +1633,22 @@ impl RawArgsParser {
         Ok(ArgParseFlow::Continue)
     }
 
+    fn parse_permission_reviewer(
+        &mut self,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<ArgParseFlow> {
+        if self.parsed.permission_reviewer.is_some() {
+            return Err(anyhow!("--permission-reviewer was provided more than once"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| anyhow!("--permission-reviewer requires a value"))?;
+        let reviewer = PermissionReviewer::parse(&value)
+            .ok_or_else(|| anyhow!("--permission-reviewer must be one of user|guardian"))?;
+        self.parsed.permission_reviewer = Some(reviewer);
+        Ok(ArgParseFlow::Continue)
+    }
+
     fn parse_extensions(
         &mut self,
         args: &mut impl Iterator<Item = String>,
@@ -1765,6 +1797,7 @@ fn build_run_args(
         auto_compaction: parsed.auto_compaction,
         compaction_budget_bytes: parsed.compaction_budget_bytes,
         reasoning_effort: parsed.reasoning_effort,
+        permission_reviewer: parsed.permission_reviewer,
         extensions: parsed.extensions.clone(),
         observe,
         linefeed_history_insert: parsed.linefeed_history_insert.unwrap_or(parsed.tui),

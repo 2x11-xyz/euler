@@ -357,6 +357,8 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 allowed,
                 grant_scope,
                 instruction,
+                decision_source,
+                rationale,
             } => {
                 render_permission_decision(
                     &mut lines,
@@ -366,6 +368,8 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                         allowed: *allowed,
                         grant_scope: grant_scope.as_deref(),
                         instruction: instruction.as_deref(),
+                        decision_source: decision_source.as_deref(),
+                        rationale: rationale.as_deref(),
                     },
                     theme,
                     width,

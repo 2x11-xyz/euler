@@ -54,6 +54,10 @@ pub struct StatusSnapshot {
     /// `None` until named — unnamed sessions show nothing in the footer.
     pub session_name: Option<String>,
     pub extension_slots: StatusSlots,
+    /// Non-default permission reviewer label (ADR 0011): `Some("guardian")`
+    /// when the guardian reviews asks; `None` for the default user reviewer.
+    /// Surfaced by `/status`, not the footer.
+    pub permission_reviewer: Option<String>,
 }
 
 impl StatusSnapshot {
@@ -67,6 +71,7 @@ impl StatusSnapshot {
             git_branch: None,
             session_name: None,
             extension_slots: StatusSlots::default(),
+            permission_reviewer: None,
         }
     }
 }

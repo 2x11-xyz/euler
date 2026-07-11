@@ -142,14 +142,20 @@ impl AppCore {
 
     pub(super) fn show_status(&mut self) -> CoreEffect {
         let session = self.status.session_id.as_deref().unwrap_or("none");
-        self.summary_item(format!(
+        let mut status = format!(
             "session: {session}\nmodel: {}::{}\neffort: {}\ntheme: {} ({})",
             self.status.provider,
             self.status.model,
             self.current_reasoning_effort().as_str(),
             self.theme_choice.label(),
             self.theme_choice.as_str()
-        ))
+        );
+        // ADR 0011 visibility: say so whenever a non-default reviewer
+        // resolves permission asks in place of the user.
+        if let Some(reviewer) = self.status.permission_reviewer.as_deref() {
+            status.push_str(&format!("\npermission reviewer: {reviewer}"));
+        }
+        self.summary_item(status)
     }
 
     pub(super) fn set_theme(&mut self, choice: ThemeChoice) -> CoreEffect {
