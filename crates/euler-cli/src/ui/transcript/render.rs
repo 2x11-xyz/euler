@@ -285,6 +285,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 output,
                 exit_code,
                 grant_source,
+                static_safe,
             } => {
                 render_tool_run(
                     &mut lines,
@@ -295,6 +296,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                         output,
                         exit_code: *exit_code,
                         grant_source: grant_source.as_deref(),
+                        static_safe: *static_safe,
                     },
                     theme,
                     width,
@@ -1102,6 +1104,7 @@ mod tests {
             output: "line 1\nline 2\nline 3\nline 4\ntest result: ok. 12 passed; 0 failed\ntail 1\ntail 2\n".to_owned(),
             exit_code: Some(0),
             grant_source: None,
+            static_safe: false,
         };
 
         let lines = render_projected_items(

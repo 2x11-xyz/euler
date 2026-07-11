@@ -9,6 +9,8 @@ pub(in crate::ui::transcript) struct ToolRunRender<'a> {
     pub(in crate::ui::transcript) exit_code: Option<i64>,
     /// "session" / "project" when covered by an existing grant.
     pub(in crate::ui::transcript) grant_source: Option<&'a str>,
+    /// Auto-approved by static command-safety analysis.
+    pub(in crate::ui::transcript) static_safe: bool,
 }
 
 pub(in crate::ui::transcript) fn render_tool_run(
@@ -76,6 +78,11 @@ fn tool_run_heading(run: &ToolRunRender<'_>, width: u16, footer: &str) -> String
     let available = content_width(width);
     let reserved = display_width(BASH_PREFIX)
         + grant_suffix.as_deref().map(display_width).unwrap_or(0)
+        + if run.static_safe {
+            display_width(" · safe")
+        } else {
+            0
+        }
         + display_width(" · ")
         + display_width(footer);
     let command_budget = available.saturating_sub(reserved);
@@ -90,6 +97,11 @@ fn tool_run_heading(run: &ToolRunRender<'_>, width: u16, footer: &str) -> String
         // Provenance trace of an existing grant lives on the header (dim),
         // not as a standalone decision record (review v2 §8).
         heading.push_str(&suffix);
+    }
+    if run.static_safe {
+        // Static-safety auto-approvals get the same quiet header trace: the
+        // mode=static-safe decision record is suppressed in the transcript.
+        heading.push_str(" · safe");
     }
     heading
 }

@@ -27,6 +27,12 @@ pub struct PermissionRequest {
     pub command_truncated: bool,
     /// Optional workspace-relative path for fs-write scope matching / derivation.
     pub path: Option<PathBuf>,
+    /// Execution cwd for shell requests (`sh -c` runs here). Segment-safety
+    /// composition and static-safe analysis reason about workspace
+    /// confinement relative to this root; `None` disables the statically-
+    /// safe escape hatch in scoped matching (fail closed to token-only
+    /// coverage).
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl PermissionRequest {
@@ -37,7 +43,13 @@ impl PermissionRequest {
             command: None,
             command_truncated: false,
             path: None,
+            workspace_root: None,
         }
+    }
+
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = Some(root.into());
+        self
     }
 
     pub fn with_command(mut self, command: impl Into<String>) -> Self {
@@ -364,21 +376,22 @@ impl<D> PermissionGate<D> {
     pub fn granted_source(&self, request: &PermissionRequest) -> Option<GrantSource> {
         let command = request.command_for_matching();
         let path = request.path.as_deref();
+        let root = request.workspace_root.as_deref();
         if self
             .session_grants
-            .is_granted(request.capability, command, path)
+            .is_granted(request.capability, command, path, root)
         {
             return Some(GrantSource::Session);
         }
         if self
             .project_grants
-            .is_granted(request.capability, command, path)
+            .is_granted(request.capability, command, path, root)
         {
             return Some(GrantSource::Project);
         }
         if self
             .user_grants
-            .is_granted(request.capability, command, path)
+            .is_granted(request.capability, command, path, root)
         {
             return Some(GrantSource::User);
         }

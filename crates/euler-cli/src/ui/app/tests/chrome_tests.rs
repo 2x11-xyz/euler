@@ -754,6 +754,7 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
             output: "exit 0\nfile".to_owned(),
             exit_code: Some(0),
             grant_source: None,
+            static_safe: false,
         }]),
         &theme,
         80,
@@ -786,6 +787,7 @@ fn finalized_tool_output_batch_separates_following_assistant_prose() {
         output: "last tool output row".to_owned(),
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     });
     render_compact_frame(&mut terminal, &mut core);
 

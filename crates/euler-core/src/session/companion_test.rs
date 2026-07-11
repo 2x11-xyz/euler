@@ -2,6 +2,7 @@ use super::*;
 use crate::canvas::{assemble_canvas, canvas_prompt, CompactionTier};
 use crate::permissions::{DeciderVerdict, PermissionRequest, ScriptedDecider};
 use crate::{read_provenance, ProvenanceWriter, SessionConfig};
+use crate::{GrantScope, ScopePattern};
 use euler_agents::{AgentBudget, MAX_OUTPUT_BYTES};
 use euler_provider::{
     FixtureResponse, ModelProvider, ProviderStream, ScriptedProvider, StopReason, ToolCall,
@@ -43,6 +44,68 @@ fn companion_tool_output_is_redacted() {
         .expect("tool output");
     assert!(!output.contains("sk-or-v1-abcdefghijklmnop"), "{output}");
     assert!(output.contains("[redacted-secret]"));
+}
+
+#[test]
+#[cfg(unix)]
+fn companion_scoped_fs_grant_does_not_cover_symlink_escapes() {
+    // Twin of the root-session canonicalization test (security audit): the
+    // companion permission gate builds requests through the same
+    // permission_request_for_tool seam, so a scoped `src` grant installed
+    // mid-companion must not cover `src/link.txt` when the link resolves
+    // outside the granted subtree — prefix-matching the RAW path would
+    // borrow the grant.
+    let (temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-inside".to_owned(),
+                name: "edit_file".to_owned(),
+                input: json!({"path": "src/lib.rs", "old": "alpha", "new": "beta"}),
+            }]),
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-symlink".to_owned(),
+                name: "edit_file".to_owned(),
+                input: json!({"path": "src/link.txt", "old": "alpha", "new": "beta"}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]),
+        ScriptedDecider::new(vec![
+            DeciderVerdict::AllowScoped(GrantScope::Session(
+                ScopePattern::new("src").expect("pattern"),
+            )),
+            DeciderVerdict::Deny,
+        ]),
+    );
+    std::fs::create_dir(temp.path().join("src")).expect("src dir");
+    std::fs::write(temp.path().join("src/lib.rs"), "alpha").expect("seed lib");
+    std::fs::write(temp.path().join("outside.txt"), "alpha").expect("seed outside");
+    std::os::unix::fs::symlink(
+        temp.path().join("outside.txt"),
+        temp.path().join("src").join("link.txt"),
+    )
+    .expect("symlink");
+
+    let summary = session
+        .spawn_companion(task_with_caps([Capability::FsWrite]))
+        .expect("companion");
+    assert!(summary.result.ok());
+
+    // Covered write inside the granted subtree went through; the `..`
+    // escape re-prompted (second scripted verdict) and was denied.
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("src/lib.rs")).expect("lib"),
+        "beta"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("outside.txt")).expect("outside"),
+        "alpha"
+    );
+    let prompts = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
+        .count();
+    assert_eq!(prompts, 2, "the symlink escape must re-prompt, not inherit");
 }
 
 #[test]

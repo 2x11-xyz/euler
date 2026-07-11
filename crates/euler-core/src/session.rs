@@ -1799,6 +1799,7 @@ impl<D: PermissionDecider> Session<D> {
         sink.flush(self.bus.events());
 
         let mut covered_grant_source: Option<crate::GrantSource> = None;
+        let mut static_safe = false;
         if let Some(capability) = self
             .tools
             .required_capability_for_input(&call.name, &call.input)
@@ -1817,36 +1818,45 @@ impl<D: PermissionDecider> Session<D> {
                 )?;
                 return Ok(());
             }
-            let mut request = permission_request_for_tool(
+            let request = permission_request_for_tool(
                 capability,
                 &self.tools.permission_reason(&call.name, &call.input),
                 &call.name,
                 &call.input,
+                &self.tools,
             );
-            // Scoped fs-write grants match the canonicalized workspace-
-            // relative path (`..`/symlinks resolved exactly as the write
-            // resolves them), so `src/../Cargo.toml` or a symlink inside the
-            // granted subtree cannot borrow its grant. An unresolvable path
-            // clears the field: scoped grants then never match and the
-            // request falls back to the ask path.
-            if capability == Capability::FsWrite {
-                request.path = request
-                    .path
-                    .as_deref()
-                    .and_then(|path| self.tools.workspace_relative_path(&path.to_string_lossy()));
-            }
             let mode = self.permissions.mode(capability);
+            // Statically-safe read-only shell commands run under `ask`
+            // without a prompt (issue #78): recorded as a fresh
+            // permission.decision with mode "static-safe" — allowed-once
+            // semantics, no grant installed, parented to the tool call. The
+            // check sits before grant coverage so the ledger attributes the
+            // run to the analysis, not to an unrelated grant. It never
+            // applies under always-deny, and a denial earlier this turn
+            // still short-circuits above. A TRUNCATED command is never
+            // analyzed: the bounded prefix could parse as safe while
+            // `sh -c` runs the full string (security review, #66 class) —
+            // decomposing a truncated command is decomposing a lie.
+            static_safe = mode == ApprovalMode::Ask
+                && capability == Capability::ShellExec
+                && !request.command_truncated
+                && request.command.as_deref().is_some_and(|command| {
+                    crate::command_safety::is_statically_safe_command(command, self.tools.root())
+                });
+            if static_safe {
+                self.emit_static_safe_decision(capability, tool_call_event_id.clone())?;
+            }
             // A request covered by an existing session/project grant runs
             // under THAT decision: no prompt, and no fresh permission.decision
             // event — recording "allowed once" here would misstate what the
             // user actually granted (review v2 §8). The tool result carries a
             // `grant_source` tag so the ledger can show `· session grant`.
-            covered_grant_source = if mode == ApprovalMode::Ask {
+            covered_grant_source = if mode == ApprovalMode::Ask && !static_safe {
                 self.permissions.granted_source(&request)
             } else {
                 None
             };
-            if covered_grant_source.is_none() {
+            if covered_grant_source.is_none() && !static_safe {
                 let needs_prompt = mode == ApprovalMode::Ask;
                 let prompt_id = if needs_prompt {
                     let prompt_id = self.emit(
@@ -1984,6 +1994,12 @@ impl<D: PermissionDecider> Session<D> {
                     // decision record (review v2 §8).
                     payload.insert("grant_source".to_owned(), source.as_str().into());
                 }
+                if static_safe {
+                    // Ran under static command-safety analysis — the ledger
+                    // shows a dim `· safe` on the tool header (the decision
+                    // record itself is suppressed like covered grants).
+                    payload.insert("static_safe".to_owned(), true.into());
+                }
                 self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
                 crate::diagnostics::tool_exec_end(
                     &self.config.session_id,
@@ -2012,6 +2028,33 @@ impl<D: PermissionDecider> Session<D> {
             }
         }
         Ok(())
+    }
+
+    /// Record the allowed-once decision for a statically-safe shell command
+    /// (issue #78): mode `static-safe`, no prompt, no grant installed,
+    /// parented to the tool call.
+    fn emit_static_safe_decision(
+        &mut self,
+        capability: Capability,
+        tool_call_event_id: String,
+    ) -> Result<String, SessionError> {
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            capability.as_str(),
+            "static-safe",
+            true,
+        );
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            object([
+                ("capability", capability.as_str().into()),
+                ("mode", "static-safe".into()),
+                ("allowed", true.into()),
+                ("decision", "allowed".into()),
+                ("grant_scope", "once".into()),
+            ]),
+            Some(tool_call_event_id),
+        )
     }
 
     /// The error text is what the model reads next round: it must teach that
@@ -2575,8 +2618,10 @@ pub(crate) fn permission_request_for_tool(
     reason: &str,
     tool_name: &str,
     input: &Value,
+    tools: &crate::tools::ToolRegistry,
 ) -> PermissionRequest {
-    let mut request = PermissionRequest::new(capability, reason.to_owned());
+    let mut request =
+        PermissionRequest::new(capability, reason.to_owned()).with_workspace_root(tools.root());
     match tool_name {
         "run_shell" => {
             if let Some(command) = input.get("command").and_then(Value::as_str) {
@@ -2589,6 +2634,20 @@ pub(crate) fn permission_request_for_tool(
             }
         }
         _ => {}
+    }
+    // Scoped fs-write grants match the canonicalized workspace-relative
+    // path (`..`/symlinks resolved exactly as the write resolves them), so
+    // `src/../Cargo.toml` or a symlink inside the granted subtree cannot
+    // borrow its grant. An unresolvable path clears the field: scoped
+    // grants then never match and the request falls back to the ask path.
+    // Living HERE means every permission gate — root session AND companion
+    // loop — gets the same resolution; a caller-side fix-up covers one gate
+    // and silently misses the twin (security audit finding).
+    if capability == Capability::FsWrite {
+        request.path = request
+            .path
+            .as_deref()
+            .and_then(|path| tools.workspace_relative_path(&path.to_string_lossy()));
     }
     request
 }

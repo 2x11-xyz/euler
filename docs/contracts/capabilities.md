@@ -138,14 +138,12 @@ recorded as a `permission.decision` event with `grant_scope: "user"` (and
 the pattern). Silent user-store mutation is forbidden.
 
 Pattern semantics for `shell-exec` are a **command prefix over the parsed
-first token** of a simple command line — a rule `cargo` covers any command
-whose first token is `cargo`, exactly as session/project token scopes match
-today, and therefore never covers a compound line (control operators,
-substitution, redirection fall back to ask; see the simple-command gate).
-Per-segment composition across compound commands — a prefix rule covering a
-compound iff every segment is safe or prefix-covered — is a follow-up that
-lands with the safe-command analysis (issue #78); until then compound
-commands always re-ask.
+first token** — a rule `cargo` covers any command whose first token is
+`cargo`, exactly as session/project token scopes match. Coverage composes
+per segment (issue #78, see "Static command safety"): a prefix rule covers
+a compound command iff it parses into plain segments and every segment is
+either statically safe or prefix-covered. Unparseable commands (redirects,
+substitution, subshells) are never covered and always re-ask.
 
 A run covered by an existing user rule executes under that original
 decision: no fresh `permission.decision` event, and the tool result carries
@@ -156,6 +154,89 @@ alongside once/session/project — and only when it is honest: a prefix must
 derive from a simple shell command AND the session must hold a loaded user
 store. Unscoped or compound asks never show the option, and a session
 without a resolvable user grant dir hides it entirely.
+
+### Static command safety
+
+Core performs static analysis of `shell-exec` command lines
+(`euler-core/src/command_safety.rs`). Execution is `sh -c <command>`, so the
+analysis reasons about the whole line:
+
+- **Parsing.** A command line decomposes into plain segments across `&&`,
+  `||`, `;`, `|`, and newlines. The tokenizer honors single/double quotes
+  (quoted metacharacters are literal text, never operators). Any redirect
+  (`>`, `<`, `>>`, `<<`), subshell/grouping/brace form (`(`, `)`, `{`, `}`),
+  substitution or expansion (`$`, backtick — including inside double
+  quotes), background `&`, comment, unterminated quote, or empty segment
+  makes the whole command **not statically analyzable**. Unparseable
+  commands are never auto-approved and never covered by scoped grants; they
+  fall to the ask path. False negatives cost a prompt; false positives are
+  forbidden.
+- **Classification.** Each segment's argv is checked against a behavioral
+  allowlist of read-only binaries: `cat cd cut echo expr false grep head id
+  ls nl paste pwd rev seq stat tail tr true uname uniq wc which whoami`,
+  plus flag-inspected binaries that are safe only in read-only form: `find`
+  (no `-exec`/`-execdir`/`-ok`/`-okdir`/`-delete`/`-fls`/
+  `-fprint`/`-fprint0`/`-fprintf`), `rg` (no `--pre`/`--hostname-bin`/
+  `--search-zip`/`-z`, including bundled shorts), `base64` (no
+  `-o`/`--output`), `sed` (only `sed -n Np` / `sed -n M,Np` print-range
+  form), `git` (only `status`/`log`/`diff`/`show`/`branch` as the token
+  immediately after `git` — any global flag rejects — with no
+  `--output`/`--ext-diff`/`--textconv`/`--exec` args, and `branch` only as
+  a pure listing query). Binary names match the first token exactly
+  (`/bin/ls` and `env ls` do not match); unquoted globs reject the
+  flag-inspected binaries because runtime expansion could inject
+  flag-shaped tokens.
+- **Workspace confinement.** Read-only is not harmless: `cat
+  ~/.aws/credentials` writes nothing and still exfiltrates. Every argument
+  of a safe segment that may name a filesystem path must stay inside the
+  workspace root the command executes in: an existing path must
+  canonicalize (symlinks resolved) under the canonicalized root; a
+  non-existing argument must be relative with no `..` component, no leading
+  `~`, and no `$`/backtick. A sensitive-basename denylist (`.env*`, names
+  containing `secret`/`credential`, `id_rsa`, `id_ed25519`, `*.pem`,
+  `*.key`) rejects even inside the workspace. Argument positions are
+  classified conservatively — only the grep/rg pattern position is exempt,
+  and only when no `-e`/`-f`-style flag can shift it; `--flag=value` values
+  are checked, and flags that could carry an attached path reject. A
+  rejected segment is simply not statically safe: the command falls back to
+  the ordinary ask path (fail open to ask, never a new denial surface).
+- A command is **statically safe** iff it parses AND every segment is safe
+  AND every segment's path arguments are confined to the workspace.
+
+**Auto-approval under `ask`.** When `shell-exec` is in `ask` mode, a
+statically-safe command runs without a prompt. The run is recorded as a
+fresh `permission.decision` with `mode: "static-safe"`, `allowed: true`,
+`grant_scope: "once"`, parented to the `tool.call` — allowed-once
+semantics; **no grant is installed** and no prompt event is emitted. The
+static-safe check precedes grant-coverage matching, so the ledger
+attributes such runs to the analysis rather than to an unrelated grant.
+Static safety never bypasses `always-deny`, and a capability denial earlier
+in the same turn still short-circuits the tool call. A command truncated at
+the retention bound is never analyzed (and never matches scoped grants):
+any permission decision must be based on exactly what will execute, or fail
+closed to the ask path.
+
+**Ledger treatment.** The decision event keeps provenance honest, but the
+transcript does not render it as a standalone record — the
+standalone-record-per-call noise is exactly what covered grants eliminated
+(review v2 §8). Instead the `tool.result` carries `static_safe: true` and
+the tool header shows a dim `· safe` tag, matching the covered-grant
+`· session grant` header treatment.
+
+**Segment-aware grant coverage.** Scoped `shell-exec` grant matching uses
+the same segment analysis: a command is covered iff it parses into plain
+segments and EVERY segment either has a granted first token or is
+statically safe — with at least one segment actually matching a granted
+token (an all-safe command is attributed to the static-safe path, never to
+an unrelated grant). Tokens pool within one store: `cargo test && npm run
+lint` is covered when the session store (or the project store) grants both
+`cargo` and `npm`; a compound whose segments straddle the two stores falls
+back to ask so the ledger's single `grant_source` tag stays honest.
+Unparseable commands are never covered. The approval panel offers a token
+scope only when the gate could actually grant it for the live command:
+when every non-statically-safe segment shares one first token, that token
+is offered; otherwise (distinct unsafe tokens, unparseable command) only
+allow-once / unscoped / deny are offered.
 
 ### Revocation and listing
 

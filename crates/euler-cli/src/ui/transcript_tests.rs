@@ -617,6 +617,54 @@ fn tui_history_suppresses_routine_allow_permission_rows() {
 }
 
 #[test]
+fn tui_static_safe_run_tags_header_and_suppresses_decision_record() {
+    // Issue #78: a statically-safe auto-approval records a
+    // mode=static-safe permission.decision in provenance, but the ledger
+    // shows a dim `· safe` on the tool header instead of a standalone
+    // decision record — the covered-grant precedent (review v2 §8).
+    let events = vec![
+        tool_call(
+            "call-safe",
+            "run_shell",
+            serde_json::json!({"command": "ls | wc -l"}),
+        ),
+        event(
+            EventKind::PERMISSION_DECISION,
+            object([
+                ("capability", "shell-exec".into()),
+                ("mode", "static-safe".into()),
+                ("decision", "allowed".into()),
+                ("allowed", true.into()),
+                ("grant_scope", "once".into()),
+            ]),
+        ),
+        event(
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", "call-safe".into()),
+                ("name", "run_shell".into()),
+                ("ok", true.into()),
+                ("output", "3".into()),
+                ("exit_code", 0.into()),
+                ("static_safe", true.into()),
+            ]),
+        ),
+    ];
+    let theme = Theme::default();
+
+    let contents = rendered_screen(&events, &theme, 80, 8);
+
+    assert!(
+        contents.contains("bash $ ls | wc -l · safe"),
+        "contents: {contents:?}"
+    );
+    assert!(
+        !contents.contains("allowed once · shell-exec"),
+        "contents: {contents:?}"
+    );
+}
+
+#[test]
 fn tui_permission_decisions_render_approved_and_canceled_notices() {
     let events = vec![
         event(
@@ -1480,6 +1528,7 @@ fn tui_tool_output_trims_trailing_blank_rows_before_rendering() {
         output: "visible\n\n\n\n\n".to_owned(),
         exit_code: None,
         grant_source: None,
+        static_safe: false,
     }];
 
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
@@ -1516,6 +1565,7 @@ fn tool_run_header_tags_covering_grant_source() {
             output: "ok".to_owned(),
             exit_code: Some(0),
             grant_source: Some("user".to_owned()),
+            static_safe: false,
         },
         TranscriptItem::ToolRun {
             command: "cargo build".to_owned(),
@@ -1524,6 +1574,7 @@ fn tool_run_header_tags_covering_grant_source() {
             output: "ok".to_owned(),
             exit_code: Some(0),
             grant_source: Some("session".to_owned()),
+            static_safe: false,
         },
     ];
 
@@ -1551,6 +1602,7 @@ fn tool_artifact_cell_handles_empty_output_without_fold_affordance() {
         output: String::new(),
         exit_code: None,
         grant_source: None,
+        static_safe: false,
     }];
 
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
@@ -1589,6 +1641,7 @@ fn tool_artifact_cell_folds_only_above_threshold() {
             output: exact_output,
             exit_code: Some(0),
             grant_source: None,
+            static_safe: false,
         }],
         &theme,
         80,
@@ -1602,6 +1655,7 @@ fn tool_artifact_cell_folds_only_above_threshold() {
             output: overflowing_output,
             exit_code: Some(0),
             grant_source: None,
+            static_safe: false,
         }],
         &theme,
         80,
@@ -1630,6 +1684,7 @@ fn tool_artifact_cell_expands_with_unbounded_limit() {
         output,
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     let folded = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -1665,6 +1720,7 @@ fn tool_artifact_flat_style_survives_fold_and_expand() {
         output,
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     let folded_lines = render_items_for_history(&item, &theme, 80);
@@ -1708,6 +1764,7 @@ fn tool_artifact_flat_style_handles_empty_output() {
         output: String::new(),
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     for (label, lines) in [
@@ -1737,6 +1794,7 @@ fn tool_artifact_cell_sanitizes_controls_tabs_and_bounds_width() {
             .to_owned(),
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     for width in [8, 12, 24, 80] {
@@ -1777,6 +1835,7 @@ fn tool_artifact_cell_uses_available_width_for_long_command_title() {
         output: "done".to_owned(),
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     let wide = line_texts(&render_items_for_history(&item, &theme, 120));
@@ -1815,6 +1874,7 @@ fn tool_artifact_cell_truncates_command_not_metadata_at_narrow_widths() {
         output,
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     for width in [30u16, 40, 50, 60, 80] {
@@ -1854,6 +1914,7 @@ fn tool_artifact_cell_keeps_minimum_width_at_tiny_widths() {
         output: "ok".to_owned(),
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     for width in [0, 1, 2, 3] {
@@ -1889,6 +1950,7 @@ fn tool_artifact_cell_reports_failure_without_exit_code() {
         output: String::new(),
         exit_code: None,
         grant_source: None,
+        static_safe: false,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
@@ -1916,6 +1978,7 @@ fn collapsed_tool_run_previews_head_and_tail_in_buffer_order() {
         output,
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
@@ -1986,6 +2049,7 @@ fn collapsed_tool_run_keeps_test_summary_visible_in_tail() {
             .to_owned(),
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 96));
@@ -2019,6 +2083,7 @@ fn collapsed_tool_run_short_output_renders_whole_without_marker() {
         output: "src/lib.rs:3\nsrc/main.rs:5\n8 matches\n".to_owned(),
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 96));
@@ -2179,6 +2244,7 @@ fn expanded_tool_run_keeps_full_output_without_result_line_prefix() {
         output,
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }];
 
     let expanded = line_texts(&render_items_for_history_with_limit(
@@ -3549,6 +3615,7 @@ fn failed_tool_run_previews_head_and_tail_in_buffer_order() {
         output,
         exit_code: Some(101),
         grant_source: None,
+        static_safe: false,
     }];
 
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));

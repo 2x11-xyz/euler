@@ -1,6 +1,7 @@
 use super::patch_diff::{self, PatchDisplay};
 use super::text::{display_width, wrap_text};
 use super::theme::Theme;
+use euler_core::command_safety::{parse_plain_segments, CommandSegment};
 use euler_core::grants::{command_first_token, shell_command_is_simple};
 use euler_core::permissions::PermissionRequest;
 use euler_core::{parse_single_file_apply_patch, ApplyPatchDocument};
@@ -243,32 +244,59 @@ pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String>
         return None;
     }
     match request.capability {
-        Capability::ShellExec => request.command.as_deref().and_then(derive_shell_prefix),
+        Capability::ShellExec => request
+            .command
+            .as_deref()
+            .and_then(|command| derive_shell_prefix(command, request.workspace_root.as_deref())),
         Capability::FsWrite => request.path.as_deref().and_then(derive_edit_prefix),
         _ => None,
     }
 }
 
-pub(crate) fn derive_shell_prefix(command: &str) -> Option<String> {
-    // Scoped shell grants never cover compound commands (control operators,
-    // substitution, redirection — the gate matches what `sh -c` actually
-    // executes). Offering a token scope for a compound command is dishonest:
-    // the grant could not even cover a rerun of this command. Compound
-    // commands get the unscoped (whole-capability) options instead.
-    if !shell_command_is_simple(command) {
-        return None;
-    }
-    command_first_token(command).map(str::to_owned)
+/// Scope offering for a live shell command (issues #61/#78). Grant coverage
+/// is segment-aware, so the panel only offers a token the gate could
+/// actually grant for THIS command:
+///
+/// - unparseable command (redirects, substitution, …) → `None`: no token
+///   scope can ever cover it, so offering one would be dishonest (#61);
+/// - every non-statically-safe segment shares one first token → offer that
+///   token (a grant on it covers the whole command: granted segments plus
+///   statically-safe segments);
+/// - multiple distinct unsafe tokens → `None`: a single token grant cannot
+///   cover the command, so the panel falls back to unscoped labels;
+/// - all segments statically safe (normally auto-approved before any
+///   prompt) → the first segment's token.
+///
+/// Static safety includes workspace confinement, so it needs the execution
+/// cwd from the request; without one no segment counts as safe and the
+/// offer follows the same fail-closed rule as coverage.
+pub(crate) fn derive_shell_prefix(command: &str, workspace_root: Option<&Path>) -> Option<String> {
+    let segments = parse_plain_segments(command)?;
+    let mut unsafe_tokens = segments
+        .iter()
+        .filter(|segment| !workspace_root.is_some_and(|root| segment.is_statically_safe(root)))
+        .map(CommandSegment::first_token);
+    let Some(first) = unsafe_tokens.next() else {
+        return segments
+            .first()
+            .map(|segment| segment.first_token().to_owned())
+            .filter(|token| !token.is_empty());
+    };
+    // An empty token (quoted-empty word) would read back as an unscoped
+    // pattern; never offer it.
+    (!first.is_empty() && unsafe_tokens.all(|token| token == first)).then(|| first.to_owned())
 }
 
 /// Prefix for the durable user-rule option (`u  Allow cargo * always`).
 ///
-/// User rules are command-prefix rules over the parsed first token, so the
-/// option is honest only for a `shell-exec` ask whose command is a single
-/// simple invocation: compound lines (control operators, substitution,
-/// redirection) are never covered by prefix grants and must keep re-asking
-/// until the safe-command composition lands (capabilities contract, #78).
-/// Callers additionally gate on the session having a loaded user store.
+/// User rules are command-prefix rules over the parsed first token. Grant
+/// COVERAGE is segment-aware (#78) — an installed rule covers compounds
+/// whose every segment is granted or statically safe — but the OFFERING
+/// stays deliberately narrower than session/project scopes: a durable rule
+/// spanning every session and project is only proposed from a single simple
+/// invocation, never derived from a compound line. Offering ⊆ coverage
+/// keeps the panel honest. Callers additionally gate on the session having
+/// a loaded user store.
 pub(crate) fn derive_user_rule_prefix(request: &PermissionRequest) -> Option<String> {
     if request.capability != Capability::ShellExec || request.command_truncated {
         // A truncated command may hide metacharacters past the bound; never
@@ -279,7 +307,7 @@ pub(crate) fn derive_user_rule_prefix(request: &PermissionRequest) -> Option<Str
     if !shell_command_is_simple(command) {
         return None;
     }
-    derive_shell_prefix(command)
+    command_first_token(command).map(str::to_owned)
 }
 
 pub(crate) fn derive_edit_prefix(path: &Path) -> Option<String> {

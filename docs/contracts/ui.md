@@ -255,6 +255,12 @@ ledger. Scoped grants and project persistence are defined in
 `docs/contracts/capabilities.md` (when extended); the UI must not claim a
 scope the gate did not grant.
 
+Runs that did not prompt render their provenance as a dim tag on the tool
+header instead of a standalone decision record: `· session grant` /
+`· project grant` for covered grants, `· safe` for static-safety
+auto-approvals (whose `mode: "static-safe"` decision events are suppressed
+from the transcript, like extension `static-grant` records).
+
 ## Non-goals
 
 Do not build:
