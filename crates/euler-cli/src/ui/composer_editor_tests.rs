@@ -382,7 +382,6 @@ fn composer_empty_draft_keeps_single_visible_cursor_row() {
             indicator: None,
             prompt: true,
             text,
-            ghost: false,
             ..
         }] if text.is_empty()
     ));

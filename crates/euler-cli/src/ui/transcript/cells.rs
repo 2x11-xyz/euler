@@ -37,7 +37,8 @@ pub(super) use permission::{
 pub(crate) use shell::normalized_shell_command;
 
 pub(super) use tool_run::{
-    edit_failure_status, most_informative_line, render_tool_run, tool_failure_status, ToolRunRender,
+    edit_failure_status, most_informative_line, normalize_tool_run_output, render_tool_run,
+    tool_failure_status, ToolRunRender,
 };
 
 use tool_run::promote_informative_row;
@@ -543,6 +544,68 @@ mod tests {
     #[test]
     fn most_informative_line_returns_none_without_markers() {
         assert_eq!(most_informative_line("line one\nline two\n"), None);
+    }
+
+    #[test]
+    fn most_informative_line_matches_lowercase_failure_markers() {
+        // Real-world tool output is not consistently uppercase/prefixed —
+        // the scorer must catch lowercase "failed"/"error"/"panicked"/
+        // "warning" the same way it catches "FAILED"/"error:"/"fatal".
+        assert_eq!(
+            most_informative_line("ok\n3 failed, 1 passed\ntail"),
+            Some("3 failed, 1 passed")
+        );
+        assert_eq!(
+            most_informative_line("start\nsomething error occurred\nend"),
+            Some("something error occurred")
+        );
+        assert_eq!(
+            most_informative_line("start\ngoroutine panicked unexpectedly\nend"),
+            Some("goroutine panicked unexpectedly")
+        );
+        assert_eq!(
+            most_informative_line("start\nwarning low disk space\nend"),
+            Some("warning low disk space")
+        );
+    }
+
+    #[test]
+    fn most_informative_line_does_not_match_marker_as_substring_of_other_word() {
+        // Word-boundary tokenizing (not naive lowercase substring matching)
+        // must not treat "errorless"/"warningless" as the "error"/"warning"
+        // marker — this is the concrete false-positive risk a naive
+        // `to_ascii_lowercase().contains(...)` check would introduce.
+        assert_eq!(
+            most_informative_line("a mostly errorless run\nsome other line"),
+            None
+        );
+        assert_eq!(
+            most_informative_line("running in warningless mode\nsome other line"),
+            None
+        );
+    }
+
+    #[test]
+    fn most_informative_line_prefers_test_summary_over_other_signals() {
+        let output = "running 3 tests\ntest foo ... ok\ntest result: ok. 3 passed; 0 failed\n";
+        assert_eq!(
+            most_informative_line(output),
+            Some("test result: ok. 3 passed; 0 failed")
+        );
+    }
+
+    #[test]
+    fn most_informative_line_picks_trailing_match_count_over_earlier_rows() {
+        let output = "src/lib.rs:3:match\nsrc/main.rs:5:match\n8 matches\n";
+        assert_eq!(most_informative_line(output), Some("8 matches"));
+    }
+
+    #[test]
+    fn most_informative_line_returns_none_for_ls_style_listing() {
+        // No test summary, error/panic marker, or count/total row — the
+        // caller (collapsed `└ ` selection) is responsible for falling back
+        // to the last non-empty line in this case.
+        assert_eq!(most_informative_line("Cargo.toml\nsrc\ntarget\n"), None);
     }
 
     #[test]

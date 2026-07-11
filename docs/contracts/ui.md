@@ -59,6 +59,30 @@ emission + unrelated renderers.
   `├` / `└` children with per-step result data.
 - Fold marker language: `… N more lines · ctrl+o expand` (and matching collapse).
 
+### Collapsed tool output preview (v4 spec amendment)
+
+Collapsed tool-run blocks use the Codex head+tail preview model. This
+supersedes the earlier "exactly one `└ ` result line" rule (review v2 §14.2)
+and its most-informative-line scoring: the collapsed preview never selects,
+promotes, or reorders lines.
+
+- **Head** = the literal first **2** buffer lines; **tail** = the literal
+  last **3** buffer lines; both strictly in buffer order. The tail is where
+  test summaries and errors live, so it gets the larger share.
+- The fold marker sits **between** head and tail and carries the hidden
+  count: `… K more lines · ctrl+o expand`, with `K = total − head − tail`.
+- `└` elbow on the first preview line; sibling preview lines (rest of head,
+  marker, tail) are indented two extra spaces to align under it.
+- Outputs short enough to fit (≤ the collapsed row budget, or ≤ head+tail
+  lines) render whole with no marker — head and tail can never overlap.
+- Head 2 / tail 3 keeps the whole collapsed cell (header + 6 preview rows)
+  inside the default 10-row collapsed budget (`TOOL_CALL_MAX_LINES`).
+- The buffer both views render is normalized once at ingest: the leading
+  `exit N` status row run_shell emits is stripped there (the header owns
+  exit status) and trailing whitespace padding is never stored, so the
+  collapsed and expanded views agree on line count and order by
+  construction. The expanded view is the full buffer, in buffer order.
+
 ### Fold
 
 - **One** fold key: `ctrl+o`. **Global toggle** (issue #49), not a per-cell
@@ -66,10 +90,11 @@ emission + unrelated renderers.
   (tool output, reasoning, diffs); the next press collapses them all
   together. No per-cell targeting and no invisible "nearest to viewport
   center" heuristic — this is deliberate: mouse capture is off (native
-  selection and native scrollback stay intact, see the Mouse section), so
-  there is no honest per-cell input method, and a predictable global state
-  beats an invisible one. Native scrollback and `ctrl+f` search remain the
-  navigation tools; `ctrl+o` only decides how much of each cell is showing.
+  selection and native scrollback stay intact outside of resize
+  reconciliation, see the Mouse section), so there is no honest per-cell
+  input method, and a predictable global state beats an invisible one.
+  Native scrollback and `ctrl+f` search remain the navigation tools; `ctrl+o`
+  only decides how much of each cell is showing.
 - Search and other read-only modes must not mutate fold state.
 
 ### Typography
@@ -136,12 +161,65 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
 
 Mouse capture is deliberately off (terminal enter-session modes never emit
 `\x1b[?1000h`/`\x1b[?1006h`) so the terminal's native text selection and
-native scrollback stay fully usable — copying transcript text and scrolling
-back through history work exactly as they would in any other CLI output. A
-practical consequence: crossterm never delivers mouse events in a real
-terminal, so click/drag is not a supported input path — there is no
-click-to-expand affordance. `ctrl+o` (global fold toggle) and `ctrl+f`
-(search) are the supported disclosure and navigation controls.
+native scrollback stay usable — copying transcript text and scrolling back
+through history work as they would in any other CLI output, **with the one
+exception below for resize reconciliation**. A practical consequence:
+crossterm never delivers mouse events in a real terminal, so click/drag is
+not a supported input path — there is no click-to-expand affordance.
+`ctrl+o` (global fold toggle) and `ctrl+f` (search) are the supported
+disclosure and navigation controls.
+
+**Resize exception — settled-resize scrollback purge (issue #38).** Per-tick
+incremental append during a resize corrupted output in all three major
+terminals tested (Ghostty, iTerm2, Terminal.app): stale-viewport re-renders
+scrolled prior rows into native scrollback, accumulating one fossil
+transcript copy per width tick. There is no terminal escape/control sequence
+that scopes a scrollback purge to "only euler's rows" — `ESC[3J` (and the
+native scrollback buffer generally) is all-or-nothing per terminal session.
+Given that constraint, the mechanism is: intermediate resize ticks re-render
+the live viewport only (no scrollback writes); once the resize settles (a
+450ms trailing debounce with no further resize events), euler runs exactly
+ONE purge+replay — it clears the entire native scrollback buffer (`ESC[2J`
++ `ESC[3J`), **including any content the user had in their terminal before
+euler started**, and re-emits euler's own transcript from its internal
+event-log model at the settled width. This is a deliberate, disclosed
+trade-off, not an oversight: it is strictly better than the fossil-copy
+corruption it replaces, but it does mean a user who resizes their terminal
+loses pre-euler scrollback history.
+
+Full-repaint invariants (settled-resize replay, `ctrl+o` fold toggle, theme
+switch, resume — anything that clears the surface and rebuilds it):
+
+- **Live geometry.** A repaint reads the terminal's live dimensions at the
+  moment it runs; a resize event only updates the cached size and schedules
+  the repaint. No repaint may consume dimensions older than the most recent
+  resize event already drained.
+- **Fresh anchor.** The anchor is recomputed from scratch: content shorter
+  than the screen with nothing committed above is top-anchored (the
+  session-start layout); otherwise the bottom chrome pins to the screen
+  bottom.
+- **Every row painted.** Rows the repaint does not cover are painted with
+  the theme background — never left as terminal-default voids.
+- **Re-emission prints through the screen.** After the clear, the committed
+  history prefix is re-emitted by printing rows through the screen so they
+  physically flow into native scrollback. The scroll-region linefeed bridge
+  is only valid incrementally, when the region above the bottom band still
+  holds the previously committed rows; used right after a clear it scrolls
+  blank rows into scrollback while the viewport draw overpaints the rows it
+  wrote, destroying the history head.
+- **Theme switch history policy.** A theme switch is a full-repaint
+  consumer: the whole region repaints and history is re-emitted in the new
+  theme. History above the fold must remain reachable in scrollback after
+  the switch — old-theme cells are acceptable, a purged-to-void history is
+  not.
+
+> **Owner-acceptance pending (real-terminal dogfood).** This mechanism is
+> PTY-tested (see the drag-resize test in `tests/headless.rs`) but has not
+> yet been hands-on validated by the owner in real terminal emulators
+> (Ghostty, iTerm2, Terminal.app). Treat the purge-on-settled-resize
+> behavior above as a disclosed, not-yet-fully-settled trade-off until that
+> dogfood pass confirms it reads correctly outside of PTY harness
+> reconstruction.
 
 ## Transcript event model
 

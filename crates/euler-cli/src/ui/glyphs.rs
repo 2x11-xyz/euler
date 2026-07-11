@@ -238,6 +238,13 @@ pub(crate) fn user_line_prefix(_first_visual_row: bool) -> &'static str {
     glyph_set().user_rail_prefix()
 }
 
+/// Bare rail glyph (no trailing pad space) for the shared spine-anchor slot
+/// (review v3 §R4) — `stamp_first_line` pads it to `SPINE_WIDTH` itself, the
+/// same as every other anchor glyph.
+pub(crate) fn user_rail() -> &'static str {
+    glyph_set().user_rail()
+}
+
 pub(crate) fn companion_glyph() -> &'static str {
     glyph_set().companion()
 }

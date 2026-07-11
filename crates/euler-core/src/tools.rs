@@ -469,7 +469,11 @@ fn is_secret_env_name(name: &std::ffi::OsStr) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(
         upper.as_str(),
-        "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "OPENROUTER_API_KEY" | "EULER_AUTH_FILE"
+        "ANTHROPIC_API_KEY"
+            | "OPENAI_API_KEY"
+            | "OPENROUTER_API_KEY"
+            | "XAI_API_KEY"
+            | "EULER_AUTH_FILE"
     ) || upper.ends_with("_API_KEY")
         || upper.ends_with("_ACCESS_KEY")
         || upper.split('_').any(|segment| {

@@ -126,7 +126,9 @@ fn built_in_descriptors_include_curated_advisory_metadata() {
 
     let model = model(&catalog, "chatgpt", DEFAULT_CHATGPT_MODEL);
 
-    assert_eq!(model.context_window_tokens(), Some(1_050_000));
+    // pi reference (openai-codex.models.ts): the ChatGPT backend serves
+    // gpt-5.5 with a 272k window, not the platform API's advertised sizes.
+    assert_eq!(model.context_window_tokens(), Some(272_000));
     assert_eq!(model.max_output_tokens(), Some(128_000));
     assert_eq!(model.supports_tools(), Some(true));
     assert_eq!(model.supports_reasoning(), Some(true));

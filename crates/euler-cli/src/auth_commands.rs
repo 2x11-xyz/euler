@@ -68,6 +68,7 @@ fn write_auth_status(storage: &AuthStorage, mut output: impl Write) -> Result<()
         Some("OPENROUTER_API_KEY"),
         &mut output,
     )?;
+    write_auth_status_line(storage, "xai", Some("XAI_API_KEY"), &mut output)?;
     Ok(())
 }
 
@@ -189,6 +190,9 @@ mod tests {
         storage
             .set("openrouter", api_key("$STATUS_OPENROUTER_SECRET_REF"))
             .expect("set");
+        storage
+            .set("xai", api_key("status-xai-secret"))
+            .expect("set");
         let mut output = Vec::new();
 
         print_auth_status_with_path(Some(&path), &mut output).expect("status");
@@ -201,6 +205,7 @@ mod tests {
                 "anthropic: configured=true source=stored status=valid\n",
                 "openai: configured=true source=stored status=valid\n",
                 "openrouter: configured=true source=stored status=valid\n",
+                "xai: configured=true source=stored status=valid\n",
             )
         );
         assert!(!output.contains("status-access-secret"));
@@ -208,6 +213,7 @@ mod tests {
         assert!(!output.contains("status-anthropic-secret"));
         assert!(!output.contains("status-openai-secret"));
         assert!(!output.contains("STATUS_OPENROUTER_SECRET_REF"));
+        assert!(!output.contains("status-xai-secret"));
     }
 
     #[test]
@@ -223,6 +229,7 @@ mod tests {
         assert!(output.contains("anthropic:"));
         assert!(output.contains("openai:"));
         assert!(output.contains("openrouter:"));
+        assert!(output.contains("xai:"));
     }
 
     #[test]

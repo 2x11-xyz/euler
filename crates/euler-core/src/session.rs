@@ -19,6 +19,7 @@ use crate::permissions::{
     ApprovalMode, GrantDecision, GrantSource, PermissionDecider, PermissionGate, PermissionRequest,
 };
 use crate::provenance::ProvenanceWriter;
+use crate::redaction::SecretRedactor;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
@@ -454,6 +455,9 @@ pub struct Session<D> {
     providers: ProviderSet,
     bus: EventBus,
     permissions: PermissionGate<D>,
+    /// Secret redaction applied to tool output before it reaches the canvas
+    /// or the ledger (contract: secrets.md redaction rules; issue #56).
+    redactor: SecretRedactor,
     tools: ToolRegistry,
     provenance: Option<Arc<ProvenanceWriter>>,
     persisted_events: usize,
@@ -717,6 +721,7 @@ impl<D> Session<D> {
             providers,
             bus,
             permissions,
+            redactor: SecretRedactor::from_env(),
             tools,
             provenance: None,
             persisted_events: 0,
@@ -730,11 +735,17 @@ impl<D> Session<D> {
 
     pub fn into_fresh_session(self, session_id: impl Into<String>, decider: D) -> Self {
         let active_target = self.active_target;
+        let redactor = self.redactor;
         let mut config = self.config;
         config.session_id = session_id.into();
         config.provider = active_target.provider;
         config.model = active_target.model;
-        Self::new_with_providers(config, self.providers, decider)
+        let mut fresh = Self::new_with_providers(config, self.providers, decider);
+        // Same user, same process: host-seeded secret values (auth file,
+        // runtime-resolved) carry into the fresh session — /new must not
+        // silently drop redaction back to env-only (review finding on #56).
+        fresh.redactor = redactor;
+        fresh
     }
 
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
@@ -758,6 +769,13 @@ impl<D> Session<D> {
 
     pub fn events(&self) -> &[EventEnvelope] {
         self.bus.events()
+    }
+
+    /// Register a known secret value for redaction from tool output (auth
+    /// credentials, resolved x-secret values). Values shorter than the
+    /// redaction minimum are ignored.
+    pub fn add_redacted_secret(&mut self, value: impl Into<String>) {
+        self.redactor.add_value(value);
     }
 
     pub fn extension_enabled(&self, id: &str) -> bool {
@@ -944,6 +962,13 @@ impl<D> Session<D> {
         &self.active_target
     }
 
+    /// Exposed so callers (e.g. the reviewer-model picker) can check which
+    /// configured providers are actually authenticated before offering them
+    /// as spawn targets, instead of discovering it via a burned spawn (#58).
+    pub fn providers(&self) -> &ProviderSet {
+        &self.providers
+    }
+
     pub fn reasoning_effort(&self) -> ReasoningEffort {
         self.config.reasoning_effort
     }
@@ -1011,6 +1036,7 @@ impl<D> Session<D> {
             providers,
             bus: EventBus { events },
             permissions,
+            redactor: SecretRedactor::from_env(),
             tools,
             provenance: None,
             persisted_events,
@@ -1825,7 +1851,13 @@ impl<D: PermissionDecider> Session<D> {
                 self.emit_permission_denied_tool_result(
                     call,
                     tool_call_event_id,
-                    "permission denied",
+                    &format!(
+                        "permission denied: {} was denied earlier this turn and \
+                         remains denied for the rest of it — do not retry {} \
+                         commands; use a different tool or ask the user",
+                        capability.as_str(),
+                        capability.as_str()
+                    ),
                 )?;
                 return Ok(());
             }
@@ -1896,11 +1928,13 @@ impl<D: PermissionDecider> Session<D> {
         {
             Ok(execution) => {
                 if let Some(patch) = execution.patch {
-                    let payload = object([
+                    let mut payload = object([
                         ("path", patch.path.clone().into()),
                         ("old", patch.before.clone().into()),
                         ("new", patch.after.clone().into()),
                     ]);
+                    self.redactor
+                        .redact_payload_fields(&mut payload, &["old", "new"]);
                     let patch_proposed_id = self.emit_with_parent(
                         EventKind::PATCH_PROPOSED,
                         payload.clone(),
@@ -1913,7 +1947,7 @@ impl<D: PermissionDecider> Session<D> {
                                 ("id", call.id.into()),
                                 ("name", execution.name.into()),
                                 ("ok", false.into()),
-                                ("error", error.to_string().into()),
+                                ("error", self.redactor.redact(&error.to_string()).into()),
                             ]),
                             Some(tool_call_event_id),
                         )?;
@@ -1936,9 +1970,12 @@ impl<D: PermissionDecider> Session<D> {
                         file_change_payload(&call.id, &patch, pre_image_blob.as_deref()),
                         Some(patch_applied_id.clone()),
                     )?;
+                    let mut diff_payload = file_diff_payload(&call.id, &file_change_id, &patch);
+                    self.redactor
+                        .redact_payload_fields(&mut diff_payload, &["diff"]);
                     self.emit_with_parent(
                         EventKind::FILE_DIFF,
-                        file_diff_payload(&call.id, &file_change_id, &patch),
+                        diff_payload,
                         Some(patch_applied_id),
                     )?;
                 }
@@ -1948,9 +1985,13 @@ impl<D: PermissionDecider> Session<D> {
                         observed_file_change_payload(&call.id, "run_shell", change),
                         Some(tool_call_event_id.clone()),
                     )?;
+                    let mut observed_diff =
+                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change);
+                    self.redactor
+                        .redact_payload_fields(&mut observed_diff, &["diff"]);
                     self.emit_with_parent(
                         EventKind::FILE_DIFF,
-                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change),
+                        observed_diff,
                         Some(tool_call_event_id.clone()),
                     )?;
                 }
@@ -1958,7 +1999,7 @@ impl<D: PermissionDecider> Session<D> {
                     ("id", call.id.into()),
                     ("name", execution.name.into()),
                     ("ok", true.into()),
-                    ("output", execution.output.into()),
+                    ("output", self.redactor.redact(&execution.output).into()),
                 ]);
                 if let Some(exit_code) = execution.exit_code {
                     payload.insert("exit_code".to_owned(), exit_code.into());
@@ -1990,7 +2031,7 @@ impl<D: PermissionDecider> Session<D> {
                         ("id", call.id.into()),
                         ("name", call.name.into()),
                         ("ok", false.into()),
-                        ("error", error.to_string().into()),
+                        ("error", self.redactor.redact(&error.to_string()).into()),
                     ]),
                     Some(tool_call_event_id),
                 )?;
@@ -2098,7 +2139,13 @@ impl<D: PermissionDecider> Session<D> {
         } else {
             turn_state.record_denial(capability);
             Ok(PermissionRuling::Denied {
-                message: "permission denied".to_owned(),
+                message: format!(
+                    "permission denied by the user; {} is denied for \
+                     the rest of this turn — do not retry {} commands; \
+                     use a different tool or ask the user",
+                    capability.as_str(),
+                    capability.as_str()
+                ),
             })
         }
     }
@@ -2140,6 +2187,11 @@ impl<D: PermissionDecider> Session<D> {
                 (false, rationale.clone(), verdict.as_ref())
             }
         };
+        // The rationale is model-generated text prompted to hunt secret
+        // exfiltration — it may quote the offending token. Redact once here:
+        // it flows into both the permission.decision payload and the denied
+        // tool result teaching text.
+        let rationale = self.redactor.redact(&rationale);
         self.emit_with_parent(
             EventKind::PERMISSION_DECISION,
             guardian::guardian_decision_payload(capability, allowed, &rationale, verdict),

@@ -10,7 +10,7 @@ use crossterm::{
         Attribute, Color as CrosstermColor, Print, ResetColor, SetAttribute, SetBackgroundColor,
         SetForegroundColor,
     },
-    terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use ratatui::{
     backend::Backend,
@@ -37,6 +37,7 @@ use std::{
 use super::history_insert::{emit_history_lines, plan_history_insert};
 use super::metrics;
 use super::text::display_width;
+#[cfg(test)]
 use super::theme::USER_RAIL_COLOR;
 use super::visual_canvas::{CanvasLine, CanvasSpan, CursorTarget, TextRole, VisualCanvasFrame};
 
@@ -95,11 +96,16 @@ impl TerminalSession {
     pub fn ratatui_terminal(
         &self,
     ) -> Result<InlineTerminal<ratatui::backend::CrosstermBackend<FrameBufferedStdout>>> {
-        let (_, rows) = size()?;
-        let height = rows.max(1);
+        // The active region may cover the whole screen at whatever size the
+        // terminal is NOW. Passing the startup row count here fossilized the
+        // launch height as a permanent clamp: after growing the window, every
+        // repaint kept sizing the viewport to the old height and the extra
+        // rows were never painted (resize dogfood repro 3, giant void).
+        // `resize_active_height` already clamps to the live screen height on
+        // every repaint, which is the honest bound.
         Ok(InlineTerminal::new(
             ratatui::backend::CrosstermBackend::new(FrameBufferedStdout::new()),
-            height,
+            u16::MAX,
         )?)
     }
 }
@@ -286,6 +292,7 @@ where
     foreground: RatatuiColor,
     background: RatatuiColor,
     cursor: RatatuiColor,
+    user_rail: RatatuiColor,
 }
 
 impl<B> InlineTerminal<B>
@@ -323,6 +330,7 @@ where
             foreground: RatatuiColor::Reset,
             background: RatatuiColor::Reset,
             cursor: RatatuiColor::Reset,
+            user_rail: RatatuiColor::Reset,
         })
     }
 
@@ -372,20 +380,46 @@ where
             return Ok(());
         }
         let area = self.viewport_area;
+        let screen_size = self.inner.size()?;
+        let cursor_authoritative = std::mem::take(&mut self.cursor_position_authoritative);
         let writer = self.inner.backend_mut();
         queue_clear_area(writer, area, self.background)?;
-        queue!(writer, MoveTo(0, self.viewport_area.top()))?;
+        queue!(writer, MoveTo(0, area.top()))?;
         for line in &wrapped_lines {
-            write_canvas_row(writer, Some(line), width, self.foreground, self.background)?;
+            write_canvas_row(
+                writer,
+                Some(line),
+                width,
+                self.foreground,
+                self.background,
+                self.user_rail,
+            )?;
             queue!(writer, Print("\r\n"))?;
         }
         queue!(writer, SetAttribute(Attribute::Reset), ResetColor)?;
         flush_terminal_writer(writer)?;
 
-        let screen_size = self.inner.size()?;
-        let cursor_pos = self
-            .queried_cursor_position()
-            .unwrap_or(Position::new(0, self.viewport_area.top()));
+        let cursor_pos = if cursor_authoritative {
+            // A history replay parked the cursor at a known position and the
+            // print loop above advances it deterministically (every row is
+            // pre-wrapped to the width, so no auto-wrap): after R rows each
+            // followed by \r\n from `area.top()`, the cursor sits at
+            // min(top + R, bottom row). Deriving it avoids a DSR round-trip
+            // inside the DEC 2026 guard — which would flush a half-painted
+            // frame — and avoids trusting a cursor report from a terminal
+            // that may still be mid-resize (the reply then describes a grid
+            // we no longer paint against).
+            let rows = u16::try_from(wrapped_lines.len()).unwrap_or(u16::MAX);
+            Position::new(
+                0,
+                area.top()
+                    .saturating_add(rows)
+                    .min(screen_size.height.saturating_sub(1)),
+            )
+        } else {
+            self.queried_cursor_position()
+                .unwrap_or(Position::new(0, area.top()))
+        };
         self.last_known_screen_size = screen_size;
         self.last_reported_resize_size = screen_size;
         self.last_known_cursor_pos = cursor_pos;
@@ -428,7 +462,14 @@ where
         let writer = self.inner.backend_mut();
         let width = usize::from(screen_size.width).max(1);
         emit_history_lines(writer, plan, wrapped_lines, |writer, line| {
-            write_canvas_row(writer, Some(line), width, self.foreground, self.background)
+            write_canvas_row(
+                writer,
+                Some(line),
+                width,
+                self.foreground,
+                self.background,
+                self.user_rail,
+            )
         })?;
         queue!(
             writer,
@@ -587,6 +628,7 @@ where
         foreground: RatatuiColor,
         background: RatatuiColor,
         cursor: RatatuiColor,
+        user_rail: RatatuiColor,
     ) -> io::Result<()> {
         if self.foreground != foreground || self.background != background {
             self.foreground = foreground;
@@ -599,6 +641,10 @@ where
             if let Some(sequence) = terminal_cursor_color_sequence(cursor) {
                 self.write_terminal_sequence(&sequence)?;
             }
+        }
+        if self.user_rail != user_rail {
+            self.user_rail = user_rail;
+            self.invalidate_draw_cache();
         }
         Ok(())
     }
@@ -668,7 +714,17 @@ where
         self.pending_stale_rows.clear();
         self.last_background_fill = None;
         self.review_scroll_offset = 0;
-        self.linefeed_history_insert_suspended_after_resize = false;
+        // The screen (and, on purge, the scrollback) is blank now. The next
+        // history re-commit must PRINT its rows through the screen so they
+        // physically flow into native scrollback — the scroll-region bridge
+        // assumes the region above the bottom band still holds the previous
+        // committed rows, and right after this clear it would scroll BLANK
+        // rows into scrollback while the viewport draw overpaints the rows it
+        // wrote (resize dogfood repros 1/2/5: banner and greeting above the
+        // fold replaced by a void after theme switch / fold toggle). The
+        // suspension flag routes exactly one conservative print-through
+        // commit, then the bridge resumes.
+        self.linefeed_history_insert_suspended_after_resize = true;
         self.invalidate_draw_cache();
         Ok(())
     }
@@ -761,7 +817,32 @@ where
             .min(screen_size.height);
 
         let old_area = self.viewport_area;
-        let mut top = old_area.top().min(screen_size.height.saturating_sub(1));
+        let old_screen = self.last_known_screen_size;
+        let screen_height_changed = screen_size.height != old_screen.height;
+        // Rows the resize just exposed (screen grew taller) start with the
+        // terminal's default background — schedule a theme-background paint
+        // so a size change never leaves terminal-default voids on screen.
+        // Rows the current area covers are skipped at drain time.
+        if screen_size.height > old_screen.height {
+            self.pending_stale_rows
+                .extend(old_screen.height..screen_size.height);
+        }
+        // Recompute the anchor from scratch when this repaint consumes a new
+        // screen HEIGHT: the old top offset described a screen that no longer
+        // exists (keeping it bottom-anchored the transcript at the old offset
+        // with a giant void above after growing the window — resize dogfood
+        // repro 3). Top-anchor when nothing is committed above and the frame
+        // is shorter than the screen (the session-start layout); otherwise
+        // pin the active region's bottom to the screen bottom.
+        let mut top = if screen_height_changed {
+            if self.committed_active_rows == 0 && height < screen_size.height {
+                0
+            } else {
+                screen_size.height.saturating_sub(height)
+            }
+        } else {
+            old_area.top().min(screen_size.height.saturating_sub(1))
+        };
         let mut scrolled = false;
         if top.saturating_add(height) > screen_size.height {
             let scroll_rows = top
@@ -834,6 +915,7 @@ where
                 usize::from(area.width),
                 self.foreground,
                 self.background,
+                self.user_rail,
             )?;
         }
         if repaint_screen_background && self.committed_active_rows == 0 {

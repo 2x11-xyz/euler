@@ -344,6 +344,10 @@ pub(crate) fn approval_option_lines(
             format!("a  Allow {prefix} * for this session"),
             format!("p  Allow {prefix} * in this project"),
         ),
+        None if capability == "shell-exec" => (
+            "a  Allow all shell commands for this session".to_owned(),
+            "p  Allow all shell commands in this project".to_owned(),
+        ),
         None => (
             format!("a  Allow {capability} for this session"),
             format!("p  Allow {capability} in this project"),

@@ -18,6 +18,7 @@ pub mod guardian;
 pub mod home;
 pub mod permissions;
 pub mod provenance;
+pub mod redaction;
 pub mod resume;
 pub mod session;
 pub mod session_kind;

@@ -125,7 +125,12 @@ Extensions gain the authority to run child agents through one SDK method:
   removes the need to use it as the transport.
 - **Budgets**: the task's `AgentBudget` is recorded as today and enforced to
   the extent the child session loop enforces budgets; accounting/escrow
-  remain future work.
+  remain future work. `max_tokens` bounds OUTPUT (completion) tokens only,
+  not total (input+output) usage: it is applied both as the provider-facing
+  `max_output_tokens` request cap and as the round-accounting check (#58).
+  A companion/reviewer sees the whole session canvas as input, which
+  routinely dwarfs an output-scale budget on its own; counting input against
+  the same budget made real sessions unable to complete.
 - **Failure**: worker launch/panic degradation follows the background-agent
   rules above (sanitized failure `agent.result`); `spawn_agent` then returns
   the failure outcome rather than an SDK error, so extensions observe

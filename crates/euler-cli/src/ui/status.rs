@@ -369,27 +369,29 @@ fn join_footer_span_clusters(
     right: Vec<Span<'static>>,
     width: usize,
 ) -> Vec<Span<'static>> {
-    let left_width = spans_width(&left);
     let right_width = spans_width(&right);
-    if left_width + right_width <= width {
-        let gap = width - left_width - right_width;
-        let mut spans = left;
-        if gap > 0 {
-            spans.push(Span::raw(" ".repeat(gap)));
-        }
-        spans.extend(right);
-        return spans;
+    if right_width >= width {
+        // The right cluster (model · ctx N% [· session name]) never yields;
+        // if even it alone can't fit, it gets the whole line.
+        return truncate_spans(&right, width);
     }
 
-    // The path is already squeezed to its minimum inside `status_left_spans`;
-    // this is the last-resort safety net so the line never overflows width.
-    if width > right_width {
-        let mut spans = truncate_spans(&left, width - right_width);
-        spans.extend(right);
-        return spans;
+    // Always reserve at least one column of separation before the right
+    // cluster (v4 dogfood, #round4): the path is already squeezed to its
+    // minimum inside `status_left_spans`, but once the right cluster grows
+    // (adding session name this round) an exact-fit left cluster used to
+    // render with zero gap — `(inte` glued directly against
+    // `z-ai/glm-5.2 · ctx …`. Truncate the left cluster (cwd/branch)
+    // harder instead of ever letting the gap collapse to nothing.
+    let available_for_left = width - right_width;
+    let left_budget = available_for_left - 1;
+    let mut spans = truncate_spans(&left, left_budget);
+    let gap = available_for_left - spans_width(&spans);
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
     }
-
-    truncate_spans(&right, width)
+    spans.extend(right);
+    spans
 }
 
 fn status_line_spans(
@@ -742,6 +744,74 @@ mod tests {
         assert!(rendered.contains("/ commands · …/2x11/euler (main)"));
         assert!(rendered.ends_with("echo · ctx ?%"));
         assert!(display_width(&rendered) < 49);
+    }
+
+    /// Issue #59: a narrower budget that no longer fits the `2x11` component
+    /// must drop that whole component and land on the next `/` boundary
+    /// (`…/euler`), never bisect it (`…11/euler`).
+    #[test]
+    fn narrow_width_truncates_directory_at_component_boundary_not_mid_component() {
+        let mut snapshot =
+            StatusSnapshot::new("fixture", "echo", PathBuf::from("/Users/x/code/2x11/euler"));
+        snapshot.git_branch = Some("main".to_owned());
+        let tokens = TokenUsageSnapshot::default();
+
+        // 4 cells narrower than the `…/2x11/euler` case above — exactly
+        // enough budget for the pre-fix raw cut to land inside "2x11"
+        // ("11/euler"); the fix must sacrifice the whole component instead.
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 45);
+
+        assert!(rendered.contains("/ commands · …/euler (main)"));
+        assert!(!rendered.contains("11/euler"));
+        assert!(display_width(&rendered) < 45);
+    }
+
+    /// Footer §4 (v4 dogfood): once the right cluster grows (model · ctx ·
+    /// session name), a width can exist where the clusters still don't fit
+    /// even after `status_left_spans` squeezes the path to nothing — the
+    /// fallback safety net used to truncate the left cluster to exactly
+    /// `width - right_width` with no gap reserved, so `(inte` butted
+    /// directly against `z-ai/glm-5.2 · ctx …` with zero separation. At
+    /// every width where the left cluster still has content left to show,
+    /// the clusters must keep at least one column of gap, and the right
+    /// cluster's full text must survive intact — the left cluster
+    /// (cwd/branch) truncates harder instead.
+    #[test]
+    fn narrow_width_keeps_a_gap_between_clusters_and_truncates_left_harder() {
+        let mut snapshot = StatusSnapshot::new(
+            "openrouter",
+            "z-ai/glm-5.2",
+            PathBuf::from("/Users/x/code/2x11/euler"),
+        );
+        snapshot.git_branch = Some("integration".to_owned());
+        snapshot.session_name = Some("apple-terminal-v4-test".to_owned());
+        let tokens = TokenUsageSnapshot::default();
+        let right_cluster = "z-ai/glm-5.2 · ctx ?% · apple-terminal-v4-test";
+
+        // 66 is the exact width from the owner's dogfood screenshot where
+        // the fallback collided (`(int` glued to `z-ai/glm-5.2`). Sweep a
+        // wide band of widths — enough above `right_cluster`'s own width
+        // (plus the 2-cell indent and 1-cell body-width margin) that the
+        // right cluster always fits, where the gap invariant must hold.
+        let min_width = display_width(right_cluster) as u16 + 4;
+        for width in min_width..120u16 {
+            let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, width);
+            assert!(
+                display_width(&rendered) <= usize::from(width),
+                "width {width} rendered {rendered:?} overflows"
+            );
+            assert!(
+                rendered.ends_with(right_cluster),
+                "width {width} rendered {rendered:?} must keep the right cluster intact"
+            );
+            let left_of_right = rendered
+                .strip_suffix(right_cluster)
+                .expect("right cluster suffix");
+            assert!(
+                left_of_right.ends_with(' '),
+                "width {width} rendered {rendered:?} must keep >=1 column of gap before the right cluster"
+            );
+        }
     }
 
     #[test]
