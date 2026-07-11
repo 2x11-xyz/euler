@@ -1954,34 +1954,60 @@ fn collapsed_tool_run_result_line_dedupes_against_sanitized_row() {
     );
 }
 
-#[test]
-fn collapsed_tool_run_strips_leading_literal_exit_code_row() {
-    let theme = Theme::default();
-    let item = [TranscriptItem::ToolRun {
-        command: "printf leaked".to_owned(),
-        ok: true,
-        error: String::new(),
-        output: "exit 0\nreal output".to_owned(),
-        exit_code: Some(0),
-        grant_source: None,
-    }];
-
-    let texts = line_texts(&render_items_for_history(&item, &theme, 80));
-    let joined = texts.join("\n");
-
-    assert!(joined.contains("└ real output"), "texts: {texts:?}");
-    assert!(
-        !texts
-            .iter()
-            .any(|line| line.trim_start().starts_with("exit 0")),
-        "exit code must not leak as an output row: {texts:?}"
-    );
-    // The footer still owns the exit status.
-    assert!(joined.contains("exit 0 · 1 line"), "texts: {texts:?}");
+/// Project run_shell tool events into transcript items (the real ingest
+/// seam, `run_item_from_result`), for tests that pin ingest normalization
+/// rather than view behavior.
+fn projected_tool_run_items(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
+    super::transcript::project_tui_entries(events)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect()
 }
 
 #[test]
-fn collapsed_tool_run_strips_signed_annotated_timeout_exit_row() {
+fn ingest_strips_leading_literal_exit_code_row_for_both_views() {
+    let theme = Theme::default();
+    let events = vec![
+        tool_call(
+            "call-leak",
+            "run_shell",
+            serde_json::json!({"command": "printf leaked"}),
+        ),
+        tool_result_with_exit("call-leak", "run_shell", "exit 0\nreal output", true, 0),
+    ];
+    let items = projected_tool_run_items(&events);
+
+    for (label, texts) in [
+        (
+            "collapsed",
+            line_texts(&render_items_for_history(&items, &theme, 80)),
+        ),
+        (
+            "expanded",
+            line_texts(&render_items_for_history_with_limit(
+                &items,
+                &theme,
+                80,
+                usize::MAX,
+            )),
+        ),
+    ] {
+        let joined = texts.join("\n");
+        assert!(joined.contains("real output"), "{label}: {texts:?}");
+        assert!(
+            !texts
+                .iter()
+                .any(|line| line.trim_start().starts_with("exit 0")),
+            "{label}: exit code must not leak as an output row: {texts:?}"
+        );
+        // The header still owns the exit status, and both views count the
+        // same normalized buffer.
+        assert!(joined.contains("exit 0 · 1 line"), "{label}: {texts:?}");
+    }
+}
+
+#[test]
+fn ingest_strips_signed_annotated_timeout_exit_row() {
     // Matches euler-core::tools::ShellExecutor::run_shell's real timeout
     // header verbatim (crates/euler-core/src/tools.rs): a signed exit code
     // followed by a parenthesized annotation, not just an unsigned "exit N".
@@ -1989,16 +2015,17 @@ fn collapsed_tool_run_strips_signed_annotated_timeout_exit_row() {
     let output = "exit -1 (command timed out after 5000 ms and was killed; \
 pass timeout_ms up to 600000 for longer runs)\nreal output"
         .to_owned();
-    let item = [TranscriptItem::ToolRun {
-        command: "sleep 999".to_owned(),
-        ok: false,
-        error: String::new(),
-        output,
-        exit_code: Some(-1),
-        grant_source: None,
-    }];
+    let events = vec![
+        tool_call(
+            "call-timeout",
+            "run_shell",
+            serde_json::json!({"command": "sleep 999"}),
+        ),
+        tool_result_with_exit("call-timeout", "run_shell", &output, false, -1),
+    ];
+    let items = projected_tool_run_items(&events);
 
-    let texts = line_texts(&render_items_for_history(&item, &theme, 96));
+    let texts = line_texts(&render_items_for_history(&items, &theme, 96));
     let joined = texts.join("\n");
 
     assert!(joined.contains("└ real output"), "texts: {texts:?}");
@@ -2009,6 +2036,56 @@ pass timeout_ms up to 600000 for longer runs)\nreal output"
         "signed annotated exit row must not leak as an output row: {texts:?}"
     );
     assert!(joined.contains("exit -1 · 1 line"), "texts: {texts:?}");
+}
+
+#[test]
+fn collapsed_and_expanded_views_agree_on_line_count_after_ingest() {
+    // Owner dogfood v4: the header said "66 lines" expanded but "65 lines"
+    // folded because the collapsed view stripped the leaked `exit 0` row
+    // while the expanded view rendered it. Normalizing once at ingest makes
+    // both views count the same stored buffer.
+    let theme = Theme::default();
+    let body = (1..=65)
+        .map(|index| format!("row {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let events = vec![
+        tool_call(
+            "call-count",
+            "run_shell",
+            serde_json::json!({"command": "find ."}),
+        ),
+        tool_result_with_exit(
+            "call-count",
+            "run_shell",
+            &format!("exit 0\n{body}"),
+            true,
+            0,
+        ),
+    ];
+    let items = projected_tool_run_items(&events);
+
+    let collapsed = line_texts(&render_items_for_history(&items, &theme, 80)).join("\n");
+    let expanded = line_texts(&render_items_for_history_with_limit(
+        &items,
+        &theme,
+        80,
+        usize::MAX,
+    ))
+    .join("\n");
+
+    assert!(
+        collapsed.contains("exit 0 · 65 lines"),
+        "collapsed: {collapsed:?}"
+    );
+    assert!(
+        expanded.contains("exit 0 · 65 lines"),
+        "expanded: {expanded:?}"
+    );
+    assert!(
+        !expanded.contains("66 lines"),
+        "expanded must not count the stripped exit row: {expanded:?}"
+    );
 }
 
 #[test]
@@ -3709,6 +3786,25 @@ fn tool_result(id: &str, name: &str, output: &str) -> EventEnvelope {
             ("name", name.to_owned().into()),
             ("ok", true.into()),
             ("output", output.to_owned().into()),
+        ]),
+    )
+}
+
+fn tool_result_with_exit(
+    id: &str,
+    name: &str,
+    output: &str,
+    ok: bool,
+    exit_code: i64,
+) -> EventEnvelope {
+    event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", id.to_owned().into()),
+            ("name", name.to_owned().into()),
+            ("ok", ok.into()),
+            ("output", output.to_owned().into()),
+            ("exit_code", exit_code.into()),
         ]),
     )
 }

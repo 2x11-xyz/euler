@@ -268,19 +268,18 @@ fn tool_run_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
 /// line), with any remaining preview rows indented two extra spaces
 /// underneath it (review v2 §14.2, spec §0/§1).
 fn collapsed_tool_run_rows(detail: &str, ok: bool, limit: usize) -> ArtifactOutputRows {
-    let detail = strip_leading_exit_code_row(detail);
     let base = if ok {
-        tool_run_output_rows(&detail, limit)
+        tool_run_output_rows(detail, limit)
     } else {
-        informative_output_rows(&detail, limit)
+        informative_output_rows(detail, limit)
     };
     if base.total_rows == 0 {
         return base;
     }
 
     let mut rows = base.rows;
-    let result_line = most_informative_line(&detail)
-        .or_else(|| last_non_empty_line(&detail))
+    let result_line = most_informative_line(detail)
+        .or_else(|| last_non_empty_line(detail))
         .map(str::to_owned)
         .or_else(|| rows.iter().find(|row| !row.trim().is_empty()).cloned())
         .unwrap_or_default();
@@ -307,6 +306,36 @@ fn collapsed_tool_run_rows(detail: &str, ok: bool, limit: usize) -> ArtifactOutp
         total_rows: base.total_rows,
         folded: base.folded,
     }
+}
+
+/// Normalize raw `run_shell` output once, at transcript ingest
+/// (`run_item_from_result`), upstream of BOTH the collapsed and the
+/// expanded view:
+///
+/// - drop the literal leading `exit N` status row `euler-core::tools::
+///   run_shell` emits ahead of bounded output — including its signed,
+///   annotated timeout/kill form — since the cell header/footer already
+///   own the exit status;
+/// - strip trailing whitespace from every stored line, so render-time
+///   width padding can never round-trip back into the stored buffer (the
+///   resize re-emit path commits rendered, width-padded rows to native
+///   scrollback; stored buffers must hold raw logical lines only).
+///
+/// Views render the stored buffer as-is. Normalizing here — instead of
+/// per-view — is what keeps both views agreeing on line count and order
+/// by construction.
+pub(in crate::ui::transcript) fn normalize_tool_run_output(output: &str) -> String {
+    let output = strip_leading_exit_code_row(output);
+    let mut lines = output.lines().map(str::trim_end);
+    let mut normalized = String::with_capacity(output.len());
+    if let Some(first) = lines.next() {
+        normalized.push_str(first);
+    }
+    for line in lines {
+        normalized.push('\n');
+        normalized.push_str(line);
+    }
+    normalized
 }
 
 /// Shell output sometimes carries a literal leading "exit N" row ahead of
@@ -394,4 +423,57 @@ pub(super) fn promote_informative_row(mut rows: Vec<String>) -> Vec<String> {
     let line = rows.remove(index);
     rows.insert(0, line);
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_strips_leading_exit_status_row() {
+        assert_eq!(
+            normalize_tool_run_output("exit 0\nreal output"),
+            "real output"
+        );
+        assert_eq!(normalize_tool_run_output("exit 12\na\nb"), "a\nb");
+    }
+
+    #[test]
+    fn normalize_strips_signed_annotated_timeout_exit_row() {
+        // Matches euler-core::tools::ShellExecutor::run_shell's real timeout
+        // header verbatim (crates/euler-core/src/tools.rs).
+        let output = "exit -1 (command timed out after 5000 ms and was killed; \
+pass timeout_ms up to 600000 for longer runs)\nreal output";
+        assert_eq!(normalize_tool_run_output(output), "real output");
+    }
+
+    #[test]
+    fn normalize_keeps_non_status_first_lines() {
+        assert_eq!(
+            normalize_tool_run_output("exit code fine\nb"),
+            "exit code fine\nb"
+        );
+        assert_eq!(normalize_tool_run_output("exit N\nb"), "exit N\nb");
+        assert_eq!(normalize_tool_run_output("plain\nrows"), "plain\nrows");
+    }
+
+    #[test]
+    fn normalize_strips_render_padding_from_stored_lines() {
+        // Defensive: rendered rows are padded to the terminal width before
+        // they hit native scrollback; if such a row ever round-trips toward
+        // the stored buffer, ingest must drop the padding so buffers hold
+        // raw logical lines only.
+        let padded = format!("exit 0\n./.gitignore{}\n./CLAUDE.md", " ".repeat(300));
+        assert_eq!(
+            normalize_tool_run_output(&padded),
+            "./.gitignore\n./CLAUDE.md"
+        );
+    }
+
+    #[test]
+    fn normalize_handles_exit_row_only_output() {
+        assert_eq!(normalize_tool_run_output("exit 0"), "");
+        assert_eq!(normalize_tool_run_output("exit 0\n"), "");
+        assert_eq!(normalize_tool_run_output(""), "");
+    }
 }

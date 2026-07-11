@@ -16,7 +16,10 @@ mod file_diff;
 mod line;
 mod render;
 pub(crate) use cells::normalized_shell_command;
-use cells::{file_change_action_label, file_change_path_label, tool_output_is_foldable};
+use cells::{
+    file_change_action_label, file_change_path_label, normalize_tool_run_output,
+    tool_output_is_foldable,
+};
 use file_diff::file_diff_is_foldable;
 use line::render_line_oriented_item;
 #[cfg(test)]
@@ -1544,7 +1547,11 @@ fn run_item_from_result(
         command,
         ok,
         error: payload_string(event, "error").unwrap_or_default(),
-        output: payload_string(event, "output").unwrap_or_default(),
+        // The buffer is normalized exactly once, here at ingest — the
+        // leading `exit N` status row dropped, render padding stripped —
+        // so the collapsed and expanded views render the same stored
+        // lines and agree on count/order by construction.
+        output: normalize_tool_run_output(&payload_string(event, "output").unwrap_or_default()),
         exit_code: event
             .payload
             .get("exit_code")

@@ -37,7 +37,8 @@ pub(super) use permission::{
 pub(crate) use shell::normalized_shell_command;
 
 pub(super) use tool_run::{
-    edit_failure_status, most_informative_line, render_tool_run, tool_failure_status, ToolRunRender,
+    edit_failure_status, most_informative_line, normalize_tool_run_output, render_tool_run,
+    tool_failure_status, ToolRunRender,
 };
 
 use tool_run::promote_informative_row;
