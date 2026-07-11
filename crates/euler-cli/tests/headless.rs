@@ -3007,6 +3007,294 @@ fn extension_cli_code_swarm_review_validates_input_and_stays_live_only() {
 }
 
 #[test]
+fn headless_exec_code_swarm_review_tool_runs_reviewers_from_project_config() {
+    // The checkpoint loop, headless (multi-agent contract): instructions
+    // drive the model to call code_swarm_review; the tool reads the project
+    // store this cwd owns, fans out the reviewer, returns the findings into
+    // the loop, and the turn continues to an adjudicated answer — all under
+    // the default read-only auto-approve tier.
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    write_code_swarm_project_config(root.path(), &["fixture::reviewer-model"]);
+    let script = write_fixture_script(
+        root.path(),
+        "swarm-loop.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        {
+          "tool_call": {
+            "id": "call-review",
+            "name": "code_swarm_review",
+            "input": { "focus": "the migration plan" }
+          }
+        },
+        { "finished": { "stop_reason": "tool_use" } }
+      ]
+    },
+    {
+      "events": [
+        { "text_delta": "finding: the plan has no rollback step" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    },
+    {
+      "events": [
+        { "text_delta": "adjudicated: the rollback finding is valid" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+
+    let output = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("exec")
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provider-option")
+        .arg(format!("event-script={}", path_str(&script)))
+        .arg("--provenance")
+        .arg(path_str(&log))
+        .arg("--extensions")
+        .arg("code-swarm")
+        .arg("--auto-approve")
+        .arg("read-only")
+        .arg("draft the migration plan, then gate it through code_swarm_review")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run exec swarm loop");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = read_jsonl(&log);
+    let tool_result = events
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == "tool.result"
+                && event.payload["name"] == serde_json::json!("code_swarm_review")
+        })
+        .expect("code_swarm_review tool result");
+    assert_eq!(tool_result.payload["ok"], serde_json::json!(true));
+    let review = tool_result.payload["output"].as_str().expect("output");
+    assert!(
+        review.contains("1/1 reviewers succeeded"),
+        "honest K-of-N: {review}"
+    );
+    assert!(
+        review.contains("finding: the plan has no rollback step"),
+        "findings must reach the calling agent: {review}"
+    );
+    assert!(
+        review.contains("fixture::reviewer-model"),
+        "resolved target named: {review}"
+    );
+    let spawn = events
+        .iter()
+        .find(|event| event.kind.as_str() == "agent.spawn")
+        .expect("reviewer spawn");
+    assert_eq!(spawn.payload["model"], serde_json::json!("reviewer-model"));
+    // The loop continued past the gate: the final assistant message is the
+    // model's adjudication of the reviewer findings.
+    let last_assistant = events
+        .iter()
+        .rev()
+        .find(|event| event.kind.as_str() == "assistant.message")
+        .expect("final assistant message");
+    assert_eq!(
+        last_assistant.payload["content"],
+        serde_json::json!("adjudicated: the rollback finding is valid")
+    );
+}
+
+#[test]
+fn headless_run_code_swarm_review_uses_persisted_project_config() {
+    // A headless run with NO explicit models uses the TUI-persisted project
+    // store for this cwd (resolution chain, step 2).
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    write_code_swarm_project_config(root.path(), &["fixture::config-model"]);
+    let script = write_fixture_script(
+        root.path(),
+        "swarm-config.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        { "text_delta": "finding from the configured reviewer" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+
+    let result = run_headless_code_swarm_review(exe, &home, root.path(), &script, &log, "{}");
+    assert_eq!(result["type"], serde_json::json!("extension_run_result"));
+    let reviewers = &result["result"]["reviewers"];
+    assert_eq!(reviewers[0]["model"], serde_json::json!("config-model"));
+    assert_eq!(reviewers[0]["ok"], serde_json::json!(true));
+    assert_eq!(
+        reviewers[0]["findings"],
+        serde_json::json!("finding from the configured reviewer")
+    );
+    assert_eq!(result["result"]["succeeded"], serde_json::json!(1));
+}
+
+#[test]
+fn headless_run_code_swarm_review_explicit_models_override_persisted_config() {
+    // Explicit models on the invocation win outright (resolution chain,
+    // step 1) and never mutate the stores.
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    write_code_swarm_project_config(root.path(), &["fixture::config-model"]);
+    let script = write_fixture_script(
+        root.path(),
+        "swarm-override.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        { "text_delta": "finding from the override reviewer" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+
+    let result = run_headless_code_swarm_review(
+        exe,
+        &home,
+        root.path(),
+        &script,
+        &log,
+        "{\"models\":[\"fixture::override-model\"]}",
+    );
+    let reviewers = &result["result"]["reviewers"];
+    assert_eq!(reviewers[0]["model"], serde_json::json!("override-model"));
+    // One-shot: the persisted store is untouched.
+    let stored = std::fs::read_to_string(root.path().join(".euler").join("code-swarm.json"))
+        .expect("config still present");
+    assert!(stored.contains("config-model"));
+    assert!(!stored.contains("override-model"));
+}
+
+#[test]
+fn headless_run_code_swarm_review_unconfigured_is_the_honest_remediation_error() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    let script = write_fixture_script(
+        root.path(),
+        "swarm-unconfigured.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        { "text_delta": "unused" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+
+    let result = run_headless_code_swarm_review(exe, &home, root.path(), &script, &log, "{}");
+    assert_eq!(result["type"], serde_json::json!("error"));
+    let message = result["message"].as_str().expect("message");
+    assert!(message.contains("/code-swarm"), "TUI path: {message}");
+    assert!(
+        message.contains("extension_run code-swarm.review"),
+        "headless override path: {message}"
+    );
+}
+
+/// Drive one `extension_run code-swarm.review <input>` control line through
+/// a headless `euler run` session and return the JSON result line.
+fn run_headless_code_swarm_review(
+    exe: &str,
+    home: &tempfile::TempDir,
+    root: &Path,
+    script: &Path,
+    log: &Path,
+    input: &str,
+) -> serde_json::Value {
+    let mut child = command_with_home(exe, home)
+        .current_dir(root)
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provider-option")
+        .arg(format!("event-script={}", path_str(script)))
+        .arg("--provenance")
+        .arg(path_str(log))
+        .arg("--extensions")
+        .arg("code-swarm")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler run");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(format!("extension_run code-swarm.review {input}\n").as_bytes())
+        .expect("write control line");
+    let output = child.wait_with_output().expect("wait euler run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .expect("result JSON line");
+    serde_json::from_str(line).expect("result json")
+}
+
+fn write_code_swarm_project_config(root: &Path, targets: &[&str]) {
+    let dir = root.join(".euler");
+    fs::create_dir_all(&dir).expect("project .euler dir");
+    let reviewers: Vec<serde_json::Value> = targets
+        .iter()
+        .map(|target| serde_json::json!({ "target": target }))
+        .collect();
+    fs::write(
+        dir.join("code-swarm.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "reviewers": reviewers,
+        }))
+        .expect("config bytes"),
+    )
+    .expect("write project config");
+}
+
+#[test]
 fn extension_cli_enable_and_run_causal_dag_export() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
