@@ -1137,3 +1137,120 @@ fn model_tools_includes_tool_result_get() {
         .iter()
         .any(|tool| tool.name == "tool_result_get"));
 }
+
+// --- rung-2 re-teach escalation (issue #94) -------------------------------
+
+/// Every `*** Begin Patch` block in the re-teach payload must parse with
+/// the real parser: the payload teaches the format, so it can never drift
+/// into syntax the parser rejects.
+#[test]
+fn reteach_examples_parse() {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in APPLY_PATCH_RETEACH.lines() {
+        if line == "*** Begin Patch" {
+            current = Some(vec![line]);
+        } else if let Some(block) = current.as_mut() {
+            block.push(line);
+            if line == "*** End Patch" {
+                blocks.push(current.take().expect("open block").join("\n"));
+            }
+        }
+    }
+    assert_eq!(blocks.len(), 2, "payload shows one Add and one Update");
+    let add = parse_single_file_apply_patch(&blocks[0]).expect("add example parses");
+    assert!(matches!(add, ApplyPatchDocument::Add { .. }));
+    let update = parse_single_file_apply_patch(&blocks[1]).expect("update example parses");
+    let ApplyPatchDocument::Update { chunks, .. } = update else {
+        panic!("second example must be an update");
+    };
+    assert_eq!(chunks.len(), 1);
+}
+
+#[test]
+fn second_consecutive_failure_appends_full_payload_first_does_not() {
+    let registry = ToolRegistry::new(".");
+    let mut tracker = ReteachTracker::default();
+    let input = json!({"patch": "nope"});
+    let first = registry.teach_on_failure(&mut tracker, "apply_patch", &input, "bad".to_owned());
+    assert_eq!(first, "bad", "first failure keeps the rung-1 one-liner");
+    let second = registry.teach_on_failure(&mut tracker, "apply_patch", &input, "bad".to_owned());
+    assert_eq!(second, format!("bad\n\n{APPLY_PATCH_RETEACH}"));
+    let third = registry.teach_on_failure(&mut tracker, "apply_patch", &input, "bad".to_owned());
+    assert_eq!(
+        third,
+        format!("bad\n\n{APPLY_PATCH_RETEACH}"),
+        "the streak keeps teaching until a success resets it"
+    );
+}
+
+#[test]
+fn success_resets_streak_to_the_one_liner() {
+    let registry = ToolRegistry::new(".");
+    let mut tracker = ReteachTracker::default();
+    let input = json!({"patch": "nope"});
+    let _ = registry.teach_on_failure(&mut tracker, "apply_patch", &input, "bad".to_owned());
+    tracker.record_success(registry.reteach_identity("apply_patch", &input));
+    let after_success =
+        registry.teach_on_failure(&mut tracker, "apply_patch", &input, "bad".to_owned());
+    assert_eq!(
+        after_success, "bad",
+        "failure -> success -> failure is a fresh streak"
+    );
+}
+
+#[test]
+fn streaks_are_per_tool_and_other_tools_never_reset_them() {
+    let registry = ToolRegistry::new(".");
+    let mut tracker = ReteachTracker::default();
+    let patch_input = json!({"patch": "nope"});
+    let edit_input = json!({"path": "x"});
+    let _ = registry.teach_on_failure(&mut tracker, "apply_patch", &patch_input, "a1".to_owned());
+    // Another tool fails and a third tool succeeds in between; neither
+    // touches apply_patch's streak.
+    let b_error =
+        registry.teach_on_failure(&mut tracker, "edit_file", &edit_input, "b1".to_owned());
+    let _ = registry.teach_on_failure(&mut tracker, "edit_file", &edit_input, "b2".to_owned());
+    tracker.record_success("read_file");
+    let a_second =
+        registry.teach_on_failure(&mut tracker, "apply_patch", &patch_input, "a2".to_owned());
+    assert_eq!(b_error, "b1", "tools without a payload never escalate");
+    assert_eq!(a_second, format!("a2\n\n{APPLY_PATCH_RETEACH}"));
+}
+
+#[test]
+fn escalation_is_deterministic_across_fresh_trackers() {
+    let registry = ToolRegistry::new(".");
+    let input = json!({"patch": "nope"});
+    let run = || {
+        let mut tracker = ReteachTracker::default();
+        (0..3)
+            .map(|_| {
+                registry.teach_on_failure(&mut tracker, "apply_patch", &input, "bad".to_owned())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(run(), run(), "same failure sequence, same strings");
+}
+
+#[test]
+fn intercepted_run_shell_heredoc_counts_against_apply_patch() {
+    let registry = ToolRegistry::new(".");
+    let mut tracker = ReteachTracker::default();
+    let heredoc = json!({"command": "apply_patch <<'EOF'\nnot a patch\nEOF"});
+    assert_eq!(
+        registry.reteach_identity("run_shell", &heredoc),
+        "apply_patch"
+    );
+    assert_eq!(
+        registry.reteach_identity("run_shell", &json!({"command": "ls"})),
+        "run_shell"
+    );
+    let _ = registry.teach_on_failure(&mut tracker, "apply_patch", &json!({}), "a1".to_owned());
+    let second = registry.teach_on_failure(&mut tracker, "run_shell", &heredoc, "a2".to_owned());
+    assert_eq!(
+        second,
+        format!("a2\n\n{APPLY_PATCH_RETEACH}"),
+        "a failed apply_patch heredoc through run_shell continues the apply_patch streak"
+    );
+}

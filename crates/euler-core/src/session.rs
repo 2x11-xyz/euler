@@ -23,7 +23,7 @@ use crate::redaction::SecretRedactor;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
-use crate::tools::{PatchEvents, ToolError, ToolRegistry};
+use crate::tools::{PatchEvents, ReteachTracker, ToolError, ToolRegistry};
 use crate::EventBus;
 use euler_agents::{
     generated_agent_id, AgentError, AgentReportPayload, AgentResult, AgentTask, SpawnedAgent,
@@ -466,6 +466,10 @@ pub struct Session<D> {
     /// or the ledger (contract: secrets.md redaction rules; issue #56).
     redactor: SecretRedactor,
     tools: ToolRegistry,
+    /// Session-scoped (not turn-scoped like `TurnState`): context rot is a
+    /// session-length phenomenon, so a tool's failure streak must survive
+    /// turn boundaries until that tool succeeds.
+    tool_reteach: ReteachTracker,
     provenance: Option<Arc<ProvenanceWriter>>,
     persisted_events: usize,
     extension_emission_degraded: bool, // sticky after queue divergence; reload-only recovery
@@ -733,6 +737,7 @@ impl<D> Session<D> {
             permissions,
             redactor: SecretRedactor::from_env(),
             tools,
+            tool_reteach: ReteachTracker::default(),
             provenance: None,
             persisted_events: 0,
             extension_emission_degraded: false,
@@ -1060,6 +1065,7 @@ impl<D> Session<D> {
             permissions,
             redactor: SecretRedactor::from_env(),
             tools,
+            tool_reteach: ReteachTracker::default(),
             provenance: None,
             persisted_events,
             extension_emission_degraded: false,
@@ -1965,6 +1971,11 @@ impl<D: PermissionDecider> Session<D> {
             .execute_with_events(&call.name, &call.input, self.bus.events())
         {
             Ok(execution) => {
+                // The input format was accepted: reset this tool's re-teach
+                // streak even if a later write fails for environmental
+                // reasons (the streak tracks format competence, issue #94).
+                self.tool_reteach
+                    .record_success(self.tools.reteach_identity(&call.name, &call.input));
                 if let Some(patch) = execution.patch {
                     let mut payload = object([
                         ("path", patch.path.clone().into()),
@@ -1979,22 +1990,13 @@ impl<D: PermissionDecider> Session<D> {
                         Some(tool_call_event_id.clone()),
                     )?;
                     if let Err(error) = self.tools.apply_patch(&patch) {
-                        self.emit_with_parent(
-                            EventKind::TOOL_RESULT,
-                            object([
-                                ("id", call.id.into()),
-                                ("name", execution.name.into()),
-                                ("ok", false.into()),
-                                ("error", self.redactor.redact(&error.to_string()).into()),
-                            ]),
-                            Some(tool_call_event_id),
+                        self.emit_failed_tool_result(
+                            call.id,
+                            execution.name,
+                            error.to_string(),
+                            tool_call_event_id,
+                            tool_started,
                         )?;
-                        crate::diagnostics::tool_exec_end(
-                            &self.config.session_id,
-                            &tool_name,
-                            elapsed_ms(tool_started),
-                            false,
-                        );
                         return Ok(());
                     }
                     let patch_applied_id = self.emit_with_parent(
@@ -2063,22 +2065,22 @@ impl<D: PermissionDecider> Session<D> {
                 );
             }
             Err(error) => {
-                self.emit_with_parent(
-                    EventKind::TOOL_RESULT,
-                    object([
-                        ("id", call.id.into()),
-                        ("name", call.name.into()),
-                        ("ok", false.into()),
-                        ("error", self.redactor.redact(&error.to_string()).into()),
-                    ]),
-                    Some(tool_call_event_id),
-                )?;
-                crate::diagnostics::tool_exec_end(
-                    &self.config.session_id,
-                    &tool_name,
-                    elapsed_ms(tool_started),
-                    false,
+                // Rung-2 re-teaching (issue #94): repeated consecutive
+                // failures of a formatted tool append its full-format
+                // payload to the error the model reads next.
+                let error = self.tools.teach_on_failure(
+                    &mut self.tool_reteach,
+                    &call.name,
+                    &call.input,
+                    error.to_string(),
                 );
+                self.emit_failed_tool_result(
+                    call.id,
+                    call.name,
+                    error,
+                    tool_call_event_id,
+                    tool_started,
+                )?;
             }
         }
         Ok(())
@@ -2258,6 +2260,37 @@ impl<D: PermissionDecider> Session<D> {
     /// Denied tool result. `error` is the plain `permission denied` string,
     /// or teaching text (guardian denials tell the model not to work around
     /// the block).
+    /// Failed tool-result emission shared by the execution-error and
+    /// patch-write-failure paths of [`Self::execute_tool_call`].
+    fn emit_failed_tool_result(
+        &mut self,
+        call_id: String,
+        name: String,
+        error: String,
+        tool_call_event_id: String,
+        tool_started: Instant,
+    ) -> Result<(), SessionError> {
+        self.emit_with_parent(
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", call_id.into()),
+                ("name", name.clone().into()),
+                ("ok", false.into()),
+                // Preserve the failed-error redaction main applies
+                // (#67): a tool error may echo a secret-bearing arg.
+                ("error", self.redactor.redact(&error).into()),
+            ]),
+            Some(tool_call_event_id),
+        )?;
+        crate::diagnostics::tool_exec_end(
+            &self.config.session_id,
+            &name,
+            elapsed_ms(tool_started),
+            false,
+        );
+        Ok(())
+    }
+
     fn emit_permission_denied_tool_result(
         &mut self,
         call: ToolCall,

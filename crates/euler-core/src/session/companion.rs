@@ -59,6 +59,9 @@ struct CompanionLoop<'a, D> {
     persisted_events: &'a mut usize,
     permissions: PermissionGate<&'a mut D>,
     turn_state: TurnState,
+    /// Companion-lifetime re-teach streaks: a companion is its own model
+    /// context, so it neither shares nor pollutes the parent's tracker.
+    reteach: crate::tools::ReteachTracker,
     tool_calls: u32,
     /// Cumulative OUTPUT tokens only (see `add_usage`), checked against
     /// `AgentBudget::max_tokens`.
@@ -214,6 +217,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             persisted_events: &mut session.persisted_events,
             permissions,
             turn_state: TurnState::default(),
+            reteach: crate::tools::ReteachTracker::default(),
             tool_calls: 0,
             tokens: 0,
         }
@@ -325,6 +329,10 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             .execute_with_events(&call.name, &call.input, self.bus.events())
         {
             Ok(execution) => {
+                // The input format was accepted: reset this tool's re-teach
+                // streak (issue #94), mirroring the parent session loop.
+                self.reteach
+                    .record_success(self.tools.reteach_identity(&call.name, &call.input));
                 if self.record_patch_if_present(&call, &tool_call_event_id, &execution)? {
                     crate::diagnostics::tool_exec_end(
                         &self.session_id,
@@ -344,7 +352,14 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 );
             }
             Err(error) => {
-                self.emit_tool_failure(call.id, call.name, error.to_string(), tool_call_event_id)?;
+                // Rung-2 re-teaching (issue #94), companion-local streaks.
+                let error = self.tools.teach_on_failure(
+                    &mut self.reteach,
+                    &call.name,
+                    &call.input,
+                    error.to_string(),
+                );
+                self.emit_tool_failure(call.id, call.name, error, tool_call_event_id)?;
                 crate::diagnostics::tool_exec_end(
                     &self.session_id,
                     &tool_name,

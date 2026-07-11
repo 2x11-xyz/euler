@@ -1878,3 +1878,124 @@ impl ExtensionCommand for TestCommand {
         }
     }
 }
+
+// --- rung-2 re-teach escalation (issue #94) -------------------------------
+
+const RETEACH_MARKER: &str = "apply_patch full format specification";
+
+fn reteach_apply_patch_call(id: &str, patch: &str) -> euler_provider::ToolCall {
+    euler_provider::ToolCall {
+        id: id.to_owned(),
+        name: "apply_patch".to_owned(),
+        input: json!({"patch": patch}),
+    }
+}
+
+fn reteach_session(
+    responses: Vec<FixtureResponse>,
+) -> (tempfile::TempDir, Session<ScriptedDecider>) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = SessionConfig::new(temp.path());
+    let session = Session::new(
+        config,
+        ScriptedProvider::new(responses),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::AllowSession]),
+    );
+    (temp, session)
+}
+
+fn failed_tool_errors(events: &[EventEnvelope]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT && event.payload["ok"] == json!(false)
+        })
+        .map(|event| event.payload["error"].as_str().expect("error").to_owned())
+        .collect()
+}
+
+fn run_two_bad_patches() -> Vec<String> {
+    let (_temp, mut session) = reteach_session(vec![
+        FixtureResponse::ToolCalls(vec![reteach_apply_patch_call("call-1", "not a patch")]),
+        FixtureResponse::ToolCalls(vec![reteach_apply_patch_call("call-2", "not a patch")]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    session.run_turn("patch it").expect("turn");
+    failed_tool_errors(session.events())
+}
+
+#[test]
+fn second_consecutive_apply_patch_failure_reteaches_full_format_in_tool_result() {
+    let errors = run_two_bad_patches();
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors[0].contains("invalid patch: the first line must be exactly"),
+        "first failure keeps the rung-1 teaching one-liner: {}",
+        errors[0]
+    );
+    assert!(
+        !errors[0].contains(RETEACH_MARKER),
+        "first failure must not escalate: {}",
+        errors[0]
+    );
+    assert!(
+        errors[1].contains("invalid patch: the first line must be exactly"),
+        "the rung-1 line still leads the escalated error: {}",
+        errors[1]
+    );
+    assert!(
+        errors[1].contains(RETEACH_MARKER) && errors[1].contains("*** Update File: src/example.rs"),
+        "second consecutive failure appends the full spec and worked example: {}",
+        errors[1]
+    );
+}
+
+#[test]
+fn apply_patch_success_resets_the_reteach_streak() {
+    let good_patch = "*** Begin Patch\n*** Add File: made.txt\n+hi\n*** End Patch";
+    let (_temp, mut session) = reteach_session(vec![
+        FixtureResponse::ToolCalls(vec![reteach_apply_patch_call("call-1", "not a patch")]),
+        FixtureResponse::ToolCalls(vec![reteach_apply_patch_call("call-2", good_patch)]),
+        FixtureResponse::ToolCalls(vec![reteach_apply_patch_call("call-3", "not a patch")]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    session.run_turn("patch it").expect("turn");
+    let errors = failed_tool_errors(session.events());
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors.iter().all(|error| !error.contains(RETEACH_MARKER)),
+        "failure -> success -> failure is a fresh streak; no escalation: {errors:?}"
+    );
+}
+
+#[test]
+fn another_tools_success_between_apply_patch_failures_still_escalates() {
+    let (_temp, mut session) = reteach_session(vec![
+        FixtureResponse::ToolCalls(vec![reteach_apply_patch_call("call-1", "not a patch")]),
+        FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
+            id: "call-2".to_owned(),
+            name: "read_file".to_owned(),
+            input: json!({"path": "note.txt"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![reteach_apply_patch_call("call-3", "not a patch")]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    std::fs::write(session.config.root.join("note.txt"), "hello").expect("write note");
+    session.run_turn("patch it").expect("turn");
+    let errors = failed_tool_errors(session.events());
+    assert_eq!(errors.len(), 2, "read_file succeeds; only patches fail");
+    assert!(
+        errors[1].contains(RETEACH_MARKER),
+        "another tool's success must not reset apply_patch's streak: {}",
+        errors[1]
+    );
+}
+
+#[test]
+fn reteach_escalation_is_deterministic_across_sessions() {
+    assert_eq!(
+        run_two_bad_patches(),
+        run_two_bad_patches(),
+        "same failure sequence must produce identical error strings"
+    );
+}

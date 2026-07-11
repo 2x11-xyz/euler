@@ -8,10 +8,42 @@ use euler_sdk::Capability;
 use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
+
+/// Rung-2 escalation threshold (issue #94): the first failure of a
+/// formatted tool gets the rung-1 teaching one-liner; from the second
+/// consecutive failure of the SAME tool on, the tool's full-format
+/// re-teach payload is appended to the error the model reads next.
+const RETEACH_AFTER_CONSECUTIVE_FAILURES: u32 = 2;
+
+/// Full apply_patch grammar plus worked examples, appended to repeated
+/// parse failures. Every example here must parse: `reteach_examples_parse`
+/// in tools_test.rs runs each `*** Begin Patch` block through the real
+/// parser so this text can never drift into syntax the parser rejects.
+const APPLY_PATCH_RETEACH: &str = r#"apply_patch full format specification:
+A patch is one envelope that adds or updates exactly one file. Paths are relative to the workspace root; delete and rename are not supported. Send one patch per file.
+
+Add a new file (every content line starts with `+`):
+*** Begin Patch
+*** Add File: src/example.rs
++fn main() {
++    println!("hello");
++}
+*** End Patch
+
+Update an existing file (one or more `@@` hunks; hunk lines start with a space for context, `-` for removed, `+` for added; each hunk's context and removed lines must match the file exactly once):
+*** Begin Patch
+*** Update File: src/example.rs
+@@
+ fn main() {
+-    println!("hello");
++    println!("hello, world");
+ }
+*** End Patch"#;
 
 const DEFAULT_MAX_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_LINES: usize = 400;
@@ -69,6 +101,32 @@ pub struct PatchEvents {
     write_content: String,
 }
 
+/// Per-tool consecutive-failure streaks driving rung-2 format
+/// re-teaching (issue #94). One tracker per model context — the driver
+/// session and each companion own their own — because context rot is a
+/// property of a single model context, not of the process. A tool's
+/// success clears only that tool's streak; other tools' outcomes never
+/// touch it.
+#[derive(Debug, Default)]
+pub(crate) struct ReteachTracker {
+    consecutive_failures: BTreeMap<String, u32>,
+}
+
+impl ReteachTracker {
+    pub(crate) fn record_success(&mut self, identity: &str) {
+        self.consecutive_failures.remove(identity);
+    }
+
+    fn record_failure(&mut self, identity: &str) -> u32 {
+        let streak = self
+            .consecutive_failures
+            .entry(identity.to_owned())
+            .or_insert(0);
+        *streak += 1;
+        *streak
+    }
+}
+
 #[derive(Debug)]
 pub struct ToolRegistry {
     root: PathBuf,
@@ -111,6 +169,51 @@ impl ToolRegistry {
             "tool apply_patch".to_owned()
         } else {
             format!("tool {name}")
+        }
+    }
+
+    /// Identity a tool call teaches (and counts failures) under: an
+    /// intercepted `apply_patch` heredoc sent through `run_shell` counts
+    /// against `apply_patch`, mirroring `permission_reason`. Everything
+    /// else teaches under its own tool name.
+    pub(crate) fn reteach_identity<'a>(&self, name: &'a str, input: &Value) -> &'a str {
+        if is_shell_apply_patch_request(name, input) {
+            "apply_patch"
+        } else {
+            name
+        }
+    }
+
+    /// Rung-2 re-teach payload registry (issue #94): a tool with a strict
+    /// input format registers its full grammar plus a worked example here.
+    /// Registration is the only per-tool step — the escalation machinery
+    /// in the session loops is tool-agnostic.
+    fn reteach_payload(identity: &str) -> Option<&'static str> {
+        match identity {
+            "apply_patch" => Some(APPLY_PATCH_RETEACH),
+            _ => None,
+        }
+    }
+
+    /// Record a failed call in `tracker` and escalate the error text with
+    /// the tool's full-format payload once that tool's consecutive-failure
+    /// streak reaches [`RETEACH_AFTER_CONSECUTIVE_FAILURES`]. Deterministic:
+    /// the same failure sequence always yields the same strings, so
+    /// fixture and resume replays stay stable.
+    pub(crate) fn teach_on_failure(
+        &self,
+        tracker: &mut ReteachTracker,
+        name: &str,
+        input: &Value,
+        error: String,
+    ) -> String {
+        let identity = self.reteach_identity(name, input);
+        let streak = tracker.record_failure(identity);
+        match Self::reteach_payload(identity) {
+            Some(payload) if streak >= RETEACH_AFTER_CONSECUTIVE_FAILURES => {
+                format!("{error}\n\n{payload}")
+            }
+            _ => error,
         }
     }
 
