@@ -124,15 +124,18 @@ impl ModelProvider for CanaryEntryProvider {
 
 /// The string fields of `event` that are secret ENTRY surfaces — text that
 /// arrives from outside the model (tool output, provider error bodies,
-/// extension slot content) and is persisted + replayed into model context.
-/// Model-authored text (model.result content, reasoning, assistant
-/// messages, agent results) and tool-call arguments are intentionally NOT
-/// listed: provenance keeps model cognition faithful.
+/// extension slot content, and the agent.result ERROR field, which carries
+/// propagated provider-error text) and is persisted + replayed into model
+/// context. Model-authored text (model.result content, reasoning, assistant
+/// messages, agent result success output / reviewer findings) and tool-call
+/// arguments are intentionally NOT listed: provenance keeps model cognition
+/// faithful.
 fn entry_surface_strings(event: &EventEnvelope) -> Vec<(String, String)> {
     let fields: &[&str] = match event.kind.as_str() {
         EventKind::TOOL_RESULT => &["output", "error"],
         EventKind::ERROR => &["message"],
         EventKind::CONTEXT_SLOT_UPDATED => &["content"],
+        EventKind::AGENT_RESULT => &["error"],
         _ => return Vec::new(),
     };
     fields
@@ -178,6 +181,11 @@ fn leak_canary_never_reaches_an_entry_point_emission() {
                 input: json!({"command": echo_all}),
             }]),
             FixtureResponse::Assistant("done".to_owned()),
+            // Consumed by the flow-3 companion: model cognition echoing the
+            // canaries, which must stay faithful in agent.result output.
+            FixtureResponse::Assistant(format!(
+                "assessment mentions {known_canary}, {resolved_canary} and {shaped_canary}"
+            )),
         ]),
         resolved_secret: resolved_canary.to_owned(),
         fail_message: format!(
@@ -218,7 +226,21 @@ fn leak_canary_never_reaches_an_entry_point_emission() {
             [Capability::ContextSlot],
         )
         .expect("slot update");
-    // Flow 3: provider error echoing all three (scripted queue exhausted).
+    // Flow 3: a companion whose model SUCCEEDS while echoing the canaries —
+    // agent.result success output is model cognition and stays faithful
+    // (asserted below).
+    let ok_summary = session
+        .spawn_companion(AgentTask::new_inheriting_target("assess", "default").expect("task"))
+        .expect("companion succeeds");
+    assert!(ok_summary.result.ok());
+    // Flow 4: a companion whose provider FAILS echoing all three — the
+    // failure string is entry text (external HTTP body) and must reach
+    // agent.result error redacted (scripted queue exhausted).
+    let failed_summary = session
+        .spawn_companion(AgentTask::new_inheriting_target("assess again", "default").expect("task"))
+        .expect("companion records a failure result");
+    assert!(!failed_summary.result.ok());
+    // Flow 5: provider error echoing all three on the root session.
     let error = session.run_turn("fail now").expect_err("provider rejects");
     drop(error);
 
@@ -240,6 +262,7 @@ fn leak_canary_never_reaches_an_entry_point_emission() {
         "tool.result.output",
         "error.message",
         "context.slot.updated.content",
+        "agent.result.error",
     ] {
         assert!(surfaces_seen.contains(surface), "missing {surface}");
     }
@@ -253,6 +276,23 @@ fn leak_canary_never_reaches_an_entry_point_emission() {
         .payload["input"]
         .to_string();
     assert!(tool_call_input.contains(known_canary), "{tool_call_input}");
+    // Faithful-output guard: the successful companion's agent.result output
+    // (model cognition) carries the canaries verbatim — only the ERROR
+    // field of agent.result is an entry surface.
+    let ok_output = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::AGENT_RESULT && event.payload["ok"] == json!(true)
+        })
+        .expect("successful agent.result")
+        .payload["output"]
+        .as_str()
+        .expect("success output")
+        .to_owned();
+    for canary in canaries {
+        assert!(ok_output.contains(canary), "{ok_output}");
+    }
 }
 
 /// Wraps a scripted provider and reports `secret` to the installed

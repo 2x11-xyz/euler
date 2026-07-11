@@ -234,9 +234,17 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             transport_retries: self.transport_retries,
             transport_retry_backoff_ms: self.transport_retry_backoff_ms.clone(),
         };
-        match RoundLoop::new(self, config).run(cancel_flag) {
+        let outcome = RoundLoop::new(self, config).run(cancel_flag);
+        match outcome {
             Ok(result) => result,
-            Err(error) => companion_failure(error.to_string()),
+            // The loop's terminal error carries the raw provider message
+            // (HTTP error bodies can echo request fragments — secrets
+            // contract). This failure string becomes the agent.result error
+            // field and AgentOutcome.error, and from there the code-swarm
+            // tool output and consolidated artifact; redacting at this
+            // conversion point makes every downstream sink inherit it.
+            // Success output is model cognition and stays faithful.
+            Err(error) => companion_failure(self.redactor.redact(&error.to_string())),
         }
     }
 

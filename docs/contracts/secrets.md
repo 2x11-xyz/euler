@@ -136,13 +136,20 @@ persisted to the ledger (and from there replays into model context):
 - provider `error` messages (HTTP error bodies can echo request
   fragments) — root session, companion loop, and the parallel-reviewer
   buffered append;
+- `agent.result` error / failure text (provider-error propagation): a
+  provider failure is also stringified into the agent failure result, and
+  it is redacted at that conversion point — in the companion loop and the
+  parallel-reviewer outcome recording — so the `agent.result` event,
+  `AgentOutcome`, the `code_swarm_review` tool result, and the consolidated
+  review artifact all inherit the redacted text. Only the ERROR field:
+  success output and reviewer findings stay faithful;
 - `context.slot.updated` content (extension-injected text that replays
   into every later round).
 
 Model-authored text (`model.result` content, `model.reasoning`,
-`assistant.message`, agent results, reviewer findings, and the guardian's
-rationale) and model-authored tool-call arguments are NOT redaction
-chokepoints: provenance keeps model cognition faithful.
+`assistant.message`, agent result success output, reviewer findings, and
+the guardian's rationale) and model-authored tool-call arguments are NOT
+redaction chokepoints: provenance keeps model cognition faithful.
 Secrets are caught where they enter (tool results, provider errors,
 extension content) rather than by rewriting what the model said.
 
