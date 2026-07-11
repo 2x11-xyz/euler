@@ -24,16 +24,15 @@ pub(in crate::ui::transcript) fn render_tool_run(
         theme.transcript.tool_error
     };
     // `limit == usize::MAX` is how an explicitly-expanded (ctrl+o) cell is
-    // signaled by the renderer; anything else is a collapsed cell (review v2
-    // §14.2) and gets exactly one `└ ` result line instead of a raw output
-    // preview that can read as if the exit status leaked into the body.
+    // signaled by the renderer; anything else is a collapsed cell and gets
+    // the head+tail preview (v4 spec amendment, docs/contracts/ui.md).
+    // Expanded cells render the full stored buffer in buffer order — no
+    // informative-line promotion, no reordering of any kind.
     let collapsed = limit != usize::MAX;
     let output = if collapsed {
-        collapsed_tool_run_rows(run.output, run.ok, limit)
-    } else if run.ok {
-        tool_run_output_rows(run.output, limit)
+        collapsed_tool_run_rows(run.output, limit)
     } else {
-        informative_output_rows(run.output, limit)
+        artifact_output_rows(run.output, limit)
     };
     let rows = plain_artifact_rows(&output.rows, theme.transcript.muted);
     // The footer (status · line count · folded) is computed before the
@@ -125,9 +124,11 @@ pub(in crate::ui::transcript) fn edit_failure_status(path: &str, error: &str) ->
 /// Most informative output line worth surfacing from a completed command, if
 /// any. Scored heuristic (design review v3 §R3, spec §0/§1): test summaries
 /// outrank error/panic lines, which outrank count/total rows; ties keep the
-/// earliest match. Callers that need a line unconditionally (e.g. the
-/// collapsed `└ ` result row) fall back to the last non-empty line, then the
-/// first, when nothing scores above zero.
+/// earliest match. The collapsed tool-run preview no longer uses this (the
+/// v4 head+tail amendment withdrew the one-selected-line rule); the surviving
+/// consumer is the generic ToolResult failure preview
+/// (`bounded_failure_preview_rows`), which still promotes the strongest
+/// failure marker above the fold.
 pub(in crate::ui::transcript) fn most_informative_line(output: &str) -> Option<&str> {
     let mut best: Option<(&str, u32)> = None;
     for line in output_rows_without_trailing_blanks(output) {
@@ -223,15 +224,6 @@ fn has_count_token(line: &str, words: &[&str]) -> bool {
     })
 }
 
-/// Last non-empty output line, ignoring trailing blank rows — usually more
-/// conclusive than the first line for output with no strong signal (e.g. an
-/// `ls`-style listing).
-fn last_non_empty_line(output: &str) -> Option<&str> {
-    output_rows_without_trailing_blanks(output)
-        .into_iter()
-        .last()
-}
-
 fn tool_run_footer(run: &ToolRunRender<'_>, total_rows: usize, folded: bool) -> String {
     let cross = glyphs::cross();
     let status = match (run.exit_code, run.ok) {
@@ -255,56 +247,61 @@ fn tool_run_footer(run: &ToolRunRender<'_>, total_rows: usize, folded: bool) -> 
     }
 }
 
-fn tool_run_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
-    if most_informative_line(detail).is_some() {
-        informative_output_rows(detail, limit)
-    } else {
-        artifact_output_rows(detail, limit)
-    }
-}
+/// Collapsed tool-run preview shape (v4 spec amendment, docs/contracts/
+/// ui.md): the literal first `COLLAPSED_PREVIEW_HEAD_LINES` and literal last
+/// `COLLAPSED_PREVIEW_TAIL_LINES` buffer rows, in buffer order, with the
+/// fold marker between them (the Codex preview model). head 2 / tail 3
+/// keeps the whole collapsed cell (header + 6 preview rows) inside the
+/// default 10-row collapsed budget (`TOOL_CALL_MAX_LINES`) while giving the
+/// tail — where test summaries and errors live — the larger share.
+const COLLAPSED_PREVIEW_HEAD_LINES: usize = 2;
+const COLLAPSED_PREVIEW_TAIL_LINES: usize = 3;
 
-/// Collapsed-cell preview: exactly one `└ ` result line carrying the most
-/// informative output line (falling back to the first non-empty output
-/// line), with any remaining preview rows indented two extra spaces
-/// underneath it (review v2 §14.2, spec §0/§1).
-fn collapsed_tool_run_rows(detail: &str, ok: bool, limit: usize) -> ArtifactOutputRows {
-    let base = if ok {
-        tool_run_output_rows(detail, limit)
+/// Collapsed-cell preview (v4 spec amendment; supersedes the "exactly one
+/// `└ ` result line" rule of review v2 §14.2): head = the literal first N
+/// buffer rows, tail = the literal last M rows, both in buffer order; the
+/// `… K more lines · ctrl+o expand` fold marker sits between them and
+/// carries the hidden count. The `└ ` elbow marks the first preview row,
+/// with sibling rows indented two extra spaces to align under it. Outputs
+/// short enough to fit (≤ limit rows, or ≤ head+tail rows) render whole
+/// with no marker, so head and tail can never overlap.
+fn collapsed_tool_run_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
+    let rows = normalized_output_rows(detail);
+    let total_rows = rows.len();
+    if total_rows == 0 {
+        return ArtifactOutputRows {
+            rows: vec![String::new()],
+            total_rows,
+            folded: false,
+        };
+    }
+    let preview_rows = COLLAPSED_PREVIEW_HEAD_LINES + COLLAPSED_PREVIEW_TAIL_LINES;
+    let folded = total_rows > limit && total_rows > preview_rows;
+    let source = if folded {
+        let hidden = total_rows - preview_rows;
+        let mut source = rows[..COLLAPSED_PREVIEW_HEAD_LINES].to_vec();
+        source.push(format!("… {hidden} more lines · ctrl+o expand"));
+        source.extend(
+            rows[total_rows - COLLAPSED_PREVIEW_TAIL_LINES..]
+                .iter()
+                .cloned(),
+        );
+        source
     } else {
-        informative_output_rows(detail, limit)
+        rows
     };
-    if base.total_rows == 0 {
-        return base;
-    }
 
-    let mut rows = base.rows;
-    let result_line = most_informative_line(detail)
-        .or_else(|| last_non_empty_line(detail))
-        .map(str::to_owned)
-        .or_else(|| rows.iter().find(|row| !row.trim().is_empty()).cloned())
-        .unwrap_or_default();
-    // `most_informative_line`/`last_non_empty_line` scan the raw `detail`
-    // text, but `rows` (from `informative_output_rows`/`artifact_output_rows`
-    // -> `normalized_output_rows`) is already sanitized (ANSI escapes, tabs,
-    // control/invisible-format chars stripped). Comparing the raw candidate
-    // against sanitized rows directly can fail to match even when they are
-    // "the same line", so the row would never get deduped — leaving it
-    // duplicated between the `└ ` result line and the plain preview rows
-    // below it. Sanitize the candidate through the same function before
-    // comparing (and before display) so both sides are apples-to-apples.
-    let result_line = sanitize_metadata_text(&result_line);
-    if let Some(pos) = rows.iter().position(|row| *row == result_line) {
-        rows.remove(pos);
+    let mut source = source.into_iter();
+    let mut preview = Vec::with_capacity(total_rows.min(preview_rows + 1));
+    if let Some(first) = source.next() {
+        preview.push(format!("└ {first}"));
     }
-
-    let mut preview = Vec::with_capacity(rows.len() + 1);
-    preview.push(format!("└ {result_line}"));
-    preview.extend(rows.into_iter().map(|row| format!("  {row}")));
+    preview.extend(source.map(|row| format!("  {row}")));
 
     ArtifactOutputRows {
         rows: preview,
-        total_rows: base.total_rows,
-        folded: base.folded,
+        total_rows,
+        folded,
     }
 }
 
@@ -371,46 +368,6 @@ fn is_leading_exit_code_row(line: &str) -> bool {
     }
     let remainder = rest[digits_len..].trim_start();
     remainder.is_empty() || (remainder.starts_with('(') && remainder.ends_with(')'))
-}
-
-fn informative_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
-    let rows = normalized_output_rows(detail);
-    let total_rows = rows.len();
-    if total_rows == 0 {
-        return ArtifactOutputRows {
-            rows: vec![String::new()],
-            total_rows,
-            folded: false,
-        };
-    }
-    if total_rows <= limit {
-        return ArtifactOutputRows {
-            rows: promote_informative_row(rows),
-            total_rows,
-            folded: false,
-        };
-    }
-
-    let informative = rows.iter().find(|row| is_informative_line(row)).cloned();
-    let tail_n = OUTPUT_PREVIEW_TAIL_LINES.min(total_rows);
-    let mut tail = rows[total_rows.saturating_sub(tail_n)..].to_vec();
-    let mut preview = Vec::new();
-    if let Some(line) = informative {
-        // Keep the informative match as the first surfaced row even when it
-        // already lives in the tail window.
-        tail.retain(|row| row != &line);
-        preview.push(line);
-    }
-    let hidden = total_rows.saturating_sub(preview.len() + tail.len());
-    if hidden > 0 {
-        preview.push(format!("… {hidden} more lines · ctrl+o expand"));
-    }
-    preview.extend(tail);
-    ArtifactOutputRows {
-        rows: preview,
-        total_rows,
-        folded: true,
-    }
 }
 
 pub(super) fn promote_informative_row(mut rows: Vec<String>) -> Vec<String> {

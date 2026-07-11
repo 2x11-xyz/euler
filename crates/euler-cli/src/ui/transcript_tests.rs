@@ -1323,10 +1323,13 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
         2,
         "expected continuous rail for each wrapped user prompt row, got {prompt_glyph_lines:?}"
     );
+    // Five rows fit inside the head+tail preview budget (2 + 3), so the
+    // whole output renders with no fold marker even at a tiny row limit.
     assert!(contents.contains("line one output"));
     assert!(contents.contains("line two output"));
-    assert!(contents.contains("1 more lines"));
+    assert!(contents.contains("line three output"));
     assert!(contents.contains("line five output"));
+    assert!(!contents.contains("more lines"));
 
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
         let trimmed = line.trim_start();
@@ -1410,15 +1413,16 @@ fn vt100_long_tool_output_uses_head_tail_affordance() {
     let contents = rendered_screen(&events, &theme, 80, 16);
 
     assert!(contents.contains("bash $ printf lines"));
-    // No test-summary/error/count signal, so the collapsed `└ ` result line
-    // falls back to the last non-empty line rather than the first (design
-    // review v3 §R3); head/tail preview rows sit underneath it.
-    assert!(contents.contains("└ line 12"));
-    assert!(contents.contains("line 1"));
+    // Head+tail preview (v4 spec amendment): the literal first two and last
+    // three buffer rows in buffer order, elbow on the first, fold marker
+    // carrying the hidden count in between.
+    assert!(contents.contains("└ line 1"));
     assert!(contents.contains("line 2"));
-    assert!(contents.contains("8 more lines"));
+    assert!(contents.contains("7 more lines"));
     assert!(contents.contains("ctrl+o expand"));
+    assert!(contents.contains("line 10"));
     assert!(contents.contains("line 11"));
+    assert!(contents.contains("line 12"));
     assert!(!contents.contains("line 3"));
 }
 
@@ -1523,7 +1527,8 @@ fn tool_artifact_cell_folds_only_above_threshold() {
 
     assert!(!exact.contains("more lines"), "exact: {exact:?}");
     assert!(exact.contains("line 10"), "exact: {exact:?}");
-    assert!(overflow.contains("7 more lines"), "overflow: {overflow:?}");
+    // 11 rows fold to head 2 + tail 3: 11 − 5 = 6 hidden.
+    assert!(overflow.contains("6 more lines"), "overflow: {overflow:?}");
     assert!(overflow.contains("ctrl+o expand"), "overflow: {overflow:?}");
     assert!(!overflow.contains("line 3"), "overflow: {overflow:?}");
 }
@@ -1553,7 +1558,7 @@ fn tool_artifact_cell_expands_with_unbounded_limit() {
     ))
     .join("\n");
 
-    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("7 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
     assert!(!expanded.contains("more lines"), "expanded: {expanded:?}");
     assert!(expanded.contains("line 3"), "expanded: {expanded:?}");
@@ -1814,7 +1819,7 @@ fn tool_artifact_cell_reports_failure_without_exit_code() {
 }
 
 #[test]
-fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
+fn collapsed_tool_run_previews_head_and_tail_in_buffer_order() {
     let theme = Theme::default();
     let last_line = DEFAULT_OUTPUT_LIMIT_LINES + 1;
     let output = (1..=last_line)
@@ -1833,24 +1838,49 @@ fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    // Exactly one `└ ` result line. With no test-summary/error/count signal
-    // (spec §0/§1, design review v3 §R3), the last non-empty output row is
-    // the fallback — it usually reads as more conclusive than the first.
+    // Head+tail preview (v4 spec amendment): one `└ ` elbow on the FIRST
+    // buffer row — never a selected/rotated line — then the rest of the
+    // head, the fold marker, and the literal last three rows, all in
+    // buffer order.
     assert_eq!(
         texts.iter().filter(|line| line.contains('└')).count(),
         1,
         "texts: {texts:?}"
     );
-    let result_marker = format!("└ line {last_line}");
-    assert!(joined.contains(&result_marker), "texts: {texts:?}");
-    // Remaining preview rows sit two extra spaces deeper than the result
-    // line: result line body indent is 4 cells ("  " gutter pad + "└ "),
-    // continuation rows are 6 cells ("  " gutter pad + "  " extra indent).
+    let row_index = |needle: &str| {
+        texts
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("row {needle:?} missing: {texts:?}"))
+    };
+    let head_first = row_index("└ line 1");
+    let head_second = row_index("line 2");
+    let marker = row_index("more lines · ctrl+o expand");
+    let tail_first = row_index(&format!("line {}", last_line - 2));
+    let tail_mid = row_index(&format!("line {}", last_line - 1));
+    let tail_last = row_index(&format!("line {last_line}"));
+    assert!(
+        head_first < head_second
+            && head_second < marker
+            && marker < tail_first
+            && tail_first < tail_mid
+            && tail_mid < tail_last,
+        "preview must keep buffer order: {texts:?}"
+    );
+    // The fold marker carries the hidden count: total − head − tail.
+    let hidden = last_line - 5;
+    assert!(
+        joined.contains(&format!("… {hidden} more lines · ctrl+o expand")),
+        "texts: {texts:?}"
+    );
+    // Sibling preview rows sit two extra spaces deeper than the elbow row:
+    // elbow body indent is 4 cells ("  " gutter pad + "└ "), continuation
+    // rows are 6 cells ("  " gutter pad + "  " alignment indent).
     let result_indent = texts
         .iter()
-        .find(|line| line.contains(&result_marker))
+        .find(|line| line.contains("└ line 1"))
         .map(|line| line.len() - line.trim_start().len())
-        .expect("result line present");
+        .expect("elbow line present");
     let continuation_indent = texts
         .iter()
         .find(|line| line.contains("more lines · ctrl+o expand"))
@@ -1860,7 +1890,10 @@ fn collapsed_tool_run_shows_exactly_one_result_line_with_extra_indented_rest() {
 }
 
 #[test]
-fn collapsed_tool_run_result_line_prefers_test_summary_over_first_line() {
+fn collapsed_tool_run_keeps_test_summary_visible_in_tail() {
+    // The one-selected-informative-line rule is withdrawn (v4 amendment):
+    // the tail of the buffer is where test summaries live, and the head+tail
+    // preview keeps them visible without reordering anything.
     let theme = Theme::default();
     let item = [TranscriptItem::ToolRun {
         command: "cargo test".to_owned(),
@@ -1875,20 +1908,26 @@ fn collapsed_tool_run_result_line_prefers_test_summary_over_first_line() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 96));
     let joined = texts.join("\n");
 
-    assert_eq!(
-        texts.iter().filter(|line| line.contains('└')).count(),
-        1,
-        "texts: {texts:?}"
-    );
+    // Three rows fit whole: elbow on the literal first row, summary last.
+    assert!(joined.contains("└ running 3 tests"), "texts: {texts:?}");
     assert!(
-        joined.contains("└ test result: ok. 3 passed; 0 failed"),
+        joined.contains("test result: ok. 3 passed; 0 failed"),
         "texts: {texts:?}"
     );
-    assert!(!joined.contains("└ running 3 tests"), "texts: {texts:?}");
+    assert!(!joined.contains("more lines"), "texts: {texts:?}");
+    let first = texts
+        .iter()
+        .position(|line| line.contains("running 3 tests"))
+        .expect("head row");
+    let summary = texts
+        .iter()
+        .position(|line| line.contains("test result:"))
+        .expect("summary row");
+    assert!(first < summary, "buffer order preserved: {texts:?}");
 }
 
 #[test]
-fn collapsed_tool_run_result_line_prefers_match_count_over_first_line() {
+fn collapsed_tool_run_short_output_renders_whole_without_marker() {
     let theme = Theme::default();
     let item = [TranscriptItem::ToolRun {
         command: "rg -c foo".to_owned(),
@@ -1902,56 +1941,11 @@ fn collapsed_tool_run_result_line_prefers_match_count_over_first_line() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 96));
     let joined = texts.join("\n");
 
-    assert_eq!(
-        texts.iter().filter(|line| line.contains('└')).count(),
-        1,
-        "texts: {texts:?}"
-    );
-    assert!(joined.contains("└ 8 matches"), "texts: {texts:?}");
-    assert!(!joined.contains("└ src/lib.rs:3"), "texts: {texts:?}");
-}
-
-#[test]
-fn collapsed_tool_run_result_line_dedupes_against_sanitized_row() {
-    let theme = Theme::default();
-    // The informative line carries a raw tab; `most_informative_line`
-    // returns it verbatim from the raw output, while the `rows` list it must
-    // be deduped against has already been sanitized (tabs expanded to four
-    // spaces). A raw-vs-sanitized comparison would fail to recognize them as
-    // the same line, leaving the line duplicated: once as the `└ ` result
-    // line, once as a plain preview row.
-    let output = "warmup\nerror: bad\tvalue".to_owned();
-    let item = [TranscriptItem::ToolRun {
-        command: "run".to_owned(),
-        ok: false,
-        error: String::new(),
-        output,
-        exit_code: Some(1),
-        grant_source: None,
-    }];
-
-    let texts = line_texts(&render_items_for_history(&item, &theme, 96));
-    let joined = texts.join("\n");
-
-    assert_eq!(
-        texts.iter().filter(|line| line.contains('└')).count(),
-        1,
-        "texts: {texts:?}"
-    );
-    assert!(
-        joined.contains("└ error: bad    value"),
-        "result line should be sanitized (tab expanded, escape stripped): {texts:?}"
-    );
-    // The sanitized line must not additionally show up as a separate,
-    // undeduped preview row.
-    assert_eq!(
-        texts
-            .iter()
-            .filter(|line| line.contains("error: bad"))
-            .count(),
-        1,
-        "informative line must not be duplicated: {texts:?}"
-    );
+    assert!(joined.contains("└ src/lib.rs:3"), "texts: {texts:?}");
+    assert!(joined.contains("src/main.rs:5"), "texts: {texts:?}");
+    assert!(joined.contains("8 matches"), "texts: {texts:?}");
+    assert!(!joined.contains("more lines"), "texts: {texts:?}");
+    assert!(!joined.contains("folded"), "texts: {texts:?}");
 }
 
 /// Project run_shell tool events into transcript items (the real ingest
@@ -3309,15 +3303,15 @@ fn tui_long_tool_output_ignores_trailing_blanks_in_head_tail_preview() {
     let theme = Theme::default();
     let contents = rendered_screen(&events, &theme, 80, 16);
 
-    // No test-summary/error/count signal in this output, so the collapsed
-    // `└ ` result line falls back to the last non-empty line (trailing
-    // blanks ignored) rather than the first (design review v3 §R3).
-    assert!(contents.contains("└ line 12"));
-    assert!(contents.contains("8 more lines"));
+    // Trailing blank rows are ignored: the head+tail preview counts and
+    // slices the 12 real rows, not the 18 raw ones.
+    assert!(contents.contains("└ line 1"));
+    assert!(contents.contains("7 more lines"));
     assert!(contents.contains("ctrl+o expand"));
-    assert!(contents.contains("line 1"));
+    assert!(contents.contains("line 10"));
     assert!(contents.contains("line 11"));
-    assert!(!contents.contains("14 more lines"));
+    assert!(contents.contains("line 12"));
+    assert!(!contents.contains("13 more lines"));
 }
 
 #[test]
@@ -3450,11 +3444,14 @@ fn vt100_failed_tool_with_exit_code_and_empty_error_has_no_dangling_colon() {
 }
 
 #[test]
-fn failed_tool_run_surfaces_informative_line_before_tail() {
+fn failed_tool_run_previews_head_and_tail_in_buffer_order() {
+    // v4 amendment: failures use the same head+tail preview as successes —
+    // no informative-line promotion. The loud failure signal lives in the
+    // header (`✗ exit N`), and the tail keeps the conclusive final rows.
     let theme = Theme::default();
     let output = (1..=12)
         .map(|index| {
-            if index == 5 {
+            if index == 12 {
                 "error[E0425]: cannot find value `x`".to_owned()
             } else {
                 format!("line {index}")
@@ -3485,17 +3482,16 @@ fn failed_tool_run_surfaces_informative_line_before_tail() {
         .filter(|line| line.starts_with("    ") && !line.trim().is_empty())
         .collect();
     assert!(
-        body.first()
-            .is_some_and(|line| line.contains("error[E0425]: cannot find value `x`")),
-        "first surfaced body line should be the informative match: {texts:?}"
+        body.first().is_some_and(|line| line.contains("└ line 1")),
+        "first surfaced body line is the literal first buffer row: {texts:?}"
     );
     assert!(
         joined.contains("more lines · ctrl+o expand"),
         "fold marker should remain: {joined:?}"
     );
     assert!(
-        joined.contains("line 11") && joined.contains("line 12"),
-        "summary tail should remain: {joined:?}"
+        joined.contains("line 11") && joined.contains("error[E0425]: cannot find value `x`"),
+        "tail keeps the conclusive final rows: {joined:?}"
     );
 }
 

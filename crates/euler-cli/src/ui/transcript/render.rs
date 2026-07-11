@@ -1060,7 +1060,10 @@ mod tests {
     }
 
     #[test]
-    fn successful_shell_output_promotes_informative_result_line() {
+    fn successful_shell_output_keeps_summary_tail_in_head_tail_preview() {
+        // v4 amendment: the collapsed preview is the literal head + tail of
+        // the buffer in buffer order — test summaries live in the tail, so
+        // they stay visible without any informative-line promotion.
         let item = TranscriptItem::ToolRun {
             command: "cargo test".to_owned(),
             ok: true,
@@ -1079,9 +1082,12 @@ mod tests {
         let text = plain_text(&lines);
 
         assert!(
-            text.contains("test result: ok. 12 passed; 0 failed")
+            text.contains("└ line 1")
+                && text.contains("line 2")
+                && text.contains("… 2 more lines · ctrl+o expand")
+                && text.contains("test result: ok. 12 passed; 0 failed")
                 && text.contains("tail 2")
-                && !text.contains("line 1"),
+                && !text.contains("line 3"),
             "text: {text:?}"
         );
     }
