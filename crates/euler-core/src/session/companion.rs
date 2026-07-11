@@ -44,7 +44,11 @@ struct CompanionLoop<'a, D> {
     workspace_root: std::path::PathBuf,
     auto_compaction: AutoCompactionPolicy,
     reasoning_effort: ReasoningEffort,
-    max_output_tokens: Option<u64>,
+    /// Per-request provider cap inherited from the parent session
+    /// (`--max-output-tokens`). The task budget's cumulative output cap is
+    /// tracked separately: each round requests at most the REMAINING task
+    /// budget (see `round_max_output_tokens`).
+    session_max_output_tokens: Option<u64>,
     transport_retries: usize,
     transport_retry_backoff_ms: Vec<u64>,
     providers: &'a euler_provider::ProviderSet,
@@ -187,15 +191,6 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         for (capability, mode) in modes {
             permissions.set_mode(capability, mode);
         }
-        // The task budget's max_tokens must bound the provider call itself,
-        // not only the post-round accounting: a companion whose brief allows
-        // 8192 tokens must not be silently capped at the provider default
-        // because the parent session never set --max-output-tokens.
-        let max_output_tokens = match (session.config.max_output_tokens, task.budget().max_tokens())
-        {
-            (Some(session_cap), Some(task_cap)) => Some(session_cap.min(task_cap)),
-            (session_cap, task_cap) => session_cap.or(task_cap),
-        };
         Self {
             session_id: session.config.session_id.clone(),
             agent_id,
@@ -204,7 +199,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             workspace_root: session.config.root.clone(),
             auto_compaction: session.config.auto_compaction,
             reasoning_effort: session.config.reasoning_effort,
-            max_output_tokens,
+            session_max_output_tokens: session.config.max_output_tokens,
             transport_retries: session.config.provider_transport_retries,
             transport_retry_backoff_ms: session.config.provider_transport_retry_backoff_ms.clone(),
             providers: &session.providers,
@@ -224,6 +219,11 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     /// maps onto the loop's round limit: it counts companion model rounds,
     /// and max_turns = 1 means at most one model round total.
     fn run(&mut self, cancel_flag: &AtomicBool) -> AgentResult {
+        // A zero output budget can never produce a round: fail honestly
+        // before spending a provider call on it.
+        if self.remaining_output_budget() == Some(0) {
+            return companion_failure("budget exhausted: max_tokens");
+        }
         let config = RoundLoopConfig {
             max_rounds: self.task.budget().max_turns().map(|max| max as usize),
             transport_retries: self.transport_retries,
@@ -554,6 +554,10 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             .is_some_and(|max| self.tool_calls >= max)
     }
 
+    /// The budget is exhausted when cumulative output EXCEEDS the cap
+    /// (strictly greater): a round that lands exactly on the cap succeeds,
+    /// but the next round would have a zero remaining budget and fails
+    /// before it is ever requested (see `finish_round` / `run`).
     fn token_budget_exhausted(&self) -> bool {
         self.task
             .budget()
@@ -561,13 +565,38 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             .is_some_and(|max| self.tokens > max)
     }
 
+    /// Output tokens the task budget still allows: `max_tokens` minus the
+    /// cumulative output so far. `None` means unbudgeted.
+    fn remaining_output_budget(&self) -> Option<u64> {
+        self.task
+            .budget()
+            .max_tokens()
+            .map(|max| max.saturating_sub(self.tokens))
+    }
+
+    /// Provider cap for the NEXT round. The task budget's max_tokens must
+    /// bound the provider call itself, not only the post-round accounting: a
+    /// companion whose brief allows 8192 tokens must not be silently capped
+    /// at the provider default because the parent session never set
+    /// --max-output-tokens. It is the REMAINING budget that bounds the call,
+    /// not the full cap — otherwise a multi-round companion could emit up to
+    /// the full cap every round before the accounting noticed (#58).
+    fn round_max_output_tokens(&self) -> Option<u64> {
+        match (
+            self.session_max_output_tokens,
+            self.remaining_output_budget(),
+        ) {
+            (Some(session_cap), Some(remaining)) => Some(session_cap.min(remaining)),
+            (session_cap, remaining) => session_cap.or(remaining),
+        }
+    }
+
     /// `AgentBudget::max_tokens` bounds OUTPUT (completion) tokens, not
     /// total usage: reviewers/companions see the whole session canvas as
     /// input, which routinely exceeds any output-scale budget on its own
     /// (#58). Only `usage.output_tokens` counts against it here; it is the
-    /// same quantity `max_output_tokens` already asks the provider to cap
-    /// (see `CompanionLoop::new`), so the request-side cap and the
-    /// round-accounting check now agree.
+    /// same quantity `round_max_output_tokens` already asks the provider to
+    /// cap, so the request-side cap and the round-accounting check agree.
     fn add_usage(&mut self, usage: Option<&Usage>) {
         if let Some(usage) = usage {
             self.tokens = self.tokens.saturating_add(usage.output_tokens);
@@ -629,7 +658,8 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         {
             model_call.insert("reasoning_effort".to_owned(), reasoning_effort.into());
         }
-        if let Some(max_output_tokens) = self.max_output_tokens {
+        let round_max_output_tokens = self.round_max_output_tokens();
+        if let Some(max_output_tokens) = round_max_output_tokens {
             model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
         }
         let model_call_id = self.append(EventKind::MODEL_CALL, model_call, None)?.id;
@@ -655,7 +685,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
                 self.tools.model_tools()
             },
             reasoning_effort: self.reasoning_effort,
-            max_output_tokens: self.max_output_tokens,
+            max_output_tokens: round_max_output_tokens,
         }
         .for_target(&target.provider, &target.model);
         Ok((model_call_id, request))
@@ -748,6 +778,14 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
                 None,
             )?;
             return Ok(RoundOutcome::Complete(companion_success(data.content)));
+        }
+        // The round wants to continue (tool calls), but a zero remaining
+        // output budget means the next model round could never run. Fail
+        // before executing tool calls whose results no round will observe.
+        if self.remaining_output_budget() == Some(0) {
+            return Ok(RoundOutcome::Complete(companion_failure(
+                "budget exhausted: max_tokens",
+            )));
         }
         for call in data.tool_calls {
             if self.tool_budget_exhausted() {

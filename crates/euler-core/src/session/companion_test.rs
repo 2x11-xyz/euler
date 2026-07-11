@@ -862,6 +862,122 @@ fn session_cap_and_task_budget_take_the_smaller_bound() {
 }
 
 #[test]
+fn round_max_output_tokens_is_remaining_budget_after_prior_rounds() {
+    // #58 follow-through: the cap handed to the provider is the REMAINING
+    // output budget, not the full cap replayed every round.
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        BudgetRoundProvider::new(
+            vec![
+                BudgetRound::tool_call(90),
+                BudgetRound::assistant("done", 5),
+            ],
+            captured.clone(),
+        ),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let task = task_with_caps([Capability::FsRead])
+        .with_budget(AgentBudget::new(None, None, Some(100)).expect("budget"));
+
+    let summary = session.spawn_companion(task).expect("companion");
+
+    assert!(summary.result.ok(), "{:?}", summary.result.error());
+    assert_eq!(
+        captured.lock().expect("captured").as_slice(),
+        &[Some(100), Some(10)],
+        "round 2 gets the remainder, not the full cap"
+    );
+}
+
+#[test]
+fn cumulative_output_exceeding_budget_fails_exhausted() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        BudgetRoundProvider::new(
+            vec![
+                BudgetRound::tool_call(90),
+                BudgetRound::assistant("over", 20),
+            ],
+            captured,
+        ),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let task = task_with_caps([Capability::FsRead])
+        .with_budget(AgentBudget::new(None, None, Some(100)).expect("budget"));
+
+    let summary = session.spawn_companion(task).expect("companion");
+
+    assert_budget_failure(&summary, "budget exhausted: max_tokens");
+}
+
+#[test]
+fn round_landing_exactly_on_cap_completes() {
+    // Exhaustion is strictly-greater-than: output == cap is within budget.
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        BudgetRoundProvider::new(vec![BudgetRound::assistant("done", 100)], captured),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let task =
+        task_with_caps([]).with_budget(AgentBudget::new(None, None, Some(100)).expect("budget"));
+
+    let summary = session.spawn_companion(task).expect("companion");
+
+    assert!(summary.result.ok(), "{:?}", summary.result.error());
+    assert_eq!(summary.result.output(), Some("done"));
+}
+
+#[test]
+fn exact_cap_continuation_is_exhausted_before_the_next_call() {
+    // A tool-call round that lands exactly on the cap leaves zero remaining
+    // budget: the loop fails before executing the tools or issuing a
+    // provider call that could only request zero output tokens.
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        BudgetRoundProvider::new(
+            vec![
+                BudgetRound::tool_call(100),
+                BudgetRound::assistant("unreached", 1),
+            ],
+            captured.clone(),
+        ),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let task = task_with_caps([Capability::FsRead])
+        .with_budget(AgentBudget::new(None, None, Some(100)).expect("budget"));
+
+    let summary = session.spawn_companion(task).expect("companion");
+
+    assert_budget_failure(&summary, "budget exhausted: max_tokens");
+    assert_eq!(
+        captured.lock().expect("captured").as_slice(),
+        &[Some(100)],
+        "no second provider call"
+    );
+    assert!(
+        events_of_kind(session.events(), EventKind::TOOL_CALL).is_empty(),
+        "tools whose results no round will observe are not executed"
+    );
+}
+
+#[test]
+fn zero_token_budget_fails_before_any_model_call() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        BudgetRoundProvider::new(vec![BudgetRound::assistant("unreached", 1)], captured),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let task =
+        task_with_caps([]).with_budget(AgentBudget::new(None, None, Some(0)).expect("budget"));
+
+    let summary = session.spawn_companion(task).expect("companion");
+
+    assert_budget_failure(&summary, "budget exhausted: max_tokens");
+    assert!(events_of_kind(session.events(), EventKind::MODEL_CALL).is_empty());
+    assert_spawn_result_pair(session.events(), &summary);
+}
+
+#[test]
 fn truncated_or_refused_round_reports_failure_not_success() {
     // An empty round that stopped on max_tokens was summarized
     // as ok=true "companion completed".
@@ -910,6 +1026,89 @@ fn zero_tool_budget_hides_the_tool_palette_from_the_provider_call() {
     let counts = captured.lock().expect("captured");
     assert_eq!(counts[0], 0, "zero-tool budget advertises no tools");
     assert!(counts[1] > 0, "default budget keeps the palette");
+}
+
+/// One scripted companion round with a fixed OUTPUT token usage.
+struct BudgetRound {
+    tool_call: bool,
+    content: &'static str,
+    output_tokens: u64,
+}
+
+impl BudgetRound {
+    fn tool_call(output_tokens: u64) -> Self {
+        Self {
+            tool_call: true,
+            content: "",
+            output_tokens,
+        }
+    }
+
+    fn assistant(content: &'static str, output_tokens: u64) -> Self {
+        Self {
+            tool_call: false,
+            content,
+            output_tokens,
+        }
+    }
+}
+
+/// Plays scripted rounds while capturing each request's max_output_tokens,
+/// so tests can assert the provider-side cap round by round.
+struct BudgetRoundProvider {
+    rounds: RefCell<std::collections::VecDeque<BudgetRound>>,
+    captured_caps: Arc<Mutex<Vec<Option<u64>>>>,
+}
+
+impl BudgetRoundProvider {
+    fn new(rounds: Vec<BudgetRound>, captured_caps: Arc<Mutex<Vec<Option<u64>>>>) -> Self {
+        Self {
+            rounds: RefCell::new(rounds.into()),
+            captured_caps,
+        }
+    }
+}
+
+impl ModelProvider for BudgetRoundProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.captured_caps
+            .lock()
+            .expect("captured")
+            .push(request.max_output_tokens);
+        let round = self
+            .rounds
+            .borrow_mut()
+            .pop_front()
+            .expect("unscripted companion round");
+        let usage = Usage {
+            input_tokens: 1,
+            output_tokens: round.output_tokens,
+            cached_tokens: Some(0),
+            reasoning_tokens: Some(0),
+        };
+        let events = if round.tool_call {
+            vec![
+                Ok(ModelStreamEvent::ToolCall(read_note_call())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Some(usage),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(ModelStreamEvent::TextDelta(round.content.to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: Some(usage),
+                }),
+            ]
+        };
+        Ok(Box::new(events.into_iter()))
+    }
 }
 
 struct StopReasonProvider {
