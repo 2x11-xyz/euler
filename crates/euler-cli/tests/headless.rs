@@ -7125,6 +7125,23 @@ fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
     // during resize + item-boundary remap, a drag may leave at most the
     // pre-resize copy plus one bounded partial-item re-emission — never a
     // copy per tick.
+    //
+    // Issue #38 mechanism under test: intermediate ticks re-render the live
+    // viewport only; once the drag settles (450ms trailing debounce), euler
+    // runs exactly ONE purge+replay that clears the ENTIRE native scrollback
+    // buffer (ESC[2J + ESC[3J) — including any pre-euler content the user's
+    // terminal held before euler started — and re-emits euler's own
+    // transcript from the event log at the settled width. See
+    // docs/contracts/ui.md ("Mouse" section, resize exception) for the full
+    // rationale: per-tick append corrupted all three terminals under test
+    // (Ghostty, iTerm2, Terminal.app), and no escape/control sequence scopes
+    // a scrollback purge to euler-only rows.
+    //
+    // OWNER-ACCEPTANCE PENDING: this test exercises the mechanism via PTY +
+    // vt100 reconstruction only. It does not substitute for hands-on
+    // real-terminal dogfood in Ghostty/iTerm2/Terminal.app, which remains
+    // the outstanding #38 acceptance step before this trade-off is
+    // considered fully settled.
     let temp = tempfile::tempdir().expect("temp dir");
     let mut events = Vec::new();
     for paragraph in 1..=6 {

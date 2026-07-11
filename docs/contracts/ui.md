@@ -66,10 +66,11 @@ emission + unrelated renderers.
   (tool output, reasoning, diffs); the next press collapses them all
   together. No per-cell targeting and no invisible "nearest to viewport
   center" heuristic — this is deliberate: mouse capture is off (native
-  selection and native scrollback stay intact, see the Mouse section), so
-  there is no honest per-cell input method, and a predictable global state
-  beats an invisible one. Native scrollback and `ctrl+f` search remain the
-  navigation tools; `ctrl+o` only decides how much of each cell is showing.
+  selection and native scrollback stay intact outside of resize
+  reconciliation, see the Mouse section), so there is no honest per-cell
+  input method, and a predictable global state beats an invisible one.
+  Native scrollback and `ctrl+f` search remain the navigation tools; `ctrl+o`
+  only decides how much of each cell is showing.
 - Search and other read-only modes must not mutate fold state.
 
 ### Typography
@@ -136,12 +137,39 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
 
 Mouse capture is deliberately off (terminal enter-session modes never emit
 `\x1b[?1000h`/`\x1b[?1006h`) so the terminal's native text selection and
-native scrollback stay fully usable — copying transcript text and scrolling
-back through history work exactly as they would in any other CLI output. A
-practical consequence: crossterm never delivers mouse events in a real
-terminal, so click/drag is not a supported input path — there is no
-click-to-expand affordance. `ctrl+o` (global fold toggle) and `ctrl+f`
-(search) are the supported disclosure and navigation controls.
+native scrollback stay usable — copying transcript text and scrolling back
+through history work as they would in any other CLI output, **with the one
+exception below for resize reconciliation**. A practical consequence:
+crossterm never delivers mouse events in a real terminal, so click/drag is
+not a supported input path — there is no click-to-expand affordance.
+`ctrl+o` (global fold toggle) and `ctrl+f` (search) are the supported
+disclosure and navigation controls.
+
+**Resize exception — settled-resize scrollback purge (issue #38).** Per-tick
+incremental append during a resize corrupted output in all three major
+terminals tested (Ghostty, iTerm2, Terminal.app): stale-viewport re-renders
+scrolled prior rows into native scrollback, accumulating one fossil
+transcript copy per width tick. There is no terminal escape/control sequence
+that scopes a scrollback purge to "only euler's rows" — `ESC[3J` (and the
+native scrollback buffer generally) is all-or-nothing per terminal session.
+Given that constraint, the mechanism is: intermediate resize ticks re-render
+the live viewport only (no scrollback writes); once the resize settles (a
+450ms trailing debounce with no further resize events), euler runs exactly
+ONE purge+replay — it clears the entire native scrollback buffer (`ESC[2J`
++ `ESC[3J`), **including any content the user had in their terminal before
+euler started**, and re-emits euler's own transcript from its internal
+event-log model at the settled width. This is a deliberate, disclosed
+trade-off, not an oversight: it is strictly better than the fossil-copy
+corruption it replaces, but it does mean a user who resizes their terminal
+loses pre-euler scrollback history.
+
+> **Owner-acceptance pending (real-terminal dogfood).** This mechanism is
+> PTY-tested (see the drag-resize test in `tests/headless.rs`) but has not
+> yet been hands-on validated by the owner in real terminal emulators
+> (Ghostty, iTerm2, Terminal.app). Treat the purge-on-settled-resize
+> behavior above as a disclosed, not-yet-fully-settled trade-off until that
+> dogfood pass confirms it reads correctly outside of PTY harness
+> reconstruction.
 
 ## Transcript event model
 
