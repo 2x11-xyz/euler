@@ -1834,7 +1834,10 @@ fn apply_patch_parse_failure_persists_sanitized_error_without_file_change() {
 
     assert_eq!(
         payload_str(tool_result, "error"),
-        Some("invalid patch: invalid add line")
+        Some(
+            "invalid patch: every content line in an Add File must start \
+             with `+` (e.g. `+fn main() {`)"
+        )
     );
     assert!(!events
         .iter()

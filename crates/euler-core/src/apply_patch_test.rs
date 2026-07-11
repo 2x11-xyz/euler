@@ -83,3 +83,48 @@ fn overlapping_hunks_are_rejected() {
         }
     );
 }
+
+#[test]
+fn parse_errors_teach_the_expected_format() {
+    // Live-session finding (review-v4-code-write): a model sent an Add File
+    // without the envelope, then with raw body lines, burned three minutes
+    // of reasoning on "missing begin marker"/"invalid add line", and fell
+    // back to a shell heredoc. Parse errors reach the model verbatim as the
+    // tool error — each must name what the format EXPECTS.
+    let cases: &[(&str, &str)] = &[
+        (
+            // attempt 1 from the session: no envelope
+            "*** Add File: a.rs\nfn main() {}\n*** End Patch",
+            "must be exactly `*** Begin Patch`",
+        ),
+        (
+            // attempt 2 from the session: raw body lines in an Add File
+            "*** Begin Patch\n*** Add File: a.rs\nfn main() {}\n*** End Patch",
+            "must start with `+`",
+        ),
+        (
+            "*** Begin Patch\n*** Delete File: a.rs\n*** End Patch",
+            "delete and rename are not supported",
+        ),
+        (
+            "*** Begin Patch\n*** Add File: a.rs\n+fn main() {}",
+            "must end with a `*** End Patch` line",
+        ),
+        (
+            "*** Begin Patch\n*** Update File: a.rs\n@@\n*old\n*** End Patch",
+            "hunk lines must start with ` ` (context), `-` (remove), or `+` (add)",
+        ),
+        (
+            "*** Begin Patch\n*** Update File: a.rs\n-old\n+new\n*** End Patch",
+            "update content must come after an `@@` hunk marker",
+        ),
+    ];
+    for (patch, teaching) in cases {
+        let error = parse_single_file_apply_patch(patch).expect_err(patch);
+        let message = error.to_string();
+        assert!(
+            message.contains(teaching),
+            "error for {patch:?} must teach; got: {message}"
+        );
+    }
+}

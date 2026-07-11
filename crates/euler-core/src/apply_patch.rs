@@ -20,6 +20,11 @@ pub struct ApplyPatchChunk {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ApplyPatchError {
+    /// Parse failures reach the model verbatim as the tool error, so every
+    /// message must TEACH the expected format (the #63 teaching-denial
+    /// lesson): euler serves many providers and cannot assume the patch
+    /// dialect is in any model's training. Name what was expected, not
+    /// just what was wrong.
     #[error("invalid patch: {0}")]
     Invalid(&'static str),
     #[error("update hunk {hunk} matched {count} times; expected exactly one")]
@@ -31,22 +36,30 @@ pub enum ApplyPatchError {
 pub fn parse_single_file_apply_patch(patch: &str) -> Result<ApplyPatchDocument, ApplyPatchError> {
     let mut lines = patch.lines();
     if lines.next() != Some("*** Begin Patch") {
-        return Err(ApplyPatchError::Invalid("missing begin marker"));
+        return Err(ApplyPatchError::Invalid(
+            "the first line must be exactly `*** Begin Patch`",
+        ));
     }
-    let header = lines
-        .next()
-        .ok_or(ApplyPatchError::Invalid("missing file header"))?;
+    let header = lines.next().ok_or(ApplyPatchError::Invalid(
+        "line 2 must be `*** Add File: <path>` or `*** Update File: <path>`",
+    ))?;
     let parsed = if let Some(path) = header.strip_prefix("*** Add File: ") {
         parse_add_patch(path, &mut lines)?
     } else if let Some(path) = header.strip_prefix("*** Update File: ") {
         parse_update_patch(path, &mut lines)?
     } else if header.starts_with("*** Delete File: ") || header.starts_with("*** Move to: ") {
-        return Err(ApplyPatchError::Invalid("unsupported action"));
+        return Err(ApplyPatchError::Invalid(
+            "delete and rename are not supported — only `*** Add File:` and `*** Update File:`",
+        ));
     } else {
-        return Err(ApplyPatchError::Invalid("invalid file header"));
+        return Err(ApplyPatchError::Invalid(
+            "line 2 must be `*** Add File: <path>` or `*** Update File: <path>`",
+        ));
     };
     if lines.next().is_some() {
-        return Err(ApplyPatchError::Invalid("trailing content"));
+        return Err(ApplyPatchError::Invalid(
+            "nothing may follow `*** End Patch` — one file per patch",
+        ));
     }
     Ok(parsed)
 }
@@ -93,12 +106,16 @@ fn parse_add_patch<'a>(
             return Ok(ApplyPatchDocument::Add { path, content });
         }
         let Some(body) = line.strip_prefix('+') else {
-            return Err(ApplyPatchError::Invalid("invalid add line"));
+            return Err(ApplyPatchError::Invalid(
+                "every content line in an Add File must start with `+` (e.g. `+fn main() {`)",
+            ));
         };
         content.push_str(body);
         content.push('\n');
     }
-    Err(ApplyPatchError::Invalid("missing end marker"))
+    Err(ApplyPatchError::Invalid(
+        "the patch must end with a `*** End Patch` line",
+    ))
 }
 
 fn parse_update_patch<'a>(
@@ -117,12 +134,16 @@ fn parse_update_patch<'a>(
                 finish_update_chunk(&mut chunks, &mut old, &mut new, changed)?;
             }
             if chunks.is_empty() {
-                return Err(ApplyPatchError::Invalid("empty update"));
+                return Err(ApplyPatchError::Invalid(
+                    "an Update File needs at least one `@@` hunk with `-`/`+` lines",
+                ));
             }
             return Ok(ApplyPatchDocument::Update { path, chunks });
         }
         if line.starts_with("*** ") {
-            return Err(ApplyPatchError::Invalid("unsupported action"));
+            return Err(ApplyPatchError::Invalid(
+                "unexpected `*** ` marker inside the update body — one file per patch",
+            ));
         }
         if line.starts_with("@@") {
             if started {
@@ -133,11 +154,13 @@ fn parse_update_patch<'a>(
             continue;
         }
         if !started {
-            return Err(ApplyPatchError::Invalid("missing hunk"));
+            return Err(ApplyPatchError::Invalid(
+                "update content must come after an `@@` hunk marker line",
+            ));
         }
-        let (prefix, body) = line
-            .split_at_checked(1)
-            .ok_or(ApplyPatchError::Invalid("empty line"))?;
+        let (prefix, body) = line.split_at_checked(1).ok_or(ApplyPatchError::Invalid(
+            "empty hunk line — a blank context line is a single space `' '`",
+        ))?;
         match prefix {
             " " => push_patch_line(&mut old, &mut new, body),
             "-" => {
@@ -150,10 +173,16 @@ fn parse_update_patch<'a>(
                 new.push('\n');
                 changed = true;
             }
-            _ => return Err(ApplyPatchError::Invalid("invalid hunk line")),
+            _ => {
+                return Err(ApplyPatchError::Invalid(
+                    "hunk lines must start with ` ` (context), `-` (remove), or `+` (add)",
+                ))
+            }
         }
     }
-    Err(ApplyPatchError::Invalid("missing end marker"))
+    Err(ApplyPatchError::Invalid(
+        "the patch must end with a `*** End Patch` line",
+    ))
 }
 
 fn finish_update_chunk(
@@ -163,10 +192,14 @@ fn finish_update_chunk(
     changed: bool,
 ) -> Result<(), ApplyPatchError> {
     if !changed {
-        return Err(ApplyPatchError::Invalid("empty update hunk"));
+        return Err(ApplyPatchError::Invalid(
+            "hunk has no `-` or `+` lines — every `@@` hunk must change something",
+        ));
     }
     if old.is_empty() {
-        return Err(ApplyPatchError::Invalid("empty update target"));
+        return Err(ApplyPatchError::Invalid(
+            "hunk has no `-` or context lines to locate it — include the lines being replaced",
+        ));
     }
     chunks.push(ApplyPatchChunk {
         old: std::mem::take(old),
@@ -177,7 +210,7 @@ fn finish_update_chunk(
 
 fn non_empty_patch_path(path: &str) -> Result<String, ApplyPatchError> {
     if path.is_empty() {
-        Err(ApplyPatchError::Invalid("empty path"))
+        Err(ApplyPatchError::Invalid("the file header needs a path, e.g. `*** Add File: src/lib.rs` (relative to the workspace root)"))
     } else {
         Ok(path.to_owned())
     }
