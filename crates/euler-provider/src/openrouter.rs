@@ -116,6 +116,10 @@ fn request_body(request: &ModelRequest) -> serde_json::Value {
 /// readable reasoning-delta capture, reusing the same compat-config code
 /// path that custom `openrouter_reasoning` providers go through (see
 /// `ChatCompletionsOptions::from_compat`) instead of a bespoke SSE parser.
+/// The `openrouter_reasoning` request format also switches on
+/// `reasoning_details` preservation: streamed blocks are captured verbatim
+/// as an opaque reasoning artifact and replayed on assistant turns per
+/// OpenRouter's reasoning-tokens rules.
 fn chat_completions_options() -> crate::chat_completions::ChatCompletionsOptions {
     crate::chat_completions::ChatCompletionsOptions::from_compat(Some(&serde_json::json!({
         "max_tokens_field": "max_tokens",

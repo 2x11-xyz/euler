@@ -254,6 +254,227 @@ data: [DONE]
 }
 
 #[test]
+fn stream_captures_reasoning_details_as_provider_fidelity_artifact() {
+    let mut parser = OpenRouterSseParser::new();
+    let events = parser.feed(
+        br#"data: {"choices":[{"delta":{"reasoning":"think ","reasoning_details":[{"type":"reasoning.text","index":0,"text":"think "}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"reasoning":"hard","reasoning_details":[{"type":"reasoning.text","index":0,"text":"hard","signature":"sig-1"}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","index":1,"data":"enc-1"}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+    );
+
+    let reasoning: Vec<&crate::ReasoningChunk> = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(ModelStreamEvent::ReasoningDelta(chunk)) => Some(chunk),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning.len(), 3, "two plaintext chunks plus one artifact");
+    assert_eq!(reasoning[0], &crate::ReasoningChunk::raw("think "));
+    assert_eq!(reasoning[1], &crate::ReasoningChunk::raw("hard"));
+    let artifact_chunk = reasoning[2];
+    assert_eq!(artifact_chunk.fidelity, crate::ReasoningFidelity::Raw);
+    assert_eq!(artifact_chunk.content, "");
+    let details: serde_json::Value =
+        serde_json::from_str(artifact_chunk.artifact.as_deref().expect("artifact"))
+            .expect("artifact is JSON");
+    assert_eq!(
+        details,
+        json!([
+            {"type": "reasoning.text", "index": 0, "text": "think hard", "signature": "sig-1"},
+            {"type": "reasoning.encrypted", "index": 1, "data": "enc-1"},
+        ])
+    );
+    assert!(matches!(
+        events.last(),
+        Some(Ok(ModelStreamEvent::Finished { .. }))
+    ));
+}
+
+#[test]
+fn stream_encrypted_only_reasoning_details_are_opaque() {
+    let mut parser = OpenRouterSseParser::new();
+    let events = parser.feed(
+        br#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","index":0,"data":"enc-only"}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+    );
+
+    let reasoning: Vec<&crate::ReasoningChunk> = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(ModelStreamEvent::ReasoningDelta(chunk)) => Some(chunk),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning.len(), 1);
+    assert_eq!(reasoning[0].fidelity, crate::ReasoningFidelity::Opaque);
+    assert_eq!(reasoning[0].content, "");
+    let details: serde_json::Value =
+        serde_json::from_str(reasoning[0].artifact.as_deref().expect("artifact"))
+            .expect("artifact is JSON");
+    assert_eq!(
+        details,
+        json!([{"type": "reasoning.encrypted", "index": 0, "data": "enc-only"}])
+    );
+}
+
+#[test]
+fn stream_truncation_drops_partial_reasoning_details() {
+    let mut parser = OpenRouterSseParser::new();
+    let mut events = parser.feed(
+        br#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","index":0,"text":"partial"}]},"finish_reason":null}]}
+
+"#,
+    );
+    events.extend(parser.finish());
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Ok(ModelStreamEvent::ReasoningDelta(_)))),
+        "partial reasoning_details must not be stored for replay: {events:?}"
+    );
+    assert_eq!(
+        events,
+        vec![Err(ProviderError::stream_truncation(
+            "OpenRouter provider stream truncated before finish_reason"
+        ))]
+    );
+}
+
+fn reasoning_details_input_item(details: serde_json::Value) -> ModelInputItem {
+    ModelInputItem::Reasoning {
+        provider: "openrouter".to_owned(),
+        model: DEFAULT_MODEL.to_owned(),
+        fidelity: crate::ReasoningFidelity::Raw,
+        content: String::new(),
+        artifact: Some(details.to_string()),
+    }
+}
+
+#[test]
+fn request_replays_reasoning_details_on_assistant_tool_call_turn() {
+    let details = json!([
+        {"type": "reasoning.text", "index": 0, "text": "think hard", "signature": "sig-1"},
+        {"type": "reasoning.encrypted", "index": 1, "data": "enc-1"},
+    ]);
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![
+            ModelInputItem::Message {
+                role: ModelRole::User,
+                content: "lookup".to_owned(),
+            },
+            reasoning_details_input_item(details.clone()),
+            ModelInputItem::ToolCall {
+                call_id: "call_123".to_owned(),
+                name: "tiny_lookup".to_owned(),
+                arguments: json!({"key": "m2"}),
+            },
+            ModelInputItem::ToolOutput {
+                call_id: "call_123".to_owned(),
+                name: "tiny_lookup".to_owned(),
+                ok: true,
+                output: Some("m2 = 7".to_owned()),
+                error: None,
+                exit_code: None,
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 3, "reasoning item folds into the tool turn");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["tool_calls"][0]["id"], "call_123");
+    assert_eq!(messages[1]["reasoning_details"], details);
+    assert_eq!(messages[2]["role"], "tool");
+}
+
+#[test]
+fn request_replays_reasoning_details_on_assistant_content_turn() {
+    let details = json!([{"type": "reasoning.text", "index": 0, "text": "planned"}]);
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![
+            ModelInputItem::Message {
+                role: ModelRole::User,
+                content: "hello".to_owned(),
+            },
+            reasoning_details_input_item(details.clone()),
+            ModelInputItem::Message {
+                role: ModelRole::Assistant,
+                content: "answer".to_owned(),
+            },
+            ModelInputItem::Message {
+                role: ModelRole::User,
+                content: "follow up".to_owned(),
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "answer");
+    assert_eq!(messages[1]["reasoning_details"], details);
+    assert!(messages[2].get("reasoning_details").is_none());
+}
+
+#[test]
+fn request_never_replays_non_json_array_artifacts_as_reasoning_details() {
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![
+            ModelInputItem::Reasoning {
+                provider: "openrouter".to_owned(),
+                model: DEFAULT_MODEL.to_owned(),
+                fidelity: crate::ReasoningFidelity::Raw,
+                content: "streamed text".to_owned(),
+                artifact: Some("not-a-json-array".to_owned()),
+            },
+            ModelInputItem::Message {
+                role: ModelRole::Assistant,
+                content: "answer".to_owned(),
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    assert!(!body.to_string().contains("not-a-json-array"));
+    assert!(body["messages"][0].get("reasoning_details").is_none());
+}
+
+#[test]
 fn stream_reasoning_deltas_precede_text_deltas_in_ordering() {
     let mut parser = OpenRouterSseParser::new();
     let events = parser.feed(
