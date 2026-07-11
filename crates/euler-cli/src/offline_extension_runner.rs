@@ -30,13 +30,16 @@ pub(super) fn execute_offline_extension_run(
         })?
         .to_owned();
     let writer = Arc::new(ProvenanceWriter::new(target.log_path.clone())?);
+    // Offline runs have no live session redactor; env-seeded known values
+    // plus the token-shape layer still cover host-API emissions.
     let mut host = ExtensionHost::with_artifact_writer(
         &target.log_path,
         session_id.clone(),
         "root",
         writer,
         run.command.required_capabilities.iter().copied(),
-    );
+    )
+    .with_redactor(euler_core::redaction::SecretRedactor::from_env());
     host.register_extension_for_command(run.extension, &run.command.name)
         .map_err(|error| {
             anyhow!(

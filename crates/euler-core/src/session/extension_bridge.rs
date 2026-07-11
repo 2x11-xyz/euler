@@ -170,12 +170,16 @@ impl<D> Session<D> {
                 .as_ref()
                 .ok_or(SessionError::ExtensionEmissionUnavailable)?,
         );
-        Ok(ExtensionHost::with_queued_artifact_writer(
+        let (host, queue) = ExtensionHost::with_queued_artifact_writer(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
             writer,
             granted,
-        ))
+        );
+        // Session-registered secret values (auth file, runtime-resolved)
+        // must cover extension host-API emissions too, not only the
+        // shape-only default (secrets contract).
+        Ok((host.with_redactor(self.redactor.clone()), queue))
     }
 
     pub fn publish_queued_extension_events(

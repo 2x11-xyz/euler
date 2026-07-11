@@ -74,6 +74,10 @@ pub struct ExtensionHost {
     artifact_recorder: Option<ArtifactRecorder>,
     extensions: BTreeMap<String, ExtensionRecord>,
     commands: BTreeMap<String, CommandRecord>,
+    /// Secret redaction for host-API emissions that inject external text
+    /// into the ledger/canvas (context slots). Hosts constructed without an
+    /// explicit redactor still get the token-shape layer via the default.
+    redactor: crate::redaction::SecretRedactor,
 }
 
 #[derive(Clone)]
@@ -128,6 +132,7 @@ impl ExtensionHost {
             artifact_recorder: None,
             extensions: BTreeMap::new(),
             commands: BTreeMap::new(),
+            redactor: crate::redaction::SecretRedactor::default(),
         }
     }
 
@@ -150,6 +155,7 @@ impl ExtensionHost {
             }),
             extensions: BTreeMap::new(),
             commands: BTreeMap::new(),
+            redactor: crate::redaction::SecretRedactor::default(),
         }
     }
 
@@ -172,8 +178,17 @@ impl ExtensionHost {
             }),
             extensions: BTreeMap::new(),
             commands: BTreeMap::new(),
+            redactor: crate::redaction::SecretRedactor::default(),
         };
         (host, queue)
+    }
+
+    /// Attach the owning session's secret redactor so host-API emissions
+    /// (context slots) mask registered secret values, not only token
+    /// shapes. Hosts without one keep the shape-only default.
+    pub fn with_redactor(mut self, redactor: crate::redaction::SecretRedactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     pub fn register_extension(
@@ -338,6 +353,7 @@ impl ExtensionHost {
             artifact_recorder: self.artifact_recorder.clone(),
             denied_capabilities: Mutex::new(BTreeSet::new()),
             spawner,
+            redactor: self.redactor.clone(),
         };
         match catch_extension_unwind(|| runner.execute(CommandContext { input }, &host)) {
             Ok(Ok(output)) => Ok(output),
@@ -504,6 +520,7 @@ struct CommandHost<'a> {
     artifact_recorder: Option<ArtifactRecorder>,
     denied_capabilities: Mutex<BTreeSet<Capability>>,
     spawner: Option<&'a dyn ExtensionSpawner>,
+    redactor: crate::redaction::SecretRedactor,
 }
 impl CommandRegistrar for PendingRegistrar {
     fn register_command(&mut self, name: &str, command: Box<dyn ExtensionCommand>) {
@@ -734,6 +751,13 @@ impl HostApi for CommandHost<'_> {
         let _guard = ExtensionPanicSuppressionGuard::suspend_for_host_api();
         self.require_capability(Capability::ContextSlot)?;
         let slot = validate_context_slot_name(slot)?;
+        // Slot content is extension-authored text that replays into EVERY
+        // later model round via the canvas — redact at emission so the
+        // ledger and all replays inherit it (secrets contract). Redaction
+        // precedes validation so a masked payload that inflates past the
+        // size cap fails honestly instead of persisting oversized.
+        let content = self.redactor.redact(content);
+        let content = content.as_str();
         validate_context_slot_content(content)?;
         let recorder = self
             .artifact_recorder
