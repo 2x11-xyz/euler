@@ -24,6 +24,17 @@ Frozen contracts (binding, from docs/adr/phase2-primitives-2026-07-05.md):
 - budget accounting identical (AgentBudget max_tokens counts input+output),
 - event kinds/ordering on the bus identical.
 
+Amendment (2026-07-11, issue #58): AgentBudget max_tokens now bounds
+cumulative OUTPUT (completion) tokens only, not input+output as frozen
+above. Reviewers/companions see the whole session canvas as input, which
+routinely exceeded any output-scale budget on its own, exhausting budgets
+before the first completion token. Owner-approved semantics change:
+- each round requests at most the REMAINING output budget (cap minus
+  cumulative output so far) as the provider-side max_output_tokens;
+- the budget is exhausted when cumulative output strictly EXCEEDS the cap;
+  a round landing exactly on the cap succeeds, and a continuation with
+  zero remaining budget fails before the next provider call.
+
 Intentional behavior change, documented here: companions inherit bounded
 transport retry (#193 semantics: zero-output rounds, transport category
 only). This is a deliberate upgrade, not drift; a companion retry test is

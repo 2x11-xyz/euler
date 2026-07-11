@@ -202,6 +202,10 @@ impl AppCore {
             }
         }
         self.state = AppState::Idle { session };
+        // The session is back on this thread: refresh the last-known
+        // authenticated-provider snapshot used by bottom-surface rebuilds
+        // that happen while a turn is in flight.
+        self.refresh_authenticated_providers();
         self.in_flight_label = None;
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
@@ -239,11 +243,7 @@ impl AppCore {
                     request.id, request.command
                 ));
                 if request.id == "code-swarm" && request.command == "review" {
-                    let reviewers = output["reviewer_count"].as_u64().unwrap_or(0);
-                    let path = output["relative_path"].as_str().unwrap_or("(unknown path)");
-                    let _ = self.summary_item(format!(
-                        "✓ code-swarm review complete · {reviewers} reviewers · artifact {path}"
-                    ));
+                    let _ = self.summary_item(code_swarm_summary_line(&output));
                 }
             }
             ExtensionOutcome::Failed(message) => {
@@ -441,6 +441,30 @@ fn is_test_runner_command(command: &str) -> bool {
             .any(|needle| lower.contains(needle))
 }
 
+/// #58: the completion line must read per-reviewer `ok` flags from the
+/// output JSON, not just `reviewer_count` — a line reading "complete" while
+/// every reviewer failed is a dishonest summary. `reviewers[].ok` is what the
+/// extension actually records per spawn outcome; `reviewer_count` alone
+/// cannot distinguish "3 reviewers, 3 ok" from "3 reviewers, 0 ok".
+fn code_swarm_summary_line(output: &serde_json::Value) -> String {
+    let path = output["relative_path"].as_str().unwrap_or("(unknown path)");
+    let reviewers = output["reviewers"].as_array();
+    let total = reviewers.map_or(0, Vec::len);
+    let ok_count = reviewers
+        .map(|reviewers| {
+            reviewers
+                .iter()
+                .filter(|reviewer| reviewer["ok"].as_bool().unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0);
+    if total > 0 && ok_count == total {
+        format!("✓ code-swarm review complete · {total} reviewers · artifact {path}")
+    } else {
+        format!("✗ code-swarm review · {ok_count}/{total} reviewers succeeded · artifact {path}")
+    }
+}
+
 /// #47: bounded tail length for the live streaming-reasoning preview under
 /// the thinking HUD line — enough for a couple of wrapped lines at typical
 /// composer widths, never the full reasoning transcript.
@@ -459,4 +483,68 @@ fn truncate_reasoning_tail_left(tail: &mut String, max_chars: usize) {
         .nth(overflow)
         .map_or(tail.len(), |(index, _)| index);
     tail.drain(..byte_offset);
+}
+
+#[cfg(test)]
+mod code_swarm_summary_tests {
+    use super::code_swarm_summary_line;
+    use serde_json::json;
+
+    #[test]
+    fn all_reviewers_ok_reports_success() {
+        let output = json!({
+            "relative_path": "artifacts/review.json",
+            "reviewer_count": 3,
+            "reviewers": [
+                {"ok": true}, {"ok": true}, {"ok": true},
+            ],
+        });
+
+        assert_eq!(
+            code_swarm_summary_line(&output),
+            "✓ code-swarm review complete · 3 reviewers · artifact artifacts/review.json"
+        );
+    }
+
+    #[test]
+    fn any_failure_reports_honest_partial_count() {
+        let output = json!({
+            "relative_path": "artifacts/review.json",
+            "reviewer_count": 3,
+            "reviewers": [
+                {"ok": true}, {"ok": false}, {"ok": false},
+            ],
+        });
+
+        assert_eq!(
+            code_swarm_summary_line(&output),
+            "✗ code-swarm review · 1/3 reviewers succeeded · artifact artifacts/review.json"
+        );
+    }
+
+    #[test]
+    fn all_failed_reports_zero_of_total_not_dishonest_complete() {
+        let output = json!({
+            "relative_path": "artifacts/review.json",
+            "reviewer_count": 3,
+            "reviewers": [
+                {"ok": false}, {"ok": false}, {"ok": false},
+            ],
+        });
+
+        assert_eq!(
+            code_swarm_summary_line(&output),
+            "✗ code-swarm review · 0/3 reviewers succeeded · artifact artifacts/review.json"
+        );
+    }
+
+    #[test]
+    fn missing_reviewers_array_reports_zero_of_zero() {
+        let output = json!({"relative_path": "artifacts/review.json"});
+
+        assert_eq!(
+            code_swarm_summary_line(&output),
+            "✗ code-swarm review · 0/0 reviewers succeeded · artifact artifacts/review.json"
+        );
+    }
 }

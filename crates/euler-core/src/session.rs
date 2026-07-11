@@ -900,6 +900,13 @@ impl<D> Session<D> {
         &self.active_target
     }
 
+    /// Exposed so callers (e.g. the reviewer-model picker) can check which
+    /// configured providers are actually authenticated before offering them
+    /// as spawn targets, instead of discovering it via a burned spawn (#58).
+    pub fn providers(&self) -> &ProviderSet {
+        &self.providers
+    }
+
     pub fn reasoning_effort(&self) -> ReasoningEffort {
         self.config.reasoning_effort
     }
