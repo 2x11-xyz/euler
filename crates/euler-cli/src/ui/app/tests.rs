@@ -242,6 +242,7 @@ fn shell_artifact_with_lines(total: usize) -> TranscriptItem {
             .join("\n"),
         exit_code: Some(0),
         grant_source: None,
+        static_safe: false,
     }
 }
 

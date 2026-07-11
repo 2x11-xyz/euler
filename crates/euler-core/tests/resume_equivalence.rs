@@ -584,15 +584,18 @@ fn pending_permission_prompt_tail_reprompts_on_frontier_retry_equivalence() {
     fs::create_dir_all(&resumed).expect("resumed dir");
     let baseline_log = baseline.join("events.jsonl");
     let resumed_log = resumed.join("events.jsonl");
+    // `printf` is deliberately NOT statically safe (issue #78): a safe
+    // command would auto-approve and never emit the permission prompt this
+    // test truncates at.
     let initial = FixtureResponse::ToolCalls(vec![ToolCall {
         id: "call-pending-old".to_owned(),
         name: "run_shell".to_owned(),
-        input: json!({"command": "true", "max_bytes": 100}),
+        input: json!({"command": "printf ok", "max_bytes": 100}),
     }]);
     let retry = FixtureResponse::ToolCalls(vec![ToolCall {
         id: "call-pending-retry".to_owned(),
         name: "run_shell".to_owned(),
-        input: json!({"command": "true", "max_bytes": 100}),
+        input: json!({"command": "printf ok", "max_bytes": 100}),
     }]);
     run_fresh_session(
         &baseline,

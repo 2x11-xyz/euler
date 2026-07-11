@@ -1773,6 +1773,7 @@ impl<D: PermissionDecider> Session<D> {
         sink.flush(self.bus.events());
 
         let mut covered_grant_source: Option<crate::GrantSource> = None;
+        let mut static_safe = false;
         if let Some(capability) = self
             .tools
             .required_capability_for_input(&call.name, &call.input)
@@ -1800,17 +1801,34 @@ impl<D: PermissionDecider> Session<D> {
                     .and_then(|path| self.tools.workspace_relative_path(&path.to_string_lossy()));
             }
             let mode = self.permissions.mode(capability);
+            // Statically-safe read-only shell commands run under `ask`
+            // without a prompt (issue #78): recorded as a fresh
+            // permission.decision with mode "static-safe" — allowed-once
+            // semantics, no grant installed, parented to the tool call. The
+            // check sits before grant coverage so the ledger attributes the
+            // run to the analysis, not to an unrelated grant. It never
+            // applies under always-deny, and a denial earlier this turn
+            // still short-circuits above.
+            static_safe = mode == ApprovalMode::Ask
+                && capability == Capability::ShellExec
+                && request
+                    .command
+                    .as_deref()
+                    .is_some_and(crate::command_safety::is_statically_safe_command);
+            if static_safe {
+                self.emit_static_safe_decision(capability, tool_call_event_id.clone())?;
+            }
             // A request covered by an existing session/project grant runs
             // under THAT decision: no prompt, and no fresh permission.decision
             // event — recording "allowed once" here would misstate what the
             // user actually granted (review v2 §8). The tool result carries a
             // `grant_source` tag so the ledger can show `· session grant`.
-            covered_grant_source = if mode == ApprovalMode::Ask {
+            covered_grant_source = if mode == ApprovalMode::Ask && !static_safe {
                 self.permissions.granted_source(&request)
             } else {
                 None
             };
-            if covered_grant_source.is_none() {
+            if covered_grant_source.is_none() && !static_safe {
                 let needs_prompt = mode == ApprovalMode::Ask;
                 let prompt_id = if needs_prompt {
                     let prompt_id = self.emit(
@@ -1929,6 +1947,12 @@ impl<D: PermissionDecider> Session<D> {
                     // decision record (review v2 §8).
                     payload.insert("grant_source".to_owned(), source.as_str().into());
                 }
+                if static_safe {
+                    // Ran under static command-safety analysis — the ledger
+                    // shows a dim `· safe` on the tool header (the decision
+                    // record itself is suppressed like covered grants).
+                    payload.insert("static_safe".to_owned(), true.into());
+                }
                 self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
                 crate::diagnostics::tool_exec_end(
                     &self.config.session_id,
@@ -1957,6 +1981,33 @@ impl<D: PermissionDecider> Session<D> {
             }
         }
         Ok(())
+    }
+
+    /// Record the allowed-once decision for a statically-safe shell command
+    /// (issue #78): mode `static-safe`, no prompt, no grant installed,
+    /// parented to the tool call.
+    fn emit_static_safe_decision(
+        &mut self,
+        capability: Capability,
+        tool_call_event_id: String,
+    ) -> Result<String, SessionError> {
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            capability.as_str(),
+            "static-safe",
+            true,
+        );
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            object([
+                ("capability", capability.as_str().into()),
+                ("mode", "static-safe".into()),
+                ("allowed", true.into()),
+                ("decision", "allowed".into()),
+                ("grant_scope", "once".into()),
+            ]),
+            Some(tool_call_event_id),
+        )
     }
 
     fn emit_permission_denied_tool_result(

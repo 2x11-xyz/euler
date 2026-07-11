@@ -8,6 +8,8 @@ pub(in crate::ui::transcript) struct ToolRunRender<'a> {
     pub(in crate::ui::transcript) exit_code: Option<i64>,
     /// "session" / "project" / "user" when covered by an existing grant.
     pub(in crate::ui::transcript) grant_source: Option<&'a str>,
+    /// Auto-approved by static command-safety analysis.
+    pub(in crate::ui::transcript) static_safe: bool,
 }
 
 pub(in crate::ui::transcript) fn render_tool_run(
@@ -30,6 +32,12 @@ pub(in crate::ui::transcript) fn render_tool_run(
             "user" => heading.push_str(" · user rule"),
             _ => heading.push_str(&format!(" · {source} grant")),
         }
+    }
+    if run.static_safe {
+        // Same quiet treatment for static-safety auto-approvals: the
+        // mode=static-safe decision record is suppressed in the transcript
+        // and the header carries the provenance trace instead.
+        heading.push_str(" · safe");
     }
     let style = if run.ok {
         theme.transcript.tool

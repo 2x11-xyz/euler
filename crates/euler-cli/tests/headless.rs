@@ -7006,10 +7006,12 @@ fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
     // nothing may duplicate.
     let temp = tempfile::tempdir().expect("temp dir");
     let mut responses = Vec::new();
+    // `printf` is deliberately NOT statically safe (issue #78): a safe
+    // binary like `echo` would auto-approve and never render the panel.
     for (id, cmd) in [
-        ("call-1", "echo alpha-one"),
-        ("call-2", "echo beta-two"),
-        ("call-3", "echo gamma-three"),
+        ("call-1", "printf alpha-one"),
+        ("call-2", "printf beta-two"),
+        ("call-3", "printf gamma-three"),
     ] {
         responses.push(serde_json::json!({"events": [
             {"tool_call": {"id": id, "name": "run_shell", "input": {"command": cmd}}},
@@ -7054,7 +7056,7 @@ fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
 
     let final_state = pty_final_state_text(&tui.output, 24, 80);
     let mut failures = Vec::new();
-    for cmd in ["echo alpha-one", "echo beta-two", "echo gamma-three"] {
+    for cmd in ["printf alpha-one", "printf beta-two", "printf gamma-three"] {
         let headers = final_state
             .lines()
             .filter(|line| line.contains(&format!("bash $ {cmd}")))

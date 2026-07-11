@@ -69,6 +69,10 @@ pub enum TranscriptItem {
         /// existing grant (dim `· session grant` / `· user rule` on the
         /// header; no decision record).
         grant_source: Option<String>,
+        /// Run auto-approved by static command-safety analysis (dim `· safe`
+        /// on the header; the mode=static-safe decision record is
+        /// suppressed like covered grants).
+        static_safe: bool,
     },
     Exploration {
         summaries: Vec<String>,
@@ -1103,9 +1107,10 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
                 .get("allowed")
                 .and_then(serde_json::Value::as_bool);
             let capability = payload_string(event, "capability").unwrap_or_default();
+            let mode = payload_string(event, "mode");
             let suppress_allowed = allowed == Some(true)
                 && (capability == "fs-read"
-                    || payload_string(event, "mode").as_deref() == Some("static-grant"));
+                    || matches!(mode.as_deref(), Some("static-grant" | "static-safe")));
             if suppress_allowed {
                 None
             } else {
@@ -1554,6 +1559,11 @@ fn run_item_from_result(
             .get("exit_code")
             .and_then(serde_json::Value::as_i64),
         grant_source: payload_string(event, "grant_source"),
+        static_safe: event
+            .payload
+            .get("static_safe")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     })
 }
 

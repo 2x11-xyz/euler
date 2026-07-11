@@ -84,10 +84,19 @@ envelope `v` per `docs/contracts/persistence.md`.
   Optional `recovery_closure: true` marks a resume-time canonical closure for
   an interrupted tail `tool.call`; it records the resume observation, not the
   original tool outcome.
+  Optional `grant_source` (`"session"` | `"project"`) marks a run covered by
+  an existing scoped grant; optional `static_safe: true` marks a run
+  auto-approved by static command-safety analysis (see
+  `docs/contracts/capabilities.md`). Both are ledger provenance tags rendered
+  on the tool header, not fresh decisions.
   This payload is the canonical tool-result shape; provider adapters map
   exactly this shape onto their wire formats.
 - `permission.prompt`: `capability`, `reason`.
 - `permission.decision`: `capability`, `mode`, `allowed`, `decision`.
+  `mode` is the approval mode label (`ask` | `session-allow` |
+  `always-deny`), or `static-grant` for extension registration grants, or
+  `static-safe` for statically-safe shell auto-approvals
+  (`docs/contracts/capabilities.md`).
   Additive optional fields for scoped grants (see
   `docs/contracts/capabilities.md`):
   - `grant_scope`: `once` | `session` | `project` when the decision allowed a

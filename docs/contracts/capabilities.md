@@ -190,6 +190,23 @@ analysis reasons about the whole line:
   flag-shaped tokens.
 - A command is **statically safe** iff it parses AND every segment is safe.
 
+**Auto-approval under `ask`.** When `shell-exec` is in `ask` mode, a
+statically-safe command runs without a prompt. The run is recorded as a
+fresh `permission.decision` with `mode: "static-safe"`, `allowed: true`,
+`grant_scope: "once"`, parented to the `tool.call` — allowed-once
+semantics; **no grant is installed** and no prompt event is emitted. The
+static-safe check precedes grant-coverage matching, so the ledger
+attributes such runs to the analysis rather than to an unrelated grant.
+Static safety never bypasses `always-deny`, and a capability denial earlier
+in the same turn still short-circuits the tool call.
+
+**Ledger treatment.** The decision event keeps provenance honest, but the
+transcript does not render it as a standalone record — the
+standalone-record-per-call noise is exactly what covered grants eliminated
+(review v2 §8). Instead the `tool.result` carries `static_safe: true` and
+the tool header shows a dim `· safe` tag, matching the covered-grant
+`· session grant` header treatment.
+
 ### Revocation and listing
 
 Core exposes list and revoke APIs over session, project, and user grant

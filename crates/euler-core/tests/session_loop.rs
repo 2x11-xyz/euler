@@ -232,7 +232,10 @@ fn scripted_session_records_read_edit_shell_summary_sequence() {
         FixtureResponse::ToolCalls(vec![ToolCall {
             id: "call-shell".to_owned(),
             name: "run_shell".to_owned(),
-            input: json!({"command": "cat note.txt"}),
+            // `sort` is deliberately NOT statically safe (issue #78): this
+            // test freezes the canonical prompt+decision shell sequence, so
+            // the command must not auto-approve.
+            input: json!({"command": "sort note.txt"}),
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
@@ -810,6 +813,103 @@ fn allow_session_makes_second_use_session_allow_without_second_prompt() {
         decisions[1].parent.as_deref(),
         Some(second_call.id.as_str())
     );
+}
+
+#[test]
+fn statically_safe_command_auto_approves_without_prompt() {
+    // Issue #78: under mode=ask, a statically-safe read-only command runs
+    // without a prompt. Provenance stays honest with a fresh
+    // permission.decision carrying mode "static-safe" (allowed once, no
+    // grant installed), and the tool result carries a static_safe tag for
+    // the ledger header.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-safe".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "find . | head -2"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        // Empty script: consulting the decider would deny and fail the
+        // assertions below — the ask path must never be reached.
+        ScriptedDecider::new(vec![]),
+    );
+
+    session.run_turn("list files").expect("turn");
+
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        0
+    );
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .filter(|event| payload_str(event, "capability") == Some("shell-exec"))
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(payload_str(decisions[0], "mode"), Some("static-safe"));
+    assert_eq!(payload_str(decisions[0], "decision"), Some("allowed"));
+    assert_eq!(payload_str(decisions[0], "grant_scope"), Some("once"));
+    let call = event_for_tool(session.events(), EventKind::TOOL_CALL, "call-safe");
+    assert_eq!(decisions[0].parent.as_deref(), Some(call.id.as_str()));
+    let result = event_for_tool(session.events(), EventKind::TOOL_RESULT, "call-safe");
+    assert_eq!(
+        result
+            .payload
+            .get("ok")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        result
+            .payload
+            .get("static_safe")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    // Allowed-once semantics: no grant was installed.
+    assert!(session.list_grants().is_empty());
+}
+
+#[test]
+fn statically_unsafe_command_still_prompts_under_ask() {
+    // The static-safe seam must not widen: an unknown binary keeps the
+    // full prompt + decision flow.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-unsafe".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch created-file"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+
+    session.run_turn("touch a file").expect("turn");
+
+    assert!(temp.path().join("created-file").exists());
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        1
+    );
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .filter(|event| payload_str(event, "capability") == Some("shell-exec"))
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(payload_str(decisions[0], "mode"), Some("ask"));
 }
 
 #[test]
