@@ -140,6 +140,19 @@ Observer, companion, peer, adversarial remain extension compositions; core
 still never knows those words — `spawn_agent` is mechanism, the pattern
 lives in the extension.
 
+## Guardian permission reviewer (ADR 0011)
+
+The guardian is a **core permissions feature that reuses the companion
+primitive**, not a new lifecycle concept: when `permission_reviewer =
+guardian`, the session spawns a synchronous companion with persona
+`guardian`, an empty capability set, and a one-round zero-tool budget to
+review an uncovered permission ask. It records the standard
+`agent.spawn`/`agent.result` pair; the resulting decision is a
+`permission.decision` event tagged `decision_source: "guardian"` (see the
+capabilities and events contracts). Child-agent (companion) asks are not
+guardian-routed in v0; the guardian sits only on the parent session's tool
+dispatch, which also prevents review recursion.
+
 ## Companion UI presentation (v0)
 
 The terminal companion block is a **presentation of existing multi-agent

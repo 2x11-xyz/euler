@@ -695,6 +695,45 @@ fn tui_permission_decisions_render_approved_and_canceled_notices() {
 }
 
 #[test]
+fn tui_guardian_decisions_render_source_tag_and_rationale() {
+    // ADR 0011: guardian verdicts are quiet decision records — the ✓/✗
+    // anchor, a `· guardian` tag, and the rationale as a dim quoted line.
+    let events = vec![
+        event(
+            EventKind::PERMISSION_DECISION,
+            object([
+                ("capability", "shell-exec".into()),
+                ("decision", "allowed".into()),
+                ("allowed", true.into()),
+                ("grant_scope", "once".into()),
+                ("decision_source", "guardian".into()),
+                ("rationale", "routine command the user asked for".into()),
+            ]),
+        ),
+        event(
+            EventKind::PERMISSION_DECISION,
+            object([
+                ("capability", "shell-exec".into()),
+                ("decision", "denied".into()),
+                ("allowed", false.into()),
+                ("decision_source", "guardian".into()),
+                ("rationale", "deletes data outside the workspace".into()),
+                ("risk_level", "high".into()),
+                ("user_authorization", "unknown".into()),
+            ]),
+        ),
+    ];
+    let theme = Theme::default();
+
+    let contents = rendered_screen(&events, &theme, 80, 10);
+
+    assert!(contents.contains("✓ allowed once · shell-exec · guardian"));
+    assert!(contents.contains("\"routine command the user asked for\""));
+    assert!(contents.contains("✗ denied · shell-exec · guardian"));
+    assert!(contents.contains("\"deletes data outside the workspace\""));
+}
+
+#[test]
 fn tui_read_tool_flow_uses_compact_result_without_raw_lifecycle_rows() {
     let events = vec![
         event(
@@ -1316,6 +1355,8 @@ fn projects_slice2_events_without_opaque_reasoning_artifacts() {
                 allowed: Some(false),
                 grant_scope: None,
                 instruction: None,
+                decision_source: None,
+                rationale: None,
             },
             TranscriptItem::CheckStarted {
                 name: "cargo test".to_owned(),

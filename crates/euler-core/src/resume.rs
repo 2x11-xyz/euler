@@ -371,10 +371,7 @@ fn recovery_closure(events: &[EventEnvelope]) -> Option<EventEnvelope> {
 
 fn tail_unmatched_tool_call_index(events: &[EventEnvelope]) -> Option<usize> {
     let mut index = events.len().checked_sub(1)?;
-    while matches!(
-        events[index].kind.as_str(),
-        EventKind::PERMISSION_PROMPT | EventKind::PERMISSION_DECISION
-    ) {
+    while is_pending_tool_window_event(events, index) {
         index = index.checked_sub(1)?;
     }
     if events[index].kind.as_str() != EventKind::TOOL_CALL {
@@ -395,9 +392,47 @@ fn tail_unmatched_tool_call_index(events: &[EventEnvelope]) -> Option<usize> {
     Some(index)
 }
 
+/// Events that may legitimately sit between a pending `tool.call` and its
+/// (missing) `tool.result`: the permission ask itself, plus a bounded
+/// companion window — guardian review (ADR 0011) and `code_swarm_review`
+/// fan-out both spawn child agents whose events interleave before the
+/// result lands. Child-attributed events (`agent` differs from the root
+/// agent that emitted the tool call) and the parent-side spawn/result/
+/// artifact bookkeeping all belong to that window; anything else means the
+/// tail is not a pending tool call.
+fn is_pending_tool_window_event(events: &[EventEnvelope], index: usize) -> bool {
+    let event = &events[index];
+    if matches!(
+        event.kind.as_str(),
+        EventKind::PERMISSION_PROMPT
+            | EventKind::PERMISSION_DECISION
+            | EventKind::AGENT_SPAWN
+            | EventKind::AGENT_RESULT
+            | EventKind::EXTENSION_ARTIFACT
+    ) {
+        return true;
+    }
+    // Companion (child-agent) events carry the child's agent id; the root
+    // agent's id is what the session started with.
+    events
+        .first()
+        .is_some_and(|origin| event.agent != origin.agent)
+}
+
 fn permission_suffix_belongs_to_call(call: &EventEnvelope, suffix: &[EventEnvelope]) -> bool {
     let mut prompt_ids = BTreeSet::new();
     for event in suffix {
+        // Companion-window events between the call and its missing result
+        // (guardian review, reviewer fan-out) neither claim nor disclaim the
+        // call — the permission chain itself decides ownership.
+        if event.agent != call.agent
+            || matches!(
+                event.kind.as_str(),
+                EventKind::AGENT_SPAWN | EventKind::AGENT_RESULT | EventKind::EXTENSION_ARTIFACT
+            )
+        {
+            continue;
+        }
         match event.kind.as_str() {
             EventKind::PERMISSION_PROMPT => {
                 if event.parent.as_deref() != Some(call.id.as_str()) {

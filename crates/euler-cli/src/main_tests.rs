@@ -2471,6 +2471,65 @@ fn reasoning_effort_rejected_outside_exec_and_bad_values() {
 }
 
 #[test]
+fn permission_reviewer_parses_for_run_tui_and_exec() {
+    for (args, is_exec) in [
+        (&["run", "--permission-reviewer", "guardian"][..], false),
+        (&["tui", "--permission-reviewer", "guardian"][..], false),
+        (
+            &["exec", "--permission-reviewer", "guardian", "hello"][..],
+            true,
+        ),
+    ] {
+        let mut args = args.iter().copied().map(str::to_owned);
+        let parsed = Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse");
+        let run = match parsed.command {
+            Command::Exec(exec) if is_exec => exec.run,
+            Command::Run(run) | Command::Tui(run) if !is_exec => run,
+            _ => panic!("unexpected command shape"),
+        };
+        assert_eq!(
+            run.permission_reviewer,
+            Some(euler_core::PermissionReviewer::Guardian)
+        );
+    }
+    // Default: no flag means no override — the session default (user) holds.
+    let mut args = ["run"].iter().copied().map(str::to_owned);
+    let parsed = unwrap_run(Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse"));
+    assert_eq!(parsed.permission_reviewer, None);
+}
+
+#[test]
+fn permission_reviewer_rejects_bad_values_and_duplicates() {
+    for (args, expected) in [
+        (
+            &["run", "--permission-reviewer", "auto"][..],
+            "--permission-reviewer must be one of user|guardian",
+        ),
+        (
+            &["run", "--permission-reviewer"][..],
+            "--permission-reviewer requires a value",
+        ),
+        (
+            &[
+                "run",
+                "--permission-reviewer",
+                "user",
+                "--permission-reviewer",
+                "guardian",
+            ][..],
+            "--permission-reviewer was provided more than once",
+        ),
+    ] {
+        let mut args = args.iter().copied().map(str::to_owned);
+        let error = match Args::parse_with_env(&mut args, EnvArgs::default()) {
+            Ok(_) => panic!("expected args error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn resume_provider_set_includes_all_builtin_providers_for_mid_session_switch() {
     // Review v2 §14.5: a resumed session rejected /model switches with
     // "provider is not configured" because only {active, original} providers

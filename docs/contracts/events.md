@@ -109,6 +109,17 @@ envelope `v` per `docs/contracts/persistence.md`.
     until resume learns patterned fold.
   - `instruction`: non-empty deny-with-guidance text when the user denied with
     instructions; omitted on bare deny and on allows.
+
+  Additive optional fields for guardian-reviewed decisions (ADR 0011 /
+  `docs/contracts/capabilities.md`):
+  - `decision_source`: `"guardian"` when an automated guardian reviewer made
+    the decision. Omitted means the configured decider (the user) decided.
+  - `risk_level`: `low` | `medium` | `high` | `critical` — the guardian's
+    risk assessment, present when the verdict parsed.
+  - `user_authorization`: `unknown` | `low` | `medium` | `high` — the
+    guardian's read of user authorization, present when the verdict parsed.
+  - `rationale`: short guardian rationale for the outcome (also present on
+    fail-closed denials, where it names the failure instead of a verdict).
 - `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file
@@ -236,6 +247,11 @@ envelope `v` per `docs/contracts/persistence.md`.
   Optional `session_kind` is `interactive` or `non-interactive`. It records
   how the session was launched for discovery/resume UI grouping only. Omitted
   means unknown/legacy and must not affect resume authority or canvas content.
+  Optional `permission_reviewer` is `user` or `guardian` (ADR 0011),
+  recording which reviewer the session was configured with at start. Omitted
+  in older streams means `user`. It is config projection for visibility, not
+  resume authority; per-decision truth is `permission.decision`
+  `decision_source`.
   Optional `context_limit` is either `null` (unknown/legacy window) or an
   object `{ "limit_tokens": <u64>, "source": "catalog" }` recording the
   catalog-derived context window used for token-threshold compaction and

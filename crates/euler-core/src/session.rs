@@ -14,6 +14,7 @@ use crate::file_diff::{
     file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
 };
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
+use crate::guardian::{self, GuardianRuling, PermissionReviewer};
 use crate::permissions::{
     ApprovalMode, GrantDecision, GrantSource, PermissionDecider, PermissionGate, PermissionRequest,
 };
@@ -154,6 +155,10 @@ pub struct SessionConfig {
     /// intersection applies — the store is user-authored in the user-owned
     /// euler home and never repo-controlled content.
     pub user_grant_dir: Option<PathBuf>,
+    /// Who resolves uncovered `ask` permission decisions (ADR 0011).
+    /// Default: the configured decider (the user). `Guardian` routes asks
+    /// to a companion reviewer; the decider remains the abstain fallback.
+    pub permission_reviewer: PermissionReviewer,
 }
 
 impl SessionConfig {
@@ -178,6 +183,7 @@ impl SessionConfig {
             round_observer: None,
             project_grant_consent_dir: None,
             user_grant_dir: None,
+            permission_reviewer: PermissionReviewer::default(),
         }
     }
 }
@@ -247,6 +253,16 @@ pub enum SessionError {
     CheckpointMissingBlob { event_id: String },
     #[error("checkpoint blob unavailable: {0}")]
     CheckpointBlob(String),
+}
+
+/// Outcome of one uncovered permission decision inside tool dispatch.
+enum PermissionRuling {
+    Allowed,
+    /// Denied; `message` is the tool-result error text (plain
+    /// `permission denied` or guardian teaching).
+    Denied {
+        message: String,
+    },
 }
 
 /// Outcome of a successful workspace restore (`/rollback`).
@@ -586,6 +602,24 @@ where
                 self.turn_state,
             )?;
             self.sink.flush(self.session.bus.events());
+            if self.turn_state.guardian_interrupted() {
+                // Circuit breaker (ADR 0011): consecutive guardian denials
+                // end the turn instead of letting the model keep thrashing
+                // against the gate. The denied tool result is already
+                // recorded; remaining calls in this round are not attempted.
+                self.session.emit(
+                    EventKind::ERROR,
+                    object([
+                        ("source", "guardian".into()),
+                        (
+                            "message",
+                            crate::guardian::GUARDIAN_TURN_INTERRUPT_MESSAGE.into(),
+                        ),
+                    ]),
+                )?;
+                self.sink.flush(self.session.bus.events());
+                return Ok(RoundOutcome::Complete(()));
+            }
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err(SessionError::Cancelled);
             }
@@ -649,6 +683,10 @@ impl<D> Session<D> {
                         .into(),
                 ),
                 ("session_kind", config.session_kind.as_str().into()),
+                (
+                    "permission_reviewer",
+                    config.permission_reviewer.as_str().into(),
+                ),
                 (
                     "auto_compaction",
                     json!({
@@ -890,6 +928,11 @@ impl<D> Session<D> {
 
     pub fn set_permission_mode(&mut self, capability: Capability, mode: ApprovalMode) {
         self.permissions.set_mode(capability, mode);
+    }
+
+    /// Who resolves uncovered `ask` permission decisions (ADR 0011).
+    pub fn permission_reviewer(&self) -> PermissionReviewer {
+        self.config.permission_reviewer
     }
 
     /// Active session + project + user grants for `/permissions` listing.
@@ -1857,49 +1900,22 @@ impl<D: PermissionDecider> Session<D> {
                 None
             };
             if covered_grant_source.is_none() && !static_safe {
-                let needs_prompt = mode == ApprovalMode::Ask;
-                let prompt_id = if needs_prompt {
-                    let prompt_id = self.emit(
-                        EventKind::PERMISSION_PROMPT,
-                        object([
-                            ("capability", capability.as_str().into()),
-                            ("reason", request.reason.clone().into()),
-                        ]),
-                    )?;
-                    sink.flush(self.bus.events());
-                    Some(prompt_id)
-                } else {
-                    None
-                };
-                let decision = self.permissions.decide_detailed(&request, mode);
-                let allowed = decision.allowed();
-                let mode_label = approval_mode_str(mode);
-                let payload = permission_decision_payload(&decision, mode_label, mode);
-                self.emit_with_parent(
-                    EventKind::PERMISSION_DECISION,
-                    payload,
-                    Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
-                )?;
-                crate::diagnostics::permission_decision(
-                    &self.config.session_id,
-                    capability.as_str(),
-                    mode_label,
-                    allowed,
-                );
-                if !allowed {
-                    turn_state.record_denial(capability);
-                    self.emit_permission_denied_tool_result(
-                        call,
-                        tool_call_event_id,
-                        &format!(
-                            "permission denied by the user; {} is denied for \
-                             the rest of this turn — do not retry {} commands; \
-                             use a different tool or ask the user",
-                            capability.as_str(),
-                            capability.as_str()
-                        ),
-                    )?;
-                    return Ok(());
+                match self.decide_uncovered_permission(
+                    &request,
+                    mode,
+                    &tool_call_event_id,
+                    sink,
+                    turn_state,
+                )? {
+                    PermissionRuling::Allowed => {}
+                    PermissionRuling::Denied { message } => {
+                        self.emit_permission_denied_tool_result(
+                            call,
+                            tool_call_event_id,
+                            &message,
+                        )?;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -2057,9 +2073,153 @@ impl<D: PermissionDecider> Session<D> {
         )
     }
 
-    /// The error text is what the model reads next round: it must teach that
-    /// the denial is turn-scoped so the model pivots instead of probing
-    /// twelve command variants against a dead capability (issue #63).
+    /// Resolve an uncovered `ask`/`session-allow`/`always-deny` permission
+    /// decision: emits the `permission.prompt` (for asks) and the
+    /// `permission.decision`, routes asks through the guardian when
+    /// configured (ADR 0011), and reports whether the tool may run.
+    fn decide_uncovered_permission<F>(
+        &mut self,
+        request: &PermissionRequest,
+        mode: ApprovalMode,
+        tool_call_event_id: &str,
+        sink: &mut EventSink<'_, F>,
+        turn_state: &mut TurnState,
+    ) -> Result<PermissionRuling, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let capability = request.capability;
+        let needs_prompt = mode == ApprovalMode::Ask;
+        let prompt_id = if needs_prompt {
+            let prompt_id = self.emit(
+                EventKind::PERMISSION_PROMPT,
+                object([
+                    ("capability", capability.as_str().into()),
+                    ("reason", request.reason.clone().into()),
+                ]),
+            )?;
+            sink.flush(self.bus.events());
+            Some(prompt_id)
+        } else {
+            None
+        };
+        let decision_parent = prompt_id.unwrap_or_else(|| tool_call_event_id.to_owned());
+        // A non-verbatim-briefable request (truncated command / over-bound
+        // field) never consults the guardian — adjudicating a command it
+        // cannot see exactly would judge a lie (ADR 0011 amendment, security
+        // review F3). The ask goes to the human decider below instead.
+        if needs_prompt
+            && self.config.permission_reviewer == PermissionReviewer::Guardian
+            && guardian::adjudicates_verbatim(request)
+        {
+            if let Some(ruling) =
+                self.guardian_permission_ruling(request, &decision_parent, sink, turn_state)?
+            {
+                return Ok(ruling);
+            }
+            // Guardian abstained: fall through to the configured decider.
+        }
+        let decision = self.permissions.decide_detailed(request, mode);
+        let allowed = decision.allowed();
+        let mode_label = approval_mode_str(mode);
+        let payload = permission_decision_payload(&decision, mode_label, mode);
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            payload,
+            Some(decision_parent),
+        )?;
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            capability.as_str(),
+            mode_label,
+            allowed,
+        );
+        if allowed {
+            Ok(PermissionRuling::Allowed)
+        } else {
+            turn_state.record_denial(capability);
+            Ok(PermissionRuling::Denied {
+                message: format!(
+                    "permission denied by the user; {} is denied for \
+                     the rest of this turn — do not retry {} commands; \
+                     use a different tool or ask the user",
+                    capability.as_str(),
+                    capability.as_str()
+                ),
+            })
+        }
+    }
+
+    /// Guardian review for one ask (ADR 0011). Returns `None` on abstain —
+    /// the configured decider then resolves the ask. Every failure path
+    /// (task build, spawn, companion failure, unparseable verdict) resolves
+    /// to a deny; guardian denials never fall back to the decider. Three
+    /// consecutive guardian denials trip the circuit breaker, which
+    /// interrupts the turn after the denied tool result is recorded.
+    fn guardian_permission_ruling<F>(
+        &mut self,
+        request: &PermissionRequest,
+        decision_parent: &str,
+        sink: &mut EventSink<'_, F>,
+        turn_state: &mut TurnState,
+    ) -> Result<Option<PermissionRuling>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let capability = request.capability;
+        let ruling = match guardian::guardian_task(request) {
+            Ok(task) => match self.spawn_companion(task) {
+                Ok(summary) => guardian::ruling_for_result(&summary.result),
+                Err(error) => {
+                    guardian::deny_failure(format!("guardian review failed to run: {error}"))
+                }
+            },
+            Err(error) => guardian::deny_failure(format!("guardian task rejected: {error}")),
+        };
+        sink.flush(self.bus.events());
+        let (allowed, rationale, verdict) = match &ruling {
+            GuardianRuling::Abstain(_) => {
+                turn_state.reset_guardian_denials();
+                return Ok(None);
+            }
+            GuardianRuling::Allow(verdict) => (true, verdict.rationale.clone(), Some(verdict)),
+            GuardianRuling::Deny { rationale, verdict } => {
+                (false, rationale.clone(), verdict.as_ref())
+            }
+        };
+        // The rationale is model-generated text prompted to hunt secret
+        // exfiltration — it may quote the offending token. Redact once here:
+        // it flows into both the permission.decision payload and the denied
+        // tool result teaching text.
+        let rationale = self.redactor.redact(&rationale);
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            guardian::guardian_decision_payload(capability, allowed, &rationale, verdict),
+            Some(decision_parent.to_owned()),
+        )?;
+        sink.flush(self.bus.events());
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            capability.as_str(),
+            "ask",
+            allowed,
+        );
+        if allowed {
+            turn_state.reset_guardian_denials();
+            return Ok(Some(PermissionRuling::Allowed));
+        }
+        let denials = turn_state.record_guardian_denial();
+        if denials >= guardian::MAX_CONSECUTIVE_GUARDIAN_DENIALS_PER_TURN {
+            turn_state.mark_guardian_interrupted();
+        }
+        Ok(Some(PermissionRuling::Denied {
+            message: guardian::guardian_denial_teaching(&rationale),
+        }))
+    }
+
+    /// Denied tool result. `error` is the plain `permission denied` string,
+    /// or teaching text (guardian denials tell the model not to work around
+    /// the block).
     fn emit_permission_denied_tool_result(
         &mut self,
         call: ToolCall,
@@ -2072,7 +2232,7 @@ impl<D: PermissionDecider> Session<D> {
                 ("id", call.id.into()),
                 ("name", call.name.into()),
                 ("ok", false.into()),
-                ("error", error.into()),
+                ("error", error.to_owned().into()),
             ]),
             Some(tool_call_event_id),
         )

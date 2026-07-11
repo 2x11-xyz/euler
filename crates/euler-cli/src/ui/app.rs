@@ -704,6 +704,10 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
     status.session_id = Some(session_id.clone());
     status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
     status.git_branch = detect_git_branch(&status.cwd);
+    // /status visibility line (ADR 0011): only a non-default reviewer shows.
+    if session.permission_reviewer() != euler_core::PermissionReviewer::User {
+        status.permission_reviewer = Some(session.permission_reviewer().as_str().to_owned());
+    }
     let initial_token_usage = TokenUsageSnapshot {
         context_window_tokens: context_window_tokens_for(
             &model_catalog,

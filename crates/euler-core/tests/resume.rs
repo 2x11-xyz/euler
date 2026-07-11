@@ -203,6 +203,96 @@ fn permission_gated_tail_closure_says_tool_never_executed() {
 }
 
 #[test]
+fn guardian_interleaved_tail_still_appends_recovery_closure() {
+    // Security-audit finding: guardian review (and code-swarm fan-out)
+    // interleave companion events between a pending tool.call and its
+    // result. A crash after a guardian ALLOW but before the tool result
+    // persisted must still get the side-effect recovery closure — the
+    // companion window must not defeat the tail walk.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let call = tool_call(None, "call-shell", "run_shell");
+    let prompt = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::PERMISSION_PROMPT,
+        object([
+            ("capability", "shell-exec".into()),
+            ("reason", "tool run_shell".into()),
+        ]),
+    );
+    let spawn = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(prompt.id.clone()),
+        EventKind::AGENT_SPAWN,
+        object([("agent_id", "agent.guardian".into())]),
+    );
+    let child_model_call = EventEnvelope::new(
+        "session",
+        "agent.guardian",
+        Some(spawn.id.clone()),
+        EventKind::MODEL_CALL,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let child_result = EventEnvelope::new(
+        "session",
+        "agent.guardian",
+        Some(child_model_call.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([("content", "verdict".into())]),
+    );
+    let agent_result = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(spawn.id.clone()),
+        EventKind::AGENT_RESULT,
+        object([("ok", true.into())]),
+    );
+    let decision = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(prompt.id.clone()),
+        EventKind::PERMISSION_DECISION,
+        object([
+            ("capability", "shell-exec".into()),
+            ("mode", "ask".into()),
+            ("allowed", true.into()),
+            ("decision", "allowed".into()),
+        ]),
+    );
+    write_events(
+        &log,
+        &[
+            call.clone(),
+            prompt,
+            spawn,
+            child_model_call,
+            child_result,
+            agent_result,
+            decision,
+        ],
+    );
+
+    let outcome = resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    assert!(outcome.recovery_closure_appended);
+
+    let closures = recovery_closures(outcome.session.events());
+    assert_eq!(closures.len(), 1);
+    assert_eq!(closures[0].parent.as_deref(), Some(call.id.as_str()));
+    // The decision was ALLOW: the tool may have executed.
+    let message = payload_str(closures[0], "error").expect("closure message");
+    assert!(message.contains("side effects may have occurred"));
+}
+
+#[test]
 fn extension_permission_decisions_do_not_satisfy_tool_prompts_or_tail_matching() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");

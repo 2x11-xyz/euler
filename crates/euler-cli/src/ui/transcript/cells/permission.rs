@@ -6,6 +6,10 @@ pub(in crate::ui::transcript) struct PermissionDecisionView<'a> {
     pub(in crate::ui::transcript) allowed: Option<bool>,
     pub(in crate::ui::transcript) grant_scope: Option<&'a str>,
     pub(in crate::ui::transcript) instruction: Option<&'a str>,
+    /// `Some("guardian")` when an automated reviewer decided (ADR 0011).
+    pub(in crate::ui::transcript) decision_source: Option<&'a str>,
+    /// Guardian rationale; rendered as a dim follow-up line.
+    pub(in crate::ui::transcript) rationale: Option<&'a str>,
 }
 
 pub(in crate::ui::transcript) fn render_permission_decision(
@@ -29,19 +33,26 @@ pub(in crate::ui::transcript) fn render_permission_decision(
         .filter(|instruction| !instruction.is_empty());
     let capability = view.capability;
     let decision = view.decision;
-    let text = if view.allowed == Some(true) && !scope_label.is_empty() && !capability.is_empty() {
-        format!("{scope_label} · {capability}")
-    } else if view.allowed == Some(false) && inst.is_some() && !capability.is_empty() {
-        format!("denied · {capability} — \"{}\"", inst.unwrap_or_default())
-    } else if view.allowed == Some(false) && decision.contains("cancel") {
-        format!("permission canceled · {capability}")
-    } else if view.allowed == Some(false) && !capability.is_empty() {
-        format!("denied · {capability}")
-    } else if capability.is_empty() {
-        format!("permission decided · {decision}")
-    } else {
-        format!("permission decided · {capability}")
-    };
+    let mut text =
+        if view.allowed == Some(true) && !scope_label.is_empty() && !capability.is_empty() {
+            format!("{scope_label} · {capability}")
+        } else if view.allowed == Some(false) && inst.is_some() && !capability.is_empty() {
+            format!("denied · {capability} — \"{}\"", inst.unwrap_or_default())
+        } else if view.allowed == Some(false) && decision.contains("cancel") {
+            format!("permission canceled · {capability}")
+        } else if view.allowed == Some(false) && !capability.is_empty() {
+            format!("denied · {capability}")
+        } else if capability.is_empty() {
+            format!("permission decided · {decision}")
+        } else {
+            format!("permission decided · {capability}")
+        };
+    // ADR 0011: automated decisions are always distinguishable from user
+    // decisions — a quiet `· guardian` tag on the record line.
+    let source = view.decision_source.filter(|source| !source.is_empty());
+    if let Some(source) = source {
+        text.push_str(&format!(" · {source}"));
+    }
     push_wrapped_with_prefix(
         lines,
         CellPrefixes {
@@ -53,6 +64,24 @@ pub(in crate::ui::transcript) fn render_permission_decision(
         theme,
         width,
     );
+    // Guardian rationale as a dim follow-up line, only when a reviewer is
+    // tagged: user decisions carry no rationale payload.
+    if let Some(rationale) = view
+        .rationale
+        .filter(|rationale| !rationale.is_empty() && source.is_some())
+    {
+        push_wrapped_with_prefix(
+            lines,
+            CellPrefixes {
+                first: blank_gutter(),
+                next: blank_gutter(),
+            },
+            &format!("\"{rationale}\""),
+            theme.transcript.muted,
+            theme,
+            width,
+        );
+    }
 }
 
 pub(in crate::ui::transcript) struct PermissionAskView<'a> {

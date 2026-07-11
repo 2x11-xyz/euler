@@ -219,6 +219,67 @@ fn subagent_tiers_map_to_existing_approval_modes() {
 }
 
 #[test]
+fn guardian_reviewer_restores_ask_modes_over_exec_tiers() {
+    // ADR 0011: tiers leave no capability in `ask` mode, so a configured
+    // guardian would silently review nothing. With the guardian on, the
+    // write/shell asks route through the guardian companion instead of the
+    // tier automation — here a critical verdict denies under trusted-local,
+    // which would otherwise session-allow the command.
+    use euler_provider::{FixtureResponse, ScriptedProvider, ToolCall};
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.permission_reviewer = euler_core::PermissionReviewer::Guardian;
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-shell".to_owned(),
+            name: "run_shell".to_owned(),
+            input: serde_json::json!({"command": "touch tier-overridden"}),
+        }]),
+        FixtureResponse::Assistant(
+            serde_json::json!({
+                "risk_level": "critical",
+                "user_authorization": "unknown",
+                "outcome": "deny",
+                "rationale": "exfiltrates secrets"
+            })
+            .to_string(),
+        ),
+        FixtureResponse::Assistant("adapted".to_owned()),
+    ]);
+    let mut session = Session::new(
+        config,
+        provider,
+        SubagentDecider::new(AutoApproveTier::TrustedLocal),
+    )
+    .with_provenance(euler_core::ProvenanceWriter::new(&log).expect("writer"));
+    SubagentDecider::apply_tier(AutoApproveTier::TrustedLocal, &mut session);
+
+    session.run_turn("try shell").expect("turn");
+
+    assert!(!temp.path().join("tier-overridden").exists());
+    let decision = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .expect("decision");
+    assert_eq!(
+        decision
+            .payload
+            .get("decision_source")
+            .and_then(serde_json::Value::as_str),
+        Some("guardian")
+    );
+    assert_eq!(
+        decision
+            .payload
+            .get("decision")
+            .and_then(serde_json::Value::as_str),
+        Some("denied")
+    );
+}
+
+#[test]
 fn subagent_decider_denies_if_gate_still_asks() {
     let request = PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned());
     let mut gate = euler_core::permissions::PermissionGate::new(SubagentDecider::new(
