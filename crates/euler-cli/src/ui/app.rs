@@ -61,7 +61,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 #[cfg(test)]
 use ratatui::Frame;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
@@ -165,6 +165,12 @@ pub struct AppCore {
     reply_tx: Sender<PermissionReply>,
     bottom: BottomSurface,
     status: StatusSnapshot,
+    /// Last-known authenticated provider ids, refreshed whenever the session
+    /// is Idle (construction, turn completion). Bottom-surface rebuilds that
+    /// happen while the session is checked out onto the worker thread reuse
+    /// this snapshot so the reviewer-model picker never silently shrinks to
+    /// empty because of turn state.
+    authenticated_providers: BTreeSet<String>,
     model_catalog: MergedModelCatalog,
     session_store: Option<SessionStore>,
     active_session_home_managed: bool,
@@ -609,6 +615,7 @@ struct AppCoreBootstrap {
     status: StatusSnapshot,
     initial_token_usage: TokenUsageSnapshot,
     initial_context: super::commands::CommandContext,
+    authenticated_providers: BTreeSet<String>,
 }
 
 fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> AppCoreBootstrap {
@@ -650,11 +657,12 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         ),
         ..TokenUsageSnapshot::default()
     };
+    let authenticated_providers = session.providers().authenticated_provider_ids();
     let initial_context = command_context(
         &model_catalog,
         &target.provider,
         &target.model,
-        Some(session.providers()),
+        &authenticated_providers,
         empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
     );
     AppCoreBootstrap {
@@ -672,6 +680,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         status,
         initial_token_usage,
         initial_context,
+        authenticated_providers,
     }
 }
 
@@ -702,6 +711,7 @@ impl AppCore {
             status,
             initial_token_usage,
             initial_context,
+            authenticated_providers,
         } = boot;
         Self {
             state: AppState::Idle {
@@ -711,6 +721,7 @@ impl AppCore {
             reply_tx: channels.reply_tx,
             bottom: BottomSurface::new(initial_context),
             status,
+            authenticated_providers,
             model_catalog,
             session_store,
             active_session_home_managed,
@@ -763,6 +774,7 @@ impl AppCore {
     }
 
     fn rebuild_bottom_surface(&mut self) {
+        self.refresh_authenticated_providers();
         let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
@@ -777,12 +789,13 @@ impl AppCore {
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
-            self.current_providers(),
+            &self.authenticated_providers,
             parts,
         ));
     }
 
     fn replace_bottom_surface_for_session(&mut self) {
+        self.refresh_authenticated_providers();
         let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
@@ -797,15 +810,18 @@ impl AppCore {
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
-            self.current_providers(),
+            &self.authenticated_providers,
             parts,
         ));
     }
 
-    fn current_providers(&self) -> Option<&euler_provider::ProviderSet> {
-        match &self.state {
-            AppState::Idle { session } => Some(session.providers()),
-            _ => None,
+    /// Recomputes the authenticated-provider snapshot when the session is on
+    /// this thread (Idle). While a turn is in flight the session lives on the
+    /// worker thread, so rebuilds keep the last-known snapshot instead of
+    /// degrading the reviewer-model picker to an empty list.
+    fn refresh_authenticated_providers(&mut self) {
+        if let AppState::Idle { session } = &self.state {
+            self.authenticated_providers = session.providers().authenticated_provider_ids();
         }
     }
 

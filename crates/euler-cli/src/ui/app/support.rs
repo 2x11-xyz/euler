@@ -14,8 +14,8 @@ use euler_core::{EulerHome, ReasoningEffort, SessionRecord, SessionStore};
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
-use euler_provider::ProviderSet;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Looks up the context window size (in tokens) for the given provider/model
@@ -101,7 +101,7 @@ pub(super) fn command_context(
     model_catalog: &MergedModelCatalog,
     provider: &str,
     model: &str,
-    providers: Option<&ProviderSet>,
+    authenticated_providers: &BTreeSet<String>,
     parts: CommandContextParts,
 ) -> CommandContext {
     // This is called when the bottom surface is rebuilt for session lifecycle
@@ -112,18 +112,17 @@ pub(super) fn command_context(
     let model_choices = model_choices(model_catalog, &provider_config.registry, provider, model);
     // The reviewer-model picker must not offer a target that will burn a
     // spawn slot to discover it isn't authenticated (#58): filter to
-    // providers `validate_auth` accepts today. The general `/model` picker
-    // keeps the full list — switching to an unauthenticated provider there
-    // is a normal way to be prompted to /login. No active session (rare,
-    // between-session rebuilds) means no targets can be validated yet.
-    let code_swarm_model_choices = match providers {
-        Some(providers) => model_choices
-            .iter()
-            .filter(|choice| providers.is_authenticated(&choice.provider))
-            .cloned()
-            .collect(),
-        None => Vec::new(),
-    };
+    // providers `validate_auth` accepted when the session was last Idle.
+    // The general `/model` picker keeps the full list — switching to an
+    // unauthenticated provider there is a normal way to be prompted to
+    // /login. The caller passes a cached snapshot so rebuilds while the
+    // session is checked out onto the worker thread (mid-turn, after
+    // submission) never shrink the picker to empty.
+    let code_swarm_model_choices = model_choices
+        .iter()
+        .filter(|choice| authenticated_providers.contains(&choice.provider))
+        .cloned()
+        .collect();
     CommandContext {
         model_choices,
         code_swarm_model_choices,

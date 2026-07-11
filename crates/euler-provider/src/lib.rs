@@ -515,6 +515,18 @@ impl ProviderSet {
             .is_some_and(|provider| provider.validate_auth().is_ok())
     }
 
+    /// Every configured provider id whose `validate_auth` succeeds today —
+    /// the same predicate as [`Self::is_authenticated`], enumerated so
+    /// callers that lose access to the set (e.g. while a session is checked
+    /// out onto a worker thread) can keep a last-known snapshot.
+    pub fn authenticated_provider_ids(&self) -> std::collections::BTreeSet<String> {
+        self.providers
+            .iter()
+            .filter(|(_, provider)| provider.validate_auth().is_ok())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     pub fn reasoning_effort(&self, provider: &str, model: &str) -> Option<&str> {
         self.providers
             .get(provider)

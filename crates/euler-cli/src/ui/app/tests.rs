@@ -4220,6 +4220,32 @@ fn wait_for_idle(core: &mut AppCore) {
     panic!("turn did not finish");
 }
 
+#[test]
+fn code_swarm_picker_choices_survive_rebuild_while_turn_in_flight() {
+    let mut core = core();
+    let idle_choices = core.bottom.context().code_swarm_model_choices.clone();
+    assert!(
+        !idle_choices.is_empty(),
+        "idle session with an authenticated provider offers reviewer targets"
+    );
+
+    // handle_submit rebuilds the bottom surface AFTER checking the session
+    // out onto the worker thread; simulate that state and rebuild again.
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.rebuild_bottom_surface();
+
+    assert_eq!(
+        core.bottom.context().code_swarm_model_choices,
+        idle_choices,
+        "the reviewer-model picker must never shrink because a turn is in flight"
+    );
+}
+
 mod code_swarm_tests {
     use crate::ui::app::code_swarm::code_swarm_review_input;
 

@@ -202,6 +202,10 @@ impl AppCore {
             }
         }
         self.state = AppState::Idle { session };
+        // The session is back on this thread: refresh the last-known
+        // authenticated-provider snapshot used by bottom-surface rebuilds
+        // that happen while a turn is in flight.
+        self.refresh_authenticated_providers();
         self.in_flight_label = None;
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
