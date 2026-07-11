@@ -55,6 +55,7 @@ pub use extension_bridge::MAX_SPAWNS_PER_COMMAND;
 mod observer;
 mod parallel_spawn;
 mod round_loop;
+mod swarm_tool;
 pub use companion::AgentResultSummary;
 pub use observer::RoundObserverConfig;
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
@@ -147,6 +148,10 @@ pub struct SessionConfig {
     /// `.euler/grants.json` is repo-controlled content and must never become
     /// authority without a matching user consent entry outside the repo.
     pub project_grant_consent_dir: Option<PathBuf>,
+    /// User-tier CodeSwarm reviewer config file (swarm contract). `None`
+    /// (default) limits the resolution chain to explicit models and the
+    /// project tier. Config is data, not authorization.
+    pub code_swarm_user_config_path: Option<PathBuf>,
 }
 
 impl SessionConfig {
@@ -170,6 +175,7 @@ impl SessionConfig {
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
             round_observer: None,
             project_grant_consent_dir: None,
+            code_swarm_user_config_path: None,
         }
     }
 }
@@ -439,6 +445,9 @@ pub struct Session<D> {
     context_limit_emitted: Option<ModelTarget>,
     open_agent_spawns: BTreeMap<String, String>,
     observer_extension: Option<Arc<dyn Extension>>,
+    /// Wired code-swarm extension backing the `code_swarm_review` tool; the
+    /// tool is advertised to the root session's model only when this is set.
+    code_swarm_extension: Option<Arc<dyn Extension>>,
 }
 
 /// Session-side adapter driving the shared [`RoundLoop`]: bundles the
@@ -677,6 +686,7 @@ impl<D> Session<D> {
             context_limit_emitted: None,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            code_swarm_extension: None,
         }
     }
 
@@ -698,6 +708,13 @@ impl<D> Session<D> {
     /// observer executes; config without extension (or vice versa) is inert.
     pub fn set_observer_extension(&mut self, extension: Arc<dyn Extension>) {
         self.observer_extension = Some(extension);
+    }
+
+    /// Wire the code-swarm extension for the `code_swarm_review` tool
+    /// (tools contract). Without this, the tool is neither advertised nor
+    /// executable.
+    pub fn set_code_swarm_extension(&mut self, extension: Arc<dyn Extension>) {
+        self.code_swarm_extension = Some(extension);
     }
 
     pub fn open_event_wake(&self) -> Result<EventWakeRegistration, SessionError> {
@@ -958,6 +975,7 @@ impl<D> Session<D> {
             context_limit_emitted,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            code_swarm_extension: None,
         }
     }
 }
@@ -1524,11 +1542,17 @@ impl<D: PermissionDecider> Session<D> {
         let model_call_id = self.emit(EventKind::MODEL_CALL, model_call)?;
         sink.flush(self.bus.events());
 
+        // The review-gate tool is root-session only: companions build their
+        // requests through the companion loop and never see it (depth one).
+        let mut tools = self.tools.model_tools();
+        if self.code_swarm_extension.is_some() && self.extension_enabled(swarm_tool::EXTENSION_ID) {
+            tools.push(swarm_tool::code_swarm_review_tool_definition());
+        }
         let request = ModelRequest {
             model: target.model.clone(),
             instructions: SYSTEM_INSTRUCTIONS.to_owned(),
             input: canvas.iter().map(model_input_item).collect(),
-            tools: self.tools.model_tools(),
+            tools,
             reasoning_effort: self.config.reasoning_effort,
             max_output_tokens: self.config.max_output_tokens,
         }
@@ -1827,6 +1851,15 @@ impl<D: PermissionDecider> Session<D> {
                     return Ok(());
                 }
             }
+        }
+
+        if call.name == swarm_tool::CODE_SWARM_REVIEW_TOOL {
+            return self.execute_code_swarm_review_tool(
+                call,
+                tool_call_event_id,
+                covered_grant_source,
+                sink,
+            );
         }
 
         let tool_name = call.name.clone();

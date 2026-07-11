@@ -84,6 +84,9 @@ impl ToolRegistry {
             "read_file" | "git_status" | "git_diff" | "tool_result_get" => Some(Capability::FsRead),
             "edit_file" | "apply_patch" => Some(Capability::FsWrite),
             "run_shell" => Some(Capability::ShellExec),
+            // Session-level review gate (tools contract): executed by the
+            // session, not this registry, but gated here like every tool.
+            "code_swarm_review" => Some(Capability::AgentSpawn),
             _ => None,
         }
     }
