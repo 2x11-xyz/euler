@@ -244,7 +244,10 @@ pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String>
         return None;
     }
     match request.capability {
-        Capability::ShellExec => request.command.as_deref().and_then(derive_shell_prefix),
+        Capability::ShellExec => request
+            .command
+            .as_deref()
+            .and_then(|command| derive_shell_prefix(command, request.workspace_root.as_deref())),
         Capability::FsWrite => request.path.as_deref().and_then(derive_edit_prefix),
         _ => None,
     }
@@ -263,11 +266,15 @@ pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String>
 ///   cover the command, so the panel falls back to unscoped labels;
 /// - all segments statically safe (normally auto-approved before any
 ///   prompt) → the first segment's token.
-pub(crate) fn derive_shell_prefix(command: &str) -> Option<String> {
+///
+/// Static safety includes workspace confinement, so it needs the execution
+/// cwd from the request; without one no segment counts as safe and the
+/// offer follows the same fail-closed rule as coverage.
+pub(crate) fn derive_shell_prefix(command: &str, workspace_root: Option<&Path>) -> Option<String> {
     let segments = parse_plain_segments(command)?;
     let mut unsafe_tokens = segments
         .iter()
-        .filter(|segment| !segment.is_statically_safe())
+        .filter(|segment| !workspace_root.is_some_and(|root| segment.is_statically_safe(root)))
         .map(CommandSegment::first_token);
     let Some(first) = unsafe_tokens.next() else {
         return segments

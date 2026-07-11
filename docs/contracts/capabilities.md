@@ -172,10 +172,10 @@ analysis reasons about the whole line:
   fall to the ask path. False negatives cost a prompt; false positives are
   forbidden.
 - **Classification.** Each segment's argv is checked against a behavioral
-  allowlist. Read-only binaries are safe with any flags: `cat cd cut echo
-  expr false grep head id ls nl paste pwd rev seq stat tail tr true uname
-  uniq wc which whoami`. Flag-inspected binaries are safe only in read-only
-  form: `find` (no `-exec`/`-execdir`/`-ok`/`-okdir`/`-delete`/`-fls`/
+  allowlist of read-only binaries: `cat cd cut echo expr false grep head id
+  ls nl paste pwd rev seq stat tail tr true uname uniq wc which whoami`,
+  plus flag-inspected binaries that are safe only in read-only form: `find`
+  (no `-exec`/`-execdir`/`-ok`/`-okdir`/`-delete`/`-fls`/
   `-fprint`/`-fprint0`/`-fprintf`), `rg` (no `--pre`/`--hostname-bin`/
   `--search-zip`/`-z`, including bundled shorts), `base64` (no
   `-o`/`--output`), `sed` (only `sed -n Np` / `sed -n M,Np` print-range
@@ -186,7 +186,22 @@ analysis reasons about the whole line:
   (`/bin/ls` and `env ls` do not match); unquoted globs reject the
   flag-inspected binaries because runtime expansion could inject
   flag-shaped tokens.
-- A command is **statically safe** iff it parses AND every segment is safe.
+- **Workspace confinement.** Read-only is not harmless: `cat
+  ~/.aws/credentials` writes nothing and still exfiltrates. Every argument
+  of a safe segment that may name a filesystem path must stay inside the
+  workspace root the command executes in: an existing path must
+  canonicalize (symlinks resolved) under the canonicalized root; a
+  non-existing argument must be relative with no `..` component, no leading
+  `~`, and no `$`/backtick. A sensitive-basename denylist (`.env*`, names
+  containing `secret`/`credential`, `id_rsa`, `id_ed25519`, `*.pem`,
+  `*.key`) rejects even inside the workspace. Argument positions are
+  classified conservatively — only the grep/rg pattern position is exempt,
+  and only when no `-e`/`-f`-style flag can shift it; `--flag=value` values
+  are checked, and flags that could carry an attached path reject. A
+  rejected segment is simply not statically safe: the command falls back to
+  the ordinary ask path (fail open to ask, never a new denial surface).
+- A command is **statically safe** iff it parses AND every segment is safe
+  AND every segment's path arguments are confined to the workspace.
 
 **Auto-approval under `ask`.** When `shell-exec` is in `ask` mode, a
 statically-safe command runs without a prompt. The run is recorded as a
@@ -196,7 +211,10 @@ semantics; **no grant is installed** and no prompt event is emitted. The
 static-safe check precedes grant-coverage matching, so the ledger
 attributes such runs to the analysis rather than to an unrelated grant.
 Static safety never bypasses `always-deny`, and a capability denial earlier
-in the same turn still short-circuits the tool call.
+in the same turn still short-circuits the tool call. A command truncated at
+the retention bound is never analyzed (and never matches scoped grants):
+any permission decision must be based on exactly what will execute, or fail
+closed to the ask path.
 
 **Ledger treatment.** The decision event keeps provenance honest, but the
 transcript does not render it as a standalone record — the

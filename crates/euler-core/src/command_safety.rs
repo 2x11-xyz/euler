@@ -36,6 +36,31 @@
 //! unquoted glob rejects the flag-inspected binaries (`find`, `rg`,
 //! `base64`, `sed`, `git`) because runtime expansion could inject
 //! flag-shaped tokens (a file named `-delete` in `find . *`).
+//!
+//! ## Workspace confinement (security review F1)
+//!
+//! Read-only is not harmless: `cat ~/.aws/credentials` writes nothing and
+//! still exfiltrates. A segment is only statically safe when every argument
+//! that may name a filesystem path stays inside the workspace root the
+//! command executes in (`sh -c` runs in that root):
+//!
+//! - an argument naming an existing path must canonicalize (symlinks
+//!   resolved) to a location under the canonicalized root;
+//! - a non-existing argument must pass textual rules: no absolute path, no
+//!   leading `~`, no `$` or backtick, no `..` component — a relative path
+//!   without `..` cannot leave the execution cwd;
+//! - a small sensitive-basename denylist (`.env*`, `secret`/`credential`
+//!   names, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`) rejects even inside
+//!   the workspace;
+//! - argument positions are classified conservatively: only the grep/rg
+//!   pattern position is exempt, and only when no `-e`/`-f`-style flag can
+//!   shift it; everything else — including `--flag=value` values — is
+//!   treated as a potential path.
+//!
+//! A rejected segment is simply not statically safe: the command falls to
+//! the ordinary ask path (no new denial surface).
+
+use std::path::Path;
 
 /// One word of a parsed segment, quotes resolved to literal text.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,8 +85,15 @@ impl CommandSegment {
         &self.words[0].text
     }
 
-    /// Whether this segment is a known read-only invocation.
-    pub fn is_statically_safe(&self) -> bool {
+    /// Whether this segment is a known read-only invocation whose path
+    /// arguments are confined to `workspace_root` (see the module docs,
+    /// "Workspace confinement").
+    pub fn is_statically_safe(&self, workspace_root: &Path) -> bool {
+        self.is_read_only_invocation() && self.paths_confined(workspace_root)
+    }
+
+    /// Behavioral allowlist check: known read-only binary, flags inspected.
+    fn is_read_only_invocation(&self) -> bool {
         let first = &self.words[0];
         // A glob in the command-name position expands to file names at
         // runtime; never trust it.
@@ -89,6 +121,115 @@ impl CommandSegment {
             _ => false,
         }
     }
+
+    /// Workspace confinement (security review F1): every argument that may
+    /// name a filesystem path must stay inside `workspace_root`. Position
+    /// classification is conservative — when in doubt whether an argument
+    /// is a path, path rules apply (over-rejection costs one ask prompt;
+    /// under-rejection exfiltrates).
+    fn paths_confined(&self, workspace_root: &Path) -> bool {
+        // Canonicalize the root itself (macOS `/var` is a symlink):
+        // unresolvable root means nothing can be proven confined.
+        let Ok(root) = workspace_root.canonicalize() else {
+            return false;
+        };
+        let args = &self.words[1..];
+        let pattern_index = pattern_position(self.first_token(), args);
+        args.iter().enumerate().all(|(index, word)| {
+            if Some(index) == pattern_index {
+                return true;
+            }
+            let arg = word.text.as_str();
+            if let Some(rest) = arg.strip_prefix('-') {
+                // `--flag=value`: the value may name a path. A no-`=` flag
+                // carrying a path-ish character (`-f/etc/passwd` attached
+                // value) is rejected outright — per-binary attached-value
+                // grammars are exactly the ambiguity this check must not
+                // guess about.
+                match arg.split_once('=') {
+                    Some((_, value)) => arg_confined(value, &root),
+                    None => !rest.contains(['/', '~', '$', '`']),
+                }
+            } else {
+                arg_confined(arg, &root)
+            }
+        })
+    }
+}
+
+/// grep/rg read their pattern from the first non-flag argument — a regex is
+/// not a path, so that one position is exempt from confinement — UNLESS a
+/// pattern/file flag (`-e`, `-f`, `--regexp`, `--file`, or a short cluster
+/// containing `e` or `f` such as `-rf`) could shift positions: then every
+/// non-flag argument is treated as a path (the safe direction).
+fn pattern_position(binary: &str, args: &[Word]) -> Option<usize> {
+    if !matches!(binary, "grep" | "rg") {
+        return None;
+    }
+    let has_pattern_flag = args.iter().any(|word| {
+        let arg = word.text.as_str();
+        arg.starts_with("--regexp")
+            || arg.starts_with("--file")
+            || arg
+                .strip_prefix('-')
+                .is_some_and(|rest| !rest.starts_with('-') && rest.contains(['e', 'f']))
+    });
+    if has_pattern_flag {
+        return None;
+    }
+    args.iter().position(|word| !word.text.starts_with('-'))
+}
+
+/// One potential path argument, checked against the canonicalized root.
+fn arg_confined(arg: &str, canonical_root: &Path) -> bool {
+    if arg.is_empty() || arg == "-" {
+        // Empty word / stdin convention: not a path.
+        return true;
+    }
+    // Textual rejections apply regardless of existence: `~` and `$`/backtick
+    // are rewritten by the shell before the binary ever sees them.
+    if arg.starts_with('~') || arg.contains(['$', '`']) {
+        return false;
+    }
+    let path = Path::new(arg);
+    if sensitive_basename(path) {
+        return false;
+    }
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        // Absolute and parent-traversing forms are rejected textually even
+        // when they would resolve inside the workspace — over-rejection
+        // costs one prompt.
+        return false;
+    }
+    match canonical_root.join(path).canonicalize() {
+        // Existing path: symlinks resolved, must land under the root and
+        // must not resolve to a sensitive name.
+        Ok(resolved) => resolved.starts_with(canonical_root) && !sensitive_basename(&resolved),
+        // Nonexistent/unresolvable: the textual rules above already hold,
+        // and `sh -c` runs in the workspace root — a relative path without
+        // `..` cannot leave it.
+        Err(_) => true,
+    }
+}
+
+/// Names whose contents are categorically sensitive, denied even inside the
+/// workspace (security review F1).
+fn sensitive_basename(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with(".env")
+        || lower.contains("secret")
+        || lower.contains("credential")
+        || lower == "id_rsa"
+        || lower == "id_ed25519"
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
 }
 
 /// Decompose a command line into plain segments across `&&`, `||`, `;`,
@@ -247,10 +388,13 @@ fn scan_double_quoted(
 }
 
 /// Whether `command` parses into plain segments that are ALL statically
-/// safe read-only invocations.
-pub fn is_statically_safe_command(command: &str) -> bool {
-    parse_plain_segments(command)
-        .is_some_and(|segments| segments.iter().all(CommandSegment::is_statically_safe))
+/// safe read-only invocations confined to `workspace_root`.
+pub fn is_statically_safe_command(command: &str, workspace_root: &Path) -> bool {
+    parse_plain_segments(command).is_some_and(|segments| {
+        segments
+            .iter()
+            .all(|segment| segment.is_statically_safe(workspace_root))
+    })
 }
 
 /// Read-only regardless of flags: nothing these binaries accept makes them
@@ -368,6 +512,13 @@ mod tests {
 
     fn segments(command: &str) -> Vec<CommandSegment> {
         parse_plain_segments(command).expect("command should parse")
+    }
+
+    /// Safety against an empty temp workspace: existence-dependent checks
+    /// see no files, so args are judged by the textual confinement rules.
+    fn safe(command: &str) -> bool {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        is_statically_safe_command(command, temp.path())
     }
 
     #[test]
@@ -488,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_binaries_are_safe_with_any_flags() {
+    fn read_only_binaries_are_safe_with_workspace_confined_args() {
         for command in [
             "ls",
             "ls -la --color=always",
@@ -500,13 +651,89 @@ mod tests {
             "nl -nrz Cargo.toml",
             "echo hello world",
             "true",
-            "cd /tmp",
+            "cd src",
         ] {
-            assert!(
-                is_statically_safe_command(command),
-                "expected safe: {command}"
-            );
+            assert!(safe(command), "expected safe: {command}");
         }
+    }
+
+    #[test]
+    fn path_arguments_outside_the_workspace_are_unsafe() {
+        // Security review F1: read-only binaries exfiltrate; every path
+        // argument must stay inside the execution workspace.
+        for command in [
+            "cat /etc/passwd",
+            "cat ~/.aws/credentials",
+            "cat ../outside.txt",
+            "tail -f /var/log/system.log",
+            "cd /tmp",
+            "cd ..",
+            "head -n 5 /etc/hosts",
+            "ls /",
+            "find /etc -name x",
+            "git diff --no-index /etc/passwd /dev/null",
+            "base64 /etc/shadow",
+            "grep pattern /etc/passwd",
+            // Attached flag values can smuggle a path; reject any no-`=`
+            // flag carrying a path-ish character.
+            "grep -f/etc/passwd .",
+            "grep --file=/etc/passwd .",
+            // `-e`/`-f`-style flags shift the pattern position: every
+            // non-flag argument is then a potential path.
+            "grep -rf /etc/passwd .",
+            "grep -e x /etc/passwd",
+        ] {
+            assert!(!safe(command), "expected unsafe: {command}");
+        }
+        // Confined relative forms stay safe (the pattern position is
+        // exempt; `.` and workspace-relative paths are inside).
+        for command in [
+            "ls",
+            "grep -r pattern .",
+            "grep -rn 'foo$' src",
+            "cat README.md",
+            "tail -n 20 logs/output.txt",
+        ] {
+            assert!(safe(command), "expected safe: {command}");
+        }
+    }
+
+    #[test]
+    fn sensitive_basenames_are_unsafe_even_inside_the_workspace() {
+        for command in [
+            "cat .env",
+            "cat .envrc",
+            "cat .env.local",
+            "cat config/secrets.yaml",
+            "cat aws_credentials.json",
+            "cat id_rsa",
+            "cat keys/id_ed25519",
+            "cat server.pem",
+            "cat private.key",
+        ] {
+            assert!(!safe(command), "expected unsafe: {command}");
+        }
+    }
+
+    #[test]
+    fn symlink_escaping_the_workspace_is_unsafe() {
+        // A symlink INSIDE the workspace pointing outside must not be
+        // readable via static-safe approval: existence-based confinement
+        // resolves symlinks before the boundary check.
+        let temp = tempfile::tempdir().expect("temp");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("target.txt"), "beyond").expect("seed outside");
+        std::fs::write(workspace.join("inside.txt"), "within").expect("seed inside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("target.txt"), workspace.join("link.txt"))
+            .expect("symlink");
+
+        assert!(is_statically_safe_command("cat inside.txt", &workspace));
+        #[cfg(unix)]
+        assert!(!is_statically_safe_command("cat link.txt", &workspace));
     }
 
     #[test]
@@ -519,26 +746,23 @@ mod tests {
             "npm install",
             "python3 x.py",
         ] {
-            assert!(
-                !is_statically_safe_command(command),
-                "expected unsafe: {command}"
-            );
+            assert!(!safe(command), "expected unsafe: {command}");
         }
     }
 
     #[test]
     fn quoted_single_token_command_name_is_unsafe() {
         // `'git status'` is a program NAMED "git status", not git.
-        assert!(!is_statically_safe_command("'git status'"));
-        assert!(!is_statically_safe_command("\"git status\""));
+        assert!(!safe("'git status'"));
+        assert!(!safe("\"git status\""));
     }
 
     #[test]
     fn exact_name_match_only() {
         // Path-qualified and env-wrapped invocations do not match.
-        assert!(!is_statically_safe_command("/bin/ls"));
-        assert!(!is_statically_safe_command("env ls"));
-        assert!(!is_statically_safe_command("GIT_DIR=.evil git status"));
+        assert!(!safe("/bin/ls"));
+        assert!(!safe("env ls"));
+        assert!(!safe("GIT_DIR=.evil git status"));
     }
 
     #[test]
@@ -551,10 +775,7 @@ mod tests {
             "echo hi ; ls",
             "cd src && ls\nwc -l lib.rs",
         ] {
-            assert!(
-                is_statically_safe_command(command),
-                "expected safe: {command}"
-            );
+            assert!(safe(command), "expected safe: {command}");
         }
     }
 
@@ -566,17 +787,14 @@ mod tests {
             "ls | sh",
             "find . -name x | xargs rm",
         ] {
-            assert!(
-                !is_statically_safe_command(command),
-                "expected unsafe: {command}"
-            );
+            assert!(!safe(command), "expected unsafe: {command}");
         }
     }
 
     #[test]
     fn find_flag_rules() {
-        assert!(is_statically_safe_command("find . -name file.txt"));
-        assert!(is_statically_safe_command("find . -type f -newer ref"));
+        assert!(safe("find . -name file.txt"));
+        assert!(safe("find . -type f -newer ref"));
         for command in [
             "find . -name file.txt -exec rm {} ;",
             "find . -name file.txt -execdir chmod +x {} ;",
@@ -588,17 +806,14 @@ mod tests {
             "find . -fprint0 /etc/passwd",
             "find . -fprintf /root/out.txt %p",
         ] {
-            assert!(
-                !is_statically_safe_command(command),
-                "expected unsafe: {command}"
-            );
+            assert!(!safe(command), "expected unsafe: {command}");
         }
     }
 
     #[test]
     fn rg_flag_rules() {
-        assert!(is_statically_safe_command("rg Cargo.toml -n"));
-        assert!(is_statically_safe_command("rg --no-ignore pattern src"));
+        assert!(safe("rg Cargo.toml -n"));
+        assert!(safe("rg --no-ignore pattern src"));
         for command in [
             "rg --pre pwned files",
             "rg --pre=pwned files",
@@ -608,36 +823,30 @@ mod tests {
             "rg -z files",
             "rg -zn files", // bundled short flags
         ] {
-            assert!(
-                !is_statically_safe_command(command),
-                "expected unsafe: {command}"
-            );
+            assert!(!safe(command), "expected unsafe: {command}");
         }
     }
 
     #[test]
     fn base64_flag_rules() {
-        assert!(is_statically_safe_command("base64 file"));
-        assert!(is_statically_safe_command("base64 -d file"));
+        assert!(safe("base64 file"));
+        assert!(safe("base64 -d file"));
         for command in [
             "base64 -o out.bin file",
             "base64 -oout.bin file",
             "base64 --output out.bin file",
             "base64 --output=out.bin file",
         ] {
-            assert!(
-                !is_statically_safe_command(command),
-                "expected unsafe: {command}"
-            );
+            assert!(!safe(command), "expected unsafe: {command}");
         }
     }
 
     #[test]
     fn sed_print_range_rules() {
-        assert!(is_statically_safe_command("sed -n 10p file.txt"));
-        assert!(is_statically_safe_command("sed -n 1,5p file.txt"));
-        assert!(is_statically_safe_command("sed -n '1,5p' file.txt"));
-        assert!(is_statically_safe_command("sed -n 1,5p")); // stdin in a pipeline
+        assert!(safe("sed -n 10p file.txt"));
+        assert!(safe("sed -n 1,5p file.txt"));
+        assert!(safe("sed -n '1,5p' file.txt"));
+        assert!(safe("sed -n 1,5p")); // stdin in a pipeline
         for command in [
             "sed -n xp file.txt",
             "sed -n 1,5,9p file.txt",
@@ -647,10 +856,7 @@ mod tests {
             "sed -i s/a/b/ file.txt",
             "sed -n 1,5p a.txt b.txt",
         ] {
-            assert!(
-                !is_statically_safe_command(command),
-                "expected unsafe: {command}"
-            );
+            assert!(!safe(command), "expected unsafe: {command}");
         }
     }
 
@@ -667,10 +873,7 @@ mod tests {
             "git branch --list -v",
             "git branch --format='%(refname)'",
         ] {
-            assert!(
-                is_statically_safe_command(command),
-                "expected safe: {command}"
-            );
+            assert!(safe(command), "expected safe: {command}");
         }
     }
 
@@ -701,34 +904,31 @@ mod tests {
             "git log --exec=evil",
             "git", // bare git prints help; no subcommand to allow
         ] {
-            assert!(
-                !is_statically_safe_command(command),
-                "expected unsafe: {command}"
-            );
+            assert!(!safe(command), "expected unsafe: {command}");
         }
     }
 
     #[test]
     fn glob_rules_differ_by_binary_class() {
         // Read-only binaries stay read-only whatever expansion produces.
-        assert!(is_statically_safe_command("ls *.rs"));
-        assert!(is_statically_safe_command("wc -l src/*.rs"));
+        assert!(safe("ls *.rs"));
+        assert!(safe("wc -l src/*.rs"));
         // Flag-inspected binaries reject unquoted globs: expansion could
         // inject flag-shaped tokens (a file literally named `-delete`).
-        assert!(!is_statically_safe_command("find . -name *.rs"));
-        assert!(!is_statically_safe_command("rg pattern *"));
-        assert!(!is_statically_safe_command("git status *"));
+        assert!(!safe("find . -name *.rs"));
+        assert!(!safe("rg pattern *"));
+        assert!(!safe("git status *"));
         // Quoted globs are literal text.
-        assert!(is_statically_safe_command("find . -name '*.rs'"));
-        assert!(is_statically_safe_command("rg pattern \"*.rs\""));
+        assert!(safe("find . -name '*.rs'"));
+        assert!(safe("rg pattern \"*.rs\""));
         // A glob in the command-name position never matches anything.
-        assert!(!is_statically_safe_command("l? -la"));
+        assert!(!safe("l? -la"));
     }
 
     #[test]
     fn safe_flag_rules_hold_inside_pipelines() {
-        assert!(is_statically_safe_command("find . -name '*.rs' | head -3"));
-        assert!(!is_statically_safe_command("find . -delete | head -3"));
-        assert!(!is_statically_safe_command("ls | base64 -o out"));
+        assert!(safe("find . -name '*.rs' | head -3"));
+        assert!(!safe("find . -delete | head -3"));
+        assert!(!safe("ls | base64 -o out"));
     }
 }

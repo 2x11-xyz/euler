@@ -79,6 +79,13 @@ impl ToolRegistry {
         Self { root: root.into() }
     }
 
+    /// The workspace root every tool executes in (`run_shell` is
+    /// `sh -c <command>` with this as its cwd). Permission requests carry it
+    /// so path-confinement checks reason about the real execution cwd.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn required_capability(&self, name: &str) -> Option<Capability> {
         match name {
             "read_file" | "git_status" | "git_diff" | "tool_result_get" => Some(Capability::FsRead),

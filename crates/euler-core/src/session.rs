@@ -1787,6 +1787,7 @@ impl<D: PermissionDecider> Session<D> {
                 &self.tools.permission_reason(&call.name, &call.input),
                 &call.name,
                 &call.input,
+                self.tools.root(),
             );
             // Scoped fs-write grants match the canonicalized workspace-
             // relative path (`..`/symlinks resolved exactly as the write
@@ -1815,10 +1816,9 @@ impl<D: PermissionDecider> Session<D> {
             static_safe = mode == ApprovalMode::Ask
                 && capability == Capability::ShellExec
                 && !request.command_truncated
-                && request
-                    .command
-                    .as_deref()
-                    .is_some_and(crate::command_safety::is_statically_safe_command);
+                && request.command.as_deref().is_some_and(|command| {
+                    crate::command_safety::is_statically_safe_command(command, self.tools.root())
+                });
             if static_safe {
                 self.emit_static_safe_decision(capability, tool_call_event_id.clone())?;
             }
@@ -2571,8 +2571,10 @@ pub(crate) fn permission_request_for_tool(
     reason: &str,
     tool_name: &str,
     input: &Value,
+    workspace_root: &std::path::Path,
 ) -> PermissionRequest {
-    let mut request = PermissionRequest::new(capability, reason.to_owned());
+    let mut request =
+        PermissionRequest::new(capability, reason.to_owned()).with_workspace_root(workspace_root);
     match tool_name {
         "run_shell" => {
             if let Some(command) = input.get("command").and_then(Value::as_str) {

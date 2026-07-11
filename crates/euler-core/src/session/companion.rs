@@ -258,6 +258,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 &self.tools.permission_reason(&call.name, &call.input),
                 &call.name,
                 &call.input,
+                self.tools.root(),
             );
             let mode = self.permissions.mode(capability);
             let needs_prompt = mode == ApprovalMode::Ask && !self.permissions.is_granted(&request);
