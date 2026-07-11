@@ -546,6 +546,45 @@ mod tests {
     }
 
     #[test]
+    fn most_informative_line_matches_lowercase_failure_markers() {
+        // Real-world tool output is not consistently uppercase/prefixed —
+        // the scorer must catch lowercase "failed"/"error"/"panicked"/
+        // "warning" the same way it catches "FAILED"/"error:"/"fatal".
+        assert_eq!(
+            most_informative_line("ok\n3 failed, 1 passed\ntail"),
+            Some("3 failed, 1 passed")
+        );
+        assert_eq!(
+            most_informative_line("start\nsomething error occurred\nend"),
+            Some("something error occurred")
+        );
+        assert_eq!(
+            most_informative_line("start\ngoroutine panicked unexpectedly\nend"),
+            Some("goroutine panicked unexpectedly")
+        );
+        assert_eq!(
+            most_informative_line("start\nwarning low disk space\nend"),
+            Some("warning low disk space")
+        );
+    }
+
+    #[test]
+    fn most_informative_line_does_not_match_marker_as_substring_of_other_word() {
+        // Word-boundary tokenizing (not naive lowercase substring matching)
+        // must not treat "errorless"/"warningless" as the "error"/"warning"
+        // marker — this is the concrete false-positive risk a naive
+        // `to_ascii_lowercase().contains(...)` check would introduce.
+        assert_eq!(
+            most_informative_line("a mostly errorless run\nsome other line"),
+            None
+        );
+        assert_eq!(
+            most_informative_line("running in warningless mode\nsome other line"),
+            None
+        );
+    }
+
+    #[test]
     fn most_informative_line_prefers_test_summary_over_other_signals() {
         let output = "running 3 tests\ntest foo ... ok\ntest result: ok. 3 passed; 0 failed\n";
         assert_eq!(

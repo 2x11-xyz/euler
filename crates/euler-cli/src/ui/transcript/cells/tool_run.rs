@@ -165,19 +165,20 @@ fn line_score(line: &str) -> u32 {
     if lower.contains("test result:") {
         return 400;
     }
-    if trimmed.contains("FAILED") || has_count_token(&lower, &["passed", "failed"]) {
+    if contains_word_ci(trimmed, "failed") || has_count_token(&lower, &["passed", "failed"]) {
         return 380;
     }
 
-    // Tier 2: error / panic lines outrank warnings.
-    if lower.contains("error[")
-        || lower.contains("error:")
-        || lower.contains("panicked")
+    // Tier 2: error / panic lines outrank warnings. `contains_word_ci(_,
+    // "error")` also covers the old bracketed-code form ("error[E0308]:
+    // ..."), since `[` is a non-alphanumeric token boundary.
+    if contains_word_ci(trimmed, "error")
+        || contains_word_ci(trimmed, "panicked")
         || lower.contains("fatal")
     {
         return 300;
     }
-    if lower.contains("warning:") {
+    if contains_word_ci(trimmed, "warning") {
         return 250;
     }
 
@@ -191,6 +192,20 @@ fn line_score(line: &str) -> u32 {
     }
 
     0
+}
+
+/// True if `word` appears in `line` as a standalone, case-insensitive token —
+/// i.e. bounded by non-alphanumeric characters (or the string ends). Plain
+/// tool output regularly carries these markers in any case ("FAILED",
+/// "Failed", "failed"), so a naive `line.to_ascii_lowercase().contains(word)`
+/// would work for casing but also fires inside unrelated words that merely
+/// contain the marker as a substring (e.g. "errorless", "warningless-mode").
+/// Splitting on non-alphanumeric boundaries and comparing whole tokens
+/// case-insensitively catches every casing of the real marker without that
+/// over-matching.
+fn contains_word_ci(line: &str, word: &str) -> bool {
+    line.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(word))
 }
 
 /// True if some whitespace-delimited token in `line` is a bare integer
