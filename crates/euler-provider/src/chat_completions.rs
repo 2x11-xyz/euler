@@ -16,7 +16,7 @@ pub(crate) fn request_body_with_options(
 ) -> Value {
     let mut body = json!({
         "model": request.model,
-        "messages": chat_messages(request),
+        "messages": chat_messages(request, options),
         "stream": true,
     });
     if options.stream_usage {
@@ -55,13 +55,6 @@ impl Default for ChatCompletionsOptions {
 }
 
 impl ChatCompletionsOptions {
-    pub(crate) fn openrouter() -> Self {
-        Self {
-            max_tokens_field: MaxTokensField::MaxTokens,
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn from_compat(compat: Option<&Value>) -> Self {
         let mut options = Self::default();
         let Some(compat) = compat.and_then(Value::as_object) else {
@@ -95,6 +88,17 @@ impl ChatCompletionsOptions {
             });
         }
         options
+    }
+
+    /// OpenRouter's reasoning dialect carries `reasoning_details` blocks that
+    /// must be preserved at provider fidelity and replayed verbatim on
+    /// tool-call continuations (some models return signed or encrypted
+    /// blocks). Other chat-completions dialects reject unknown fields, so
+    /// both capture and replay are gated on the OpenRouter request format.
+    fn reasoning_details_enabled(&self) -> bool {
+        self.reasoning_request
+            .as_ref()
+            .is_some_and(|request| request.format == ReasoningRequestFormat::OpenRouterReasoning)
     }
 }
 
@@ -225,7 +229,7 @@ fn reasoning_bool(value: &str) -> bool {
     )
 }
 
-fn chat_messages(request: &ModelRequest) -> Vec<Value> {
+fn chat_messages(request: &ModelRequest, options: &ChatCompletionsOptions) -> Vec<Value> {
     let mut messages = Vec::new();
     if !request.instructions.is_empty() {
         messages.push(json!({
@@ -233,12 +237,46 @@ fn chat_messages(request: &ModelRequest) -> Vec<Value> {
             "content": request.instructions,
         }));
     }
+    // OpenRouter reasoning_details replay: reasoning items store the
+    // provider-native blocks as an opaque artifact (a JSON array). They are
+    // replayed verbatim on the assistant message they preceded — the message
+    // carrying the tool calls or final content of that turn — per OpenRouter's
+    // reasoning-tokens preservation rules.
+    let mut pending_reasoning_details: Vec<Value> = Vec::new();
     for item in &request.input {
-        if let Some(message) = chat_message(item) {
+        if options.reasoning_details_enabled() {
+            if let Some(details) = reasoning_details_from_item(item) {
+                pending_reasoning_details.extend(details);
+                continue;
+            }
+        }
+        if let Some(mut message) = chat_message(item) {
+            if !pending_reasoning_details.is_empty() && message["role"] == "assistant" {
+                message["reasoning_details"] =
+                    Value::Array(std::mem::take(&mut pending_reasoning_details));
+            }
             messages.push(message);
         }
     }
     messages
+}
+
+/// Extracts stored `reasoning_details` blocks from a reasoning input item.
+/// Only artifacts that parse as a JSON array are OpenRouter-native
+/// `reasoning_details`; any other artifact shape belongs to a different
+/// provider dialect and is never replayed onto this wire format.
+fn reasoning_details_from_item(item: &ModelInputItem) -> Option<Vec<Value>> {
+    let ModelInputItem::Reasoning {
+        artifact: Some(artifact),
+        ..
+    } = item
+    else {
+        return None;
+    };
+    match serde_json::from_str::<Value>(artifact) {
+        Ok(Value::Array(details)) => Some(details),
+        _ => None,
+    }
 }
 
 fn chat_message(item: &ModelInputItem) -> Option<Value> {
@@ -377,14 +415,10 @@ pub(crate) struct ChatCompletionsSseParser {
     pending_stop_reason: Option<StopReason>,
     usage: Option<Usage>,
     tool_calls: Vec<PartialToolCall>,
+    reasoning_details: Vec<Value>,
 }
 
 impl ChatCompletionsSseParser {
-    #[cfg(test)]
-    pub(crate) fn new(provider_label: impl Into<String>) -> Self {
-        Self::new_with_options(provider_label, ChatCompletionsOptions::default())
-    }
-
     pub(crate) fn new_with_options(
         provider_label: impl Into<String>,
         options: ChatCompletionsOptions,
@@ -399,6 +433,7 @@ impl ChatCompletionsSseParser {
             pending_stop_reason: None,
             usage: None,
             tool_calls: Vec::new(),
+            reasoning_details: Vec::new(),
         }
     }
 
@@ -522,6 +557,16 @@ impl ChatCompletionsSseParser {
                 reasoning.to_owned(),
             ))));
         }
+        if self.options.reasoning_details_enabled() {
+            for source in [delta, choice.get("message")] {
+                if let Some(details) = source
+                    .and_then(|source| source.get("reasoning_details"))
+                    .and_then(Value::as_array)
+                {
+                    merge_reasoning_details(&mut self.reasoning_details, details);
+                }
+            }
+        }
         if let Some(content) = delta
             .and_then(|delta| delta.get("content"))
             .and_then(Value::as_str)
@@ -576,6 +621,15 @@ impl ChatCompletionsSseParser {
             ))));
             return;
         };
+        // reasoning_details are only complete once the round finished; a
+        // truncated stream never emits them, so partial blocks are never
+        // stored for replay.
+        if !self.reasoning_details.is_empty() {
+            let details = std::mem::take(&mut self.reasoning_details);
+            events.push(Ok(ModelStreamEvent::ReasoningDelta(
+                reasoning_details_chunk(&details),
+            )));
+        }
         for call in std::mem::take(&mut self.tool_calls) {
             if call.id.is_empty() && call.name.is_empty() && call.arguments.is_empty() {
                 continue;
@@ -639,6 +693,76 @@ fn set_once(
     Err(ProviderError::transport(format!(
         "{provider_label} provider emitted conflicting tool call {label}"
     )))
+}
+
+/// Accumulates streamed `reasoning_details` deltas. OpenRouter splits one
+/// logical block across deltas that share an `index`: string payload fields
+/// (`text`, `summary`, `data`) concatenate, every other field is
+/// last-write-wins. Blocks without an index are self-contained and append.
+fn merge_reasoning_details(accumulated: &mut Vec<Value>, deltas: &[Value]) {
+    for delta in deltas {
+        let Some(delta) = delta.as_object() else {
+            continue;
+        };
+        let existing = delta
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| {
+                accumulated
+                    .iter_mut()
+                    .find(|block| block.get("index").and_then(Value::as_u64) == Some(index))
+            });
+        match existing.and_then(Value::as_object_mut) {
+            Some(block) => merge_reasoning_detail(block, delta),
+            None => accumulated.push(Value::Object(delta.clone())),
+        }
+    }
+}
+
+fn merge_reasoning_detail(
+    block: &mut serde_json::Map<String, Value>,
+    delta: &serde_json::Map<String, Value>,
+) {
+    for (key, value) in delta {
+        if value.is_null() {
+            continue;
+        }
+        match (block.get_mut(key), value.as_str()) {
+            (Some(Value::String(current)), Some(addition))
+                if matches!(key.as_str(), "text" | "summary" | "data") =>
+            {
+                current.push_str(addition);
+            }
+            _ => {
+                block.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Wraps the completed `reasoning_details` array as a reasoning chunk at
+/// provider fidelity: the verbatim JSON rides in the opaque artifact for
+/// replay, and the fidelity label records the best readable form the blocks
+/// contain (`raw` text, `summary`, or fully `opaque` encrypted data). The
+/// chunk carries no display content — readable text already streamed as
+/// plaintext reasoning deltas.
+fn reasoning_details_chunk(details: &[Value]) -> ReasoningChunk {
+    let artifact = Value::Array(details.to_vec()).to_string();
+    let has_field = |field: &str| {
+        details.iter().any(|block| {
+            block
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+    };
+    if has_field("text") {
+        ReasoningChunk::raw_artifact(String::new(), artifact)
+    } else if has_field("summary") {
+        ReasoningChunk::summary_artifact(artifact)
+    } else {
+        ReasoningChunk::opaque_artifact(artifact)
+    }
 }
 
 fn reasoning_delta(delta: Option<&Value>, enabled: bool) -> Option<&str> {

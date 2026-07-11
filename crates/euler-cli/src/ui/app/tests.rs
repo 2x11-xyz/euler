@@ -1414,7 +1414,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("7 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
 
     assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::Render);
@@ -1434,7 +1434,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
         CoreEffect::ReplayHistoryWithScrollbackPurge
     );
     let refolded = drain_finalized_visual_text(&mut core, 80);
-    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("7 more lines"), "refolded: {refolded:?}");
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
 }
 
@@ -1493,11 +1493,11 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw folded");
     let folded = terminal.backend().screen_contents();
-    assert!(folded.contains("44 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("43 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
     let folded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
-        folded_scrollback.contains("44 more lines"),
+        folded_scrollback.contains("43 more lines"),
         "folded summary should commit to native scrollback: {folded_scrollback:?}"
     );
 
@@ -1549,11 +1549,11 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw refolded");
     let refolded = terminal.backend().screen_contents();
-    assert!(refolded.contains("44 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("43 more lines"), "refolded: {refolded:?}");
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
     let refolded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
-        refolded_scrollback.contains("44 more lines"),
+        refolded_scrollback.contains("43 more lines"),
         "refold replay should commit folded summary: {refolded_scrollback:?}"
     );
 }
@@ -1567,6 +1567,7 @@ fn history_replay_clear_uses_theme_background() {
             Color::Rgb(60, 56, 54),
             Color::Rgb(251, 241, 199),
             Color::Rgb(60, 56, 54),
+            Color::Rgb(142, 192, 124),
         )
         .expect("theme colors");
     if std::env::var_os("NO_COLOR").is_some() {
@@ -1760,8 +1761,8 @@ fn ctrl_o_expands_all_foldable_artifacts_globally() {
     core.push_finalized_visual_item(shell_artifact_with_lines(14));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
-    assert!(folded.contains("10 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("7 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("9 more lines"), "folded: {folded:?}");
     assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
     assert!(
         !folded.contains("unique reasoning marker"),
@@ -1793,8 +1794,8 @@ fn ctrl_o_expands_all_foldable_artifacts_globally() {
         CoreEffect::ReplayHistoryWithScrollbackPurge
     );
     let refolded = drain_finalized_visual_text(&mut core, 80);
-    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
-    assert!(refolded.contains("10 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("7 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("9 more lines"), "refolded: {refolded:?}");
     assert!(
         !refolded.contains("unique reasoning marker"),
         "refolded: {refolded:?}"
@@ -1840,7 +1841,7 @@ fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     assert_eq!(modal_core.handle_input(ctrl_o()), CoreEffect::None);
     let modal_text = drain_finalized_visual_text(&mut modal_core, 80);
     assert!(
-        modal_text.contains("8 more lines"),
+        modal_text.contains("7 more lines"),
         "modal_text: {modal_text:?}"
     );
     assert!(matches!(modal_core.modal, Some(Modal::Permission(_))));
@@ -1852,7 +1853,7 @@ fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     assert_eq!(palette_core.handle_input(ctrl_o()), CoreEffect::None);
     let palette_text = drain_finalized_visual_text(&mut palette_core, 80);
     assert!(
-        palette_text.contains("8 more lines"),
+        palette_text.contains("7 more lines"),
         "palette_text: {palette_text:?}"
     );
     let BottomOwner::Palette(palette) = palette_core.bottom.owner() else {
@@ -2079,10 +2080,19 @@ fn name_session_reports_metadata_refresh_failure_after_durable_rename() {
         CoreEffect::Render
     );
 
-    let notice = core.notice.as_deref().expect("notice");
-    assert!(notice.starts_with("session named honest name; metadata refresh failed:"));
+    // Routed through the shared spine notice (review v4 dogfood), not the
+    // transient `self.notice` banner: same treatment as `theme set to …`,
+    // anchored on the spine rather than rendering flush at column 0.
+    let notice = drain_finalized_visual_text(&mut core, 80);
+    // Pin the `•` spine anchor (review v2 §14.4): the bug rendered this
+    // notice flush at column 0 with no bullet, unlike every other setting
+    // confirmation.
+    assert!(
+        notice.contains("\u{2022} session named honest name; metadata refresh failed:"),
+        "notice: {notice:?}"
+    );
     assert!(notice.contains("session not found"));
-    assert!(!notice.starts_with("session naming failed:"));
+    assert!(!notice.contains("session naming failed:"));
     let events = read_resume_prefix(record.events_path()).expect("events");
     let rename = events
         .iter()
@@ -2118,7 +2128,14 @@ fn name_session_refreshes_metadata_after_durable_rename() {
         CoreEffect::Render
     );
 
-    assert_eq!(core.notice.as_deref(), Some("session named clean name"));
+    // Routed through the shared spine notice (review v4 dogfood): same
+    // treatment as `theme set to …`, not the transient `self.notice` banner.
+    // Pin the `•` spine anchor — the bug rendered this flush at column 0.
+    let notice = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        notice.contains("\u{2022} session named clean name"),
+        "notice: {notice:?}"
+    );
     let refreshed = store
         .find_session(record.id())
         .expect("find session")
@@ -2854,9 +2871,8 @@ fn slash_palette_backspace_corrects_input_before_confirm() {
 
     core.handle_input(key(KeyCode::Enter));
 
-    assert!(
-        drain_finalized_visual_text(&mut core, 80).contains("ui: reasoning effort set to large")
-    );
+    // #53: setting confirmations are neutral notices, not "ui:" errors.
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("reasoning effort set to large"));
 }
 
 #[test]
@@ -2883,7 +2899,9 @@ fn slash_palette_trailing_noise_correction_submits_visible_effort_argument() {
     core.handle_input(key(KeyCode::Enter));
 
     let pending = drain_finalized_visual_text(&mut core, 80);
-    assert!(pending.contains("ui: reasoning effort set to large"));
+    // #53: setting confirmations are neutral notices, not "ui:" errors.
+    assert!(pending.contains("reasoning effort set to large"));
+    assert!(!pending.contains("ui: reasoning effort set to large"));
     assert!(!pending.contains("unknown command: /effort//"));
 }
 
@@ -2901,7 +2919,9 @@ fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
         panic!("model picker should own surface");
     };
     let rendered = picker.render_lines(80).join("\n");
-    assert!(rendered.contains("anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
+    // claude-fable-5 sorts first in the (now 14-entry) anthropic list, so it
+    // is the anthropic model guaranteed inside the picker's render window.
+    assert!(rendered.contains("anthropic::claude-fable-5 — 1M ctx, reasoning"));
     assert_eq!(picker.selected_index(), 0);
 
     core.handle_input(key(KeyCode::Down));
@@ -2922,7 +2942,7 @@ fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
         panic!("model picker should own surface");
     };
     let rendered = picker.render_lines(80).join("\n");
-    assert!(rendered.contains("chatgpt::gpt-5.5 — 1.05M ctx, reasoning ✓"));
+    assert!(rendered.contains("chatgpt::gpt-5.5 — 272K ctx, reasoning ✓"));
 }
 
 #[test]
@@ -2940,6 +2960,58 @@ fn model_switch_error_renders_as_ui_notice() {
     let rendered = drain_finalized_visual_text(&mut core, 200);
     assert!(rendered.contains("ui: model switch rejected:"));
     assert!(rendered.contains("missing"));
+}
+
+// Review v3 §R5(a): the recap and its `── Worked for Ns ──` divider are one
+// unit — a turn too short to earn a divider must not leave an orphaned
+// recap line either (observed live after error-only turns that finished
+// under MIN_WORKED_DURATION).
+#[test]
+fn turn_recap_never_renders_without_its_worked_divider() {
+    let mut core = core();
+    core.transcript.push_event(event(
+        EventKind::FILE_DIFF,
+        object([("path", "src/lib.rs".into()), ("diff", "+line\n".into())]),
+    ));
+
+    core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(1)));
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        !text.contains("Worked for"),
+        "elapsed under MIN_WORKED_DURATION should suppress the divider: {text:?}"
+    );
+    // The recap would otherwise report the one changed file; its absence
+    // (distinct from the persistent footer's own "ctx" token) confirms no
+    // orphaned recap line rendered.
+    assert!(
+        !text.contains("1 file"),
+        "recap must not render without its divider: {text:?}"
+    );
+}
+
+// Review v3 §R5(b): empty-turn suppression. A turn that changed 0 files,
+// moved context by less than ~1%, and ran no tests renders the divider
+// (there was elapsed time worth naming) but not the recap line itself.
+#[test]
+fn empty_turn_suppresses_recap_line_but_keeps_the_divider() {
+    let mut core = core();
+    core.token_usage.context_window_tokens = Some(100_000);
+    core.turn_start_input_tokens = core.token_usage.input_tokens;
+
+    core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(10)));
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        text.contains("Worked for"),
+        "an elapsed turn still earns its divider: {text:?}"
+    );
+    // "0 files" is the recap's own distinctive token (the footer's "ctx N%"
+    // token alone isn't distinctive enough — it renders every turn).
+    assert!(
+        !text.contains("0 files"),
+        "0 files, negligible ctx move, and no tests must suppress the recap line: {text:?}"
+    );
 }
 
 #[test]
@@ -3117,6 +3189,67 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
         object([("kind", "text".into()), ("delta", "answer".into())]),
     )));
     assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+}
+
+/// #62: the verb must not go stale once its tool call terminates — success,
+/// failure, *or* auto-denial via the turn denial cache all resolve through
+/// the same `tool.result` event, so all three must clear the verb back to
+/// the live phase instead of parroting a tool that already finished.
+#[test]
+fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-bash".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "ls -la"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+
+    // Auto-denied via the turn denial cache: `ok: false`, no distinct
+    // tool-call event precedes it — same shape as a normal failure result.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-bash".into()),
+            ("name", "run_shell".into()),
+            ("ok", false.into()),
+            ("error", "permission denied".into()),
+        ]),
+    )));
+    assert_eq!(
+        core.current_phase_verb, None,
+        "verb must fall back to the live phase once the tool call resolves, denied or not"
+    );
+
+    // A second bash attempt that succeeds also clears on its own result.
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-bash-2".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "ls -la"})),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-bash-2".into()),
+            ("name", "run_shell".into()),
+            ("ok", true.into()),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb, None);
 }
 
 /// #47(a): while reasoning streams, the dim-italic reasoning text itself
@@ -3792,13 +3925,11 @@ fn rejecting_patch_permission_does_not_apply_patch_and_turn_continues() {
         .iter()
         .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
         .expect("tool result");
-    assert_eq!(
-        result
-            .payload
-            .get("error")
-            .and_then(serde_json::Value::as_str),
-        Some("permission denied")
-    );
+    assert!(result
+        .payload
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|error| error.starts_with("permission denied")));
     assert!(core
         .transcript
         .items()
@@ -4218,6 +4349,32 @@ fn wait_for_idle(core: &mut AppCore) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("turn did not finish");
+}
+
+#[test]
+fn code_swarm_picker_choices_survive_rebuild_while_turn_in_flight() {
+    let mut core = core();
+    let idle_choices = core.bottom.context().code_swarm_model_choices.clone();
+    assert!(
+        !idle_choices.is_empty(),
+        "idle session with an authenticated provider offers reviewer targets"
+    );
+
+    // handle_submit rebuilds the bottom surface AFTER checking the session
+    // out onto the worker thread; simulate that state and rebuild again.
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.rebuild_bottom_surface();
+
+    assert_eq!(
+        core.bottom.context().code_swarm_model_choices,
+        idle_choices,
+        "the reviewer-model picker must never shrink because a turn is in flight"
+    );
 }
 
 mod code_swarm_tests {

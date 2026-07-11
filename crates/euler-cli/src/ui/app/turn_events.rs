@@ -15,6 +15,10 @@ impl AppCore {
         self.queue_notification(NotifyEvent::Stall);
     }
 
+    /// Review v3 §R5(b): empty-turn suppression. When a turn changed 0
+    /// files AND context moved less than ~1% AND no tests ran, the divider
+    /// still renders (via the caller) but the recap line itself is skipped
+    /// — there's nothing worth summarizing.
     fn push_turn_recap(&mut self) {
         let ctx = super::turn_recap::ctx_percent(
             self.token_usage.input_tokens,
@@ -25,6 +29,18 @@ impl AppCore {
             self.turn_event_start,
             ctx,
         );
+        let ctx_delta_tokens = self
+            .token_usage
+            .input_tokens
+            .abs_diff(self.turn_start_input_tokens);
+        let ctx_moved_negligible = super::turn_recap::ctx_percent(
+            ctx_delta_tokens,
+            self.token_usage.context_window_tokens,
+        )
+        .is_some_and(|moved_pct| moved_pct < 1);
+        if recap.file_count == 0 && recap.test_status.is_none() && ctx_moved_negligible {
+            return;
+        }
         self.push_finalized_visual_item(TranscriptItem::TurnRecap {
             summary: recap.summary_line(),
             files: recap.files_line(),
@@ -112,12 +128,15 @@ impl AppCore {
         update_token_usage(&mut self.token_usage, event, context_window_tokens);
     }
 
-    /// Working HUD phase verb (issue #27): thinking / exploring / reading X /
-    /// writing X / running bash / running tests, falling back to "working"
-    /// only when nothing more specific applies. Only reasoning and tool-call
-    /// events carry a new phase — other event kinds (streamed text deltas,
-    /// tool results) leave the verb in place so it swaps only when the phase
-    /// actually changes, not on every event.
+    /// Working HUD phase verb (issue #27, #62): thinking / exploring /
+    /// reading X / writing X / running bash / running tests, falling back to
+    /// "working" only when nothing more specific applies. Reasoning and
+    /// tool-call events set a new phase; a tool result — success, failure,
+    /// *or* auto-denial via the turn denial cache (#62) — clears it back to
+    /// `None` so the HUD falls back to the live phase (working, or whatever
+    /// the next reasoning/tool-call event sets) instead of parroting the verb
+    /// of a tool call that has already finished. Streamed text deltas leave
+    /// the verb alone so it doesn't flicker mid-phase.
     fn update_phase_verb(&mut self, event: &EventEnvelope) {
         match event.kind.as_str() {
             EventKind::MODEL_REASONING => {
@@ -125,6 +144,9 @@ impl AppCore {
             }
             EventKind::TOOL_CALL => {
                 self.current_phase_verb = Some(phase_verb_for_tool_call(event));
+            }
+            EventKind::TOOL_RESULT => {
+                self.current_phase_verb = None;
             }
             _ => {}
         }
@@ -202,6 +224,10 @@ impl AppCore {
             }
         }
         self.state = AppState::Idle { session };
+        // The session is back on this thread: refresh the last-known
+        // authenticated-provider snapshot used by bottom-surface rebuilds
+        // that happen while a turn is in flight.
+        self.refresh_authenticated_providers();
         self.in_flight_label = None;
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
@@ -239,11 +265,7 @@ impl AppCore {
                     request.id, request.command
                 ));
                 if request.id == "code-swarm" && request.command == "review" {
-                    let reviewers = output["reviewer_count"].as_u64().unwrap_or(0);
-                    let path = output["relative_path"].as_str().unwrap_or("(unknown path)");
-                    let _ = self.summary_item(format!(
-                        "✓ code-swarm review complete · {reviewers} reviewers · artifact {path}"
-                    ));
+                    let _ = self.summary_item(code_swarm_summary_line(&output));
                 }
             }
             ExtensionOutcome::Failed(message) => {
@@ -355,12 +377,17 @@ impl AppCore {
                 true
             }
         };
-        if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed >= MIN_WORKED_DURATION) {
+        let worked_divider_shown = elapsed.is_some_and(|elapsed| elapsed >= MIN_WORKED_DURATION);
+        if worked_divider_shown {
             self.push_finalized_visual_item(TranscriptItem::WorkedDuration(format_live_elapsed(
-                elapsed,
+                elapsed.expect("worked_divider_shown implies elapsed is Some"),
             )));
         }
-        if emit_recap {
+        // Review v3 §R5(a): the recap and its `── Worked for Ns ──` divider
+        // are one unit — a recap must never render without the divider (a
+        // turn too short to get a divider has nothing worth recapping
+        // either).
+        if emit_recap && worked_divider_shown {
             self.push_turn_recap();
         }
         match outcome {
@@ -441,6 +468,30 @@ fn is_test_runner_command(command: &str) -> bool {
             .any(|needle| lower.contains(needle))
 }
 
+/// #58: the completion line must read per-reviewer `ok` flags from the
+/// output JSON, not just `reviewer_count` — a line reading "complete" while
+/// every reviewer failed is a dishonest summary. `reviewers[].ok` is what the
+/// extension actually records per spawn outcome; `reviewer_count` alone
+/// cannot distinguish "3 reviewers, 3 ok" from "3 reviewers, 0 ok".
+fn code_swarm_summary_line(output: &serde_json::Value) -> String {
+    let path = output["relative_path"].as_str().unwrap_or("(unknown path)");
+    let reviewers = output["reviewers"].as_array();
+    let total = reviewers.map_or(0, Vec::len);
+    let ok_count = reviewers
+        .map(|reviewers| {
+            reviewers
+                .iter()
+                .filter(|reviewer| reviewer["ok"].as_bool().unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0);
+    if total > 0 && ok_count == total {
+        format!("✓ code-swarm review complete · {total} reviewers · artifact {path}")
+    } else {
+        format!("✗ code-swarm review · {ok_count}/{total} reviewers succeeded · artifact {path}")
+    }
+}
+
 /// #47: bounded tail length for the live streaming-reasoning preview under
 /// the thinking HUD line — enough for a couple of wrapped lines at typical
 /// composer widths, never the full reasoning transcript.
@@ -459,4 +510,68 @@ fn truncate_reasoning_tail_left(tail: &mut String, max_chars: usize) {
         .nth(overflow)
         .map_or(tail.len(), |(index, _)| index);
     tail.drain(..byte_offset);
+}
+
+#[cfg(test)]
+mod code_swarm_summary_tests {
+    use super::code_swarm_summary_line;
+    use serde_json::json;
+
+    #[test]
+    fn all_reviewers_ok_reports_success() {
+        let output = json!({
+            "relative_path": "artifacts/review.json",
+            "reviewer_count": 3,
+            "reviewers": [
+                {"ok": true}, {"ok": true}, {"ok": true},
+            ],
+        });
+
+        assert_eq!(
+            code_swarm_summary_line(&output),
+            "✓ code-swarm review complete · 3 reviewers · artifact artifacts/review.json"
+        );
+    }
+
+    #[test]
+    fn any_failure_reports_honest_partial_count() {
+        let output = json!({
+            "relative_path": "artifacts/review.json",
+            "reviewer_count": 3,
+            "reviewers": [
+                {"ok": true}, {"ok": false}, {"ok": false},
+            ],
+        });
+
+        assert_eq!(
+            code_swarm_summary_line(&output),
+            "✗ code-swarm review · 1/3 reviewers succeeded · artifact artifacts/review.json"
+        );
+    }
+
+    #[test]
+    fn all_failed_reports_zero_of_total_not_dishonest_complete() {
+        let output = json!({
+            "relative_path": "artifacts/review.json",
+            "reviewer_count": 3,
+            "reviewers": [
+                {"ok": false}, {"ok": false}, {"ok": false},
+            ],
+        });
+
+        assert_eq!(
+            code_swarm_summary_line(&output),
+            "✗ code-swarm review · 0/3 reviewers succeeded · artifact artifacts/review.json"
+        );
+    }
+
+    #[test]
+    fn missing_reviewers_array_reports_zero_of_zero() {
+        let output = json!({"relative_path": "artifacts/review.json"});
+
+        assert_eq!(
+            code_swarm_summary_line(&output),
+            "✗ code-swarm review · 0/0 reviewers succeeded · artifact artifacts/review.json"
+        );
+    }
 }

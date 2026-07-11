@@ -28,7 +28,6 @@ mod composer_tests {
             [ComposerLine::Draft {
                 prompt: true,
                 text,
-                ghost: false,
                 ..
             }] if text.is_empty()
         ));

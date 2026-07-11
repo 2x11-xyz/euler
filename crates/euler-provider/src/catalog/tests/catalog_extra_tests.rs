@@ -20,8 +20,16 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
         .models()
         .find(|model| model.id() == "gpt-5.5")
         .expect("gpt-5.5");
-    assert_eq!(gpt55.context_window_tokens(), Some(1_050_000));
+    assert_eq!(gpt55.context_window_tokens(), Some(272_000));
     assert!(openai.models().any(|model| model.id() == "gpt-5.3-codex"));
+
+    // The ChatGPT-subscription backend exposes a different model set than
+    // the platform API (pi reference: openai-codex.models.ts vs
+    // openai.models.ts) — the two providers must not share one list.
+    let chatgpt = catalog.provider("chatgpt").expect("chatgpt");
+    assert!(chatgpt.models().any(|model| model.id() == "gpt-5.6-luna"));
+    assert!(chatgpt.models().all(|model| model.id() != "gpt-4.1"));
+    assert!(openai.models().any(|model| model.id() == "gpt-4.1"));
 
     let openrouter = catalog.provider("openrouter").expect("openrouter");
     assert!(openrouter
@@ -33,6 +41,12 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
     assert!(openrouter
         .models()
         .any(|model| model.id() == DEFAULT_OPENROUTER_MODEL));
+    // The router pseudo-model is only routable as `openrouter/auto`; a bare
+    // `auto` id was a PI-import artifact that 404s against the API.
+    assert!(openrouter
+        .models()
+        .any(|model| model.id() == "openrouter/auto"));
+    assert!(openrouter.models().all(|model| model.id() != "auto"));
 }
 
 #[test]

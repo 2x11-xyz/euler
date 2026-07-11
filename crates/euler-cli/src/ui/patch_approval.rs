@@ -250,6 +250,14 @@ pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String>
 }
 
 pub(crate) fn derive_shell_prefix(command: &str) -> Option<String> {
+    // Scoped shell grants never cover compound commands (control operators,
+    // substitution, redirection — the gate matches what `sh -c` actually
+    // executes). Offering a token scope for a compound command is dishonest:
+    // the grant could not even cover a rerun of this command. Compound
+    // commands get the unscoped (whole-capability) options instead.
+    if !shell_command_is_simple(command) {
+        return None;
+    }
     command_first_token(command).map(str::to_owned)
 }
 
@@ -307,6 +315,10 @@ pub(crate) fn approval_option_lines(
         Some(prefix) => (
             format!("a  Allow {prefix} * for this session"),
             format!("p  Allow {prefix} * in this project"),
+        ),
+        None if capability == "shell-exec" => (
+            "a  Allow all shell commands for this session".to_owned(),
+            "p  Allow all shell commands in this project".to_owned(),
         ),
         None => (
             format!("a  Allow {capability} for this session"),

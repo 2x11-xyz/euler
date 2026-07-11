@@ -433,7 +433,7 @@ fn scrollback_preserves_banner_user_tool_and_final_after_many_insertions() {
             "e^(iπ) + 1 = 0",
             "▌ inspect",
             "explore",
-            "Read AGENTS.md",
+            "read AGENTS.md",
             "final prose",
             "filler 11",
         ],
@@ -890,7 +890,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let before_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &before_final,
-        &["explore", "Read Cargo.toml", "bash $ cargo test"],
+        &["explore", "read Cargo.toml", "bash $ cargo test"],
     );
     assert!(!before_final.iter().any(|row| row.contains("final answer")));
 

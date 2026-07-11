@@ -12,13 +12,14 @@ use euler_provider::catalog::{MergedModelCatalog, BUILTIN_PROVIDERS};
 #[cfg(test)]
 use euler_provider::catalog::{
     DEFAULT_ANTHROPIC_MODEL, DEFAULT_CHATGPT_MODEL, DEFAULT_FIXTURE_MODEL, DEFAULT_OPENAI_MODEL,
-    DEFAULT_OPENROUTER_MODEL,
+    DEFAULT_OPENROUTER_MODEL, DEFAULT_XAI_MODEL,
 };
 use euler_provider::chatgpt::ChatGptProvider;
 use euler_provider::custom_provider::CustomOpenAiProvider;
 use euler_provider::openai::OpenAiProvider;
 use euler_provider::openrouter::OpenRouterProvider;
 use euler_provider::provider_config::ProviderConfigRegistry;
+use euler_provider::xai::XaiProvider;
 use euler_provider::ReasoningEffort;
 use euler_provider::{EchoProvider, ModelProvider, ProviderSet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -185,6 +186,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let providers = ProviderSet::single_named(run.provider_id.clone(), run.provider);
     let mut session = Session::new_with_providers(live_session.config, providers, CliDecider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
+    crate::session_lifecycle::seed_secret_redaction(&mut session, run.auth_file.as_deref());
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
@@ -220,6 +222,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         load_notifications_preference(preference_path.as_deref()).unwrap_or(true);
     let mut session = Session::new_with_providers(live_session.config, providers, decider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
+    crate::session_lifecycle::seed_secret_redaction(&mut session, run.auth_file.as_deref());
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
@@ -290,6 +293,7 @@ fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
         SubagentDecider::new(exec.auto_approve),
     )
     .with_provenance(ProvenanceWriter::new(log_path)?);
+    crate::session_lifecycle::seed_secret_redaction(&mut session, exec.run.auth_file.as_deref());
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
@@ -478,6 +482,7 @@ where
 
     let outcome = resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
     let mut session = outcome.session;
+    crate::session_lifecycle::seed_secret_redaction(&mut session, run.auth_file.as_deref());
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
@@ -1892,6 +1897,10 @@ pub(crate) fn provider_for_id(
                 Box::new(OpenRouterProvider::with_api_key_auth(api_key_auth(
                     auth_file,
                 )))
+            }
+            "xai" => {
+                reject_provider_options("xai", options)?;
+                Box::new(XaiProvider::with_api_key_auth(api_key_auth(auth_file)))
             }
             other => return Err(anyhow!("provider `{other}` is missing CLI factory wiring")),
         });
