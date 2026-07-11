@@ -1912,6 +1912,49 @@ fn collapsed_tool_run_result_line_prefers_match_count_over_first_line() {
 }
 
 #[test]
+fn collapsed_tool_run_result_line_dedupes_against_sanitized_row() {
+    let theme = Theme::default();
+    // The informative line carries a raw tab; `most_informative_line`
+    // returns it verbatim from the raw output, while the `rows` list it must
+    // be deduped against has already been sanitized (tabs expanded to four
+    // spaces). A raw-vs-sanitized comparison would fail to recognize them as
+    // the same line, leaving the line duplicated: once as the `└ ` result
+    // line, once as a plain preview row.
+    let output = "warmup\nerror: bad\tvalue".to_owned();
+    let item = [TranscriptItem::ToolRun {
+        command: "run".to_owned(),
+        ok: false,
+        error: String::new(),
+        output,
+        exit_code: Some(1),
+        grant_source: None,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&item, &theme, 96));
+    let joined = texts.join("\n");
+
+    assert_eq!(
+        texts.iter().filter(|line| line.contains('└')).count(),
+        1,
+        "texts: {texts:?}"
+    );
+    assert!(
+        joined.contains("└ error: bad    value"),
+        "result line should be sanitized (tab expanded, escape stripped): {texts:?}"
+    );
+    // The sanitized line must not additionally show up as a separate,
+    // undeduped preview row.
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|line| line.contains("error: bad"))
+            .count(),
+        1,
+        "informative line must not be duplicated: {texts:?}"
+    );
+}
+
+#[test]
 fn collapsed_tool_run_strips_leading_literal_exit_code_row() {
     let theme = Theme::default();
     let item = [TranscriptItem::ToolRun {

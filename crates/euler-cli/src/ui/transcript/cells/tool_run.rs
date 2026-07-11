@@ -284,6 +284,16 @@ fn collapsed_tool_run_rows(detail: &str, ok: bool, limit: usize) -> ArtifactOutp
         .map(str::to_owned)
         .or_else(|| rows.iter().find(|row| !row.trim().is_empty()).cloned())
         .unwrap_or_default();
+    // `most_informative_line`/`last_non_empty_line` scan the raw `detail`
+    // text, but `rows` (from `informative_output_rows`/`artifact_output_rows`
+    // -> `normalized_output_rows`) is already sanitized (ANSI escapes, tabs,
+    // control/invisible-format chars stripped). Comparing the raw candidate
+    // against sanitized rows directly can fail to match even when they are
+    // "the same line", so the row would never get deduped — leaving it
+    // duplicated between the `└ ` result line and the plain preview rows
+    // below it. Sanitize the candidate through the same function before
+    // comparing (and before display) so both sides are apples-to-apples.
+    let result_line = sanitize_metadata_text(&result_line);
     if let Some(pos) = rows.iter().position(|row| *row == result_line) {
         rows.remove(pos);
     }
