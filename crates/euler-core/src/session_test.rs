@@ -750,6 +750,66 @@ fn live_extension_spawn_agent_enforces_per_command_quota() {
 }
 
 #[test]
+fn live_extension_spawn_agents_batch_records_pairs_and_quota_is_per_execution() {
+    // Two batches within one command share the quota (8 + 8 = 16 is fine),
+    // and a second command execution starts with a fresh quota — the
+    // checkpoint-loop workflow calls the review gate repeatedly.
+    use crate::session::MAX_SPAWNS_PER_COMMAND;
+    let responses = (0..MAX_SPAWNS_PER_COMMAND * 2)
+        .map(|_| FixtureResponse::Assistant("batch review".to_owned()))
+        .collect::<Vec<_>>();
+    let (_temp, log, mut session) = spawn_session(responses);
+    let extension = test_extension(
+        "spawn-ext",
+        vec![Capability::AgentSpawn],
+        TestCommandBehavior::SpawnAgentsBatch {
+            batches: vec![8, 8],
+        },
+    );
+
+    let first = session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::AgentSpawn])
+        .expect("first batched execution");
+    let second = session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::AgentSpawn])
+        .expect("second execution gets a fresh quota");
+
+    assert_eq!(first["count"], json!(16));
+    assert_eq!(first["all_ok"], json!(true));
+    assert_eq!(second["count"], json!(16));
+    let durable = read_provenance(&log).expect("durable events");
+    assert_eq!(
+        agent_pair_events(&durable).len(),
+        MAX_SPAWNS_PER_COMMAND * 2 * 2,
+        "both executions record full spawn/result pairs"
+    );
+}
+
+#[test]
+fn live_extension_spawn_agents_batch_over_quota_is_rejected_before_any_event() {
+    use crate::session::MAX_SPAWNS_PER_COMMAND;
+    let (_temp, log, mut session) = spawn_session(Vec::new());
+    let extension = test_extension(
+        "spawn-ext",
+        vec![Capability::AgentSpawn],
+        TestCommandBehavior::SpawnAgentsBatch {
+            batches: vec![MAX_SPAWNS_PER_COMMAND + 1],
+        },
+    );
+
+    let error = session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::AgentSpawn])
+        .expect_err("over-quota batch fails the command");
+
+    assert!(matches!(error, ExtensionExecutionError::CommandFailed));
+    let durable = read_provenance(&log).expect("durable events");
+    assert!(
+        agent_pair_events(&durable).is_empty(),
+        "an over-quota batch is rejected before any agent event"
+    );
+}
+
+#[test]
 fn live_extension_execute_command_helper_allows_empty_success_queue() {
     let (_temp, log, mut session) = live_session();
     let extension = test_extension(
@@ -1579,6 +1639,10 @@ enum TestCommandBehavior {
         artifact_first: bool,
         spawn_count: usize,
     },
+    /// One `spawn_agents` batch call per entry, sized by the entry.
+    SpawnAgentsBatch {
+        batches: Vec<usize>,
+    },
     Slot {
         slot: &'static str,
         content: &'static str,
@@ -1655,6 +1719,7 @@ impl ExtensionCommand for TestCommand {
                 }
                 capabilities
             }
+            TestCommandBehavior::SpawnAgentsBatch { .. } => vec![Capability::AgentSpawn],
             TestCommandBehavior::Slot { .. } => vec![Capability::ContextSlot],
             TestCommandBehavior::Noop(_) => Vec::new(),
         };
@@ -1716,6 +1781,29 @@ impl ExtensionCommand for TestCommand {
                     "child_agent_id": outcome.child_agent_id,
                     "spawn_event_id": outcome.spawn_event_id,
                     "result_event_id": outcome.result_event_id,
+                }))
+            }
+            TestCommandBehavior::SpawnAgentsBatch { batches } => {
+                let mut outcomes = Vec::new();
+                for batch in batches {
+                    let tasks = (0..*batch)
+                        .map(|_| SpawnAgentTask {
+                            task: "review the diff".to_owned(),
+                            persona: "reviewer".to_owned(),
+                            provider: String::new(),
+                            model: String::new(),
+                            system_prompt: String::new(),
+                            capabilities: Vec::new(),
+                            max_turns: Some(1),
+                            max_tool_calls: Some(0),
+                            max_tokens: Some(2048),
+                        })
+                        .collect();
+                    outcomes.extend(host.spawn_agents(tasks)?);
+                }
+                Ok(json!({
+                    "count": outcomes.len(),
+                    "all_ok": outcomes.iter().all(|outcome| outcome.ok),
                 }))
             }
             TestCommandBehavior::RecordAgent => {

@@ -489,6 +489,11 @@ struct PendingRegistrar(Vec<(String, Box<dyn ExtensionCommand>)>);
 /// the spawner owns running the child and recording provenance.
 pub trait ExtensionSpawner {
     fn spawn_agent(&self, task: SpawnAgentTask) -> Result<AgentOutcome, ExtensionError>;
+    /// Batch sibling of `spawn_agent` (multi-agent contract v0.2): run the
+    /// tasks concurrently, return outcomes in task order, and count the
+    /// whole batch against the per-command spawn quota up front.
+    fn spawn_agents(&self, tasks: Vec<SpawnAgentTask>)
+        -> Result<Vec<AgentOutcome>, ExtensionError>;
 }
 
 struct CommandHost<'a> {
@@ -522,6 +527,29 @@ impl HostApi for CommandHost<'_> {
             ExtensionError::Message("agent spawn unavailable on this host".to_owned())
         })?;
         spawner.spawn_agent(task)
+    }
+
+    fn spawn_agents(
+        &self,
+        tasks: Vec<SpawnAgentTask>,
+    ) -> Result<Vec<AgentOutcome>, ExtensionError> {
+        let _guard = ExtensionPanicSuppressionGuard::suspend_for_host_api();
+        self.require_capability(Capability::AgentSpawn)?;
+        // Same exact-flat attenuation as spawn_agent, applied to the whole
+        // batch before any event is emitted.
+        for task in &tasks {
+            if let Some(&capability) = task
+                .capabilities
+                .iter()
+                .find(|capability| !self.capabilities.contains(capability))
+            {
+                return Err(ExtensionError::CapabilityDenied { capability });
+            }
+        }
+        let spawner = self.spawner.ok_or_else(|| {
+            ExtensionError::Message("agent spawn unavailable on this host".to_owned())
+        })?;
+        spawner.spawn_agents(tasks)
     }
 
     fn query_provenance(

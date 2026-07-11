@@ -53,6 +53,7 @@ mod companion;
 mod extension_bridge;
 pub use extension_bridge::MAX_SPAWNS_PER_COMMAND;
 mod observer;
+mod parallel_spawn;
 mod round_loop;
 pub use companion::AgentResultSummary;
 pub use observer::RoundObserverConfig;
