@@ -96,14 +96,15 @@ impl<D: PermissionDecider> Session<D> {
         ]);
         match outcome {
             Ok(output) => {
-                // Reviewer findings quote arbitrary canvas content: they ride
-                // the same tool-result redaction chokepoint as every other
-                // tool (secrets contract) — a secret a reviewer quotes must
-                // not reach the ledger or the next model call.
-                payload.insert("output".to_owned(), self.redactor.redact(&output).into());
+                // Reviewer findings are the reviewer models' own cognition;
+                // euler provenance keeps cognition faithful and does NOT
+                // redact it (owner decision, 2026-07-11). A credential a
+                // reviewer quotes is surfaced by the credential-exposure
+                // warning and removed on demand by scrub, never silently.
+                payload.insert("output".to_owned(), output.into());
             }
             Err(ReviewToolFailure::Honest(error)) => {
-                payload.insert("error".to_owned(), self.redactor.redact(&error).into());
+                payload.insert("error".to_owned(), error.into());
             }
             Err(ReviewToolFailure::Session(error)) => return Err(error),
         }

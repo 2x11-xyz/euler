@@ -2225,11 +2225,12 @@ impl<D: PermissionDecider> Session<D> {
                 (false, rationale.clone(), verdict.as_ref())
             }
         };
-        // The rationale is model-generated text prompted to hunt secret
-        // exfiltration — it may quote the offending token. Redact once here:
-        // it flows into both the permission.decision payload and the denied
-        // tool result teaching text.
-        let rationale = self.redactor.redact(&rationale);
+        // The rationale is the guardian model's own reasoning about the
+        // command — model cognition. Euler provenance captures cognition
+        // faithfully; it is NOT redacted (owner decision, 2026-07-11). A
+        // credential the guardian quotes is surfaced to the user via the
+        // credential-exposure warning and removed on demand by the scrub
+        // operation, never by silently corrupting the record.
         self.emit_with_parent(
             EventKind::PERMISSION_DECISION,
             guardian::guardian_decision_payload(capability, allowed, &rationale, verdict),
