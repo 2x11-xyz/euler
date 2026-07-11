@@ -157,6 +157,39 @@ derive from a simple shell command AND the session must hold a loaded user
 store. Unscoped or compound asks never show the option, and a session
 without a resolvable user grant dir hides it entirely.
 
+### Static command safety
+
+Core performs static analysis of `shell-exec` command lines
+(`euler-core/src/command_safety.rs`). Execution is `sh -c <command>`, so the
+analysis reasons about the whole line:
+
+- **Parsing.** A command line decomposes into plain segments across `&&`,
+  `||`, `;`, `|`, and newlines. The tokenizer honors single/double quotes
+  (quoted metacharacters are literal text, never operators). Any redirect
+  (`>`, `<`, `>>`, `<<`), subshell/grouping/brace form (`(`, `)`, `{`, `}`),
+  substitution or expansion (`$`, backtick — including inside double
+  quotes), background `&`, comment, unterminated quote, or empty segment
+  makes the whole command **not statically analyzable**. Unparseable
+  commands are never auto-approved and never covered by scoped grants; they
+  fall to the ask path. False negatives cost a prompt; false positives are
+  forbidden.
+- **Classification.** Each segment's argv is checked against a behavioral
+  allowlist. Read-only binaries are safe with any flags: `cat cd cut echo
+  expr false grep head id ls nl paste pwd rev seq stat tail tr true uname
+  uniq wc which whoami`. Flag-inspected binaries are safe only in read-only
+  form: `find` (no `-exec`/`-execdir`/`-ok`/`-okdir`/`-delete`/`-fls`/
+  `-fprint`/`-fprint0`/`-fprintf`), `rg` (no `--pre`/`--hostname-bin`/
+  `--search-zip`/`-z`, including bundled shorts), `base64` (no
+  `-o`/`--output`), `sed` (only `sed -n Np` / `sed -n M,Np` print-range
+  form), `git` (only `status`/`log`/`diff`/`show`/`branch` as the token
+  immediately after `git` — any global flag rejects — with no
+  `--output`/`--ext-diff`/`--textconv`/`--exec` args, and `branch` only as
+  a pure listing query). Binary names match the first token exactly
+  (`/bin/ls` and `env ls` do not match); unquoted globs reject the
+  flag-inspected binaries because runtime expansion could inject
+  flag-shaped tokens.
+- A command is **statically safe** iff it parses AND every segment is safe.
+
 ### Revocation and listing
 
 Core exposes list and revoke APIs over session, project, and user grant

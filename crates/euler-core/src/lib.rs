@@ -7,6 +7,7 @@ pub mod apply_patch;
 pub mod auth_storage;
 pub mod canvas;
 pub mod checkpoints;
+pub mod command_safety;
 pub mod compaction;
 mod diagnostics;
 pub mod extension_registry;
