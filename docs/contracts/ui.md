@@ -59,6 +59,30 @@ emission + unrelated renderers.
   `├` / `└` children with per-step result data.
 - Fold marker language: `… N more lines · ctrl+o expand` (and matching collapse).
 
+### Collapsed tool output preview (v4 spec amendment)
+
+Collapsed tool-run blocks use the Codex head+tail preview model. This
+supersedes the earlier "exactly one `└ ` result line" rule (review v2 §14.2)
+and its most-informative-line scoring: the collapsed preview never selects,
+promotes, or reorders lines.
+
+- **Head** = the literal first **2** buffer lines; **tail** = the literal
+  last **3** buffer lines; both strictly in buffer order. The tail is where
+  test summaries and errors live, so it gets the larger share.
+- The fold marker sits **between** head and tail and carries the hidden
+  count: `… K more lines · ctrl+o expand`, with `K = total − head − tail`.
+- `└` elbow on the first preview line; sibling preview lines (rest of head,
+  marker, tail) are indented two extra spaces to align under it.
+- Outputs short enough to fit (≤ the collapsed row budget, or ≤ head+tail
+  lines) render whole with no marker — head and tail can never overlap.
+- Head 2 / tail 3 keeps the whole collapsed cell (header + 6 preview rows)
+  inside the default 10-row collapsed budget (`TOOL_CALL_MAX_LINES`).
+- The buffer both views render is normalized once at ingest: the leading
+  `exit N` status row run_shell emits is stripped there (the header owns
+  exit status) and trailing whitespace padding is never stored, so the
+  collapsed and expanded views agree on line count and order by
+  construction. The expanded view is the full buffer, in buffer order.
+
 ### Fold
 
 - **One** fold key: `ctrl+o`. **Global toggle** (issue #49), not a per-cell

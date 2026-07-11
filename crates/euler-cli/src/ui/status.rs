@@ -739,6 +739,26 @@ mod tests {
         assert!(display_width(&rendered) < 49);
     }
 
+    /// Issue #59: a narrower budget that no longer fits the `2x11` component
+    /// must drop that whole component and land on the next `/` boundary
+    /// (`…/euler`), never bisect it (`…11/euler`).
+    #[test]
+    fn narrow_width_truncates_directory_at_component_boundary_not_mid_component() {
+        let mut snapshot =
+            StatusSnapshot::new("fixture", "echo", PathBuf::from("/Users/x/code/2x11/euler"));
+        snapshot.git_branch = Some("main".to_owned());
+        let tokens = TokenUsageSnapshot::default();
+
+        // 4 cells narrower than the `…/2x11/euler` case above — exactly
+        // enough budget for the pre-fix raw cut to land inside "2x11"
+        // ("11/euler"); the fix must sacrifice the whole component instead.
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 45);
+
+        assert!(rendered.contains("/ commands · …/euler (main)"));
+        assert!(!rendered.contains("11/euler"));
+        assert!(display_width(&rendered) < 45);
+    }
+
     #[test]
     fn absent_context_window_tokens_render_unknown_fill() {
         let snapshot = TokenUsageSnapshot {

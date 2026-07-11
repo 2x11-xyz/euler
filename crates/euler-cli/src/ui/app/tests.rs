@@ -1414,7 +1414,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
     core.push_finalized_visual_item(shell_artifact_with_lines(12));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("7 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
 
     assert_eq!(core.handle_input(key(KeyCode::PageUp)), CoreEffect::Render);
@@ -1434,7 +1434,7 @@ fn ctrl_o_expands_and_refolds_finalized_shell_artifacts() {
         CoreEffect::ReplayHistoryWithScrollbackPurge
     );
     let refolded = drain_finalized_visual_text(&mut core, 80);
-    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("7 more lines"), "refolded: {refolded:?}");
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
 }
 
@@ -1493,11 +1493,11 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw folded");
     let folded = terminal.backend().screen_contents();
-    assert!(folded.contains("44 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("43 more lines"), "folded: {folded:?}");
     assert!(!folded.contains("line 3"), "folded: {folded:?}");
     let folded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
-        folded_scrollback.contains("44 more lines"),
+        folded_scrollback.contains("43 more lines"),
         "folded summary should commit to native scrollback: {folded_scrollback:?}"
     );
 
@@ -1549,11 +1549,11 @@ fn ctrl_o_expands_and_refolds_terminal_rendered_shell_artifacts() {
         .draw_visual_frame(&core.visual_canvas_frame(80))
         .expect("draw refolded");
     let refolded = terminal.backend().screen_contents();
-    assert!(refolded.contains("44 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("43 more lines"), "refolded: {refolded:?}");
     assert!(!refolded.contains("line 3"), "refolded: {refolded:?}");
     let refolded_scrollback = terminal.backend().scrollback_rows().join("\n");
     assert!(
-        refolded_scrollback.contains("44 more lines"),
+        refolded_scrollback.contains("43 more lines"),
         "refold replay should commit folded summary: {refolded_scrollback:?}"
     );
 }
@@ -1760,8 +1760,8 @@ fn ctrl_o_expands_all_foldable_artifacts_globally() {
     core.push_finalized_visual_item(shell_artifact_with_lines(14));
 
     let folded = drain_finalized_visual_text(&mut core, 80);
-    assert!(folded.contains("8 more lines"), "folded: {folded:?}");
-    assert!(folded.contains("10 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("7 more lines"), "folded: {folded:?}");
+    assert!(folded.contains("9 more lines"), "folded: {folded:?}");
     assert!(folded.contains("ctrl+o expand"), "folded: {folded:?}");
     assert!(
         !folded.contains("unique reasoning marker"),
@@ -1793,8 +1793,8 @@ fn ctrl_o_expands_all_foldable_artifacts_globally() {
         CoreEffect::ReplayHistoryWithScrollbackPurge
     );
     let refolded = drain_finalized_visual_text(&mut core, 80);
-    assert!(refolded.contains("8 more lines"), "refolded: {refolded:?}");
-    assert!(refolded.contains("10 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("7 more lines"), "refolded: {refolded:?}");
+    assert!(refolded.contains("9 more lines"), "refolded: {refolded:?}");
     assert!(
         !refolded.contains("unique reasoning marker"),
         "refolded: {refolded:?}"
@@ -1840,7 +1840,7 @@ fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     assert_eq!(modal_core.handle_input(ctrl_o()), CoreEffect::None);
     let modal_text = drain_finalized_visual_text(&mut modal_core, 80);
     assert!(
-        modal_text.contains("8 more lines"),
+        modal_text.contains("7 more lines"),
         "modal_text: {modal_text:?}"
     );
     assert!(matches!(modal_core.modal, Some(Modal::Permission(_))));
@@ -1852,7 +1852,7 @@ fn ctrl_o_does_not_bypass_modal_or_palette_ownership() {
     assert_eq!(palette_core.handle_input(ctrl_o()), CoreEffect::None);
     let palette_text = drain_finalized_visual_text(&mut palette_core, 80);
     assert!(
-        palette_text.contains("8 more lines"),
+        palette_text.contains("7 more lines"),
         "palette_text: {palette_text:?}"
     );
     let BottomOwner::Palette(palette) = palette_core.bottom.owner() else {
