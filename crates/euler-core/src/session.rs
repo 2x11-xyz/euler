@@ -146,6 +146,13 @@ pub struct SessionConfig {
     /// `.euler/grants.json` is repo-controlled content and must never become
     /// authority without a matching user consent entry outside the repo.
     pub project_grant_consent_dir: Option<PathBuf>,
+    /// User-home directory holding the durable user-level grant store
+    /// (`<dir>/user-grants.json` — prefix rules that persist across sessions
+    /// AND projects). `None` (default) disables user rules entirely: reads
+    /// and writes both fail closed. Unlike project grants, no consent
+    /// intersection applies — the store is user-authored in the user-owned
+    /// euler home and never repo-controlled content.
+    pub user_grant_dir: Option<PathBuf>,
 }
 
 impl SessionConfig {
@@ -169,6 +176,7 @@ impl SessionConfig {
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
             round_observer: None,
             project_grant_consent_dir: None,
+            user_grant_dir: None,
         }
     }
 }
@@ -662,6 +670,9 @@ impl<D> Session<D> {
         // files leave the store unloaded so project writes fail closed.
         let _ = permissions
             .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
+        // User rules follow the same discipline: missing file is empty;
+        // corrupt files leave the store unloaded (reads and writes fail closed).
+        let _ = permissions.load_user_grants(config.user_grant_dir.as_deref());
         Self {
             config,
             active_target,
@@ -863,12 +874,20 @@ impl<D> Session<D> {
         self.permissions.set_mode(capability, mode);
     }
 
-    /// Active session + project grants for `/permissions` listing.
+    /// Active session + project + user grants for `/permissions` listing.
     pub fn list_grants(&self) -> Vec<(GrantSource, ActiveGrant)> {
         self.permissions.list_grants()
     }
 
-    /// Revoke a session or project grant. Project revokes rewrite `.euler/grants.json`.
+    /// Whether durable user-level rules are enabled for this session (a user
+    /// grant dir was configured and loadable). Gates the "always" approval
+    /// option in the UI.
+    pub fn user_rules_enabled(&self) -> bool {
+        self.permissions.user_rules_enabled()
+    }
+
+    /// Revoke a session, project, or user grant. Project revokes rewrite
+    /// `.euler/grants.json`; user revokes rewrite `<home>/user-grants.json`.
     pub fn revoke_grant(
         &mut self,
         capability: Capability,
@@ -942,6 +961,7 @@ impl<D> Session<D> {
         let mut permissions = PermissionGate::new(decider);
         let _ = permissions
             .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
+        let _ = permissions.load_user_grants(config.user_grant_dir.as_deref());
         Self {
             config,
             active_target,

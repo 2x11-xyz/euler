@@ -1,9 +1,9 @@
-//! Scoped permission grants: session and project stores.
+//! Scoped permission grants: session, project, and user stores.
 //!
 //! Capability approval modes (`ask` / `session-allow` / `always-deny`) remain the
-//! coarse gate. Scoped grants sit above `ask`: a matching session or project
-//! grant allows a request without re-prompting. Project grants persist under
-//! the workspace `.euler/` directory; every project-grant write is a user
+//! coarse gate. Scoped grants sit above `ask`: a matching session, project, or
+//! user grant allows a request without re-prompting. Project grants persist
+//! under the workspace `.euler/` directory; every project-grant write is a user
 //! decision that callers must record in provenance (see capabilities contract).
 //!
 //! The workspace grants file is repo-controlled content: a cloned repository
@@ -13,6 +13,12 @@
 //! user-owned euler home, written when the user approves the grant). Either
 //! side alone grants nothing: the repo file cannot preseed authority, and a
 //! stale consent entry dies with the workspace entry it consented to.
+//!
+//! User grants (durable prefix rules — "don't ask again for commands starting
+//! with `cargo`") persist under the user's euler home and cover every session
+//! in every project. They need no consent intersection: the store is
+//! user-authored, lives in the user-owned home, and is never repo-controlled
+//! content, so there is no second party whose entries could preseed it.
 
 use euler_sdk::Capability;
 use serde::{Deserialize, Serialize};
@@ -31,6 +37,7 @@ pub const MAX_GRANT_INSTRUCTION_BYTES: usize = 4 * 1024;
 const MAX_GRANTS_FILE_BYTES: u64 = 64 * 1024;
 
 const GRANTS_FILE: &str = "grants.json";
+const USER_GRANTS_FILE: &str = "user-grants.json";
 const EULER_DIR: &str = ".euler";
 const GRANTS_VERSION: u64 = 1;
 
@@ -99,22 +106,27 @@ pub enum GrantScope {
     Session(ScopePattern),
     /// Persist under the project grants file under `ScopePattern`.
     Project(ScopePattern),
+    /// Persist under the user-home grants file under `ScopePattern` —
+    /// covers every session in every project ("always").
+    User(ScopePattern),
 }
 
 impl GrantScope {
     pub fn pattern(&self) -> Option<&ScopePattern> {
         match self {
             Self::Once => None,
-            Self::Session(p) | Self::Project(p) => Some(p),
+            Self::Session(p) | Self::Project(p) | Self::User(p) => Some(p),
         }
     }
 
-    /// Wire label for permission.decision payloads: `once` | `session` | `project`.
+    /// Wire label for permission.decision payloads:
+    /// `once` | `session` | `project` | `user`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Once => "once",
             Self::Session(_) => "session",
             Self::Project(_) => "project",
+            Self::User(_) => "user",
         }
     }
 }
@@ -325,9 +337,22 @@ impl ProjectGrantStore {
         }
     }
 
-    /// Store at an explicit file path (used for the user-home consent store).
+    /// Store at an explicit file path (used for the user-home consent store
+    /// and the user-level durable grants store).
     pub fn at_path(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
+    }
+
+    /// User-level durable grants file under the euler home:
+    /// `<home>/user-grants.json`.
+    ///
+    /// Unlike the workspace grants file, this store needs no consent
+    /// intersection: it is user-authored, lives in the user-owned euler home,
+    /// and is never repo-controlled content — there is no second party whose
+    /// entries could preseed authority. Writes use the same atomic-rename +
+    /// 0600 discipline as every other grant store.
+    pub fn user_grants_path(user_dir: &Path) -> PathBuf {
+        user_dir.join(USER_GRANTS_FILE)
     }
 
     /// User-consent store path for a workspace root: one file per root under

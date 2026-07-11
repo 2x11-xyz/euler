@@ -109,11 +109,14 @@ pub(crate) fn session_config(
     config.agent_id = AGENT_ID.to_owned();
     config.provider = provider;
     config.model = model;
-    // Project grants activate only against the user-home consent store; if
-    // the home cannot be resolved they stay disabled (fail closed).
-    config.project_grant_consent_dir = EulerHome::resolve()
+    // Project grants activate only against the user-home consent store, and
+    // durable user rules live in the same home; if the home cannot be
+    // resolved both stay disabled (fail closed).
+    let euler_home = EulerHome::resolve()
         .ok()
         .map(|home| home.root().to_path_buf());
+    config.project_grant_consent_dir = euler_home.clone();
+    config.user_grant_dir = euler_home;
     config
 }
 
