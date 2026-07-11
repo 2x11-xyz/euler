@@ -692,11 +692,16 @@ impl<D> Session<D> {
 
     pub fn into_fresh_session(self, session_id: impl Into<String>, decider: D) -> Self {
         let active_target = self.active_target;
+        let code_swarm_extension = self.code_swarm_extension;
         let mut config = self.config;
         config.session_id = session_id.into();
         config.provider = active_target.provider;
         config.model = active_target.model;
-        Self::new_with_providers(config, self.providers, decider)
+        let mut session = Self::new_with_providers(config, self.providers, decider);
+        // The code-swarm wiring is launch configuration, not session state:
+        // a fresh session in the same process keeps the review-gate tool.
+        session.code_swarm_extension = code_swarm_extension;
+        session
     }
 
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {

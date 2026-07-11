@@ -132,6 +132,7 @@ impl AppCore {
         if let Some((_, extension)) = observer {
             session.set_observer_extension(extension);
         }
+        crate::wire_code_swarm(&mut session);
         let events = session.events().to_vec();
         let events_replayed = outcome.events_folded;
         Ok(TuiResume {

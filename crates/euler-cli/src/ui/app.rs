@@ -1647,7 +1647,10 @@ impl AppCore {
                 raw_args,
             } => self.extension_run(id, command, input, raw_args),
             CommandAction::CompanionRun { input } => self.companion_run(input),
-            CommandAction::CodeSwarmSaveModels { models } => self.code_swarm_save_models(models),
+            CommandAction::CodeSwarmSaveModels { models, user_tier } => {
+                self.code_swarm_save_models(models, user_tier)
+            }
+            CommandAction::CodeSwarmClear { user_tier } => self.code_swarm_clear(user_tier),
             CommandAction::CodeSwarmReview { prompt, personas } => {
                 self.code_swarm_review(prompt, personas)
             }

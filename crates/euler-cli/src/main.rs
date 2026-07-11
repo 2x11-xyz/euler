@@ -31,6 +31,7 @@ static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod auth_commands;
 mod auth_validation;
 mod bundled_extensions;
+mod code_swarm_config;
 mod companion_run;
 mod diagnostics;
 mod extension_cli;
@@ -188,6 +189,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
+    wire_code_swarm(&mut session);
     run_stdin_loop(&mut session, live_session.refresh.as_ref())
 }
 
@@ -223,6 +225,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
+    wire_code_swarm(&mut session);
     let mut app = App::enter_with_options(
         session,
         channels,
@@ -293,6 +296,7 @@ fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
+    wire_code_swarm(&mut session);
     SubagentDecider::apply_tier(tier, &mut session);
     let events = session.run_turn(&prompt)?;
     if let Some(refresh) = refresh.as_ref() {
@@ -481,6 +485,7 @@ where
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
+    wire_code_swarm(&mut session);
     Ok(ResumeCliOutcome {
         session,
         refresh,
@@ -627,6 +632,16 @@ fn parse_live_extension_reference(reference: &str) -> Result<(String, String)> {
     Ok((id.to_owned(), command.to_owned()))
 }
 
+/// Attach the bundled code-swarm extension so the session can execute the
+/// `code_swarm_review` tool (tools contract). Advertisement additionally
+/// requires the extension to be enabled for the session; wiring alone grants
+/// nothing.
+fn wire_code_swarm<D>(session: &mut Session<D>) {
+    session.set_code_swarm_extension(std::sync::Arc::new(
+        euler_extension_code_swarm::CodeSwarmExtension,
+    ));
+}
+
 fn run_live_extension_command(
     session: &mut Session<CliDecider>,
     id: &str,
@@ -643,6 +658,20 @@ fn run_live_extension_command(
     };
     let Some(bundled) = bundled_extension_by_id(id) else {
         return headless_extension_error(format!("unknown extension id: {id}"));
+    };
+    // code-swarm.review rides the shared resolution chain: explicit models in
+    // the input win; otherwise the persisted project/user config (the same
+    // stores the TUI writes) fills them in; neither is an honest error.
+    let input = if id == "code-swarm" && command == "review" {
+        match code_swarm_config::apply_config_to_review_input(
+            &code_swarm_config::workspace_root(),
+            input,
+        ) {
+            Ok(input) => input,
+            Err(error) => return headless_extension_error(error),
+        }
+    } else {
+        input
     };
     // Piped headless runs cannot prompt (stdin is the command protocol):
     // invoking `extension_run` names the command explicitly, so its declared

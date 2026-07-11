@@ -4223,10 +4223,12 @@ fn wait_for_idle(core: &mut AppCore) {
 mod code_swarm_tests {
     use crate::ui::app::code_swarm::code_swarm_review_input;
 
+    // Models are no longer built here: the extension_run seam injects them
+    // through the shared resolution chain (explicit flags -> project tier ->
+    // user tier -> honest unconfigured error).
     #[test]
-    fn review_input_carries_models_prompt_and_personas() {
+    fn review_input_carries_prompt_and_personas_without_models() {
         let input = code_swarm_review_input(
-            vec!["fixture::echo".to_owned(), "fixture::alt".to_owned()],
             Some("focus on the parser".to_owned()),
             Some(vec!["safety".to_owned()]),
         );
@@ -4234,7 +4236,6 @@ mod code_swarm_tests {
         assert_eq!(
             input,
             serde_json::json!({
-                "models": ["fixture::echo", "fixture::alt"],
                 "prompt": "focus on the parser",
                 "reviewers": ["safety"],
             })
@@ -4243,12 +4244,8 @@ mod code_swarm_tests {
 
     #[test]
     fn review_input_omits_blank_prompt_and_empty_personas() {
-        let input = code_swarm_review_input(
-            vec!["fixture::echo".to_owned()],
-            Some("   ".to_owned()),
-            Some(Vec::new()),
-        );
+        let input = code_swarm_review_input(Some("   ".to_owned()), Some(Vec::new()));
 
-        assert_eq!(input, serde_json::json!({"models": ["fixture::echo"]}));
+        assert_eq!(input, serde_json::json!({}));
     }
 }

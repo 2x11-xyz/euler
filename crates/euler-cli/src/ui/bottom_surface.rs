@@ -583,7 +583,8 @@ impl BottomSurface {
                 self.owner = BottomOwner::Picker(picker);
                 return SurfaceEvent::Message("select at least 1 model (min 1 · max 5)".to_owned());
             }
-            return self.apply_action(CommandAction::CodeSwarmSaveModels { models });
+            let user_tier = picker.code_swarm_user_tier;
+            return self.apply_action(CommandAction::CodeSwarmSaveModels { models, user_tier });
         }
         // Extension manager: Enter shows details.
         if picker.kind == PickerKind::Extensions {

@@ -347,9 +347,15 @@ pub enum CommandAction {
     CompanionRun {
         input: serde_json::Value,
     },
-    /// Persist the `/code-swarm` reviewer model set (1-5 provider::model).
+    /// Persist the `/code-swarm` reviewer model set (1-5 provider::model)
+    /// to the project tier, or the user-global tier with `--user`.
     CodeSwarmSaveModels {
         models: Vec<String>,
+        user_tier: bool,
+    },
+    /// Remove one tier's persisted `/code-swarm` reviewer config.
+    CodeSwarmClear {
+        user_tier: bool,
     },
     /// Run the reviewer swarm: brief -> spawn companions -> report.
     CodeSwarmReview {
@@ -437,9 +443,11 @@ pub enum PickerSpec {
     Rollback(Vec<CheckpointItem>),
     Extensions(Vec<ExtensionManagerItem>),
     /// `/code-swarm` reviewer-model checklist: selection IS the agent count.
+    /// `user_tier` routes the save to the user-global store.
     CodeSwarmModels {
         choices: Vec<ModelChoice>,
         selected: Vec<String>,
+        user_tier: bool,
     },
 }
 
@@ -804,10 +812,12 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
 }
 
 /// `/code-swarm` — extension-provided surface (teaches when disabled).
-/// No arg: open the reviewer-model checklist picker (selection IS the count).
+/// No arg: open the reviewer-model checklist picker (selection IS the
+/// count); the save persists to the project tier, or the user tier with
+/// `--user`. `clear [--user]` removes one tier's config.
 /// `review [--personas a,b,c] [--prompt <text…>]`: run the swarm.
 fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
-    const USAGE: &str = "usage: /code-swarm  or  /code-swarm review [--personas correctness,safety,tests] [--prompt <focus…>]";
+    const USAGE: &str = "usage: /code-swarm [--user]  ·  /code-swarm clear [--user]  ·  /code-swarm review [--personas correctness,safety,tests] [--prompt <focus…>]";
     let enabled = context
         .extension_items
         .iter()
@@ -816,23 +826,36 @@ fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffe
     if !enabled {
         return CommandEffect::Notice(disabled_extension_teach("/code-swarm", "code-swarm"));
     }
-    let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
-        return CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
+    let arg = arg.map(str::trim).filter(|arg| !arg.is_empty());
+    match arg {
+        None => CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
             choices: context.model_choices.clone(),
             selected: context.code_swarm_models.clone(),
-        });
-    };
-    let Some(rest) = arg.strip_prefix("review") else {
-        return CommandEffect::Message(USAGE.to_owned());
-    };
-    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-        return CommandEffect::Message(USAGE.to_owned());
-    }
-    match parse_code_swarm_review_args(rest.trim_start()) {
-        Ok((prompt, personas)) => {
-            CommandEffect::Action(CommandAction::CodeSwarmReview { prompt, personas })
+            user_tier: false,
+        }),
+        Some("--user") => CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
+            choices: context.model_choices.clone(),
+            selected: context.code_swarm_models.clone(),
+            user_tier: true,
+        }),
+        Some("clear") => CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: false }),
+        Some("clear --user") => {
+            CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: true })
         }
-        Err(message) => CommandEffect::Message(format!("{message}\n{USAGE}")),
+        Some(arg) => {
+            let Some(rest) = arg.strip_prefix("review") else {
+                return CommandEffect::Message(USAGE.to_owned());
+            };
+            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                return CommandEffect::Message(USAGE.to_owned());
+            }
+            match parse_code_swarm_review_args(rest.trim_start()) {
+                Ok((prompt, personas)) => {
+                    CommandEffect::Action(CommandAction::CodeSwarmReview { prompt, personas })
+                }
+                Err(message) => CommandEffect::Message(format!("{message}\n{USAGE}")),
+            }
+        }
     }
 }
 
@@ -1439,12 +1462,40 @@ mod tests {
     fn code_swarm_no_arg_opens_model_checklist_picker() {
         let context = code_swarm_context(true);
         match dispatch_command("/code-swarm", &context) {
-            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels { choices, selected }) => {
+            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
+                choices,
+                selected,
+                user_tier: false,
+            }) => {
                 assert_eq!(choices.len(), 4);
                 assert!(selected.is_empty());
             }
             other => panic!("expected picker, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn code_swarm_user_flag_routes_picker_to_user_tier() {
+        let context = code_swarm_context(true);
+        match dispatch_command("/code-swarm --user", &context) {
+            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
+                user_tier: true, ..
+            }) => {}
+            other => panic!("expected user-tier picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_swarm_clear_targets_one_tier() {
+        let context = code_swarm_context(true);
+        assert_eq!(
+            dispatch_command("/code-swarm clear", &context),
+            CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: false })
+        );
+        assert_eq!(
+            dispatch_command("/code-swarm clear --user", &context),
+            CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: true })
+        );
     }
 
     #[test]
