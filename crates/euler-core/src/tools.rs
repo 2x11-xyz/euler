@@ -89,7 +89,7 @@ impl ToolRegistry {
     pub fn required_capability(&self, name: &str) -> Option<Capability> {
         match name {
             "read_file" | "git_status" | "git_diff" | "tool_result_get" => Some(Capability::FsRead),
-            "edit_file" | "apply_patch" => Some(Capability::FsWrite),
+            "edit_file" | "write_file" | "apply_patch" => Some(Capability::FsWrite),
             "run_shell" => Some(Capability::ShellExec),
             // Session-level review gate (tools contract): executed by the
             // session, not this registry, but gated here like every tool.
@@ -118,6 +118,7 @@ impl ToolRegistry {
         match name {
             "read_file" => self.read_file(input),
             "edit_file" => self.edit_file(input),
+            "write_file" => self.write_file(input),
             "apply_patch" => self.apply_patch_tool(input),
             "run_shell" => self.run_shell(input),
             "git_status" => self.git(&["status", "--short"], "git_status"),
@@ -168,29 +169,7 @@ impl ToolRegistry {
         let old = required_str(input, "old")?;
         let new = required_str(input, "new")?;
         if old.is_empty() {
-            let path = self.resolve_create_path(relative)?;
-            if path.exists() {
-                return Err(ToolError::FileAlreadyExists);
-            }
-            return Ok(ToolExecution {
-                name: "edit_file".to_owned(),
-                output: format!("created {relative}"),
-                exit_code: None,
-                patch: Some(PatchEvents {
-                    path: relative.to_owned(),
-                    before: String::new(),
-                    after: new.to_owned(),
-                    origin: "edit_file",
-                    action: "add",
-                    before_sha256: None,
-                    after_sha256: hash_bytes(new.as_bytes()),
-                    before_byte_len: 0,
-                    after_byte_len: new.len(),
-                    write_path: path,
-                    write_content: new.to_owned(),
-                }),
-                file_changes: Vec::new(),
-            });
+            return self.prepare_create(relative, new, "edit_file");
         }
         let path = self.resolve_path(relative)?;
         let content = fs::read_to_string(&path)?;
@@ -220,6 +199,47 @@ impl ToolRegistry {
                 after_byte_len: updated.len(),
                 write_path: path,
                 write_content: updated,
+            }),
+            file_changes: Vec::new(),
+        })
+    }
+
+    fn write_file(&self, input: &Value) -> Result<ToolExecution, ToolError> {
+        let relative = required_str(input, "path")?;
+        let content = required_str(input, "content")?;
+        self.prepare_create(relative, content, "write_file")
+    }
+
+    /// Shared create path for `write_file` and `edit_file` with an empty
+    /// `old`: create-only (never clobbers an existing file), same workspace
+    /// confinement as every write, and the same `PatchEvents` add-action
+    /// provenance apply_patch's `Add File` emits.
+    fn prepare_create(
+        &self,
+        relative: &str,
+        content: &str,
+        origin: &'static str,
+    ) -> Result<ToolExecution, ToolError> {
+        let path = self.resolve_create_path(relative)?;
+        if path.exists() {
+            return Err(ToolError::FileAlreadyExists);
+        }
+        Ok(ToolExecution {
+            name: origin.to_owned(),
+            output: format!("created {relative}"),
+            exit_code: None,
+            patch: Some(PatchEvents {
+                path: relative.to_owned(),
+                before: String::new(),
+                after: content.to_owned(),
+                origin,
+                action: "add",
+                before_sha256: None,
+                after_sha256: hash_bytes(content.as_bytes()),
+                before_byte_len: 0,
+                after_byte_len: content.len(),
+                write_path: path,
+                write_content: content.to_owned(),
             }),
             file_changes: Vec::new(),
         })
@@ -812,6 +832,7 @@ fn coding_tool_definitions() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        write_file_definition(),
         ToolDefinition {
             name: "apply_patch".to_owned(),
             description: "Apply one structured patch envelope to add or update one UTF-8 file under the workspace root. Prefer this over shell commands for code and text edits. File paths inside the patch must be relative to the workspace root; absolute paths (for example /tmp/name.py) and parent-traversal paths are rejected. Updates may contain multiple hunks for the same file. V0 rejects delete, rename, and multi-file patches.".to_owned(),
@@ -851,6 +872,28 @@ after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
             parameters: empty_parameters(),
         },
     ]
+}
+
+fn write_file_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "write_file".to_owned(),
+        description: "Create a new UTF-8 file at `path` (relative to the workspace root) with exactly `content`. Fails if the file already exists — use edit_file or apply_patch to modify an existing file — and if the parent directory is missing. Absolute and parent-traversal paths are rejected. For creating whole files this is more direct than apply_patch: plain JSON fields, no patch syntax.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path of the file to create; the parent directory must already exist."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Complete file contents, written verbatim."
+                }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 fn tool_result_get_definition() -> ToolDefinition {

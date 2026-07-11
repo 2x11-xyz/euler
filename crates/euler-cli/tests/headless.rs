@@ -879,6 +879,144 @@ fn headless_edit_file_persists_metadata_only_file_change_event() {
 }
 
 #[test]
+fn headless_write_file_persists_metadata_only_file_change_event() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let script = script_dir.path().join("write-file.json");
+    fs::write(
+        &script,
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        {
+          "tool_call": {
+            "id": "call-write",
+            "name": "write_file",
+            "input": {
+              "path": "headless-written.txt",
+              "content": "hello\n"
+            }
+          }
+        },
+        { "finished": { "stop_reason": "tool_use" } }
+      ]
+    },
+    {
+      "events": [
+        { "text_delta": "done" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    )
+    .expect("write script");
+
+    let mut child = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provider-option")
+        .arg(format!("event-script={}", path_str(&script)))
+        .arg("--provenance")
+        .arg(path_str(&log))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"create file\ny\n")
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("headless-written.txt")).expect("created file"),
+        "hello\n"
+    );
+
+    let events = read_jsonl(&log);
+    let prompt = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
+        .expect("permission prompt");
+    let patch_applied = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::PATCH_APPLIED)
+        .expect("patch applied");
+    let file_change = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .expect("file change");
+
+    assert_eq!(
+        prompt.payload.get("reason"),
+        Some(&serde_json::json!("tool write_file"))
+    );
+    assert_eq!(
+        file_change.parent.as_deref(),
+        Some(patch_applied.id.as_str())
+    );
+    assert_eq!(
+        file_change.payload.get("tool_call_id"),
+        Some(&serde_json::json!("call-write"))
+    );
+    assert_eq!(
+        file_change.payload.get("origin"),
+        Some(&serde_json::json!("write_file"))
+    );
+    assert_eq!(
+        file_change.payload.get("action"),
+        Some(&serde_json::json!("add"))
+    );
+    assert_eq!(
+        file_change.payload.get("path"),
+        Some(&serde_json::json!("headless-written.txt"))
+    );
+    assert_eq!(
+        file_change.payload.get("before_sha256"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        file_change.payload.get("before_byte_len"),
+        Some(&serde_json::json!(0))
+    );
+    assert_eq!(
+        file_change.payload.get("after_byte_len"),
+        Some(&serde_json::json!(6))
+    );
+    assert_eq!(
+        file_change.payload.get("diff_redaction"),
+        Some(&serde_json::json!("omitted"))
+    );
+    assert!(!file_change.payload.contains_key("old"));
+    assert!(!file_change.payload.contains_key("new"));
+    assert!(!file_change.payload.contains_key("diff"));
+    let file_change_json = file_change.to_json_line().expect("serialize file.change");
+    assert!(!file_change_json.contains("hello"));
+
+    let resumed = run_euler_with_input(exe, &["--resume", path_str(&log)], "");
+    assert!(
+        resumed.status.success(),
+        "resume stderr: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+}
+
+#[test]
 fn headless_direct_apply_patch_persists_metadata_only_file_change_event() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();

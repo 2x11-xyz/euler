@@ -247,7 +247,10 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             } => {
                 let (heading, style) = if *ok {
                     (tool_result_label(name), theme.transcript.tool)
-                } else if matches!(name.as_str(), "edit_file" | "apply_patch" | "apply-patch") {
+                } else if matches!(
+                    name.as_str(),
+                    "edit_file" | "write_file" | "apply_patch" | "apply-patch"
+                ) {
                     (
                         edit_failure_status(path.as_deref().unwrap_or(""), error),
                         theme.transcript.tool_error,

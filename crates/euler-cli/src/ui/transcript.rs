@@ -926,7 +926,7 @@ fn project_tui_tool_result(
     if let Some(run) = run_item_from_result(event, calls, ok) {
         return Some(run);
     }
-    if ok && name == "edit_file" {
+    if ok && matches!(name.as_str(), "edit_file" | "write_file") {
         return None;
     }
     if ok {
@@ -936,7 +936,12 @@ fn project_tui_tool_result(
             });
         }
     }
-    if !ok && matches!(name.as_str(), "edit_file" | "apply_patch" | "apply-patch") {
+    if !ok
+        && matches!(
+            name.as_str(),
+            "edit_file" | "write_file" | "apply_patch" | "apply-patch"
+        )
+    {
         let path =
             tool_projection_for_result(event, calls).and_then(|projection| match projection {
                 ToolCallProjection::Edit { path } => Some(path.clone()),
@@ -1134,7 +1139,7 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
                 .get("ok")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            if ok && name == "edit_file" {
+            if ok && matches!(name.as_str(), "edit_file" | "write_file") {
                 None
             } else {
                 project_event(event)
@@ -1532,7 +1537,7 @@ fn tool_projection_from_call(event: &EventEnvelope) -> Option<ToolCallProjection
                 .map(normalized_shell_command)
                 .unwrap_or_default(),
         }),
-        "edit_file" | "apply_patch" | "apply-patch" => {
+        "edit_file" | "write_file" | "apply_patch" | "apply-patch" => {
             let path = input
                 .and_then(|input| input.get("path"))
                 .and_then(serde_json::Value::as_str)

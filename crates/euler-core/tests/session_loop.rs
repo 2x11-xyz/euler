@@ -118,7 +118,8 @@ fn model_request_prefers_apply_patch_for_file_edits() {
     let request = requests.first().expect("captured request");
     assert!(request
         .instructions
-        .contains("adds or updates, prefer apply_patch"));
+        .contains("To create a new file, prefer write_file"));
+    assert!(request.instructions.contains("updates, prefer apply_patch"));
     assert!(request.instructions.contains("deletes, and renames"));
     assert!(request
         .instructions
@@ -132,6 +133,14 @@ fn model_request_prefers_apply_patch_for_file_edits() {
         .description
         .contains("Prefer this over shell commands"));
     assert!(apply_patch.description.contains("multiple hunks"));
+    let write_file = request
+        .tools
+        .iter()
+        .find(|tool| tool.name == "write_file")
+        .expect("write_file tool");
+    assert!(write_file
+        .description
+        .contains("Fails if the file already exists"));
 }
 
 #[test]
@@ -1632,6 +1641,187 @@ fn edit_file_create_emits_add_file_change_metadata() {
     assert!(diff.contains("--- /dev/null"));
     assert!(diff.contains("+++ b/created.txt"));
     assert!(diff.contains("+hello"));
+}
+
+#[test]
+fn write_file_create_emits_add_file_change_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-write".to_owned(),
+        name: "write_file".to_owned(),
+        input: json!({"path": "created.txt", "content": "hello\n"}),
+    }])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+
+    let error = session
+        .run_turn("write file then fail")
+        .expect_err("provider error");
+    assert!(matches!(error, SessionError::Provider(_)));
+
+    let events = logged_events(&log);
+    let patch_proposed = find_kind(&events, EventKind::PATCH_PROPOSED);
+    let patch_applied = find_kind(&events, EventKind::PATCH_APPLIED);
+    let file_change = find_kind(&events, EventKind::FILE_CHANGE);
+    let file_diff = find_kind(&events, EventKind::FILE_DIFF);
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("created.txt")).expect("read created"),
+        "hello\n"
+    );
+    assert_eq!(payload_str(patch_proposed, "path"), Some("created.txt"));
+    assert_eq!(
+        patch_applied.parent.as_deref(),
+        Some(patch_proposed.id.as_str())
+    );
+    assert_eq!(
+        file_change.parent.as_deref(),
+        Some(patch_applied.id.as_str())
+    );
+    assert_eq!(payload_str(file_change, "tool_call_id"), Some("call-write"));
+    assert_eq!(payload_str(file_change, "origin"), Some("write_file"));
+    assert_eq!(payload_str(file_change, "action"), Some("add"));
+    assert_eq!(payload_str(file_change, "path"), Some("created.txt"));
+    assert_eq!(
+        file_change.payload.get("before_sha256"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(file_change.payload.get("before_byte_len"), Some(&json!(0)));
+    assert_eq!(file_change.payload.get("after_byte_len"), Some(&json!(6)));
+    assert_eq!(payload_str(file_change, "diff_redaction"), Some("omitted"));
+    let serialized_file_change = file_change.to_json_line().expect("serialize file.change");
+    assert!(!serialized_file_change.contains("hello"));
+    assert_eq!(file_diff.parent.as_deref(), Some(patch_applied.id.as_str()));
+    assert_eq!(payload_str(file_diff, "tool_call_id"), Some("call-write"));
+    assert_eq!(
+        payload_str(file_diff, "file_change_id"),
+        Some(file_change.id.as_str())
+    );
+    assert_eq!(payload_str(file_diff, "action"), Some("add"));
+    assert_eq!(payload_str(file_diff, "origin"), Some("write_file"));
+    assert_eq!(payload_str(file_diff, "path"), Some("created.txt"));
+    let diff = payload_str(file_diff, "diff").expect("file diff");
+    assert!(diff.contains("--- /dev/null"));
+    assert!(diff.contains("+++ b/created.txt"));
+    assert!(diff.contains("+hello"));
+}
+
+#[test]
+fn write_file_secret_content_is_redacted_in_patch_events_but_written_to_disk() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-secret-write".to_owned(),
+            name: "write_file".to_owned(),
+            input: json!({"path": "config.txt", "content": "key = registered-secret-value-42\n"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    session.add_redacted_secret("registered-secret-value-42");
+
+    session.run_turn("write secret file").expect("turn");
+
+    // The workspace file carries the real content...
+    assert_eq!(
+        fs::read_to_string(temp.path().join("config.txt")).expect("read created"),
+        "key = registered-secret-value-42\n"
+    );
+    // ...but the emitted provenance never does (secrets contract:
+    // redaction applies at emission, same as edit_file/apply_patch).
+    for kind in [EventKind::PATCH_PROPOSED, EventKind::PATCH_APPLIED] {
+        let event = find_kind(session.events(), kind);
+        let serialized = event.to_json_line().expect("serialize patch event");
+        assert!(
+            !serialized.contains("registered-secret-value-42"),
+            "{kind} must not leak the secret: {serialized}"
+        );
+        assert!(
+            payload_str(event, "new").is_some_and(|new| new.contains("[redacted-secret]")),
+            "{kind} carries the redaction marker"
+        );
+    }
+}
+
+#[test]
+fn denying_write_file_writes_nothing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-denied-write".to_owned(),
+            name: "write_file".to_owned(),
+            input: json!({"path": "denied.txt", "content": "hello\n"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Deny]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+
+    session
+        .run_turn("deny write file")
+        .expect("permission denial returns tool result cleanly");
+
+    let events = logged_events(&log);
+    let prompt = find_kind(&events, EventKind::PERMISSION_PROMPT);
+    let tool_result = event_for_tool(&events, EventKind::TOOL_RESULT, "call-denied-write");
+
+    assert_eq!(payload_str(prompt, "capability"), Some("fs-write"));
+    assert_eq!(payload_str(prompt, "reason"), Some("tool write_file"));
+    assert!(payload_str(tool_result, "error")
+        .is_some_and(|error| error.starts_with("permission denied")));
+    assert!(!events
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::FILE_CHANGE));
+    assert!(!temp.path().join("denied.txt").exists());
+}
+
+#[test]
+fn write_file_rejects_existing_file_without_overwriting() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "existing").expect("seed note");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-clobber".to_owned(),
+            name: "write_file".to_owned(),
+            input: json!({"path": "note.txt", "content": "clobber"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+
+    session.run_turn("try to clobber").expect("turn");
+
+    let tool_result = event_for_tool(session.events(), EventKind::TOOL_RESULT, "call-clobber");
+    assert_eq!(
+        payload_str(tool_result, "error"),
+        Some("file already exists")
+    );
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::FILE_CHANGE));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("note.txt")).expect("read note"),
+        "existing"
+    );
 }
 
 #[test]

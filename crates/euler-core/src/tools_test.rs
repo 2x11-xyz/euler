@@ -355,6 +355,166 @@ fn edit_file_rejects_missing_file_when_old_is_non_empty() {
 }
 
 #[test]
+fn write_file_creates_missing_file_with_add_patch_events() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+
+    let execution = registry
+        .execute(
+            "write_file",
+            &json!({"path": "created.txt", "content": "fresh\n"}),
+        )
+        .expect("create patch");
+
+    assert_eq!(execution.output, "created created.txt");
+    let patch = execution.patch.expect("patch event");
+    assert_eq!(patch.origin, "write_file");
+    assert_eq!(patch.action, "add");
+    assert_eq!(patch.before, "");
+    assert_eq!(patch.after, "fresh\n");
+    assert_eq!(patch.before_sha256, None);
+    assert_eq!(patch.before_byte_len, 0);
+    assert_eq!(patch.after_byte_len, 6);
+    registry.apply_patch(&patch).expect("apply patch");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("created.txt")).expect("created file"),
+        "fresh\n"
+    );
+}
+
+#[test]
+fn write_file_rejects_existing_file_without_writing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "existing").expect("fixture");
+    let registry = ToolRegistry::new(temp.path());
+
+    let error = registry
+        .execute(
+            "write_file",
+            &json!({"path": "note.txt", "content": "clobber"}),
+        )
+        .expect_err("existing file rejected");
+
+    assert!(matches!(error, ToolError::FileAlreadyExists));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("note.txt")).expect("read fixture"),
+        "existing"
+    );
+}
+
+#[test]
+fn write_file_rejects_missing_parent_directory() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+
+    let error = registry
+        .execute(
+            "write_file",
+            &json!({"path": "missing/created.txt", "content": "fresh"}),
+        )
+        .expect_err("missing parent rejected");
+
+    assert!(matches!(error, ToolError::ParentDirectoryMissing));
+    assert!(!temp.path().join("missing").exists());
+}
+
+#[test]
+fn write_file_rejects_absolute_and_traversal_paths_without_writing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let absolute = std::env::temp_dir()
+        .join("anything.txt")
+        .to_string_lossy()
+        .into_owned();
+
+    let absolute_error = registry
+        .execute("write_file", &json!({"path": absolute, "content": "x"}))
+        .expect_err("absolute create rejected");
+    let traversal_error = registry
+        .execute(
+            "write_file",
+            &json!({"path": "../escape.txt", "content": "x"}),
+        )
+        .expect_err("traversal create rejected");
+
+    assert!(matches!(
+        absolute_error,
+        ToolError::PathOutsideWorkspace {
+            reason: "absolute paths are not allowed",
+            ..
+        }
+    ));
+    assert!(matches!(
+        traversal_error,
+        ToolError::PathOutsideWorkspace {
+            reason: "path escapes the workspace root",
+            ..
+        }
+    ));
+    assert!(!temp
+        .path()
+        .parent()
+        .expect("tempdir parent")
+        .join("escape.txt")
+        .exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn write_file_rejects_create_through_symlink_escape() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let outside = tempfile::tempdir().expect("outside dir");
+    symlink(outside.path(), temp.path().join("outside")).expect("symlink");
+    let registry = ToolRegistry::new(temp.path());
+
+    let error = registry
+        .execute(
+            "write_file",
+            &json!({"path": "outside/created.txt", "content": "fresh"}),
+        )
+        .expect_err("escape rejected");
+
+    assert!(matches!(
+        error,
+        ToolError::PathOutsideWorkspace {
+            reason: "path escapes the workspace root",
+            ..
+        }
+    ));
+    assert!(!outside.path().join("created.txt").exists());
+}
+
+#[test]
+fn write_file_requires_fs_write_capability() {
+    let registry = ToolRegistry::new(".");
+
+    assert_eq!(
+        registry.required_capability("write_file"),
+        Some(Capability::FsWrite)
+    );
+}
+
+#[test]
+fn model_tools_includes_write_file_with_create_only_semantics() {
+    let registry = ToolRegistry::new(".");
+    let write_file = registry
+        .model_tools()
+        .into_iter()
+        .find(|tool| tool.name == "write_file")
+        .expect("write_file schema");
+
+    assert!(write_file.description.contains("Create a new"));
+    assert!(write_file
+        .description
+        .contains("Fails if the file already exists"));
+    assert_eq!(
+        write_file.parameters["required"],
+        json!(["path", "content"])
+    );
+    assert_eq!(write_file.parameters["additionalProperties"], json!(false));
+}
+
+#[test]
 fn apply_patch_add_file_creates_missing_file() {
     let temp = tempfile::tempdir().expect("temp dir");
     let registry = ToolRegistry::new(temp.path());

@@ -130,7 +130,10 @@ pub(crate) fn is_patch_permission(request: &PermissionRequest) -> bool {
     let Some(tool_name) = request.reason.strip_prefix("tool ") else {
         return false;
     };
-    matches!(tool_name, "edit_file" | "apply_patch" | "apply-patch")
+    matches!(
+        tool_name,
+        "edit_file" | "write_file" | "apply_patch" | "apply-patch"
+    )
 }
 
 pub(crate) fn preview_from_events(events: &[EventEnvelope]) -> PatchPreview {
@@ -430,6 +433,14 @@ fn preview_from_tool_event(event: &EventEnvelope) -> PatchPreview {
                 path: path.to_owned(),
                 old: old.to_owned(),
                 new: new.to_owned(),
+            },
+            _ => fallback("Patch details are malformed or empty."),
+        },
+        Some("write_file") => match (field("path"), field("content")) {
+            (Some(path), Some(content)) => PatchPreview::Diff {
+                path: path.to_owned(),
+                old: String::new(),
+                new: content.to_owned(),
             },
             _ => fallback("Patch details are malformed or empty."),
         },

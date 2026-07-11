@@ -25,6 +25,7 @@ the context-engineering principle above.
 |---|---|---|
 | `read_file` | FsRead | Relative path; optional line offset / max_bytes / max_lines |
 | `edit_file` | FsWrite | Single exact replacement |
+| `write_file` | FsWrite | Create a new file from plain `{path, content}` — no patch dialect. Create-only: fails if the file exists (use `edit_file`/`apply_patch` to modify) or the parent directory is missing. Emits the same `patch.proposed`/`patch.applied`/`file.change`/`file.diff` provenance as the add path of `apply_patch`. |
 | `apply_patch` | FsWrite | Structured single-file patch |
 | `run_shell` | ShellExec | Workspace root; timeout bounds |
 | `git_status` / `git_diff` | FsRead | Short workspace git views |
