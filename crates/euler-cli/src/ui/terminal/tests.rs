@@ -2212,6 +2212,53 @@ mod terminal_tests {
         );
     }
 
+    #[test]
+    fn trailing_fill_spans_paint_via_erase_not_literal_spaces() {
+        // Buffer-hygiene: artifact cards pad body rows to the card edge.
+        // Printing that padding as literal spaces bakes it into the
+        // terminal's stored rows; reflowing terminals then rejoin the space
+        // run into logical lines on the next width change. Fill must go out
+        // as ECH (erase characters, BCE-colored blank cells), which reflow
+        // drops.
+        let backend = VT100Backend::new(30, 3);
+        let mut terminal = InlineTerminal::new(backend, 3).expect("inline terminal");
+        terminal
+            .draw_visual_frame(&VisualCanvasFrame {
+                active_frame_lines: vec![
+                    CanvasLine::from_spans(vec![
+                        CanvasSpan::new("artifact-body", TextRole::Plain),
+                        CanvasSpan::new("        ", TextRole::Plain),
+                    ]),
+                    CanvasLine::plain("status"),
+                ],
+                cursor: None,
+                required_height: 2,
+                history_rows: 0,
+                history_item_offsets: Vec::new(),
+                prefer_stable_height: false,
+                committable_rows: 0,
+                pinned_rows: 0,
+            })
+            .expect("draw padded row");
+
+        let raw = terminal.backend().raw_output().to_vec();
+        assert!(
+            raw.windows(b"\x1b[8X\x1b[8C".len())
+                .any(|window| window == b"\x1b[8X\x1b[8C"),
+            "trailing fill must be painted with ECH, not printed spaces: {raw:?}"
+        );
+        assert!(
+            !raw.windows(b"artifact-body        ".len())
+                .any(|window| window == b"artifact-body        ".as_slice()),
+            "literal padding spaces must not be written after content: {raw:?}"
+        );
+        let screen = terminal.backend().screen_rows();
+        assert!(
+            screen.iter().any(|row| row.contains("artifact-body")),
+            "content still renders: {screen:?}"
+        );
+    }
+
     fn row_containing(rows: &[String], needle: &str) -> usize {
         rows.iter()
             .position(|row| row.contains(needle))
