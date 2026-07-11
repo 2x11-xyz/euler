@@ -302,8 +302,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 );
             }
             TranscriptItem::Exploration { summaries } => {
-                let rows =
-                    exploration_detail_rows(&super::coalesced_exploration_summaries(summaries));
+                let rows = super::coalesced_exploration_summaries(summaries);
                 let header = tool_group_header("explore", rows.len(), entry.timing.as_ref());
                 push_cell_parent(&mut lines, &header, theme.transcript.tool, theme, width);
                 push_child_rows(&mut lines, &rows, theme.transcript.muted, theme, width);
@@ -694,44 +693,6 @@ fn step_count_label(steps: usize) -> String {
     }
 }
 
-fn exploration_detail_rows(rows: &[String]) -> Vec<String> {
-    let parsed = rows
-        .iter()
-        .map(|row| split_exploration_row(row))
-        .collect::<Vec<_>>();
-    let verb_width = parsed
-        .iter()
-        .map(|(verb, _)| verb.chars().count())
-        .max()
-        .unwrap_or(0);
-    parsed
-        .into_iter()
-        .map(|(verb, detail)| aligned_exploration_row(&verb, &detail, verb_width))
-        .collect()
-}
-
-fn split_exploration_row(row: &str) -> (String, String) {
-    for (prefix, verb) in [
-        ("Read ", "Read"),
-        ("Git ", "Git"),
-        ("List ", "List"),
-        ("Search ", "Search"),
-    ] {
-        if let Some(detail) = row.strip_prefix(prefix) {
-            return (verb.to_owned(), detail.to_owned());
-        }
-    }
-    ("Tool".to_owned(), row.to_owned())
-}
-
-fn aligned_exploration_row(verb: &str, detail: &str, verb_width: usize) -> String {
-    if detail.is_empty() {
-        verb.to_owned()
-    } else {
-        format!("{verb:<width$} {detail}", width = verb_width)
-    }
-}
-
 /// v2 anchor spine: glyph + style for an event's first row (§1). `None`
 /// keeps the blank spine (separators have no anchor). Every anchor glyph —
 /// including the user-message rail — sits flush in this same slot (review
@@ -1090,7 +1051,10 @@ mod tests {
     fn exploration_group_header_carries_steps_elapsed_and_tree_children() {
         let entries = vec![ProjectedEntry {
             item: TranscriptItem::Exploration {
-                summaries: vec!["Read Cargo.toml".to_owned(), "Git diff".to_owned()],
+                summaries: vec![
+                    "read Cargo.toml · 12 lines".to_owned(),
+                    "git diff".to_owned(),
+                ],
             },
             timing: Some(EventTiming {
                 absolute: "12:00:06".to_owned(),
@@ -1111,15 +1075,24 @@ mod tests {
         });
         let text = plain_text(&lines);
 
+        // Lowercase verbs, single space, per-step result data (design review
+        // v3 §R3) — not the old capitalized, double-spaced alignment bug.
         assert!(text.contains("explore · 2 steps · 6s"), "text: {text:?}");
-        assert!(text.contains("├ Read Cargo.toml"), "text: {text:?}");
-        assert!(text.contains("└ Git  diff"), "text: {text:?}");
-        assert!(!text.contains("└ Read Cargo.toml"), "text: {text:?}");
-        assert!(!text.contains("├ Git  diff"), "text: {text:?}");
+        assert!(
+            text.contains("├ read Cargo.toml · 12 lines"),
+            "text: {text:?}"
+        );
+        assert!(text.contains("└ git diff"), "text: {text:?}");
+        assert!(!text.contains("└ read Cargo.toml"), "text: {text:?}");
+        assert!(!text.contains("├ git diff"), "text: {text:?}");
+        assert!(!text.contains("git  diff"), "text: {text:?}");
     }
 
     #[test]
-    fn successful_shell_output_promotes_informative_result_line() {
+    fn successful_shell_output_keeps_summary_tail_in_head_tail_preview() {
+        // v4 amendment: the collapsed preview is the literal head + tail of
+        // the buffer in buffer order — test summaries live in the tail, so
+        // they stay visible without any informative-line promotion.
         let item = TranscriptItem::ToolRun {
             command: "cargo test".to_owned(),
             ok: true,
@@ -1138,9 +1111,12 @@ mod tests {
         let text = plain_text(&lines);
 
         assert!(
-            text.contains("test result: ok. 12 passed; 0 failed")
+            text.contains("└ line 1")
+                && text.contains("line 2")
+                && text.contains("… 2 more lines · ctrl+o expand")
+                && text.contains("test result: ok. 12 passed; 0 failed")
                 && text.contains("tail 2")
-                && !text.contains("line 1"),
+                && !text.contains("line 3"),
             "text: {text:?}"
         );
     }

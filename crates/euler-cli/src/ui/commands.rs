@@ -12,6 +12,11 @@ pub struct CommandSpec {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CommandContext {
     pub model_choices: Vec<ModelChoice>,
+    /// Same shape as `model_choices`, filtered to providers whose auth
+    /// `ProviderSet::is_authenticated` accepts today. Feeds the
+    /// `/code-swarm` reviewer-model picker so it cannot offer a target that
+    /// only fails once a spawn slot is already spent (#58).
+    pub code_swarm_model_choices: Vec<ModelChoice>,
     pub effort_choices: Vec<EffortChoice>,
     pub theme_choices: Vec<ThemeChoiceItem>,
     pub resume_items: Vec<ResumeItem>,
@@ -818,7 +823,7 @@ fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffe
     }
     let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
         return CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
-            choices: context.model_choices.clone(),
+            choices: context.code_swarm_model_choices.clone(),
             selected: context.code_swarm_models.clone(),
         });
     };
@@ -1413,13 +1418,18 @@ mod tests {
     }
 
     fn code_swarm_context(enabled: bool) -> CommandContext {
+        let model_choices = vec![
+            ModelChoice::new("openrouter", "z-ai/glm-5.2"),
+            ModelChoice::new("anthropic", "claude-opus-5"),
+            ModelChoice::new("openai", "gpt-5.5"),
+            ModelChoice::new("mistral", "large-3"),
+        ];
         CommandContext {
-            model_choices: vec![
-                ModelChoice::new("openrouter", "z-ai/glm-5.2"),
-                ModelChoice::new("anthropic", "claude-opus-5"),
-                ModelChoice::new("openai", "gpt-5.5"),
-                ModelChoice::new("mistral", "large-3"),
-            ],
+            // All four are "authenticated" in this fixture; the filtering
+            // behavior itself is covered by the dedicated picker-filter test
+            // below.
+            code_swarm_model_choices: model_choices.clone(),
+            model_choices,
             extension_items: vec![ExtensionManagerItem {
                 id: "code-swarm".to_owned(),
                 display_name: "CodeSwarm Review".to_owned(),
@@ -1442,6 +1452,22 @@ mod tests {
             CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels { choices, selected }) => {
                 assert_eq!(choices.len(), 4);
                 assert!(selected.is_empty());
+            }
+            other => panic!("expected picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_swarm_picker_uses_authenticated_choices_not_all_model_choices() {
+        // #58: the picker must not offer a provider that will burn a spawn
+        // slot to discover it isn't authenticated. code_swarm_model_choices
+        // is the pre-filtered list; the picker must read that field, not the
+        // unfiltered model_choices.
+        let mut context = code_swarm_context(true);
+        context.code_swarm_model_choices = vec![ModelChoice::new("openai", "gpt-5.5")];
+        match dispatch_command("/code-swarm", &context) {
+            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels { choices, .. }) => {
+                assert_eq!(choices, vec![ModelChoice::new("openai", "gpt-5.5")]);
             }
             other => panic!("expected picker, got {other:?}"),
         }

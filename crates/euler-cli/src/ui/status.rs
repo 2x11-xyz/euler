@@ -54,6 +54,10 @@ pub struct StatusSnapshot {
     /// `None` until named — unnamed sessions show nothing in the footer.
     pub session_name: Option<String>,
     pub extension_slots: StatusSlots,
+    /// Non-default permission reviewer label (ADR 0011): `Some("guardian")`
+    /// when the guardian reviews asks; `None` for the default user reviewer.
+    /// Surfaced by `/status`, not the footer.
+    pub permission_reviewer: Option<String>,
 }
 
 impl StatusSnapshot {
@@ -67,6 +71,7 @@ impl StatusSnapshot {
             git_branch: None,
             session_name: None,
             extension_slots: StatusSlots::default(),
+            permission_reviewer: None,
         }
     }
 }
@@ -739,6 +744,26 @@ mod tests {
         assert!(rendered.contains("/ commands · …/2x11/euler (main)"));
         assert!(rendered.ends_with("echo · ctx ?%"));
         assert!(display_width(&rendered) < 49);
+    }
+
+    /// Issue #59: a narrower budget that no longer fits the `2x11` component
+    /// must drop that whole component and land on the next `/` boundary
+    /// (`…/euler`), never bisect it (`…11/euler`).
+    #[test]
+    fn narrow_width_truncates_directory_at_component_boundary_not_mid_component() {
+        let mut snapshot =
+            StatusSnapshot::new("fixture", "echo", PathBuf::from("/Users/x/code/2x11/euler"));
+        snapshot.git_branch = Some("main".to_owned());
+        let tokens = TokenUsageSnapshot::default();
+
+        // 4 cells narrower than the `…/2x11/euler` case above — exactly
+        // enough budget for the pre-fix raw cut to land inside "2x11"
+        // ("11/euler"); the fix must sacrifice the whole component instead.
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 45);
+
+        assert!(rendered.contains("/ commands · …/euler (main)"));
+        assert!(!rendered.contains("11/euler"));
+        assert!(display_width(&rendered) < 45);
     }
 
     /// Footer §4 (v4 dogfood): once the right cluster grows (model · ctx ·

@@ -61,7 +61,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 #[cfg(test)]
 use ratatui::Frame;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
@@ -70,6 +70,12 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Trailing debounce for the post-resize history replay. Matches the
+/// terminal's RESIZE_COMMIT_QUIESCENCE so there is exactly one notion of
+/// "the resize has settled": long enough that even slow PTY delivery of a
+/// drag's ticks coalesces into a single purge+replay, short enough to feel
+/// immediate once the user lets go.
+const RESIZE_REPLAY_DEBOUNCE: Duration = Duration::from_millis(450);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
@@ -140,6 +146,12 @@ pub struct App {
     _terminal_session: TerminalSession,
     event_loop: EventLoop,
     core: AppCore,
+    /// Trailing-debounce deadline for the post-resize history replay: every
+    /// resize event pushes it out, so a drag settles into exactly ONE
+    /// purge+replay at the final width instead of appending a fossil copy of
+    /// the transcript to scrollback per width tick (issue #38; mechanism
+    /// adopted from codex's resize reflow).
+    resize_replay_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -164,6 +176,12 @@ pub struct AppCore {
     reply_tx: Sender<PermissionReply>,
     bottom: BottomSurface,
     status: StatusSnapshot,
+    /// Last-known authenticated provider ids, refreshed whenever the session
+    /// is Idle (construction, turn completion). Bottom-surface rebuilds that
+    /// happen while the session is checked out onto the worker thread reuse
+    /// this snapshot so the reviewer-model picker never silently shrinks to
+    /// empty because of turn state.
+    authenticated_providers: BTreeSet<String>,
     model_catalog: MergedModelCatalog,
     session_store: Option<SessionStore>,
     active_session_home_managed: bool,
@@ -329,6 +347,7 @@ impl App {
             _terminal_session: terminal_session,
             event_loop,
             core,
+            resize_replay_deadline: None,
         })
     }
 
@@ -341,7 +360,23 @@ impl App {
             if self.drain_actions()? {
                 return Ok(());
             }
+            self.flush_resize_replay()?;
         }
+    }
+
+    /// Run the debounced post-resize replay once the deadline passes with no
+    /// further resize events: purge euler-emitted scrollback and re-emit the
+    /// transcript from the event log at the settled width (exactly one copy).
+    fn flush_resize_replay(&mut self) -> Result<()> {
+        let due = self
+            .resize_replay_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !due {
+            return Ok(());
+        }
+        self.resize_replay_deadline = None;
+        self.core.invalidate_history_cache();
+        self.replay_history(true)
     }
 
     fn poll_background(&mut self) {
@@ -372,9 +407,14 @@ impl App {
     }
 
     fn poll_timeout(&self) -> Duration {
-        self.event_loop
+        let mut timeout = self
+            .event_loop
             .poll_timeout(Instant::now())
-            .min(WORKER_POLL_INTERVAL)
+            .min(WORKER_POLL_INTERVAL);
+        if let Some(deadline) = self.resize_replay_deadline {
+            timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        timeout
     }
 
     fn poll_terminal(&mut self, timeout: Duration) -> Result<()> {
@@ -442,14 +482,17 @@ impl App {
             }
             UiAction::Resize { .. } => {
                 metrics::record(metrics::Metric::ResizeAction);
-                // No replay, no scrollback purge: rows already in native
-                // scrollback stay untouched (re-purging duplicated them in
-                // 3J-ignoring terminals and destroyed them in honoring ones —
-                // the P1 audit finding). The canvas re-renders at the new
-                // width and the terminal remaps its committed boundary by
-                // item identity (commit_scrolled_history width branch).
+                // Intermediate ticks are cheap: re-render the live viewport
+                // at the new width and leave scrollback alone. The real
+                // reconciliation is a SINGLE purge+replay at the settled
+                // width, scheduled with a trailing debounce below — the
+                // per-tick variants (purge every tick, or never purge) both
+                // corrupted real terminals (review v3 §R2: Ghostty, iTerm2,
+                // and Terminal.app all accumulated one fossil re-render per
+                // width step).
                 self.core.invalidate_history_cache();
                 self.render_frame()?;
+                self.resize_replay_deadline = Some(Instant::now() + RESIZE_REPLAY_DEBOUNCE);
                 return Ok(false);
             }
             UiAction::Render(_) => {
@@ -612,6 +655,7 @@ struct AppCoreBootstrap {
     status: StatusSnapshot,
     initial_token_usage: TokenUsageSnapshot,
     initial_context: super::commands::CommandContext,
+    authenticated_providers: BTreeSet<String>,
 }
 
 fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> AppCoreBootstrap {
@@ -658,10 +702,12 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         ),
         ..TokenUsageSnapshot::default()
     };
+    let authenticated_providers = session.providers().authenticated_provider_ids();
     let initial_context = command_context(
         &model_catalog,
         &target.provider,
         &target.model,
+        &authenticated_providers,
         empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
     );
     AppCoreBootstrap {
@@ -679,6 +725,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         status,
         initial_token_usage,
         initial_context,
+        authenticated_providers,
     }
 }
 
@@ -709,6 +756,7 @@ impl AppCore {
             status,
             initial_token_usage,
             initial_context,
+            authenticated_providers,
         } = boot;
         Self {
             state: AppState::Idle {
@@ -718,6 +766,7 @@ impl AppCore {
             reply_tx: channels.reply_tx,
             bottom: BottomSurface::new(initial_context),
             status,
+            authenticated_providers,
             model_catalog,
             session_store,
             active_session_home_managed,
@@ -770,6 +819,7 @@ impl AppCore {
     }
 
     fn rebuild_bottom_surface(&mut self) {
+        self.refresh_authenticated_providers();
         let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
@@ -784,11 +834,13 @@ impl AppCore {
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
+            &self.authenticated_providers,
             parts,
         ));
     }
 
     fn replace_bottom_surface_for_session(&mut self) {
+        self.refresh_authenticated_providers();
         let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
@@ -803,8 +855,19 @@ impl AppCore {
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
+            &self.authenticated_providers,
             parts,
         ));
+    }
+
+    /// Recomputes the authenticated-provider snapshot when the session is on
+    /// this thread (Idle). While a turn is in flight the session lives on the
+    /// worker thread, so rebuilds keep the last-known snapshot instead of
+    /// degrading the reviewer-model picker to an empty list.
+    fn refresh_authenticated_providers(&mut self) {
+        if let AppState::Idle { session } = &self.state {
+            self.authenticated_providers = session.providers().authenticated_provider_ids();
+        }
     }
 
     fn current_checkpoint_items(&self) -> Vec<crate::ui::commands::CheckpointItem> {
