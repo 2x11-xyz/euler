@@ -2901,7 +2901,9 @@ fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
         panic!("model picker should own surface");
     };
     let rendered = picker.render_lines(80).join("\n");
-    assert!(rendered.contains("anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
+    // claude-fable-5 sorts first in the (now 14-entry) anthropic list, so it
+    // is the anthropic model guaranteed inside the picker's render window.
+    assert!(rendered.contains("anthropic::claude-fable-5 — 1M ctx, reasoning"));
     assert_eq!(picker.selected_index(), 0);
 
     core.handle_input(key(KeyCode::Down));
@@ -2922,7 +2924,7 @@ fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
         panic!("model picker should own surface");
     };
     let rendered = picker.render_lines(80).join("\n");
-    assert!(rendered.contains("chatgpt::gpt-5.5 — 1.05M ctx, reasoning ✓"));
+    assert!(rendered.contains("chatgpt::gpt-5.5 — 272K ctx, reasoning ✓"));
 }
 
 #[test]
