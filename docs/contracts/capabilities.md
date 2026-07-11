@@ -75,6 +75,12 @@ use. Rules (normative; enforced in code, not only in the guardian prompt):
 - Every guardian decision is a `permission.decision` event tagged
   `decision_source: "guardian"` with the verdict fields (events contract);
   automated decisions are always distinguishable from user decisions.
+- Headless `exec`: auto-approve tiers leave no capability in `ask` mode, so
+  configuring the guardian returns `fs-write` and `shell-exec` to `ask` —
+  every use is guardian-reviewed, overriding the tier for those two
+  capabilities in both directions (read-only's always-deny and
+  trusted-local's session-allow). A guardian abstain then hits the headless
+  decider's unconditional deny (fail closed; no prompt exists).
 
 ## Extension capability approval
 
