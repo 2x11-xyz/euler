@@ -1784,7 +1784,17 @@ impl<D: PermissionDecider> Session<D> {
             .required_capability_for_input(&call.name, &call.input)
         {
             if turn_state.denied(capability) {
-                self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
+                self.emit_permission_denied_tool_result(
+                    call,
+                    tool_call_event_id,
+                    &format!(
+                        "permission denied: {} was denied earlier this turn and \
+                         remains denied for the rest of it — do not retry {} \
+                         commands; use a different tool or ask the user",
+                        capability.as_str(),
+                        capability.as_str()
+                    ),
+                )?;
                 return Ok(());
             }
             let mut request = permission_request_for_tool(
@@ -1848,7 +1858,17 @@ impl<D: PermissionDecider> Session<D> {
                 );
                 if !allowed {
                     turn_state.record_denial(capability);
-                    self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
+                    self.emit_permission_denied_tool_result(
+                        call,
+                        tool_call_event_id,
+                        &format!(
+                            "permission denied by the user; {} is denied for \
+                             the rest of this turn — do not retry {} commands; \
+                             use a different tool or ask the user",
+                            capability.as_str(),
+                            capability.as_str()
+                        ),
+                    )?;
                     return Ok(());
                 }
             }
@@ -1974,10 +1994,14 @@ impl<D: PermissionDecider> Session<D> {
         Ok(())
     }
 
+    /// The error text is what the model reads next round: it must teach that
+    /// the denial is turn-scoped so the model pivots instead of probing
+    /// twelve command variants against a dead capability (issue #63).
     fn emit_permission_denied_tool_result(
         &mut self,
         call: ToolCall,
         tool_call_event_id: String,
+        error: &str,
     ) -> Result<String, SessionError> {
         self.emit_with_parent(
             EventKind::TOOL_RESULT,
@@ -1985,7 +2009,7 @@ impl<D: PermissionDecider> Session<D> {
                 ("id", call.id.into()),
                 ("name", call.name.into()),
                 ("ok", false.into()),
-                ("error", "permission denied".into()),
+                ("error", error.into()),
             ]),
             Some(tool_call_event_id),
         )

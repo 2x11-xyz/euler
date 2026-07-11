@@ -1,7 +1,7 @@
 use super::patch_diff::{self, PatchDisplay};
 use super::text::{display_width, wrap_text};
 use super::theme::Theme;
-use euler_core::grants::command_first_token;
+use euler_core::grants::{command_first_token, shell_command_is_simple};
 use euler_core::permissions::PermissionRequest;
 use euler_core::{parse_single_file_apply_patch, ApplyPatchDocument};
 use euler_event::{EventEnvelope, EventKind};
@@ -226,6 +226,11 @@ pub(crate) fn consequences_row(preview: &PatchPreview, prior_count: usize) -> Op
 /// workspace-relative directory. Returns `None` when derivation is not possible
 /// (caller falls back to unscoped and labels honestly).
 pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String> {
+    if request.command_truncated {
+        // A truncated command can never satisfy scoped matching (the full
+        // string may differ past the bound) — offer only unscoped options.
+        return None;
+    }
     match request.capability {
         Capability::ShellExec => request.command.as_deref().and_then(derive_shell_prefix),
         Capability::FsWrite => request.path.as_deref().and_then(derive_edit_prefix),
@@ -234,6 +239,14 @@ pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String>
 }
 
 pub(crate) fn derive_shell_prefix(command: &str) -> Option<String> {
+    // Scoped shell grants never cover compound commands (control operators,
+    // substitution, redirection — the gate matches what `sh -c` actually
+    // executes). Offering a token scope for a compound command is dishonest:
+    // the grant could not even cover a rerun of this command. Compound
+    // commands get the unscoped (whole-capability) options instead.
+    if !shell_command_is_simple(command) {
+        return None;
+    }
     command_first_token(command).map(str::to_owned)
 }
 
@@ -266,6 +279,10 @@ pub(crate) fn approval_option_lines(
         Some(prefix) => (
             format!("a  Allow {prefix} * for this session"),
             format!("p  Allow {prefix} * in this project"),
+        ),
+        None if capability == "shell-exec" => (
+            "a  Allow all shell commands for this session".to_owned(),
+            "p  Allow all shell commands in this project".to_owned(),
         ),
         None => (
             format!("a  Allow {capability} for this session"),

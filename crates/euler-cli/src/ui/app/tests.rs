@@ -3925,13 +3925,11 @@ fn rejecting_patch_permission_does_not_apply_patch_and_turn_continues() {
         .iter()
         .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
         .expect("tool result");
-    assert_eq!(
-        result
-            .payload
-            .get("error")
-            .and_then(serde_json::Value::as_str),
-        Some("permission denied")
-    );
+    assert!(result
+        .payload
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|error| error.starts_with("permission denied")));
     assert!(core
         .transcript
         .items()
