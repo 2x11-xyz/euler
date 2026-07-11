@@ -217,10 +217,41 @@ pub(crate) fn parse_guardian_verdict(output: &str) -> Option<GuardianVerdict> {
     serde_json::from_str(&trimmed[start..=end]).ok()
 }
 
+/// Whether the guardian can adjudicate this request at all (ADR 0011
+/// amendment 2026-07-11, security review F3): the task brief must embed the
+/// EXACT action that will execute. Two layers can misrepresent it —
+/// [`PermissionRequest`] retention truncated the command, or the brief's own
+/// field bound would alter it — and the pending tool call is not guaranteed
+/// to appear in the guardian's canvas, so the brief is the only guaranteed
+/// channel. When either layer would alter the command (or an fs-write path),
+/// the guardian is NOT consulted and the ask goes straight to the human
+/// decider, who can see the full context the guardian cannot. This is
+/// fail-to-human, not deny: the request itself is not evidence of anything
+/// beyond being too large to brief. The `reason` field is advisory metadata,
+/// not the action, and may still be bounded.
+pub(crate) fn adjudicates_verbatim(request: &PermissionRequest) -> bool {
+    if request.command_truncated {
+        return false;
+    }
+    if request
+        .command
+        .as_deref()
+        .is_some_and(|command| command.len() > MAX_TASK_FIELD_BYTES)
+    {
+        return false;
+    }
+    request
+        .path
+        .as_deref()
+        .is_none_or(|path| path.to_string_lossy().len() <= MAX_TASK_FIELD_BYTES)
+}
+
 /// Companion task for one permission review: empty capability set (the
 /// guardian cannot act), one model round, zero tool calls (no tools are
 /// advertised), inherited provider/model. The session canvas the guardian
 /// sees is the transcript; the task carries the exact request under review.
+/// Callers gate on [`adjudicates_verbatim`], so the field bounds below never
+/// alter the command or path for a consulted guardian (belt and suspenders).
 pub(crate) fn guardian_task(request: &PermissionRequest) -> Result<AgentTask, AgentError> {
     // `new_inheriting_target` starts with an empty capability set; the
     // guardian deliberately never widens it.
@@ -540,6 +571,50 @@ mod tests {
         assert!(task.task().contains("capability: shell-exec"));
         assert!(task.task().contains("command: rm -rf /tmp/scratch"));
         assert!(task.system_prompt().expect("prompt").contains("guardian"));
+    }
+
+    #[test]
+    fn verbatim_gate_rejects_truncated_and_overlong_requests() {
+        // ADR 0011 amendment (security review F3): the guardian adjudicates
+        // only requests whose exact action fits its brief.
+        let short = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(adjudicates_verbatim(&short));
+
+        // Longer than the brief field bound but not request-truncated: the
+        // brief's own bounding would alter the command.
+        let overlong = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command(format!("echo {}", "a".repeat(MAX_TASK_FIELD_BYTES)));
+        assert!(!overlong.command_truncated);
+        assert!(!adjudicates_verbatim(&overlong));
+
+        // Truncated at the request retention bound.
+        let truncated = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command(format!("echo {}", "a".repeat(8 * 1024)));
+        assert!(truncated.command_truncated);
+        assert!(!adjudicates_verbatim(&truncated));
+
+        // Overlong fs-write paths would be altered by the brief bound too.
+        let long_path = PermissionRequest::new(Capability::FsWrite, "tool edit_file")
+            .with_path(format!("src/{}.rs", "a".repeat(MAX_TASK_FIELD_BYTES)));
+        assert!(!adjudicates_verbatim(&long_path));
+
+        // Ordinary fs-write and commandless asks stay adjudicable.
+        let write =
+            PermissionRequest::new(Capability::FsWrite, "tool edit_file").with_path("src/lib.rs");
+        assert!(adjudicates_verbatim(&write));
+    }
+
+    #[test]
+    fn guardian_brief_embeds_exact_command_for_verbatim_requests() {
+        // A consulted guardian must see the command exactly as it will
+        // execute — the brief bound must be a no-op for gated requests.
+        let command = format!("echo {}", "a".repeat(1024));
+        let request =
+            PermissionRequest::new(Capability::ShellExec, "tool run_shell").with_command(&command);
+        assert!(adjudicates_verbatim(&request));
+        let task = guardian_task(&request).expect("task");
+        assert!(task.task().contains(&format!("command: {command}\n")));
     }
 
     #[test]

@@ -2063,7 +2063,14 @@ impl<D: PermissionDecider> Session<D> {
             None
         };
         let decision_parent = prompt_id.unwrap_or_else(|| tool_call_event_id.to_owned());
-        if needs_prompt && self.config.permission_reviewer == PermissionReviewer::Guardian {
+        // A non-verbatim-briefable request (truncated command / over-bound
+        // field) never consults the guardian — adjudicating a command it
+        // cannot see exactly would judge a lie (ADR 0011 amendment, security
+        // review F3). The ask goes to the human decider below instead.
+        if needs_prompt
+            && self.config.permission_reviewer == PermissionReviewer::Guardian
+            && guardian::adjudicates_verbatim(request)
+        {
             if let Some(ruling) =
                 self.guardian_permission_ruling(request, &decision_parent, sink, turn_state)?
             {

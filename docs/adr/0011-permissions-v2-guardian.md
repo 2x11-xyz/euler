@@ -86,3 +86,23 @@ Adopt three, defer one:
   (child-agent) asks are not guardian-routed; token budgets on the guardian
   task are structural (one round, no tools, bounded output bytes) rather
   than a token ceiling, because companion token budgets count canvas input.
+
+## Amendment (2026-07-11): the guardian adjudicates only commands it can see verbatim
+
+Security review finding (F3): the guardian task brief bounded the request
+command a second time (on top of the request-layer retention bound), and the
+pending tool call is not guaranteed to appear in the guardian's canvas — the
+canvas includes only selected tool call/result pairs. A guardian judging a
+doubly-bounded string can approve an action whose executing tail it never
+saw.
+
+Amended invariant: **the guardian's brief must embed the exact command (and
+fs-write path) that will execute.** If the request command was truncated at
+the retention bound, or the brief's own field bound would alter the command
+or path, the guardian is **not consulted** for that request: the ask falls
+through directly to the configured human decider, who can inspect the full
+context the guardian cannot. This is fail-to-human — distinct from the
+abstain flow in origin (the guardian never runs) though it resolves through
+the same decider fallback — and is enforced in code
+(`guardian::adjudicates_verbatim`), not in the prompt. The `reason` field
+remains advisory metadata and may still be bounded.

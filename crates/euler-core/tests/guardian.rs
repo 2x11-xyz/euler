@@ -349,6 +349,82 @@ fn guardian_abstain_falls_back_to_the_configured_decider() {
 }
 
 #[test]
+fn truncated_command_bypasses_guardian_and_asks_the_human() {
+    // ADR 0011 amendment (security review F3): the guardian adjudicates only
+    // commands it can see verbatim. A command truncated at the request
+    // retention bound must go straight to the human decider — the scripted
+    // provider holds NO verdict response, so a wrongly consulted guardian
+    // would consume the final assistant turn and fail this test.
+    let consulted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut long = String::from("echo ");
+    long.push_str(&"a".repeat(8 * 1024));
+    let (temp, mut session) = guardian_session(
+        vec![
+            FixtureResponse::ToolCalls(vec![shell_call("call-long", &long)]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ],
+        RecordingDecider {
+            verdict: DeciderVerdict::Allow,
+            consulted: consulted.clone(),
+        },
+    );
+
+    session.run_turn("echo a lot").expect("turn");
+
+    assert!(
+        consulted.get(),
+        "truncated commands must reach the human decider"
+    );
+    let decisions = events_of(session.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decisions.len(), 1);
+    assert!(
+        !decisions[0].payload.contains_key("decision_source"),
+        "the guardian must never rule on a truncated command"
+    );
+    assert_eq!(payload_str(decisions[0], "decision"), Some("allowed"));
+    assert_eq!(
+        events_of(session.events(), EventKind::PERMISSION_PROMPT).len(),
+        1
+    );
+    // No guardian companion ever spawned.
+    assert!(events_of(session.events(), EventKind::AGENT_SPAWN).is_empty());
+    let _ = temp;
+}
+
+#[test]
+fn overlong_brief_field_bypasses_guardian_and_asks_the_human() {
+    // Same invariant, second layer: a command below the retention bound but
+    // above the brief field bound would be altered by the brief itself.
+    // (An unknown binary, so the static-safe tier does not intercept the
+    // ask before the reviewer routing.)
+    let consulted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut long = String::from("definitely-not-a-binary ");
+    long.push_str(&"a".repeat(3 * 1024));
+    let (temp, mut session) = guardian_session(
+        vec![
+            FixtureResponse::ToolCalls(vec![shell_call("call-overlong", &long)]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ],
+        RecordingDecider {
+            verdict: DeciderVerdict::Allow,
+            consulted: consulted.clone(),
+        },
+    );
+
+    session.run_turn("echo a fair amount").expect("turn");
+
+    assert!(
+        consulted.get(),
+        "over-bound commands must reach the human decider"
+    );
+    let decisions = events_of(session.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decisions.len(), 1);
+    assert!(!decisions[0].payload.contains_key("decision_source"));
+    assert!(events_of(session.events(), EventKind::AGENT_SPAWN).is_empty());
+    let _ = temp;
+}
+
+#[test]
 fn guardian_spawn_failure_fails_closed_to_deny() {
     // No provenance writer: spawn_companion cannot record provenance and the
     // review must deny rather than fall back to the decider or allow.

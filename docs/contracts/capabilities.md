@@ -69,6 +69,11 @@ use. Rules (normative; enforced in code, not only in the guardian prompt):
 - Guardian allows are once-scoped; the guardian never installs session or
   project grants. Requests covered by existing grants run under those grants
   and are not guardian-reviewed.
+- The guardian adjudicates only requests it can see **verbatim** (ADR 0011
+  amendment): if the command was truncated at the retention bound, or the
+  task brief's own field bound would alter the command or path, the guardian
+  is never consulted — the ask goes directly to the human decider
+  (fail-to-human, enforced in code).
 - Denials inject guidance into the failed tool result telling the model not
   to work around the block. Three consecutive guardian denials in one turn
   interrupt the turn (circuit breaker).
