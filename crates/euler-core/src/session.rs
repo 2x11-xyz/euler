@@ -466,9 +466,13 @@ pub struct Session<D> {
     /// or the ledger (contract: secrets.md redaction rules; issue #56).
     redactor: SecretRedactor,
     tools: ToolRegistry,
-    /// Session-scoped (not turn-scoped like `TurnState`): context rot is a
-    /// session-length phenomenon, so a tool's failure streak must survive
-    /// turn boundaries until that tool succeeds.
+    /// Process-local runtime state (not turn-scoped like `TurnState`, and
+    /// NOT reconstructed from the event log): context rot is a session-length
+    /// phenomenon, so a tool's failure streak survives turn boundaries within
+    /// a live session until that tool succeeds. Resume and `into_fresh_session`
+    /// start with an empty tracker, so a session resumed mid-streak re-teaches
+    /// from rung 1 — accepted: the loop is a usability aid and a resume reset
+    /// costs at most one extra one-line error before re-escalation.
     tool_reteach: ReteachTracker,
     provenance: Option<Arc<ProvenanceWriter>>,
     persisted_events: usize,
@@ -803,6 +807,11 @@ impl<D> Session<D> {
     /// redaction minimum are ignored.
     pub fn add_redacted_secret(&mut self, value: impl Into<String>) {
         self.redactor.add_value(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reteach_streak_is_empty(&self) -> bool {
+        self.tool_reteach.is_empty()
     }
 
     pub fn extension_enabled(&self, id: &str) -> bool {

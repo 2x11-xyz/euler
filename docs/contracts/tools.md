@@ -34,11 +34,15 @@ both "never knew the format" and "forgot it to context rot".
 
 Semantics:
 
-- The failure streak is **per tool** and **session-scoped** (one streak set
+- The failure streak is **per tool** and **process-local** (one streak set
   per model context: the driver session and each companion track their own).
   A tool's success resets only that tool's streak; other tools' outcomes
   never touch it. An `apply_patch` heredoc intercepted from `run_shell`
   counts against (and re-teaches) `apply_patch`.
+- The streak is **live-session runtime state, not reconstructed from the
+  event log**: resume and `/new` start with an empty tracker, so a session
+  resumed mid-streak re-teaches from rung 1. Deliberate — the loop is a
+  usability aid, and a resume reset costs at most one extra one-line error.
 - Escalation is **deterministic**: the same failure sequence always yields
   the same error strings, so fixtures and resume replays stay stable.
 - The re-teach text is part of the ordinary `tool.result` error payload —

@@ -1992,6 +1992,39 @@ fn another_tools_success_between_apply_patch_failures_still_escalates() {
 }
 
 #[test]
+fn resume_starts_the_reteach_streak_empty() {
+    // Review finding: the streak is process-local runtime state, NOT
+    // reconstructed from the event log — a session resumed mid-streak
+    // re-teaches from rung 1. This pins that decided behavior so the
+    // contract and code cannot silently drift back to claiming the streak
+    // survives resume.
+    let (temp, mut session) = reteach_session(vec![
+        FixtureResponse::ToolCalls(vec![reteach_apply_patch_call("call-1", "not a patch")]),
+        FixtureResponse::Assistant("stopped".to_owned()),
+    ]);
+    session.run_turn("patch it").expect("turn");
+    let first = failed_tool_errors(session.events());
+    assert_eq!(first.len(), 1);
+    assert!(
+        !first[0].contains(RETEACH_MARKER),
+        "first failure is rung 1"
+    );
+    assert!(
+        !session.reteach_streak_is_empty(),
+        "the live session holds the apply_patch failure streak"
+    );
+
+    // into_fresh_session (the /new path, same code path resume rebuilds
+    // through) starts the tracker empty — the next failure would be rung 1.
+    let _ = &temp;
+    let fresh = session.into_fresh_session("resumed", ScriptedDecider::new(vec![]));
+    assert!(
+        fresh.reteach_streak_is_empty(),
+        "resume/new must start the reteach tracker empty (process-local)"
+    );
+}
+
+#[test]
 fn reteach_escalation_is_deterministic_across_sessions() {
     assert_eq!(
         run_two_bad_patches(),

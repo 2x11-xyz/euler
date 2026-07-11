@@ -117,6 +117,11 @@ impl ReteachTracker {
         self.consecutive_failures.remove(identity);
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.consecutive_failures.is_empty()
+    }
+
     fn record_failure(&mut self, identity: &str) -> u32 {
         let streak = self
             .consecutive_failures
