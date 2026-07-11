@@ -33,6 +33,12 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
     assert!(openrouter
         .models()
         .any(|model| model.id() == DEFAULT_OPENROUTER_MODEL));
+    // The router pseudo-model is only routable as `openrouter/auto`; a bare
+    // `auto` id was a PI-import artifact that 404s against the API.
+    assert!(openrouter
+        .models()
+        .any(|model| model.id() == "openrouter/auto"));
+    assert!(openrouter.models().all(|model| model.id() != "auto"));
 }
 
 #[test]

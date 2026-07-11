@@ -407,7 +407,6 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         64_000,
         false,
     ),
-    built_in_model("auto", "Auto", 2_000_000, 30_000, true),
     built_in_model(
         "bytedance-seed/seed-1.6",
         "ByteDance Seed: Seed 1.6",
