@@ -247,6 +247,7 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
                 .map(HomeSessionRefresh::session_store),
             extensions: run.extensions.clone(),
             observe: run.observe.clone(),
+            auth_file: run.auth_file.clone(),
         },
     )?;
     app.run()

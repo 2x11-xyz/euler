@@ -168,6 +168,11 @@ pub struct AppOptions {
     pub session_store: Option<SessionStore>,
     pub extensions: ExtensionSelection,
     pub observe: ObserveOptions,
+    /// `--auth-file` override from launch. In-app session resume must seed
+    /// secret redaction from the SAME credential store the launch used;
+    /// defaulting to the standard auth file would silently drop the
+    /// override's values from redaction (secrets contract).
+    pub auth_file: Option<PathBuf>,
 }
 
 pub struct AppCore {
@@ -251,6 +256,9 @@ pub struct AppCore {
     reasoning_tail_locked: bool,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
+    /// Launch `--auth-file` override; consulted when an in-app resume
+    /// re-seeds secret redaction (see [`AppOptions::auth_file`]).
+    auth_file: Option<PathBuf>,
     turn_event_start: usize,
     /// ctx input-token count when the current turn was spawned (review v3
     /// §R5(b)): compared against the count at turn end to decide whether
@@ -658,6 +666,7 @@ struct AppCoreBootstrap {
     session_store: Option<SessionStore>,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
+    auth_file: Option<PathBuf>,
     active_session_home_managed: bool,
     user_rules_enabled: bool,
     theme: Theme,
@@ -682,6 +691,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         session_store,
         extensions,
         observe,
+        auth_file,
         ..
     } = options;
     // v2 Warm Spine default: spine only; /timestamps opts the gutter in.
@@ -734,6 +744,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         session_store,
         extensions,
         observe,
+        auth_file,
         active_session_home_managed,
         user_rules_enabled,
         theme,
@@ -756,41 +767,23 @@ impl AppCore {
         options: AppOptions,
     ) -> Self {
         let boot = bootstrap_app_core(&session, options);
-        let AppCoreBootstrap {
-            session_id,
-            theme_choice,
-            theme_preference_path,
-            show_timestamp_gutter,
-            notifications_enabled,
-            model_catalog,
-            session_store,
-            extensions,
-            observe,
-            active_session_home_managed,
-            user_rules_enabled,
-            theme,
-            status,
-            initial_token_usage,
-            initial_context,
-            authenticated_providers,
-        } = boot;
         Self {
             state: AppState::Idle {
                 session: Box::new(session),
             },
             permission_rx: channels.request_rx,
             reply_tx: channels.reply_tx,
-            bottom: BottomSurface::new(initial_context),
-            status,
-            authenticated_providers,
-            model_catalog,
-            session_store,
-            active_session_home_managed,
-            user_rules_enabled,
-            token_usage: initial_token_usage,
+            bottom: BottomSurface::new(boot.initial_context),
+            status: boot.status,
+            authenticated_providers: boot.authenticated_providers,
+            model_catalog: boot.model_catalog,
+            session_store: boot.session_store,
+            active_session_home_managed: boot.active_session_home_managed,
+            user_rules_enabled: boot.user_rules_enabled,
+            token_usage: boot.initial_token_usage,
             transcript: TranscriptState::default(),
             visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner {
-                session_id: Some(session_id.clone()),
+                session_id: Some(boot.session_id),
             }]),
             visual_scroll_offset: 0,
             composer_navigation_width: 80,
@@ -805,10 +798,10 @@ impl AppCore {
             in_flight_error: None,
             tool_output_expanded: false,
             last_history_viewport: (0, 24),
-            theme,
-            theme_choice,
-            theme_preference_path,
-            show_timestamp_gutter,
+            theme: boot.theme,
+            theme_choice: boot.theme_choice,
+            theme_preference_path: boot.theme_preference_path,
+            show_timestamp_gutter: boot.show_timestamp_gutter,
             editor: Box::<SystemExternalEditor>::default(),
             clipboard: Box::<SystemClipboard>::default(),
             pending_runs: VecDeque::new(),
@@ -824,14 +817,15 @@ impl AppCore {
             current_phase_verb: None,
             reasoning_stream_tail: String::new(),
             reasoning_tail_locked: false,
-            extensions,
-            observe,
+            extensions: boot.extensions,
+            observe: boot.observe,
+            auth_file: boot.auth_file,
             turn_event_start: 0,
             turn_start_input_tokens: 0,
             last_turn_activity_at: None,
             stall_notified: false,
             terminal_focused: true,
-            notifications_enabled,
+            notifications_enabled: boot.notifications_enabled,
             pending_notifications: VecDeque::new(),
         }
     }

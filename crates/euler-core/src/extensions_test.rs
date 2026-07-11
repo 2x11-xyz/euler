@@ -1708,7 +1708,7 @@ fn extensions_context_slot_content_is_redacted_at_emission() {
     writer
         .append(&[session_start_event(session_id)])
         .expect("source append");
-    let mut redactor = crate::redaction::SecretRedactor::new();
+    let redactor = crate::redaction::SecretRedactor::new();
     redactor.add_value("known-slot-secret-value-11");
     let mut host = ExtensionHost::with_artifact_writer(
         &log,

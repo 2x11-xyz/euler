@@ -424,6 +424,14 @@ impl std::error::Error for ProviderError {}
 
 pub type ProviderStream = Box<dyn Iterator<Item = Result<ModelStreamEvent, ProviderError>> + Send>;
 
+/// Observer for secret values a provider resolves at request time (custom
+/// provider `$ENV` / `!command` / literal api_key and header values). The
+/// session installs a sink that registers each value with its redactor so
+/// the value is secret-tainted from the moment it exists (secrets contract,
+/// "any value resolved through this contract"). Must be `Send + Sync`:
+/// parallel reviewer workers invoke providers off the session thread.
+pub type ResolvedSecretSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// `Sync` is required so a `ProviderSet` can be shared across the parallel
 /// reviewer fan-out's worker threads (multi-agent contract v0.2). Providers
 /// are stateless request adapters; scripted/test providers use `Mutex` for
@@ -440,6 +448,11 @@ pub trait ModelProvider: Send + Sync {
     fn reasoning_effort(&self, _model: &str) -> Option<&str> {
         None
     }
+    /// Install the host's resolved-secret observer. Default no-op: only
+    /// providers that resolve secrets at request time (custom providers)
+    /// have anything to report; built-in providers read pre-seeded env vars
+    /// and the auth file, which the host registers directly.
+    fn set_resolved_secret_sink(&self, _sink: ResolvedSecretSink) {}
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError>;
 }
 
@@ -454,6 +467,10 @@ impl ModelProvider for Box<dyn ModelProvider> {
 
     fn reasoning_effort(&self, model: &str) -> Option<&str> {
         self.as_ref().reasoning_effort(model)
+    }
+
+    fn set_resolved_secret_sink(&self, sink: ResolvedSecretSink) {
+        self.as_ref().set_resolved_secret_sink(sink);
     }
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
@@ -548,6 +565,14 @@ impl ProviderSet {
             )));
         };
         provider.invoke(request)
+    }
+
+    /// Install `sink` on every configured provider so request-time secret
+    /// resolution reports each value to the host (see [`ResolvedSecretSink`]).
+    pub fn install_resolved_secret_sink(&self, sink: ResolvedSecretSink) {
+        for provider in self.providers.values() {
+            provider.set_resolved_secret_sink(std::sync::Arc::clone(&sink));
+        }
     }
 }
 

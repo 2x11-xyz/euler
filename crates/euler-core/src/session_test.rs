@@ -92,6 +92,74 @@ fn provider_error_message_is_redacted_at_emission() {
     assert!(message.contains("[redacted-secret]"), "{message}");
 }
 
+/// Wraps a scripted provider and reports `secret` to the installed
+/// resolved-secret sink on every invoke — the shape of a custom provider
+/// resolving an `$ENV` / `!command` / literal credential at request time.
+struct RequestTimeSecretProvider {
+    inner: ScriptedProvider,
+    secret: String,
+    sink: Mutex<Option<euler_provider::ResolvedSecretSink>>,
+}
+
+impl ModelProvider for RequestTimeSecretProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn set_resolved_secret_sink(&self, sink: euler_provider::ResolvedSecretSink) {
+        *self.sink.lock().expect("sink lock") = Some(sink);
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if let Some(sink) = self.sink.lock().expect("sink lock").as_ref() {
+            sink(&self.secret);
+        }
+        self.inner.invoke(request)
+    }
+}
+
+#[test]
+fn request_time_resolved_provider_secret_registers_with_session_redactor() {
+    // Seeding gap: custom-provider secrets resolved at request time were
+    // never registered with the session redactor, so a later echo of the
+    // value (tool output here) persisted raw. The session installs a sink
+    // at construction; the provider reports the value at invoke; the tool
+    // result chokepoint must then mask it. The value is deliberately NOT
+    // token-shaped so only known-value registration can catch it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let secret = "request-time-resolved-credential-42";
+    let provider = RequestTimeSecretProvider {
+        inner: ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
+                id: "call-echo".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": format!("printf 'value {secret} end'")}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]),
+        secret: secret.to_owned(),
+        sink: Mutex::new(None),
+    };
+    let config = SessionConfig::new(temp.path());
+    let mut session = Session::new(
+        config,
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+
+    session.run_turn("run it").expect("turn");
+
+    let output = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .find_map(|event| event.payload["output"].as_str().map(str::to_owned))
+        .expect("tool output");
+    assert!(!output.contains(secret), "{output}");
+    assert!(output.contains("[redacted-secret]"), "{output}");
+}
+
 #[test]
 fn into_fresh_session_carries_registered_secret_values() {
     // /new rebuilds the session in-process; host-seeded redaction values
