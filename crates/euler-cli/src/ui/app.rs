@@ -581,6 +581,7 @@ fn set_terminal_theme_colors(terminal: &mut CrosstermTerminal, core: &AppCore) -
         core.theme.palette.foreground,
         core.theme.palette.background,
         core.theme.palette.cursor,
+        core.theme.palette.user_rail,
     )
 }
 

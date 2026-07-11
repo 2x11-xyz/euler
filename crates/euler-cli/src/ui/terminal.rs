@@ -37,6 +37,7 @@ use std::{
 use super::history_insert::{emit_history_lines, plan_history_insert};
 use super::metrics;
 use super::text::display_width;
+#[cfg(test)]
 use super::theme::USER_RAIL_COLOR;
 use super::visual_canvas::{CanvasLine, CanvasSpan, CursorTarget, TextRole, VisualCanvasFrame};
 
@@ -286,6 +287,7 @@ where
     foreground: RatatuiColor,
     background: RatatuiColor,
     cursor: RatatuiColor,
+    user_rail: RatatuiColor,
 }
 
 impl<B> InlineTerminal<B>
@@ -323,6 +325,7 @@ where
             foreground: RatatuiColor::Reset,
             background: RatatuiColor::Reset,
             cursor: RatatuiColor::Reset,
+            user_rail: RatatuiColor::Reset,
         })
     }
 
@@ -376,7 +379,14 @@ where
         queue_clear_area(writer, area, self.background)?;
         queue!(writer, MoveTo(0, self.viewport_area.top()))?;
         for line in &wrapped_lines {
-            write_canvas_row(writer, Some(line), width, self.foreground, self.background)?;
+            write_canvas_row(
+                writer,
+                Some(line),
+                width,
+                self.foreground,
+                self.background,
+                self.user_rail,
+            )?;
             queue!(writer, Print("\r\n"))?;
         }
         queue!(writer, SetAttribute(Attribute::Reset), ResetColor)?;
@@ -428,7 +438,14 @@ where
         let writer = self.inner.backend_mut();
         let width = usize::from(screen_size.width).max(1);
         emit_history_lines(writer, plan, wrapped_lines, |writer, line| {
-            write_canvas_row(writer, Some(line), width, self.foreground, self.background)
+            write_canvas_row(
+                writer,
+                Some(line),
+                width,
+                self.foreground,
+                self.background,
+                self.user_rail,
+            )
         })?;
         queue!(
             writer,
@@ -587,6 +604,7 @@ where
         foreground: RatatuiColor,
         background: RatatuiColor,
         cursor: RatatuiColor,
+        user_rail: RatatuiColor,
     ) -> io::Result<()> {
         if self.foreground != foreground || self.background != background {
             self.foreground = foreground;
@@ -599,6 +617,10 @@ where
             if let Some(sequence) = terminal_cursor_color_sequence(cursor) {
                 self.write_terminal_sequence(&sequence)?;
             }
+        }
+        if self.user_rail != user_rail {
+            self.user_rail = user_rail;
+            self.invalidate_draw_cache();
         }
         Ok(())
     }
@@ -834,6 +856,7 @@ where
                 usize::from(area.width),
                 self.foreground,
                 self.background,
+                self.user_rail,
             )?;
         }
         if repaint_screen_background && self.committed_active_rows == 0 {

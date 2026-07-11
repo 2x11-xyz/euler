@@ -169,7 +169,10 @@ mod terminal_tests {
         let backend = VT100Backend::new(30, 3);
         let mut terminal = InlineTerminal::new(backend, 3).expect("inline terminal");
         let prompt = CanvasSpan::new_lossy("▌ ", TextRole::Prompt);
-        assert_eq!(canvas_span_style(&prompt).fg, Some(USER_RAIL_COLOR));
+        assert_eq!(
+            canvas_span_style(&prompt, USER_RAIL_COLOR).fg,
+            Some(USER_RAIL_COLOR)
+        );
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
                 active_frame_lines: vec![CanvasLine::plain("placeholder")],
@@ -217,10 +220,40 @@ mod terminal_tests {
                 .remove_modifier(Modifier::BOLD),
         );
 
-        let style = canvas_span_style(&span);
+        let style = canvas_span_style(&span, USER_RAIL_COLOR);
         assert_eq!(style.fg, Some(RatatuiColor::Reset));
         assert!(!style.add_modifier.contains(Modifier::BOLD));
         assert!(style.sub_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn prompt_rail_color_quantizes_when_truecolor_is_unsupported() {
+        // #64's Apple_Terminal fallback path (from_env_signals) forces
+        // ColorLevel::Indexed256. The rail color threaded into role_style
+        // must flow through that same quantizer boundary — not bypass it
+        // via a hardcoded Color::Rgb literal — so it must render as an
+        // indexed/ANSI color here, never a raw truecolor Rgb.
+        let color_level =
+            crate::ui::theme::ColorLevel::from_env_signals(None, Some("Apple_Terminal"));
+        assert_eq!(color_level, crate::ui::theme::ColorLevel::Indexed256);
+        let theme = crate::ui::theme::Theme::for_choice_with_color_level(
+            crate::theme_catalog::ThemeChoice::GruvboxDark,
+            color_level,
+        );
+        let user_rail = theme.palette.user_rail;
+        assert!(
+            matches!(user_rail, RatatuiColor::Indexed(_)),
+            "expected an indexed color under the Apple_Terminal fallback, got {user_rail:?}"
+        );
+
+        let prompt = CanvasSpan::new_lossy("▌ ", TextRole::Prompt);
+        let style = canvas_span_style(&prompt, user_rail);
+        assert!(
+            !matches!(style.fg, Some(RatatuiColor::Rgb(..))),
+            "prompt rail style must not carry a raw truecolor Rgb when truecolor is unsupported: {:?}",
+            style.fg
+        );
+        assert_eq!(style.fg, Some(user_rail));
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -460,7 +493,7 @@ mod terminal_tests {
             ),
         ]);
 
-        let converted = canvas_lines_to_ratatui(&[line]);
+        let converted = canvas_lines_to_ratatui(&[line], USER_RAIL_COLOR);
 
         let spans = &converted[0].spans;
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
@@ -591,6 +624,7 @@ mod terminal_tests {
                 RatatuiColor::Rgb(60, 56, 54),
                 RatatuiColor::Rgb(251, 241, 199),
                 RatatuiColor::Rgb(60, 56, 54),
+                RatatuiColor::Rgb(142, 192, 124),
             )
             .expect("theme colors");
 

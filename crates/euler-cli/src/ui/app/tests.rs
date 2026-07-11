@@ -1567,6 +1567,7 @@ fn history_replay_clear_uses_theme_background() {
             Color::Rgb(60, 56, 54),
             Color::Rgb(251, 241, 199),
             Color::Rgb(60, 56, 54),
+            Color::Rgb(142, 192, 124),
         )
         .expect("theme colors");
     if std::env::var_os("NO_COLOR").is_some() {
