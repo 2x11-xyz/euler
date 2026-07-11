@@ -2347,9 +2347,12 @@ impl<D: PermissionDecider> Session<D> {
         error: &ProviderError,
         model_call_id: String,
     ) -> Result<String, SessionError> {
+        // Provider error text can echo request fragments (HTTP error bodies
+        // quote what was sent); redact before it reaches the ledger and the
+        // canvas (secrets contract, "error messages").
         let mut payload = object([
             ("source", "provider".into()),
-            ("message", error.to_string().into()),
+            ("message", self.redactor.redact(&error.to_string()).into()),
         ]);
         payload.insert("category".to_owned(), error.category().as_str().into());
         self.emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))

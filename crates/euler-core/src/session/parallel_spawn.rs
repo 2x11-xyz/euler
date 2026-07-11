@@ -218,7 +218,13 @@ impl<D: PermissionDecider> Session<D> {
                 session_id: &session_id,
                 agent_id: &child_agent_id,
             };
-            if let Some((payload, parent)) = outcome.buffered_error {
+            if let Some((mut payload, parent)) = outcome.buffered_error {
+                // Workers buffer the raw provider error (they carry no
+                // redactor); this session-thread append is the emission
+                // site, so redact here — provider HTTP error bodies can
+                // echo request fragments (secrets contract).
+                self.redactor
+                    .redact_payload_fields(&mut payload, &["message"]);
                 appender.append(EventKind::ERROR, payload, Some(parent))?;
             }
             match outcome.round {

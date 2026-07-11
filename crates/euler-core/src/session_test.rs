@@ -41,6 +41,57 @@ fn max_output_tokens_propagates_to_model_request_and_model_call() {
     assert_eq!(model_call.payload["max_output_tokens"], json!(42));
 }
 
+/// Provider whose invoke fails with an error message echoing request
+/// fragments — models real HTTP 4xx bodies that quote what was sent.
+#[derive(Debug)]
+struct ErroringProvider {
+    message: String,
+}
+
+impl ModelProvider for ErroringProvider {
+    fn name(&self) -> &'static str {
+        "erroring"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        Err(ProviderError::rejected(self.message.clone()))
+    }
+}
+
+#[test]
+fn provider_error_message_is_redacted_at_emission() {
+    // F8: provider HTTP error bodies can echo request fragments (including
+    // credentials); the error event is a durable ledger emission and must go
+    // through the same redaction chokepoint as tool output.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = SessionConfig::new(temp.path());
+    // Token-shaped fixture assembled at runtime (repo convention: no
+    // credential-shaped literal in the source tree).
+    let shaped = format!("sk-or-v1-{}", "abcdefghijklmnop");
+    let provider = ErroringProvider {
+        message: format!("HTTP 400: body echoed bearer known-error-echo-secret-77 and {shaped}"),
+    };
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+    session.add_redacted_secret("known-error-echo-secret-77");
+
+    let result = session.run_turn("hello");
+
+    assert!(result.is_err(), "rejected provider call fails the turn");
+    let message = session
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.kind.as_str() == EventKind::ERROR)
+        .expect("error event")
+        .payload["message"]
+        .as_str()
+        .expect("message")
+        .to_owned();
+    assert!(!message.contains("known-error-echo-secret-77"), "{message}");
+    assert!(!message.contains(&shaped), "{message}");
+    assert!(message.contains("[redacted-secret]"), "{message}");
+}
+
 #[test]
 fn into_fresh_session_carries_registered_secret_values() {
     // /new rebuilds the session in-process; host-seeded redaction values
