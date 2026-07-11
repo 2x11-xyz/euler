@@ -144,6 +144,45 @@ mod tests {
     }
 
     #[test]
+    fn decide_maps_user_scope_and_never_broadens_it() {
+        let (mut decider, channels) = TuiDecider::new();
+        let handle = thread::spawn(move || {
+            let user = decider.decide(&request());
+            let empty = decider.decide(&request());
+            let control = decider.decide(&request());
+            (user, empty, control)
+        });
+
+        let _ = channels.request_rx.recv().expect("request");
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowUserScope("cargo".into()))
+            .expect("reply");
+        let _ = channels.request_rx.recv().expect("request");
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowUserScope(String::new()))
+            .expect("reply");
+        let _ = channels.request_rx.recv().expect("request");
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowUserScope("cargo\u{0001}".into()))
+            .expect("reply");
+
+        let (user, empty, control) = handle.join().expect("join");
+        assert_eq!(
+            user,
+            DeciderVerdict::AllowScoped(GrantScope::User(
+                ScopePattern::new("cargo").expect("pattern")
+            ))
+        );
+        // Empty would be an unscoped ("whole capability forever") rule and
+        // invalid patterns must not broaden either: both degrade to once.
+        assert_eq!(empty, DeciderVerdict::Allow);
+        assert_eq!(control, DeciderVerdict::Allow);
+    }
+
+    #[test]
     fn decide_maps_deny_with_instruction() {
         let (mut decider, channels) = TuiDecider::new();
         let handle = thread::spawn(move || decider.decide(&request()));

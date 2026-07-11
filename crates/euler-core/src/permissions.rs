@@ -797,4 +797,94 @@ mod tests {
         assert!(gate.is_granted(&request));
         assert!(!gate.decide(&request, ApprovalMode::AlwaysDeny));
     }
+
+    #[test]
+    fn user_rule_persists_and_covers_fresh_gate() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let mut gate =
+            PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
+                GrantScope::User(ScopePattern::new("cargo").expect("pattern")),
+            )]));
+        gate.load_user_grants(Some(&home)).expect("load");
+        assert!(gate.user_rules_enabled());
+
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test -q");
+        let decision = gate.decide_detailed(&request, ApprovalMode::Ask);
+        assert!(decision.allowed());
+        assert_eq!(decision.scope.as_str(), "user");
+        assert_eq!(decision.grant_pattern(), Some("cargo"));
+        assert!(home.join("user-grants.json").exists());
+
+        // A FRESH gate loading the same home covers any identical-token
+        // command — that is what "always" means.
+        let mut gate2 = PermissionGate::new(PanicDecider);
+        gate2.load_user_grants(Some(&home)).expect("reload");
+        let other = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo build --release");
+        assert_eq!(gate2.granted_source(&other), Some(GrantSource::User));
+        assert!(gate2.decide(&other, ApprovalMode::Ask));
+        // Compound lines are never covered by a prefix rule.
+        let compound = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test; rm -rf ~");
+        assert!(!gate2.is_granted(&compound));
+        let listed = gate2.list_grants();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, GrantSource::User);
+    }
+
+    #[test]
+    fn revoking_user_rule_removes_it_durably() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let pattern = ScopePattern::new("cargo").expect("pattern");
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_user_grants(Some(&home)).expect("load");
+        gate.install_grant(Capability::ShellExec, GrantScope::User(pattern.clone()))
+            .expect("install");
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(gate.is_granted(&request));
+
+        assert_eq!(
+            gate.revoke(Capability::ShellExec, &pattern, GrantSource::User)
+                .expect("revoke"),
+            1
+        );
+        assert!(!gate.is_granted(&request));
+
+        // Durable: a fresh gate sees the revoked store, not the old rule.
+        let mut gate2 = PermissionGate::new(PanicDecider);
+        gate2.load_user_grants(Some(&home)).expect("reload");
+        assert!(!gate2.is_granted(&request));
+        assert!(gate2.list_grants().is_empty());
+    }
+
+    #[test]
+    fn no_user_dir_disables_user_rules_entirely() {
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_user_grants(None).expect("load");
+        assert!(!gate.user_rules_enabled());
+        // Writes fail closed: no user dir means no durable installs.
+        let result = gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::User(ScopePattern::new("git").expect("pattern")),
+        );
+        assert!(matches!(result, Err(ProjectGrantError::NoStore)));
+
+        // A user-scoped verdict without a store still allows once — the
+        // decision never claims a durable rule that did not land.
+        let mut gate =
+            PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
+                GrantScope::User(ScopePattern::new("cargo").expect("pattern")),
+            )]));
+        gate.load_user_grants(None).expect("load");
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        let decision = gate.decide_detailed(&request, ApprovalMode::Ask);
+        assert!(decision.allowed());
+        assert_eq!(decision.scope, GrantScope::Once);
+        assert!(gate.user_grants().is_empty());
+    }
 }

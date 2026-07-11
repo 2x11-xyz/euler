@@ -864,6 +864,76 @@ fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
 }
 
 #[test]
+fn user_rule_records_scope_and_covers_a_fresh_session() {
+    // Permissions v2 (#79): a durable user rule persists to the home store,
+    // the approving decision records grant_scope "user", and a FRESH session
+    // instance is covered without a prompt or a fresh decision record — the
+    // tool result carries grant_source "user" for the `· user rule` tag.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&root).expect("root");
+    let mut config = SessionConfig::new(&root);
+    config.user_grant_dir = Some(home.clone());
+
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        config.clone(),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(GrantScope::User(
+            ScopePattern::new("touch").expect("pattern"),
+        ))]),
+    );
+    session.run_turn("run shell").expect("turn");
+    assert!(root.join("first-ran").exists());
+    assert!(home.join("user-grants.json").exists());
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(payload_str(decisions[0], "grant_scope"), Some("user"));
+    assert_eq!(payload_str(decisions[0], "grant_pattern"), Some("touch"));
+
+    let provider2 = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-second".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch second-ran"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    // Fresh session, empty decider script: any prompt would deny (and a
+    // covered run must never prompt at all).
+    let mut session2 = Session::new(config, provider2, ScriptedDecider::new(Vec::new()));
+    session2.run_turn("run shell again").expect("turn");
+    assert!(root.join("second-ran").exists());
+    assert_eq!(
+        count_kind(session2.events(), EventKind::PERMISSION_PROMPT),
+        0
+    );
+    assert_eq!(
+        count_kind(session2.events(), EventKind::PERMISSION_DECISION),
+        0
+    );
+    let results = session2
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(payload_str(results[0], "grant_source"), Some("user"));
+}
+
+#[test]
 fn scoped_shell_grant_does_not_cover_compound_commands() {
     // Execution is `sh -c`: a `touch` grant covering `touch a; <anything>`
     // would authorize the whole line. Compound commands must re-ask.
