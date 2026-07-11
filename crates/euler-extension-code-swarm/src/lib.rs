@@ -15,6 +15,10 @@ const DEFAULT_MAX_TOKENS: u64 = 8192;
 const PERSONA_PREFIX: &str = "code-swarm-";
 /// Hard cap on reviewer agents per swarm (matches the prototype's limit).
 const MAX_SWARM_AGENTS: usize = 5;
+/// Backstop for a direct invocation that dodged every config-resolving entry
+/// seam (the TUI, headless `extension_run`, and tool seams pre-empt this with
+/// `euler_core::UNCONFIGURED_SWARM_ERROR`). The swarm never guesses targets.
+const UNCONFIGURED_MESSAGE: &str = "code-swarm review needs explicit reviewer models: pass --model provider::model (repeatable, 1-5), or configure a persistent set with /code-swarm in the TUI";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodeSwarmExtension;
@@ -35,10 +39,11 @@ impl Extension for CodeSwarmExtension {
     }
 }
 
-/// The whole swarm in one command: build reviewer tasks, run each through
-/// `HostApi::spawn_agent` (synchronous, depth one), and consolidate the
-/// outcomes into the review artifact. Orchestration lives here, not in a
-/// host-side state machine.
+/// The whole swarm in one command: build reviewer tasks, run them as one
+/// concurrent `HostApi::spawn_agents` batch, and consolidate the outcomes
+/// into the review artifact. Orchestration lives here, not in a host-side
+/// state machine; entry seams (TUI, headless, the `code_swarm_review` tool)
+/// only resolve config into this command's input.
 #[derive(Clone, Copy, Debug)]
 struct ReviewCommand;
 
@@ -60,12 +65,19 @@ impl ExtensionCommand for ReviewCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let input = ReviewInput::parse(&context.input)?;
-        let mut reviewers = Vec::new();
-        for task in input.tasks() {
-            let persona = task.persona.clone();
-            let outcome = host.spawn_agent(task)?;
-            reviewers.push(ReviewerResult::from_outcome(persona, outcome));
-        }
+        let tasks = input.tasks();
+        let personas = tasks
+            .iter()
+            .map(|task| task.persona.clone())
+            .collect::<Vec<_>>();
+        // One concurrent batch (multi-agent contract v0.2): outcomes return
+        // in task order, so persona pairing stays positional.
+        let outcomes = host.spawn_agents(tasks)?;
+        let reviewers = personas
+            .into_iter()
+            .zip(outcomes)
+            .map(|(persona, outcome)| ReviewerResult::from_outcome(persona, outcome))
+            .collect::<Vec<_>>();
         let generated_from = reviewers
             .iter()
             .map(|reviewer| reviewer.result_event_id.clone())
@@ -85,12 +97,15 @@ impl ExtensionCommand for ReviewCommand {
             source_event_ids: generated_from,
             metadata: report_metadata(reviewer_count),
         })?;
+        let succeeded = reviewers.iter().filter(|reviewer| reviewer.ok).count();
         Ok(json!({
             "persisted_event_id": record.persisted_event_id,
             "relative_path": record.relative_path,
             "sha256": record.sha256,
             "byte_len": record.byte_len,
             "reviewer_count": reviewer_count,
+            "succeeded": succeeded,
+            "failed": reviewer_count - succeeded,
             "reviewers": reviewers
                 .iter()
                 .map(|reviewer| json!({
@@ -99,10 +114,33 @@ impl ExtensionCommand for ReviewCommand {
                     "model": reviewer.model,
                     "ok": reviewer.ok,
                     "summary": reviewer.summary,
+                    "error": reviewer.error,
+                    // Bounded for the command/tool result; the artifact
+                    // always holds the full findings text.
+                    "findings": bound_findings(&reviewer.findings),
                 }))
                 .collect::<Vec<_>>(),
         }))
     }
+}
+
+/// Per-reviewer findings bound on the command/tool result. The consolidated
+/// artifact carries the full text; the result never silently clips.
+pub const REVIEWER_FINDINGS_RESULT_BYTES: usize = 16 * 1024;
+const FINDINGS_TRUNCATION_MARKER: &str =
+    "\n[findings truncated: the full text is in the consolidated review artifact]";
+
+fn bound_findings(findings: &str) -> String {
+    if findings.len() <= REVIEWER_FINDINGS_RESULT_BYTES {
+        return findings.to_owned();
+    }
+    let mut end = REVIEWER_FINDINGS_RESULT_BYTES;
+    while end > 0 && !findings.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = findings[..end].to_owned();
+    bounded.push_str(FINDINGS_TRUNCATION_MARKER);
+    bounded
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,51 +208,38 @@ struct ReviewInput {
 impl ReviewInput {
     fn parse(value: &Value) -> Result<Self, ExtensionError> {
         if value.is_null() {
-            return Ok(Self::default());
+            return Err(input_error(UNCONFIGURED_MESSAGE));
         }
         let object = value
             .as_object()
             .ok_or_else(|| input_error("code-swarm review input must be a JSON object"))?;
         reject_unknown_fields(object, &["reviewers", "models", "prompt", "max_tokens"])?;
+        let models = parse_models(object.get("models"))?;
+        if models.is_empty() {
+            return Err(input_error(UNCONFIGURED_MESSAGE));
+        }
         Ok(Self {
             charters: parse_charters(object.get("reviewers"))?,
-            models: parse_models(object.get("models"))?,
+            models,
             prompt: optional_string(object, "prompt")?.filter(|prompt| !prompt.trim().is_empty()),
             max_tokens: parse_positive_u64(object, "max_tokens", DEFAULT_MAX_TOKENS)?,
         })
     }
 
-    /// One task per agent. With explicit models the selection IS the agent
-    /// count (1–5); charters cycle round-robin across agents. Without models:
-    /// one inheriting task per charter.
+    /// One task per reviewer target: the model selection IS the agent count
+    /// (1-5); charters cycle round-robin across agents. Targets are always
+    /// explicit — they come from persisted config or one-off flags, never
+    /// from guessing (resolution chain, multi-agent contract).
     fn tasks(&self) -> Vec<SpawnAgentTask> {
         let prompt = self.prompt.as_deref();
-        if self.models.is_empty() {
-            return self
-                .charters
-                .iter()
-                .map(|charter| charter_task(charter, None, prompt, self.max_tokens))
-                .collect();
-        }
         self.models
             .iter()
             .enumerate()
             .map(|(index, target)| {
                 let charter = &self.charters[index % self.charters.len()];
-                charter_task(charter, Some(target), prompt, self.max_tokens)
+                charter_task(charter, target, prompt, self.max_tokens)
             })
             .collect()
-    }
-}
-
-impl Default for ReviewInput {
-    fn default() -> Self {
-        Self {
-            charters: CHARTERS.to_vec(),
-            models: Vec::new(),
-            prompt: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
-        }
     }
 }
 
@@ -269,6 +294,7 @@ struct ReviewerResult {
     model: String,
     ok: bool,
     summary: String,
+    error: Option<String>,
     findings: String,
     result_event_id: String,
 }
@@ -281,6 +307,7 @@ impl ReviewerResult {
             model: outcome.model,
             ok: outcome.ok,
             summary: outcome.summary,
+            error: outcome.error,
             findings: outcome.output,
             result_event_id: outcome.result_event_id,
         }
@@ -293,6 +320,7 @@ impl ReviewerResult {
             "model": self.model,
             "ok": self.ok,
             "summary": self.summary,
+            "error": self.error,
             "findings": self.findings,
         })
     }
@@ -333,15 +361,14 @@ fn review_args() -> Vec<ArgSpec> {
 
 fn charter_task(
     charter: &Charter,
-    target: Option<&ModelTarget>,
+    target: &ModelTarget,
     prompt: Option<&str>,
     max_tokens: u64,
 ) -> SpawnAgentTask {
-    let (provider, model) = target
-        .map(|target| (target.provider.as_str(), target.model.as_str()))
-        .unwrap_or(("", ""));
+    // Stage-agnostic brief: the subject may be a plan, a code change, an
+    // analysis, or a draft — the review focus names it when given.
     let mut task = format!(
-        "Review the work visible in this session as the {} reviewer. Companion agents see the session canvas; no event listing is needed. Stay review-only and return concise findings about the current session's work.",
+        "Review the subject visible in this session as the {} reviewer. Companion agents see the session canvas; no event listing is needed. The subject may be a plan, a code change, an analysis, or a draft. Stay review-only and return findings: specific, checkable claims tied to a location in the subject (file, section, or step), not a prose essay.",
         charter.name
     );
     if let Some(prompt) = prompt {
@@ -351,8 +378,8 @@ fn charter_task(
     SpawnAgentTask {
         task,
         persona: format!("{PERSONA_PREFIX}{}", charter.name),
-        provider: provider.to_owned(),
-        model: model.to_owned(),
+        provider: target.provider.clone(),
+        model: target.model.clone(),
         system_prompt: charter.system_prompt.to_owned(),
         capabilities: Vec::new(),
         max_turns: Some(1),
@@ -395,7 +422,16 @@ fn find_charter(name: &str) -> Result<Charter, ExtensionError> {
         .iter()
         .copied()
         .find(|charter| charter.name == name)
-        .ok_or_else(|| input_error(format!("unknown CodeSwarm reviewer `{name}`")))
+        .ok_or_else(|| {
+            let valid = CHARTERS
+                .iter()
+                .map(|charter| charter.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            input_error(format!(
+                "unknown CodeSwarm reviewer `{name}`; valid personas: {valid}"
+            ))
+        })
 }
 
 fn report_metadata(reviewer_count: usize) -> Map<String, Value> {
@@ -470,43 +506,115 @@ mod tests {
     use std::cell::RefCell;
     use std::path::PathBuf;
 
+    fn models_input(models: &[&str]) -> Value {
+        json!({ "models": models })
+    }
+
     #[test]
-    fn review_runs_one_inheriting_agent_per_default_charter() {
+    fn review_without_models_fails_honestly_and_spawns_nothing() {
+        for input in [Value::Null, json!({}), json!({"reviewers": ["tests"]})] {
+            let host = MockHost::default();
+            let error = ReviewCommand
+                .execute(CommandContext { input }, &host)
+                .expect_err("missing models must fail");
+            let message = error.to_string();
+            assert!(
+                message.contains("--model provider::model") && message.contains("/code-swarm"),
+                "unconfigured error must carry remediation, got: {message}"
+            );
+            assert!(host.spawned_batches.borrow().is_empty(), "no spawn");
+            assert!(host.writes.borrow().is_empty(), "no artifact");
+        }
+    }
+
+    #[test]
+    fn review_spawns_one_concurrent_batch_with_cycled_charters() {
         let host = MockHost::default();
+        let input = json!({"models": [
+            "openrouter::z-ai/glm-5.2",
+            "anthropic::claude-opus-5",
+            "openai::gpt-5.5",
+            "openrouter::z-ai/glm-5.2",
+        ], "prompt": "focus on the parser"});
         let output = ReviewCommand
-            .execute(CommandContext { input: Value::Null }, &host)
+            .execute(CommandContext { input }, &host)
             .expect("review output");
 
-        let spawned = host.spawned.borrow();
-        assert_eq!(spawned.len(), 3);
-        assert_eq!(spawned[0].persona, "code-swarm-correctness");
-        assert_eq!(spawned[1].persona, "code-swarm-safety");
-        assert_eq!(spawned[2].persona, "code-swarm-tests");
-        for task in spawned.iter() {
-            assert!(task
-                .task
-                .contains("Review the work visible in this session"));
-            assert_eq!(task.provider, "");
-            assert_eq!(task.model, "");
+        let batches = host.spawned_batches.borrow();
+        assert_eq!(batches.len(), 1, "one concurrent batch, not serial spawns");
+        let tasks = &batches[0];
+        assert_eq!(tasks.len(), 4);
+        assert_eq!(tasks[0].provider, "openrouter");
+        assert_eq!(tasks[0].model, "z-ai/glm-5.2");
+        assert_eq!(tasks[0].persona, "code-swarm-correctness");
+        assert_eq!(tasks[1].persona, "code-swarm-safety");
+        assert_eq!(tasks[2].persona, "code-swarm-tests");
+        // Fourth agent cycles back to the first charter.
+        assert_eq!(tasks[3].persona, "code-swarm-correctness");
+        for task in tasks.iter() {
+            assert!(task.task.contains("Review focus: focus on the parser"));
+            assert!(
+                task.task
+                    .contains("plan, a code change, an analysis, or a draft"),
+                "brief must stay stage-agnostic"
+            );
+            assert!(task.task.contains("findings"), "brief demands findings");
             assert!(task.capabilities.is_empty(), "reviewers stay review-only");
             assert_eq!(task.max_turns, Some(1));
             assert_eq!(task.max_tool_calls, Some(0));
             assert_eq!(task.max_tokens, Some(DEFAULT_MAX_TOKENS));
         }
-        assert_eq!(output["reviewer_count"], json!(3));
-        // Inherited targets come back resolved from the spawn outcome.
-        assert_eq!(
-            output["reviewers"][0]["provider"],
-            json!("session-provider")
+        assert_eq!(output["reviewer_count"], json!(4));
+        assert_eq!(output["succeeded"], json!(4));
+        assert_eq!(output["failed"], json!(0));
+    }
+
+    #[test]
+    fn review_result_carries_bounded_findings_per_reviewer() {
+        let host = MockHost {
+            long_findings: true,
+            ..MockHost::default()
+        };
+        let output = ReviewCommand
+            .execute(
+                CommandContext {
+                    input: models_input(&["a::b"]),
+                },
+                &host,
+            )
+            .expect("review output");
+
+        let findings = output["reviewers"][0]["findings"]
+            .as_str()
+            .expect("findings text");
+        assert!(
+            findings.len() <= REVIEWER_FINDINGS_RESULT_BYTES + FINDINGS_TRUNCATION_MARKER.len(),
+            "result findings must be bounded"
         );
-        assert_eq!(output["reviewers"][0]["model"], json!("session-model"));
+        assert!(
+            findings.ends_with(FINDINGS_TRUNCATION_MARKER),
+            "truncation must be explicit, never silent"
+        );
+        // The artifact keeps the full text.
+        let writes = host.writes.borrow();
+        let artifact: Value = serde_json::from_slice(&writes[0].bytes).expect("artifact json");
+        let full = artifact["reviewers"][0]["findings"]
+            .as_str()
+            .expect("artifact findings");
+        assert!(full.len() > REVIEWER_FINDINGS_RESULT_BYTES);
+        assert!(!full.contains("[findings truncated"));
     }
 
     #[test]
     fn review_writes_report_artifact_from_outcomes() {
         let host = MockHost::default();
         let output = ReviewCommand
-            .execute(CommandContext { input: Value::Null }, &host)
+            .execute(
+                CommandContext {
+                    input: models_input(&["a::b", "c::d", "e::f"]),
+                },
+                &host,
+            )
             .expect("review output");
 
         let writes = host.writes.borrow();
@@ -536,44 +644,16 @@ mod tests {
     #[test]
     fn review_selects_requested_charter_and_budget() {
         let host = MockHost::default();
-        let input = json!({"reviewers": ["tests"], "max_tokens": 123});
+        let input = json!({"models": ["a::b"], "reviewers": ["tests"], "max_tokens": 123});
         let _ = ReviewCommand
             .execute(CommandContext { input }, &host)
             .expect("review output");
 
-        let spawned = host.spawned.borrow();
-        assert_eq!(spawned.len(), 1);
-        assert_eq!(spawned[0].persona, "code-swarm-tests");
-        assert!(spawned[0].system_prompt.contains("coverage honesty"));
-        assert_eq!(spawned[0].max_tokens, Some(123));
-    }
-
-    #[test]
-    fn review_with_models_sets_targets_and_cycles_charters() {
-        let host = MockHost::default();
-        let input = json!({"models": [
-            "openrouter::z-ai/glm-5.2",
-            "anthropic::claude-opus-5",
-            "openai::gpt-5.5",
-            "openrouter::z-ai/glm-5.2",
-        ], "prompt": "focus on the parser"});
-        let _ = ReviewCommand
-            .execute(CommandContext { input }, &host)
-            .expect("review output");
-
-        let spawned = host.spawned.borrow();
-        assert_eq!(spawned.len(), 4);
-        assert_eq!(spawned[0].provider, "openrouter");
-        assert_eq!(spawned[0].model, "z-ai/glm-5.2");
-        assert_eq!(spawned[0].persona, "code-swarm-correctness");
-        assert_eq!(spawned[1].persona, "code-swarm-safety");
-        assert_eq!(spawned[2].persona, "code-swarm-tests");
-        // Fourth agent cycles back to the first charter.
-        assert_eq!(spawned[3].persona, "code-swarm-correctness");
-        assert_eq!(spawned[3].provider, "openrouter");
-        for task in spawned.iter() {
-            assert!(task.task.contains("Review focus: focus on the parser"));
-        }
+        let batches = host.spawned_batches.borrow();
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[0][0].persona, "code-swarm-tests");
+        assert!(batches[0][0].system_prompt.contains("coverage honesty"));
+        assert_eq!(batches[0][0].max_tokens, Some(123));
     }
 
     #[test]
@@ -596,21 +676,32 @@ mod tests {
                 error.to_string().contains(fragment),
                 "error `{error}` should contain `{fragment}`"
             );
-            assert!(host.spawned.borrow().is_empty(), "no spawn before reject");
+            assert!(
+                host.spawned_batches.borrow().is_empty(),
+                "no spawn before reject"
+            );
         }
     }
 
     #[test]
-    fn review_rejects_over_cap_reviewer_lists() {
-        // The 5-agent cap must bound the charter path too: repeated
-        // reviewer names would otherwise spawn unbounded agents.
+    fn review_rejects_over_cap_reviewer_lists_and_unknown_personas() {
         let host = MockHost::default();
-        let input = json!({"reviewers": ["tests", "tests", "tests", "tests", "tests", "tests"]});
+        let input = json!({"models": ["a::b"], "reviewers": ["tests", "tests", "tests", "tests", "tests", "tests"]});
         let error = ReviewCommand
             .execute(CommandContext { input }, &host)
             .expect_err("over-cap reviewers");
         assert!(error.to_string().contains("cap is 5"));
-        assert!(host.spawned.borrow().is_empty(), "no spawn before reject");
+
+        let input = json!({"models": ["a::b"], "reviewers": ["astrology"]});
+        let error = ReviewCommand
+            .execute(CommandContext { input }, &host)
+            .expect_err("unknown persona");
+        let message = error.to_string();
+        assert!(
+            message.contains("valid personas: correctness, safety, tests"),
+            "unknown-persona error must name the valid set: {message}"
+        );
+        assert!(host.spawned_batches.borrow().is_empty());
     }
 
     #[test]
@@ -618,7 +709,7 @@ mod tests {
         let error = ReviewCommand
             .execute(
                 CommandContext {
-                    input: json!({"reviewers": ["safety"], "extra": true}),
+                    input: json!({"models": ["a::b"], "extra": true}),
                 },
                 &MockHost::default(),
             )
@@ -634,11 +725,19 @@ mod tests {
             ..MockHost::default()
         };
         let output = ReviewCommand
-            .execute(CommandContext { input: Value::Null }, &host)
+            .execute(
+                CommandContext {
+                    input: models_input(&["a::b", "c::d", "e::f"]),
+                },
+                &host,
+            )
             .expect("failure outcome is still a command success");
 
         assert_eq!(output["reviewer_count"], json!(3));
+        assert_eq!(output["succeeded"], json!(2));
+        assert_eq!(output["failed"], json!(1));
         assert_eq!(output["reviewers"][1]["ok"], json!(false));
+        assert_eq!(output["reviewers"][1]["error"], json!("budget exhausted"));
         let writes = host.writes.borrow();
         let artifact: Value = serde_json::from_slice(&writes[0].bytes).expect("artifact json");
         assert_eq!(artifact["reviewers"][1]["ok"], json!(false));
@@ -651,64 +750,70 @@ mod tests {
     #[test]
     fn review_propagates_spawn_errors_and_writes_nothing() {
         let host = MockHost {
-            spawn_error: Some("agent spawn failed: provider missing".to_owned()),
+            spawn_error: Some("agent spawn quota exhausted".to_owned()),
             ..MockHost::default()
         };
         let error = ReviewCommand
-            .execute(CommandContext { input: Value::Null }, &host)
+            .execute(
+                CommandContext {
+                    input: models_input(&["a::b"]),
+                },
+                &host,
+            )
             .expect_err("spawn error propagates");
 
-        assert!(error.to_string().contains("provider missing"));
+        assert!(error.to_string().contains("quota exhausted"));
         assert!(host.writes.borrow().is_empty());
     }
 
     #[derive(Default)]
     struct MockHost {
-        spawned: RefCell<Vec<SpawnAgentTask>>,
+        spawned_batches: RefCell<Vec<Vec<SpawnAgentTask>>>,
         writes: RefCell<Vec<ArtifactWrite>>,
         fail_persona: Option<String>,
         spawn_error: Option<String>,
+        long_findings: bool,
     }
 
     impl HostApi for MockHost {
-        fn spawn_agent(&self, task: SpawnAgentTask) -> Result<AgentOutcome, ExtensionError> {
+        fn spawn_agents(
+            &self,
+            tasks: Vec<SpawnAgentTask>,
+        ) -> Result<Vec<AgentOutcome>, ExtensionError> {
             if let Some(message) = &self.spawn_error {
                 return Err(ExtensionError::Message(message.clone()));
             }
-            let failed = self.fail_persona.as_deref() == Some(task.persona.as_str());
-            let index = {
-                let mut spawned = self.spawned.borrow_mut();
-                spawned.push(task);
-                spawned.len()
-            };
-            let spawned = self.spawned.borrow();
-            let task = spawned.last().expect("just pushed");
-            // Mirror companion target resolution: empty targets inherit the
-            // session's active target and come back resolved.
-            let (provider, model) = if task.provider.is_empty() {
-                ("session-provider".to_owned(), "session-model".to_owned())
-            } else {
-                (task.provider.clone(), task.model.clone())
-            };
-            Ok(AgentOutcome {
-                ok: !failed,
-                summary: if failed {
-                    "reviewer failed".to_owned()
-                } else {
-                    "reviewed".to_owned()
-                },
-                output: if failed {
-                    String::new()
-                } else {
-                    format!("finding for {}", task.persona)
-                },
-                error: failed.then(|| "budget exhausted".to_owned()),
-                provider,
-                model,
-                child_agent_id: format!("child_{index}"),
-                spawn_event_id: format!("event_spawn_{index}"),
-                result_event_id: format!("event_result_{index}"),
-            })
+            let outcomes = tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| {
+                    let failed = self.fail_persona.as_deref() == Some(task.persona.as_str());
+                    let output = if failed {
+                        String::new()
+                    } else if self.long_findings {
+                        "f".repeat(REVIEWER_FINDINGS_RESULT_BYTES + 100)
+                    } else {
+                        format!("finding for {}", task.persona)
+                    };
+                    AgentOutcome {
+                        ok: !failed,
+                        summary: if failed {
+                            "reviewer failed".to_owned()
+                        } else {
+                            "reviewed".to_owned()
+                        },
+                        output,
+                        error: failed.then(|| "budget exhausted".to_owned()),
+                        provider: task.provider.clone(),
+                        model: task.model.clone(),
+                        child_agent_id: format!("child_{}", index + 1),
+                        spawn_event_id: format!("event_spawn_{}", index + 1),
+                        result_event_id: format!("event_result_{}", index + 1),
+                    }
+                })
+                .collect();
+            self.spawned_batches.borrow_mut().push(tasks);
+            Ok(outcomes)
         }
 
         fn query_provenance(

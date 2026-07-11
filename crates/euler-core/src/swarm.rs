@@ -21,6 +21,13 @@ use thiserror::Error;
 
 /// Hard cap on configured reviewers (matches the code-swarm extension cap).
 pub const MAX_SWARM_REVIEWERS: usize = 5;
+
+/// Canonical remediation-bearing unconfigured error (multi-agent contract):
+/// every entry seam — TUI, headless `extension_run`, the `code_swarm_review`
+/// tool — emits this text instead of invoking the swarm, and it must name
+/// working invocations only. The invocations are pinned by tests; update
+/// them together with the surfaces they describe.
+pub const UNCONFIGURED_SWARM_ERROR: &str = "code-swarm is not configured: no reviewer models are set for this project or user, and none were passed. Pick reviewers in the TUI with /code-swarm (persists to this project; /code-swarm --user for a global default), or pass explicit one-off targets: TUI `/review --model provider::model`, or headless (`euler run`) control line `extension_run code-swarm.review {\"models\":[\"provider::model\"]}`.";
 /// Max bytes for the config file at either tier.
 const MAX_SWARM_CONFIG_BYTES: u64 = 16 * 1024;
 

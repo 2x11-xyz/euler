@@ -324,9 +324,10 @@ fn headless_observer_companion_observe_composition_persists_artifact() {
 
 #[test]
 fn headless_code_swarm_review_spawns_reviewer_and_persists_report_artifact() {
-    // One command runs the whole swarm: the extension spawns its reviewer
-    // through HostApi::spawn_agent and consolidates the outcomes itself —
-    // no host-side brief/report orchestration.
+    // One command runs the whole swarm: the extension fans its reviewers out
+    // through one HostApi::spawn_agents batch and consolidates the outcomes
+    // itself — no host-side brief/report orchestration. Targets are always
+    // explicit (resolution chain); nothing is inherited or guessed.
     let (temp, mut session) = companion_test_session(vec![
         FixtureResponse::Assistant("implementation complete".to_owned()),
         FixtureResponse::Assistant("Finding: boundary condition needs coverage".to_owned()),
@@ -337,15 +338,22 @@ fn headless_code_swarm_review_spawns_reviewer_and_persists_report_artifact() {
 
     let report_line = execute_headless_extension_run(
         &mut session,
-        "code-swarm.review {\"reviewers\":[\"tests\"],\"max_tokens\":2048}",
+        "code-swarm.review {\"models\":[\"fixture::echo\"],\"reviewers\":[\"tests\"],\"max_tokens\":2048}",
     );
 
     assert_eq!(report_line["type"], json!("extension_run_result"));
     let result = &report_line["result"];
     assert_eq!(result["reviewer_count"], json!(1));
-    // Inherited target comes back resolved from the recorded spawn.
+    assert_eq!(result["succeeded"], json!(1));
     assert_eq!(result["reviewers"][0]["provider"], json!("fixture"));
     assert_eq!(result["reviewers"][0]["model"], json!("echo"));
+    assert!(
+        result["reviewers"][0]["findings"]
+            .as_str()
+            .expect("result findings")
+            .contains("boundary condition needs coverage"),
+        "the command result must carry the reviewer findings for adjudication"
+    );
     assert_eq!(result["reviewers"][0]["ok"], json!(true));
     let result_event_id = session
         .events()

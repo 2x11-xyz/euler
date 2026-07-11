@@ -96,7 +96,7 @@ pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};
 pub use swarm::{
     resolve_swarm_config, SwarmConfig, SwarmConfigError, SwarmConfigStore, SwarmConfigTier,
-    SwarmReviewer, MAX_SWARM_REVIEWERS,
+    SwarmReviewer, MAX_SWARM_REVIEWERS, UNCONFIGURED_SWARM_ERROR,
 };
 pub use tools::{ToolError, ToolRegistry};
 

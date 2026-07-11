@@ -2968,12 +2968,36 @@ fn extension_cli_code_swarm_review_validates_input_and_stays_live_only() {
         "expected model target guidance, got: {stderr}"
     );
 
-    let offline = command_with_home(exe, &home)
+    // No models and no persisted config: the honest unconfigured error with
+    // remediation, never a guessed reviewer set.
+    let unconfigured = command_with_home(exe, &home)
         .args(["extension", "run", "code-swarm.review", &session_id])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .expect("code swarm review offline run");
+    assert!(!unconfigured.status.success());
+    let stderr = String::from_utf8_lossy(&unconfigured.stderr);
+    assert!(
+        stderr.contains("--model provider::model") && stderr.contains("/code-swarm"),
+        "expected unconfigured remediation, got: {stderr}"
+    );
+
+    // Explicit models get past input validation; the offline runner then has
+    // no live session to spawn against and must say so honestly.
+    let offline = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "code-swarm.review",
+            &session_id,
+            "--model",
+            "fixture::fixture-model",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("code swarm review offline run with models");
     assert!(!offline.status.success());
     let stderr = String::from_utf8_lossy(&offline.stderr);
     assert!(
