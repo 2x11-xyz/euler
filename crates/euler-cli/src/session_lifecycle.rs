@@ -102,8 +102,15 @@ pub(crate) fn live_session_config(
 /// set so tool output can never carry them to the canvas or the ledger
 /// (secrets contract; issue #56). Best-effort: a missing/corrupt auth file
 /// only means fewer known values — the shape-based layer still applies.
-pub(crate) fn seed_secret_redaction<D>(session: &mut euler_core::Session<D>) {
-    let Ok(storage) = euler_core::auth_storage::AuthStorage::new_default() else {
+pub(crate) fn seed_secret_redaction<D>(
+    session: &mut euler_core::Session<D>,
+    auth_file: Option<&std::path::Path>,
+) {
+    let storage = match auth_file {
+        Some(path) => euler_core::auth_storage::AuthStorage::new(path),
+        None => euler_core::auth_storage::AuthStorage::new_default(),
+    };
+    let Ok(storage) = storage else {
         return;
     };
     for provider in storage.list() {

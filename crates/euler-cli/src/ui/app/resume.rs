@@ -129,6 +129,7 @@ impl AppCore {
         let outcome =
             resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
         let mut session = outcome.session;
+        crate::session_lifecycle::seed_secret_redaction(&mut session, None);
         if let Some((_, extension)) = observer {
             session.set_observer_extension(extension);
         }

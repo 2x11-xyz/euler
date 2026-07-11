@@ -42,6 +42,25 @@ fn max_output_tokens_propagates_to_model_request_and_model_call() {
 }
 
 #[test]
+fn into_fresh_session_carries_registered_secret_values() {
+    // /new rebuilds the session in-process; host-seeded redaction values
+    // (auth-file credentials, resolved x-secret values) must survive the
+    // rebuild — from_env alone would silently drop them (review on #56).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(Vec::new());
+    let config = SessionConfig::new(temp.path());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+    session.add_redacted_secret("carried-secret-value-xyz");
+
+    let fresh = session.into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()));
+
+    let out = fresh
+        .redactor
+        .redact("before carried-secret-value-xyz after");
+    assert!(!out.contains("carried-secret-value-xyz"), "{out}");
+}
+
+#[test]
 fn persisted_session_events_never_parent_to_runtime_only_model_delta() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");

@@ -41,6 +41,7 @@ struct CompanionLoop<'a, D> {
     agent_id: String,
     target: ModelTarget,
     task: AgentTask,
+    redactor: crate::redaction::SecretRedactor,
     workspace_root: std::path::PathBuf,
     auto_compaction: AutoCompactionPolicy,
     reasoning_effort: ReasoningEffort,
@@ -192,6 +193,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         };
         Self {
             session_id: session.config.session_id.clone(),
+            redactor: session.redactor.clone(),
             agent_id,
             target,
             task,
@@ -353,11 +355,13 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let Some(patch) = execution.patch.as_ref() else {
             return Ok(false);
         };
-        let payload = object([
+        let mut payload = object([
             ("path", patch.path.clone().into()),
             ("old", patch.before.clone().into()),
             ("new", patch.after.clone().into()),
         ]);
+        self.redactor
+            .redact_payload_fields(&mut payload, &["old", "new"]);
         let patch_proposed_id = self
             .append(EventKind::PATCH_PROPOSED, payload.clone(), None)?
             .id;
@@ -381,11 +385,10 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 Some(patch_applied_id.clone()),
             )?
             .id;
-        self.append(
-            EventKind::FILE_DIFF,
-            file_diff_payload(&call.id, &file_change_id, patch),
-            Some(patch_applied_id),
-        )?;
+        let mut diff_payload = file_diff_payload(&call.id, &file_change_id, patch);
+        self.redactor
+            .redact_payload_fields(&mut diff_payload, &["diff"]);
+        self.append(EventKind::FILE_DIFF, diff_payload, Some(patch_applied_id))?;
         Ok(false)
     }
 
@@ -402,16 +405,15 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                     None,
                 )?
                 .id;
-            self.append(
-                EventKind::FILE_DIFF,
-                crate::file_diff::observed_file_diff_payload(
-                    call_id,
-                    &file_change_id,
-                    "run_shell",
-                    change,
-                ),
-                None,
-            )?;
+            let mut observed_diff = crate::file_diff::observed_file_diff_payload(
+                call_id,
+                &file_change_id,
+                "run_shell",
+                change,
+            );
+            self.redactor
+                .redact_payload_fields(&mut observed_diff, &["diff"]);
+            self.append(EventKind::FILE_DIFF, observed_diff, None)?;
         }
         Ok(())
     }
@@ -426,7 +428,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             ("id", call.id.into()),
             ("name", execution.name.into()),
             ("ok", true.into()),
-            ("output", execution.output.into()),
+            ("output", self.redactor.redact(&execution.output).into()),
         ]);
         if let Some(exit_code) = execution.exit_code {
             payload.insert("exit_code".to_owned(), exit_code.into());
@@ -448,7 +450,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 ("id", id.into()),
                 ("name", name.into()),
                 ("ok", false.into()),
-                ("error", error.into()),
+                ("error", self.redactor.redact(&error).into()),
             ]),
             Some(tool_call_event_id),
         )?;

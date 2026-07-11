@@ -71,6 +71,22 @@ impl SecretRedactor {
         }
     }
 
+    /// Redact string-valued fields of a payload in place (diff / old / new
+    /// content fields on patch and file-diff events — the secrets contract
+    /// covers ALL provenance payloads, not just tool output).
+    pub fn redact_payload_fields(&self, payload: &mut euler_event::JsonObject, fields: &[&str]) {
+        for field in fields {
+            if let Some(value) = payload.get_mut(*field) {
+                if let Some(text) = value.as_str() {
+                    let redacted = self.redact(text);
+                    if redacted != text {
+                        *value = redacted.into();
+                    }
+                }
+            }
+        }
+    }
+
     /// Redact known values and known token shapes from `text`.
     pub fn redact(&self, text: &str) -> String {
         let mut out = self

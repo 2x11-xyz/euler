@@ -686,11 +686,17 @@ impl<D> Session<D> {
 
     pub fn into_fresh_session(self, session_id: impl Into<String>, decider: D) -> Self {
         let active_target = self.active_target;
+        let redactor = self.redactor;
         let mut config = self.config;
         config.session_id = session_id.into();
         config.provider = active_target.provider;
         config.model = active_target.model;
-        Self::new_with_providers(config, self.providers, decider)
+        let mut fresh = Self::new_with_providers(config, self.providers, decider);
+        // Same user, same process: host-seeded secret values (auth file,
+        // runtime-resolved) carry into the fresh session — /new must not
+        // silently drop redaction back to env-only (review finding on #56).
+        fresh.redactor = redactor;
+        fresh
     }
 
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
@@ -1849,11 +1855,13 @@ impl<D: PermissionDecider> Session<D> {
         {
             Ok(execution) => {
                 if let Some(patch) = execution.patch {
-                    let payload = object([
+                    let mut payload = object([
                         ("path", patch.path.clone().into()),
                         ("old", patch.before.clone().into()),
                         ("new", patch.after.clone().into()),
                     ]);
+                    self.redactor
+                        .redact_payload_fields(&mut payload, &["old", "new"]);
                     let patch_proposed_id = self.emit_with_parent(
                         EventKind::PATCH_PROPOSED,
                         payload.clone(),
@@ -1889,9 +1897,12 @@ impl<D: PermissionDecider> Session<D> {
                         file_change_payload(&call.id, &patch, pre_image_blob.as_deref()),
                         Some(patch_applied_id.clone()),
                     )?;
+                    let mut diff_payload = file_diff_payload(&call.id, &file_change_id, &patch);
+                    self.redactor
+                        .redact_payload_fields(&mut diff_payload, &["diff"]);
                     self.emit_with_parent(
                         EventKind::FILE_DIFF,
-                        file_diff_payload(&call.id, &file_change_id, &patch),
+                        diff_payload,
                         Some(patch_applied_id),
                     )?;
                 }
@@ -1901,9 +1912,13 @@ impl<D: PermissionDecider> Session<D> {
                         observed_file_change_payload(&call.id, "run_shell", change),
                         Some(tool_call_event_id.clone()),
                     )?;
+                    let mut observed_diff =
+                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change);
+                    self.redactor
+                        .redact_payload_fields(&mut observed_diff, &["diff"]);
                     self.emit_with_parent(
                         EventKind::FILE_DIFF,
-                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change),
+                        observed_diff,
                         Some(tool_call_event_id.clone()),
                     )?;
                 }
