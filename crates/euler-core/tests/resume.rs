@@ -943,14 +943,14 @@ impl PermissionDecider for CountingDecider {
 
 struct StaticProvider {
     name: &'static str,
-    streams: std::cell::RefCell<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+    streams: std::sync::Mutex<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
 }
 
 impl StaticProvider {
     fn new(name: &'static str, streams: Vec<Vec<Result<ModelStreamEvent, ProviderError>>>) -> Self {
         Self {
             name,
-            streams: std::cell::RefCell::new(streams.into()),
+            streams: std::sync::Mutex::new(streams.into()),
         }
     }
 }
@@ -963,7 +963,8 @@ impl ModelProvider for StaticProvider {
     fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         let events = self
             .streams
-            .borrow_mut()
+            .lock()
+            .expect("stream queue")
             .pop_front()
             .ok_or_else(|| ProviderError::transport("static provider exhausted"))?;
         Ok(Box::new(events.into_iter()))

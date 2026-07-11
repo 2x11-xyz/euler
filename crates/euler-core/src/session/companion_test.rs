@@ -6,7 +6,6 @@ use euler_agents::{AgentBudget, MAX_OUTPUT_BYTES};
 use euler_provider::{
     FixtureResponse, ModelProvider, ProviderStream, ScriptedProvider, StopReason, ToolCall,
 };
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -488,7 +487,7 @@ fn companion_rejected_error_is_never_retried() {
 }
 
 struct FlakyThenScriptedProvider {
-    failures: RefCell<Vec<ProviderError>>,
+    failures: Mutex<Vec<ProviderError>>,
     inner: ScriptedProvider,
     invokes: Arc<AtomicUsize>,
 }
@@ -500,7 +499,7 @@ impl FlakyThenScriptedProvider {
         invokes: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            failures: RefCell::new(failures),
+            failures: Mutex::new(failures),
             inner,
             invokes,
         }
@@ -514,8 +513,9 @@ impl ModelProvider for FlakyThenScriptedProvider {
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         self.invokes.fetch_add(1, Ordering::Relaxed);
-        if !self.failures.borrow().is_empty() {
-            return Err(self.failures.borrow_mut().remove(0));
+        let mut failures = self.failures.lock().expect("failure queue");
+        if !failures.is_empty() {
+            return Err(failures.remove(0));
         }
         self.inner.invoke(request)
     }
