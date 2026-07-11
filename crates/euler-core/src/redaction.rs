@@ -40,6 +40,7 @@ const TOKEN_PREFIXES: &[&str] = &[
     "sk-proj-",
     "ghp_",
     "github_pat_",
+    "xai-",
     "xoxb-",
     "xoxp-",
     "AKIA",
@@ -186,6 +187,7 @@ mod tests {
             format!("AKIA{}", "IOSFODNN7EXAMPLE"),
             format!("AIza{}", "SyA-1234567890abcdefghijklmnopqrstu"),
             format!("xoxb-{}", "123456789012-abcdefghijklmnop"),
+            format!("xai-{}", "0123456789abcdefghijklmn"),
         ] {
             let token = token.as_str();
             let out = redactor.redact(&format!("before {token} after"));
