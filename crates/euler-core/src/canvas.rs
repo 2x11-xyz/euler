@@ -490,8 +490,7 @@ fn result_stub_handles(events: &[EventEnvelope]) -> BTreeMap<String, String> {
 
 /// Write-shaped results demote last and their stubs always carry the
 /// artifact path (Retention Contract): losing sight of what the agent wrote
-/// is the report-clobber failure class. `write_file` is matched for forward
-/// compatibility with the planned write tool name.
+/// is the report-clobber failure class.
 fn is_write_shaped(name: &str) -> bool {
     matches!(name, "apply_patch" | "edit_file" | "write_file")
 }
