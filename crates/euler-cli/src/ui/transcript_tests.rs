@@ -1981,6 +1981,37 @@ fn collapsed_tool_run_strips_leading_literal_exit_code_row() {
 }
 
 #[test]
+fn collapsed_tool_run_strips_signed_annotated_timeout_exit_row() {
+    // Matches euler-core::tools::ShellExecutor::run_shell's real timeout
+    // header verbatim (crates/euler-core/src/tools.rs): a signed exit code
+    // followed by a parenthesized annotation, not just an unsigned "exit N".
+    let theme = Theme::default();
+    let output = "exit -1 (command timed out after 5000 ms and was killed; \
+pass timeout_ms up to 600000 for longer runs)\nreal output"
+        .to_owned();
+    let item = [TranscriptItem::ToolRun {
+        command: "sleep 999".to_owned(),
+        ok: false,
+        error: String::new(),
+        output,
+        exit_code: Some(-1),
+        grant_source: None,
+    }];
+
+    let texts = line_texts(&render_items_for_history(&item, &theme, 96));
+    let joined = texts.join("\n");
+
+    assert!(joined.contains("└ real output"), "texts: {texts:?}");
+    assert!(
+        !texts
+            .iter()
+            .any(|line| line.trim_start().starts_with("exit -1")),
+        "signed annotated exit row must not leak as an output row: {texts:?}"
+    );
+    assert!(joined.contains("exit -1 · 1 line"), "texts: {texts:?}");
+}
+
+#[test]
 fn expanded_tool_run_keeps_full_output_without_result_line_prefix() {
     let theme = Theme::default();
     let output = (1..=DEFAULT_OUTPUT_LIMIT_LINES + 1)

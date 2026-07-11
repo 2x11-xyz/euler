@@ -324,10 +324,24 @@ fn strip_leading_exit_code_row(detail: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Matches the "exit N" header `euler-core::tools::run_shell` emits ahead of
+/// bounded output — including its signed, annotated timeout form: `exit -1
+/// (command timed out after {timeout_ms} ms and was killed; pass timeout_ms
+/// up to {MAX_SHELL_TIMEOUT_MS} for longer runs)`. Only accepting unsigned
+/// digits (`parse::<u32>`-style) would leave that timeout/signal row
+/// un-stripped, so it accepts an optional leading `-` and an optional
+/// trailing parenthesized annotation, not just the bare unsigned form.
 fn is_leading_exit_code_row(line: &str) -> bool {
-    line.trim()
-        .strip_prefix("exit ")
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    let Some(rest) = line.trim().strip_prefix("exit ") else {
+        return false;
+    };
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len == 0 {
+        return false;
+    }
+    let remainder = rest[digits_len..].trim_start();
+    remainder.is_empty() || (remainder.starts_with('(') && remainder.ends_with(')'))
 }
 
 fn informative_output_rows(detail: &str, limit: usize) -> ArtifactOutputRows {
