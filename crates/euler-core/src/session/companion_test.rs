@@ -1370,3 +1370,42 @@ impl ModelProvider for StopReasonProvider {
         ))
     }
 }
+
+#[test]
+fn companion_second_consecutive_apply_patch_failure_reteaches_with_its_own_streak() {
+    let bad_patch_call = |id: &str| ToolCall {
+        id: id.to_owned(),
+        name: "apply_patch".to_owned(),
+        input: serde_json::json!({"patch": "not a patch"}),
+    };
+    let (_temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![bad_patch_call("call-1")]),
+            FixtureResponse::ToolCalls(vec![bad_patch_call("call-2")]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]),
+        ScriptedDecider::new(vec![DeciderVerdict::AllowSession]),
+    );
+
+    let summary = session
+        .spawn_companion(task_with_caps([Capability::FsWrite]))
+        .expect("companion");
+
+    assert!(summary.result.ok());
+    let errors: Vec<String> = tool_results(session.events())
+        .into_iter()
+        .filter(|event| event.payload["ok"] == serde_json::json!(false))
+        .map(|event| event.payload["error"].as_str().expect("error").to_owned())
+        .collect();
+    assert_eq!(errors.len(), 2);
+    assert!(
+        !errors[0].contains("apply_patch full format specification"),
+        "first companion failure stays rung-1: {}",
+        errors[0]
+    );
+    assert!(
+        errors[1].contains("apply_patch full format specification"),
+        "second consecutive companion failure escalates: {}",
+        errors[1]
+    );
+}

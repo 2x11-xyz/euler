@@ -19,6 +19,40 @@ where an agent exhausted its tool budget re-reading a 523-line file that
 `read_file` would only return truncated. Rationale and sources:
 the context-engineering principle above.
 
+## Format re-teaching (two rungs)
+
+Formatted tools teach their format adaptively instead of assuming it
+(issue #94). The trigger is failure, not context depth — failure catches
+both "never knew the format" and "forgot it to context rot".
+
+- **Rung 1 — teaching errors:** every parse error names what the format
+  *expects*, not just what was wrong. One line, only on failure.
+- **Rung 2 — re-teach escalation:** on the **second consecutive failure of
+  the same tool**, the full format specification plus a worked example is
+  appended to the tool error the model reads next, and keeps being appended
+  until that tool succeeds.
+
+Semantics:
+
+- The failure streak is **per tool** and **process-local** (one streak set
+  per model context: the driver session and each companion track their own).
+  A tool's success resets only that tool's streak; other tools' outcomes
+  never touch it. An `apply_patch` heredoc intercepted from `run_shell`
+  counts against (and re-teaches) `apply_patch`.
+- The streak is **live-session runtime state, not reconstructed from the
+  event log**: resume and `/new` start with an empty tracker, so a session
+  resumed mid-streak re-teaches from rung 1. Deliberate — the loop is a
+  usability aid, and a resume reset costs at most one extra one-line error.
+- Escalation is **deterministic**: the same failure sequence always yields
+  the same error strings, so fixtures and resume replays stay stable.
+- The re-teach text is part of the ordinary `tool.result` error payload —
+  no new event kind.
+- Tool-agnostic: a tool opts in by registering a re-teach payload (full
+  grammar + example) in the `ToolRegistry`; the escalation machinery never
+  special-cases a tool. `apply_patch` is the first registered consumer, and
+  its payload examples are tested against the real parser so the taught
+  syntax cannot drift from the accepted syntax.
+
 ## Default coding tools
 
 | Tool | Capability | Notes |
