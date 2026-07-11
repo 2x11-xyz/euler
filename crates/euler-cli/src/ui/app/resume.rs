@@ -35,7 +35,7 @@ impl AppCore {
 
         match self.build_tui_resume(&session_id) {
             Ok(resume) => self.accept_tui_resume(session_id, resume),
-            Err(error) => self.notice_item(format!("resume failed: {error}")),
+            Err(error) => self.error_item(format!("resume failed: {error}")),
         }
     }
 
@@ -129,6 +129,7 @@ impl AppCore {
         let outcome =
             resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
         let mut session = outcome.session;
+        crate::session_lifecycle::seed_secret_redaction(&mut session, None);
         if let Some((_, extension)) = observer {
             session.set_observer_extension(extension);
         }

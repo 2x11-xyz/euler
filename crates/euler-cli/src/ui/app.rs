@@ -26,7 +26,7 @@ use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPrevi
 use super::status::status_widget;
 use super::status::{status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
 use super::terminal::{self, PendingSignal, TerminalSession};
-use super::theme::{Theme, ThemeChoice};
+use super::theme::{ColorLevel, Theme, ThemeChoice};
 #[cfg(test)]
 use super::transcript::transcript_items_widget;
 use super::transcript::{self, TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
@@ -61,7 +61,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 #[cfg(test)]
 use ratatui::Frame;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
@@ -70,13 +70,18 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Trailing debounce for the post-resize history replay. Matches the
+/// terminal's RESIZE_COMMIT_QUIESCENCE so there is exactly one notion of
+/// "the resize has settled": long enough that even slow PTY delivery of a
+/// drag's ticks coalesces into a single purge+replay, short enough to feel
+/// immediate once the user lets go.
+const RESIZE_REPLAY_DEBOUNCE: Duration = Duration::from_millis(450);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
 /// Working HUD braille spinner cadence (issue #27, spec v2.1 §13.3: 80-100ms).
 const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(90);
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
-const DENIED_COMPOSER_GHOST: &str = "denied — tell euler what to do instead";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
 
@@ -141,6 +146,12 @@ pub struct App {
     _terminal_session: TerminalSession,
     event_loop: EventLoop,
     core: AppCore,
+    /// Trailing-debounce deadline for the post-resize history replay: every
+    /// resize event pushes it out, so a drag settles into exactly ONE
+    /// purge+replay at the final width instead of appending a fossil copy of
+    /// the transcript to scrollback per width tick (issue #38; mechanism
+    /// adopted from codex's resize reflow).
+    resize_replay_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -165,9 +176,18 @@ pub struct AppCore {
     reply_tx: Sender<PermissionReply>,
     bottom: BottomSurface,
     status: StatusSnapshot,
+    /// Last-known authenticated provider ids, refreshed whenever the session
+    /// is Idle (construction, turn completion). Bottom-surface rebuilds that
+    /// happen while the session is checked out onto the worker thread reuse
+    /// this snapshot so the reviewer-model picker never silently shrinks to
+    /// empty because of turn state.
+    authenticated_providers: BTreeSet<String>,
     model_catalog: MergedModelCatalog,
     session_store: Option<SessionStore>,
     active_session_home_managed: bool,
+    /// Whether the session loaded a durable user grant store; gates the
+    /// `u  Allow <prefix> * always` approval option (absent = store inert).
+    user_rules_enabled: bool,
     token_usage: TokenUsageSnapshot,
     transcript: TranscriptState,
     visual_canvas: VisualCanvasState,
@@ -176,6 +196,11 @@ pub struct AppCore {
     last_working_elapsed_secs: Option<u64>,
     modal: Option<Modal>,
     approval_selection: ApprovalOption,
+    /// Composer draft stashed while an approval modal owns the keyboard.
+    /// The panel's instruction input must start EMPTY: a pre-existing draft
+    /// (typed before the ask arrived) silently disabled the y/a/p/n hotkeys
+    /// and was consumed as the deny instruction (issue #60).
+    modal_stashed_draft: Option<String>,
     quit_armed: Option<Instant>,
     notice: Option<String>,
     pending_terminal_clipboard: Option<String>,
@@ -201,8 +226,6 @@ pub struct AppCore {
     queued_inputs: VecDeque<String>,
     queued_selection: Option<usize>,
     queue_auto_flush_paused: bool,
-    /// Empty-composer ghost override (deny-with-instruction empty path).
-    empty_composer_ghost: Option<&'static str>,
     in_flight_label: Option<String>,
     /// Persona/name of the in-flight companion run, for approval panel tagging.
     in_flight_companion_name: Option<String>,
@@ -229,6 +252,11 @@ pub struct AppCore {
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     turn_event_start: usize,
+    /// ctx input-token count when the current turn was spawned (review v3
+    /// §R5(b)): compared against the count at turn end to decide whether
+    /// context moved less than ~1%, one leg of the empty-turn recap
+    /// suppression (0 files changed AND ctx <1% AND no tests run).
+    turn_start_input_tokens: u64,
     last_turn_activity_at: Option<Instant>,
     stall_notified: bool,
     terminal_focused: bool,
@@ -327,6 +355,7 @@ impl App {
             _terminal_session: terminal_session,
             event_loop,
             core,
+            resize_replay_deadline: None,
         })
     }
 
@@ -339,7 +368,23 @@ impl App {
             if self.drain_actions()? {
                 return Ok(());
             }
+            self.flush_resize_replay()?;
         }
+    }
+
+    /// Run the debounced post-resize replay once the deadline passes with no
+    /// further resize events: purge euler-emitted scrollback and re-emit the
+    /// transcript from the event log at the settled width (exactly one copy).
+    fn flush_resize_replay(&mut self) -> Result<()> {
+        let due = self
+            .resize_replay_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !due {
+            return Ok(());
+        }
+        self.resize_replay_deadline = None;
+        self.core.invalidate_history_cache();
+        self.replay_history(true)
     }
 
     fn poll_background(&mut self) {
@@ -370,9 +415,14 @@ impl App {
     }
 
     fn poll_timeout(&self) -> Duration {
-        self.event_loop
+        let mut timeout = self
+            .event_loop
             .poll_timeout(Instant::now())
-            .min(WORKER_POLL_INTERVAL)
+            .min(WORKER_POLL_INTERVAL);
+        if let Some(deadline) = self.resize_replay_deadline {
+            timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        timeout
     }
 
     fn poll_terminal(&mut self, timeout: Duration) -> Result<()> {
@@ -440,14 +490,17 @@ impl App {
             }
             UiAction::Resize { .. } => {
                 metrics::record(metrics::Metric::ResizeAction);
-                // No replay, no scrollback purge: rows already in native
-                // scrollback stay untouched (re-purging duplicated them in
-                // 3J-ignoring terminals and destroyed them in honoring ones —
-                // the P1 audit finding). The canvas re-renders at the new
-                // width and the terminal remaps its committed boundary by
-                // item identity (commit_scrolled_history width branch).
+                // Intermediate ticks are cheap: re-render the live viewport
+                // at the new width and leave scrollback alone. The real
+                // reconciliation is a SINGLE purge+replay at the settled
+                // width, scheduled with a trailing debounce below — the
+                // per-tick variants (purge every tick, or never purge) both
+                // corrupted real terminals (review v3 §R2: Ghostty, iTerm2,
+                // and Terminal.app all accumulated one fossil re-render per
+                // width step).
                 self.core.invalidate_history_cache();
                 self.render_frame()?;
+                self.resize_replay_deadline = Some(Instant::now() + RESIZE_REPLAY_DEBOUNCE);
                 return Ok(false);
             }
             UiAction::Render(_) => {
@@ -579,6 +632,7 @@ fn set_terminal_theme_colors(terminal: &mut CrosstermTerminal, core: &AppCore) -
         core.theme.palette.foreground,
         core.theme.palette.background,
         core.theme.palette.cursor,
+        core.theme.palette.user_rail,
     )
 }
 
@@ -605,16 +659,19 @@ struct AppCoreBootstrap {
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     active_session_home_managed: bool,
+    user_rules_enabled: bool,
     theme: Theme,
     status: StatusSnapshot,
     initial_token_usage: TokenUsageSnapshot,
     initial_context: super::commands::CommandContext,
+    authenticated_providers: BTreeSet<String>,
 }
 
 fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> AppCoreBootstrap {
     let target = session.active_target().clone();
     let reasoning_effort = session.reasoning_effort();
     let session_id = session.session_id().to_owned();
+    let user_rules_enabled = session.user_rules_enabled();
     let cwd = session_root_status_path();
     let AppOptions {
         theme_choice,
@@ -637,11 +694,20 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         )
         .catalog
     });
-    let theme = Theme::for_choice(theme_choice);
+    // #64: detect truecolor support once at startup; every theme RGB
+    // quantizes to ANSI-256 at this boundary when unsupported (e.g.
+    // Terminal.app / TERM_PROGRAM=Apple_Terminal), so all render sites
+    // degrade together instead of leaving 24-bit SGR for the terminal to
+    // mangle.
+    let theme = Theme::for_choice_with_color_level(theme_choice, ColorLevel::detect());
     let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
     status.session_id = Some(session_id.clone());
     status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
     status.git_branch = detect_git_branch(&status.cwd);
+    // /status visibility line (ADR 0011): only a non-default reviewer shows.
+    if session.permission_reviewer() != euler_core::PermissionReviewer::User {
+        status.permission_reviewer = Some(session.permission_reviewer().as_str().to_owned());
+    }
     let initial_token_usage = TokenUsageSnapshot {
         context_window_tokens: context_window_tokens_for(
             &model_catalog,
@@ -650,10 +716,12 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         ),
         ..TokenUsageSnapshot::default()
     };
+    let authenticated_providers = session.providers().authenticated_provider_ids();
     let initial_context = command_context(
         &model_catalog,
         &target.provider,
         &target.model,
+        &authenticated_providers,
         empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
     );
     AppCoreBootstrap {
@@ -667,10 +735,12 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         extensions,
         observe,
         active_session_home_managed,
+        user_rules_enabled,
         theme,
         status,
         initial_token_usage,
         initial_context,
+        authenticated_providers,
     }
 }
 
@@ -697,10 +767,12 @@ impl AppCore {
             extensions,
             observe,
             active_session_home_managed,
+            user_rules_enabled,
             theme,
             status,
             initial_token_usage,
             initial_context,
+            authenticated_providers,
         } = boot;
         Self {
             state: AppState::Idle {
@@ -710,9 +782,11 @@ impl AppCore {
             reply_tx: channels.reply_tx,
             bottom: BottomSurface::new(initial_context),
             status,
+            authenticated_providers,
             model_catalog,
             session_store,
             active_session_home_managed,
+            user_rules_enabled,
             token_usage: initial_token_usage,
             transcript: TranscriptState::default(),
             visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner {
@@ -723,6 +797,7 @@ impl AppCore {
             last_working_elapsed_secs: None,
             modal: None,
             approval_selection: ApprovalOption::default(),
+            modal_stashed_draft: None,
             quit_armed: None,
             notice: None,
             pending_terminal_clipboard: None,
@@ -741,7 +816,6 @@ impl AppCore {
             queued_inputs: VecDeque::new(),
             queued_selection: None,
             queue_auto_flush_paused: false,
-            empty_composer_ghost: None,
             in_flight_label: None,
             in_flight_companion_name: None,
             in_flight_cancellable: false,
@@ -753,6 +827,7 @@ impl AppCore {
             extensions,
             observe,
             turn_event_start: 0,
+            turn_start_input_tokens: 0,
             last_turn_activity_at: None,
             stall_notified: false,
             terminal_focused: true,
@@ -762,6 +837,7 @@ impl AppCore {
     }
 
     fn rebuild_bottom_surface(&mut self) {
+        self.refresh_authenticated_providers();
         let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
@@ -776,11 +852,13 @@ impl AppCore {
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
+            &self.authenticated_providers,
             parts,
         ));
     }
 
     fn replace_bottom_surface_for_session(&mut self) {
+        self.refresh_authenticated_providers();
         let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
@@ -795,8 +873,19 @@ impl AppCore {
             &self.model_catalog,
             &self.status.provider,
             &self.status.model,
+            &self.authenticated_providers,
             parts,
         ));
+    }
+
+    /// Recomputes the authenticated-provider snapshot when the session is on
+    /// this thread (Idle). While a turn is in flight the session lives on the
+    /// worker thread, so rebuilds keep the last-known snapshot instead of
+    /// degrading the reviewer-model picker to an empty list.
+    fn refresh_authenticated_providers(&mut self) {
+        if let AppState::Idle { session } = &self.state {
+            self.authenticated_providers = session.providers().authenticated_provider_ids();
+        }
     }
 
     fn current_checkpoint_items(&self) -> Vec<crate::ui::commands::CheckpointItem> {
@@ -841,9 +930,7 @@ impl AppCore {
     }
 
     fn composer_snapshot(&self) -> ComposerSnapshot<'_> {
-        ComposerSnapshot::new(self.bottom.composer())
-            .with_queued(self.queued_composer_lines())
-            .with_empty_ghost(self.empty_composer_ghost)
+        ComposerSnapshot::new(self.bottom.composer()).with_queued(self.queued_composer_lines())
     }
 
     fn queued_composer_lines(&self) -> Vec<QueuedComposerLine> {
@@ -1373,7 +1460,6 @@ impl AppCore {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
         }
-        self.empty_composer_ghost = None;
         self.bottom.edit_composer(|draft| {
             let _ = draft.insert_bracketed_paste(text);
         });
@@ -1435,6 +1521,15 @@ impl AppCore {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
             }
+            // `u` decides only when the panel actually offers the durable
+            // user rule; otherwise it falls through and types into the
+            // composer like any other character.
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if draft_empty && self.modal_user_rule_prefix().is_some() =>
+            {
+                let prefix = self.modal_user_rule_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowUserScope(prefix))
+            }
             KeyCode::Char('n') | KeyCode::Char('N') if draft_empty => self.reply_deny_from_modal(),
             KeyCode::Esc => self.reply_deny_from_modal(),
             _ if modal_quit_key(&key) => {
@@ -1447,12 +1542,16 @@ impl AppCore {
     }
 
     fn move_approval_selection_up(&mut self) -> CoreEffect {
-        self.approval_selection = self.approval_selection.previous();
+        self.approval_selection = self
+            .approval_selection
+            .previous(self.modal_user_rule_prefix().is_some());
         CoreEffect::Render
     }
 
     fn move_approval_selection_down(&mut self) -> CoreEffect {
-        self.approval_selection = self.approval_selection.next();
+        self.approval_selection = self
+            .approval_selection
+            .next(self.modal_user_rule_prefix().is_some());
         CoreEffect::Render
     }
 
@@ -1467,27 +1566,50 @@ impl AppCore {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
             }
+            ApprovalOption::AllowUser => {
+                // Unreachable without an offered prefix (navigation skips the
+                // hidden row); an empty pattern degrades to allow-once at the
+                // decider boundary rather than broadening.
+                let prefix = self.modal_user_rule_prefix().unwrap_or_default();
+                self.reply_to_modal(PermissionReply::AllowUserScope(prefix))
+            }
             ApprovalOption::Deny => self.reply_deny_from_modal(),
         }
     }
 
     fn modal_scope_prefix(&self) -> Option<String> {
-        let request = match &self.modal {
-            Some(Modal::Permission(request)) => request,
-            Some(Modal::PatchApproval(modal)) => &modal.request,
-            None | Some(Modal::Help) => return None,
-        };
+        let request = self.modal_permission_request()?;
         patch_approval::derive_scope_prefix(request)
+    }
+
+    /// Prefix for the `u  Allow <prefix> * always` option: present only when
+    /// the session has a loaded user grant store AND the ask is a simple
+    /// shell command with a derivable first token.
+    fn modal_user_rule_prefix(&self) -> Option<String> {
+        if !self.user_rules_enabled {
+            return None;
+        }
+        let request = self.modal_permission_request()?;
+        patch_approval::derive_user_rule_prefix(request)
+    }
+
+    fn modal_permission_request(&self) -> Option<&PermissionRequest> {
+        match &self.modal {
+            Some(Modal::Permission(request)) => Some(request),
+            Some(Modal::PatchApproval(modal)) => Some(&modal.request),
+            None | Some(Modal::Help) => None,
+        }
     }
 
     fn reply_deny_from_modal(&mut self) -> CoreEffect {
         let draft = self.bottom.composer().submit_text();
         if draft.trim().is_empty() {
-            self.empty_composer_ghost = Some(DENIED_COMPOSER_GHOST);
+            // Spec §13.2: empty composer is rail + dim cursor only, in every
+            // state — the transcript's `denied` event line is the single
+            // carrier of that guidance (#57). No composer ghost text here.
             self.reply_to_modal(PermissionReply::Deny)
         } else {
             self.bottom.replace_composer_text("");
-            self.empty_composer_ghost = None;
             // Front of queue: next user turn after the denied tool turn finishes.
             self.queued_inputs.push_front(draft.clone());
             self.queued_selection = Some(0);
@@ -1498,7 +1620,6 @@ impl AppCore {
     fn handle_modal_composer_input(&mut self, input: InputEvent) -> CoreEffect {
         match input {
             InputEvent::Paste(text) => {
-                self.empty_composer_ghost = None;
                 self.bottom.edit_composer(|draft| {
                     let _ = draft.insert_bracketed_paste(&text);
                 });
@@ -1619,6 +1740,7 @@ impl AppCore {
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         self.turn_event_start = self.transcript.events().len();
+        self.turn_start_input_tokens = self.token_usage.input_tokens;
         self.note_turn_activity();
     }
 
@@ -1667,7 +1789,7 @@ impl AppCore {
                 pattern,
                 source,
             } => self.revoke_grant(capability, pattern, source),
-            CommandAction::ShowHelp { text } => self.summary_item(text),
+            CommandAction::ShowHelp { text } => self.notice_item(text),
             CommandAction::ResumeSession { session_id } => {
                 self.resume_session_from_picker(session_id)
             }
@@ -1737,7 +1859,7 @@ impl AppCore {
                 ));
                 CoreEffect::Render
             }
-            Err(error) => self.notice_item(format!("rollback failed: {error}")),
+            Err(error) => self.error_item(format!("rollback failed: {error}")),
         }
     }
 
@@ -1754,11 +1876,11 @@ impl AppCore {
         });
         let (session_id, events_path) = match created {
             Ok(created) => created,
-            Err(error) => return self.notice_item(format!("new session failed: {error}")),
+            Err(error) => return self.error_item(format!("new session failed: {error}")),
         };
         let writer = match ProvenanceWriter::new(&events_path) {
             Ok(writer) => writer,
-            Err(error) => return self.notice_item(format!("new session failed: {error}")),
+            Err(error) => return self.error_item(format!("new session failed: {error}")),
         };
         let old_session = self.take_idle_session();
         let active_target = old_session.active_target().clone();
@@ -1798,7 +1920,7 @@ impl AppCore {
     fn companion_run(&mut self, input: serde_json::Value) -> CoreEffect {
         let request = match crate::companion_run::parse_agent_task_value(&input) {
             Ok(task) => CompanionRunRequest { task },
-            Err(error) => return self.notice_item(format!("companion run failed: {error}")),
+            Err(error) => return self.error_item(format!("companion run failed: {error}")),
         };
         match std::mem::replace(&mut self.state, AppState::Empty) {
             AppState::Idle { session } => {
@@ -1855,13 +1977,13 @@ impl AppCore {
     }
 
     fn login_guidance(&mut self, provider: String) -> CoreEffect {
-        self.summary_item(format!(
+        self.notice_item(format!(
             "Run outside the TUI:\neuler login --provider {provider}\n\nThe picker stays offline; auth is checked when a request uses the provider."
         ))
     }
 
     fn logout_guidance(&mut self, provider: String) -> CoreEffect {
-        self.summary_item(format!(
+        self.notice_item(format!(
             "Run outside the TUI:\neuler logout --provider {provider}"
         ))
     }
@@ -1914,7 +2036,6 @@ impl AppCore {
         &mut self,
         edit: impl FnOnce(&mut super::composer::ComposerDraft),
     ) -> CoreEffect {
-        self.empty_composer_ghost = None;
         self.bottom.edit_composer(edit);
         CoreEffect::Render
     }
@@ -2074,8 +2195,7 @@ impl AppCore {
             match self.permission_rx.try_recv() {
                 Ok(request) => {
                     self.drain_turn_events();
-                    self.approval_selection = ApprovalOption::default();
-                    self.modal = Some(self.modal_for_request(request));
+                    self.open_permission_modal(request);
                     self.queue_notification(NotifyEvent::ApprovalNeeded);
                     changed = true;
                 }
@@ -2083,6 +2203,20 @@ impl AppCore {
             }
         }
         changed
+    }
+
+    /// Open the approval modal for a request. The panel's instruction input
+    /// starts EMPTY: any in-progress composer draft is stashed (and restored
+    /// after the decision) so the y/a/p/n hotkeys stay live and a stale
+    /// draft can never be consumed as the deny instruction (issue #60).
+    fn open_permission_modal(&mut self, request: PermissionRequest) {
+        self.approval_selection = ApprovalOption::default();
+        let draft = self.bottom.composer().submit_text();
+        if !draft.is_empty() {
+            self.modal_stashed_draft = Some(draft);
+            self.bottom.replace_composer_text("");
+        }
+        self.modal = Some(self.modal_for_request(request));
     }
 
     fn modal_for_request(&self, request: PermissionRequest) -> Modal {
@@ -2154,39 +2288,67 @@ impl AppCore {
         self.modal = None;
         self.approval_selection = ApprovalOption::default();
         let _ = self.reply_tx.send(reply);
+        self.restore_stashed_draft();
         CoreEffect::Render
+    }
+
+    /// Put back the composer draft that was in progress when the approval
+    /// modal opened. The instruction typed INSIDE the panel (if any) has
+    /// already been consumed by the reply path; the user's pre-ask draft
+    /// returns untouched.
+    fn restore_stashed_draft(&mut self) {
+        if let Some(draft) = self.modal_stashed_draft.take() {
+            self.bottom.replace_composer_text(&draft);
+        }
     }
 
     fn deny_open_modal(&mut self) {
         if self.modal.take().is_some() {
             self.approval_selection = ApprovalOption::default();
             let _ = self.reply_tx.send(PermissionReply::Deny);
+            self.restore_stashed_draft();
         }
     }
 
+    /// Muted, non-error informational line (review v2 §3/§6/§14.4, #53) — no
+    /// glyph, no "ui:" source prefix, indented to the content column.
+    /// Consecutive `Notice` items stack directly without a separating blank
+    /// line (the renderer special-cases this run). Used for every neutral
+    /// confirmation/refusal: state guards ("waits for the active turn"),
+    /// setting confirmations (/theme, /model set, /effort, /status, /usage,
+    /// /compact, permission changes, extension toggles, timestamps toggle,
+    /// code-swarm save/config lines, resume refusal) — none of these are
+    /// failures, so none should read as one. Real failures go through
+    /// `error_item` instead.
     fn notice_item(&mut self, message: String) -> CoreEffect {
         self.push_notice_item(message);
         CoreEffect::Render
     }
 
     fn push_notice_item(&mut self, message: String) {
+        self.push_finalized_visual_item(TranscriptItem::Notice(message));
+    }
+
+    /// Alias kept for call sites that read more naturally as "teaching" the
+    /// user something (disabled-extension guidance, etc.) — identical
+    /// rendering to `notice_item`.
+    fn teach_notice(&mut self, message: String) -> CoreEffect {
+        self.notice_item(message)
+    }
+
+    /// Red, `✗`-anchored failure line (review v2 §3, #53) — reserved for
+    /// genuine failures: an operation was attempted and an error came back.
+    /// Never use this for state guards or confirmations.
+    fn error_item(&mut self, message: String) -> CoreEffect {
+        self.push_error_item(message);
+        CoreEffect::Render
+    }
+
+    fn push_error_item(&mut self, message: String) {
         self.push_finalized_visual_item(TranscriptItem::Error {
             source: "ui".to_owned(),
             message,
         });
-    }
-
-    /// Muted, non-error informational line (review v2 §3/§6/§14.4) — no
-    /// glyph, no "ui:" source prefix, indented to the content column.
-    /// Consecutive `Notice` items stack directly without a separating blank
-    /// line (the renderer special-cases this run). Used for every neutral
-    /// confirmation/refusal (extension toggles, timestamps toggle,
-    /// code-swarm save/config lines, resume refusal, teach messages like the
-    /// disabled-extension notice) — none of these are failures, so none
-    /// should read as one.
-    fn teach_notice(&mut self, message: String) -> CoreEffect {
-        self.push_finalized_visual_item(TranscriptItem::Notice(message));
-        CoreEffect::Render
     }
 
     fn summary_item(&mut self, text: String) -> CoreEffect {
@@ -2323,6 +2485,7 @@ impl AppCore {
             prior_count: self.prior_permission_count(request, scope_prefix.as_deref()),
             selected_option: self.approval_selection,
             scope_prefix,
+            user_rule_prefix: self.modal_user_rule_prefix(),
             companion_name: self.in_flight_companion_name.clone(),
         })
     }

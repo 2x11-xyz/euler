@@ -49,6 +49,44 @@ A capability decision is one of:
 
 Permission prompts and decisions are session events and are recorded in provenance. Privileged secret/config edits always require explicit approval even if broader write access was granted.
 
+## Permission reviewer (guardian)
+
+The session has one **permission reviewer** for uncovered `ask` decisions:
+`user` (default — the configured decider, e.g. the TUI approval panel) or
+`guardian` (ADR 0011). With `guardian`, an uncovered ask is reviewed by a
+flag-gated companion agent spawned with an **empty capability set** and a
+one-round, zero-tool budget, on the same decision channel the human would
+use. Rules (normative; enforced in code, not only in the guardian prompt):
+
+- Verdict shape: `{risk_level: low|medium|high|critical, user_authorization:
+  unknown|low|medium|high, outcome: allow|deny|abstain, rationale}`.
+- Thresholds: low/medium risk → allow; high risk → allow only when
+  `user_authorization` ≥ medium; critical → deny, not overridable.
+- Fail closed: guardian spawn failure, companion failure, or an unparseable
+  verdict is a deny.
+- `abstain` falls back to the configured decider (the human). `deny` is
+  final for the ask; it never falls back.
+- Guardian allows are once-scoped; the guardian never installs session or
+  project grants. Requests covered by existing grants run under those grants
+  and are not guardian-reviewed.
+- The guardian adjudicates only requests it can see **verbatim** (ADR 0011
+  amendment): if the command was truncated at the retention bound, or the
+  task brief's own field bound would alter the command or path, the guardian
+  is never consulted — the ask goes directly to the human decider
+  (fail-to-human, enforced in code).
+- Denials inject guidance into the failed tool result telling the model not
+  to work around the block. Three consecutive guardian denials in one turn
+  interrupt the turn (circuit breaker).
+- Every guardian decision is a `permission.decision` event tagged
+  `decision_source: "guardian"` with the verdict fields (events contract);
+  automated decisions are always distinguishable from user decisions.
+- Headless `exec`: auto-approve tiers leave no capability in `ask` mode, so
+  configuring the guardian returns `fs-write` and `shell-exec` to `ask` —
+  every use is guardian-reviewed, overriding the tier for those two
+  capabilities in both directions (read-only's always-deny and
+  trusted-local's session-allow). A guardian abstain then hits the headless
+  decider's unconditional deny (fail closed; no prompt exists).
+
 ## Extension capability approval
 
 A command descriptor's `required_capabilities` is a *declaration*, never a
@@ -66,8 +104,8 @@ stderr — visible, never silent.
 ## Scoped Grants
 
 Capability modes are the coarse gate. **Scoped grants** sit above `ask`: when a
-request matches an active session or project grant, the gate allows it without
-re-prompting. `always-deny` still denies even if a grant exists.
+request matches an active session, project, or user grant, the gate allows it
+without re-prompting. `always-deny` still denies even if a grant exists.
 `session-allow` remains capability-wide and does not require a grant match.
 
 Grant lifetime and pattern:
@@ -77,6 +115,7 @@ Grant lifetime and pattern:
 | `once` | this request only | none |
 | `session` | current session | optional `ScopePattern` |
 | `project` | workspace project config | optional `ScopePattern` |
+| `user` | every session, every project (durable) | `ScopePattern` (prefix rule) |
 
 `ScopePattern` is an opaque bounded string:
 
@@ -95,6 +134,7 @@ A decider may return:
 - allow once (`once`);
 - allow session-scoped (`session` + pattern, possibly unscoped);
 - allow project-scoped (`project` + pattern);
+- allow user-scoped (`user` + pattern — a durable prefix rule);
 - deny;
 - deny with **instruction** text — guidance the UI passes back as a user turn.
 
@@ -119,12 +159,130 @@ each entry; deleting either side deactivates the grant. Sessions opened
 without a resolvable consent directory disable project grants entirely —
 reads and writes both fail closed.
 
+### User rules (durable prefix rules)
+
+User rules are the "don't ask again for commands starting with `cargo`"
+tier: they persist across sessions AND projects, in a single store at
+`<home>/user-grants.json` under the user-owned euler home (same atomic-write
+and 0600 discipline as the other grant stores). Unlike project grants they
+need **no consent intersection** — the store is user-authored in the user's
+own home and is never repo-controlled content, so there is no second party
+whose entries could preseed authority. Sessions opened without a resolvable
+user grant dir disable user rules entirely — reads and writes both fail
+closed.
+
+Installing a user rule is an explicit durable-config write and **must** be
+recorded as a `permission.decision` event with `grant_scope: "user"` (and
+the pattern). Silent user-store mutation is forbidden.
+
+Pattern semantics for `shell-exec` are a **command prefix over the parsed
+first token** — a rule `cargo` covers any command whose first token is
+`cargo`, exactly as session/project token scopes match. Coverage composes
+per segment (issue #78, see "Static command safety"): a prefix rule covers
+a compound command iff it parses into plain segments and every segment is
+either statically safe or prefix-covered. Unparseable commands (redirects,
+substitution, subshells) are never covered and always re-ask.
+
+A run covered by an existing user rule executes under that original
+decision: no fresh `permission.decision` event, and the tool result carries
+`grant_source: "user"` so the ledger can tag the run `· user rule`.
+
+The approval panel offers the rule as `u  Allow <prefix> * always`,
+alongside once/session/project — and only when it is honest: a prefix must
+derive from a simple shell command AND the session must hold a loaded user
+store. Unscoped or compound asks never show the option, and a session
+without a resolvable user grant dir hides it entirely.
+
+### Static command safety
+
+Core performs static analysis of `shell-exec` command lines
+(`euler-core/src/command_safety.rs`). Execution is `sh -c <command>`, so the
+analysis reasons about the whole line:
+
+- **Parsing.** A command line decomposes into plain segments across `&&`,
+  `||`, `;`, `|`, and newlines. The tokenizer honors single/double quotes
+  (quoted metacharacters are literal text, never operators). Any redirect
+  (`>`, `<`, `>>`, `<<`), subshell/grouping/brace form (`(`, `)`, `{`, `}`),
+  substitution or expansion (`$`, backtick — including inside double
+  quotes), background `&`, comment, unterminated quote, or empty segment
+  makes the whole command **not statically analyzable**. Unparseable
+  commands are never auto-approved and never covered by scoped grants; they
+  fall to the ask path. False negatives cost a prompt; false positives are
+  forbidden.
+- **Classification.** Each segment's argv is checked against a behavioral
+  allowlist of read-only binaries: `cat cd cut echo expr false grep head id
+  ls nl paste pwd rev seq stat tail tr true uname uniq wc which whoami`,
+  plus flag-inspected binaries that are safe only in read-only form: `find`
+  (no `-exec`/`-execdir`/`-ok`/`-okdir`/`-delete`/`-fls`/
+  `-fprint`/`-fprint0`/`-fprintf`), `rg` (no `--pre`/`--hostname-bin`/
+  `--search-zip`/`-z`, including bundled shorts), `base64` (no
+  `-o`/`--output`), `sed` (only `sed -n Np` / `sed -n M,Np` print-range
+  form), `git` (only `status`/`log`/`diff`/`show`/`branch` as the token
+  immediately after `git` — any global flag rejects — with no
+  `--output`/`--ext-diff`/`--textconv`/`--exec` args, and `branch` only as
+  a pure listing query). Binary names match the first token exactly
+  (`/bin/ls` and `env ls` do not match); unquoted globs reject the
+  flag-inspected binaries because runtime expansion could inject
+  flag-shaped tokens.
+- **Workspace confinement.** Read-only is not harmless: `cat
+  ~/.aws/credentials` writes nothing and still exfiltrates. Every argument
+  of a safe segment that may name a filesystem path must stay inside the
+  workspace root the command executes in: an existing path must
+  canonicalize (symlinks resolved) under the canonicalized root; a
+  non-existing argument must be relative with no `..` component, no leading
+  `~`, and no `$`/backtick. A sensitive-basename denylist (`.env*`, names
+  containing `secret`/`credential`, `id_rsa`, `id_ed25519`, `*.pem`,
+  `*.key`) rejects even inside the workspace. Argument positions are
+  classified conservatively — only the grep/rg pattern position is exempt,
+  and only when no `-e`/`-f`-style flag can shift it; `--flag=value` values
+  are checked, and flags that could carry an attached path reject. A
+  rejected segment is simply not statically safe: the command falls back to
+  the ordinary ask path (fail open to ask, never a new denial surface).
+- A command is **statically safe** iff it parses AND every segment is safe
+  AND every segment's path arguments are confined to the workspace.
+
+**Auto-approval under `ask`.** When `shell-exec` is in `ask` mode, a
+statically-safe command runs without a prompt. The run is recorded as a
+fresh `permission.decision` with `mode: "static-safe"`, `allowed: true`,
+`grant_scope: "once"`, parented to the `tool.call` — allowed-once
+semantics; **no grant is installed** and no prompt event is emitted. The
+static-safe check precedes grant-coverage matching, so the ledger
+attributes such runs to the analysis rather than to an unrelated grant.
+Static safety never bypasses `always-deny`, and a capability denial earlier
+in the same turn still short-circuits the tool call. A command truncated at
+the retention bound is never analyzed (and never matches scoped grants):
+any permission decision must be based on exactly what will execute, or fail
+closed to the ask path.
+
+**Ledger treatment.** The decision event keeps provenance honest, but the
+transcript does not render it as a standalone record — the
+standalone-record-per-call noise is exactly what covered grants eliminated
+(review v2 §8). Instead the `tool.result` carries `static_safe: true` and
+the tool header shows a dim `· safe` tag, matching the covered-grant
+`· session grant` header treatment.
+
+**Segment-aware grant coverage.** Scoped `shell-exec` grant matching uses
+the same segment analysis: a command is covered iff it parses into plain
+segments and EVERY segment either has a granted first token or is
+statically safe — with at least one segment actually matching a granted
+token (an all-safe command is attributed to the static-safe path, never to
+an unrelated grant). Tokens pool within one store: `cargo test && npm run
+lint` is covered when the session store (or the project store) grants both
+`cargo` and `npm`; a compound whose segments straddle the two stores falls
+back to ask so the ledger's single `grant_source` tag stays honest.
+Unparseable commands are never covered. The approval panel offers a token
+scope only when the gate could actually grant it for the live command:
+when every non-statically-safe segment shares one first token, that token
+is offered; otherwise (distinct unsafe tokens, unparseable command) only
+allow-once / unscoped / deny are offered.
+
 ### Revocation and listing
 
-Core exposes list and revoke APIs over session and project grant stores for
-surfaces such as `/permissions`. Revoking a project grant rewrites
-`.euler/grants.json`. Child-agent capability attenuation remains exact flat
-subset semantics; scoped grants do not change child capability sets.
+Core exposes list and revoke APIs over session, project, and user grant
+stores for surfaces such as `/permissions`. Revoking a project grant rewrites
+`.euler/grants.json`; revoking a user rule rewrites `<home>/user-grants.json`.
+Child-agent capability attenuation remains exact flat subset semantics;
+scoped grants do not change child capability sets.
 
 `provenance-read` gates host-mediated bounded provenance queries. It is not
 raw filesystem read access. The v0 pull-based event feed uses this same

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use euler_provider::catalog::{
     DEFAULT_ANTHROPIC_MODEL, DEFAULT_CHATGPT_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENROUTER_MODEL,
+    DEFAULT_XAI_MODEL,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -89,6 +90,13 @@ pub(crate) fn translate_modelsdev_json(contents: &str) -> Result<(Value, Vec<Str
         root,
         "openrouter",
         DEFAULT_OPENROUTER_MODEL,
+        &mut providers,
+        &mut warnings,
+    );
+    insert_provider(
+        root,
+        "xai",
+        DEFAULT_XAI_MODEL,
         &mut providers,
         &mut warnings,
     );

@@ -126,9 +126,46 @@ data: [DONE]
 }
 
 #[test]
+fn request_never_replays_reasoning_details_on_plaintext_dialect() {
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![
+            ModelInputItem::Message {
+                role: ModelRole::User,
+                content: "hello".to_owned(),
+            },
+            ModelInputItem::Reasoning {
+                provider: "openai".to_owned(),
+                model: DEFAULT_MODEL.to_owned(),
+                fidelity: crate::ReasoningFidelity::Raw,
+                content: String::new(),
+                artifact: Some(
+                    json!([{"type": "reasoning.text", "index": 0, "text": "kept"}]).to_string(),
+                ),
+            },
+            ModelInputItem::Message {
+                role: ModelRole::Assistant,
+                content: "answer".to_owned(),
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2, "reasoning item drops entirely");
+    assert!(messages[1].get("reasoning_details").is_none());
+    assert!(!body.to_string().contains("reasoning_details"));
+}
+
+#[test]
 fn stream_ignores_reasoning_fields_by_default() {
     let events = parse_conformance_sse(
-        br#"data: {"choices":[{"delta":{"reasoning":"think","reasoning_content":"think more","content":"answer"},"finish_reason":"stop"}]}
+        br#"data: {"choices":[{"delta":{"reasoning":"think","reasoning_content":"think more","reasoning_details":[{"type":"reasoning.text","index":0,"text":"think"}],"content":"answer"},"finish_reason":"stop"}]}
 
 data: [DONE]
 

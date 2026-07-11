@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 use crate::{
-    anthropic, chatgpt, openai, openrouter, FixtureResponse, ModelInputItem, ModelProvider,
+    anthropic, chatgpt, openai, openrouter, xai, FixtureResponse, ModelInputItem, ModelProvider,
     ModelRequest, ModelRole, ModelStreamEvent, ProviderError, ProviderErrorCategory,
     ReasoningChunk, ReasoningFidelity, ScriptedProvider, StopReason, ToolCall, Usage,
 };
@@ -98,6 +98,16 @@ data: {"choices":[{"delta":{"content":"from openrouter"},"finish_reason":"stop"}
 "#,
             )),
         ),
+        (
+            "xai",
+            Transcript::from_events(xai::parse_conformance_sse(
+                br#"data: {"choices":[{"delta":{"content":"hello "},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"from xai"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}
+
+"#,
+            )),
+        ),
     ] {
         assert_no_errors(provider, &transcript);
         assert!(transcript.text.starts_with("hello"), "{provider}");
@@ -152,6 +162,16 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\
         (
             "openrouter",
             Transcript::from_events(openrouter::parse_conformance_sse(
+                br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\"path\""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"Cargo.toml\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}
+
+"#,
+            )),
+        ),
+        (
+            "xai",
+            Transcript::from_events(xai::parse_conformance_sse(
                 br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\"path\""}}]},"finish_reason":null}]}
 
 data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"Cargo.toml\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}
@@ -392,6 +412,17 @@ fn stop_reasons_map_to_canonical_taxonomy() {
             openrouter_stop("unknown_future_reason"),
             StopReason::Error,
         ),
+        ("xai max", xai_stop("length"), StopReason::MaxTokens),
+        (
+            "xai refusal",
+            xai_stop("content_filter"),
+            StopReason::Refusal,
+        ),
+        (
+            "xai error",
+            xai_stop("unknown_future_reason"),
+            StopReason::Error,
+        ),
     ];
 
     for (provider, transcript, expected) in cases {
@@ -457,6 +488,18 @@ fn provider_errors_have_canonical_categories_without_body_details() {
                 .as_bytes(),
             )),
             ProviderErrorCategory::Rejected,
+        ),
+        (
+            "xai auth",
+            Transcript::from_events(xai::parse_conformance_sse(
+                format!(
+                    r#"data: {{"error":{{"code":"invalid_api_key","message":"leaky detail {secret}"}}}}
+
+"#
+                )
+                .as_bytes(),
+            )),
+            ProviderErrorCategory::Auth,
         ),
     ];
 
@@ -539,6 +582,15 @@ fn openai_stop(reason: &str) -> Transcript {
 
 fn openrouter_stop(reason: &str) -> Transcript {
     Transcript::from_events(openrouter::parse_conformance_sse(
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{reason}\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1}}}}\n\n"
+        )
+        .as_bytes(),
+    ))
+}
+
+fn xai_stop(reason: &str) -> Transcript {
+    Transcript::from_events(xai::parse_conformance_sse(
         format!(
             "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{reason}\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1}}}}\n\n"
         )

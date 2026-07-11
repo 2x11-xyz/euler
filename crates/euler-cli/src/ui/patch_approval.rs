@@ -1,7 +1,8 @@
 use super::patch_diff::{self, PatchDisplay};
 use super::text::{display_width, wrap_text};
 use super::theme::Theme;
-use euler_core::grants::command_first_token;
+use euler_core::command_safety::{parse_plain_segments, CommandSegment};
+use euler_core::grants::{command_first_token, shell_command_is_simple};
 use euler_core::permissions::PermissionRequest;
 use euler_core::{parse_single_file_apply_patch, ApplyPatchDocument};
 use euler_event::{EventEnvelope, EventKind};
@@ -40,24 +41,32 @@ pub(crate) enum ApprovalOption {
     AllowOnce,
     AllowSession,
     AllowProject,
+    /// Durable user rule ("always"): only reachable when the panel offers it
+    /// (`user_available`) — hidden for unscoped/compound asks and when the
+    /// session has no user grant store.
+    AllowUser,
     Deny,
 }
 
 impl ApprovalOption {
-    pub(crate) fn previous(self) -> Self {
+    pub(crate) fn previous(self, user_available: bool) -> Self {
         match self {
             Self::AllowOnce => Self::AllowOnce,
             Self::AllowSession => Self::AllowOnce,
             Self::AllowProject => Self::AllowSession,
+            Self::AllowUser => Self::AllowProject,
+            Self::Deny if user_available => Self::AllowUser,
             Self::Deny => Self::AllowProject,
         }
     }
 
-    pub(crate) fn next(self) -> Self {
+    pub(crate) fn next(self, user_available: bool) -> Self {
         match self {
             Self::AllowOnce => Self::AllowSession,
             Self::AllowSession => Self::AllowProject,
+            Self::AllowProject if user_available => Self::AllowUser,
             Self::AllowProject => Self::Deny,
+            Self::AllowUser => Self::Deny,
             Self::Deny => Self::Deny,
         }
     }
@@ -197,6 +206,9 @@ pub(crate) fn panel_lines(
         approval_option_lines(
             modal.request.capability.as_str(),
             derive_scope_prefix(&modal.request).as_deref(),
+            // Patch approval is fs-write only; durable user rules are
+            // shell-command prefix rules and never apply here.
+            None,
             selected_option,
         )
         .into_iter()
@@ -226,14 +238,75 @@ pub(crate) fn consequences_row(preview: &PatchPreview, prior_count: usize) -> Op
 /// workspace-relative directory. Returns `None` when derivation is not possible
 /// (caller falls back to unscoped and labels honestly).
 pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String> {
+    if request.command_truncated {
+        // A truncated command can never satisfy scoped matching (the full
+        // string may differ past the bound) — offer only unscoped options.
+        return None;
+    }
     match request.capability {
-        Capability::ShellExec => request.command.as_deref().and_then(derive_shell_prefix),
+        Capability::ShellExec => request
+            .command
+            .as_deref()
+            .and_then(|command| derive_shell_prefix(command, request.workspace_root.as_deref())),
         Capability::FsWrite => request.path.as_deref().and_then(derive_edit_prefix),
         _ => None,
     }
 }
 
-pub(crate) fn derive_shell_prefix(command: &str) -> Option<String> {
+/// Scope offering for a live shell command (issues #61/#78). Grant coverage
+/// is segment-aware, so the panel only offers a token the gate could
+/// actually grant for THIS command:
+///
+/// - unparseable command (redirects, substitution, …) → `None`: no token
+///   scope can ever cover it, so offering one would be dishonest (#61);
+/// - every non-statically-safe segment shares one first token → offer that
+///   token (a grant on it covers the whole command: granted segments plus
+///   statically-safe segments);
+/// - multiple distinct unsafe tokens → `None`: a single token grant cannot
+///   cover the command, so the panel falls back to unscoped labels;
+/// - all segments statically safe (normally auto-approved before any
+///   prompt) → the first segment's token.
+///
+/// Static safety includes workspace confinement, so it needs the execution
+/// cwd from the request; without one no segment counts as safe and the
+/// offer follows the same fail-closed rule as coverage.
+pub(crate) fn derive_shell_prefix(command: &str, workspace_root: Option<&Path>) -> Option<String> {
+    let segments = parse_plain_segments(command)?;
+    let mut unsafe_tokens = segments
+        .iter()
+        .filter(|segment| !workspace_root.is_some_and(|root| segment.is_statically_safe(root)))
+        .map(CommandSegment::first_token);
+    let Some(first) = unsafe_tokens.next() else {
+        return segments
+            .first()
+            .map(|segment| segment.first_token().to_owned())
+            .filter(|token| !token.is_empty());
+    };
+    // An empty token (quoted-empty word) would read back as an unscoped
+    // pattern; never offer it.
+    (!first.is_empty() && unsafe_tokens.all(|token| token == first)).then(|| first.to_owned())
+}
+
+/// Prefix for the durable user-rule option (`u  Allow cargo * always`).
+///
+/// User rules are command-prefix rules over the parsed first token. Grant
+/// COVERAGE is segment-aware (#78) — an installed rule covers compounds
+/// whose every segment is granted or statically safe — but the OFFERING
+/// stays deliberately narrower than session/project scopes: a durable rule
+/// spanning every session and project is only proposed from a single simple
+/// invocation, never derived from a compound line. Offering ⊆ coverage
+/// keeps the panel honest. Callers additionally gate on the session having
+/// a loaded user store.
+pub(crate) fn derive_user_rule_prefix(request: &PermissionRequest) -> Option<String> {
+    if request.capability != Capability::ShellExec || request.command_truncated {
+        // A truncated command may hide metacharacters past the bound; never
+        // offer a durable rule the gate would refuse to honor.
+        return None;
+    }
+    let command = request.command.as_deref()?;
+    if !shell_command_is_simple(command) {
+        return None;
+    }
     command_first_token(command).map(str::to_owned)
 }
 
@@ -257,9 +330,13 @@ pub(crate) fn derive_edit_prefix(path: &Path) -> Option<String> {
 }
 
 /// Honest option labels: never show a prefix the gate will not grant.
+/// `user_rule_prefix` is `Some` only when a durable user rule is offerable
+/// (simple shell command with a derivable prefix AND a loaded user store) —
+/// the `u` row is omitted entirely otherwise.
 pub(crate) fn approval_option_lines(
     capability: &str,
     scope_prefix: Option<&str>,
+    user_rule_prefix: Option<&str>,
     selected: ApprovalOption,
 ) -> Vec<ApprovalOptionLine> {
     let (session_label, project_label) = match scope_prefix.filter(|p| !p.is_empty()) {
@@ -267,23 +344,35 @@ pub(crate) fn approval_option_lines(
             format!("a  Allow {prefix} * for this session"),
             format!("p  Allow {prefix} * in this project"),
         ),
+        None if capability == "shell-exec" => (
+            "a  Allow all shell commands for this session".to_owned(),
+            "p  Allow all shell commands in this project".to_owned(),
+        ),
         None => (
             format!("a  Allow {capability} for this session"),
             format!("p  Allow {capability} in this project"),
         ),
     };
-    vec![
+    let mut lines = vec![
         // v2.1 (§7b): the selection bar (the `›` marker plus gold-on-select
         // styling) marks the default now — no "(default selection)" text.
         approval_option_line("y  Allow once", selected, ApprovalOption::AllowOnce),
         approval_option_line(&session_label, selected, ApprovalOption::AllowSession),
         approval_option_line(&project_label, selected, ApprovalOption::AllowProject),
-        approval_option_line(
-            "n/esc  Deny with instructions",
+    ];
+    if let Some(prefix) = user_rule_prefix.filter(|p| !p.is_empty()) {
+        lines.push(approval_option_line(
+            &format!("u  Allow {prefix} * always"),
             selected,
-            ApprovalOption::Deny,
-        ),
-    ]
+            ApprovalOption::AllowUser,
+        ));
+    }
+    lines.push(approval_option_line(
+        "n/esc  Deny with instructions",
+        selected,
+        ApprovalOption::Deny,
+    ));
+    lines
 }
 
 fn approval_option_line(

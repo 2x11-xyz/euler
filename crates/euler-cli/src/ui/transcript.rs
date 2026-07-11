@@ -16,7 +16,10 @@ mod file_diff;
 mod line;
 mod render;
 pub(crate) use cells::normalized_shell_command;
-use cells::{file_change_action_label, file_change_path_label, tool_output_is_foldable};
+use cells::{
+    file_change_action_label, file_change_path_label, normalize_tool_run_output,
+    tool_output_is_foldable,
+};
 use file_diff::file_diff_is_foldable;
 use line::render_line_oriented_item;
 #[cfg(test)]
@@ -65,9 +68,14 @@ pub enum TranscriptItem {
         error: String,
         output: String,
         exit_code: Option<i64>,
-        /// "session" / "project" when the run was covered by an existing
-        /// grant (dim `· session grant` on the header; no decision record).
+        /// "session" / "project" / "user" when the run was covered by an
+        /// existing grant (dim `· session grant` / `· user rule` on the
+        /// header; no decision record).
         grant_source: Option<String>,
+        /// Run auto-approved by static command-safety analysis (dim `· safe`
+        /// on the header; the mode=static-safe decision record is
+        /// suppressed like covered grants).
+        static_safe: bool,
     },
     Exploration {
         summaries: Vec<String>,
@@ -82,6 +90,9 @@ pub enum TranscriptItem {
         command: Option<String>,
         /// Honest scope prefix for `a`/`p` labels; `None` → unscoped labels.
         scope_prefix: Option<String>,
+        /// Prefix for the durable `u  Allow <prefix> * always` option;
+        /// `None` hides the row (unscoped/compound ask or no user store).
+        user_rule_prefix: Option<String>,
         /// Prior allowed decisions for this capability / scope in the session.
         prior_count: usize,
         /// Currently highlighted approval option; defaults to allow-once.
@@ -95,6 +106,11 @@ pub enum TranscriptItem {
         allowed: Option<bool>,
         grant_scope: Option<String>,
         instruction: Option<String>,
+        /// `Some("guardian")` when an automated reviewer decided (ADR 0011);
+        /// `None` means the user decided.
+        decision_source: Option<String>,
+        /// Guardian rationale, rendered as a dim follow-up line.
+        rationale: Option<String>,
     },
     PatchProposed {
         path: String,
@@ -618,6 +634,8 @@ fn project_event_with_checkpoints(
                 .and_then(serde_json::Value::as_bool),
             grant_scope: payload_string(event, "grant_scope"),
             instruction: payload_string(event, "instruction"),
+            decision_source: payload_string(event, "decision_source"),
+            rationale: payload_string(event, "rationale"),
         }),
         EventKind::PATCH_PROPOSED => Some(project_patch(event, true)),
         EventKind::PATCH_APPLIED => Some(project_patch(event, false)),
@@ -1099,9 +1117,10 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
                 .get("allowed")
                 .and_then(serde_json::Value::as_bool);
             let capability = payload_string(event, "capability").unwrap_or_default();
+            let mode = payload_string(event, "mode");
             let suppress_allowed = allowed == Some(true)
                 && (capability == "fs-read"
-                    || payload_string(event, "mode").as_deref() == Some("static-grant"));
+                    || matches!(mode.as_deref(), Some("static-grant" | "static-safe")));
             if suppress_allowed {
                 None
             } else {
@@ -1544,12 +1563,21 @@ fn run_item_from_result(
         command,
         ok,
         error: payload_string(event, "error").unwrap_or_default(),
-        output: payload_string(event, "output").unwrap_or_default(),
+        // The buffer is normalized exactly once, here at ingest — the
+        // leading `exit N` status row dropped, render padding stripped —
+        // so the collapsed and expanded views render the same stored
+        // lines and agree on count/order by construction.
+        output: normalize_tool_run_output(&payload_string(event, "output").unwrap_or_default()),
         exit_code: event
             .payload
             .get("exit_code")
             .and_then(serde_json::Value::as_i64),
         grant_source: payload_string(event, "grant_source"),
+        static_safe: event
+            .payload
+            .get("static_safe")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -1678,16 +1706,32 @@ fn turn_footer(entries: &[ProjectedEntry]) -> Option<String> {
     Some(format!("─ {elapsed} · {} ─", timing.absolute))
 }
 
+/// Lowercase verb summaries (design review v3 §R3): `read x`, `git status`,
+/// `list x`, `search x`. `read` additionally carries a `· N lines` result
+/// suffix when the tool result payload has the file content to count.
 fn exploration_summary_from_result(
     event: &EventEnvelope,
     calls: &HashMap<String, ToolCallProjection>,
 ) -> Option<String> {
-    if let Some(ToolCallProjection::Exploration(summary)) = tool_projection_for_result(event, calls)
-    {
-        return Some(summary.clone());
-    }
     let name = payload_string(event, "name").unwrap_or_default();
-    exploration_summary_without_args(&name)
+    let summary = if let Some(ToolCallProjection::Exploration(summary)) =
+        tool_projection_for_result(event, calls)
+    {
+        summary.clone()
+    } else {
+        exploration_summary_without_args(&name)?
+    };
+    if name == "read_file" {
+        if let Some(lines) = payload_string(event, "output").map(|output| output.lines().count()) {
+            let label = if lines == 1 {
+                "1 line".to_owned()
+            } else {
+                format!("{lines} lines")
+            };
+            return Some(format!("{summary} · {label}"));
+        }
+    }
+    Some(summary)
 }
 
 fn exploration_summary_from_call(name: &str, input: Option<&serde_json::Value>) -> Option<String> {
@@ -1695,39 +1739,44 @@ fn exploration_summary_from_call(name: &str, input: Option<&serde_json::Value>) 
         "read_file" => input
             .and_then(|input| input.get("path"))
             .and_then(serde_json::Value::as_str)
-            .map(|path| format!("Read {path}"))
+            .map(|path| format!("read {path}"))
             .or_else(|| exploration_summary_without_args(name)),
         "git_status" | "git_diff" => exploration_summary_without_args(name),
         "list_files" => input
             .and_then(|input| input.get("path"))
             .and_then(serde_json::Value::as_str)
-            .map(|path| format!("List {path}"))
-            .or_else(|| Some("List files".to_owned())),
+            .map(|path| format!("list {path}"))
+            .or_else(|| Some("list files".to_owned())),
         "search" => input
             .and_then(|input| input.get("query"))
             .and_then(serde_json::Value::as_str)
-            .map(|query| format!("Search {query}"))
-            .or_else(|| Some("Search".to_owned())),
+            .map(|query| format!("search {query}"))
+            .or_else(|| Some("search".to_owned())),
         _ => None,
     }
 }
 
 fn exploration_summary_without_args(name: &str) -> Option<String> {
     match name {
-        "read_file" => Some("Read file".to_owned()),
-        "git_status" => Some("Git status".to_owned()),
-        "git_diff" => Some("Git diff".to_owned()),
+        "read_file" => Some("read file".to_owned()),
+        "git_status" => Some("git status".to_owned()),
+        "git_diff" => Some("git diff".to_owned()),
         _ => None,
     }
 }
 
+/// Coalesce consecutive `read` summaries into one row (`read a, b`),
+/// dropping each individual `· N lines` suffix once more than one path is
+/// joined — the joined list can't attribute a line count to a single path.
+/// A single, non-coalesced read keeps its per-step line count.
 fn coalesced_exploration_summaries(summaries: &[String]) -> Vec<String> {
     let mut coalesced = Vec::new();
-    let mut reads = Vec::new();
+    let mut reads: Vec<(String, Option<String>)> = Vec::new();
     for summary in summaries {
-        if let Some(path) = summary.strip_prefix("Read ") {
-            if !reads.iter().any(|existing| existing == path) {
-                reads.push(path.to_owned());
+        if let Some(rest) = summary.strip_prefix("read ") {
+            let (path, suffix) = split_read_result_suffix(rest);
+            if !reads.iter().any(|(existing, _)| existing == path) {
+                reads.push((path.to_owned(), suffix.map(str::to_owned)));
             }
             continue;
         }
@@ -1740,10 +1789,31 @@ fn coalesced_exploration_summaries(summaries: &[String]) -> Vec<String> {
     coalesced
 }
 
-fn flush_read_summaries(coalesced: &mut Vec<String>, reads: &mut Vec<String>) {
+/// Split `path · N lines` into (`path`, `Some("N lines")`); returns
+/// (`path`, `None`) when there is no result-data suffix.
+fn split_read_result_suffix(rest: &str) -> (&str, Option<&str>) {
+    match rest.split_once(" · ") {
+        Some((path, suffix)) => (path, Some(suffix)),
+        None => (rest, None),
+    }
+}
+
+fn flush_read_summaries(coalesced: &mut Vec<String>, reads: &mut Vec<(String, Option<String>)>) {
     if reads.is_empty() {
         return;
     }
-    coalesced.push(format!("Read {}", reads.join(", ")));
+    if let [(path, suffix)] = reads.as_slice() {
+        coalesced.push(match suffix {
+            Some(suffix) => format!("read {path} · {suffix}"),
+            None => format!("read {path}"),
+        });
+    } else {
+        let joined = reads
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        coalesced.push(format!("read {joined}"));
+    }
     reads.clear();
 }

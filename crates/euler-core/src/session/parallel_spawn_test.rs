@@ -366,7 +366,9 @@ fn batch_rejects_unknown_provider_before_any_event() {
         .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
         .expect_err("unknown provider");
 
-    assert!(error.to_string().contains("provider is not configured"));
+    assert!(error
+        .to_string()
+        .contains("is not configured for this session"));
     assert!(batch_events(session.events()).is_empty());
 }
 

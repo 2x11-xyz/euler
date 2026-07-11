@@ -125,7 +125,12 @@ Extensions gain the authority to run child agents through one SDK method:
   removes the need to use it as the transport.
 - **Budgets**: the task's `AgentBudget` is recorded as today and enforced to
   the extent the child session loop enforces budgets; accounting/escrow
-  remain future work.
+  remain future work. `max_tokens` bounds OUTPUT (completion) tokens only,
+  not total (input+output) usage: it is applied both as the provider-facing
+  `max_output_tokens` request cap and as the round-accounting check (#58).
+  A companion/reviewer sees the whole session canvas as input, which
+  routinely dwarfs an output-scale budget on its own; counting input against
+  the same budget made real sessions unable to complete.
 - **Failure**: worker launch/panic degradation follows the background-agent
   rules above (sanitized failure `agent.result`); `spawn_agent` then returns
   the failure outcome rather than an SDK error, so extensions observe
@@ -280,6 +285,19 @@ drafts — the optional focus prompt carries the subject.
 tool-free review briefs, and any capability-holding child's own tool calls
 remain gated by the parent's tier-configured modes, so allowing spawn
 cannot escalate beyond the tier.
+
+## Guardian permission reviewer (ADR 0011)
+
+The guardian is a **core permissions feature that reuses the companion
+primitive**, not a new lifecycle concept: when `permission_reviewer =
+guardian`, the session spawns a synchronous companion with persona
+`guardian`, an empty capability set, and a one-round zero-tool budget to
+review an uncovered permission ask. It records the standard
+`agent.spawn`/`agent.result` pair; the resulting decision is a
+`permission.decision` event tagged `decision_source: "guardian"` (see the
+capabilities and events contracts). Child-agent (companion) asks are not
+guardian-routed in v0; the guardian sits only on the parent session's tool
+dispatch, which also prevents review recursion.
 
 ## Companion UI presentation (v0)
 

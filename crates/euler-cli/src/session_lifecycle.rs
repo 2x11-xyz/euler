@@ -98,6 +98,37 @@ pub(crate) fn live_session_config(
     }
 }
 
+/// Load this user's stored credential values into the session's redaction
+/// set so tool output can never carry them to the canvas or the ledger
+/// (secrets contract; issue #56). Best-effort: a missing/corrupt auth file
+/// only means fewer known values — the shape-based layer still applies.
+pub(crate) fn seed_secret_redaction<D>(
+    session: &mut euler_core::Session<D>,
+    auth_file: Option<&std::path::Path>,
+) {
+    let storage = match auth_file {
+        Some(path) => euler_core::auth_storage::AuthStorage::new(path),
+        None => euler_core::auth_storage::AuthStorage::new_default(),
+    };
+    let Ok(storage) = storage else {
+        return;
+    };
+    for provider in storage.list() {
+        match storage.get(&provider) {
+            Some(euler_core::auth_storage::Credential::ApiKey { key }) => {
+                session.add_redacted_secret(key.expose_secret());
+            }
+            Some(euler_core::auth_storage::Credential::OAuth {
+                access, refresh, ..
+            }) => {
+                session.add_redacted_secret(access.expose_secret());
+                session.add_redacted_secret(refresh.expose_secret());
+            }
+            None => {}
+        }
+    }
+}
+
 pub(crate) fn session_config(
     root: PathBuf,
     provider: String,
@@ -109,9 +140,10 @@ pub(crate) fn session_config(
     config.agent_id = AGENT_ID.to_owned();
     config.provider = provider;
     config.model = model;
-    // Project grants activate only against the user-home consent store; if
-    // the home cannot be resolved they stay disabled (fail closed).
-    config.project_grant_consent_dir = EulerHome::resolve()
+    // Project grants activate only against the user-home consent store, and
+    // durable user rules live in the same home; if the home cannot be
+    // resolved both stay disabled (fail closed).
+    let euler_home = EulerHome::resolve()
         .ok()
         .map(|home| home.root().to_path_buf());
     // User-tier code-swarm reviewer config (data, not authorization): the
@@ -119,6 +151,8 @@ pub(crate) fn session_config(
     config.code_swarm_user_config_path = EulerHome::resolve()
         .ok()
         .map(|home| home.code_swarm_config_path());
+    config.project_grant_consent_dir = euler_home.clone();
+    config.user_grant_dir = euler_home;
     config
 }
 

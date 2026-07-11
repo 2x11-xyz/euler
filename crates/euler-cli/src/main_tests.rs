@@ -72,6 +72,7 @@ fn provider_release_matrix_defaults_auth_and_factories_are_stable() {
         ("openai", DEFAULT_OPENAI_MODEL, true),
         ("anthropic", DEFAULT_ANTHROPIC_MODEL, true),
         ("openrouter", DEFAULT_OPENROUTER_MODEL, true),
+        ("xai", DEFAULT_XAI_MODEL, true),
     ];
     assert_eq!(BUILTIN_PROVIDERS.len(), expected.len());
 
@@ -628,7 +629,7 @@ fn custom_provider_missing_default_and_auth_file_fail_before_invocation() {
     );
     assert_eq!(
         auth_file.to_string(),
-        "--auth-file is only supported with --provider chatgpt, anthropic, openai, or openrouter"
+        "--auth-file is only supported with --provider chatgpt, anthropic, openai, openrouter, or xai"
     );
 
     let explicit = parse_with_provider_config(
@@ -1358,6 +1359,21 @@ fn openrouter_cli_auth_file_wires_runtime_provider_auth() {
 }
 
 #[test]
+fn xai_cli_auth_file_wires_runtime_provider_auth() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("euler-auth.json");
+    write_api_key_auth_file(&path, "xai", "xai-auth-file-secret");
+    let run = parse_without_env([
+        "--provider",
+        "xai",
+        "--auth-file",
+        path.to_str().expect("utf8 path"),
+    ]);
+
+    run.provider.validate_auth().expect("auth file key");
+}
+
+#[test]
 fn openai_cli_auth_file_wires_runtime_provider_auth() {
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("euler-auth.json");
@@ -1569,7 +1585,7 @@ fn cli_auth_file_is_rejected_for_fixture_provider() {
 
     assert_eq!(
         error.to_string(),
-        "--auth-file is only supported with --provider chatgpt, anthropic, openai, or openrouter"
+        "--auth-file is only supported with --provider chatgpt, anthropic, openai, openrouter, or xai"
     );
 }
 
@@ -2455,6 +2471,65 @@ fn reasoning_effort_rejected_outside_exec_and_bad_values() {
 }
 
 #[test]
+fn permission_reviewer_parses_for_run_tui_and_exec() {
+    for (args, is_exec) in [
+        (&["run", "--permission-reviewer", "guardian"][..], false),
+        (&["tui", "--permission-reviewer", "guardian"][..], false),
+        (
+            &["exec", "--permission-reviewer", "guardian", "hello"][..],
+            true,
+        ),
+    ] {
+        let mut args = args.iter().copied().map(str::to_owned);
+        let parsed = Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse");
+        let run = match parsed.command {
+            Command::Exec(exec) if is_exec => exec.run,
+            Command::Run(run) | Command::Tui(run) if !is_exec => run,
+            _ => panic!("unexpected command shape"),
+        };
+        assert_eq!(
+            run.permission_reviewer,
+            Some(euler_core::PermissionReviewer::Guardian)
+        );
+    }
+    // Default: no flag means no override — the session default (user) holds.
+    let mut args = ["run"].iter().copied().map(str::to_owned);
+    let parsed = unwrap_run(Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse"));
+    assert_eq!(parsed.permission_reviewer, None);
+}
+
+#[test]
+fn permission_reviewer_rejects_bad_values_and_duplicates() {
+    for (args, expected) in [
+        (
+            &["run", "--permission-reviewer", "auto"][..],
+            "--permission-reviewer must be one of user|guardian",
+        ),
+        (
+            &["run", "--permission-reviewer"][..],
+            "--permission-reviewer requires a value",
+        ),
+        (
+            &[
+                "run",
+                "--permission-reviewer",
+                "user",
+                "--permission-reviewer",
+                "guardian",
+            ][..],
+            "--permission-reviewer was provided more than once",
+        ),
+    ] {
+        let mut args = args.iter().copied().map(str::to_owned);
+        let error = match Args::parse_with_env(&mut args, EnvArgs::default()) {
+            Ok(_) => panic!("expected args error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn resume_provider_set_includes_all_builtin_providers_for_mid_session_switch() {
     // Review v2 §14.5: a resumed session rejected /model switches with
     // "provider is not configured" because only {active, original} providers
@@ -2463,7 +2538,14 @@ fn resume_provider_set_includes_all_builtin_providers_for_mid_session_switch() {
     let active = euler_core::ModelTarget::new("fixture".to_owned(), "echo".to_owned());
     let providers =
         crate::resume_provider_set(&original, &active, None).expect("resume provider set");
-    for id in ["fixture", "anthropic", "openai", "openrouter", "chatgpt"] {
+    for id in [
+        "fixture",
+        "anthropic",
+        "openai",
+        "openrouter",
+        "xai",
+        "chatgpt",
+    ] {
         assert!(providers.contains(id), "missing provider: {id}");
     }
 }

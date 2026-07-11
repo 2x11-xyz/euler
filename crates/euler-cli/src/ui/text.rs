@@ -204,8 +204,11 @@ pub(crate) fn truncate_display(text: &str, max_width: usize) -> String {
 }
 
 /// Truncate from the left, keeping the tail and prefixing an ellipsis —
-/// footer §4: the directory truncates as `…/2x11/euler`, not `/tmp/2x1…`.
-/// Char-boundary safe (multibyte glyphs never get split).
+/// footer §4 / issue #59: the directory truncates as `…/euler`, breaking at
+/// a path-component boundary, never mid-component (`…11/euler`).
+/// Char-boundary safe (multibyte glyphs never get split). Falls back to a
+/// raw character cut only when a single component is itself wider than the
+/// budget (there is no boundary to break at) — a deliberate last resort.
 pub(crate) fn truncate_display_left(text: &str, max_width: usize) -> String {
     if display_width(text) <= max_width {
         return text.to_owned();
@@ -218,6 +221,34 @@ pub(crate) fn truncate_display_left(text: &str, max_width: usize) -> String {
         return ELLIPSIS.to_string();
     }
     let budget = max_width - 1;
+    let tail = component_boundary_suffix(text, budget).unwrap_or_else(|| raw_suffix(text, budget));
+    format!("{ELLIPSIS}{tail}")
+}
+
+/// Widest suffix of `text` that starts right at a `/` boundary and fits
+/// within `budget` display cells — the ellipsis then replaces only whole
+/// leading path components. `None` when even the last component alone
+/// (e.g. `/euler`) doesn't fit.
+fn component_boundary_suffix(text: &str, budget: usize) -> Option<String> {
+    let mut boundaries = text
+        .char_indices()
+        .filter(|(_, ch)| *ch == '/')
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    // Ascending byte offsets sort widest-suffix-first; the first fit is the
+    // most of the path we can keep intact.
+    boundaries
+        .into_iter()
+        .map(|idx| &text[idx..])
+        .find(|suffix| display_width(suffix) <= budget)
+        .map(str::to_owned)
+}
+
+/// Raw character-cut suffix fitting within `budget` cells, ignoring
+/// component boundaries — the pre-#59 behavior, kept as the last-resort
+/// fallback when no component boundary fits.
+fn raw_suffix(text: &str, budget: usize) -> String {
     let mut collected: Vec<char> = Vec::new();
     let mut width = 0;
     for ch in text.chars().rev() {
@@ -229,8 +260,7 @@ pub(crate) fn truncate_display_left(text: &str, max_width: usize) -> String {
         width += char_width;
     }
     collected.reverse();
-    let tail: String = collected.into_iter().collect();
-    format!("{ELLIPSIS}{tail}")
+    collected.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -266,6 +296,39 @@ mod tests {
         assert_eq!(truncate_display_left("short", 20), "short");
         assert_eq!(truncate_display_left("short", 0), "");
         assert_eq!(truncate_display_left("short", 1), "…");
+    }
+
+    /// Issue #59: truncation must land on a path-component boundary — a
+    /// budget that would previously bisect the "2x11" component (raw
+    /// char-count-from-the-right) must instead sacrifice that whole
+    /// component and land on the next "/" boundary.
+    #[test]
+    fn truncate_display_left_breaks_at_component_boundary_not_mid_component() {
+        let text = "/Users/x/code/2x11/euler";
+        // A budget of 9 (8 usable cells after the ellipsis) is exactly wide
+        // enough for a raw last-8-chars cut to land inside "2x11" ("11" +
+        // "/euler" = "11/euler"), the pre-fix bug. The fix instead drops the
+        // whole "2x11" component and lands on the "/" before "euler".
+        assert_eq!(truncate_display_left(text, 9), "…/euler");
+        assert!(!truncate_display_left(text, 9).contains("11/euler"));
+
+        // A wider budget that comfortably fits "/2x11/euler" keeps it whole.
+        assert_eq!(truncate_display_left(text, 12), "…/2x11/euler");
+    }
+
+    /// When a single path component is itself wider than the budget, there
+    /// is no component boundary to break at; falling back to a raw
+    /// character cut (mid-component ellipsis) is an accepted last resort.
+    #[test]
+    fn truncate_display_left_falls_back_to_raw_cut_when_one_component_too_long() {
+        let text = "/a/thisdirectorynameisverylongandwontfit";
+        let truncated = truncate_display_left(text, 10);
+
+        assert!(display_width(&truncated) <= 10);
+        assert!(truncated.starts_with('…'));
+        // No "/" boundary fits within the budget, so the cut necessarily
+        // lands inside the long component rather than before it.
+        assert!(!truncated.contains('/'));
     }
 
     #[test]

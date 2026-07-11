@@ -84,10 +84,19 @@ envelope `v` per `docs/contracts/persistence.md`.
   Optional `recovery_closure: true` marks a resume-time canonical closure for
   an interrupted tail `tool.call`; it records the resume observation, not the
   original tool outcome.
+  Optional `grant_source` (`"session"` | `"project"`) marks a run covered by
+  an existing scoped grant; optional `static_safe: true` marks a run
+  auto-approved by static command-safety analysis (see
+  `docs/contracts/capabilities.md`). Both are ledger provenance tags rendered
+  on the tool header, not fresh decisions.
   This payload is the canonical tool-result shape; provider adapters map
   exactly this shape onto their wire formats.
 - `permission.prompt`: `capability`, `reason`.
 - `permission.decision`: `capability`, `mode`, `allowed`, `decision`.
+  `mode` is the approval mode label (`ask` | `session-allow` |
+  `always-deny`), or `static-grant` for extension registration grants, or
+  `static-safe` for statically-safe shell auto-approvals
+  (`docs/contracts/capabilities.md`).
   Additive optional fields for scoped grants (see
   `docs/contracts/capabilities.md`):
   - `grant_scope`: `once` | `session` | `project` when the decision allowed a
@@ -100,6 +109,17 @@ envelope `v` per `docs/contracts/persistence.md`.
     until resume learns patterned fold.
   - `instruction`: non-empty deny-with-guidance text when the user denied with
     instructions; omitted on bare deny and on allows.
+
+  Additive optional fields for guardian-reviewed decisions (ADR 0011 /
+  `docs/contracts/capabilities.md`):
+  - `decision_source`: `"guardian"` when an automated guardian reviewer made
+    the decision. Omitted means the configured decider (the user) decided.
+  - `risk_level`: `low` | `medium` | `high` | `critical` — the guardian's
+    risk assessment, present when the verdict parsed.
+  - `user_authorization`: `unknown` | `low` | `medium` | `high` — the
+    guardian's read of user authorization, present when the verdict parsed.
+  - `rationale`: short guardian rationale for the outcome (also present on
+    fail-closed denials, where it names the failure instead of a verdict).
 - `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file
@@ -227,6 +247,11 @@ envelope `v` per `docs/contracts/persistence.md`.
   Optional `session_kind` is `interactive` or `non-interactive`. It records
   how the session was launched for discovery/resume UI grouping only. Omitted
   means unknown/legacy and must not affect resume authority or canvas content.
+  Optional `permission_reviewer` is `user` or `guardian` (ADR 0011),
+  recording which reviewer the session was configured with at start. Omitted
+  in older streams means `user`. It is config projection for visibility, not
+  resume authority; per-decision truth is `permission.decision`
+  `decision_source`.
   Optional `context_limit` is either `null` (unknown/legacy window) or an
   object `{ "limit_tokens": <u64>, "source": "catalog" }` recording the
   catalog-derived context window used for token-threshold compaction and

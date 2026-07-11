@@ -96,10 +96,14 @@ impl<D: PermissionDecider> Session<D> {
         ]);
         match outcome {
             Ok(output) => {
-                payload.insert("output".to_owned(), output.into());
+                // Reviewer findings quote arbitrary canvas content: they ride
+                // the same tool-result redaction chokepoint as every other
+                // tool (secrets contract) — a secret a reviewer quotes must
+                // not reach the ledger or the next model call.
+                payload.insert("output".to_owned(), self.redactor.redact(&output).into());
             }
             Err(ReviewToolFailure::Honest(error)) => {
-                payload.insert("error".to_owned(), error.into());
+                payload.insert("error".to_owned(), self.redactor.redact(&error).into());
             }
             Err(ReviewToolFailure::Session(error)) => return Err(error),
         }

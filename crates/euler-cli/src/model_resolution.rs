@@ -31,7 +31,7 @@ pub(crate) fn resolve_live_options(
 
     if parsed.auth_file_from_cli && !auth_file_supported_by_provider(&provider_id) {
         return Err(anyhow!(
-            "--auth-file is only supported with --provider chatgpt, anthropic, openai, or openrouter"
+            "--auth-file is only supported with --provider chatgpt, anthropic, openai, openrouter, or xai"
         ));
     }
 

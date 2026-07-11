@@ -7,15 +7,18 @@ pub mod apply_patch;
 pub mod auth_storage;
 pub mod canvas;
 pub mod checkpoints;
+pub mod command_safety;
 pub mod compaction;
 mod diagnostics;
 pub mod extension_registry;
 pub mod extensions;
 pub mod file_diff;
 pub mod grants;
+pub mod guardian;
 pub mod home;
 pub mod permissions;
 pub mod provenance;
+pub mod redaction;
 pub mod resume;
 pub mod session;
 pub mod session_kind;
@@ -71,6 +74,7 @@ pub use grants::{
     ActiveGrant, GrantScope, ProjectGrantError, ProjectGrantStore, ScopePattern, ScopePatternError,
     MAX_GRANT_COMMAND_BYTES, MAX_GRANT_INSTRUCTION_BYTES, MAX_SCOPE_PATTERN_BYTES,
 };
+pub use guardian::PermissionReviewer;
 pub use home::{EulerHome, EulerHomeError};
 pub use permissions::{
     ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,

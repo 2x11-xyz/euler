@@ -431,7 +431,14 @@ fn denied_agent_spawn_is_a_failed_tool_result() {
 
     let results = tool_results(&harness.session);
     assert_eq!(results[0].payload["ok"], json!(false));
-    assert_eq!(results[0].payload["error"], json!("permission denied"));
+    assert_eq!(
+        results[0].payload["error"],
+        json!(
+            "permission denied by the user; agent-spawn is denied for the rest of \
+             this turn — do not retry agent-spawn commands; use a different tool or \
+             ask the user"
+        )
+    );
 }
 
 #[test]

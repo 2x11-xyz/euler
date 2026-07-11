@@ -231,7 +231,10 @@ fn scripted_session_records_read_edit_shell_summary_sequence() {
         FixtureResponse::ToolCalls(vec![ToolCall {
             id: "call-shell".to_owned(),
             name: "run_shell".to_owned(),
-            input: json!({"command": "cat note.txt"}),
+            // `sort` is deliberately NOT statically safe (issue #78): this
+            // test freezes the canonical prompt+decision shell sequence, so
+            // the command must not auto-approve.
+            input: json!({"command": "sort note.txt"}),
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
@@ -812,6 +815,103 @@ fn allow_session_makes_second_use_session_allow_without_second_prompt() {
 }
 
 #[test]
+fn statically_safe_command_auto_approves_without_prompt() {
+    // Issue #78: under mode=ask, a statically-safe read-only command runs
+    // without a prompt. Provenance stays honest with a fresh
+    // permission.decision carrying mode "static-safe" (allowed once, no
+    // grant installed), and the tool result carries a static_safe tag for
+    // the ledger header.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-safe".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "find . | head -2"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        // Empty script: consulting the decider would deny and fail the
+        // assertions below — the ask path must never be reached.
+        ScriptedDecider::new(vec![]),
+    );
+
+    session.run_turn("list files").expect("turn");
+
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        0
+    );
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .filter(|event| payload_str(event, "capability") == Some("shell-exec"))
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(payload_str(decisions[0], "mode"), Some("static-safe"));
+    assert_eq!(payload_str(decisions[0], "decision"), Some("allowed"));
+    assert_eq!(payload_str(decisions[0], "grant_scope"), Some("once"));
+    let call = event_for_tool(session.events(), EventKind::TOOL_CALL, "call-safe");
+    assert_eq!(decisions[0].parent.as_deref(), Some(call.id.as_str()));
+    let result = event_for_tool(session.events(), EventKind::TOOL_RESULT, "call-safe");
+    assert_eq!(
+        result
+            .payload
+            .get("ok")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        result
+            .payload
+            .get("static_safe")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    // Allowed-once semantics: no grant was installed.
+    assert!(session.list_grants().is_empty());
+}
+
+#[test]
+fn statically_unsafe_command_still_prompts_under_ask() {
+    // The static-safe seam must not widen: an unknown binary keeps the
+    // full prompt + decision flow.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-unsafe".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch created-file"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+
+    session.run_turn("touch a file").expect("turn");
+
+    assert!(temp.path().join("created-file").exists());
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        1
+    );
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .filter(|event| payload_str(event, "capability") == Some("shell-exec"))
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(payload_str(decisions[0], "mode"), Some("ask"));
+}
+
+#[test]
 fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
     // Review v2 §8: a command covered by an existing scoped session grant
     // runs under THAT decision — no new permission.decision event (recording
@@ -863,9 +963,81 @@ fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
 }
 
 #[test]
-fn scoped_shell_grant_does_not_cover_compound_commands() {
-    // Execution is `sh -c`: a `touch` grant covering `touch a; <anything>`
-    // would authorize the whole line. Compound commands must re-ask.
+fn user_rule_records_scope_and_covers_a_fresh_session() {
+    // Permissions v2 (#79): a durable user rule persists to the home store,
+    // the approving decision records grant_scope "user", and a FRESH session
+    // instance is covered without a prompt or a fresh decision record — the
+    // tool result carries grant_source "user" for the `· user rule` tag.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&root).expect("root");
+    let mut config = SessionConfig::new(&root);
+    config.user_grant_dir = Some(home.clone());
+
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        config.clone(),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(GrantScope::User(
+            ScopePattern::new("touch").expect("pattern"),
+        ))]),
+    );
+    session.run_turn("run shell").expect("turn");
+    assert!(root.join("first-ran").exists());
+    assert!(home.join("user-grants.json").exists());
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(payload_str(decisions[0], "grant_scope"), Some("user"));
+    assert_eq!(payload_str(decisions[0], "grant_pattern"), Some("touch"));
+
+    let provider2 = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-second".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch second-ran"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    // Fresh session, empty decider script: any prompt would deny (and a
+    // covered run must never prompt at all).
+    let mut session2 = Session::new(config, provider2, ScriptedDecider::new(Vec::new()));
+    session2.run_turn("run shell again").expect("turn");
+    assert!(root.join("second-ran").exists());
+    assert_eq!(
+        count_kind(session2.events(), EventKind::PERMISSION_PROMPT),
+        0
+    );
+    assert_eq!(
+        count_kind(session2.events(), EventKind::PERMISSION_DECISION),
+        0
+    );
+    let results = session2
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(payload_str(results[0], "grant_source"), Some("user"));
+}
+
+#[test]
+fn scoped_shell_grant_covers_compound_when_every_segment_granted_or_safe() {
+    // Issue #78: coverage is segment-aware. After a `touch` session grant,
+    // `touch a && touch b` and `touch c && ls` run under that grant (every
+    // segment granted or statically safe) with no fresh prompt or decision
+    // record.
     let temp = tempfile::tempdir().expect("temp dir");
     let provider = ScriptedProvider::new(vec![
         FixtureResponse::ToolCalls(vec![ToolCall {
@@ -876,7 +1048,59 @@ fn scoped_shell_grant_does_not_cover_compound_commands() {
         FixtureResponse::ToolCalls(vec![ToolCall {
             id: "call-compound".to_owned(),
             name: "run_shell".to_owned(),
-            input: json!({"command": "touch second-ran; touch evil-ran"}),
+            input: json!({"command": "touch second-ran && touch third-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-mixed".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch fourth-ran && ls"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(GrantScope::Session(
+            ScopePattern::new("touch").expect("pattern"),
+        ))]),
+    );
+
+    session.run_turn("run shell three times").expect("turn");
+
+    for file in ["first-ran", "second-ran", "third-ran", "fourth-ran"] {
+        assert!(temp.path().join(file).exists(), "missing {file}");
+    }
+    // One prompt, one decision — the compound calls ran under the grant.
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        1
+    );
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_DECISION),
+        1
+    );
+    for call_id in ["call-compound", "call-mixed"] {
+        let result = event_for_tool(session.events(), EventKind::TOOL_RESULT, call_id);
+        assert_eq!(payload_str(result, "grant_source"), Some("session"));
+    }
+}
+
+#[test]
+fn scoped_shell_grant_does_not_cover_ungranted_unsafe_segment() {
+    // A `touch` grant must not authorize `touch a && mkdir evil`: the
+    // mkdir segment is neither granted nor statically safe, so the
+    // compound re-asks and the scripted denial stops the whole line.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-compound".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch second-ran && mkdir evil-dir"}),
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
@@ -894,14 +1118,86 @@ fn scoped_shell_grant_does_not_cover_compound_commands() {
     session.run_turn("run shell twice").expect("turn");
 
     assert!(temp.path().join("first-ran").exists());
-    // The compound command was NOT covered: it re-prompted and the scripted
-    // denial stopped it.
     assert_eq!(
         count_kind(session.events(), EventKind::PERMISSION_PROMPT),
         2
     );
-    assert!(!temp.path().join("evil-ran").exists());
+    assert!(!temp.path().join("evil-dir").exists());
     assert!(!temp.path().join("second-ran").exists());
+}
+
+#[test]
+fn redirect_command_is_never_covered_or_auto_approved() {
+    // `ls > file` is not statically analyzable: it must neither
+    // auto-approve as static-safe nor ride an existing scoped grant — it
+    // still asks, and the scripted denial stops it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-first".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch first-ran"}),
+        }]),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-redirect".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "ls > listing.txt"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![
+            DeciderVerdict::AllowScoped(GrantScope::Session(
+                ScopePattern::new("touch").expect("pattern"),
+            )),
+            DeciderVerdict::Deny,
+        ]),
+    );
+
+    session.run_turn("run shell twice").expect("turn");
+
+    assert!(temp.path().join("first-ran").exists());
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        2
+    );
+    assert!(!temp.path().join("listing.txt").exists());
+}
+
+#[test]
+fn truncated_command_is_never_statically_safe() {
+    // Security review (#66 class): the static-safe check reads the
+    // 4 KiB-bounded request command while `sh -c` runs the full string.
+    // A safe-looking bounded prefix (`ls aaa…`) hiding a compound payload
+    // past the bound must fall to the ask path, never auto-approve.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut long = String::from("ls ");
+    long.push_str(&"a".repeat(5 * 1024));
+    long.push_str(" ; touch evil-file");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-truncated".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({ "command": long }),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Deny]),
+    );
+
+    session.run_turn("run shell").expect("turn");
+
+    assert_eq!(
+        count_kind(session.events(), EventKind::PERMISSION_PROMPT),
+        1,
+        "truncated command must reach the ask path"
+    );
+    assert!(!temp.path().join("evil-file").exists());
 }
 
 #[test]
@@ -1077,7 +1373,9 @@ fn denied_shell_permission_records_decision_and_does_not_execute() {
             .and_then(serde_json::Value::as_bool),
         Some(false)
     );
-    assert_eq!(payload_str(result, "error"), Some("permission denied"));
+    assert!(
+        payload_str(result, "error").is_some_and(|error| error.starts_with("permission denied"))
+    );
     let assistant = session
         .events()
         .iter()
@@ -1130,7 +1428,13 @@ fn denied_shell_permission_short_circuits_same_capability_repeat_in_same_turn() 
             .and_then(serde_json::Value::as_bool),
         Some(false)
     );
-    assert_eq!(payload_str(repeated, "error"), Some("permission denied"));
+    let repeated_error = payload_str(repeated, "error").expect("repeated error");
+    assert!(repeated_error.starts_with("permission denied"));
+    // The auto-denied repeat teaches the model the denial is turn-scoped.
+    assert!(
+        repeated_error.contains("denied earlier this turn"),
+        "auto-denied result must teach turn scope: {repeated_error}"
+    );
     let assistant = find_kind(session.events(), EventKind::ASSISTANT_MESSAGE);
     assert_eq!(payload_str(assistant, "content"), Some("done"));
 }
@@ -1448,7 +1752,8 @@ fn denying_direct_apply_patch_writes_nothing() {
 
     assert_eq!(payload_str(prompt, "capability"), Some("fs-write"));
     assert_eq!(payload_str(prompt, "reason"), Some("tool apply_patch"));
-    assert_eq!(payload_str(tool_result, "error"), Some("permission denied"));
+    assert!(payload_str(tool_result, "error")
+        .is_some_and(|error| error.starts_with("permission denied")));
     assert!(!events
         .iter()
         .any(|event| event.kind.as_str() == EventKind::FILE_CHANGE));
@@ -1838,7 +2143,8 @@ fn denying_run_shell_apply_patch_intercept_writes_nothing() {
 
     assert_eq!(payload_str(prompt, "capability"), Some("fs-write"));
     assert_eq!(payload_str(prompt, "reason"), Some("tool apply_patch"));
-    assert_eq!(payload_str(tool_result, "error"), Some("permission denied"));
+    assert!(payload_str(tool_result, "error")
+        .is_some_and(|error| error.starts_with("permission denied")));
     assert!(!events
         .iter()
         .any(|event| event.kind.as_str() == EventKind::FILE_CHANGE));

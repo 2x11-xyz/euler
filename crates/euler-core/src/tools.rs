@@ -79,6 +79,13 @@ impl ToolRegistry {
         Self { root: root.into() }
     }
 
+    /// The workspace root every tool executes in (`run_shell` is
+    /// `sh -c <command>` with this as its cwd). Permission requests carry it
+    /// so path-confinement checks reason about the real execution cwd.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn required_capability(&self, name: &str) -> Option<Capability> {
         match name {
             "read_file" | "git_status" | "git_diff" | "tool_result_get" => Some(Capability::FsRead),
@@ -465,7 +472,11 @@ fn is_secret_env_name(name: &std::ffi::OsStr) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(
         upper.as_str(),
-        "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "OPENROUTER_API_KEY" | "EULER_AUTH_FILE"
+        "ANTHROPIC_API_KEY"
+            | "OPENAI_API_KEY"
+            | "OPENROUTER_API_KEY"
+            | "XAI_API_KEY"
+            | "EULER_AUTH_FILE"
     ) || upper.ends_with("_API_KEY")
         || upper.ends_with("_ACCESS_KEY")
         || upper.split('_').any(|segment| {

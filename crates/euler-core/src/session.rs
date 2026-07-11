@@ -14,10 +14,12 @@ use crate::file_diff::{
     file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
 };
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
+use crate::guardian::{self, GuardianRuling, PermissionReviewer};
 use crate::permissions::{
     ApprovalMode, GrantDecision, GrantSource, PermissionDecider, PermissionGate, PermissionRequest,
 };
 use crate::provenance::ProvenanceWriter;
+use crate::redaction::SecretRedactor;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
@@ -152,6 +154,17 @@ pub struct SessionConfig {
     /// (default) limits the resolution chain to explicit models and the
     /// project tier. Config is data, not authorization.
     pub code_swarm_user_config_path: Option<PathBuf>,
+    /// User-home directory holding the durable user-level grant store
+    /// (`<dir>/user-grants.json` — prefix rules that persist across sessions
+    /// AND projects). `None` (default) disables user rules entirely: reads
+    /// and writes both fail closed. Unlike project grants, no consent
+    /// intersection applies — the store is user-authored in the user-owned
+    /// euler home and never repo-controlled content.
+    pub user_grant_dir: Option<PathBuf>,
+    /// Who resolves uncovered `ask` permission decisions (ADR 0011).
+    /// Default: the configured decider (the user). `Guardian` routes asks
+    /// to a companion reviewer; the decider remains the abstain fallback.
+    pub permission_reviewer: PermissionReviewer,
 }
 
 impl SessionConfig {
@@ -176,6 +189,8 @@ impl SessionConfig {
             round_observer: None,
             project_grant_consent_dir: None,
             code_swarm_user_config_path: None,
+            user_grant_dir: None,
+            permission_reviewer: PermissionReviewer::default(),
         }
     }
 }
@@ -245,6 +260,16 @@ pub enum SessionError {
     CheckpointMissingBlob { event_id: String },
     #[error("checkpoint blob unavailable: {0}")]
     CheckpointBlob(String),
+}
+
+/// Outcome of one uncovered permission decision inside tool dispatch.
+enum PermissionRuling {
+    Allowed,
+    /// Denied; `message` is the tool-result error text (plain
+    /// `permission denied` or guardian teaching).
+    Denied {
+        message: String,
+    },
 }
 
 /// Outcome of a successful workspace restore (`/rollback`).
@@ -437,6 +462,9 @@ pub struct Session<D> {
     providers: ProviderSet,
     bus: EventBus,
     permissions: PermissionGate<D>,
+    /// Secret redaction applied to tool output before it reaches the canvas
+    /// or the ledger (contract: secrets.md redaction rules; issue #56).
+    redactor: SecretRedactor,
     tools: ToolRegistry,
     provenance: Option<Arc<ProvenanceWriter>>,
     persisted_events: usize,
@@ -584,6 +612,24 @@ where
                 self.turn_state,
             )?;
             self.sink.flush(self.session.bus.events());
+            if self.turn_state.guardian_interrupted() {
+                // Circuit breaker (ADR 0011): consecutive guardian denials
+                // end the turn instead of letting the model keep thrashing
+                // against the gate. The denied tool result is already
+                // recorded; remaining calls in this round are not attempted.
+                self.session.emit(
+                    EventKind::ERROR,
+                    object([
+                        ("source", "guardian".into()),
+                        (
+                            "message",
+                            crate::guardian::GUARDIAN_TURN_INTERRUPT_MESSAGE.into(),
+                        ),
+                    ]),
+                )?;
+                self.sink.flush(self.session.bus.events());
+                return Ok(RoundOutcome::Complete(()));
+            }
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err(SessionError::Cancelled);
             }
@@ -648,6 +694,10 @@ impl<D> Session<D> {
                 ),
                 ("session_kind", config.session_kind.as_str().into()),
                 (
+                    "permission_reviewer",
+                    config.permission_reviewer.as_str().into(),
+                ),
+                (
                     "auto_compaction",
                     json!({
                         "tier": config.auto_compaction.tier.as_str(),
@@ -672,12 +722,16 @@ impl<D> Session<D> {
         // files leave the store unloaded so project writes fail closed.
         let _ = permissions
             .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
+        // User rules follow the same discipline: missing file is empty;
+        // corrupt files leave the store unloaded (reads and writes fail closed).
+        let _ = permissions.load_user_grants(config.user_grant_dir.as_deref());
         Self {
             config,
             active_target,
             providers,
             bus,
             permissions,
+            redactor: SecretRedactor::from_env(),
             tools,
             provenance: None,
             persisted_events: 0,
@@ -693,15 +747,20 @@ impl<D> Session<D> {
     pub fn into_fresh_session(self, session_id: impl Into<String>, decider: D) -> Self {
         let active_target = self.active_target;
         let code_swarm_extension = self.code_swarm_extension;
+        let redactor = self.redactor;
         let mut config = self.config;
         config.session_id = session_id.into();
         config.provider = active_target.provider;
         config.model = active_target.model;
-        let mut session = Self::new_with_providers(config, self.providers, decider);
+        let mut fresh = Self::new_with_providers(config, self.providers, decider);
+        // Same user, same process: host-seeded secret values (auth file,
+        // runtime-resolved) carry into the fresh session — /new must not
+        // silently drop redaction back to env-only (review finding on #56).
+        fresh.redactor = redactor;
         // The code-swarm wiring is launch configuration, not session state:
         // a fresh session in the same process keeps the review-gate tool.
-        session.code_swarm_extension = code_swarm_extension;
-        session
+        fresh.code_swarm_extension = code_swarm_extension;
+        fresh
     }
 
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
@@ -732,6 +791,13 @@ impl<D> Session<D> {
 
     pub fn events(&self) -> &[EventEnvelope] {
         self.bus.events()
+    }
+
+    /// Register a known secret value for redaction from tool output (auth
+    /// credentials, resolved x-secret values). Values shorter than the
+    /// redaction minimum are ignored.
+    pub fn add_redacted_secret(&mut self, value: impl Into<String>) {
+        self.redactor.add_value(value);
     }
 
     pub fn extension_enabled(&self, id: &str) -> bool {
@@ -886,12 +952,25 @@ impl<D> Session<D> {
         self.permissions.set_mode(capability, mode);
     }
 
-    /// Active session + project grants for `/permissions` listing.
+    /// Who resolves uncovered `ask` permission decisions (ADR 0011).
+    pub fn permission_reviewer(&self) -> PermissionReviewer {
+        self.config.permission_reviewer
+    }
+
+    /// Active session + project + user grants for `/permissions` listing.
     pub fn list_grants(&self) -> Vec<(GrantSource, ActiveGrant)> {
         self.permissions.list_grants()
     }
 
-    /// Revoke a session or project grant. Project revokes rewrite `.euler/grants.json`.
+    /// Whether durable user-level rules are enabled for this session (a user
+    /// grant dir was configured and loadable). Gates the "always" approval
+    /// option in the UI.
+    pub fn user_rules_enabled(&self) -> bool {
+        self.permissions.user_rules_enabled()
+    }
+
+    /// Revoke a session, project, or user grant. Project revokes rewrite
+    /// `.euler/grants.json`; user revokes rewrite `<home>/user-grants.json`.
     pub fn revoke_grant(
         &mut self,
         capability: Capability,
@@ -903,6 +982,13 @@ impl<D> Session<D> {
 
     pub fn active_target(&self) -> &ModelTarget {
         &self.active_target
+    }
+
+    /// Exposed so callers (e.g. the reviewer-model picker) can check which
+    /// configured providers are actually authenticated before offering them
+    /// as spawn targets, instead of discovering it via a burned spawn (#58).
+    pub fn providers(&self) -> &ProviderSet {
+        &self.providers
     }
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {
@@ -965,12 +1051,14 @@ impl<D> Session<D> {
         let mut permissions = PermissionGate::new(decider);
         let _ = permissions
             .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
+        let _ = permissions.load_user_grants(config.user_grant_dir.as_deref());
         Self {
             config,
             active_target,
             providers,
             bus: EventBus { events },
             permissions,
+            redactor: SecretRedactor::from_env(),
             tools,
             provenance: None,
             persisted_events,
@@ -1783,77 +1871,80 @@ impl<D: PermissionDecider> Session<D> {
         sink.flush(self.bus.events());
 
         let mut covered_grant_source: Option<crate::GrantSource> = None;
+        let mut static_safe = false;
         if let Some(capability) = self
             .tools
             .required_capability_for_input(&call.name, &call.input)
         {
             if turn_state.denied(capability) {
-                self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
+                self.emit_permission_denied_tool_result(
+                    call,
+                    tool_call_event_id,
+                    &format!(
+                        "permission denied: {} was denied earlier this turn and \
+                         remains denied for the rest of it — do not retry {} \
+                         commands; use a different tool or ask the user",
+                        capability.as_str(),
+                        capability.as_str()
+                    ),
+                )?;
                 return Ok(());
             }
-            let mut request = permission_request_for_tool(
+            let request = permission_request_for_tool(
                 capability,
                 &self.tools.permission_reason(&call.name, &call.input),
                 &call.name,
                 &call.input,
+                &self.tools,
             );
-            // Scoped fs-write grants match the canonicalized workspace-
-            // relative path (`..`/symlinks resolved exactly as the write
-            // resolves them), so `src/../Cargo.toml` or a symlink inside the
-            // granted subtree cannot borrow its grant. An unresolvable path
-            // clears the field: scoped grants then never match and the
-            // request falls back to the ask path.
-            if capability == Capability::FsWrite {
-                request.path = request
-                    .path
-                    .as_deref()
-                    .and_then(|path| self.tools.workspace_relative_path(&path.to_string_lossy()));
-            }
             let mode = self.permissions.mode(capability);
+            // Statically-safe read-only shell commands run under `ask`
+            // without a prompt (issue #78): recorded as a fresh
+            // permission.decision with mode "static-safe" — allowed-once
+            // semantics, no grant installed, parented to the tool call. The
+            // check sits before grant coverage so the ledger attributes the
+            // run to the analysis, not to an unrelated grant. It never
+            // applies under always-deny, and a denial earlier this turn
+            // still short-circuits above. A TRUNCATED command is never
+            // analyzed: the bounded prefix could parse as safe while
+            // `sh -c` runs the full string (security review, #66 class) —
+            // decomposing a truncated command is decomposing a lie.
+            static_safe = mode == ApprovalMode::Ask
+                && capability == Capability::ShellExec
+                && !request.command_truncated
+                && request.command.as_deref().is_some_and(|command| {
+                    crate::command_safety::is_statically_safe_command(command, self.tools.root())
+                });
+            if static_safe {
+                self.emit_static_safe_decision(capability, tool_call_event_id.clone())?;
+            }
             // A request covered by an existing session/project grant runs
             // under THAT decision: no prompt, and no fresh permission.decision
             // event — recording "allowed once" here would misstate what the
             // user actually granted (review v2 §8). The tool result carries a
             // `grant_source` tag so the ledger can show `· session grant`.
-            covered_grant_source = if mode == ApprovalMode::Ask {
+            covered_grant_source = if mode == ApprovalMode::Ask && !static_safe {
                 self.permissions.granted_source(&request)
             } else {
                 None
             };
-            if covered_grant_source.is_none() {
-                let needs_prompt = mode == ApprovalMode::Ask;
-                let prompt_id = if needs_prompt {
-                    let prompt_id = self.emit(
-                        EventKind::PERMISSION_PROMPT,
-                        object([
-                            ("capability", capability.as_str().into()),
-                            ("reason", request.reason.clone().into()),
-                        ]),
-                    )?;
-                    sink.flush(self.bus.events());
-                    Some(prompt_id)
-                } else {
-                    None
-                };
-                let decision = self.permissions.decide_detailed(&request, mode);
-                let allowed = decision.allowed();
-                let mode_label = approval_mode_str(mode);
-                let payload = permission_decision_payload(&decision, mode_label, mode);
-                self.emit_with_parent(
-                    EventKind::PERMISSION_DECISION,
-                    payload,
-                    Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
-                )?;
-                crate::diagnostics::permission_decision(
-                    &self.config.session_id,
-                    capability.as_str(),
-                    mode_label,
-                    allowed,
-                );
-                if !allowed {
-                    turn_state.record_denial(capability);
-                    self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
-                    return Ok(());
+            if covered_grant_source.is_none() && !static_safe {
+                match self.decide_uncovered_permission(
+                    &request,
+                    mode,
+                    &tool_call_event_id,
+                    sink,
+                    turn_state,
+                )? {
+                    PermissionRuling::Allowed => {}
+                    PermissionRuling::Denied { message } => {
+                        self.emit_permission_denied_tool_result(
+                            call,
+                            tool_call_event_id,
+                            &message,
+                        )?;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1875,11 +1966,13 @@ impl<D: PermissionDecider> Session<D> {
         {
             Ok(execution) => {
                 if let Some(patch) = execution.patch {
-                    let payload = object([
+                    let mut payload = object([
                         ("path", patch.path.clone().into()),
                         ("old", patch.before.clone().into()),
                         ("new", patch.after.clone().into()),
                     ]);
+                    self.redactor
+                        .redact_payload_fields(&mut payload, &["old", "new"]);
                     let patch_proposed_id = self.emit_with_parent(
                         EventKind::PATCH_PROPOSED,
                         payload.clone(),
@@ -1892,7 +1985,7 @@ impl<D: PermissionDecider> Session<D> {
                                 ("id", call.id.into()),
                                 ("name", execution.name.into()),
                                 ("ok", false.into()),
-                                ("error", error.to_string().into()),
+                                ("error", self.redactor.redact(&error.to_string()).into()),
                             ]),
                             Some(tool_call_event_id),
                         )?;
@@ -1915,9 +2008,12 @@ impl<D: PermissionDecider> Session<D> {
                         file_change_payload(&call.id, &patch, pre_image_blob.as_deref()),
                         Some(patch_applied_id.clone()),
                     )?;
+                    let mut diff_payload = file_diff_payload(&call.id, &file_change_id, &patch);
+                    self.redactor
+                        .redact_payload_fields(&mut diff_payload, &["diff"]);
                     self.emit_with_parent(
                         EventKind::FILE_DIFF,
-                        file_diff_payload(&call.id, &file_change_id, &patch),
+                        diff_payload,
                         Some(patch_applied_id),
                     )?;
                 }
@@ -1927,9 +2023,13 @@ impl<D: PermissionDecider> Session<D> {
                         observed_file_change_payload(&call.id, "run_shell", change),
                         Some(tool_call_event_id.clone()),
                     )?;
+                    let mut observed_diff =
+                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change);
+                    self.redactor
+                        .redact_payload_fields(&mut observed_diff, &["diff"]);
                     self.emit_with_parent(
                         EventKind::FILE_DIFF,
-                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change),
+                        observed_diff,
                         Some(tool_call_event_id.clone()),
                     )?;
                 }
@@ -1937,7 +2037,7 @@ impl<D: PermissionDecider> Session<D> {
                     ("id", call.id.into()),
                     ("name", execution.name.into()),
                     ("ok", true.into()),
-                    ("output", execution.output.into()),
+                    ("output", self.redactor.redact(&execution.output).into()),
                 ]);
                 if let Some(exit_code) = execution.exit_code {
                     payload.insert("exit_code".to_owned(), exit_code.into());
@@ -1947,6 +2047,12 @@ impl<D: PermissionDecider> Session<D> {
                     // `· session grant` on the tool header instead of a fresh
                     // decision record (review v2 §8).
                     payload.insert("grant_source".to_owned(), source.as_str().into());
+                }
+                if static_safe {
+                    // Ran under static command-safety analysis — the ledger
+                    // shows a dim `· safe` on the tool header (the decision
+                    // record itself is suppressed like covered grants).
+                    payload.insert("static_safe".to_owned(), true.into());
                 }
                 self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
                 crate::diagnostics::tool_exec_end(
@@ -1963,7 +2069,7 @@ impl<D: PermissionDecider> Session<D> {
                         ("id", call.id.into()),
                         ("name", call.name.into()),
                         ("ok", false.into()),
-                        ("error", error.to_string().into()),
+                        ("error", self.redactor.redact(&error.to_string()).into()),
                     ]),
                     Some(tool_call_event_id),
                 )?;
@@ -1978,10 +2084,185 @@ impl<D: PermissionDecider> Session<D> {
         Ok(())
     }
 
+    /// Record the allowed-once decision for a statically-safe shell command
+    /// (issue #78): mode `static-safe`, no prompt, no grant installed,
+    /// parented to the tool call.
+    fn emit_static_safe_decision(
+        &mut self,
+        capability: Capability,
+        tool_call_event_id: String,
+    ) -> Result<String, SessionError> {
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            capability.as_str(),
+            "static-safe",
+            true,
+        );
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            object([
+                ("capability", capability.as_str().into()),
+                ("mode", "static-safe".into()),
+                ("allowed", true.into()),
+                ("decision", "allowed".into()),
+                ("grant_scope", "once".into()),
+            ]),
+            Some(tool_call_event_id),
+        )
+    }
+
+    /// Resolve an uncovered `ask`/`session-allow`/`always-deny` permission
+    /// decision: emits the `permission.prompt` (for asks) and the
+    /// `permission.decision`, routes asks through the guardian when
+    /// configured (ADR 0011), and reports whether the tool may run.
+    fn decide_uncovered_permission<F>(
+        &mut self,
+        request: &PermissionRequest,
+        mode: ApprovalMode,
+        tool_call_event_id: &str,
+        sink: &mut EventSink<'_, F>,
+        turn_state: &mut TurnState,
+    ) -> Result<PermissionRuling, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let capability = request.capability;
+        let needs_prompt = mode == ApprovalMode::Ask;
+        let prompt_id = if needs_prompt {
+            let prompt_id = self.emit(
+                EventKind::PERMISSION_PROMPT,
+                object([
+                    ("capability", capability.as_str().into()),
+                    ("reason", request.reason.clone().into()),
+                ]),
+            )?;
+            sink.flush(self.bus.events());
+            Some(prompt_id)
+        } else {
+            None
+        };
+        let decision_parent = prompt_id.unwrap_or_else(|| tool_call_event_id.to_owned());
+        // A non-verbatim-briefable request (truncated command / over-bound
+        // field) never consults the guardian — adjudicating a command it
+        // cannot see exactly would judge a lie (ADR 0011 amendment, security
+        // review F3). The ask goes to the human decider below instead.
+        if needs_prompt
+            && self.config.permission_reviewer == PermissionReviewer::Guardian
+            && guardian::adjudicates_verbatim(request)
+        {
+            if let Some(ruling) =
+                self.guardian_permission_ruling(request, &decision_parent, sink, turn_state)?
+            {
+                return Ok(ruling);
+            }
+            // Guardian abstained: fall through to the configured decider.
+        }
+        let decision = self.permissions.decide_detailed(request, mode);
+        let allowed = decision.allowed();
+        let mode_label = approval_mode_str(mode);
+        let payload = permission_decision_payload(&decision, mode_label, mode);
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            payload,
+            Some(decision_parent),
+        )?;
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            capability.as_str(),
+            mode_label,
+            allowed,
+        );
+        if allowed {
+            Ok(PermissionRuling::Allowed)
+        } else {
+            turn_state.record_denial(capability);
+            Ok(PermissionRuling::Denied {
+                message: format!(
+                    "permission denied by the user; {} is denied for \
+                     the rest of this turn — do not retry {} commands; \
+                     use a different tool or ask the user",
+                    capability.as_str(),
+                    capability.as_str()
+                ),
+            })
+        }
+    }
+
+    /// Guardian review for one ask (ADR 0011). Returns `None` on abstain —
+    /// the configured decider then resolves the ask. Every failure path
+    /// (task build, spawn, companion failure, unparseable verdict) resolves
+    /// to a deny; guardian denials never fall back to the decider. Three
+    /// consecutive guardian denials trip the circuit breaker, which
+    /// interrupts the turn after the denied tool result is recorded.
+    fn guardian_permission_ruling<F>(
+        &mut self,
+        request: &PermissionRequest,
+        decision_parent: &str,
+        sink: &mut EventSink<'_, F>,
+        turn_state: &mut TurnState,
+    ) -> Result<Option<PermissionRuling>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let capability = request.capability;
+        let ruling = match guardian::guardian_task(request) {
+            Ok(task) => match self.spawn_companion(task) {
+                Ok(summary) => guardian::ruling_for_result(&summary.result),
+                Err(error) => {
+                    guardian::deny_failure(format!("guardian review failed to run: {error}"))
+                }
+            },
+            Err(error) => guardian::deny_failure(format!("guardian task rejected: {error}")),
+        };
+        sink.flush(self.bus.events());
+        let (allowed, rationale, verdict) = match &ruling {
+            GuardianRuling::Abstain(_) => {
+                turn_state.reset_guardian_denials();
+                return Ok(None);
+            }
+            GuardianRuling::Allow(verdict) => (true, verdict.rationale.clone(), Some(verdict)),
+            GuardianRuling::Deny { rationale, verdict } => {
+                (false, rationale.clone(), verdict.as_ref())
+            }
+        };
+        // The rationale is model-generated text prompted to hunt secret
+        // exfiltration — it may quote the offending token. Redact once here:
+        // it flows into both the permission.decision payload and the denied
+        // tool result teaching text.
+        let rationale = self.redactor.redact(&rationale);
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            guardian::guardian_decision_payload(capability, allowed, &rationale, verdict),
+            Some(decision_parent.to_owned()),
+        )?;
+        sink.flush(self.bus.events());
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            capability.as_str(),
+            "ask",
+            allowed,
+        );
+        if allowed {
+            turn_state.reset_guardian_denials();
+            return Ok(Some(PermissionRuling::Allowed));
+        }
+        let denials = turn_state.record_guardian_denial();
+        if denials >= guardian::MAX_CONSECUTIVE_GUARDIAN_DENIALS_PER_TURN {
+            turn_state.mark_guardian_interrupted();
+        }
+        Ok(Some(PermissionRuling::Denied {
+            message: guardian::guardian_denial_teaching(&rationale),
+        }))
+    }
+
+    /// Denied tool result. `error` is the plain `permission denied` string,
+    /// or teaching text (guardian denials tell the model not to work around
+    /// the block).
     fn emit_permission_denied_tool_result(
         &mut self,
         call: ToolCall,
         tool_call_event_id: String,
+        error: &str,
     ) -> Result<String, SessionError> {
         self.emit_with_parent(
             EventKind::TOOL_RESULT,
@@ -1989,7 +2270,7 @@ impl<D: PermissionDecider> Session<D> {
                 ("id", call.id.into()),
                 ("name", call.name.into()),
                 ("ok", false.into()),
-                ("error", "permission denied".into()),
+                ("error", error.to_owned().into()),
             ]),
             Some(tool_call_event_id),
         )
@@ -2535,8 +2816,10 @@ pub(crate) fn permission_request_for_tool(
     reason: &str,
     tool_name: &str,
     input: &Value,
+    tools: &crate::tools::ToolRegistry,
 ) -> PermissionRequest {
-    let mut request = PermissionRequest::new(capability, reason.to_owned());
+    let mut request =
+        PermissionRequest::new(capability, reason.to_owned()).with_workspace_root(tools.root());
     match tool_name {
         "run_shell" => {
             if let Some(command) = input.get("command").and_then(Value::as_str) {
@@ -2549,6 +2832,20 @@ pub(crate) fn permission_request_for_tool(
             }
         }
         _ => {}
+    }
+    // Scoped fs-write grants match the canonicalized workspace-relative
+    // path (`..`/symlinks resolved exactly as the write resolves them), so
+    // `src/../Cargo.toml` or a symlink inside the granted subtree cannot
+    // borrow its grant. An unresolvable path clears the field: scoped
+    // grants then never match and the request falls back to the ask path.
+    // Living HERE means every permission gate — root session AND companion
+    // loop — gets the same resolution; a caller-side fix-up covers one gate
+    // and silently misses the twin (security audit finding).
+    if capability == Capability::FsWrite {
+        request.path = request
+            .path
+            .as_deref()
+            .and_then(|path| tools.workspace_relative_path(&path.to_string_lossy()));
     }
     request
 }
