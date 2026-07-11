@@ -61,14 +61,37 @@ A new or changed `!command` secret value may also prompt on first execution.
 
 Any value resolved through this contract is secret-tainted.
 
-Secret-tainted values must be redacted from:
+Redaction happens at the boundary where secrets **enter** the record from
+outside or are **injected** by the host — never over the model's own
+cognition. Faithful capture of what the model thought and did is the point
+of euler provenance; redacting it would corrupt the record (owner decision,
+2026-07-11).
 
-- logs,
-- provenance payloads,
-- tool output shown to models,
-- error messages,
-- debug dumps,
-- review artifacts.
+**Redacted (secret entering / injected):**
+
+- logs and debug dumps,
+- **tool RESULTS** shown to models (external data a tool read in — the #56
+  incident: a granted `cat` of a foreign secrets file),
+- provider error messages (external HTTP bodies),
+- context-slot content (extension-supplied data that enters model context),
+- resolved provider/auth secrets (registered with the redactor at
+  resolution time so their values are caught wherever they surface).
+
+**NOT redacted (model / user cognition — kept faithful):**
+
+- model reasoning, model content, assistant messages,
+- reviewer findings and the guardian's rationale (a reviewer model's own
+  reasoning),
+- tool-call arguments (the faithful record of the action the model chose —
+  including a credential the model placed in a command),
+- user messages.
+
+When a secret nonetheless lands in a faithful-cognition payload (the model
+echoes it, or a credential sits in a tool-call argument), euler does not
+silently rewrite the record. It **detects and warns** the user, and offers
+an explicit **scrub** operation that removes the value from every surface
+(provenance, blobs, checkpoints, sidecars, projections) on demand. Default
+is faithful; scrub is opt-in.
 
 Tool output redaction is implemented in two layers at the tool-result
 emission chokepoint (before the canvas and the ledger both):
