@@ -70,6 +70,19 @@ Secret-tainted values must be redacted from:
 - debug dumps,
 - review artifacts.
 
+Tool output redaction is implemented in two layers at the tool-result
+emission chokepoint (before the canvas and the ledger both):
+
+1. **Known values** — secret environment variables read at session start,
+   stored auth credentials, and any value the host registers at runtime are
+   replaced by exact match.
+2. **Known token shapes** — well-known credential prefixes (`sk-or-v1-`,
+   `sk-ant-`, `ghp_`, `AKIA…`, …) are masked even when the value was never
+   resolved through euler — e.g. a granted shell command reading a foreign
+   secrets file. This layer is a heuristic, not a guarantee: novel token
+   formats pass through, and over-matching costs only a masked token, which
+   is the safe direction.
+
 ## Non-Goals
 
 Euler is not a multi-user secrets manager.

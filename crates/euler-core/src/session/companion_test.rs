@@ -12,6 +12,40 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 #[test]
+fn companion_tool_output_is_redacted() {
+    // Review finding on #56: the companion loop emitted raw tool output,
+    // bypassing the parent session's redaction chokepoint.
+    let (_temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-echo".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": "printf 'key sk-or-v1-abcdefghijklmnop end'"}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]),
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+
+    let summary = session
+        .spawn_companion(task_with_caps([Capability::ShellExec]))
+        .expect("companion");
+    assert!(summary.result.ok());
+
+    let output = tool_results(session.events())
+        .into_iter()
+        .find_map(|event| {
+            event.payload["output"]
+                .as_str()
+                .map(std::borrow::ToOwned::to_owned)
+        })
+        .expect("tool output");
+    assert!(!output.contains("sk-or-v1-abcdefghijklmnop"), "{output}");
+    assert!(output.contains("[redacted-secret]"));
+}
+
+#[test]
 fn companion_ask_with_scripted_decider_executes_tool() {
     let (_temp, _log, mut session) = session_with_provider(
         ScriptedProvider::new(vec![

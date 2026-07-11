@@ -864,6 +864,52 @@ fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
 }
 
 #[test]
+fn tool_output_redacts_known_values_and_token_shapes() {
+    // Issue #56 incident repro: a granted shell command read a secret store;
+    // the raw key must never reach the tool result (canvas + ledger).
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        temp.path().join("secrets.txt"),
+        "name=OPENROUTER_API_KEY value=sk-or-v1-597ab1cbbc96dfffffffffffffffffff\nknown=registered-secret-value-42\n",
+    )
+    .expect("seed secrets file");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-cat".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "cat secrets.txt"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    session.add_redacted_secret("registered-secret-value-42");
+
+    session.run_turn("read the secrets").expect("turn");
+
+    let result = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    let output = payload_str(result, "output").expect("output");
+    assert!(
+        !output.contains("sk-or-v1-597a"),
+        "token shape must be redacted: {output}"
+    );
+    assert!(
+        !output.contains("registered-secret-value-42"),
+        "known value must be redacted: {output}"
+    );
+    assert!(output.contains("[redacted-secret]"));
+    // Non-secret content survives.
+    assert!(output.contains("name=OPENROUTER_API_KEY"));
+}
+
+#[test]
 fn scoped_shell_grant_does_not_cover_compound_commands() {
     // Execution is `sh -c`: a `touch` grant covering `touch a; <anything>`
     // would authorize the whole line. Compound commands must re-ask.
