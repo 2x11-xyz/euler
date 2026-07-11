@@ -92,6 +92,169 @@ fn provider_error_message_is_redacted_at_emission() {
     assert!(message.contains("[redacted-secret]"), "{message}");
 }
 
+/// Scripted rounds, plus the two provider-side entry behaviours the canary
+/// test needs: reports a request-time resolved secret to the installed sink
+/// on every invoke, and turns queue exhaustion into a provider error whose
+/// message carries the canaries (the HTTP-body-echo shape).
+struct CanaryEntryProvider {
+    inner: ScriptedProvider,
+    resolved_secret: String,
+    fail_message: String,
+    sink: Mutex<Option<euler_provider::ResolvedSecretSink>>,
+}
+
+impl ModelProvider for CanaryEntryProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn set_resolved_secret_sink(&self, sink: euler_provider::ResolvedSecretSink) {
+        *self.sink.lock().expect("sink lock") = Some(sink);
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if let Some(sink) = self.sink.lock().expect("sink lock").as_ref() {
+            sink(&self.resolved_secret);
+        }
+        self.inner
+            .invoke(request)
+            .map_err(|_| ProviderError::rejected(self.fail_message.clone()))
+    }
+}
+
+/// The string fields of `event` that are secret ENTRY surfaces — text that
+/// arrives from outside the model (tool output, provider error bodies,
+/// extension slot content) and is persisted + replayed into model context.
+/// Model-authored text (model.result content, reasoning, assistant
+/// messages, agent results) and tool-call arguments are intentionally NOT
+/// listed: provenance keeps model cognition faithful.
+fn entry_surface_strings(event: &EventEnvelope) -> Vec<(String, String)> {
+    let fields: &[&str] = match event.kind.as_str() {
+        EventKind::TOOL_RESULT => &["output", "error"],
+        EventKind::ERROR => &["message"],
+        EventKind::CONTEXT_SLOT_UPDATED => &["content"],
+        _ => return Vec::new(),
+    };
+    fields
+        .iter()
+        .filter_map(|field| {
+            event
+                .payload
+                .get(*field)
+                .and_then(Value::as_str)
+                .map(|text| (format!("{}.{field}", event.kind.as_str()), text.to_owned()))
+        })
+        .collect()
+}
+
+#[test]
+fn leak_canary_never_reaches_an_entry_point_emission() {
+    // Regression backstop for the secrets contract: drive one session
+    // through every entry-point flow — a tool result echoing secrets, a
+    // provider error echoing them back, an extension context-slot update
+    // carrying them — with all three seeding paths live (host-registered
+    // value, request-time resolved value, token shape), then assert no
+    // canary survives in ANY entry-surface string field, in memory or in
+    // the durable log. A NEW entry emission path that skips the redactor
+    // shows up here as a canary hit once added to `entry_surface_strings`.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-canary");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+
+    let known_canary = "auth-file-known-canary-secret-91";
+    let resolved_canary = "request-time-resolved-canary-77";
+    // Assembled at runtime: no token-shaped literal in the source tree.
+    let shaped_canary = format!("ghp_{}", "0123456789abcdefghij");
+    let canaries = [known_canary, resolved_canary, shaped_canary.as_str()];
+
+    let echo_all = format!("printf '{known_canary} {resolved_canary} {shaped_canary}'");
+    let provider = CanaryEntryProvider {
+        inner: ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
+                id: "call-echo".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": echo_all}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]),
+        resolved_secret: resolved_canary.to_owned(),
+        fail_message: format!(
+            "HTTP 400: request echoed {known_canary}, {resolved_canary} and {shaped_canary}"
+        ),
+        sink: Mutex::new(None),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-canary".to_owned();
+    enable_test_extensions(&mut config, &["slot-ext"]);
+    let mut session = Session::new(
+        config,
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    )
+    .with_provenance(writer);
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+    session.add_redacted_secret(known_canary);
+
+    // Flow 1: tool result echoing all three canaries.
+    session.run_turn("echo the secrets").expect("turn one");
+    // Flow 2: extension context-slot update carrying all three.
+    let slot_content: &'static str = Box::leak(
+        format!("note {known_canary} {resolved_canary} {shaped_canary}").into_boxed_str(),
+    );
+    session
+        .execute_extension_command(
+            &test_extension(
+                "slot-ext",
+                vec![Capability::ContextSlot],
+                TestCommandBehavior::Slot {
+                    slot: "main",
+                    content: slot_content,
+                },
+            ),
+            "write",
+            json!(null),
+            [Capability::ContextSlot],
+        )
+        .expect("slot update");
+    // Flow 3: provider error echoing all three (scripted queue exhausted).
+    let error = session.run_turn("fail now").expect_err("provider rejects");
+    drop(error);
+
+    let persisted = read_provenance(&log).expect("persisted events");
+    let mut surfaces_seen = std::collections::BTreeSet::new();
+    for event in session.events().iter().chain(persisted.iter()) {
+        for (surface, text) in entry_surface_strings(event) {
+            surfaces_seen.insert(surface.clone());
+            for canary in canaries {
+                assert!(
+                    !text.contains(canary),
+                    "canary `{canary}` leaked into {surface}: {text}"
+                );
+            }
+        }
+    }
+    // Non-vacuous: every driven entry surface actually produced text.
+    for surface in [
+        "tool.result.output",
+        "error.message",
+        "context.slot.updated.content",
+    ] {
+        assert!(surfaces_seen.contains(surface), "missing {surface}");
+    }
+    // Faithful-args guard: the canaries really flowed through the session —
+    // the tool-call arguments (model cognition, kept verbatim) carry them.
+    let tool_call_input = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .expect("tool call")
+        .payload["input"]
+        .to_string();
+    assert!(tool_call_input.contains(known_canary), "{tool_call_input}");
+}
+
 /// Wraps a scripted provider and reports `secret` to the installed
 /// resolved-secret sink on every invoke — the shape of a custom provider
 /// resolving an `$ENV` / `!command` / literal credential at request time.
