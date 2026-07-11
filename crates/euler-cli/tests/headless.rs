@@ -7027,7 +7027,7 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
         ],
     );
     assert!(
-        tui.wait_for_screen("· ctx"),
+        tui.wait_for_screen("/ commands"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -7129,7 +7129,7 @@ fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
             &script_option,
         ],
     );
-    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
     tui.write("run the three commands\r");
     // First shell call prompts; grant the session scope.
     assert!(
@@ -7244,7 +7244,7 @@ fn tui_pty_resize_drag_never_amplifies_scrollback_copies() {
             &script_option,
         ],
     );
-    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
     tui.write("overview please\r");
     assert!(tui.wait_for_screen("Paragraph 6:"), "{}", tui.screen_text());
     // Simulate a drag: many rapid width ticks in both directions.
@@ -7367,7 +7367,7 @@ fn tui_pty_theme_switch_replay_keeps_history_head_reachable() {
             &script_option,
         ],
     );
-    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
     tui.write("overview please\r");
     assert!(tui.wait_for_screen("Paragraph 6:"), "{}", tui.screen_text());
 
@@ -7427,7 +7427,7 @@ fn tui_pty_grow_settles_top_anchored_with_nothing_below_footer() {
             &script_option,
         ],
     );
-    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
     tui.write("overview please\r");
     assert!(tui.wait_for_screen("Paragraph 8:"), "{}", tui.screen_text());
 
@@ -7438,7 +7438,7 @@ fn tui_pty_grow_settles_top_anchored_with_nothing_below_footer() {
     // Harvest the settled frame and remember where it ends: the quit path
     // prints the exit recap BELOW the app frame by design, which must not
     // count against the "nothing below the footer" assertion.
-    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
     let settled_len = tui.output.len();
     tui.quit();
 
@@ -7548,7 +7548,7 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
             &script_option,
         ],
     );
-    assert!(tui.wait_for_screen("· ctx"), "{}", tui.screen_text());
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
     tui.write("generate lines\r");
     assert!(
         tui.wait_for_screen("Run command?"),
@@ -7667,7 +7667,7 @@ fn tui_pty_transcript_lines_commit_exactly_once() {
         ],
     );
     assert!(
-        tui.wait_for_screen("· ctx"),
+        tui.wait_for_screen("/ commands"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
