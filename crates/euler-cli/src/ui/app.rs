@@ -26,7 +26,7 @@ use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPrevi
 use super::status::status_widget;
 use super::status::{status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
 use super::terminal::{self, PendingSignal, TerminalSession};
-use super::theme::{Theme, ThemeChoice};
+use super::theme::{ColorLevel, Theme, ThemeChoice};
 #[cfg(test)]
 use super::transcript::transcript_items_widget;
 use super::transcript::{self, TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
@@ -82,7 +82,6 @@ const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
 /// Working HUD braille spinner cadence (issue #27, spec v2.1 §13.3: 80-100ms).
 const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(90);
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
-const DENIED_COMPOSER_GHOST: &str = "denied — tell euler what to do instead";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
 
@@ -219,8 +218,6 @@ pub struct AppCore {
     queued_inputs: VecDeque<String>,
     queued_selection: Option<usize>,
     queue_auto_flush_paused: bool,
-    /// Empty-composer ghost override (deny-with-instruction empty path).
-    empty_composer_ghost: Option<&'static str>,
     in_flight_label: Option<String>,
     /// Persona/name of the in-flight companion run, for approval panel tagging.
     in_flight_companion_name: Option<String>,
@@ -247,6 +244,11 @@ pub struct AppCore {
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     turn_event_start: usize,
+    /// ctx input-token count when the current turn was spawned (review v3
+    /// §R5(b)): compared against the count at turn end to decide whether
+    /// context moved less than ~1%, one leg of the empty-turn recap
+    /// suppression (0 files changed AND ctx <1% AND no tests run).
+    turn_start_input_tokens: u64,
     last_turn_activity_at: Option<Instant>,
     stall_notified: bool,
     terminal_focused: bool,
@@ -622,6 +624,7 @@ fn set_terminal_theme_colors(terminal: &mut CrosstermTerminal, core: &AppCore) -
         core.theme.palette.foreground,
         core.theme.palette.background,
         core.theme.palette.cursor,
+        core.theme.palette.user_rail,
     )
 }
 
@@ -681,7 +684,12 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         )
         .catalog
     });
-    let theme = Theme::for_choice(theme_choice);
+    // #64: detect truecolor support once at startup; every theme RGB
+    // quantizes to ANSI-256 at this boundary when unsupported (e.g.
+    // Terminal.app / TERM_PROGRAM=Apple_Terminal), so all render sites
+    // degrade together instead of leaving 24-bit SGR for the terminal to
+    // mangle.
+    let theme = Theme::for_choice_with_color_level(theme_choice, ColorLevel::detect());
     let mut status = StatusSnapshot::new(target.provider.clone(), target.model.clone(), cwd);
     status.session_id = Some(session_id.clone());
     status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
@@ -790,7 +798,6 @@ impl AppCore {
             queued_inputs: VecDeque::new(),
             queued_selection: None,
             queue_auto_flush_paused: false,
-            empty_composer_ghost: None,
             in_flight_label: None,
             in_flight_companion_name: None,
             in_flight_cancellable: false,
@@ -802,6 +809,7 @@ impl AppCore {
             extensions,
             observe,
             turn_event_start: 0,
+            turn_start_input_tokens: 0,
             last_turn_activity_at: None,
             stall_notified: false,
             terminal_focused: true,
@@ -904,9 +912,7 @@ impl AppCore {
     }
 
     fn composer_snapshot(&self) -> ComposerSnapshot<'_> {
-        ComposerSnapshot::new(self.bottom.composer())
-            .with_queued(self.queued_composer_lines())
-            .with_empty_ghost(self.empty_composer_ghost)
+        ComposerSnapshot::new(self.bottom.composer()).with_queued(self.queued_composer_lines())
     }
 
     fn queued_composer_lines(&self) -> Vec<QueuedComposerLine> {
@@ -1436,7 +1442,6 @@ impl AppCore {
         if !matches!(self.bottom.owner(), BottomOwner::Composer) {
             return CoreEffect::None;
         }
-        self.empty_composer_ghost = None;
         self.bottom.edit_composer(|draft| {
             let _ = draft.insert_bracketed_paste(text);
         });
@@ -1546,11 +1551,12 @@ impl AppCore {
     fn reply_deny_from_modal(&mut self) -> CoreEffect {
         let draft = self.bottom.composer().submit_text();
         if draft.trim().is_empty() {
-            self.empty_composer_ghost = Some(DENIED_COMPOSER_GHOST);
+            // Spec §13.2: empty composer is rail + dim cursor only, in every
+            // state — the transcript's `denied` event line is the single
+            // carrier of that guidance (#57). No composer ghost text here.
             self.reply_to_modal(PermissionReply::Deny)
         } else {
             self.bottom.replace_composer_text("");
-            self.empty_composer_ghost = None;
             // Front of queue: next user turn after the denied tool turn finishes.
             self.queued_inputs.push_front(draft.clone());
             self.queued_selection = Some(0);
@@ -1561,7 +1567,6 @@ impl AppCore {
     fn handle_modal_composer_input(&mut self, input: InputEvent) -> CoreEffect {
         match input {
             InputEvent::Paste(text) => {
-                self.empty_composer_ghost = None;
                 self.bottom.edit_composer(|draft| {
                     let _ = draft.insert_bracketed_paste(&text);
                 });
@@ -1682,6 +1687,7 @@ impl AppCore {
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         self.turn_event_start = self.transcript.events().len();
+        self.turn_start_input_tokens = self.token_usage.input_tokens;
         self.note_turn_activity();
     }
 
@@ -1727,7 +1733,7 @@ impl AppCore {
                 pattern,
                 source,
             } => self.revoke_grant(capability, pattern, source),
-            CommandAction::ShowHelp { text } => self.summary_item(text),
+            CommandAction::ShowHelp { text } => self.notice_item(text),
             CommandAction::ResumeSession { session_id } => {
                 self.resume_session_from_picker(session_id)
             }
@@ -1797,7 +1803,7 @@ impl AppCore {
                 ));
                 CoreEffect::Render
             }
-            Err(error) => self.notice_item(format!("rollback failed: {error}")),
+            Err(error) => self.error_item(format!("rollback failed: {error}")),
         }
     }
 
@@ -1814,11 +1820,11 @@ impl AppCore {
         });
         let (session_id, events_path) = match created {
             Ok(created) => created,
-            Err(error) => return self.notice_item(format!("new session failed: {error}")),
+            Err(error) => return self.error_item(format!("new session failed: {error}")),
         };
         let writer = match ProvenanceWriter::new(&events_path) {
             Ok(writer) => writer,
-            Err(error) => return self.notice_item(format!("new session failed: {error}")),
+            Err(error) => return self.error_item(format!("new session failed: {error}")),
         };
         let old_session = self.take_idle_session();
         let active_target = old_session.active_target().clone();
@@ -1858,7 +1864,7 @@ impl AppCore {
     fn companion_run(&mut self, input: serde_json::Value) -> CoreEffect {
         let request = match crate::companion_run::parse_agent_task_value(&input) {
             Ok(task) => CompanionRunRequest { task },
-            Err(error) => return self.notice_item(format!("companion run failed: {error}")),
+            Err(error) => return self.error_item(format!("companion run failed: {error}")),
         };
         match std::mem::replace(&mut self.state, AppState::Empty) {
             AppState::Idle { session } => {
@@ -1915,13 +1921,13 @@ impl AppCore {
     }
 
     fn login_guidance(&mut self, provider: String) -> CoreEffect {
-        self.summary_item(format!(
+        self.notice_item(format!(
             "Run outside the TUI:\neuler login --provider {provider}\n\nThe picker stays offline; auth is checked when a request uses the provider."
         ))
     }
 
     fn logout_guidance(&mut self, provider: String) -> CoreEffect {
-        self.summary_item(format!(
+        self.notice_item(format!(
             "Run outside the TUI:\neuler logout --provider {provider}"
         ))
     }
@@ -1974,7 +1980,6 @@ impl AppCore {
         &mut self,
         edit: impl FnOnce(&mut super::composer::ComposerDraft),
     ) -> CoreEffect {
-        self.empty_composer_ghost = None;
         self.bottom.edit_composer(edit);
         CoreEffect::Render
     }
@@ -2224,29 +2229,45 @@ impl AppCore {
         }
     }
 
+    /// Muted, non-error informational line (review v2 §3/§6/§14.4, #53) — no
+    /// glyph, no "ui:" source prefix, indented to the content column.
+    /// Consecutive `Notice` items stack directly without a separating blank
+    /// line (the renderer special-cases this run). Used for every neutral
+    /// confirmation/refusal: state guards ("waits for the active turn"),
+    /// setting confirmations (/theme, /model set, /effort, /status, /usage,
+    /// /compact, permission changes, extension toggles, timestamps toggle,
+    /// code-swarm save/config lines, resume refusal) — none of these are
+    /// failures, so none should read as one. Real failures go through
+    /// `error_item` instead.
     fn notice_item(&mut self, message: String) -> CoreEffect {
         self.push_notice_item(message);
         CoreEffect::Render
     }
 
     fn push_notice_item(&mut self, message: String) {
+        self.push_finalized_visual_item(TranscriptItem::Notice(message));
+    }
+
+    /// Alias kept for call sites that read more naturally as "teaching" the
+    /// user something (disabled-extension guidance, etc.) — identical
+    /// rendering to `notice_item`.
+    fn teach_notice(&mut self, message: String) -> CoreEffect {
+        self.notice_item(message)
+    }
+
+    /// Red, `✗`-anchored failure line (review v2 §3, #53) — reserved for
+    /// genuine failures: an operation was attempted and an error came back.
+    /// Never use this for state guards or confirmations.
+    fn error_item(&mut self, message: String) -> CoreEffect {
+        self.push_error_item(message);
+        CoreEffect::Render
+    }
+
+    fn push_error_item(&mut self, message: String) {
         self.push_finalized_visual_item(TranscriptItem::Error {
             source: "ui".to_owned(),
             message,
         });
-    }
-
-    /// Muted, non-error informational line (review v2 §3/§6/§14.4) — no
-    /// glyph, no "ui:" source prefix, indented to the content column.
-    /// Consecutive `Notice` items stack directly without a separating blank
-    /// line (the renderer special-cases this run). Used for every neutral
-    /// confirmation/refusal (extension toggles, timestamps toggle,
-    /// code-swarm save/config lines, resume refusal, teach messages like the
-    /// disabled-extension notice) — none of these are failures, so none
-    /// should read as one.
-    fn teach_notice(&mut self, message: String) -> CoreEffect {
-        self.push_finalized_visual_item(TranscriptItem::Notice(message));
-        CoreEffect::Render
     }
 
     fn summary_item(&mut self, text: String) -> CoreEffect {

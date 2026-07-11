@@ -35,7 +35,7 @@ impl AppCore {
 
         match self.build_tui_resume(&session_id) {
             Ok(resume) => self.accept_tui_resume(session_id, resume),
-            Err(error) => self.notice_item(format!("resume failed: {error}")),
+            Err(error) => self.error_item(format!("resume failed: {error}")),
         }
     }
 

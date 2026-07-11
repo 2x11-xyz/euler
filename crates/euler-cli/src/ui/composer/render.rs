@@ -13,8 +13,6 @@ use ratatui::{
 pub struct ComposerSnapshot<'a> {
     pub draft: &'a ComposerDraft,
     pub queued: Vec<QueuedComposerLine>,
-    /// Override empty-composer ghost text (e.g. deny-with-instruction prompt).
-    pub empty_ghost: Option<&'a str>,
 }
 
 impl<'a> ComposerSnapshot<'a> {
@@ -22,17 +20,11 @@ impl<'a> ComposerSnapshot<'a> {
         Self {
             draft,
             queued: Vec::new(),
-            empty_ghost: None,
         }
     }
 
     pub fn with_queued(mut self, queued: Vec<QueuedComposerLine>) -> Self {
         self.queued = queued;
-        self
-    }
-
-    pub fn with_empty_ghost(mut self, ghost: Option<&'a str>) -> Self {
-        self.empty_ghost = ghost;
         self
     }
 }
@@ -179,7 +171,6 @@ pub fn render_lines(
         width,
         draft_height,
         true,
-        snapshot.empty_ghost,
     ));
     lines
 }
@@ -191,7 +182,6 @@ pub enum ComposerLine {
         indicator: Option<OverflowIndicator>,
         prompt: bool,
         text: String,
-        ghost: bool,
     },
 }
 
@@ -306,10 +296,8 @@ fn visible_draft_lines(
     width: u16,
     visible_height: usize,
     prompt_first_line: bool,
-    empty_ghost: Option<&str>,
 ) -> Vec<ComposerLine> {
     let rows = visual_rows(draft, width);
-    let empty_draft = draft.submit_text().is_empty();
     let visible_height = visible_height.max(1).min(rows.len().max(1));
     let cursor_row = visual_cursor_row_index(&rows, draft.cursor);
     let (start, end) = cursor_visible_window(
@@ -324,7 +312,7 @@ fn visible_draft_lines(
         .enumerate()
         .map(|(index, row)| {
             let prompt = prompt_first_line && start + index == 0;
-            let mut line = draft_line(
+            draft_line(
                 row,
                 DraftLineContext {
                     start,
@@ -333,22 +321,7 @@ fn visible_draft_lines(
                     total_rows: rows.len(),
                     prompt,
                 },
-            );
-            if let Some(empty_ghost) = empty_ghost.filter(|_| empty_draft) {
-                if let ComposerLine::Draft {
-                    text,
-                    ghost,
-                    prompt,
-                    ..
-                } = &mut line
-                {
-                    if *prompt && text.is_empty() {
-                        *text = empty_ghost.to_owned();
-                        *ghost = true;
-                    }
-                }
-            }
-            line
+            )
         })
         .collect()
 }
@@ -396,7 +369,6 @@ fn draft_line(row: &VisualRow, context: DraftLineContext) -> ComposerLine {
         indicator,
         prompt: context.prompt,
         text: row.text.clone(),
-        ghost: false,
     }
 }
 
@@ -639,8 +611,7 @@ fn render_line(line: ComposerLine, x: u16, y: u16, width: u16, buf: &mut Buffer,
             indicator,
             prompt,
             text,
-            ghost,
-        } => draft_spans(indicator, prompt, text, ghost, theme),
+        } => draft_spans(indicator, prompt, text, theme),
     };
     Line::from(spans).render(Rect::new(x, y, width, 1), buf);
 }
@@ -665,7 +636,6 @@ fn draft_spans(
     indicator: Option<OverflowIndicator>,
     prompt: bool,
     text: String,
-    ghost: bool,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -679,11 +649,6 @@ fn draft_spans(
             theme.composer.rule,
         )),
     }
-    let style = if ghost {
-        theme.composer.placeholder
-    } else {
-        theme.composer.text
-    };
-    spans.push(Span::styled(text, style));
+    spans.push(Span::styled(text, theme.composer.text));
     spans
 }

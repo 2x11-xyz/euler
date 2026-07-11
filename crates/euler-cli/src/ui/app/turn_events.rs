@@ -15,6 +15,10 @@ impl AppCore {
         self.queue_notification(NotifyEvent::Stall);
     }
 
+    /// Review v3 §R5(b): empty-turn suppression. When a turn changed 0
+    /// files AND context moved less than ~1% AND no tests ran, the divider
+    /// still renders (via the caller) but the recap line itself is skipped
+    /// — there's nothing worth summarizing.
     fn push_turn_recap(&mut self) {
         let ctx = super::turn_recap::ctx_percent(
             self.token_usage.input_tokens,
@@ -25,6 +29,18 @@ impl AppCore {
             self.turn_event_start,
             ctx,
         );
+        let ctx_delta_tokens = self
+            .token_usage
+            .input_tokens
+            .abs_diff(self.turn_start_input_tokens);
+        let ctx_moved_negligible = super::turn_recap::ctx_percent(
+            ctx_delta_tokens,
+            self.token_usage.context_window_tokens,
+        )
+        .is_some_and(|moved_pct| moved_pct < 1);
+        if recap.file_count == 0 && recap.test_status.is_none() && ctx_moved_negligible {
+            return;
+        }
         self.push_finalized_visual_item(TranscriptItem::TurnRecap {
             summary: recap.summary_line(),
             files: recap.files_line(),
@@ -112,12 +128,15 @@ impl AppCore {
         update_token_usage(&mut self.token_usage, event, context_window_tokens);
     }
 
-    /// Working HUD phase verb (issue #27): thinking / exploring / reading X /
-    /// writing X / running bash / running tests, falling back to "working"
-    /// only when nothing more specific applies. Only reasoning and tool-call
-    /// events carry a new phase — other event kinds (streamed text deltas,
-    /// tool results) leave the verb in place so it swaps only when the phase
-    /// actually changes, not on every event.
+    /// Working HUD phase verb (issue #27, #62): thinking / exploring /
+    /// reading X / writing X / running bash / running tests, falling back to
+    /// "working" only when nothing more specific applies. Reasoning and
+    /// tool-call events set a new phase; a tool result — success, failure,
+    /// *or* auto-denial via the turn denial cache (#62) — clears it back to
+    /// `None` so the HUD falls back to the live phase (working, or whatever
+    /// the next reasoning/tool-call event sets) instead of parroting the verb
+    /// of a tool call that has already finished. Streamed text deltas leave
+    /// the verb alone so it doesn't flicker mid-phase.
     fn update_phase_verb(&mut self, event: &EventEnvelope) {
         match event.kind.as_str() {
             EventKind::MODEL_REASONING => {
@@ -125,6 +144,9 @@ impl AppCore {
             }
             EventKind::TOOL_CALL => {
                 self.current_phase_verb = Some(phase_verb_for_tool_call(event));
+            }
+            EventKind::TOOL_RESULT => {
+                self.current_phase_verb = None;
             }
             _ => {}
         }
@@ -355,12 +377,17 @@ impl AppCore {
                 true
             }
         };
-        if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed >= MIN_WORKED_DURATION) {
+        let worked_divider_shown = elapsed.is_some_and(|elapsed| elapsed >= MIN_WORKED_DURATION);
+        if worked_divider_shown {
             self.push_finalized_visual_item(TranscriptItem::WorkedDuration(format_live_elapsed(
-                elapsed,
+                elapsed.expect("worked_divider_shown implies elapsed is Some"),
             )));
         }
-        if emit_recap {
+        // Review v3 §R5(a): the recap and its `── Worked for Ns ──` divider
+        // are one unit — a recap must never render without the divider (a
+        // turn too short to get a divider has nothing worth recapping
+        // either).
+        if emit_recap && worked_divider_shown {
             self.push_turn_recap();
         }
         match outcome {

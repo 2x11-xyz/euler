@@ -170,6 +170,7 @@ pub(super) fn write_canvas_row<W>(
     width: usize,
     foreground: RatatuiColor,
     background: RatatuiColor,
+    user_rail: RatatuiColor,
 ) -> io::Result<()>
 where
     W: Write,
@@ -192,7 +193,7 @@ where
         // content — auto-wrap physically scrolls the terminal, pushing rows
         // (banner, transcript) off-screen and corrupting the repaint.
         if let Some(clipped) = wrap_canvas_line(line, width).first() {
-            write_canvas_line(writer, clipped, foreground, background)?;
+            write_canvas_line(writer, clipped, foreground, background, user_rail)?;
         }
     }
     Ok(())
@@ -224,7 +225,10 @@ pub(super) fn stale_rows_after_resize(
 }
 
 #[cfg(test)]
-pub(super) fn canvas_lines_to_ratatui(lines: &[CanvasLine]) -> Vec<Line<'static>> {
+pub(super) fn canvas_lines_to_ratatui(
+    lines: &[CanvasLine],
+    user_rail: RatatuiColor,
+) -> Vec<Line<'static>> {
     lines
         .iter()
         .map(|line| {
@@ -232,7 +236,10 @@ pub(super) fn canvas_lines_to_ratatui(lines: &[CanvasLine]) -> Vec<Line<'static>
                 line.spans
                     .iter()
                     .map(|span| {
-                        Span::styled(span.text.as_str().to_owned(), canvas_span_style(span))
+                        Span::styled(
+                            span.text.as_str().to_owned(),
+                            canvas_span_style(span, user_rail),
+                        )
                     })
                     .collect::<Vec<_>>(),
             )
@@ -297,6 +304,7 @@ pub(super) fn write_canvas_line<W>(
     line: &CanvasLine,
     foreground: RatatuiColor,
     background: RatatuiColor,
+    user_rail: RatatuiColor,
 ) -> io::Result<usize>
 where
     W: Write,
@@ -325,7 +333,12 @@ where
     }
     let mut width = 0;
     for (index, span) in line.spans.iter().enumerate() {
-        queue_span_style(writer, canvas_span_style(span), foreground, background)?;
+        queue_span_style(
+            writer,
+            canvas_span_style(span, user_rail),
+            foreground,
+            background,
+        )?;
         let text = span.text.as_str();
         let (content, fill) = text.split_at(content_len[index]);
         if !content.is_empty() {
@@ -345,16 +358,16 @@ where
     Ok(width)
 }
 
-pub(super) fn canvas_span_style(span: &CanvasSpan) -> Style {
-    role_style(span.role).patch(span.style)
+pub(super) fn canvas_span_style(span: &CanvasSpan, user_rail: RatatuiColor) -> Style {
+    role_style(span.role, user_rail).patch(span.style)
 }
 
-pub(super) fn role_style(role: TextRole) -> Style {
+pub(super) fn role_style(role: TextRole, user_rail: RatatuiColor) -> Style {
     match role {
         TextRole::Plain => Style::default(),
         TextRole::Prompt => {
             let mut style = Style::default().add_modifier(Modifier::BOLD);
-            style.fg = Some(USER_RAIL_COLOR);
+            style.fg = Some(user_rail);
             style
         }
         TextRole::Status => Style::default().add_modifier(Modifier::DIM),
