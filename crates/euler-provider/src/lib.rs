@@ -12,6 +12,7 @@ pub mod openai;
 pub mod openrouter;
 pub mod provider_config;
 pub mod sse;
+pub mod xai;
 
 #[cfg(test)]
 mod conformance_tests;

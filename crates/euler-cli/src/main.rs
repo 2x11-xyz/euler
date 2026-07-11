@@ -12,13 +12,14 @@ use euler_provider::catalog::{MergedModelCatalog, BUILTIN_PROVIDERS};
 #[cfg(test)]
 use euler_provider::catalog::{
     DEFAULT_ANTHROPIC_MODEL, DEFAULT_CHATGPT_MODEL, DEFAULT_FIXTURE_MODEL, DEFAULT_OPENAI_MODEL,
-    DEFAULT_OPENROUTER_MODEL,
+    DEFAULT_OPENROUTER_MODEL, DEFAULT_XAI_MODEL,
 };
 use euler_provider::chatgpt::ChatGptProvider;
 use euler_provider::custom_provider::CustomOpenAiProvider;
 use euler_provider::openai::OpenAiProvider;
 use euler_provider::openrouter::OpenRouterProvider;
 use euler_provider::provider_config::ProviderConfigRegistry;
+use euler_provider::xai::XaiProvider;
 use euler_provider::ReasoningEffort;
 use euler_provider::{EchoProvider, ModelProvider, ProviderSet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1892,6 +1893,10 @@ pub(crate) fn provider_for_id(
                 Box::new(OpenRouterProvider::with_api_key_auth(api_key_auth(
                     auth_file,
                 )))
+            }
+            "xai" => {
+                reject_provider_options("xai", options)?;
+                Box::new(XaiProvider::with_api_key_auth(api_key_auth(auth_file)))
             }
             other => return Err(anyhow!("provider `{other}` is missing CLI factory wiring")),
         });

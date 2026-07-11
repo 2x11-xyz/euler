@@ -9,12 +9,14 @@ pub const CHATGPT_PROVIDER_ID: &str = "chatgpt";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
+pub const XAI_PROVIDER_ID: &str = "xai";
 
 pub const DEFAULT_FIXTURE_MODEL: &str = "echo";
 pub const DEFAULT_CHATGPT_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_OPENAI_MODEL: &str = crate::openai::DEFAULT_MODEL;
 pub const DEFAULT_ANTHROPIC_MODEL: &str = crate::anthropic::DEFAULT_MODEL;
 pub const DEFAULT_OPENROUTER_MODEL: &str = crate::openrouter::DEFAULT_MODEL;
+pub const DEFAULT_XAI_MODEL: &str = crate::xai::DEFAULT_MODEL;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuiltInModelDescriptor {
@@ -175,6 +177,14 @@ pub const BUILTIN_PROVIDERS: &[ProviderDescriptor] = &[
         aliases: &[],
         auth_file_supported: true,
         models: OPENROUTER_MODELS,
+    },
+    ProviderDescriptor {
+        id: XAI_PROVIDER_ID,
+        display_name: "xAI",
+        default_model: DEFAULT_XAI_MODEL,
+        aliases: &[],
+        auth_file_supported: true,
+        models: XAI_MODELS,
     },
 ];
 
@@ -2100,6 +2110,30 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
     ),
 ];
 
+/// xAI API models (pi reference: xai.models.ts).
+const XAI_MODELS: &[BuiltInModelDescriptor] = &[
+    built_in_model("grok-3", "Grok 3", 131_072, 8_192, false),
+    built_in_model("grok-3-fast", "Grok 3 Fast", 131_072, 8_192, false),
+    built_in_model(
+        "grok-4.20-0309-non-reasoning",
+        "Grok 4.20 (Non-Reasoning)",
+        1_000_000,
+        30_000,
+        false,
+    ),
+    built_in_model(
+        "grok-4.20-0309-reasoning",
+        "Grok 4.20 (Reasoning)",
+        1_000_000,
+        30_000,
+        true,
+    ),
+    built_in_model("grok-4.3", "Grok 4.3", 1_000_000, 30_000, true),
+    built_in_model("grok-4.5", "Grok 4.5", 500_000, 500_000, true),
+    built_in_model("grok-build-0.1", "Grok Build 0.1", 256_000, 256_000, true),
+    built_in_model("grok-code-fast-1", "Grok Code Fast 1", 32_768, 8_192, false),
+];
+
 const fn built_in_model(
     id: &'static str,
     display_name: &'static str,
@@ -2620,7 +2654,30 @@ mod tests {
                 (OPENAI_PROVIDER_ID, DEFAULT_OPENAI_MODEL, true),
                 (ANTHROPIC_PROVIDER_ID, DEFAULT_ANTHROPIC_MODEL, true),
                 (OPENROUTER_PROVIDER_ID, DEFAULT_OPENROUTER_MODEL, true),
+                (XAI_PROVIDER_ID, DEFAULT_XAI_MODEL, true),
             ]
+        );
+    }
+
+    #[test]
+    fn xai_built_in_models_pin_pi_reference_and_routable_default() {
+        assert_eq!(XAI_MODELS.len(), 8);
+        let default = XAI_MODELS
+            .iter()
+            .find(|model| model.id == DEFAULT_XAI_MODEL)
+            .expect("default xai model listed");
+        assert_eq!(default.display_name, "Grok 4.3");
+        assert_eq!(default.supports_reasoning, Some(true));
+        assert!(built_in_model_supports_reasoning("xai", DEFAULT_XAI_MODEL));
+
+        assert_eq!(
+            parse_model_spec("xai::grok-4.3").expect("route"),
+            ModelSpec::Routed(ModelRoute {
+                provider: ProviderId {
+                    id: XAI_PROVIDER_ID
+                },
+                model: "grok-4.3".to_owned(),
+            })
         );
     }
 
