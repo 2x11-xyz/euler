@@ -73,7 +73,7 @@ impl ExtensionCommand for CausalDagObserverBriefCommand {
             page.watermark_event_id.as_deref(),
             after_event_id.as_deref(),
         )?;
-        let listed = listed_events(&page.events)?;
+        let listed = listed_events(&page.events[..fence.listable_len])?;
         // session_id is a validation input (family semantics: the host reads
         // exactly one session log; this asserts the caller's expectation),
         // never a query filter.
@@ -296,6 +296,12 @@ pub(super) fn listed_events(
 pub(super) struct ObserverPageFence {
     pub(super) watermark_event_id: Option<String>,
     pub(super) stalled_on_incomplete_observer: bool,
+    /// Number of leading page events at or before the fence. The brief must
+    /// only LIST events up to this bound — the apply step cuts the page at
+    /// the watermark, so listing (and thus inviting citation of) events past
+    /// an incomplete observer span makes the resulting revision unapplyable
+    /// (review #105 F2).
+    pub(super) listable_len: usize,
 }
 
 pub(super) fn observer_page_fence(
@@ -316,6 +322,9 @@ pub(super) fn observer_page_fence(
                     .map(|safe_index| events[safe_index].id.clone())
                     .or_else(|| after_event_id.map(str::to_owned)),
                 stalled_on_incomplete_observer: index == 0,
+                // List only the events before the incomplete span; the span
+                // and everything after it are past the watermark.
+                listable_len: index,
             });
         }
     }
@@ -324,6 +333,7 @@ pub(super) fn observer_page_fence(
             .map(str::to_owned)
             .or_else(|| after_event_id.map(str::to_owned)),
         stalled_on_incomplete_observer: false,
+        listable_len: events.len(),
     })
 }
 

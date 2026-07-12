@@ -4746,6 +4746,32 @@ impl RecordingHost {
     }
 }
 
+#[test]
+fn corrupt_active_graph_state_self_heals_instead_of_bricking_the_loop() {
+    // review #105 F3: a corrupt active-graph.json must read as absent (fresh
+    // interpretation), not hard-error — the driver runs fail-open, so an
+    // error here would silently stop the DAG updating forever.
+    let host = RecordingHost::new(recording_page(Vec::new(), 64, None, false));
+    let path = host.state.path().join("active-graph.json");
+
+    fs::write(&path, b"{ not valid json").expect("write corrupt state");
+    assert!(
+        ActiveGraphState::load(&host)
+            .expect("corrupt JSON must not hard-error")
+            .is_none(),
+        "unparseable state must read as absent"
+    );
+
+    fs::write(&path, br#"{"schema":"euler.causal_dag.active.v999"}"#)
+        .expect("write schema-invalid state");
+    assert!(
+        ActiveGraphState::load(&host)
+            .expect("schema-invalid state must not hard-error")
+            .is_none(),
+        "schema-invalid state must read as absent"
+    );
+}
+
 fn recording_page(
     events: Vec<EventEnvelope>,
     applied_limit: usize,

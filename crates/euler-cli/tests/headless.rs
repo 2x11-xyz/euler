@@ -498,7 +498,10 @@ fn exec_observe_causal_dag_spawns_observer_companion_and_stays_fail_open() {
         .filter(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
         .collect::<Vec<_>>();
     assert_eq!(spawns.len(), 1, "observer companion must spawn");
-    assert_eq!(spawns[0].payload["persona"], "round-observer");
+    // The observer spawns under the persona the brief declares, so the
+    // extension's self-event exclusion can fence the observer's own output
+    // out of later observation windows (review #105 F1).
+    assert_eq!(spawns[0].payload["persona"], "causal-dag-observer");
     assert_eq!(
         spawns[0].payload["capabilities"],
         serde_json::json!([]),

@@ -51,10 +51,20 @@ impl ActiveGraphState {
         if bytes.len() as u64 > MAX_ACTIVE_STATE_BYTES {
             return Err(state_message("active graph state exceeds the size limit"));
         }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
-            state_message(format!("active graph state is invalid JSON: {error}"))
-        })?;
-        Self::from_value(&value).map(Some)
+        // A corrupt EXISTING state file must not permanently brick the
+        // feature: the driver runs fail-open, so a hard error here would
+        // silently stop the DAG from ever updating again with no self-heal.
+        // Treat unparseable/invalid state as absent — the loop then starts a
+        // fresh interpretation, and that restart is itself observable in the
+        // lineage (the next artifact records `predecessor: null`) rather than
+        // the feature dying silently (review #105 F3). A missing file is
+        // already the legitimate fresh-start case above; a non-regular-file
+        // or oversize file stays a hard error (attack surface / growth
+        // backpressure, not corruption).
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            return Ok(None);
+        };
+        Ok(Self::from_value(&value).ok())
     }
 
     pub(super) fn commit(

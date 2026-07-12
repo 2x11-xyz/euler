@@ -286,6 +286,108 @@ fn observer_loop_session(
     (temp, session, saw_prompt)
 }
 
+fn two_round_observer_session() -> (tempfile::TempDir, Session<AllowAllDecider>) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join(SESSION_ID);
+    fs::create_dir_all(&session_dir).expect("session dir");
+    fs::write(temp.path().join("input.txt"), "flaky test notes\n").expect("write input");
+    let writer = ProvenanceWriter::new(session_dir.join("events.jsonl")).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = SESSION_ID.to_owned();
+    config.extensions_enabled.insert(EXTENSION_ID.to_owned());
+    config.round_observer = Some(RoundObserverConfig {
+        cadence_rounds: NonZeroU64::new(1).expect("nonzero cadence"),
+        brief_command: "observer-brief".to_owned(),
+        apply_command: "observer-apply".to_owned(),
+    });
+    // Two tool-call rounds => two mid-turn observer boundaries => the rolling
+    // observer fires TWICE. The second observation must not read the first
+    // observer's own hints as evidence (review #105 F1).
+    let provider = ObserverScriptProvider::new(
+        vec![
+            DriverRound::ToolCall(ToolCall {
+                id: "call-read-1".to_owned(),
+                name: "read_file".to_owned(),
+                input: json!({"path": "input.txt"}),
+            }),
+            DriverRound::ToolCall(ToolCall {
+                id: "call-read-2".to_owned(),
+                name: "read_file".to_owned(),
+                input: json!({"path": "input.txt"}),
+            }),
+            DriverRound::Assistant("driver done"),
+        ],
+        ObserverBehavior::HintsFromListing,
+    );
+    let mut session = Session::new(config, provider, AllowAllDecider).with_provenance(writer);
+    session.set_observer_extension(Arc::new(CausalDagExtension));
+    (temp, session)
+}
+
+#[test]
+fn rolling_observer_cognition_never_becomes_graph_evidence() {
+    // The rolling observer spawns under persona `causal-dag-observer`, so the
+    // extension's self-event exclusion fences its own output out of the next
+    // observation window. If core spawns it under a mismatched persona, the
+    // exclusion is inert and the previous observer's raw hints are fed back
+    // as evidence — exactly what this machinery exists to prevent.
+    let (temp, mut session) = two_round_observer_session();
+    let events = session.run_turn("fix the flaky test").expect("turn");
+    assert_eq!(last_assistant_content(&events), "driver done");
+
+    // The loop fired at least twice (both spawn under the observer persona).
+    let observer_child_ids: std::collections::BTreeSet<String> = events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::AGENT_SPAWN
+                && event.payload["persona"] == json!("causal-dag-observer")
+        })
+        .filter_map(|event| event.payload["child_agent_id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        observer_child_ids.len() >= 2,
+        "expected >=2 rolling observer spawns, got {}",
+        observer_child_ids.len()
+    );
+
+    // Every event cited as evidence in the final graph must be authored by a
+    // NON-observer agent — no observer's own output may appear as evidence.
+    let artifacts = causal_dag_artifacts(&events);
+    let latest = artifacts.last().expect("at least one artifact");
+    let artifact = read_artifact(&temp, latest);
+    let author_of = |event_id: &str| -> Option<String> {
+        events
+            .iter()
+            .find(|event| event.id == event_id)
+            .map(|event| event.agent.clone())
+    };
+    let mut cited = std::collections::BTreeSet::new();
+    for group in ["nodes", "edges"] {
+        if let Some(items) = artifact["forest"][group].as_array() {
+            for item in items {
+                if let Some(refs) = item["source_refs"].as_array() {
+                    for source in refs {
+                        if let Some(id) = source["event_id"].as_str() {
+                            cited.insert(id.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(!cited.is_empty(), "graph should cite some evidence");
+    for event_id in &cited {
+        let author = author_of(event_id);
+        assert!(
+            author
+                .as_deref()
+                .is_none_or(|agent| !observer_child_ids.contains(agent)),
+            "evidence event {event_id} was authored by a rolling observer ({author:?}) — \
+             observer cognition leaked into graph evidence"
+        );
+    }
+}
+
 #[test]
 fn observer_loop_produces_semantic_graph_slot_end_to_end() {
     let (temp, mut session, saw_prompt) = observer_loop_session(ObserverBehavior::HintsFromListing);
@@ -299,7 +401,7 @@ fn observer_loop_produces_semantic_graph_slot_end_to_end() {
     // The observer companion spawned as a zero-capability generation task
     // and completed.
     let spawn = single_event(&events, EventKind::AGENT_SPAWN);
-    assert_eq!(spawn.payload["persona"], json!("round-observer"));
+    assert_eq!(spawn.payload["persona"], json!("causal-dag-observer"));
     assert_eq!(spawn.payload["capabilities"], json!([]));
     let result = single_event(&events, EventKind::AGENT_RESULT);
     assert_eq!(result.payload["ok"], json!(true));
