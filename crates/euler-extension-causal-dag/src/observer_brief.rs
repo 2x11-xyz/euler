@@ -698,7 +698,8 @@ pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
         "When no CURRENT GRAPH is present, return the complete initial graph.",
         "Preserve stable node and edge ids unless the interpreted entity genuinely changed identity.",
         "Revised records cite the NEW EVENTS that justify the revision; unchanged prior evidence is retained by the host.",
-        "A prior event id may be reused only when it is named in the CURRENT GRAPH record being revised.",
+        "Do not repeat CURRENT GRAPH source refs; the host preserves prior evidence on revised records.",
+        "For every NEW EVENT source ref, use payload_pointer /payload exactly; use null only for extension.artifact events.",
         "Do not use old archive knowledge, fixture oracle labels, or target edge lists.",
         "Omit unsupported claims rather than inventing structure.",
         "Node keys are exactly: id, root_id, kind, status, title, summary, source_refs, confidence, basis, metadata.",
@@ -721,7 +722,7 @@ pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
         "Use repair only when a later event explicitly reuses concrete failure material from a terminal branch.",
         "Use artifact_use only for source-session artifacts or outputs, not Causal DAG graph artifacts.",
         "Every returned node and edge must have at least one source_ref citing a NEW EVENT or a source named on its CURRENT GRAPH record.",
-        "JSON pointers are against the whole event object, usually /payload/content or /payload/output.",
+        "Never guess a kind-specific payload field: /payload is the canonical pointer for listed events.",
         "Stable ids should be short lowercase ids prefixed with node- or edge-.",
     ]
     .join("\n");

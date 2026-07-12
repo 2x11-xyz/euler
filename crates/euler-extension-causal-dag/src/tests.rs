@@ -165,6 +165,8 @@ fn observer_brief_over_knuth_fixture_builds_bounded_agent_task() {
     assert!(!task.contains("self-artifact"));
     let system_prompt = output["system_prompt"].as_str().expect("system prompt");
     assert!(system_prompt.contains("Use schema euler.causal_dag.hints.v1"));
+    assert!(system_prompt.contains("use payload_pointer /payload exactly"));
+    assert!(system_prompt.contains("Do not repeat CURRENT GRAPH source refs"));
     assert!(system_prompt.contains(
         "Every non-root node must have exactly one incoming canonical_backbone structural edge"
     ));
