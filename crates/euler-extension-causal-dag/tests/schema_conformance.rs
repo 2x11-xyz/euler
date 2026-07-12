@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_lines)]
 
-// This conformance suite validates the `euler.causal_dag.v1` artifact schema
+// This conformance suite validates the `euler.causal_dag.v2` artifact schema
 // against canonical Euler events only. It deliberately imports `euler_event`,
 // not the causal-dag extension implementation, so schema validity stays
 // independent from the current projector code.
@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCHEMA: &str = "euler.causal_dag.v1";
-const MEDIA_TYPE: &str = "application/vnd.euler.causal-dag.v1+json";
+const SCHEMA: &str = "euler.causal_dag.v2";
+const MEDIA_TYPE: &str = "application/vnd.euler.causal-dag.v2+json";
 
 #[test]
 fn causal_dag_positive_fixtures_validate() {
@@ -77,6 +77,34 @@ fn causal_dag_rejects_unknown_schema_enums() {
             edge_mut(artifact, "edge-knuth-fork-left")["class"] = json!("causal");
         },
         "edge-class",
+    );
+}
+
+#[test]
+fn causal_dag_rejects_invalid_construction_lineage() {
+    assert_knuth_mutation_fails(
+        |artifact| {
+            artifact["construction"]["operation"] = json!("rewrite");
+        },
+        "construction-operation",
+    );
+    assert_knuth_mutation_fails(
+        |artifact| {
+            artifact["construction"]["predecessor_artifact_event_id"] = json!("artifact-prior");
+        },
+        "construction-predecessor",
+    );
+    assert_knuth_mutation_fails(
+        |artifact| {
+            artifact["construction"]["operation"] = json!("incremental");
+        },
+        "construction-predecessor",
+    );
+    assert_knuth_mutation_fails(
+        |artifact| {
+            artifact["construction"]["trigger"] = json!("session_end");
+        },
+        "construction-trigger",
     );
 }
 
@@ -458,6 +486,14 @@ fn causal_dag_accepts_empty_bounded_page_artifact() {
             "basis": "bounded_provenance_query",
             "degraded": false
         },
+        "construction": {
+            "operation": "snapshot",
+            "policy": "manual",
+            "trigger": "command",
+            "predecessor_artifact_event_id": null,
+            "predecessor_watermark_event_id": null,
+            "observer_result_event_id": null
+        },
         "forest": {
             "roots": [],
             "active_root": null,
@@ -758,6 +794,7 @@ impl<'a> Validator<'a> {
                 "generated_at",
                 "session",
                 "projection",
+                "construction",
                 "forest",
                 "diagnostics",
             ],
@@ -768,6 +805,7 @@ impl<'a> Validator<'a> {
         let (event_range_complete, event_range_end) = self.validate_session(top);
         let projection = self.validate_projection(top);
         self.projection_degraded = projection;
+        self.validate_construction(top);
         let diagnostics = self.parse_diagnostics(top);
         self.diagnostics_degraded_chronology = diagnostics.degraded_chronology;
         self.validate_generated_at(top, event_range_end.as_deref());
@@ -931,6 +969,96 @@ impl<'a> Validator<'a> {
             ),
         }
         self.required_bool(projection, "degraded", "$.projection")
+    }
+
+    fn validate_construction(&mut self, top: &Map<String, Value>) {
+        let Some(construction) = top.get("construction").and_then(Value::as_object) else {
+            self.report
+                .fail("required-field", "construction must be an object");
+            return;
+        };
+        self.check_keys(
+            construction,
+            &[
+                "operation",
+                "policy",
+                "trigger",
+                "predecessor_artifact_event_id",
+                "predecessor_watermark_event_id",
+                "observer_result_event_id",
+            ],
+            "$.construction",
+        );
+        let operation = self
+            .required_str(construction, "operation", "$.construction")
+            .to_owned();
+        let policy = self
+            .required_str(construction, "policy", "$.construction")
+            .to_owned();
+        let trigger = self
+            .required_str(construction, "trigger", "$.construction")
+            .to_owned();
+        self.check_allowed(
+            "construction-operation",
+            &operation,
+            &["snapshot", "incremental", "reframe", "final"],
+        );
+        self.check_allowed(
+            "construction-policy",
+            &policy,
+            &["manual", "rolling_only", "rolling_and_final", "final_only"],
+        );
+        self.check_allowed(
+            "construction-trigger",
+            &trigger,
+            &[
+                "command",
+                "round_cadence",
+                "explicit_reframe",
+                "session_end",
+            ],
+        );
+        let predecessor_artifact = self.nullable_event_id(
+            construction,
+            "predecessor_artifact_event_id",
+            "$.construction",
+        );
+        let predecessor_watermark = self.nullable_event_id(
+            construction,
+            "predecessor_watermark_event_id",
+            "$.construction",
+        );
+        self.nullable_event_id(construction, "observer_result_event_id", "$.construction");
+        if predecessor_artifact.is_some() != predecessor_watermark.is_some() {
+            self.report.fail(
+                "construction-predecessor",
+                "construction predecessor artifact and watermark must both be null or strings",
+            );
+        }
+        if operation == "snapshot" && predecessor_artifact.is_some() {
+            self.report.fail(
+                "construction-predecessor",
+                "snapshot construction must not name a predecessor",
+            );
+        }
+        if operation == "incremental" && predecessor_artifact.is_none() {
+            self.report.fail(
+                "construction-predecessor",
+                "incremental construction requires a predecessor",
+            );
+        }
+        if (operation == "final") != (trigger == "session_end") {
+            self.report.fail(
+                "construction-trigger",
+                "final construction and session_end trigger must occur together",
+            );
+        }
+        if trigger == "explicit_reframe" && operation != "reframe" {
+            self.report.fail(
+                "construction-trigger",
+                "explicit_reframe trigger requires reframe construction",
+            );
+        }
     }
 
     fn validate_generated_at(&mut self, top: &Map<String, Value>, end: Option<&str>) {
@@ -2317,7 +2445,7 @@ impl<'a> Validator<'a> {
         for key in object.keys() {
             if !allowed.contains(&key.as_str()) {
                 self.report
-                    .fail("unknown-field", format!("{path}.{key} is not in v1 schema"));
+                    .fail("unknown-field", format!("{path}.{key} is not in v2 schema"));
             }
         }
         for key in allowed {

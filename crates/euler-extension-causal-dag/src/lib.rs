@@ -7,10 +7,14 @@ use euler_sdk::{
 };
 use serde_json::{json, Map, Value};
 
+mod active_state;
+mod construction;
 mod observer_apply;
 mod observer_brief;
 mod projection;
 mod record_observation;
+mod refresh;
+mod revision;
 mod slot_summary;
 use observer_apply::{CausalDagObserverApplyCommand, OBSERVER_APPLY_COMMAND_NAME};
 use observer_brief::{CausalDagObserverBriefCommand, OBSERVER_BRIEF_COMMAND_NAME};
@@ -22,6 +26,8 @@ use record_observation::{
     OBSERVER_TASK,
 };
 use record_observation::{CausalDagRecordObservationCommand, RECORD_OBSERVATION_COMMAND_NAME};
+use refresh::{CausalDagRefreshCommand, REFRESH_COMMAND_NAME};
+use revision::{execute_observe_projection, ObservationCommit};
 use slot_summary::{publish_graph_slot, with_slot_publication, SlotPublication};
 #[cfg(test)]
 use slot_summary::{render_slot_summary, GRAPH_SLOT_NAME};
@@ -39,8 +45,9 @@ const DEFAULT_LIMIT: usize = 64;
 const DEFAULT_MAX_CATCH_UP_TICKS: usize = 16;
 const MAX_CATCH_UP_TICKS: usize = 128;
 pub const OBSERVER_HINT_MAX_BYTES: usize = 64 * 1024;
-const SCHEMA_NAME: &str = "euler.causal_dag.v1";
-const MEDIA_TYPE_JSON: &str = "application/vnd.euler.causal-dag.v1+json";
+const SCHEMA_NAME: &str = "euler.causal_dag.v2";
+const MEDIA_TYPE_JSON: &str = "application/vnd.euler.causal-dag.v2+json";
+const LEGACY_MEDIA_TYPE_JSON: &str = "application/vnd.euler.causal-dag.v1+json";
 const EMPTY_GENERATED_AT: &str = "1970-01-01T00:00:00Z";
 const UPDATE_CAPABILITIES: [Capability; 5] = [
     Capability::ProvenanceRead,
@@ -49,12 +56,13 @@ const UPDATE_CAPABILITIES: [Capability; 5] = [
     Capability::FsWrite,
     Capability::ContextSlot,
 ];
-const EXTENSION_CAPABILITIES: [Capability; 6] = [
+const EXTENSION_CAPABILITIES: [Capability; 7] = [
     Capability::ProvenanceRead,
     Capability::ArtifactWrite,
     Capability::FsRead,
     Capability::FsWrite,
     Capability::AgentRecord,
+    Capability::AgentSpawn,
     Capability::ContextSlot,
 ];
 
@@ -76,6 +84,7 @@ impl Extension for CausalDagExtension {
         registrar.register_command(UPDATE_COMMAND_NAME, Box::new(CausalDagUpdateCommand));
         registrar.register_command(CATCH_UP_COMMAND_NAME, Box::new(CausalDagCatchUpCommand));
         registrar.register_command(OBSERVE_COMMAND_NAME, Box::new(CausalDagObserveCommand));
+        registrar.register_command(REFRESH_COMMAND_NAME, Box::new(CausalDagRefreshCommand));
         registrar.register_command(
             OBSERVER_BRIEF_COMMAND_NAME,
             Box::new(CausalDagObserverBriefCommand),
@@ -227,6 +236,8 @@ impl ExtensionCommand for CausalDagObserveCommand {
             required_capabilities: vec![
                 Capability::ProvenanceRead,
                 Capability::ArtifactWrite,
+                Capability::FsRead,
+                Capability::FsWrite,
                 Capability::ContextSlot,
             ],
             args,
@@ -240,64 +251,13 @@ impl ExtensionCommand for CausalDagObserveCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let input = ObserveInput::parse(&context.input)?;
-        execute_observe_projection(host, &input, OBSERVE_COMMAND_NAME)
+        execute_observe_projection(
+            host,
+            &input,
+            OBSERVE_COMMAND_NAME,
+            ObservationCommit::ManualReframe,
+        )
     }
-}
-
-/// Shared hints-folding path for `observe` (operator-provided hints file)
-/// and `observer-apply` (round-observer companion output): bounded page,
-/// optional watermark cut, semantic projection, artifact write, graph slot.
-fn execute_observe_projection(
-    host: &dyn HostApi,
-    input: &ObserveInput,
-    command: &'static str,
-) -> Result<Value, ExtensionError> {
-    let mut page = host.query_provenance(input.query())?;
-    if let Some(watermark) = &input.watermark_event_id {
-        cut_page_at_watermark(&mut page, watermark)?;
-    } else if page.truncated {
-        return Err(input_error(format!(
-            "causal-dag {command} requires a complete bounded event page"
-        )));
-    }
-    let split = split_update_events(&page.events)?;
-    let projection = Projection::from_observer_hints(
-        &split.source_events,
-        &input.hints,
-        input.session_id.as_deref(),
-    )?;
-    let source_event_ids = cited_source_event_ids(&projection, &split.source_events);
-    let cited_source_event_count = source_event_ids.len();
-    let source_event_count = split.source_events.len();
-    let ignored_event_count = split.ignored_self_events();
-    let record = write_projection_artifact(host, &projection, &page, source_event_ids)?;
-    let slot_publication = publish_graph_slot(host, &projection);
-
-    Ok(with_slot_publication(
-        json!({
-            "schema": SCHEMA_NAME,
-            "command": command,
-            "persisted_event_id": record.persisted_event_id,
-            "relative_path": record.relative_path,
-            "sha256": record.sha256,
-            "byte_len": record.byte_len,
-            "source_event_count": source_event_count,
-            "cited_source_event_count": cited_source_event_count,
-            "ignored_event_count": ignored_event_count,
-            "node_count": projection.node_count(),
-            "edge_count": projection.edge_count(),
-            "degraded": projection.degraded(),
-            "truncated": page.truncated,
-            "applied_limit": page.applied_limit,
-            "applied_scan_limit": page.applied_scan_limit,
-            "scanned_events": page.scanned_events,
-            "next_after_event_id": page.next_after_event_id,
-            "watermark_event_id": projection.watermark_event_id(),
-            "query_watermark_event_id": page.watermark_event_id,
-            "checkpoint_after_event_id": Value::Null,
-        }),
-        slot_publication,
-    ))
 }
 
 fn provenance_query_args(after_event_id: bool, kinds: bool) -> Vec<ArgSpec> {
@@ -578,27 +538,11 @@ pub(crate) fn is_causal_dag_self_event(event: &EventEnvelope) -> Result<bool, Ex
     }
 }
 
-/// Local post-processing for `observe` only: the mutated page never escapes
-/// the command, so rewriting truncated/next_after_event_id describes the CUT
-/// page honestly (complete up to the watermark) rather than lying to any
-/// downstream pagination consumer.
-fn cut_page_at_watermark(page: &mut ProvenancePage, watermark: &str) -> Result<(), ExtensionError> {
-    let Some(index) = page.events.iter().position(|event| event.id == watermark) else {
-        return Err(input_error(format!(
-            "causal-dag observe watermark_event_id `{watermark}` was not reached in the bounded provenance page"
-        )));
-    };
-    page.events.truncate(index + 1);
-    page.watermark_event_id = Some(watermark.to_owned());
-    page.next_after_event_id = None;
-    page.truncated = false;
-    Ok(())
-}
-
 fn is_causal_dag_graph_artifact(event: &EventEnvelope) -> Result<bool, ExtensionError> {
     let extension_id = required_artifact_payload_string(event, "extension_id")?;
     let media_type = required_artifact_payload_string(event, "media_type")?;
-    Ok(extension_id == EXTENSION_ID && media_type == MEDIA_TYPE_JSON)
+    Ok(extension_id == EXTENSION_ID
+        && matches!(media_type, MEDIA_TYPE_JSON | LEGACY_MEDIA_TYPE_JSON))
 }
 
 fn is_causal_dag_record_observation_event(event: &EventEnvelope) -> bool {
@@ -614,15 +558,6 @@ fn is_causal_dag_permission_decision(event: &EventEnvelope) -> bool {
 
 fn event_ids(events: &[EventEnvelope]) -> Vec<String> {
     events.iter().map(|event| event.id.clone()).collect()
-}
-
-fn cited_source_event_ids(projection: &Projection, events: &[EventEnvelope]) -> Vec<String> {
-    let cited = projection.cited_event_ids();
-    events
-        .iter()
-        .filter(|event| cited.contains(&event.id))
-        .map(|event| event.id.clone())
-        .collect()
 }
 
 fn required_artifact_payload_string<'a>(

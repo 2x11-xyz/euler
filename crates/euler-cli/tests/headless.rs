@@ -2527,7 +2527,7 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#"{{"id":"causal-dag","display_name":"Causal DAG","#,
                 r#""version":"{}","source_kind":"bundled","#,
                 r#""runtime_kind":"native-rust","capabilities":["provenance-read","#,
-                r#""artifact-write","fs-read","fs-write","agent-record","context-slot"],"commands":[{{"name":"export","#,
+                r#""artifact-write","fs-read","fs-write","agent-record","agent-spawn","context-slot"],"commands":[{{"name":"export","#,
                 r#""display_name":"Export causal DAG","#,
                 r#""summary":"Export a deterministic Causal DAG artifact from bounded provenance.","#,
                 r#""required_capabilities":["provenance-read","artifact-write"]}},{{"name":"update","#,
@@ -2539,13 +2539,16 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"]}},{{"name":"observe","#,
                 r#""display_name":"Observe causal DAG","#,
                 r#""summary":"Project observer-produced Causal DAG hints over bounded provenance.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","context-slot"]}},{{"name":"observer-brief","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"]}},{{"name":"refresh","#,
+                r#""display_name":"Refresh causal DAG","#,
+                r#""summary":"Increment, reframe, or finalize the active semantic Causal DAG.","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","agent-spawn","context-slot"]}},{{"name":"observer-brief","#,
                 r#""display_name":"Build observer brief","#,
                 r#""summary":"Build a bounded companion AgentTask for observing a provenance window.","#,
-                r#""required_capabilities":["provenance-read"]}},{{"name":"observer-apply","#,
+                r#""required_capabilities":["provenance-read","fs-read","fs-write"]}},{{"name":"observer-apply","#,
                 r#""display_name":"Apply observer output","#,
                 r#""summary":"Fold a round-observer companion's hints output into a Causal DAG projection.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","context-slot"]}},{{"name":"record-observation","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"]}},{{"name":"record-observation","#,
                 r#""display_name":"Record Causal DAG observation","#,
                 r#""summary":"Record post-hoc observer audit metadata for an existing Causal DAG artifact.","#,
                 r#""required_capabilities":["provenance-read","agent-record"]}}]}}"#,
@@ -2835,6 +2838,7 @@ fn extension_search_reports_deterministic_bundled_metadata_json() {
             "fs-read",
             "fs-write",
             "agent-record",
+            "agent-spawn",
             "context-slot"
         ])
     );
@@ -2842,9 +2846,10 @@ fn extension_search_reports_deterministic_bundled_metadata_json() {
     assert_eq!(result["commands"][1]["name"], "update");
     assert_eq!(result["commands"][2]["name"], "catch-up");
     assert_eq!(result["commands"][3]["name"], "observe");
-    assert_eq!(result["commands"][4]["name"], "observer-brief");
-    assert_eq!(result["commands"][5]["name"], "observer-apply");
-    assert_eq!(result["commands"][6]["name"], "record-observation");
+    assert_eq!(result["commands"][4]["name"], "refresh");
+    assert_eq!(result["commands"][5]["name"], "observer-brief");
+    assert_eq!(result["commands"][6]["name"], "observer-apply");
+    assert_eq!(result["commands"][7]["name"], "record-observation");
     assert!(!stdout.contains(home.path().to_string_lossy().as_ref()));
 
     let summary_search = command_with_home(exe, &home)
@@ -3641,7 +3646,7 @@ fn extension_cli_enable_and_run_causal_dag_export() {
     let artifact_event = events_after.last().expect("extension artifact event");
     let projection_watermark = events_before.last().expect("projection watermark");
 
-    assert_eq!(stdout["schema"], serde_json::json!("euler.causal_dag.v1"));
+    assert_eq!(stdout["schema"], serde_json::json!("euler.causal_dag.v2"));
     assert_eq!(
         stdout["event_count"],
         serde_json::json!(events_before.len())
@@ -3654,10 +3659,10 @@ fn extension_cli_enable_and_run_causal_dag_export() {
         !contains_bytes(&artifact_bytes, sentinel),
         "causal DAG artifact must not copy event payload content"
     );
-    assert_eq!(artifact["schema"], serde_json::json!("euler.causal_dag.v1"));
+    assert_eq!(artifact["schema"], serde_json::json!("euler.causal_dag.v2"));
     assert_eq!(
         artifact["media_type"],
-        serde_json::json!("application/vnd.euler.causal-dag.v1+json")
+        serde_json::json!("application/vnd.euler.causal-dag.v2+json")
     );
     assert_eq!(
         artifact["generated_at"],
@@ -3870,13 +3875,13 @@ fn extension_cli_causal_dag_observe_projects_model_hint_file_headlessly() {
         .expect("extension artifact event");
 
     assert_eq!(stdout["command"], serde_json::json!("observe"));
-    assert_eq!(stdout["schema"], serde_json::json!("euler.causal_dag.v1"));
-    assert_causal_dag_artifact_matches_expected(&artifact, &expected, &durable, artifact_event);
+    assert_eq!(stdout["schema"], serde_json::json!("euler.causal_dag.v2"));
+    assert_causal_dag_observation_matches_expected(&artifact, &expected, &durable, artifact_event);
     assert_eq!(artifact_event.kind.as_str(), EventKind::EXTENSION_ARTIFACT);
     assert_eq!(
         artifact_event.payload.get("media_type"),
         Some(&serde_json::json!(
-            "application/vnd.euler.causal-dag.v1+json"
+            "application/vnd.euler.causal-dag.v2+json"
         ))
     );
     assert_no_embedded_causal_dag_hints(&durable[..durable.len() - 1]);
@@ -4119,7 +4124,7 @@ fn extension_cli_causal_dag_knuth_parity_lifecycle_is_headless_and_checkpointed(
             .exists(),
         "observe must not seed the catch-up checkpoint"
     );
-    assert_causal_dag_artifact_matches_expected(
+    assert_causal_dag_observation_matches_expected(
         &observe_artifact,
         &expected,
         &after_observe,
@@ -9486,6 +9491,24 @@ fn assert_causal_dag_artifact_matches_expected(
     );
 }
 
+fn assert_causal_dag_observation_matches_expected(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    events: &[EventEnvelope],
+    artifact_event: &EventEnvelope,
+) {
+    let mut expected = expected.clone();
+    expected["construction"] = serde_json::json!({
+        "operation": "reframe",
+        "policy": "manual",
+        "trigger": "explicit_reframe",
+        "predecessor_artifact_event_id": null,
+        "predecessor_watermark_event_id": null,
+        "observer_result_event_id": null
+    });
+    assert_causal_dag_artifact_matches_expected(actual, &expected, events, artifact_event);
+}
+
 fn assert_causal_dag_projection_metadata(
     artifact: &serde_json::Value,
     events: &[EventEnvelope],
@@ -9545,7 +9568,7 @@ fn is_causal_dag_self_event(event: &EventEnvelope) -> bool {
                     .payload
                     .get("media_type")
                     .and_then(serde_json::Value::as_str)
-                    == Some("application/vnd.euler.causal-dag.v1+json")
+                    == Some("application/vnd.euler.causal-dag.v2+json")
         }
         EventKind::AGENT_SPAWN | EventKind::AGENT_RESULT | EventKind::PERMISSION_DECISION => {
             event
@@ -9713,14 +9736,14 @@ fn causal_dag_graph_artifact_events(events: &[EventEnvelope]) -> Vec<&EventEnvel
                     .payload
                     .get("media_type")
                     .and_then(serde_json::Value::as_str)
-                    == Some("application/vnd.euler.causal-dag.v1+json")
+                    == Some("application/vnd.euler.causal-dag.v2+json")
                 && event
                     .payload
                     .get("metadata")
                     .and_then(serde_json::Value::as_object)
                     .and_then(|metadata| metadata.get("schema"))
                     .and_then(serde_json::Value::as_str)
-                    == Some("euler.causal_dag.v1")
+                    == Some("euler.causal_dag.v2")
         })
         .collect()
 }

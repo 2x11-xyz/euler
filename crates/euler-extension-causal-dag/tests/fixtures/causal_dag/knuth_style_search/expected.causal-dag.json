@@ -1,6 +1,6 @@
 {
-  "schema": "euler.causal_dag.v1",
-  "media_type": "application/vnd.euler.causal-dag.v1+json",
+  "schema": "euler.causal_dag.v2",
+  "media_type": "application/vnd.euler.causal-dag.v2+json",
   "generated_at": "2026-06-29T00:06:00.000Z",
   "session": {
     "id": "session-knuth",
@@ -15,6 +15,14 @@
     "watermark_event_id": "event-knuth-note-artifact",
     "basis": "bounded_provenance_query",
     "degraded": false
+  },
+  "construction": {
+    "operation": "snapshot",
+    "policy": "manual",
+    "trigger": "command",
+    "predecessor_artifact_event_id": null,
+    "predecessor_watermark_event_id": null,
+    "observer_result_event_id": null
   },
   "forest": {
     "roots": [

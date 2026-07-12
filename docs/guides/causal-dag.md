@@ -44,7 +44,7 @@ euler extension run causal-dag.<command> <session.jsonl|session-id|session-name>
 
 ### `export`
 
-Project a bounded provenance window to a `euler.causal_dag.v1` artifact.
+Project a bounded provenance window to an `euler.causal_dag.v2` artifact.
 
 ```sh
 euler extension run causal-dag.export ./session.jsonl --limit 128
@@ -79,8 +79,9 @@ accepted value is `128`.
 
 ### `observer-brief`
 
-Build a one-turn companion-agent task for observing a complete event window and
-returning raw `euler.causal_dag.hints.v1` JSON.
+Build a one-turn companion-agent task from the compact active graph plus the
+next bounded event window. The companion returns raw
+`euler.causal_dag.hints.v1` JSON.
 
 ```sh
 euler extension run causal-dag.observer-brief ./session.jsonl --limit 64 --max-tokens 24576
@@ -88,9 +89,14 @@ euler extension run causal-dag.observer-brief ./session.jsonl --limit 64 --max-t
 
 Flags: `--limit`, `--scan-limit`, `--after-event-id`, `--max-tokens`.
 
-The brief output carries an `apply` object (the observe window plus the
-session assertion) that the in-session round observer echoes untouched into
-`observer-apply`.
+The brief output carries an `apply` object (the observe window, active-graph
+predecessor, and session assertion) that the in-session round observer echoes
+untouched into `observer-apply`. The private feed cursor advances across pages
+that contain only extension-owned or otherwise unobservable events, so those
+pages cannot repeatedly fill the bounded window. If a bounded page ends in the
+middle of a prior observer companion run, the cursor remains before that span
+and the command asks for a larger limit instead of treating companion output
+as driver cognition.
 
 ### `observer-apply`
 
@@ -104,14 +110,19 @@ use. Core invokes it after the observer companion turn with the envelope
 
 It parses the companion output as raw `euler.causal_dag.hints.v1` JSON (a
 single surrounding markdown code fence is tolerated), folds the hints over
-the brief's bounded window (cut at the brief watermark), writes a graph
-artifact, and publishes the `graph` context slot. A failed companion or
-non-hints output is a command error; the driver turn continues fail-open.
+the brief's bounded window (cut at the brief watermark), writes a complete
+graph artifact, advances the active pointer, and publishes the `graph` context
+slot. The first observation creates a replacement graph; subsequent rolling
+observations are incremental, so omitted prior nodes and edges remain in the
+new artifact. Stale predecessor or cursor assertions are rejected. A failed
+companion or non-hints output is a command error; the driver turn continues
+fail-open.
 
 ### `observe`
 
-Fold an observer-produced hints JSON file over a bounded provenance page and
-write a graph artifact.
+Fold an operator-provided hints JSON file over a bounded provenance page and
+write a replacement graph artifact. This is an explicit manual reframe: it may
+change roots and parentage, while the prior artifact remains immutable.
 
 ```sh
 euler extension run causal-dag.observe ./session.jsonl \
@@ -123,6 +134,43 @@ Flags: `--hints` (required JSON object file, max 64 KiB), `--limit`,
 `--scan-limit`, `--after-event-id`, `--watermark-event-id`.
 
 The hints file is the raw `causal_dag` object, not `{ "causal_dag": ... }`.
+
+### `refresh`
+
+Run a one-turn observer against the active graph and unobserved provenance,
+then create an incremental, reframe, or final graph revision.
+
+```text
+/causal-dag.refresh {"operation":"incremental"}
+/causal-dag.refresh {"operation":"reframe","policy":"rolling_and_final"}
+/causal-dag.refresh {"operation":"final","policy":"final_only"}
+```
+
+Arguments: `operation` (`incremental`, `reframe`, or `final`), `policy`
+(`manual`, `rolling_only`, `rolling_and_final`, or `final_only`), `limit`,
+`scan_limit`, paired `provider` and `model`, and `max_tokens`.
+
+`incremental` upserts returned records and preserves omitted records. Every
+returned incremental record must cite at least one newly observed event; prior
+evidence is retained and semantically duplicate source refs are coalesced.
+`reframe` and `final` replace the active interpretation, so they may introduce
+new roots, change parentage, or omit superseded structure. Replacement is
+rejected while the bounded feed reports an unobserved backlog; run incremental
+refreshes until caught up first. Every revision writes a new immutable
+artifact and links to its predecessor. The active pointer selects the latest
+revision without overwriting history.
+
+When no active graph exists, an incremental refresh may bootstrap the first
+complete graph prefix even when more provenance remains. Refresh output keeps
+artifact completeness and feed progress separate: `truncated` describes the
+exact observed graph window, while `feed.truncated` and
+`feed.next_after_event_id` report whether another incremental refresh is
+needed.
+
+`refresh` requires a live session because it uses the generic `agent-spawn`
+host capability. Offline `euler extension run` hosts can execute deterministic
+projection commands, but they cannot run the semantic observer. Invoke
+`causal-dag.refresh` from a TUI slash command or a resumed live session.
 
 ### `record-observation`
 
@@ -233,8 +281,8 @@ euler exec --extensions causal-dag --observe causal-dag --observe-cadence 8 \
 At every `--observe-cadence` completed driver rounds (default 8), core runs
 `observer-brief`, spawns a one-turn zero-capability observer companion with
 the brief's task and system prompt, and hands the companion's raw hints
-output to `observer-apply`, which writes the graph artifact and publishes
-the `graph` context slot into the driver's own context. The chain is
+output to `observer-apply`, which appends a rolling graph revision and
+publishes the `graph` context slot into the driver's own context. The chain is
 fail-open: any brief/companion/apply failure is recorded to diagnostics
 (`round_observer_end`) and never fails the driver turn.
 
@@ -247,7 +295,7 @@ euler exec --provenance ./session.jsonl --extensions causal-dag \
   "Read BRIEF.md and carry it out."
 ```
 
-Then export or catch up:
+Then export or catch up deterministically:
 
 ```sh
 euler extension enable causal-dag
@@ -256,7 +304,11 @@ euler extension run causal-dag.catch-up ./session.jsonl --limit 128 --max-ticks 
 ```
 
 `export` is stateless. `catch-up` is checkpointed and suitable for repeated
-incremental projection.
+incremental projection. These commands summarize provenance structurally;
+they do not ask a model to reinterpret the completed problem-solving process.
+For a semantic retrospective graph, resume the session and run a `final`
+refresh. That final graph is another immutable revision, not a rewrite of the
+rolling history.
 
 ### Agent-in-the-loop hints
 
@@ -285,8 +337,8 @@ promising paths.
 
 ## Output artifact
 
-Graph artifacts use schema `euler.causal_dag.v1` and media type
-`application/vnd.euler.causal-dag.v1+json`.
+Graph artifacts use schema `euler.causal_dag.v2` and media type
+`application/vnd.euler.causal-dag.v2+json`.
 
 Top-level artifact shape:
 
@@ -295,6 +347,12 @@ Top-level artifact shape:
 - `generated_at`
 - `session.id`
 - `session.event_range.start/end/complete`
+- `construction.operation`
+- `construction.policy`
+- `construction.trigger`
+- `construction.predecessor_artifact_event_id`
+- `construction.predecessor_watermark_event_id`
+- `construction.observer_result_event_id`
 - `projection.extension_id`
 - `projection.watermark_event_id`
 - `projection.basis`
@@ -321,3 +379,19 @@ extensions/causal-dag/artifacts/<sha256>
 The CLI prints JSON with `relative_path`, `persisted_event_id`, `sha256`, and
 counts. The same artifact write appends an `extension.artifact` event to the
 session log.
+
+The artifact's projection watermark is semantic: it identifies the newest
+source event represented by the graph. The extension also keeps a private
+observed-through cursor so extension artifacts, context-slot updates,
+permission records, and other filtered events are not scanned forever. That
+cursor is operational state, not graph evidence, and is intentionally absent
+from the portable artifact.
+
+The JSON artifact is the high-fidelity scientific record: complete nodes and
+edges, evidence references, confidence and basis, diagnostics, construction
+method, and immutable lineage. HTML, SVG, DOT, Markdown, and summary exports
+are views over that artifact. They may omit or progressively reveal detail for
+human legibility, but must not invent graph semantics or become the source of
+truth. The interactive 2D/3D renderer belongs to the visualization/export
+consumer; this extension contract supplies the versioned graph and lineage it
+renders.

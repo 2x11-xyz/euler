@@ -1,10 +1,12 @@
 use super::{input_error, is_causal_dag_self_event, OBSERVER_BRIEF_SCHEMA_NAME};
+use crate::active_state::ActiveGraphState;
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{
     ArgSpec, Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError,
     HostApi, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 
 pub(crate) const OBSERVER_BRIEF_COMMAND_NAME: &str = "observer-brief";
 
@@ -14,11 +16,11 @@ const DEFAULT_LIMIT: usize = 64;
 // before the hints JSON; 8192 total failed a completed round at
 // 2664 in + 6726 out, so the default leaves
 // headroom for both.
-const DEFAULT_MAX_TOKENS: u64 = 24_576;
-const MAX_TASK_BYTES: usize = 8 * 1024;
+pub(super) const DEFAULT_MAX_TOKENS: u64 = 24_576;
+const MAX_TASK_BYTES: usize = 24 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 8 * 1024;
 const EXTRACT_CHARS: usize = 240;
-const OBSERVER_PERSONA: &str = "causal-dag-observer";
+pub(super) const OBSERVER_PERSONA: &str = "causal-dag-observer";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CausalDagObserverBriefCommand;
@@ -30,7 +32,11 @@ impl ExtensionCommand for CausalDagObserverBriefCommand {
             display_name: "Build observer brief".to_owned(),
             summary: "Build a bounded companion AgentTask for observing a provenance window."
                 .to_owned(),
-            required_capabilities: vec![Capability::ProvenanceRead],
+            required_capabilities: vec![
+                Capability::ProvenanceRead,
+                Capability::FsRead,
+                Capability::FsWrite,
+            ],
             args: brief_args(),
             accepts_session_id: true,
         }
@@ -42,12 +48,31 @@ impl ExtensionCommand for CausalDagObserverBriefCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let input = ObserverBriefInput::parse(&context.input)?;
-        let page = host.query_provenance(input.query())?;
-        if page.truncated {
+        let active = ActiveGraphState::load(host)?;
+        let mut query = input.query();
+        if query.after_event_id.is_none() {
+            query.after_event_id = active
+                .as_ref()
+                .map(ActiveGraphState::cursor_event_id)
+                .map(str::to_owned);
+        }
+        if active.as_ref().is_some_and(|active| {
+            input
+                .after_event_id
+                .as_deref()
+                .is_some_and(|after| after != active.cursor_event_id())
+        }) {
             return Err(input_error(
-                "causal-dag observer-brief requires a complete bounded event page",
+                "causal-dag observer-brief cursor does not match the active graph cursor",
             ));
         }
+        let after_event_id = query.after_event_id.clone();
+        let page = host.query_provenance(query)?;
+        let fence = observer_page_fence(
+            &page.events,
+            page.watermark_event_id.as_deref(),
+            after_event_id.as_deref(),
+        )?;
         let listed = listed_events(&page.events)?;
         // session_id is a validation input (family semantics: the host reads
         // exactly one session log; this asserts the caller's expectation),
@@ -63,16 +88,38 @@ impl ExtensionCommand for CausalDagObserverBriefCommand {
                 )));
             }
         }
-        let task = build_task(&listed)?;
+        if listed.is_empty() {
+            if let (Some(active), Some(cursor)) =
+                (active.as_ref(), fence.watermark_event_id.as_deref())
+            {
+                if cursor != active.cursor_event_id() {
+                    active.advance_cursor(host, cursor)?;
+                }
+            }
+            if fence.stalled_on_incomplete_observer {
+                return Err(input_error(
+                    "causal-dag observer page ends inside a prior observer run; increase limit",
+                ));
+            }
+            return Err(input_error(
+                "causal-dag observer-brief found no observable events",
+            ));
+        }
+        let task = build_task(&listed, active.as_ref(), ObserverBriefMode::Incremental)?;
         let system_prompt = observer_system_prompt()?;
-        let watermark_event_id = listed
-            .last()
-            .map(|event| event.id.clone())
-            .or(page.watermark_event_id.clone())
+        let watermark_event_id = fence
+            .watermark_event_id
+            .or_else(|| {
+                active
+                    .as_ref()
+                    .map(ActiveGraphState::cursor_event_id)
+                    .map(str::to_owned)
+            })
             .or(input.after_event_id.clone())
             .ok_or_else(|| input_error("causal-dag observer-brief has no watermark event"))?;
         Ok(output_value(
             &input,
+            active.as_ref(),
             task,
             system_prompt,
             watermark_event_id,
@@ -165,6 +212,7 @@ fn brief_args() -> Vec<ArgSpec> {
 
 fn output_value(
     input: &ObserverBriefInput,
+    active: Option<&ActiveGraphState>,
     task: String,
     system_prompt: String,
     watermark_event_id: String,
@@ -177,8 +225,12 @@ fn output_value(
         // the brief's query (replay fidelity).
         observe_window.insert("scan_limit".to_owned(), scan_limit.into());
     }
-    if let Some(after_event_id) = &input.after_event_id {
-        observe_window.insert("after_event_id".to_owned(), after_event_id.clone().into());
+    let effective_after_event_id = input
+        .after_event_id
+        .as_deref()
+        .or_else(|| active.map(ActiveGraphState::cursor_event_id));
+    if let Some(after_event_id) = effective_after_event_id {
+        observe_window.insert("after_event_id".to_owned(), after_event_id.into());
     }
     observe_window.insert(
         "watermark_event_id".to_owned(),
@@ -191,6 +243,12 @@ fn output_value(
     // listed — replay fidelity between what the observer saw and what the
     // projection covers.
     let mut apply = observe_window.clone();
+    apply.insert(
+        "expected_predecessor_artifact_event_id".to_owned(),
+        active
+            .map(ActiveGraphState::artifact_event_id)
+            .map_or(Value::Null, Value::from),
+    );
     if let Some(session_id) = &input.session_id {
         apply.insert("session_id".to_owned(), session_id.clone().into());
     }
@@ -212,10 +270,7 @@ fn output_value(
     output.insert("watermark_event_id".to_owned(), watermark_event_id.into());
     output.insert(
         "after_event_id_echo".to_owned(),
-        input
-            .after_event_id
-            .clone()
-            .map_or(Value::Null, Value::from),
+        effective_after_event_id.map_or(Value::Null, Value::from),
     );
     output.insert("listed_event_count".to_owned(), listed_event_count.into());
     if let Some(session_id) = &input.session_id {
@@ -224,13 +279,83 @@ fn output_value(
     Value::Object(output)
 }
 
-fn listed_events(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, ExtensionError> {
+pub(super) fn listed_events(
+    events: &[EventEnvelope],
+) -> Result<Vec<EventEnvelope>, ExtensionError> {
+    let observer_agents = causal_dag_observer_agents(events)?;
     events.iter().try_fold(Vec::new(), |mut listed, event| {
-        if observer_filter(event)? == ObserverFilter::Include {
+        if !observer_agents.contains(event.agent.as_str())
+            && observer_filter(event)? == ObserverFilter::Include
+        {
             listed.push(event.clone());
         }
         Ok(listed)
     })
+}
+
+pub(super) struct ObserverPageFence {
+    pub(super) watermark_event_id: Option<String>,
+    pub(super) stalled_on_incomplete_observer: bool,
+}
+
+pub(super) fn observer_page_fence(
+    events: &[EventEnvelope],
+    page_watermark_event_id: Option<&str>,
+    after_event_id: Option<&str>,
+) -> Result<ObserverPageFence, ExtensionError> {
+    for (index, child_agent_id) in causal_dag_observer_spawns(events)? {
+        let completed = events[index + 1..].iter().any(|event| {
+            event.kind.as_str() == EventKind::AGENT_RESULT
+                && event.payload.get("child_agent_id").and_then(Value::as_str)
+                    == Some(child_agent_id)
+        });
+        if !completed {
+            return Ok(ObserverPageFence {
+                watermark_event_id: index
+                    .checked_sub(1)
+                    .map(|safe_index| events[safe_index].id.clone())
+                    .or_else(|| after_event_id.map(str::to_owned)),
+                stalled_on_incomplete_observer: index == 0,
+            });
+        }
+    }
+    Ok(ObserverPageFence {
+        watermark_event_id: page_watermark_event_id
+            .map(str::to_owned)
+            .or_else(|| after_event_id.map(str::to_owned)),
+        stalled_on_incomplete_observer: false,
+    })
+}
+
+fn causal_dag_observer_agents(events: &[EventEnvelope]) -> Result<BTreeSet<&str>, ExtensionError> {
+    Ok(causal_dag_observer_spawns(events)?
+        .into_iter()
+        .map(|(_, child_agent_id)| child_agent_id)
+        .collect())
+}
+
+fn causal_dag_observer_spawns(
+    events: &[EventEnvelope],
+) -> Result<Vec<(usize, &str)>, ExtensionError> {
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind.as_str() == EventKind::AGENT_SPAWN
+                && event.payload.get("persona").and_then(Value::as_str) == Some(OBSERVER_PERSONA)
+        })
+        .map(|(index, event)| {
+            let child_agent_id = event
+                .payload
+                .get("child_agent_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .ok_or_else(|| {
+                    input_error("causal-dag observer spawn has an invalid child_agent_id")
+                })?;
+            Ok((index, child_agent_id))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,19 +396,110 @@ fn observer_filter(event: &EventEnvelope) -> Result<ObserverFilter, ExtensionErr
     })
 }
 
-fn build_task(events: &[EventEnvelope]) -> Result<String, ExtensionError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ObserverBriefMode {
+    Incremental,
+    Replacement,
+}
+
+pub(super) fn build_task(
+    events: &[EventEnvelope],
+    active: Option<&ActiveGraphState>,
+    mode: ObserverBriefMode,
+) -> Result<String, ExtensionError> {
     let mut lines =
-        vec!["Observe this complete Euler event window. Cite only listed event ids.".to_owned()];
+        vec!["Observe this bounded Euler event window and revise the committed graph.".to_owned()];
+    if let Some(active) = active {
+        lines.push(match mode {
+            ObserverBriefMode::Incremental =>
+                "MODE INCREMENTAL: CURRENT GRAPH records omitted from your response remain unchanged; return only added or revised nodes and edges. Reuse stable ids.",
+            ObserverBriefMode::Replacement =>
+                "MODE REPLACEMENT: return one complete replacement graph. You may change roots, parentage, clustering, and statuses, but preserve stable ids when identity remains honest.",
+        }.to_owned());
+        lines.push(format!(
+            "CURRENT GRAPH artifact={} watermark={} cursor={}",
+            active.artifact_event_id(),
+            active.watermark_event_id(),
+            active.cursor_event_id()
+        ));
+        lines.extend(compact_graph_lines(active.artifact())?);
+    } else {
+        lines.push("No graph exists yet; return the complete initial graph.".to_owned());
+    }
+    lines.push("NEW EVENTS (new claims cite these event ids):".to_owned());
     lines.extend(events.iter().map(event_line));
     let task = lines.join("\n");
     let actual = task.len();
     if actual > MAX_TASK_BYTES {
         return Err(input_error(format!(
-            "observer-brief task listing is {actual} bytes for {} listed events; reduce limit",
+            "observer-brief task listing is {actual} bytes for {} listed events; reduce limit or replace the active graph with a smaller manual reframe",
             events.len()
         )));
     }
     Ok(task)
+}
+
+fn compact_graph_lines(artifact: &Value) -> Result<Vec<String>, ExtensionError> {
+    let nodes = artifact
+        .pointer("/forest/nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| input_error("active causal-dag graph has invalid nodes"))?;
+    let edges = artifact
+        .pointer("/forest/edges")
+        .and_then(Value::as_array)
+        .ok_or_else(|| input_error("active causal-dag graph has invalid edges"))?;
+    let mut lines = Vec::with_capacity(nodes.len() + edges.len());
+    for node in nodes {
+        let id = graph_string(node, "id")?;
+        let root_id = graph_string(node, "root_id")?;
+        let kind = graph_string(node, "kind")?;
+        let status = graph_string(node, "status")?;
+        let title = graph_string(node, "title")?;
+        let sources = graph_source_ids(node)?;
+        lines.push(format!(
+            "N {id} root={root_id} kind={kind} status={status} sources={} title={}",
+            sources.join(","),
+            truncate_chars(title, 96)
+        ));
+    }
+    for edge in edges {
+        let sources = graph_source_ids(edge)?;
+        lines.push(format!(
+            "E {} {}->{} class={} kind={} backbone={} sources={}",
+            graph_string(edge, "id")?,
+            graph_string(edge, "from")?,
+            graph_string(edge, "to")?,
+            graph_string(edge, "class")?,
+            graph_string(edge, "kind")?,
+            edge.get("canonical_backbone")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| input_error("active causal-dag edge has invalid backbone flag"))?,
+            sources.join(",")
+        ));
+    }
+    Ok(lines)
+}
+
+fn graph_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, ExtensionError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| input_error(format!("active causal-dag record has invalid `{key}`")))
+}
+
+fn graph_source_ids(value: &Value) -> Result<Vec<&str>, ExtensionError> {
+    value
+        .get("source_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| input_error("active causal-dag record has invalid source_refs"))?
+        .iter()
+        .map(|source_ref| {
+            source_ref
+                .get("event_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| input_error("active causal-dag source ref has invalid event_id"))
+        })
+        .collect()
 }
 
 fn event_line(event: &EventEnvelope) -> String {
@@ -390,13 +606,20 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn observer_system_prompt() -> Result<String, ExtensionError> {
+pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
     let prompt = [
         "You are a generic Causal DAG observer for Euler.",
         "Return exactly one raw JSON object. Do not use markdown fences.",
         "Use schema euler.causal_dag.hints.v1 and this shape:",
         "{\"schema\":\"euler.causal_dag.hints.v1\",\"nodes\":[],\"edges\":[]}",
-        "The graph must be based only on the current Euler events listed in the task.",
+        "The task may include a committed CURRENT GRAPH followed by NEW EVENTS.",
+        "The task declares MODE INCREMENTAL or MODE REPLACEMENT when CURRENT GRAPH is present.",
+        "In INCREMENTAL mode, return only added or revised records; omitted records remain unchanged.",
+        "In REPLACEMENT mode, return the complete replacement graph; omitted records are removed from the new interpretation but remain in prior artifacts.",
+        "When no CURRENT GRAPH is present, return the complete initial graph.",
+        "Preserve stable node and edge ids unless the interpreted entity genuinely changed identity.",
+        "Revised records cite the NEW EVENTS that justify the revision; unchanged prior evidence is retained by the host.",
+        "A prior event id may be reused only when it is named in the CURRENT GRAPH record being revised.",
         "Do not use old archive knowledge, fixture oracle labels, or target edge lists.",
         "Omit unsupported claims rather than inventing structure.",
         "Node keys are exactly: id, root_id, kind, status, title, summary, source_refs, confidence, basis, metadata.",
@@ -418,7 +641,7 @@ fn observer_system_prompt() -> Result<String, ExtensionError> {
         "Use pivot annotation when a failed branch inspires a sibling but is not the sibling's parent.",
         "Use repair only when a later event explicitly reuses concrete failure material from a terminal branch.",
         "Use artifact_use only for source-session artifacts or outputs, not Causal DAG graph artifacts.",
-        "Every node and edge must have at least one source_ref that cites an event id from the list.",
+        "Every returned node and edge must have at least one source_ref citing a NEW EVENT or a source named on its CURRENT GRAPH record.",
         "JSON pointers are against the whole event object, usually /payload/content or /payload/output.",
         "Stable ids should be short lowercase ids prefixed with node- or edge-.",
     ]

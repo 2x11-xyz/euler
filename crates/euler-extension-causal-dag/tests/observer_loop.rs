@@ -22,6 +22,7 @@ use euler_provider::{
     ModelInputItem, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ProviderStream,
     StopReason, ToolCall,
 };
+use euler_sdk::Capability;
 use serde_json::{json, Value};
 use std::fs;
 use std::num::NonZeroU64;
@@ -34,9 +35,18 @@ use tracing_subscriber::{Layer, Registry};
 
 const EXTENSION_ID: &str = "causal-dag";
 const SESSION_ID: &str = "session-observer-loop";
-const OBSERVER_TASK_MARKER: &str = "Observe this complete Euler event window";
+const OBSERVER_TASK_MARKER: &str = "Observe this bounded Euler event window";
+const NEW_EVENTS_MARKER: &str = "NEW EVENTS (new claims cite these event ids):";
 const DEAD_END_TITLE: &str = "Raise the timeout";
 const DEAD_END_REASON: &str = "Raising the timeout did not fix the flaky failure.";
+const REFRESH_CAPABILITIES: [Capability; 6] = [
+    Capability::ProvenanceRead,
+    Capability::ArtifactWrite,
+    Capability::FsRead,
+    Capability::FsWrite,
+    Capability::AgentSpawn,
+    Capability::ContextSlot,
+];
 
 /// Serves scripted driver rounds and answers the round-observer companion
 /// turn by synthesizing hints from the brief's own event listing.
@@ -136,15 +146,28 @@ fn stream(events: Vec<ModelStreamEvent>) -> ProviderStream {
 }
 
 /// Build valid semantic hints exactly the way a live observer would: cite
-/// only event ids from the task listing (lines after the instruction line,
-/// first token of each line).
+/// only event ids from the task's NEW EVENTS listing.
 fn hints_from_listing(task: &str) -> String {
-    let listed_ids = task
+    let mut listed_ids = task
         .lines()
+        .skip_while(|line| *line != NEW_EVENTS_MARKER)
         .skip(1)
         .filter_map(|line| line.split_whitespace().next())
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    for line in task.lines().filter(|line| line.starts_with("N ")) {
+        let Some(sources) = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("sources="))
+        else {
+            continue;
+        };
+        for source in sources.split(',').filter(|source| !source.is_empty()) {
+            if !listed_ids.iter().any(|listed| listed == source) {
+                listed_ids.push(source.to_owned());
+            }
+        }
+    }
     assert!(
         listed_ids.len() >= 2,
         "observer brief should list the driver's events, got: {task}"
@@ -300,7 +323,13 @@ fn observer_loop_produces_semantic_graph_slot_end_to_end() {
     let artifact: Value =
         serde_json::from_slice(&fs::read(temp.path().join(artifact_path)).expect("artifact"))
             .expect("artifact json");
-    assert_eq!(artifact["schema"], json!("euler.causal_dag.v1"));
+    assert_eq!(artifact["schema"], json!("euler.causal_dag.v2"));
+    assert_eq!(artifact["construction"]["operation"], json!("reframe"));
+    assert_eq!(artifact["construction"]["trigger"], json!("round_cadence"));
+    assert_eq!(
+        artifact["construction"]["observer_result_event_id"],
+        json!(result.id)
+    );
     assert_eq!(artifact["projection"]["degraded"], json!(false));
     let nodes = artifact["forest"]["nodes"].as_array().expect("nodes");
     assert!(
@@ -333,6 +362,97 @@ fn observer_loop_produces_semantic_graph_slot_end_to_end() {
         "canvas prompt must carry the graph slot"
     );
     assert!(prompt.contains("DEAD ENDS:"));
+}
+
+#[test]
+fn live_refresh_reframes_with_immutable_lineage_and_separate_feed_cursor() {
+    let (temp, mut session, _saw_prompt) =
+        observer_loop_session(ObserverBehavior::HintsFromListing);
+    session.run_turn("fix the flaky test").expect("turn");
+
+    let initial_event = single_event(session.events(), EventKind::EXTENSION_ARTIFACT);
+    let initial_path = initial_event.payload["path"]
+        .as_str()
+        .expect("initial path");
+    let initial_bytes = fs::read(temp.path().join(initial_path)).expect("initial artifact");
+
+    let first_refresh = session
+        .execute_extension_command(
+            &CausalDagExtension,
+            "refresh",
+            json!({"operation": "reframe", "policy": "rolling_and_final"}),
+            REFRESH_CAPABILITIES,
+        )
+        .expect("first live reframe");
+    assert_eq!(first_refresh["construction"]["operation"], "reframe");
+    assert_eq!(first_refresh["construction"]["policy"], "rolling_and_final");
+
+    let after_first = causal_dag_artifacts(session.events());
+    assert_eq!(after_first.len(), 2);
+    let first_reframe_event = &after_first[1];
+    let first_reframe = read_artifact(&temp, first_reframe_event);
+    assert_eq!(
+        first_reframe["construction"]["predecessor_artifact_event_id"],
+        initial_event.id
+    );
+    assert_eq!(
+        first_reframe["construction"]["observer_result_event_id"],
+        first_refresh["observer"]["result_event_id"]
+    );
+
+    // A second explicit reframe sees only the prior refresh's bookkeeping.
+    // It may reinterpret the graph, but those hidden records must advance only
+    // the private feed cursor, not the semantic evidence watermark.
+    let semantic_watermark = first_reframe["projection"]["watermark_event_id"].clone();
+    let first_reframe_bytes = artifact_bytes(&temp, first_reframe_event);
+    let first_cursor = first_refresh["active_cursor_event_id"]
+        .as_str()
+        .expect("first refresh cursor");
+    let cursor_index = session
+        .events()
+        .iter()
+        .position(|event| event.id == first_cursor)
+        .expect("cursor event");
+    let trailing_kinds = session.events()[cursor_index + 1..]
+        .iter()
+        .map(|event| event.kind.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let second_refresh = session
+        .execute_extension_command(
+            &CausalDagExtension,
+            "refresh",
+            json!({"operation": "reframe"}),
+            REFRESH_CAPABILITIES,
+        )
+        .expect("second live reframe");
+    assert_eq!(
+        second_refresh["source_event_count"], 0,
+        "events after first refresh cursor: {trailing_kinds:?}"
+    );
+    assert_ne!(
+        second_refresh["active_cursor_event_id"],
+        second_refresh["watermark_event_id"]
+    );
+
+    let after_second = causal_dag_artifacts(session.events());
+    assert_eq!(after_second.len(), 3);
+    let second_reframe = read_artifact(&temp, &after_second[2]);
+    assert_eq!(
+        second_reframe["construction"]["predecessor_artifact_event_id"],
+        first_reframe_event.id
+    );
+    assert_eq!(
+        second_reframe["projection"]["watermark_event_id"],
+        semantic_watermark
+    );
+    assert_eq!(
+        fs::read(temp.path().join(initial_path)).expect("initial artifact after reframes"),
+        initial_bytes
+    );
+    assert_eq!(
+        artifact_bytes(&temp, first_reframe_event),
+        first_reframe_bytes
+    );
 }
 
 #[test]
@@ -373,6 +493,26 @@ fn count_kind(events: &[EventEnvelope], kind: &'static str) -> usize {
         .iter()
         .filter(|event| event.kind.as_str() == kind)
         .count()
+}
+
+fn causal_dag_artifacts(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::EXTENSION_ARTIFACT
+                && event.payload["extension_id"] == EXTENSION_ID
+        })
+        .cloned()
+        .collect()
+}
+
+fn artifact_bytes(temp: &tempfile::TempDir, event: &EventEnvelope) -> Vec<u8> {
+    let path = event.payload["path"].as_str().expect("artifact path");
+    fs::read(temp.path().join(path)).expect("artifact bytes")
+}
+
+fn read_artifact(temp: &tempfile::TempDir, event: &EventEnvelope) -> Value {
+    serde_json::from_slice(&artifact_bytes(temp, event)).expect("artifact json")
 }
 
 fn last_assistant_content(events: &[EventEnvelope]) -> String {

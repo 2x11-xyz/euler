@@ -529,6 +529,52 @@ fn extension_parse_accepts_causal_dag_catch_up_default_tick_budget() {
 }
 
 #[test]
+fn extension_parse_accepts_causal_dag_refresh_run() {
+    let args = parse_args(&[
+        "extension",
+        "run",
+        "causal-dag.refresh",
+        "research-session",
+        "--operation",
+        "reframe",
+        "--policy",
+        "rolling_only",
+        "--limit",
+        "32",
+        "--scan-limit",
+        "128",
+        "--provider",
+        "fixture",
+        "--model",
+        "echo",
+        "--max-tokens",
+        "8192",
+    ]);
+
+    let Command::Extension(extension) = args.command else {
+        panic!("expected extension command");
+    };
+    let ExtensionAction::Run(run) = extension.action else {
+        panic!("expected extension run");
+    };
+    assert_eq!(run.id, "causal-dag");
+    assert_eq!(run.command, "refresh");
+    assert_eq!(run.target, PathBuf::from("research-session"));
+    assert_eq!(
+        run.input,
+        json!({
+            "operation": "reframe",
+            "policy": "rolling_only",
+            "limit": 32,
+            "scan_limit": 128,
+            "provider": "fixture",
+            "model": "echo",
+            "max_tokens": 8192
+        })
+    );
+}
+
+#[test]
 fn extension_parse_accepts_causal_dag_observe_run() {
     let temp = tempfile::NamedTempFile::new().expect("hint file");
     std::fs::write(temp.path(), b"{}").expect("hint json");
@@ -615,6 +661,7 @@ fn causal_dag_catalog_lists_observe_command() {
             "update",
             "catch-up",
             "observe",
+            "refresh",
             "observer-brief",
             "observer-apply",
             "record-observation"
@@ -1145,7 +1192,7 @@ impl ModelProvider for DynamicObserverProvider {
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         let prompt = request.prompt_text();
-        let content = if prompt.contains("Observe this complete Euler event window") {
+        let content = if prompt.contains("Observe this bounded Euler event window") {
             dynamic_observer_hints(&prompt)
         } else {
             "initial assistant".to_owned()

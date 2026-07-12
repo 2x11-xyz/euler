@@ -1,10 +1,12 @@
 use super::*;
+use crate::active_state::ActiveGraphState;
+use crate::construction::Construction;
 use euler_core::extensions::{ExtensionHost, ExtensionHostError};
 use euler_core::{read_provenance, ProvenanceWriter};
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_sdk::{
-    ArtifactRecord, EventFeedCheckpoint, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
-    ProvenancePage,
+    AgentOutcome, ArtifactRecord, EventFeedCheckpoint, HostAgentRecord, HostAgentResult,
+    HostAgentTask, HostApi, ProvenancePage, SpawnAgentTask,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
@@ -12,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const SDK_DEFAULT_SCAN_LIMIT: usize = 1024;
+const TEST_ARTIFACT_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[test]
 fn manifest_and_command_registration_are_stable() {
@@ -33,6 +36,7 @@ fn manifest_and_command_registration_are_stable() {
             Capability::FsRead,
             Capability::FsWrite,
             Capability::AgentRecord,
+            Capability::AgentSpawn,
             Capability::ContextSlot
         ]
     );
@@ -43,6 +47,7 @@ fn manifest_and_command_registration_are_stable() {
             UPDATE_COMMAND_NAME,
             CATCH_UP_COMMAND_NAME,
             OBSERVE_COMMAND_NAME,
+            REFRESH_COMMAND_NAME,
             OBSERVER_BRIEF_COMMAND_NAME,
             OBSERVER_APPLY_COMMAND_NAME,
             RECORD_OBSERVATION_COMMAND_NAME
@@ -81,6 +86,8 @@ fn command_required_capabilities_are_command_scoped() {
         vec![
             Capability::ProvenanceRead,
             Capability::ArtifactWrite,
+            Capability::FsRead,
+            Capability::FsWrite,
             Capability::ContextSlot
         ]
     );
@@ -88,7 +95,22 @@ fn command_required_capabilities_are_command_scoped() {
         CausalDagObserverBriefCommand
             .descriptor()
             .required_capabilities,
-        vec![Capability::ProvenanceRead]
+        vec![
+            Capability::ProvenanceRead,
+            Capability::FsRead,
+            Capability::FsWrite
+        ]
+    );
+    assert_eq!(
+        CausalDagRefreshCommand.descriptor().required_capabilities,
+        vec![
+            Capability::ProvenanceRead,
+            Capability::ArtifactWrite,
+            Capability::FsRead,
+            Capability::FsWrite,
+            Capability::AgentSpawn,
+            Capability::ContextSlot
+        ]
     );
     assert_eq!(
         CausalDagRecordObservationCommand
@@ -198,6 +220,618 @@ fn observer_apply_folds_companion_hints_and_echoes_attribution() {
 }
 
 #[test]
+fn rolling_observer_ticks_preserve_omitted_records_and_advance_lineage() {
+    let first_event = fixture_event(
+        "session-1",
+        "event-1",
+        EventKind::USER_MESSAGE,
+        "first objective",
+    );
+    let second_event = fixture_event(
+        "session-1",
+        "event-2",
+        EventKind::USER_MESSAGE,
+        "new attempt",
+    );
+    let host = RecordingHost::new_pages(vec![
+        recording_page(vec![first_event], DEFAULT_LIMIT, None, false),
+        recording_page(vec![second_event], DEFAULT_LIMIT, None, false),
+    ]);
+
+    let first = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(
+                    json!({
+                        "limit": DEFAULT_LIMIT,
+                        "watermark_event_id": "event-1",
+                        "session_id": "session-1",
+                        "expected_predecessor_artifact_event_id": null
+                    }),
+                    single_root_hints("event-1"),
+                    "evt-result-1",
+                ),
+            },
+            &host,
+        )
+        .expect("first rolling apply");
+    let brief = CausalDagObserverBriefCommand
+        .execute(
+            CommandContext {
+                input: json!({"limit": DEFAULT_LIMIT, "session_id": "session-1"}),
+            },
+            &host,
+        )
+        .expect("second observer brief");
+    let second = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(
+                    brief["apply"].clone(),
+                    child_revision_hints("event-2"),
+                    "evt-result-2",
+                ),
+            },
+            &host,
+        )
+        .expect("second rolling apply");
+
+    let queries = host.queries.lock().expect("queries");
+    assert_eq!(queries[1].after_event_id.as_deref(), Some("event-1"));
+    assert_eq!(queries[2].after_event_id.as_deref(), Some("event-1"));
+    assert_eq!(
+        brief["apply"]["expected_predecessor_artifact_event_id"],
+        json!("artifact-event")
+    );
+    let task = brief["task"].as_str().expect("brief task");
+    assert!(task.contains("MODE INCREMENTAL"));
+    assert!(task.contains("CURRENT GRAPH artifact=artifact-event watermark=event-1 cursor=event-1"));
+
+    let writes = host.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 2);
+    let first_bytes = writes[0].bytes.clone();
+    let first_artifact: Value = serde_json::from_slice(&first_bytes).expect("first artifact");
+    let second_artifact: Value = serde_json::from_slice(&writes[1].bytes).expect("second artifact");
+    assert_eq!(
+        first_artifact["forest"]["nodes"]
+            .as_array()
+            .expect("first nodes")
+            .len(),
+        1
+    );
+    assert_eq!(writes[0].bytes, first_bytes, "prior artifact bytes changed");
+    assert_eq!(
+        second_artifact["forest"]["nodes"]
+            .as_array()
+            .expect("second nodes")
+            .len(),
+        2
+    );
+    assert_eq!(second_artifact["construction"]["operation"], "incremental");
+    assert_eq!(
+        second_artifact["construction"]["predecessor_artifact_event_id"],
+        "artifact-event"
+    );
+    assert_eq!(
+        second_artifact["construction"]["predecessor_watermark_event_id"],
+        "event-1"
+    );
+    assert_eq!(
+        second_artifact["construction"]["observer_result_event_id"],
+        "evt-result-2"
+    );
+    assert_eq!(
+        writes[1].source_event_ids,
+        vec!["event-1", "event-2", "evt-result-2"]
+    );
+    assert_eq!(first["active_artifact_event_id"], "artifact-event");
+    assert_eq!(second["active_artifact_event_id"], "artifact-event-2");
+}
+
+#[test]
+fn rolling_apply_rejects_a_stale_predecessor_before_writing() {
+    let first_event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "first");
+    let second_event = fixture_event("session-1", "event-2", EventKind::USER_MESSAGE, "second");
+    let host = RecordingHost::new_pages(vec![
+        recording_page(vec![first_event], DEFAULT_LIMIT, None, false),
+        recording_page(vec![second_event], DEFAULT_LIMIT, None, false),
+    ]);
+    CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(
+                    json!({
+                        "watermark_event_id": "event-1",
+                        "session_id": "session-1",
+                        "expected_predecessor_artifact_event_id": null
+                    }),
+                    single_root_hints("event-1"),
+                    "evt-result-1",
+                ),
+            },
+            &host,
+        )
+        .expect("first apply");
+
+    let error = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(
+                    json!({
+                        "after_event_id": "event-1",
+                        "watermark_event_id": "event-2",
+                        "session_id": "session-1",
+                        "expected_predecessor_artifact_event_id": "artifact-stale"
+                    }),
+                    child_revision_hints("event-2"),
+                    "evt-result-2",
+                ),
+            },
+            &host,
+        )
+        .expect_err("stale apply rejected");
+
+    assert_eq!(
+        error,
+        ExtensionError::Message(
+            "causal-dag active graph changed between observer brief and apply".to_owned()
+        )
+    );
+    assert_eq!(host.writes.lock().expect("writes").len(), 1);
+}
+
+#[test]
+fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
+    let first_event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "first");
+    let second_event = fixture_event("session-1", "event-2", EventKind::USER_MESSAGE, "second");
+    let host = RecordingHost::new_pages(vec![
+        recording_page(vec![first_event], DEFAULT_LIMIT, None, false),
+        recording_page(vec![second_event], DEFAULT_LIMIT, None, false),
+    ]);
+    CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(
+                    json!({
+                        "watermark_event_id": "event-1",
+                        "session_id": "session-1",
+                        "expected_predecessor_artifact_event_id": null
+                    }),
+                    single_root_hints("event-1"),
+                    "evt-result-1",
+                ),
+            },
+            &host,
+        )
+        .expect("initial graph");
+
+    let apply = json!({
+        "after_event_id": "event-1",
+        "watermark_event_id": "event-2",
+        "session_id": "session-1",
+        "expected_predecessor_artifact_event_id": "artifact-event"
+    });
+    let error = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(
+                    apply.clone(),
+                    single_root_hints("event-1"),
+                    "evt-result-old-only",
+                ),
+            },
+            &host,
+        )
+        .expect_err("old evidence alone cannot justify an incremental revision");
+    assert_eq!(
+        error,
+        ExtensionError::Message(
+            "incremental causal-dag node `node-root` must cite at least one newly observed event"
+                .to_owned()
+        )
+    );
+    assert_eq!(host.writes.lock().expect("writes").len(), 1);
+
+    let mut revision = single_root_hints("event-1");
+    revision["nodes"][0]["summary"] = json!("The new event sharpens the existing root.");
+    revision["nodes"][0]["source_refs"][0]["id"] = json!("src-root-renamed");
+    revision["nodes"][0]["source_refs"]
+        .as_array_mut()
+        .expect("source refs")
+        .push(json!({
+            "id": "src-root-new",
+            "event_id": "event-2",
+            "payload_pointer": "/payload/content"
+        }));
+    CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(apply, revision, "evt-result-2"),
+            },
+            &host,
+        )
+        .expect("revision with new evidence");
+
+    let writes = host.writes.lock().expect("writes");
+    let artifact: Value = serde_json::from_slice(&writes[1].bytes).expect("artifact");
+    let source_refs = artifact["forest"]["nodes"][0]["source_refs"]
+        .as_array()
+        .expect("source refs");
+    assert_eq!(source_refs.len(), 2);
+    assert!(source_refs.iter().any(|source| source["id"] == "src-root"));
+    assert!(source_refs
+        .iter()
+        .any(|source| source["id"] == "src-root-new"));
+    assert!(source_refs
+        .iter()
+        .all(|source| source["id"] != "src-root-renamed"));
+}
+
+#[test]
+fn observer_brief_advances_private_cursor_across_self_only_pages() {
+    let source = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "first");
+    let self_artifact = causal_dag_graph_artifact_event("session-1", "self-artifact");
+    let next_source = fixture_event("session-1", "event-2", EventKind::USER_MESSAGE, "next");
+    let host = RecordingHost::new_pages(vec![
+        recording_page(vec![source], DEFAULT_LIMIT, None, false),
+        recording_page(vec![self_artifact], DEFAULT_LIMIT, None, false),
+        recording_page(vec![next_source], DEFAULT_LIMIT, None, false),
+    ]);
+    CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(
+                    json!({
+                        "watermark_event_id": "event-1",
+                        "session_id": "session-1",
+                        "expected_predecessor_artifact_event_id": null
+                    }),
+                    single_root_hints("event-1"),
+                    "evt-result-1",
+                ),
+            },
+            &host,
+        )
+        .expect("initial graph");
+
+    let error = CausalDagObserverBriefCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1"}),
+            },
+            &host,
+        )
+        .expect_err("self-only page needs no observer");
+    assert_eq!(
+        error,
+        ExtensionError::Message("causal-dag observer-brief found no observable events".to_owned())
+    );
+    let active = ActiveGraphState::load(&host)
+        .expect("active state")
+        .expect("active graph");
+    assert_eq!(active.watermark_event_id(), "event-1");
+    assert_eq!(active.cursor_event_id(), "self-artifact");
+
+    let brief = CausalDagObserverBriefCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1"}),
+            },
+            &host,
+        )
+        .expect("next source brief");
+    let queries = host.queries.lock().expect("queries");
+    assert_eq!(queries[1].after_event_id.as_deref(), Some("event-1"));
+    assert_eq!(queries[2].after_event_id.as_deref(), Some("self-artifact"));
+    assert_eq!(brief["apply"]["after_event_id"], "self-artifact");
+    assert_eq!(
+        brief["apply"]["expected_predecessor_artifact_event_id"],
+        "artifact-event"
+    );
+}
+
+#[test]
+fn reframe_without_new_evidence_is_fenced_before_observer_events() {
+    let source = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "objective");
+    let observer_spawn = fixture_event(
+        "session-1",
+        "evt-spawn-2",
+        EventKind::AGENT_SPAWN,
+        "observer spawn",
+    );
+    let observer_result = fixture_event(
+        "session-1",
+        "evt-result-2",
+        EventKind::AGENT_RESULT,
+        "observer result",
+    );
+    let host = RecordingHost::new_pages(vec![
+        recording_page(vec![source], DEFAULT_LIMIT, None, false),
+        recording_page(Vec::new(), DEFAULT_LIMIT, None, false),
+        recording_page(
+            vec![observer_spawn, observer_result],
+            DEFAULT_LIMIT,
+            None,
+            false,
+        ),
+    ])
+    .with_spawn_outcomes(vec![successful_agent_outcome(
+        single_root_hints("event-1"),
+        "2",
+    )]);
+    CausalDagObserveCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-1",
+                    "causal_dag": single_root_hints("event-1")
+                }),
+            },
+            &host,
+        )
+        .expect("initial graph");
+
+    let output = CausalDagRefreshCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1", "operation": "reframe"}),
+            },
+            &host,
+        )
+        .expect("reframe");
+    let writes = host.writes.lock().expect("writes");
+    let artifact: Value = serde_json::from_slice(&writes[1].bytes).expect("reframe artifact");
+
+    assert_eq!(output["source_event_count"], 0);
+    assert_eq!(output["scanned_events"], 0);
+    assert_eq!(artifact["projection"]["watermark_event_id"], "event-1");
+    assert_eq!(artifact["session"]["event_range"]["end"], "event-1");
+    assert_eq!(artifact["construction"]["operation"], "reframe");
+    assert_eq!(artifact["construction"]["policy"], "manual");
+    assert_eq!(
+        artifact["construction"]["predecessor_artifact_event_id"],
+        "artifact-event"
+    );
+    assert_eq!(writes[1].source_event_ids, vec!["event-1", "evt-result-2"]);
+    let tasks = host.spawn_tasks.lock().expect("spawn tasks");
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].task.contains("MODE REPLACEMENT"));
+    assert!(tasks[0].capabilities.is_empty());
+}
+
+#[test]
+fn reframe_can_replace_parentage_and_introduce_a_second_root() {
+    let events = vec![
+        fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "objective"),
+        fixture_event(
+            "session-1",
+            "event-2",
+            EventKind::USER_MESSAGE,
+            "second concern",
+        ),
+    ];
+    let host = RecordingHost::new_pages(vec![
+        recording_page(events, DEFAULT_LIMIT, None, false),
+        recording_page(Vec::new(), DEFAULT_LIMIT, None, false),
+        recording_page(
+            vec![
+                fixture_event(
+                    "session-1",
+                    "evt-spawn-2",
+                    EventKind::AGENT_SPAWN,
+                    "observer spawn",
+                ),
+                fixture_event(
+                    "session-1",
+                    "evt-result-2",
+                    EventKind::AGENT_RESULT,
+                    "observer result",
+                ),
+            ],
+            DEFAULT_LIMIT,
+            None,
+            false,
+        ),
+    ])
+    .with_spawn_outcomes(vec![successful_agent_outcome(
+        two_root_reframe_hints(),
+        "2",
+    )]);
+    CausalDagObserveCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-1",
+                    "causal_dag": root_with_child_hints()
+                }),
+            },
+            &host,
+        )
+        .expect("initial graph");
+
+    CausalDagRefreshCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1", "operation": "reframe"}),
+            },
+            &host,
+        )
+        .expect("replacement reframe");
+    let writes = host.writes.lock().expect("writes");
+    let first_bytes = writes[0].bytes.clone();
+    let first: Value = serde_json::from_slice(&first_bytes).expect("first artifact");
+    let second: Value = serde_json::from_slice(&writes[1].bytes).expect("second artifact");
+
+    assert_eq!(
+        first["forest"]["nodes"]
+            .as_array()
+            .expect("initial nodes")
+            .len(),
+        2
+    );
+    assert_eq!(writes[0].bytes, first_bytes);
+    assert_eq!(
+        second["forest"]["roots"],
+        json!(["node-root", "node-second-root"])
+    );
+    assert_eq!(
+        second["forest"]["nodes"]
+            .as_array()
+            .expect("replacement nodes")
+            .len(),
+        2
+    );
+    assert!(second["forest"]["nodes"]
+        .as_array()
+        .expect("replacement nodes")
+        .iter()
+        .all(|node| node["id"] != "node-child"));
+    assert!(second["forest"]["edges"]
+        .as_array()
+        .expect("replacement edges")
+        .is_empty());
+    assert_eq!(second["construction"]["operation"], "reframe");
+    assert_eq!(
+        second["construction"]["predecessor_artifact_event_id"],
+        "artifact-event"
+    );
+    let tasks = host.spawn_tasks.lock().expect("spawn tasks");
+    assert!(tasks[0].task.contains(
+        "E edge-child node-root->node-child class=structural kind=continuation backbone=true sources=event-2"
+    ));
+}
+
+#[test]
+fn final_refresh_records_session_end_construction() {
+    let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "objective");
+    let host = RecordingHost::new(recording_page(vec![event], DEFAULT_LIMIT, None, false))
+        .with_spawn_outcomes(vec![successful_agent_outcome(
+            single_root_hints("event-1"),
+            "final",
+        )]);
+
+    let output = CausalDagRefreshCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-1",
+                    "operation": "final",
+                    "policy": "final_only"
+                }),
+            },
+            &host,
+        )
+        .expect("final refresh");
+    let writes = host.writes.lock().expect("writes");
+    let artifact: Value = serde_json::from_slice(&writes[0].bytes).expect("final artifact");
+
+    assert_eq!(artifact["construction"]["operation"], "final");
+    assert_eq!(artifact["construction"]["trigger"], "session_end");
+    assert_eq!(artifact["construction"]["policy"], "final_only");
+    assert_eq!(
+        artifact["construction"]["observer_result_event_id"],
+        "evt-result-final"
+    );
+    assert_eq!(output["active_artifact_event_id"], "artifact-event");
+    assert_eq!(
+        writes[0].source_event_ids,
+        vec!["event-1", "evt-result-final"]
+    );
+}
+
+#[test]
+fn incremental_refresh_bootstraps_a_truncated_session() {
+    let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "objective");
+    let host = RecordingHost::new(recording_page(vec![event], 1, Some("event-1"), true))
+        .with_spawn_outcomes(vec![successful_agent_outcome(
+            single_root_hints("event-1"),
+            "bootstrap",
+        )]);
+
+    let output = CausalDagRefreshCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-1",
+                    "operation": "incremental",
+                    "limit": 1
+                }),
+            },
+            &host,
+        )
+        .expect("initial incremental refresh bootstraps a prefix");
+
+    assert_eq!(output["construction"]["operation"], "reframe");
+    assert_eq!(output["truncated"], false);
+    assert_eq!(output["feed"]["truncated"], true);
+    assert_eq!(output["feed"]["next_after_event_id"], "event-1");
+    assert_eq!(host.writes.lock().expect("writes").len(), 1);
+}
+
+#[test]
+fn active_pointer_failure_leaves_durable_artifact_unselected() {
+    let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "objective");
+    let host = RecordingHost::new(recording_page(vec![event], DEFAULT_LIMIT, None, false))
+        .with_state_failure_on_call(2);
+
+    let error = CausalDagObserveCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-1",
+                    "causal_dag": single_root_hints("event-1")
+                }),
+            },
+            &host,
+        )
+        .expect_err("active pointer write fails");
+
+    assert_eq!(
+        error,
+        ExtensionError::StateDirFailed("forced state failure".to_owned())
+    );
+    assert_eq!(host.writes.lock().expect("writes").len(), 1);
+    assert!(!host.state.path().join("active-graph.json").exists());
+    assert!(host.slots.lock().expect("slots").is_empty());
+}
+
+#[test]
+fn refresh_rejects_invalid_input_before_query_or_spawn() {
+    for (input, expected) in [
+        (json!({"operation": 1}), "operation must be a string"),
+        (json!({"policy": 1}), "policy must be a string"),
+        (json!({"limit": "many"}), "limit must be a positive integer"),
+        (
+            json!({"scan_limit": "many"}),
+            "scan_limit must be a positive integer",
+        ),
+        (
+            json!({"max_tokens": "many"}),
+            "max_tokens must be a positive integer",
+        ),
+        (
+            json!({"provider": "fixture"}),
+            "causal-dag refresh provider and model must be supplied together",
+        ),
+        (json!({"session_id": ""}), "session_id must not be empty"),
+        (
+            json!({"operation": "x".repeat(257)}),
+            "operation must be a bounded string",
+        ),
+    ] {
+        let host = RecordingHost::empty();
+        let error = CausalDagRefreshCommand
+            .execute(CommandContext { input }, &host)
+            .expect_err("invalid refresh input");
+
+        assert_eq!(error, ExtensionError::Message(expected.to_owned()));
+        assert!(host.queries.lock().expect("queries").is_empty());
+        assert!(host.spawn_tasks.lock().expect("spawn tasks").is_empty());
+        assert!(host.writes.lock().expect("writes").is_empty());
+    }
+}
+
+#[test]
 fn observer_apply_accepts_fenced_companion_output() {
     let (mut events, _) = load_knuth_fixture();
     let hints = extract_observer_hints(&mut events);
@@ -212,7 +846,11 @@ fn observer_apply_accepts_fenced_companion_output() {
             CommandContext {
                 input: json!({
                     "apply": {"session_id": "session-knuth"},
-                    "companion": {"ok": true, "output": fenced}
+                    "companion": {
+                        "ok": true,
+                        "output": fenced,
+                        "result_event_id": "evt-result"
+                    }
                 }),
             },
             &host,
@@ -350,6 +988,168 @@ fn observer_brief_filter_policy_matrix_includes_only_work_events() {
 }
 
 #[test]
+fn observer_brief_excludes_its_companion_cognition() {
+    let child_agent_id = "agent-causal-observer";
+    let mut spawn = fixture_event(
+        "session-1",
+        "observer-spawn",
+        EventKind::AGENT_SPAWN,
+        "spawn",
+    );
+    spawn
+        .payload
+        .insert("persona".to_owned(), "causal-dag-observer".into());
+    spawn
+        .payload
+        .insert("child_agent_id".to_owned(), child_agent_id.into());
+    let mut child_message = fixture_event(
+        "session-1",
+        "observer-cognition",
+        EventKind::ASSISTANT_MESSAGE,
+        "observer hints",
+    );
+    child_message.agent = child_agent_id.to_owned();
+    let mut result = fixture_event(
+        "session-1",
+        "observer-result",
+        EventKind::AGENT_RESULT,
+        "done",
+    );
+    result
+        .payload
+        .insert("child_agent_id".to_owned(), child_agent_id.into());
+    let root_message = fixture_event(
+        "session-1",
+        "driver-cognition",
+        EventKind::ASSISTANT_MESSAGE,
+        "driver conclusion",
+    );
+    let host = RecordingHost::new(recording_page(
+        vec![spawn, child_message, result, root_message],
+        64,
+        None,
+        false,
+    ));
+
+    let output = CausalDagObserverBriefCommand
+        .execute(CommandContext { input: json!({}) }, &host)
+        .expect("observer brief");
+    let task = output["task"].as_str().expect("task string");
+
+    assert!(!task.contains("observer-cognition"));
+    assert!(task.contains("driver-cognition"));
+    assert_eq!(output["listed_event_count"], 1);
+}
+
+#[test]
+fn observer_brief_does_not_advance_into_an_incomplete_observer_span() {
+    let source = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "objective");
+    let child_agent_id = "agent-causal-observer";
+    let mut spawn = fixture_event(
+        "session-1",
+        "observer-spawn",
+        EventKind::AGENT_SPAWN,
+        "spawn",
+    );
+    spawn
+        .payload
+        .insert("persona".to_owned(), "causal-dag-observer".into());
+    spawn
+        .payload
+        .insert("child_agent_id".to_owned(), child_agent_id.into());
+    let mut child_message = fixture_event(
+        "session-1",
+        "observer-cognition",
+        EventKind::ASSISTANT_MESSAGE,
+        "observer hints",
+    );
+    child_message.agent = child_agent_id.to_owned();
+    let mut result = fixture_event(
+        "session-1",
+        "observer-result",
+        EventKind::AGENT_RESULT,
+        "done",
+    );
+    result
+        .payload
+        .insert("child_agent_id".to_owned(), child_agent_id.into());
+    let next_source = fixture_event(
+        "session-1",
+        "event-2",
+        EventKind::USER_MESSAGE,
+        "next driver event",
+    );
+    let host = RecordingHost::new_pages(vec![
+        recording_page(vec![source], DEFAULT_LIMIT, None, false),
+        recording_page(
+            vec![spawn.clone(), child_message.clone()],
+            2,
+            Some("observer-cognition"),
+            true,
+        ),
+        recording_page(
+            vec![spawn, child_message, result, next_source],
+            DEFAULT_LIMIT,
+            None,
+            false,
+        ),
+    ]);
+    CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(
+                    json!({
+                        "watermark_event_id": "event-1",
+                        "session_id": "session-1",
+                        "expected_predecessor_artifact_event_id": null
+                    }),
+                    single_root_hints("event-1"),
+                    "evt-result-1",
+                ),
+            },
+            &host,
+        )
+        .expect("initial graph");
+
+    let error = CausalDagObserverBriefCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1", "limit": 2}),
+            },
+            &host,
+        )
+        .expect_err("partial prior observer span must not advance");
+    assert_eq!(
+        error,
+        ExtensionError::Message(
+            "causal-dag observer page ends inside a prior observer run; increase limit".to_owned()
+        )
+    );
+    let active = ActiveGraphState::load(&host)
+        .expect("active state")
+        .expect("active graph");
+    assert_eq!(active.cursor_event_id(), "event-1");
+
+    let brief = CausalDagObserverBriefCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1"}),
+            },
+            &host,
+        )
+        .expect("complete observer span can be skipped");
+    assert_eq!(brief["listed_event_count"], 1);
+    assert!(brief["task"].as_str().expect("task").contains("event-2"));
+    assert!(!brief["task"]
+        .as_str()
+        .expect("task")
+        .contains("observer-cognition"));
+    let queries = host.queries.lock().expect("queries");
+    assert_eq!(queries[1].after_event_id.as_deref(), Some("event-1"));
+    assert_eq!(queries[2].after_event_id.as_deref(), Some("event-1"));
+}
+
+#[test]
 fn observer_brief_rejects_unknown_input_fields() {
     let host = RecordingHost::empty();
 
@@ -367,7 +1167,7 @@ fn observer_brief_rejects_unknown_input_fields() {
 
 #[test]
 fn observer_brief_task_size_boundary_is_enforced() {
-    let exact = observer_brief_events_with_target_task_len(8192);
+    let exact = observer_brief_events_with_target_task_len(24 * 1024);
     let host = RecordingHost::new(recording_page(exact.clone(), exact.len(), None, false));
 
     let output = CausalDagObserverBriefCommand
@@ -378,7 +1178,7 @@ fn observer_brief_task_size_boundary_is_enforced() {
             &host,
         )
         .expect("exact boundary passes");
-    assert_eq!(output["task"].as_str().expect("task").len(), 8192);
+    assert_eq!(output["task"].as_str().expect("task").len(), 24 * 1024);
 
     let mut over = exact.clone();
     let event = over
@@ -399,14 +1199,14 @@ fn observer_brief_task_size_boundary_is_enforced() {
         )
         .expect_err("over boundary fails");
     let message = error.to_string();
-    assert!(message.contains("8193 bytes"));
+    assert!(message.contains("24577 bytes"));
     assert!(message.contains(&format!("{} listed events", over.len())));
     assert!(message.contains("reduce limit"));
 }
 
 #[test]
 fn observer_brief_count_overflow_fails_without_dropping_events() {
-    let events = (0..400)
+    let events = (0..1000)
         .map(|index| {
             fixture_event(
                 "session-1",
@@ -458,7 +1258,10 @@ fn observer_brief_normalizes_extracts_before_truncating() {
         )
         .expect("observer brief");
     let task = output["task"].as_str().expect("task");
-    let line = task.lines().nth(1).expect("event line");
+    let line = task
+        .lines()
+        .find(|line| line.starts_with("messy "))
+        .expect("event line");
     let extract = line.splitn(3, ' ').nth(2).expect("extract");
     assert_eq!(extract.chars().count(), 240);
     assert!(!extract.contains('\n'));
@@ -537,7 +1340,7 @@ fn export_writes_degraded_chronology_artifact_without_payload_content() {
     let artifact: Value = serde_json::from_slice(first_bytes).expect("artifact json");
 
     assert_eq!(first["event_count"], json!(3));
-    assert_eq!(second["sha256"], json!("hash"));
+    assert_eq!(second["sha256"], json!(TEST_ARTIFACT_HASH));
     assert_eq!(first_bytes, second_bytes);
     assert!(!String::from_utf8_lossy(first_bytes).contains(secret));
     assert_eq!(artifact["schema"], json!(SCHEMA_NAME));
@@ -833,12 +1636,16 @@ fn observe_knuth_stripped_events_match_expected_semantic_artifact() {
     assert_eq!(
         object_keys(&output),
         string_set([
+            "active_artifact_event_id",
+            "active_artifact_sha256",
+            "active_cursor_event_id",
             "applied_limit",
             "applied_scan_limit",
             "byte_len",
             "checkpoint_after_event_id",
             "cited_source_event_count",
             "command",
+            "construction",
             "degraded",
             "edge_count",
             "ignored_event_count",
@@ -856,7 +1663,7 @@ fn observe_knuth_stripped_events_match_expected_semantic_artifact() {
             "watermark_event_id",
         ])
     );
-    assert_eq!(artifact, expected);
+    assert_eq!(artifact, expected_manual_reframe(expected));
     assert_eq!(
         writes[0].source_event_ids,
         vec![
@@ -896,8 +1703,14 @@ fn slot_summary_knuth_fixture_preserves_dead_end_context() {
 fn slot_summary_byte_pressure_keeps_dead_ends_before_open_nodes() {
     let events = synthetic_summary_events(94);
     let hints = synthetic_pressure_hints(&events, 90);
-    let projection = Projection::from_observer_hints(&events, &hints, Some("session-1"))
-        .expect("synthetic projection");
+    let projection = Projection::from_observer_revision(
+        &events,
+        &hints,
+        Some("session-1"),
+        None,
+        Construction::snapshot(),
+    )
+    .expect("synthetic projection");
 
     let first = render_slot_summary(&projection);
     let second = render_slot_summary(&projection);
@@ -919,8 +1732,14 @@ fn slot_summary_single_giant_dead_end_reason_shrinks_to_fit() {
     let mut hints = synthetic_pressure_hints(&events, 0);
     // Blow one dead-end reason far past the whole slot budget.
     hints["nodes"][1]["summary"] = json!("x".repeat(20_000));
-    let projection = Projection::from_observer_hints(&events, &hints, Some("session-1"))
-        .expect("giant-reason projection");
+    let projection = Projection::from_observer_revision(
+        &events,
+        &hints,
+        Some("session-1"),
+        None,
+        Construction::snapshot(),
+    )
+    .expect("giant-reason projection");
 
     let rendered = render_slot_summary(&projection);
 
@@ -940,8 +1759,14 @@ fn slot_summary_empty_and_all_open_projections_render_deterministically() {
     for index in 1..=3 {
         hints["nodes"][index]["status"] = json!("open");
     }
-    let projection = Projection::from_observer_hints(&events, &hints, Some("session-1"))
-        .expect("all-open projection");
+    let projection = Projection::from_observer_revision(
+        &events,
+        &hints,
+        Some("session-1"),
+        None,
+        Construction::snapshot(),
+    )
+    .expect("all-open projection");
 
     let first = render_slot_summary(&projection);
     let second = render_slot_summary(&projection);
@@ -978,8 +1803,14 @@ fn slot_summary_strips_control_characters() {
         }],
         "edges": []
     });
-    let projection =
-        Projection::from_observer_hints(&[event], &hints, Some("session-1")).expect("projection");
+    let projection = Projection::from_observer_revision(
+        &[event],
+        &hints,
+        Some("session-1"),
+        None,
+        Construction::snapshot(),
+    )
+    .expect("projection");
 
     let summary = render_slot_summary(&projection);
 
@@ -1596,7 +2427,7 @@ fn observe_write_failure_does_not_touch_checkpoint() {
 }
 
 #[test]
-fn observe_repeat_ignores_prior_graph_artifact_and_does_not_touch_checkpoint() {
+fn observe_repeat_records_immutable_reframe_lineage_without_touching_checkpoint() {
     let (mut events, _) = load_knuth_fixture();
     let hints = extract_observer_hints(&mut events);
     let mut second_page_events = events.clone();
@@ -1637,7 +2468,37 @@ fn observe_repeat_ignores_prior_graph_artifact_and_does_not_touch_checkpoint() {
     assert_eq!(first["node_count"], second["node_count"]);
     assert_eq!(first["edge_count"], second["edge_count"]);
     assert_eq!(writes.len(), 2);
-    assert_eq!(writes[0].bytes, writes[1].bytes);
+    let first_artifact: Value =
+        serde_json::from_slice(&writes[0].bytes).expect("first artifact json");
+    let second_artifact: Value =
+        serde_json::from_slice(&writes[1].bytes).expect("second artifact json");
+    assert_eq!(first_artifact["forest"], second_artifact["forest"]);
+    assert_eq!(
+        first_artifact["construction"],
+        json!({
+            "operation": "reframe",
+            "policy": "manual",
+            "trigger": "explicit_reframe",
+            "predecessor_artifact_event_id": null,
+            "predecessor_watermark_event_id": null,
+            "observer_result_event_id": null
+        })
+    );
+    assert_eq!(
+        second_artifact["construction"],
+        json!({
+            "operation": "reframe",
+            "policy": "manual",
+            "trigger": "explicit_reframe",
+            "predecessor_artifact_event_id": "artifact-event",
+            "predecessor_watermark_event_id": "event-knuth-note-artifact",
+            "observer_result_event_id": null
+        })
+    );
+    assert_eq!(
+        second["active_artifact_event_id"],
+        json!("artifact-event-2")
+    );
     assert_eq!(writes[0].source_event_ids, writes[1].source_event_ids);
     assert!(!writes[1]
         .source_event_ids
@@ -1688,16 +2549,31 @@ fn observe_does_not_copy_source_payload_secret_or_host_paths() {
     let output_text = serde_json::to_string(&output).expect("output json");
     let metadata_text = serde_json::to_string(&writes[0].metadata).expect("metadata json");
     let artifact_text = String::from_utf8_lossy(&writes[0].bytes);
+    let state_path = host.state.path().join("active-graph.json");
+    let state_text = fs::read_to_string(&state_path).expect("active graph state");
 
     for (label, text) in [
         ("output", output_text.as_str()),
         ("metadata", metadata_text.as_str()),
         ("artifact", artifact_text.as_ref()),
+        ("active state", state_text.as_str()),
     ] {
         assert!(!text.contains(secret), "{label} leaked source secret");
         assert!(
             !text.contains(env!("CARGO_MANIFEST_DIR")),
             "{label} leaked host path"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(state_path)
+                .expect("active state metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
     }
 }
@@ -2689,6 +3565,7 @@ fn extension_host_integration_writes_artifact_event() {
             Capability::FsRead,
             Capability::FsWrite,
             Capability::AgentRecord,
+            Capability::AgentSpawn,
             Capability::ContextSlot,
         ],
     );
@@ -2731,10 +3608,11 @@ fn extension_host_integration_writes_artifact_event() {
             "truncated": false,
             "applied_limit": DEFAULT_LIMIT,
             "applied_scan_limit": SDK_DEFAULT_SCAN_LIMIT,
-            "scanned_events": 8,
+            "scanned_events": 9,
             "next_after_event_id": null,
             "watermark_event_id": artifact_json["projection"]["watermark_event_id"],
-            "query_watermark_event_id": grant_events.last().expect("grant event").id
+            "query_watermark_event_id": grant_events.last().expect("grant event").id,
+            "construction": artifact_json["construction"]
         }))
     );
 }
@@ -2761,6 +3639,8 @@ fn extension_host_observe_projects_stripped_knuth_events() {
         [
             Capability::ProvenanceRead,
             Capability::ArtifactWrite,
+            Capability::FsRead,
+            Capability::FsWrite,
             Capability::ContextSlot,
         ],
     );
@@ -2792,7 +3672,7 @@ fn extension_host_observe_projects_stripped_knuth_events() {
         .find(|event| event.kind.as_str() == EventKind::CONTEXT_SLOT_UPDATED)
         .expect("slot event");
 
-    assert_eq!(artifact_json, expected);
+    assert_eq!(artifact_json, expected_manual_reframe(expected));
     assert_eq!(output["slot_published"], json!(true));
     assert_eq!(artifact_event.kind.as_str(), EventKind::EXTENSION_ARTIFACT);
     assert_eq!(slot_event.payload["extension_id"], json!(EXTENSION_ID));
@@ -2995,6 +3875,17 @@ fn extension_registration_requires_all_causal_dag_capabilities() {
                 Capability::FsRead,
                 Capability::FsWrite,
                 Capability::AgentRecord,
+            ],
+            Capability::AgentSpawn,
+        ),
+        (
+            vec![
+                Capability::ProvenanceRead,
+                Capability::ArtifactWrite,
+                Capability::FsRead,
+                Capability::FsWrite,
+                Capability::AgentRecord,
+                Capability::AgentSpawn,
             ],
             Capability::ContextSlot,
         ),
@@ -3776,10 +4667,14 @@ impl CommandRegistrar for RecordingRegistrar {
 }
 
 struct RecordingHost {
+    state: tempfile::TempDir,
+    state_calls: Mutex<usize>,
     pages: Mutex<VecDeque<ProvenancePage>>,
     queries: Mutex<Vec<ProvenanceQuery>>,
     writes: Mutex<Vec<ArtifactWrite>>,
     slots: Mutex<Vec<(String, String)>>,
+    spawn_outcomes: Mutex<VecDeque<AgentOutcome>>,
+    spawn_tasks: Mutex<Vec<SpawnAgentTask>>,
     agent_records: Mutex<Vec<(HostAgentTask, HostAgentResult)>>,
     checkpoint: Mutex<Option<EventFeedCheckpoint>>,
     stored_checkpoints: Mutex<Vec<(String, EventFeedCheckpoint)>>,
@@ -3787,6 +4682,7 @@ struct RecordingHost {
     fail_store: bool,
     fail_slot: bool,
     fail_agent_record: bool,
+    fail_state_on_call: Option<usize>,
 }
 
 impl RecordingHost {
@@ -3800,10 +4696,14 @@ impl RecordingHost {
 
     fn new_pages(pages: Vec<ProvenancePage>) -> Self {
         Self {
+            state: tempfile::tempdir().expect("state dir"),
+            state_calls: Mutex::new(0),
             pages: Mutex::new(VecDeque::from(pages)),
             queries: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             slots: Mutex::new(Vec::new()),
+            spawn_outcomes: Mutex::new(VecDeque::new()),
+            spawn_tasks: Mutex::new(Vec::new()),
             agent_records: Mutex::new(Vec::new()),
             checkpoint: Mutex::new(None),
             stored_checkpoints: Mutex::new(Vec::new()),
@@ -3811,6 +4711,7 @@ impl RecordingHost {
             fail_store: false,
             fail_slot: false,
             fail_agent_record: false,
+            fail_state_on_call: None,
         }
     }
 
@@ -3831,6 +4732,16 @@ impl RecordingHost {
 
     fn with_agent_record_failure(mut self) -> Self {
         self.fail_agent_record = true;
+        self
+    }
+
+    fn with_spawn_outcomes(self, outcomes: Vec<AgentOutcome>) -> Self {
+        *self.spawn_outcomes.lock().expect("spawn outcomes") = VecDeque::from(outcomes);
+        self
+    }
+
+    fn with_state_failure_on_call(mut self, call: usize) -> Self {
+        self.fail_state_on_call = Some(call);
         self
     }
 }
@@ -3868,7 +4779,14 @@ impl HostApi for RecordingHost {
     }
 
     fn state_dir(&self) -> Result<std::path::PathBuf, ExtensionError> {
-        Err(ExtensionError::StateDirFailed("unused".to_owned()))
+        let mut calls = self.state_calls.lock().expect("state calls");
+        *calls += 1;
+        if self.fail_state_on_call == Some(*calls) {
+            return Err(ExtensionError::StateDirFailed(
+                "forced state failure".to_owned(),
+            ));
+        }
+        Ok(self.state.path().to_path_buf())
     }
 
     fn write_artifact(&self, artifact: ArtifactWrite) -> Result<ArtifactRecord, ExtensionError> {
@@ -3876,13 +4794,29 @@ impl HostApi for RecordingHost {
             return Err(ExtensionError::ArtifactWriteFailed("forced".to_owned()));
         }
         let byte_len = artifact.bytes.len();
-        self.writes.lock().expect("writes").push(artifact);
+        let mut writes = self.writes.lock().expect("writes");
+        let write_number = writes.len() + 1;
+        writes.push(artifact);
+        let persisted_event_id = if write_number == 1 {
+            "artifact-event".to_owned()
+        } else {
+            format!("artifact-event-{write_number}")
+        };
         Ok(ArtifactRecord {
-            persisted_event_id: "artifact-event".to_owned(),
+            persisted_event_id,
             relative_path: "sessions/session-1/extensions/causal-dag/artifacts/hash".to_owned(),
-            sha256: "hash".to_owned(),
+            sha256: TEST_ARTIFACT_HASH.to_owned(),
             byte_len,
         })
+    }
+
+    fn spawn_agent(&self, task: SpawnAgentTask) -> Result<AgentOutcome, ExtensionError> {
+        self.spawn_tasks.lock().expect("spawn tasks").push(task);
+        self.spawn_outcomes
+            .lock()
+            .expect("spawn outcomes")
+            .pop_front()
+            .ok_or_else(|| ExtensionError::Message("no recorded spawn outcome".to_owned()))
     }
 
     fn load_event_feed_checkpoint(
@@ -3960,7 +4894,7 @@ fn parented_event(id: &str, kind: &'static str, content: &str, parent: &str) -> 
 }
 
 fn observer_brief_events_with_target_task_len(target: usize) -> Vec<EventEnvelope> {
-    let mut events = (0..40)
+    let mut events = (0..100)
         .map(|index| {
             fixture_event(
                 "session-1",
@@ -3970,32 +4904,22 @@ fn observer_brief_events_with_target_task_len(target: usize) -> Vec<EventEnvelop
             )
         })
         .collect::<Vec<_>>();
-    loop {
-        let len = observer_brief_task_len(&events);
-        if len == target {
-            return events;
-        }
-        assert!(len < target, "test fixture overshot target task size");
-        let Some(event) = events.iter_mut().find(|event| {
-            event
-                .payload
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .len()
-                < 240
-        }) else {
-            panic!("test fixture cannot reach target task size")
-        };
-        let content = event
-            .payload
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+    let base_len = observer_brief_task_len(&events);
+    assert!(base_len <= target, "test fixture overshot target task size");
+    let mut remaining = target - base_len;
+    for event in &mut events {
+        let content_len = remaining.min(240);
         event
             .payload
-            .insert("content".to_owned(), format!("{content}x").into());
+            .insert("content".to_owned(), "x".repeat(content_len).into());
+        remaining -= content_len;
+        if remaining == 0 {
+            break;
+        }
     }
+    assert_eq!(remaining, 0, "test fixture cannot reach target task size");
+    assert_eq!(observer_brief_task_len(&events), target);
+    events
 }
 
 fn observer_brief_task_len(events: &[EventEnvelope]) -> usize {
@@ -4118,6 +5042,117 @@ fn single_root_hints(event_id: &str) -> Value {
         }],
         "edges": []
     })
+}
+
+fn child_revision_hints(event_id: &str) -> Value {
+    json!({
+        "schema": "euler.causal_dag.hints.v1",
+        "nodes": [{
+            "id": "node-child",
+            "root_id": "node-root",
+            "kind": "attempt",
+            "status": "open",
+            "title": "New attempt",
+            "summary": "A new attempt added by the rolling observer.",
+            "source_refs": [{
+                "id": "src-child",
+                "event_id": event_id,
+                "payload_pointer": "/payload/content"
+            }],
+            "confidence": {"level": "high", "score": 0.9},
+            "basis": {"kind": "direct", "summary": "The new event states this attempt."},
+            "metadata": {}
+        }],
+        "edges": [{
+            "id": "edge-child",
+            "from": "node-root",
+            "to": "node-child",
+            "class": "structural",
+            "kind": "continuation",
+            "canonical_backbone": true,
+            "source_refs": [{
+                "id": "src-edge-child",
+                "event_id": event_id,
+                "payload_pointer": "/payload/content"
+            }],
+            "confidence": {"level": "high", "score": 0.9},
+            "basis": {"kind": "direct", "summary": "The new attempt continues the root."},
+            "metadata": {}
+        }]
+    })
+}
+
+fn root_with_child_hints() -> Value {
+    let mut hints = single_root_hints("event-1");
+    let child = child_revision_hints("event-2");
+    hints["nodes"].as_array_mut().expect("root nodes").extend(
+        child["nodes"]
+            .as_array()
+            .expect("child nodes")
+            .iter()
+            .cloned(),
+    );
+    hints["edges"].as_array_mut().expect("root edges").extend(
+        child["edges"]
+            .as_array()
+            .expect("child edges")
+            .iter()
+            .cloned(),
+    );
+    hints
+}
+
+fn two_root_reframe_hints() -> Value {
+    let mut hints = single_root_hints("event-1");
+    hints["nodes"]
+        .as_array_mut()
+        .expect("root nodes")
+        .push(json!({
+            "id": "node-second-root",
+            "root_id": "node-second-root",
+            "kind": "root",
+            "status": "open",
+            "title": "Second root",
+            "summary": "Retrospective construction separates a second concern.",
+            "source_refs": [{
+                "id": "src-second-root",
+                "event_id": "event-2",
+                "payload_pointer": "/payload/content"
+            }],
+            "confidence": {"level": "high", "score": 0.9},
+            "basis": {"kind": "direct", "summary": "The prior event supports a separate root."},
+            "metadata": {}
+        }));
+    hints
+}
+
+fn observer_apply_input(apply: Value, hints: Value, result_event_id: &str) -> Value {
+    json!({
+        "apply": apply,
+        "companion": {
+            "ok": true,
+            "summary": "observer completed",
+            "output": serde_json::to_string(&hints).expect("hints json"),
+            "error": null,
+            "child_agent_id": format!("agent-{result_event_id}"),
+            "spawn_event_id": format!("spawn-{result_event_id}"),
+            "result_event_id": result_event_id
+        }
+    })
+}
+
+fn successful_agent_outcome(hints: Value, suffix: &str) -> AgentOutcome {
+    AgentOutcome {
+        ok: true,
+        summary: "observer completed".to_owned(),
+        output: serde_json::to_string(&hints).expect("hints json"),
+        error: None,
+        provider: "fixture".to_owned(),
+        model: "observer".to_owned(),
+        child_agent_id: format!("agent-{suffix}"),
+        spawn_event_id: format!("evt-spawn-{suffix}"),
+        result_event_id: format!("evt-result-{suffix}"),
+    }
 }
 
 fn synthetic_summary_events(count: usize) -> Vec<EventEnvelope> {
@@ -4303,6 +5338,18 @@ fn load_knuth_fixture() -> (Vec<EventEnvelope>, Value) {
     )
     .expect("knuth expected parses");
     (events, expected)
+}
+
+fn expected_manual_reframe(mut expected: Value) -> Value {
+    expected["construction"] = json!({
+        "operation": "reframe",
+        "policy": "manual",
+        "trigger": "explicit_reframe",
+        "predecessor_artifact_event_id": null,
+        "predecessor_watermark_event_id": null,
+        "observer_result_event_id": null
+    });
+    expected
 }
 
 fn extract_observer_hints(events: &mut [EventEnvelope]) -> Value {
