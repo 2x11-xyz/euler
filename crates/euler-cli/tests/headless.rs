@@ -530,6 +530,71 @@ fn exec_observe_causal_dag_spawns_observer_companion_and_stays_fail_open() {
 }
 
 #[test]
+fn exec_renders_each_turn_event_to_stdout_in_order() {
+    // Regression for #7: exec stdout is produced per event (streamed +
+    // flushed as the turn runs), so every event of the turn — not just the
+    // final assistant line — reaches stdout, in emission order. Provenance
+    // stays the canonical detailed stream.
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    fs::write(root.path().join("note.txt"), "alpha\n").expect("write note");
+    let script = write_fixture_script(
+        root.path(),
+        "exec-stream.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        { "tool_call": { "id": "c1", "name": "read_file", "input": { "path": "note.txt" } } },
+        { "finished": { "stop_reason": "tool_use" } }
+      ]
+    },
+    {
+      "events": [
+        { "text_delta": "all done" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+
+    let output = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("exec")
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provider-option")
+        .arg(format!("event-script={}", path_str(&script)))
+        .arg("--provenance")
+        .arg(path_str(&log))
+        .arg("--auto-approve")
+        .arg("read-only")
+        .arg("summarize note")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run exec");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let user_at = stdout.find("user: summarize note").expect("user line streamed");
+    let read_at = stdout.find("tool.call: read_file").expect("tool call streamed");
+    let assistant_at = stdout.find("assistant: all done").expect("assistant line streamed");
+    // The whole turn is on stdout, in order — not just the final response.
+    assert!(user_at < read_at, "user before tool: {stdout}");
+    assert!(read_at < assistant_at, "tool before assistant: {stdout}");
+}
+
+#[test]
 fn diagnostics_canary_excludes_user_tool_payloads_and_secret_sentinels() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();

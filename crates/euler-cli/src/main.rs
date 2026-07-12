@@ -253,6 +253,28 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     app.run()
 }
 
+/// Run a turn while streaming each event's line-oriented rendering to stdout
+/// as it is produced, flushing per event so piped or redirected `exec` output
+/// is visibly incremental instead of appearing only when the turn completes
+/// (issue #7). Provenance JSONL remains the canonical, detailed event stream;
+/// stdout is the human-facing progress view. Each event renders standalone, so
+/// the stream is strictly append-only (no retroactive coalescing to unprint).
+fn run_turn_streaming<D: PermissionDecider>(
+    session: &mut Session<D>,
+    prompt: &str,
+) -> Result<()> {
+    let mut stdout = io::stdout();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    session.run_turn_with_sink(prompt, cancel, |event| {
+        let line = render_line_oriented(std::slice::from_ref(event));
+        if !line.is_empty() {
+            let _ = stdout.write_all(line.as_bytes());
+            let _ = stdout.flush();
+        }
+    })?;
+    Ok(())
+}
+
 fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
     if let Some(path) = exec.resume_path {
         let prompt = read_exec_prompt(exec.prompt)?;
@@ -306,14 +328,12 @@ fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
     }
     wire_code_swarm(&mut session);
     SubagentDecider::apply_tier(tier, &mut session);
-    let events = session.run_turn(&prompt)?;
+    run_turn_streaming(&mut session, &prompt)?;
     if let Some(refresh) = refresh.as_ref() {
         if let Err(error) = refresh.refresh() {
             eprintln!("warning: failed to refresh session metadata: {error}");
         }
     }
-    print!("{}", render_line_oriented(&events));
-    io::stdout().flush()?;
     Ok(())
 }
 
@@ -329,14 +349,12 @@ fn run_exec_resume(
             apply_exec_config(config, overrides);
         })?;
     SubagentDecider::apply_tier(auto_approve, &mut outcome.session);
-    let events = outcome.session.run_turn(&prompt)?;
+    run_turn_streaming(&mut outcome.session, &prompt)?;
     if let Some(refresh) = outcome.refresh.as_ref() {
         if let Err(error) = refresh.refresh() {
             eprintln!("warning: failed to refresh session metadata: {error}");
         }
     }
-    print!("{}", render_line_oriented(&events));
-    io::stdout().flush()?;
     Ok(())
 }
 
