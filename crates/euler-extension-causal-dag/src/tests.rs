@@ -1,6 +1,7 @@
 use super::*;
 use crate::active_state::ActiveGraphState;
 use crate::construction::Construction;
+use crate::observer_brief::{build_task, ObserverBriefMode};
 use euler_agents::{AgentTask, MAX_TASK_BYTES};
 use euler_core::extensions::{ExtensionHost, ExtensionHostError};
 use euler_core::{read_provenance, ProvenanceWriter};
@@ -703,9 +704,9 @@ fn reframe_can_replace_parentage_and_introduce_a_second_root() {
         "artifact-event"
     );
     let tasks = host.spawn_tasks.lock().expect("spawn tasks");
-    assert!(tasks[0].task.contains(
-        "E edge-child node-root->node-child class=structural kind=continuation backbone=true sources=event-2"
-    ));
+    assert!(tasks[0]
+        .task
+        .contains("parent=node-root via=edge-child:structural:continuation edge_source=event-2"));
 }
 
 #[test]
@@ -1210,6 +1211,53 @@ fn observer_brief_adapts_extracts_to_the_real_agent_task_boundary() {
     assert!(extract_lengths.iter().all(|length| *length < 240));
     AgentTask::new_inheriting_target(task, output["persona"].as_str().expect("persona"))
         .expect("brief must satisfy the real companion task contract");
+}
+
+#[test]
+fn observer_brief_compacts_backbone_without_losing_stable_record_ids() {
+    let host = RecordingHost::empty();
+    let (_, artifact) = load_knuth_fixture();
+    let record = ArtifactRecord {
+        persisted_event_id: "source-artifact-event".to_owned(),
+        relative_path: "extensions/causal-dag/artifacts/source.json".to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: 1,
+    };
+    let active = ActiveGraphState::commit(&host, &record, artifact.clone(), None)
+        .expect("active graph state");
+    let event = fixture_event(
+        "session-knuth",
+        "new-event",
+        EventKind::USER_MESSAGE,
+        "continue",
+    );
+
+    let task = build_task(&[event], Some(&active), ObserverBriefMode::Incremental)
+        .expect("compact observer task");
+    assert!(task.len() <= MAX_TASK_BYTES);
+    for node in artifact["forest"]["nodes"].as_array().expect("nodes") {
+        let id = node["id"].as_str().expect("node id");
+        assert!(
+            task.lines()
+                .any(|line| line.starts_with(&format!("N {id} "))),
+            "missing node id {id}"
+        );
+    }
+    for edge in artifact["forest"]["edges"].as_array().expect("edges") {
+        let id = edge["id"].as_str().expect("edge id");
+        if edge["canonical_backbone"] == true {
+            assert!(
+                task.contains(&format!("via={id}:")),
+                "missing folded edge {id}"
+            );
+        } else {
+            assert!(
+                task.lines()
+                    .any(|line| line.starts_with(&format!("E {id} "))),
+                "missing non-backbone edge {id}"
+            );
+        }
+    }
 }
 
 #[test]

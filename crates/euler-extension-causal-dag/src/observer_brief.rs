@@ -7,7 +7,7 @@ use euler_sdk::{
     HostApi, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const OBSERVER_BRIEF_COMMAND_NAME: &str = "observer-brief";
 
@@ -500,33 +500,71 @@ fn compact_graph_lines(artifact: &Value) -> Result<Vec<String>, ExtensionError> 
         .pointer("/forest/edges")
         .and_then(Value::as_array)
         .ok_or_else(|| input_error("active causal-dag graph has invalid edges"))?;
-    let mut lines = Vec::with_capacity(nodes.len() + edges.len());
+    let mut parents = BTreeMap::new();
+    let mut non_backbone = Vec::new();
+    for edge in edges {
+        let backbone = edge
+            .get("canonical_backbone")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| input_error("active causal-dag edge has invalid backbone flag"))?;
+        if backbone {
+            let child = graph_string(edge, "to")?;
+            if parents.insert(child, edge).is_some() {
+                return Err(input_error(format!(
+                    "active causal-dag node `{child}` has multiple backbone parents"
+                )));
+            }
+        } else {
+            non_backbone.push(edge);
+        }
+    }
+    let mut represented_parents = BTreeSet::new();
+    let mut lines = Vec::with_capacity(nodes.len() + non_backbone.len());
     for node in nodes {
         let id = graph_string(node, "id")?;
         let root_id = graph_string(node, "root_id")?;
         let kind = graph_string(node, "kind")?;
         let status = graph_string(node, "status")?;
         let title = graph_string(node, "title")?;
-        let sources = graph_source_ids(node)?;
+        let source = latest_graph_source_id(node)?;
+        let parent = parents.get(id).copied();
+        if (kind == "root" && parent.is_some()) || (kind != "root" && parent.is_none()) {
+            return Err(input_error(format!(
+                "active causal-dag node `{id}` has invalid backbone parentage"
+            )));
+        }
+        let parent_fields = if let Some(edge) = parent {
+            represented_parents.insert(id);
+            format!(
+                "parent={} via={}:{}:{} edge_source={}",
+                graph_string(edge, "from")?,
+                graph_string(edge, "id")?,
+                graph_string(edge, "class")?,
+                graph_string(edge, "kind")?,
+                latest_graph_source_id(edge)?
+            )
+        } else {
+            "parent=- via=- edge_source=-".to_owned()
+        };
         lines.push(format!(
-            "N {id} root={root_id} kind={kind} status={status} sources={} title={}",
-            sources.join(","),
-            truncate_chars(title, 96)
+            "N {id} root={root_id} kind={kind} status={status} sources={source} {parent_fields} title={}",
+            truncate_chars(title, 72)
         ));
     }
-    for edge in edges {
-        let sources = graph_source_ids(edge)?;
+    if represented_parents.len() != parents.len() {
+        return Err(input_error(
+            "active causal-dag backbone references a missing child node",
+        ));
+    }
+    for edge in non_backbone {
         lines.push(format!(
-            "E {} {}->{} class={} kind={} backbone={} sources={}",
+            "E {} {}->{} class={} kind={} backbone=false sources={}",
             graph_string(edge, "id")?,
             graph_string(edge, "from")?,
             graph_string(edge, "to")?,
             graph_string(edge, "class")?,
             graph_string(edge, "kind")?,
-            edge.get("canonical_backbone")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| input_error("active causal-dag edge has invalid backbone flag"))?,
-            sources.join(",")
+            latest_graph_source_id(edge)?
         ));
     }
     Ok(lines)
@@ -539,19 +577,15 @@ fn graph_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, ExtensionErr
         .ok_or_else(|| input_error(format!("active causal-dag record has invalid `{key}`")))
 }
 
-fn graph_source_ids(value: &Value) -> Result<Vec<&str>, ExtensionError> {
+fn latest_graph_source_id(value: &Value) -> Result<&str, ExtensionError> {
     value
         .get("source_refs")
         .and_then(Value::as_array)
         .ok_or_else(|| input_error("active causal-dag record has invalid source_refs"))?
-        .iter()
-        .map(|source_ref| {
-            source_ref
-                .get("event_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| input_error("active causal-dag source ref has invalid event_id"))
-        })
-        .collect()
+        .last()
+        .and_then(|source_ref| source_ref.get("event_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| input_error("active causal-dag source ref has invalid event_id"))
 }
 
 fn payload_extract(event: &EventEnvelope) -> String {
@@ -656,6 +690,8 @@ pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
         "Use schema euler.causal_dag.hints.v1 and this shape:",
         "{\"schema\":\"euler.causal_dag.hints.v1\",\"nodes\":[],\"edges\":[]}",
         "The task may include a committed CURRENT GRAPH followed by NEW EVENTS.",
+        "CURRENT GRAPH N lines fold the canonical parent edge into parent= and via=<edge-id>:<class>:<kind>; E lines are non-backbone edges.",
+        "The compact graph names one reusable source event per record; the host retains all omitted prior evidence.",
         "The task declares MODE INCREMENTAL or MODE REPLACEMENT when CURRENT GRAPH is present.",
         "In INCREMENTAL mode, return only added or revised records; omitted records remain unchanged.",
         "In REPLACEMENT mode, return the complete replacement graph; omitted records are removed from the new interpretation but remain in prior artifacts.",
