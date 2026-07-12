@@ -13,7 +13,7 @@ use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
 use crate::ui::text::{
     blank_gutter, content_width, display_width, gutter_width, is_ledger_gutter, timestamp_gutter,
-    timestamp_gutter_shown, tree_gutter_pipe, wrap_text,
+    timestamp_gutter_shown, tree_gutter_hairline, wrap_text,
 };
 use crate::ui::theme::Theme;
 use ratatui::style::Style;
@@ -200,7 +200,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     );
                     push_wrapped(
                         &mut lines,
-                        tree_gutter_pipe(),
+                        tree_gutter_hairline(),
                         content,
                         theme.transcript.reasoning,
                         theme,
@@ -505,7 +505,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     output,
                     DetailRender {
                         style: theme.transcript.muted,
-                        gutter: tree_gutter_pipe(),
+                        gutter: tree_gutter_hairline(),
                     },
                     theme,
                     width,
@@ -975,7 +975,7 @@ fn push_wrapped(
         "invalid ledger gutter: {gutter:?}"
     );
     // Wrap at the actual prefix width, not the generic 2-/11-cell gutter:
-    // tree-nested content (`tree_gutter_pipe`/`_last`/`_mid` in narrow mode)
+    // tree-nested content (`tree_gutter_hairline`/`_last`/`_mid` in narrow mode)
     // is wider than the plain spine, and reusing `content_width` here would
     // let every physical row run 2 cells past the terminal edge — the
     // overflow that resize exposed as a stale fragment at column 0 outside
@@ -1134,8 +1134,48 @@ mod tests {
     }
 
     #[test]
+    fn expanded_reasoning_rail_is_a_hairline_not_a_pipe_or_box_border() {
+        // Design (Euler Thinking State): the expanded reasoning body rides a
+        // continuous hairline, never the old per-line `|` pipe, and never a
+        // box-drawing border (reserved for the approval panel).
+        let item = TranscriptItem::ModelReasoning {
+            fidelity: String::new(),
+            content: "one two three four five six seven eight nine ten \
+                      eleven twelve thirteen fourteen fifteen sixteen"
+                .to_owned(),
+        };
+        let lines = render_projected_items_with_expansion(
+            std::slice::from_ref(&item),
+            &Theme::default(),
+            48,
+            TranscriptRenderLimits::default(),
+            true,
+        );
+        let body_rows: Vec<String> = lines
+            .iter()
+            .filter_map(|line| line.spans.first().map(|s| s.content.to_string()))
+            .filter(|gutter| gutter == tree_gutter_hairline())
+            .collect();
+        assert!(body_rows.len() >= 2, "expected wrapped body rows");
+        for gutter in &body_rows {
+            assert!(
+                gutter.contains('\u{258f}'),
+                "rail must be the hairline: {gutter:?}"
+            );
+            assert!(
+                !gutter.contains('|'),
+                "rail must not be the ASCII pipe: {gutter:?}"
+            );
+            assert!(
+                !gutter.contains(['\u{2502}', '\u{250c}', '\u{2510}', '\u{2518}']),
+                "rail must not be a box-drawing border: {gutter:?}"
+            );
+        }
+    }
+
+    #[test]
     fn expanded_thinking_body_rewraps_inside_the_rail_on_resize() {
-        // Regression: the pipe-rail gutter (`tree_gutter_pipe`, 4 cells wide
+        // Regression: the hairline-rail gutter (`tree_gutter_hairline`, 4 cells wide
         // in narrow/no-timestamp mode) was wrapped using the generic
         // 2-cell `content_width`, so every physical row ran 2 cells past
         // the terminal edge. On repaint at a narrower width the stale
@@ -1156,7 +1196,7 @@ mod tests {
                 true,
             );
 
-            let pipe = tree_gutter_pipe();
+            let hairline = tree_gutter_hairline();
             let mut body_words = Vec::new();
             for line in &lines {
                 let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1168,14 +1208,14 @@ mod tests {
                     "line {text:?} exceeds width {width} at rendered width"
                 );
                 // Body rows are identified by their gutter span (emitted by
-                // `push_wrapped_segment`) being the pipe rail exactly; every
+                // `push_wrapped_segment`) being the hairline rail exactly; every
                 // one of them must carry it — none may land bare at column 0.
                 let is_body_row = line
                     .spans
                     .first()
-                    .is_some_and(|s| s.content.as_ref() == pipe);
+                    .is_some_and(|s| s.content.as_ref() == hairline);
                 if is_body_row {
-                    body_words.push(text.trim_start_matches(pipe).trim().to_owned());
+                    body_words.push(text.trim_start_matches(hairline).trim().to_owned());
                 }
             }
             assert!(
