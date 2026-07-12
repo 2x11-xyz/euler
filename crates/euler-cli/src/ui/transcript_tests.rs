@@ -279,6 +279,66 @@ fn transcript_state_finalize_replaces_live_body_and_clears_it_for_the_next_round
 }
 
 #[test]
+fn transcript_state_live_reasoning_body_is_bounded_but_finalize_keeps_full_text() {
+    // ui.md: reasoning is "collapsible and bounded" — the LIVE body is a
+    // trailing tail window capped at `REASONING_LIVE_BODY_MAX_CHARS`, while
+    // the finalized thought sources the FULL text from the
+    // `MODEL_REASONING` event payload, so the live bound can never truncate
+    // the committed, expandable history item.
+    const BOUND: usize = super::transcript::REASONING_LIVE_BODY_MAX_CHARS;
+    let mut state = TranscriptState::default();
+    // Multibyte deltas well past the bound: the trim must land on a char
+    // boundary, never mid-glyph.
+    let delta = "こんにちは世界 residue lemma chunk ";
+    let mut full = String::new();
+    for _ in 0..120 {
+        full.push_str(delta);
+        state.push_event(event_at(
+            EventKind::MODEL_DELTA,
+            object([("kind", "reasoning".into()), ("delta", delta.into())]),
+            "2026-07-05T00:00:01.000Z",
+        ));
+    }
+    assert!(
+        full.chars().count() > BOUND,
+        "stream must overflow the bound"
+    );
+
+    let live = state.live_mutable_items();
+    let [TranscriptItem::ModelReasoningLive { content, .. }] = live.as_slice() else {
+        panic!("expected the live reasoning item, got {live:?}");
+    };
+    assert_eq!(
+        content.chars().count(),
+        BOUND,
+        "live body must trim to exactly the bound"
+    );
+    assert!(
+        full.ends_with(content.as_str()),
+        "live body must be the trailing tail of the stream"
+    );
+    assert!(
+        content.chars().all(|ch| ch != '\u{fffd}'),
+        "trim must never split a multibyte glyph"
+    );
+
+    // Finalize: the committed thought carries the FULL reasoning from the
+    // event payload — never the bounded live tail.
+    state.push_event(event(
+        EventKind::MODEL_REASONING,
+        object([("fidelity", "raw".into()), ("content", full.clone().into())]),
+    ));
+    assert!(state.live_mutable_items().is_empty());
+    assert!(
+        state.items().iter().any(|item| matches!(
+            item,
+            TranscriptItem::ModelReasoning { content, .. } if *content == full
+        )),
+        "finalized thought must keep the full reasoning text"
+    );
+}
+
+#[test]
 fn transcript_state_preserves_live_tail_across_tool_call_model_result() {
     let mut state = TranscriptState::default();
     state.push_event(event(
