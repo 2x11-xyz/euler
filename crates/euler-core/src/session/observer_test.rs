@@ -288,16 +288,68 @@ fn companion_rounds_do_not_trigger_the_observer() {
 }
 
 #[test]
-fn companion_acts_with_the_extension_manifest_capabilities() {
-    // The manifest grants FsRead; the observer companion runs a real
-    // read_file tool round. Without the manifest grant flowing to the
-    // companion task, this read would be denied (companion tasks declare
-    // their own capabilities and default to none).
+fn observer_companion_spawns_despite_extension_host_manifest_capabilities() {
+    // The manifest grants extension-host capabilities (context-slot,
+    // artifact-write, agent-record, provenance-read) that are never part of
+    // the parent session's configured tool-permission set. The observer
+    // companion is a zero-capability generation task, so the spawn must
+    // validate regardless of the manifest — granting the manifest set to the
+    // companion task used to fail subset validation and reject every spawn.
+    let (_temp, mut session) = observer_session(
+        vec![
+            tool_round(),
+            FixtureResponse::Assistant("observation produced".to_owned()),
+            FixtureResponse::Assistant("driver done".to_owned()),
+        ],
+        1,
+    );
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let mut extension = ObserverExtension::new(
+        Ok(json!({"task": "observe the window", "budget": {"max_turns": 1, "max_tool_calls": 0}})),
+        Arc::clone(&calls),
+    );
+    extension.capabilities = vec![
+        Capability::ProvenanceRead,
+        Capability::ArtifactWrite,
+        Capability::AgentRecord,
+        Capability::ContextSlot,
+    ];
+    session.set_observer_extension(Arc::new(extension));
+
+    let events = session.run_turn("go").expect("turn");
+
+    assert_eq!(last_assistant_content(&events), "driver done");
+    assert_eq!(count_kind(&events, EventKind::AGENT_SPAWN), 1);
+    let calls = calls.lock().expect("call log");
+    let apply_input = &calls
+        .iter()
+        .find(|(name, _)| name == "apply")
+        .expect("apply ran")
+        .1;
+    assert_eq!(apply_input["companion"]["ok"], json!(true));
+    assert_eq!(
+        apply_input["companion"]["output"],
+        json!("observation produced")
+    );
+    let spawn = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
+        .expect("observer spawn event");
+    assert_eq!(spawn.payload["capabilities"], json!([]));
+}
+
+#[test]
+fn observer_companion_runs_with_zero_capabilities_and_denial_is_fail_safe() {
+    // Manifest grants FsRead, but the observer companion never inherits it:
+    // it is a generation task whose writes happen in the apply command under
+    // the extension's grant. A companion tool call is therefore denied — and
+    // the denial is a failed tool result the companion adapts to, never a
+    // spawn failure or a driver-turn failure.
     let (_temp, mut session) = observer_session(
         vec![
             tool_round(),
             tool_round(),
-            FixtureResponse::Assistant("companion read the note".to_owned()),
+            FixtureResponse::Assistant("companion adapted".to_owned()),
             FixtureResponse::Assistant("driver done".to_owned()),
         ],
         1,
@@ -322,15 +374,67 @@ fn companion_acts_with_the_extension_manifest_capabilities() {
     assert_eq!(apply_input["companion"]["ok"], json!(true));
     assert_eq!(
         apply_input["companion"]["output"],
-        json!("companion read the note")
+        json!("companion adapted")
     );
-    // Driver round 1 + companion round: both read_file calls produced results.
-    assert_eq!(count_kind(&events, EventKind::TOOL_RESULT), 2);
     let denied = events.iter().any(|event| {
         event.kind.as_str() == EventKind::PERMISSION_DECISION
             && event.payload["allowed"] == json!(false)
     });
-    assert!(!denied, "companion read must be allowed via manifest grant");
+    assert!(
+        denied,
+        "companion read must be denied without a manifest grant"
+    );
+}
+
+#[test]
+fn brief_system_prompt_reaches_the_companion_task() {
+    let (_temp, mut session) = observer_session(
+        vec![
+            tool_round(),
+            FixtureResponse::Assistant("observed".to_owned()),
+            FixtureResponse::Assistant("driver done".to_owned()),
+        ],
+        1,
+    );
+    wire_extension(
+        &mut session,
+        Ok(json!({
+            "task": "observe the window",
+            "system_prompt": "Return exactly one raw hints JSON object.",
+        })),
+    );
+
+    let events = session.run_turn("go").expect("turn");
+
+    let spawn = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
+        .expect("observer spawn event");
+    assert_eq!(
+        spawn.payload["system_prompt"],
+        json!("Return exactly one raw hints JSON object.")
+    );
+}
+
+#[test]
+fn malformed_brief_system_prompt_is_fail_open_without_companion() {
+    let (_temp, mut session) = observer_session(
+        vec![
+            tool_round(),
+            FixtureResponse::Assistant("driver done".to_owned()),
+        ],
+        1,
+    );
+    let calls = wire_extension(
+        &mut session,
+        Ok(json!({"task": "observe", "system_prompt": 7})),
+    );
+
+    let events = session.run_turn("go").expect("turn");
+
+    assert_eq!(last_assistant_content(&events), "driver done");
+    assert_eq!(count_kind(&events, EventKind::AGENT_SPAWN), 0);
+    assert_eq!(calls.lock().expect("call log").len(), 1);
 }
 
 #[test]

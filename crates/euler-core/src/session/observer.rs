@@ -22,8 +22,9 @@ pub struct RoundObserverConfig {
     pub cadence_rounds: NonZeroU64,
     /// Extension command producing the observer brief envelope: a JSON
     /// object with `task` (required string), optional `provider`/`model`
-    /// (both or neither), optional `budget` (`max_turns`, `max_tool_calls`,
-    /// `max_tokens`), and an opaque `apply` value passed back untouched.
+    /// (both or neither), optional `system_prompt` (string), optional
+    /// `budget` (`max_turns`, `max_tool_calls`, `max_tokens`), and an
+    /// opaque `apply` value passed back untouched.
     pub brief_command: String,
     /// Extension command receiving `{ "apply": <brief apply value>,
     /// "companion": { ok, summary, output, error, ids... } }`.
@@ -74,8 +75,13 @@ impl<D: PermissionDecider> Session<D> {
             )
             .map_err(|_| "brief")?;
         let (task, apply) = observer_task(&brief)?;
-        // The companion acts with the extension's authority: same manifest grant as brief/apply.
-        let task = task.with_capabilities(granted.iter().copied());
+        // The observer companion is a one-turn generation task: it only
+        // PRODUCES the observation. It runs with an empty capability set —
+        // extension-host capabilities (artifact-write, context-slot, ...)
+        // are not tool-permission capabilities, so granting the manifest set
+        // here would fail companion subset validation against the parent
+        // session and reject every spawn. All writes happen in the apply
+        // command, which core executes with the extension's manifest grant.
         let summary = self
             .spawn_companion_with_cancel(task, cancel_flag)
             .map_err(|_| "companion")?;
@@ -99,6 +105,15 @@ fn observer_task(brief: &Value) -> Result<(AgentTask, Value), &'static str> {
         _ => return Err("envelope"),
     }
     .map_err(|_| "envelope")?;
+    match brief.get("system_prompt") {
+        None | Some(Value::Null) => {}
+        Some(value) => {
+            let system_prompt = value.as_str().ok_or("envelope")?;
+            task = task
+                .with_system_prompt(system_prompt)
+                .map_err(|_| "envelope")?;
+        }
+    }
     if let Some(budget) = brief.get("budget") {
         let budget = AgentBudget::new(
             budget_u32(budget, "max_turns")?,

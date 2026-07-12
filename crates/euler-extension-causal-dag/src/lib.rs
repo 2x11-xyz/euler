@@ -7,10 +7,12 @@ use euler_sdk::{
 };
 use serde_json::{json, Map, Value};
 
+mod observer_apply;
 mod observer_brief;
 mod projection;
 mod record_observation;
 mod slot_summary;
+use observer_apply::{CausalDagObserverApplyCommand, OBSERVER_APPLY_COMMAND_NAME};
 use observer_brief::{CausalDagObserverBriefCommand, OBSERVER_BRIEF_COMMAND_NAME};
 use projection::Projection;
 #[cfg(test)]
@@ -77,6 +79,10 @@ impl Extension for CausalDagExtension {
         registrar.register_command(
             OBSERVER_BRIEF_COMMAND_NAME,
             Box::new(CausalDagObserverBriefCommand),
+        );
+        registrar.register_command(
+            OBSERVER_APPLY_COMMAND_NAME,
+            Box::new(CausalDagObserverApplyCommand),
         );
         registrar.register_command(
             RECORD_OBSERVATION_COMMAND_NAME,
@@ -234,53 +240,64 @@ impl ExtensionCommand for CausalDagObserveCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let input = ObserveInput::parse(&context.input)?;
-        let mut page = host.query_provenance(input.query())?;
-        if let Some(watermark) = &input.watermark_event_id {
-            cut_page_at_watermark(&mut page, watermark)?;
-        } else if page.truncated {
-            return Err(input_error(
-                "causal-dag observe requires a complete bounded event page",
-            ));
-        }
-        let split = split_update_events(&page.events)?;
-        let projection = Projection::from_observer_hints(
-            &split.source_events,
-            &input.hints,
-            input.session_id.as_deref(),
-        )?;
-        let source_event_ids = cited_source_event_ids(&projection, &split.source_events);
-        let cited_source_event_count = source_event_ids.len();
-        let source_event_count = split.source_events.len();
-        let ignored_event_count = split.ignored_self_events();
-        let record = write_projection_artifact(host, &projection, &page, source_event_ids)?;
-        let slot_publication = publish_graph_slot(host, &projection);
-
-        Ok(with_slot_publication(
-            json!({
-                "schema": SCHEMA_NAME,
-                "command": OBSERVE_COMMAND_NAME,
-                "persisted_event_id": record.persisted_event_id,
-                "relative_path": record.relative_path,
-                "sha256": record.sha256,
-                "byte_len": record.byte_len,
-                "source_event_count": source_event_count,
-                "cited_source_event_count": cited_source_event_count,
-                "ignored_event_count": ignored_event_count,
-                "node_count": projection.node_count(),
-                "edge_count": projection.edge_count(),
-                "degraded": projection.degraded(),
-                "truncated": page.truncated,
-                "applied_limit": page.applied_limit,
-                "applied_scan_limit": page.applied_scan_limit,
-                "scanned_events": page.scanned_events,
-                "next_after_event_id": page.next_after_event_id,
-                "watermark_event_id": projection.watermark_event_id(),
-                "query_watermark_event_id": page.watermark_event_id,
-                "checkpoint_after_event_id": Value::Null,
-            }),
-            slot_publication,
-        ))
+        execute_observe_projection(host, &input, OBSERVE_COMMAND_NAME)
     }
+}
+
+/// Shared hints-folding path for `observe` (operator-provided hints file)
+/// and `observer-apply` (round-observer companion output): bounded page,
+/// optional watermark cut, semantic projection, artifact write, graph slot.
+fn execute_observe_projection(
+    host: &dyn HostApi,
+    input: &ObserveInput,
+    command: &'static str,
+) -> Result<Value, ExtensionError> {
+    let mut page = host.query_provenance(input.query())?;
+    if let Some(watermark) = &input.watermark_event_id {
+        cut_page_at_watermark(&mut page, watermark)?;
+    } else if page.truncated {
+        return Err(input_error(format!(
+            "causal-dag {command} requires a complete bounded event page"
+        )));
+    }
+    let split = split_update_events(&page.events)?;
+    let projection = Projection::from_observer_hints(
+        &split.source_events,
+        &input.hints,
+        input.session_id.as_deref(),
+    )?;
+    let source_event_ids = cited_source_event_ids(&projection, &split.source_events);
+    let cited_source_event_count = source_event_ids.len();
+    let source_event_count = split.source_events.len();
+    let ignored_event_count = split.ignored_self_events();
+    let record = write_projection_artifact(host, &projection, &page, source_event_ids)?;
+    let slot_publication = publish_graph_slot(host, &projection);
+
+    Ok(with_slot_publication(
+        json!({
+            "schema": SCHEMA_NAME,
+            "command": command,
+            "persisted_event_id": record.persisted_event_id,
+            "relative_path": record.relative_path,
+            "sha256": record.sha256,
+            "byte_len": record.byte_len,
+            "source_event_count": source_event_count,
+            "cited_source_event_count": cited_source_event_count,
+            "ignored_event_count": ignored_event_count,
+            "node_count": projection.node_count(),
+            "edge_count": projection.edge_count(),
+            "degraded": projection.degraded(),
+            "truncated": page.truncated,
+            "applied_limit": page.applied_limit,
+            "applied_scan_limit": page.applied_scan_limit,
+            "scanned_events": page.scanned_events,
+            "next_after_event_id": page.next_after_event_id,
+            "watermark_event_id": projection.watermark_event_id(),
+            "query_watermark_event_id": page.watermark_event_id,
+            "checkpoint_after_event_id": Value::Null,
+        }),
+        slot_publication,
+    ))
 }
 
 fn provenance_query_args(after_event_id: bool, kinds: bool) -> Vec<ArgSpec> {
