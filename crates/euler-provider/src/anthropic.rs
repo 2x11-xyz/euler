@@ -223,7 +223,7 @@ impl MessageBuilder {
 
 fn anthropic_content_block(model: &str, item: &ModelInputItem) -> Option<(AnthropicRole, Value)> {
     match item {
-        ModelInputItem::Message { role, content } => Some(message_content_block(*role, content)),
+        ModelInputItem::Message { role, content } => message_content_block(*role, content),
         ModelInputItem::Reasoning {
             provider,
             model: reasoning_model,
@@ -266,12 +266,21 @@ fn anthropic_content_block(model: &str, item: &ModelInputItem) -> Option<(Anthro
     }
 }
 
-fn message_content_block(role: ModelRole, content: &str) -> (AnthropicRole, Value) {
+fn message_content_block(role: ModelRole, content: &str) -> Option<(AnthropicRole, Value)> {
+    // Anthropic rejects the whole request with HTTP 400
+    // (invalid_request_error: "text content blocks must contain non-whitespace
+    // text") if any text block is empty. An empty/whitespace-only message
+    // carries no signal, so drop it rather than emit a block the API refuses —
+    // e.g. an assistant turn recorded with no text alongside a tool call, or a
+    // blank replayed message (issue #8).
+    if content.trim().is_empty() {
+        return None;
+    }
     let role = match role {
         ModelRole::User => AnthropicRole::User,
         ModelRole::Assistant => AnthropicRole::Assistant,
     };
-    (role, json!({ "type": "text", "text": content }))
+    Some((role, json!({ "type": "text", "text": content })))
 }
 
 fn reasoning_content_block(
@@ -320,6 +329,14 @@ fn tool_output_content_block(call_id: &str, ok: bool, content: &str) -> (Anthrop
         content.to_owned()
     } else {
         format!("[tool failed] {content}")
+    };
+    // A tool that succeeds with no output would otherwise emit an empty
+    // tool_result text block, which Anthropic 400s on. Stand in a marker so the
+    // block is well-formed and the model still sees the call completed (#8).
+    let text = if text.trim().is_empty() {
+        "[no output]".to_owned()
+    } else {
+        text
     };
     let mut block = json!({
         "type": "tool_result",
