@@ -117,9 +117,9 @@ mod visual;
 use self::visual::ratatui_lines_to_canvas;
 
 use self::support::{
-    command_context, context_window_tokens_for, detect_git_branch, is_copy_key, merge_effects,
-    read_terminal_event, session_resume_label, session_root_status_path, update_token_usage,
-    CommandContextParts,
+    causal_dag_stats_from_events, command_context, context_window_tokens_for, detect_git_branch,
+    is_copy_key, merge_effects, read_terminal_event, session_resume_label,
+    session_root_status_path, update_token_usage, CommandContextParts,
 };
 
 /// Working HUD content, shared by the plain-text and styled render paths
@@ -828,6 +828,7 @@ impl AppCore {
             extension_items,
             extension_slash_commands,
             code_swarm_models: self.code_swarm_models.clone(),
+            causal_dag_stats: self.current_causal_dag_stats(),
         };
         self.bottom.reset_context(command_context(
             &self.model_catalog,
@@ -849,6 +850,7 @@ impl AppCore {
             extension_items,
             extension_slash_commands,
             code_swarm_models: self.code_swarm_models.clone(),
+            causal_dag_stats: self.current_causal_dag_stats(),
         };
         self.bottom = BottomSurface::new(command_context(
             &self.model_catalog,
@@ -900,6 +902,22 @@ impl AppCore {
         let items = list_extension_manager_items(session_enabled.as_ref());
         let slash = crate::ui::commands::build_extension_slash_commands(&items);
         (items, slash)
+    }
+
+    fn current_causal_dag_stats(&self) -> Option<crate::ui::commands::CausalDagStats> {
+        let session_id = self.status.session_id.as_deref()?;
+        match &self.state {
+            AppState::Idle { session } => {
+                Some(causal_dag_stats_from_events(session.events(), session_id))
+            }
+            _ => self.bottom.context().causal_dag_stats.clone().or_else(|| {
+                Some(crate::ui::commands::CausalDagStats {
+                    session_id: session_id.to_owned(),
+                    node_count: 0,
+                    cross_arc_count: 0,
+                })
+            }),
+        }
     }
 
     fn current_reasoning_effort(&self) -> ReasoningEffort {
@@ -1205,9 +1223,7 @@ impl AppCore {
                 CoreEffect::Render
             }
             KeyCode::Backspace => {
-                // Issue #24: an empty code-swarm filter steps back to the
-                // slash palette rather than exiting outright.
-                if self.bottom.code_swarm_backspace_steps_back_to_palette() {
+                if self.bottom.picker_backspace_steps_back() {
                     return CoreEffect::Render;
                 }
                 // Issue #23: backspacing over the leading `/` with nothing
@@ -1785,7 +1801,11 @@ impl AppCore {
             CommandAction::ToggleTimestamps => self.toggle_timestamps(),
             CommandAction::ShowDiff => self.show_session_diff(),
             CommandAction::ShowUsage => self.show_session_usage(),
-            CommandAction::DagExport => self.dag_export(),
+            CommandAction::OpenCausalDagExport { stats } => {
+                self.bottom
+                    .open_picker(crate::ui::commands::PickerSpec::CausalDagFormats(stats));
+                CoreEffect::Render
+            }
             CommandAction::OpenExtensionManager => self.open_extension_manager(),
             CommandAction::ExtensionToggle { id, enable } => self.toggle_extension(id, enable),
             CommandAction::ExtensionDetails { id } => self.show_extension_details(id),
@@ -2511,11 +2531,18 @@ fn empty_command_context_parts(
     CommandContextParts {
         current_effort,
         current_theme,
-        current_session_id,
+        current_session_id: current_session_id.clone(),
         checkpoint_items: Vec::new(),
         extension_items: Vec::new(),
         extension_slash_commands: Vec::new(),
         code_swarm_models: Vec::new(),
+        causal_dag_stats: current_session_id.map(|session_id| {
+            crate::ui::commands::CausalDagStats {
+                session_id,
+                node_count: 0,
+                cross_arc_count: 0,
+            }
+        }),
     }
 }
 

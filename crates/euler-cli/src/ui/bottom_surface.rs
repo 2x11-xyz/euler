@@ -1,7 +1,7 @@
 use super::commands::{
-    dispatch_command, filter_palette_entries, CheckpointItem, CommandAction, CommandContext,
-    CommandEffect, EffortChoice, ExtensionManagerItem, ModelChoice, PaletteEntry, PaletteEntryKind,
-    PermissionChoice, PickerSpec, ResumeItem, ThemeChoiceItem,
+    dispatch_command, filter_palette_entries, CausalDagStats, CheckpointItem, CommandAction,
+    CommandContext, CommandEffect, EffortChoice, ExtensionManagerItem, ModelChoice, PaletteEntry,
+    PaletteEntryKind, PermissionChoice, PickerSpec, ResumeItem, ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
 use super::search::TranscriptSearch;
@@ -164,6 +164,14 @@ impl BottomSurface {
             BottomOwner::Picker(picker) if picker.kind == PickerKind::CodeSwarmModels => {
                 Some(picker.render_code_swarm_canvas_lines(theme, width))
             }
+            BottomOwner::Picker(picker)
+                if matches!(
+                    picker.kind,
+                    PickerKind::CausalDagActions | PickerKind::CausalDagFormats
+                ) =>
+            {
+                Some(picker.render_causal_dag_canvas_lines(theme, width))
+            }
             _ => self
                 .surface_lines(width)
                 .map(|lines| lines.into_iter().map(CanvasLine::plain_lossy).collect()),
@@ -252,21 +260,37 @@ impl BottomSurface {
         matches!(&self.owner, BottomOwner::Palette(palette) if palette.is_query_empty())
     }
 
-    /// Issue #24: `⌫` on the `/code-swarm` picker with an empty type-to-filter
-    /// query steps back to the slash palette instead of exiting outright.
-    /// Returns `true` (and performs the transition) when that applies.
-    pub fn code_swarm_backspace_steps_back_to_palette(&mut self) -> bool {
+    /// Step backward through picker drill-downs without discarding the saved
+    /// composer draft. Returns true when a transition was performed.
+    pub fn picker_backspace_steps_back(&mut self) -> bool {
         let BottomOwner::Picker(picker) = &self.owner else {
             return false;
         };
-        if picker.kind != PickerKind::CodeSwarmModels || !picker.query_is_empty() {
+        if !picker.query_is_empty() {
             return false;
         }
         let saved_draft = picker.saved_draft.clone();
+        if picker.kind == PickerKind::CausalDagFormats {
+            let Some(stats) = picker.causal_dag_stats.clone() else {
+                return false;
+            };
+            self.open_picker_from_spec(PickerSpec::CausalDagActions(stats), saved_draft);
+            return true;
+        }
+        if !matches!(
+            picker.kind,
+            PickerKind::CodeSwarmModels | PickerKind::CausalDagActions
+        ) {
+            return false;
+        }
         self.composer = saved_draft.clone();
         let entries = filter_palette_entries("/", &self.context);
         self.owner = BottomOwner::Palette(CommandPalette::new(saved_draft, entries));
         true
+    }
+
+    pub fn set_causal_dag_stats(&mut self, stats: Option<CausalDagStats>) {
+        self.context.causal_dag_stats = stats;
     }
 
     /// Handle manager-only keys: space toggle, a add, x remove. Enter uses confirm.
@@ -595,6 +619,12 @@ impl BottomSurface {
                     SurfaceEvent::None
                 }
             };
+        }
+        if let Some(CommandAction::OpenCausalDagExport { stats }) = picker.selected_action() {
+            let stats = stats.clone();
+            let saved_draft = picker.saved_draft.clone();
+            self.open_picker_from_spec(PickerSpec::CausalDagFormats(stats), saved_draft);
+            return SurfaceEvent::None;
         }
         match picker.selected_action() {
             Some(action) => self.apply_action(action.clone()),

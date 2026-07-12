@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--__EULER_RUNTIME__-->
+
+<script>
+document.addEventListener('click', function (e) {
+  var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+  if (!a) return;
+  var h = decodeURIComponent(a.getAttribute('href') || '').split('#')[0];
+  if (h.slice(-8) === '.dc.html') { e.preventDefault(); parent.postMessage({ dagNav: h }, '*'); }
+});
+</script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    html, body { margin: 0; }
+    @media (max-width: 600px) {
+      .dag-heading { top:14px !important; left:14px !important; right:14px !important; }
+      .dag-heading > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .dag-toolbar { top:58px !important; left:14px !important; right:auto !important; gap:5px !important; }
+      .dag-overlay { top:96px !important; left:14px !important; right:14px !important; width:auto !important; box-sizing:border-box; }
+      .dag-card { left:14px !important; right:14px !important; bottom:74px !important; width:auto !important; max-height:38vh; overflow:hidden; box-sizing:border-box; }
+      .dag-hint { display:none !important; }
+      .dag-legend { left:14px !important; right:14px !important; bottom:10px !important; gap:4px 9px !important; flex-wrap:wrap; font-size:9px !important; line-height:1.1; }
+    }
+  </style>
+</helmet>
+
+<div data-screen-label="2D indented spine" style="position:fixed; inset:0; background:{{ th.bg }}; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; transition:background 0.3s; user-select:none; -webkit-user-select:none;">
+
+  <div ref="{{ paneRef }}" onwheel="{{ cvWheel }}" style="position:absolute; inset:0; overflow:hidden; touch-action:none; cursor:grab;">
+    <sc-if value="{{ ready }}" hint-placeholder-val="{{ true }}">
+      <div style="position:absolute; left:0; top:0; transform:{{ view }}; transform-origin:0 0;">
+      <div style="position:relative; width:{{ tW }}px; height:{{ tH }}px;">
+        <svg width="{{ tW }}" height="{{ tH }}" style="position:absolute; inset:0; display:block; overflow:visible;">
+          <defs>
+            <marker id="arr" viewBox="0 0 8 6" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+              <path d="M 0 0 L 8 3 L 0 6 z" style="fill:context-stroke;"></path>
+            </marker>
+          </defs>
+          <sc-for list="{{ conns }}" as="p" hint-placeholder-count="0">
+            <path d="{{ p.d }}" style="fill:none; stroke:{{ th.edge }}; stroke-width:1;"></path>
+          </sc-for>
+          <sc-if value="{{ showArcs }}" hint-placeholder-val="{{ true }}">
+            <sc-for list="{{ arcs }}" as="a" hint-placeholder-count="0">
+              <path d="{{ a.d }}" style="fill:none; stroke:{{ a.col }}; stroke-width:{{ a.sw }}; stroke-dasharray:2 4; opacity:{{ a.op }}; marker-end:url(#arr);"></path>
+              <path d="{{ a.d }}" style="fill:none; stroke:transparent; stroke-width:10; pointer-events:stroke; cursor:pointer;" onmouseenter="{{ a.enter }}"></path>
+            </sc-for>
+          </sc-if>
+        </svg>
+        <sc-for list="{{ nodes }}" as="n" hint-placeholder-count="0">
+          <span data-status="{{ n.status }}" data-kind="{{ n.kind }}" onmouseenter="{{ n.enter }}" style="position:absolute; left:{{ n.x }}px; top:{{ n.y }}px; transform:translate(-50%,-50%) rotate({{ n.rot }}deg); width:{{ n.sz }}px; height:{{ n.sz }}px; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:{{ n.bw }}px solid {{ n.col }}; border-radius:{{ n.radius }}; box-shadow:{{ n.shadow }}; font:{{ n.w }} 13px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:{{ n.col }}; opacity:{{ n.op }}; cursor:pointer;">
+            <span style="transform:rotate({{ n.invRot }}deg);">{{ n.glyph }}</span>
+          </span>
+          <span onmouseenter="{{ n.enter }}" style="position:absolute; left:{{ n.lx }}px; top:{{ n.y }}px; transform:translateY(-50%); font:{{ n.w }} 13px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:{{ th.text }}; white-space:nowrap; cursor:pointer; padding:6px 4px;">{{ n.title }}</span>
+        </sc-for>
+      </div>
+      </div>
+    </sc-if>
+  </div>
+
+  <div class="dag-heading" style="position:absolute; top:22px; left:26px; pointer-events:none; display:flex; flex-direction:column; gap:3px;">
+    <div style="color:{{ th.text }}; font-size:13px; font-weight:600;">{{ graphTitle }} · 2D indented spine</div>
+    <div style="color:{{ th.sub }}; font-size:11.5px;">{{ graphMeta }}</div>
+  </div>
+
+  <div class="dag-toolbar" style="position:absolute; top:22px; right:26px; display:flex; gap:8px; align-items:flex-start;">
+    <button onclick="{{ toggleInfo }}" style="background:{{ infoBg }}; color:{{ th.sub }}; border:1px solid {{ th.border }}; padding:6px 10px; font-size:11px; font-family:inherit; cursor:pointer;">ⓘ</button>
+    <div style="position:relative;">
+      <button onclick="{{ toggle2d }}" style="background:{{ nav2dBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">2D ▾</button>
+      <sc-if value="{{ nav2d }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+          <a href="2D%20Indented%20Spine.dc.html" style="display:block; padding:9px 13px; color:{{ th.text }}; text-decoration:none; font-size:11px; white-space:nowrap;">indented spine</a>
+          <a href="2D%20Top-Down.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">top-down</a>
+        </div>
+      </sc-if>
+    </div>
+    <div style="position:relative;">
+      <button onclick="{{ toggle3d }}" style="background:{{ nav3dBg }}; color:{{ th.sub }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">3D ▾</button>
+      <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+          <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3D · constellation</a>
+          <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · time axis</a>
+        </div>
+      </sc-if>
+    </div>
+    <button onclick="{{ togglePanel }}" style="background:{{ panelBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">tune</button>
+  </div>
+
+  <sc-if value="{{ infoOpen }}" hint-placeholder-val="{{ false }}">
+    <div class="dag-overlay" style="position:absolute; top:58px; right:26px; width:312px; display:flex; flex-direction:column; gap:10px; padding:16px 18px 18px; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+      <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">What you're looking at</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">A causal DAG of an agent's problem-solving session. Indentation follows the canonical backbone. Dashed arrows preserve source-backed relationships across branches without changing parentage.</div>
+      <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">How to interact</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Hover a row or dashed arrow — the card at bottom-right shows its story. Drag or two-finger scroll to pan; pinch or ctrl+scroll to zoom. tune sets theme, cross-arcs, and edge gap.</div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ panelOpen }}" hint-placeholder-val="{{ false }}">
+    <div class="dag-overlay" style="position:absolute; top:58px; right:26px; width:232px; display:flex; flex-direction:column; gap:13px; padding:15px 16px 17px; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+      <div style="display:flex; flex-direction:column; gap:6px; color:{{ th.sub }}; font-size:11px;">
+        theme
+        <div style="display:flex; gap:6px;">
+          <button onclick="{{ setLight }}" style="flex:1; background:{{ lightBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 0; font-size:11px; font-family:inherit; cursor:pointer;">light</button>
+          <button onclick="{{ setDark }}" style="flex:1; background:{{ darkBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 0; font-size:11px; font-family:inherit; cursor:pointer;">dark</button>
+        </div>
+      </div>
+      <label style="display:flex; align-items:center; justify-content:space-between; color:{{ th.sub }}; font-size:11px; cursor:pointer;">cross-arcs
+        <input type="checkbox" checked="{{ uiArcs }}" onchange="{{ setArcs }}" style="accent-color:{{ accent }}; cursor:pointer;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
+        <span style="display:flex; justify-content:space-between;"><span>edge gap</span><span style="color:{{ th.faint }};">{{ uiGap }}px</span></span>
+        <input type="range" min="2" max="16" step="1" value="{{ uiGap }}" onchange="{{ setGap }}" style="accent-color:{{ accent }}; width:100%; margin:0;">
+      </label>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ ready }}" hint-placeholder-val="{{ true }}">
+    <div class="dag-card" style="position:absolute; bottom:52px; right:26px; width:340px; display:flex; flex-direction:column; gap:9px; padding:15px 17px 16px; background:{{ th.cardBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px); pointer-events:none;">
+      <div style="display:flex; flex-wrap:nowrap; gap:8px; align-items:baseline; font-size:11.5px; white-space:nowrap;">
+        <span style="font-size:15px; color:{{ sel.color }}; opacity:{{ sel.op }};">{{ sel.glyph }}</span>
+        <span style="color:{{ sel.color }}; opacity:{{ sel.op }};">{{ sel.statusWord }}</span>
+        <span style="color:{{ th.sub }}; flex:none;">· {{ sel.kind }}</span>
+        <span style="margin-left:auto; color:{{ th.sub }}; flex:none;">{{ sel.conf }}</span>
+      </div>
+      <div style="color:{{ th.text }}; font-size:13.5px; font-weight:600; line-height:1.4; font-family:Georgia, serif;">{{ sel.title }}</div>
+      <div style="color:{{ th.body }}; font-size:12.5px; line-height:1.55; font-family:Georgia, serif;">{{ sel.summary }}</div>
+      <div style="color:{{ th.faint }}; font-size:10.5px;">evidence {{ sel.ev }}</div>
+      <sc-for list="{{ sel.links }}" as="l" hint-placeholder-count="0">
+        <div style="color:{{ th.sub }}; font-size:10.5px; line-height:1.5;">{{ l.txt }}</div>
+      </sc-for>
+    </div>
+  </sc-if>
+
+  <div class="dag-hint" style="position:absolute; bottom:42px; left:26px; color:{{ th.hint }}; font-size:11px; pointer-events:none; white-space:nowrap;">hover a row or a dashed arc · drag or scroll to pan · pinch or ctrl+scroll to zoom</div>
+
+  <div class="dag-legend" style="position:absolute; bottom:18px; left:26px; display:flex; align-items:center; gap:14px; font-size:11px; color:{{ th.sub }}; pointer-events:none;">
+    <sc-for list="{{ legend }}" as="g" hint-placeholder-count="0">
+      <span style="display:flex; align-items:center; gap:6px;"><span style="color:{{ g.col }}; opacity:{{ g.op }};">{{ g.glyph }}</span>{{ g.label }}</span>
+    </sc-for>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script="" data-props="{
+  &quot;theme&quot;: { &quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;light&quot;, &quot;dark&quot;], &quot;default&quot;: &quot;light&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;Theme&quot; },
+  &quot;edgeGap&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 9, &quot;min&quot;: 2, &quot;max&quot;: 16, &quot;step&quot;: 1, &quot;unit&quot;: &quot;px&quot;, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Edges&quot; },
+  &quot;showCrossArcs&quot;: { &quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Edges&quot; }
+}">
+const __DAG = /*__EULER_DAG__*/;
+const TOKENS = /*__EULER_PALETTE__*/;
+const STATUS_ORDER = TOKENS.status_order;
+const DAY = Object.fromEntries(STATUS_ORDER.map((s) => [s, TOKENS.statuses[s].day]));
+const NIGHT = Object.fromEntries(STATUS_ORDER.map((s) => [s, TOKENS.statuses[s].night]));
+const GLYPH = Object.fromEntries(STATUS_ORDER.map((s) => [s, TOKENS.statuses[s].glyph]));
+const WORD = Object.fromEntries(STATUS_ORDER.map((s) => [s, TOKENS.statuses[s].label]));
+const OPACITY = Object.fromEntries(STATUS_ORDER.map((s) => [s, 1]));
+const ARC_DAY = TOKENS.cross_arcs.kinds;
+const ARC_NIGHT = TOKENS.cross_arcs.kinds;
+const ARCC = TOKENS.cross_arcs.kinds;
+const KIND = TOKENS.kinds;
+
+function kindVisual(kind, selected) {
+  const token = KIND[kind] || KIND.attempt;
+  const size = Math.round((selected ? 27 : 23) * token.scale);
+  const diamond = token.shape === 'diamond';
+  return {
+    size,
+    rotate: diamond ? 45 : 0,
+    inverse: diamond ? -45 : 0,
+    radius: token.shape === 'circle' || token.shape === 'ring' || token.shape === 'double_ring' ? '50%' : '2px',
+    border: token.shape === 'ring' ? 2.5 : 1.25,
+    shadow: token.shape === 'double_ring' ? '0 0 0 3px currentColor' : 'none',
+    weight: token.weight
+  };
+}
+
+class Component extends DCLogic {
+  state = { dag: null, hover: null, panel: false, nav2d: false, nav3d: false, uiTheme: null, uiGap: null, uiArcs: null, vx: null, vy: null, vs: 1 };
+
+  componentDidMount() {
+    this.setState({ dag: __DAG, hover: __DAG.active_root || (__DAG.nodes[0] && __DAG.nodes[0].id) || null });
+    // block browser page-zoom on pinch and history-swipe on horizontal scroll
+    this.wheelBlock = (e) => e.preventDefault();
+    document.addEventListener('wheel', this.wheelBlock, { passive: false });
+    this.bindPane();
+  }
+
+  // React's pointer-event props don't bind in this runtime — attach natively
+  bindPane() {
+    const el = this.paneRef && this.paneRef.current;
+    if (!el || this.bound) return;
+    this.bound = true;
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      this.pan = { x0: e.clientX, y0: e.clientY, vx0: this.cur.vx, vy0: this.cur.vy };
+      try { el.setPointerCapture(e.pointerId); } catch (err) {}
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!this.pan) return;
+      this.setState({ vx: this.pan.vx0 + (e.clientX - this.pan.x0), vy: this.pan.vy0 + (e.clientY - this.pan.y0) });
+    });
+    const up = () => { this.pan = null; };
+    el.addEventListener('pointerup', up);
+    el.addEventListener('pointercancel', up);
+  }
+  componentWillUnmount() {
+    document.removeEventListener('wheel', this.wheelBlock);
+  }
+
+  renderVals() {
+    const dark = (this.state.uiTheme ?? this.props.theme ?? 'light') === 'dark';
+    const PAL = dark ? NIGHT : DAY;
+    const ARCC = dark ? ARC_NIGHT : ARC_DAY;
+    const th = dark ? {
+      bg: '#121212', edge: '#eceae2', text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
+      faint: '#6d6b64', border: 'rgba(255,255,255,0.14)', menuBg: 'rgba(22,22,22,0.92)',
+      cardBg: 'rgba(22,22,22,0.85)', hint: 'rgba(236,234,226,0.35)'
+    } : {
+      bg: '#fdfcf9', edge: '#1c1b18', text: '#26251f', sub: '#8a887f', body: '#4a4840',
+      faint: '#b0aea4', border: 'rgba(0,0,0,0.12)', menuBg: 'rgba(255,255,255,0.92)',
+      cardBg: 'rgba(255,255,255,0.88)', hint: 'rgba(28,27,24,0.4)'
+    };
+    const gap = this.state.uiGap ?? this.props.edgeGap ?? 9;
+    const showArcs = this.state.uiArcs ?? this.props.showCrossArcs ?? true;
+
+    const vs = this.state.vs ?? 1;
+    const vx = this.state.vx ?? (window.innerWidth <= 600 ? 18 : 44);
+    const vy = this.state.vy ?? (window.innerWidth <= 600 ? 132 : 84);
+    this.cur = { vx, vy, vs };
+    this.paneRef = this.paneRef || React.createRef();
+    const nav = {
+      view: 'translate(' + vx + 'px, ' + vy + 'px) scale(' + vs + ')',
+      paneRef: this.paneRef,
+      cvWheel: (e) => {
+        if (e.ctrlKey || e.metaKey) {
+          // pinch / ctrl+scroll = zoom toward pointer
+          const rect = e.currentTarget.getBoundingClientRect();
+          const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+          const k = Math.exp(-e.deltaY * 0.0035);
+          const ns = Math.max(0.3, Math.min(3, vs * k));
+          const kk = ns / vs;
+          this.setState({ vs: ns, vx: mx - (mx - vx) * kk, vy: my - (my - vy) * kk });
+        } else {
+          // two-finger scroll = pan
+          this.setState({ vx: vx - e.deltaX, vy: vy - e.deltaY });
+        }
+      },
+      infoOpen: this.state.info || false,
+      infoBg: this.state.info ? (dark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)') : 'none',
+      toggleInfo: () => this.setState({ info: !this.state.info, panel: false, nav2d: false, nav3d: false }),
+      panelOpen: this.state.panel,
+      panelBg: this.state.panel ? (dark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)') : 'none',
+      togglePanel: () => this.setState({ panel: !this.state.panel, nav2d: false, nav3d: false, info: false }),
+      nav2d: this.state.nav2d, nav3d: this.state.nav3d,
+      nav2dBg: this.state.nav2d ? (dark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)') : 'none',
+      nav3dBg: this.state.nav3d ? (dark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)') : 'none',
+      toggle2d: () => this.setState({ nav2d: !this.state.nav2d, nav3d: false, panel: false, info: false }),
+      toggle3d: () => this.setState({ nav3d: !this.state.nav3d, nav2d: false, panel: false, info: false }),
+      lightBg: !dark ? (dark ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.1)') : 'none',
+      darkBg: dark ? 'rgba(255,255,255,0.14)' : 'none',
+      setLight: () => this.setState({ uiTheme: 'light' }),
+      setDark: () => this.setState({ uiTheme: 'dark' }),
+      uiGap: gap, uiArcs: showArcs,
+      setGap: (e) => this.setState({ uiGap: parseInt(e.target.value, 10) }),
+      setArcs: (e) => this.setState({ uiArcs: e.target.checked }),
+      accent: PAL.verified,
+      legend: STATUS_ORDER.map((s) => ({
+        glyph: GLYPH[s], col: PAL[s], op: OPACITY[s], label: WORD[s]
+      }))
+    };
+
+    const dag = this.state.dag;
+    const graphTitle = dag ? dag.title : 'Causal DAG';
+    const graphMeta = dag ? 'causal DAG · ' + dag.nodes.length + ' nodes · ' + dag.arcs.filter((a) => a.class === 'annotation').length + ' cross-arcs · ' + dag.operation : 'causal DAG';
+    if (!dag || !dag.nodes.length) return { ready: false, showArcs, th, sel: {}, graphTitle, graphMeta, accent: PAL.verified, ...nav };
+
+    const byId = {}, kids = {};
+    dag.nodes.forEach((n) => { byId[n.id] = n; kids[n.id] = []; });
+    dag.nodes.forEach((n) => { if (n.parent) kids[n.parent].push(n.id); });
+
+    const rowH = 34, indent = 28, padX = 60, padY = 10;
+    const rows = [], depth = {};
+    const walk = (id, d) => { depth[id] = d; rows.push(id); kids[id].forEach((c) => walk(c, d + 1)); };
+    dag.roots.filter((id) => byId[id]).forEach((root) => walk(root, 0));
+    const pos = {};
+    rows.forEach((id, i) => { pos[id] = { x: padX + depth[id] * indent, y: padY + i * rowH + 13 }; });
+    let tW = 0;
+    const nodes = rows.map((id) => {
+      const n = byId[id], p = pos[id];
+      const selected = this.state.hover === id;
+      const shape = kindVisual(n.kind, selected);
+      tW = Math.max(tW, p.x + 17 + n.title.length * 7.85 + 20);
+      return {
+        x: p.x, y: p.y, lx: p.x + shape.size / 2 + 8,
+        status: n.status, kind: n.kind, glyph: GLYPH[n.status], title: n.title, col: PAL[n.status], op: OPACITY[n.status],
+        w: selected ? '600' : String(shape.weight), sz: shape.size, rot: shape.rotate, invRot: shape.inverse,
+        radius: shape.radius, bw: shape.border, shadow: shape.shadow,
+        enter: () => this.setState({ hover: id })
+      };
+    });
+    const tH = padY * 2 + rows.length * rowH;
+    const conns = rows.filter((id) => byId[id].parent).map((id) => {
+      const p = pos[byId[id].parent], c = pos[id];
+      return { d: 'M ' + p.x + ' ' + (p.y + gap + 2) + ' L ' + p.x + ' ' + c.y + ' L ' + (c.x - gap - 3) + ' ' + c.y };
+    });
+    const arcs = dag.arcs.map((a, i) => {
+      const f = pos[a.from], t = pos[a.to];
+      const cx = Math.min(f.x, t.x) - 34 - Math.abs(t.y - f.y) * 0.04;
+      const on = this.state.hover === 'arc:' + i;
+      return {
+        d: 'M ' + (f.x - 12) + ' ' + f.y + ' C ' + cx + ' ' + f.y + ', ' + cx + ' ' + t.y + ', ' + (t.x - 13) + ' ' + t.y,
+        ex: t.x - 13, ey: t.y,
+        col: on ? (ARCC[a.kind] || TOKENS.cross_arcs.rest) : TOKENS.cross_arcs.rest,
+        op: on ? 0.95 : TOKENS.cross_arcs.opacity, sw: on ? 1.75 : 1.1,
+        enter: () => this.setState({ hover: 'arc:' + i })
+      };
+    });
+
+    let sel;
+    if (String(this.state.hover).indexOf('arc:') === 0) {
+      const a = dag.arcs[+this.state.hover.slice(4)];
+      sel = {
+        glyph: '⤳', color: ARCC[a.kind] || th.sub, op: 1, statusWord: a.kind, kind: 'cross-arc', conf: '',
+        title: byId[a.from].title + '  →  ' + byId[a.to].title,
+        summary: a.note || '', ev: '—', links: []
+      };
+    } else {
+      const n = byId[this.state.hover] || dag.nodes[0];
+      const links = [];
+      dag.arcs.forEach((a) => {
+        if (a.from === n.id) links.push({ txt: a.kind + ' → ' + byId[a.to].title });
+        if (a.to === n.id) links.push({ txt: a.kind + ' ← ' + byId[a.from].title });
+      });
+      sel = {
+        glyph: GLYPH[n.status], color: PAL[n.status], op: OPACITY[n.status], statusWord: WORD[n.status],
+        kind: n.kind, conf: 'conf ' + n.conf.toFixed(2),
+        title: n.title, summary: n.summary, ev: n.ev, links
+      };
+    }
+
+    return { ready: true, showArcs, th, graphTitle, graphMeta, accent: PAL.verified, tW: Math.ceil(tW), tH, nodes, conns, arcs, sel, ...nav };
+  }
+}
+
+</script>
+
+
+</body></html>

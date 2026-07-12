@@ -373,6 +373,10 @@ impl Projection {
             json_pair("schema", Value::String(SCHEMA_NAME.to_owned())),
             json_pair("node_count", json!(self.node_count)),
             json_pair("edge_count", json!(self.edge_count)),
+            json_pair(
+                "annotation_edge_count",
+                json!(self.diagnostics.annotation_edge_count),
+            ),
             json_pair("degraded", Value::Bool(self.degraded)),
             json_pair("truncated", Value::Bool(page.truncated)),
             json_pair("applied_limit", json!(page.applied_limit)),

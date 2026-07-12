@@ -1,6 +1,7 @@
 use super::super::{
     commands::{
-        theme_choices, CheckpointItem, CommandContext, EffortChoice, ModelChoice, ResumeItem,
+        theme_choices, CausalDagStats, CheckpointItem, CommandContext, EffortChoice, ModelChoice,
+        ResumeItem,
     },
     event_loop::{InputEvent, UiEvent},
     status::TokenUsageSnapshot,
@@ -11,6 +12,8 @@ use crate::provider_config_runtime;
 use anyhow::Result;
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind, KeyModifiers};
 use euler_core::{EulerHome, ReasoningEffort, SessionRecord, SessionStore};
+#[cfg(test)]
+use euler_event::object;
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
@@ -95,6 +98,7 @@ pub(super) struct CommandContextParts {
     pub extension_items: Vec<super::super::commands::ExtensionManagerItem>,
     pub extension_slash_commands: Vec<super::super::commands::ExtensionSlashCommand>,
     pub code_swarm_models: Vec<String>,
+    pub causal_dag_stats: Option<CausalDagStats>,
 }
 
 pub(super) fn command_context(
@@ -133,6 +137,40 @@ pub(super) fn command_context(
         extension_items: parts.extension_items,
         extension_slash_commands: parts.extension_slash_commands,
         code_swarm_models: parts.code_swarm_models,
+        causal_dag_stats: parts.causal_dag_stats,
+    }
+}
+
+pub(super) fn causal_dag_stats_from_events(
+    events: &[EventEnvelope],
+    session_id: &str,
+) -> CausalDagStats {
+    let metadata = events.iter().rev().find_map(|event| {
+        if event.kind.as_str() != EventKind::EXTENSION_ARTIFACT
+            || event.payload.get("extension_id").and_then(Value::as_str) != Some("causal-dag")
+        {
+            return None;
+        }
+        let metadata = event.payload.get("metadata")?.as_object()?;
+        (metadata.get("schema").and_then(Value::as_str) == Some("euler.causal_dag.v2"))
+            .then_some(metadata)
+    });
+    CausalDagStats {
+        session_id: session_id.to_owned(),
+        node_count: metadata
+            .and_then(|value| value.get("node_count"))
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_default(),
+        cross_arc_count: metadata
+            .and_then(|value| {
+                value
+                    .get("annotation_edge_count")
+                    .or_else(|| value.get("cross_arc_count"))
+            })
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -373,6 +411,53 @@ fn usage_u64(usage: &serde_json::Map<String, Value>, field: &str) -> Option<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn causal_dag_stats_read_the_latest_graph_artifact_not_a_derived_export() {
+        let graph = EventEnvelope::new(
+            "session-1",
+            "agent-1",
+            None,
+            EventKind::EXTENSION_ARTIFACT,
+            object([
+                ("extension_id", "causal-dag".into()),
+                (
+                    "metadata",
+                    serde_json::json!({
+                        "schema": "euler.causal_dag.v2",
+                        "node_count": 35,
+                        "annotation_edge_count": 7
+                    }),
+                ),
+            ]),
+        );
+        let derived = EventEnvelope::new(
+            "session-1",
+            "agent-1",
+            None,
+            EventKind::EXTENSION_ARTIFACT,
+            object([
+                ("extension_id", "causal-dag".into()),
+                (
+                    "metadata",
+                    serde_json::json!({
+                        "schema": "euler.causal_dag.export.v1",
+                        "node_count": 1,
+                        "cross_arc_count": 0
+                    }),
+                ),
+            ]),
+        );
+
+        assert_eq!(
+            causal_dag_stats_from_events(&[graph, derived], "session-1"),
+            CausalDagStats {
+                session_id: "session-1".to_owned(),
+                node_count: 35,
+                cross_arc_count: 7,
+            }
+        );
+    }
 
     #[test]
     fn model_choices_include_builtin_local_and_custom_models() {

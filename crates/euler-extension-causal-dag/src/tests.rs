@@ -43,7 +43,8 @@ fn manifest_and_command_registration_are_stable() {
     assert_eq!(
         registrar.names,
         vec![
-            COMMAND_NAME,
+            EXPORT_COMMAND_NAME,
+            VIEW_COMMAND_NAME,
             UPDATE_COMMAND_NAME,
             CATCH_UP_COMMAND_NAME,
             OBSERVE_COMMAND_NAME,
@@ -59,7 +60,12 @@ fn manifest_and_command_registration_are_stable() {
 fn command_required_capabilities_are_command_scoped() {
     assert_eq!(
         CausalDagExportCommand.descriptor().required_capabilities,
-        vec![Capability::ProvenanceRead, Capability::ArtifactWrite]
+        vec![
+            Capability::ProvenanceRead,
+            Capability::ArtifactWrite,
+            Capability::FsRead,
+            Capability::FsWrite
+        ]
     );
     assert_eq!(
         CausalDagUpdateCommand.descriptor().required_capabilities,
@@ -1339,7 +1345,7 @@ fn export_writes_degraded_chronology_artifact_without_payload_content() {
     let second_bytes = &writes[1].bytes;
     let artifact: Value = serde_json::from_slice(first_bytes).expect("artifact json");
 
-    assert_eq!(first["event_count"], json!(3));
+    assert_eq!(first["node_count"], json!(3));
     assert_eq!(second["sha256"], json!(TEST_ARTIFACT_HASH));
     assert_eq!(first_bytes, second_bytes);
     assert!(!String::from_utf8_lossy(first_bytes).contains(secret));
@@ -3432,8 +3438,8 @@ fn empty_bounded_page_writes_empty_forest_with_fixed_timestamp() {
     let writes = host.writes.lock().expect("writes");
     let artifact: Value = serde_json::from_slice(&writes[0].bytes).expect("artifact json");
 
-    assert_eq!(output["event_count"], json!(0));
-    assert_eq!(output["degraded"], json!(false));
+    assert_eq!(output["node_count"], json!(0));
+    assert_eq!(output["active_graph"], json!(false));
     assert!(writes[0].source_event_ids.is_empty());
     assert_eq!(artifact["generated_at"], json!(EMPTY_GENERATED_AT));
     assert_eq!(artifact["session"]["event_range"]["start"], Value::Null);
@@ -3492,8 +3498,7 @@ fn limit_cursor_and_kind_filters_pass_through_host_query() {
         ]
     );
     assert!(!queries[0].include_blob_fields);
-    assert_eq!(output["truncated"], json!(true));
-    assert_eq!(output["next_after_event_id"], json!("event-2"));
+    assert_eq!(output["node_count"], json!(1));
     let writes = host.writes.lock().expect("writes");
     let artifact: Value = serde_json::from_slice(&writes[0].bytes).expect("artifact json");
     assert_eq!(artifact["session"]["event_range"]["complete"], json!(false));
@@ -3573,7 +3578,7 @@ fn extension_host_integration_writes_artifact_event() {
         .expect("register extension");
 
     let output = host
-        .execute_command(COMMAND_NAME, json!({"session_id": session_id}))
+        .execute_command(EXPORT_COMMAND_NAME, json!({"session_id": session_id}))
         .expect("execute export");
     let relative_path = output["relative_path"]
         .as_str()
@@ -3604,6 +3609,7 @@ fn extension_host_integration_writes_artifact_event() {
             "schema": SCHEMA_NAME,
             "node_count": 2,
             "edge_count": 1,
+            "annotation_edge_count": 0,
             "degraded": true,
             "truncated": false,
             "applied_limit": DEFAULT_LIMIT,
@@ -3918,16 +3924,21 @@ fn export_can_be_registered_with_command_scoped_capabilities() {
         session_id,
         "agent-1",
         writer,
-        [Capability::ProvenanceRead, Capability::ArtifactWrite],
+        [
+            Capability::ProvenanceRead,
+            Capability::ArtifactWrite,
+            Capability::FsRead,
+            Capability::FsWrite,
+        ],
     );
 
-    host.register_extension_for_command(&CausalDagExtension, COMMAND_NAME)
+    host.register_extension_for_command(&CausalDagExtension, EXPORT_COMMAND_NAME)
         .expect("register export only");
     let output = host
-        .execute_command(COMMAND_NAME, json!({"session_id": session_id}))
+        .execute_command(EXPORT_COMMAND_NAME, json!({"session_id": session_id}))
         .expect("execute export");
 
-    assert_eq!(output["schema"], json!(SCHEMA_NAME));
+    assert_eq!(output["source_schema"], json!(SCHEMA_NAME));
     assert_eq!(
         host.execute_command(UPDATE_COMMAND_NAME, json!({"session_id": session_id}))
             .expect_err("update was not registered"),

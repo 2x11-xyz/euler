@@ -21,6 +21,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(super) struct ActiveGraphState {
     artifact_event_id: String,
     artifact_sha256: String,
+    artifact_relative_path: Option<String>,
     projection_watermark_event_id: String,
     cursor_event_id: String,
     artifact: Value,
@@ -97,6 +98,7 @@ impl ActiveGraphState {
         let state = Self {
             artifact_event_id: record.persisted_event_id.clone(),
             artifact_sha256: record.sha256.clone(),
+            artifact_relative_path: Some(record.relative_path.clone()),
             projection_watermark_event_id,
             cursor_event_id,
             artifact,
@@ -125,6 +127,10 @@ impl ActiveGraphState {
 
     pub(super) fn artifact_sha256(&self) -> &str {
         &self.artifact_sha256
+    }
+
+    pub(super) fn artifact_relative_path(&self) -> Option<&str> {
+        self.artifact_relative_path.as_deref()
     }
 
     pub(super) fn watermark_event_id(&self) -> &str {
@@ -166,6 +172,7 @@ impl ActiveGraphState {
                 "schema"
                     | "artifact_event_id"
                     | "artifact_sha256"
+                    | "artifact_relative_path"
                     | "projection_watermark_event_id"
                     | "cursor_event_id"
                     | "artifact"
@@ -185,6 +192,7 @@ impl ActiveGraphState {
             .filter(|hash| valid_sha256(hash))
             .ok_or_else(|| state_message("active graph state has an invalid artifact hash"))?
             .to_owned();
+        let artifact_relative_path = parse_artifact_relative_path(object)?;
         let projection_watermark_event_id = bounded_id(
             object.get("projection_watermark_event_id"),
             "projection watermark",
@@ -223,6 +231,7 @@ impl ActiveGraphState {
         Ok(Self {
             artifact_event_id,
             artifact_sha256,
+            artifact_relative_path,
             projection_watermark_event_id,
             cursor_event_id,
             artifact,
@@ -234,10 +243,23 @@ impl ActiveGraphState {
             "schema": ACTIVE_STATE_SCHEMA,
             "artifact_event_id": self.artifact_event_id,
             "artifact_sha256": self.artifact_sha256,
+            "artifact_relative_path": self.artifact_relative_path,
             "projection_watermark_event_id": self.projection_watermark_event_id,
             "cursor_event_id": self.cursor_event_id,
             "artifact": self.artifact,
         })
+    }
+}
+
+fn parse_artifact_relative_path(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, ExtensionError> {
+    match object.get("artifact_relative_path") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path)) if valid_relative_path(path) => Ok(Some(path.clone())),
+        _ => Err(state_message(
+            "active graph state has an invalid artifact relative path",
+        )),
     }
 }
 
@@ -255,6 +277,15 @@ fn valid_bounded_id(value: &str) -> bool {
 
 fn valid_sha256(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 4096
+        && !Path::new(path).is_absolute()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn write_atomic(dir: &Path, bytes: &[u8]) -> io::Result<()> {

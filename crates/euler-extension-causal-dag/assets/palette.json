@@ -1,0 +1,111 @@
+{
+  "schema": "euler.causal_dag.palette.v1",
+  "backgrounds": {
+    "day": "#fdfcf9",
+    "night": "#121212",
+    "constellation": "#050507"
+  },
+  "structural_edges": {
+    "day": "#1c1b18",
+    "night": "#eceae2"
+  },
+  "status_order": [
+    "verified",
+    "success",
+    "open",
+    "inconclusive",
+    "blocked",
+    "dead_end",
+    "superseded",
+    "abandoned"
+  ],
+  "statuses": {
+    "verified": {
+      "day": "#0072B2",
+      "night": "#5ab3f0",
+      "glyph": "✓",
+      "label": "verified"
+    },
+    "success": {
+      "day": "#009E73",
+      "night": "#5fce9e",
+      "glyph": "●",
+      "label": "success"
+    },
+    "open": {
+      "day": "#E8B931",
+      "night": "#f0cb52",
+      "glyph": "○",
+      "label": "open"
+    },
+    "inconclusive": {
+      "day": "#43a5ad",
+      "night": "#6fd0d8",
+      "glyph": "◐",
+      "label": "inconclusive"
+    },
+    "blocked": {
+      "day": "#8a887f",
+      "night": "#9a988f",
+      "glyph": "⊟",
+      "label": "blocked"
+    },
+    "dead_end": {
+      "day": "#D55E00",
+      "night": "#ff8a52",
+      "glyph": "✗",
+      "label": "dead end"
+    },
+    "superseded": {
+      "day": "#9467bd",
+      "night": "#b78fe0",
+      "glyph": "⊘",
+      "label": "superseded"
+    },
+    "abandoned": {
+      "day": "#CC79A7",
+      "night": "#e79fc4",
+      "glyph": "⊗",
+      "label": "abandoned"
+    }
+  },
+  "kinds": {
+    "root": {
+      "shape": "ring",
+      "scale": 1.35,
+      "weight": 600
+    },
+    "attempt": {
+      "shape": "circle",
+      "scale": 1.0,
+      "weight": 400
+    },
+    "claim": {
+      "shape": "diamond",
+      "scale": 1.0,
+      "weight": 500
+    },
+    "checkpoint": {
+      "shape": "square",
+      "scale": 1.05,
+      "weight": 500
+    },
+    "synthesis": {
+      "shape": "double_ring",
+      "scale": 1.2,
+      "weight": 600
+    }
+  },
+  "cross_arcs": {
+    "rest": "#7f97a8",
+    "opacity": 0.45,
+    "kinds": {
+      "pivot": "#E8B931",
+      "evidence": "#43a5ad",
+      "supersedes": "#9467bd",
+      "refutation": "#D55E00",
+      "related": "#8a887f",
+      "artifact_use": "#0072B2"
+    }
+  }
+}

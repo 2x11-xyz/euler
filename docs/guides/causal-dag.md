@@ -17,16 +17,11 @@ Internally, graph nodes use these statuses:
 - `superseded`
 - `abandoned`
 
-For UI and planning, read them as five visible states:
-
-- **open**: `open`
-- **promising**: `blocked`, `inconclusive`, `success`
-- **verified**: `verified`
-- **dead end**: `dead_end`, `abandoned`
-- **superseded**: `superseded`
-
-Euler's slot summary currently highlights open nodes and dead-end-class nodes;
-the full artifact keeps the exact internal status.
+Visualization preserves all eight states. Status is encoded redundantly by
+color and glyph; kind (`root`, `attempt`, `claim`, `checkpoint`, `synthesis`)
+is encoded by outline shape, scale, and weight. The canonical tokens live in
+`crates/euler-extension-causal-dag/assets/palette.json` and are injected into
+every generated viewer.
 
 ## Enable it
 
@@ -44,15 +39,54 @@ euler extension run causal-dag.<command> <session.jsonl|session-id|session-name>
 
 ### `export`
 
-Project a bounded provenance window to an `euler.causal_dag.v2` artifact.
+Export the active `euler.causal_dag.v2` artifact. If no active semantic graph
+exists, the command first projects the requested bounded provenance window and
+uses that immutable artifact as the source.
 
 ```sh
-euler extension run causal-dag.export ./session.jsonl --limit 128
-euler extension run causal-dag.export ./session.jsonl --after-event-id <event-id>
-euler extension run causal-dag.export ./session.jsonl --kind user.message --kind tool.result
+euler extension run causal-dag.export ./session.jsonl --format html
+euler extension run causal-dag.export ./session.jsonl --format json
+euler extension run causal-dag.export ./session.jsonl --format markdown --out reports/dag.md
 ```
 
-Flags: `--limit`, `--scan-limit`, `--after-event-id`, repeatable `--kind`.
+Formats:
+
+- `html`: self-contained interactive 2D/3D viewer with inline code and data;
+  it performs no external requests.
+- `json`: the raw `euler.causal_dag.v2` artifact for analysis and training
+  pipelines.
+- `svg`: deterministic static vector view for documents and slides.
+- `dot`: Graphviz source for external layout tooling.
+- `markdown`: backbone outline, dead ends, open frontier, and cross-arcs.
+- `summary`: the compact `GRAPH:` context-slot text.
+
+Flags: `--format`, `--out`, `--limit`, `--scan-limit`, `--after-event-id`,
+repeatable `--kind`. The default format is `json`. `--out` accepts a
+workspace-relative, no-clobber file path; the provenance-backed extension
+artifact is still written first.
+
+### `view`
+
+Render the active path, open frontier, and dead ends into the transcript
+without writing a derived export file:
+
+```sh
+euler extension run causal-dag.view ./session.jsonl
+```
+
+The command requires an active graph, normally created by the round observer
+or `refresh`.
+
+### TUI surface
+
+`/causal-dag` opens an action picker with `view`, `export`, and `refresh`.
+`export` drills into all six formats and Backspace returns to the action
+picker. Direct flagged invocation remains available in the composer:
+
+```text
+/causal-dag export --format html --out reports/dag.html
+/causal-dag refresh --operation reframe
+```
 
 ### `update`
 
@@ -141,9 +175,9 @@ Run a one-turn observer against the active graph and unobserved provenance,
 then create an incremental, reframe, or final graph revision.
 
 ```text
-/causal-dag.refresh {"operation":"incremental"}
-/causal-dag.refresh {"operation":"reframe","policy":"rolling_and_final"}
-/causal-dag.refresh {"operation":"final","policy":"final_only"}
+/causal-dag refresh --operation incremental
+/causal-dag refresh {"operation":"reframe","policy":"rolling_and_final"}
+/causal-dag refresh {"operation":"final","policy":"final_only"}
 ```
 
 Arguments: `operation` (`incremental`, `reframe`, or `final`), `policy`
@@ -170,7 +204,7 @@ needed.
 `refresh` requires a live session because it uses the generic `agent-spawn`
 host capability. Offline `euler extension run` hosts can execute deterministic
 projection commands, but they cannot run the semantic observer. Invoke
-`causal-dag.refresh` from a TUI slash command or a resumed live session.
+`/causal-dag refresh` from the TUI or a resumed live session.
 
 ### `record-observation`
 
@@ -303,12 +337,12 @@ euler extension run causal-dag.export ./session.jsonl --limit 512
 euler extension run causal-dag.catch-up ./session.jsonl --limit 128 --max-ticks 16
 ```
 
-`export` is stateless. `catch-up` is checkpointed and suitable for repeated
-incremental projection. These commands summarize provenance structurally;
-they do not ask a model to reinterpret the completed problem-solving process.
-For a semantic retrospective graph, resume the session and run a `final`
-refresh. That final graph is another immutable revision, not a rewrite of the
-rolling history.
+Without an active graph, `export` performs a stateless structural projection.
+With one, every format is derived from the selected active revision.
+`catch-up` is checkpointed and suitable for repeated incremental projection.
+Neither asks a model to reinterpret the completed process. For a semantic
+retrospective graph, resume the session and run a `final` refresh. That final
+graph is another immutable revision, not a rewrite of rolling history.
 
 ### Agent-in-the-loop hints
 
@@ -395,3 +429,22 @@ human legibility, but must not invent graph semantics or become the source of
 truth. The interactive 2D/3D renderer belongs to the visualization/export
 consumer; this extension contract supplies the versioned graph and lineage it
 renders.
+
+The HTML export contains four switchable views: 2D top-down, 2D indented
+spine, 3D constellation, and 3.5D constellation with event order on the
+central axis. Annotation cross-arcs rest at `#7f97a8` with `0.45` opacity and
+switch to relationship-kind color on selection. Structural backbone edges
+remain neutral.
+
+The committed example is generated from the semantic fixture through the
+same command path. Run against a copy because offline extension execution
+appends provenance beside its input log:
+
+```sh
+mkdir -p /tmp/euler-causal-dag-example
+cp crates/euler-extension-causal-dag/tests/fixtures/causal_dag/knuth_style_search/events.jsonl \
+  /tmp/euler-causal-dag-example/events.jsonl
+mv docs/examples/knuth-gpt55-xhigh.html /tmp/euler-causal-dag-example/previous.html
+euler extension run causal-dag.export /tmp/euler-causal-dag-example/events.jsonl \
+  --format html --out docs/examples/knuth-gpt55-xhigh.html
+```

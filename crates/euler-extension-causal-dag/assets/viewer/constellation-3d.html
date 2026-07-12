@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--__EULER_RUNTIME__-->
+
+<script>
+document.addEventListener('click', function (e) {
+  var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+  if (!a) return;
+  var h = decodeURIComponent(a.getAttribute('href') || '').split('#')[0];
+  if (h.slice(-8) === '.dc.html') { e.preventDefault(); parent.postMessage({ dagNav: h }, '*'); }
+});
+</script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    html, body { margin: 0; background: #050507; }
+    @media (max-width: 600px) {
+      .dag-heading { top:14px !important; left:14px !important; right:14px !important; }
+      .dag-heading > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .dag-toolbar { top:58px !important; left:14px !important; right:auto !important; gap:5px !important; }
+      .dag-overlay { top:96px !important; left:14px !important; right:14px !important; width:auto !important; box-sizing:border-box; }
+      .dag-card { left:14px !important; right:14px !important; bottom:74px !important; width:auto !important; max-height:38vh; overflow:hidden; box-sizing:border-box; }
+      .dag-hint { display:none !important; }
+      .dag-legend { left:14px !important; right:14px !important; bottom:10px !important; gap:4px 9px !important; flex-wrap:wrap; font-size:9px !important; line-height:1.1; }
+    }
+  </style>
+</helmet>
+
+<div data-screen-label="Constellation 3D" style="position:fixed; inset:0; background:{{ th.bg }}; overflow:hidden; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;">
+  <canvas ref="{{ canvasRef }}" onwheel="{{ onWheel }}" style="position:absolute; inset:0; width:100%; height:100%; display:block; cursor:grab; touch-action:none;"></canvas>
+
+  <div class="dag-heading" style="position:absolute; top:22px; left:26px; pointer-events:none; display:flex; flex-direction:column; gap:3px;">
+    <div style="color:{{ th.text }}; font-size:13px; font-weight:600;">{{ graphTitle }}</div>
+    <div style="color:{{ th.sub }}; font-size:11.5px;">{{ graphMeta }}</div>
+  </div>
+
+  <div class="dag-toolbar" style="position:absolute; top:22px; right:26px; display:flex; gap:8px; align-items:flex-start;">
+    <button onclick="{{ toggleInfo }}" style="background:{{ infoBg }}; color:{{ th.sub }}; border:1px solid {{ th.border }}; padding:6px 10px; font-size:11px; font-family:inherit; cursor:pointer;">ⓘ</button>
+    <div style="position:relative;">
+      <button onclick="{{ toggle2d }}" style="background:{{ nav2dBg }}; color:{{ th.sub }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">2D ▾</button>
+      <sc-if value="{{ nav2d }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+          <a href="2D%20Indented%20Spine.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">indented spine</a>
+          <a href="2D%20Top-Down.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">top-down</a>
+        </div>
+      </sc-if>
+    </div>
+    <div style="position:relative;">
+      <button onclick="{{ toggle3d }}" style="background:{{ nav3dBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">3D ▾</button>
+      <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+          <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.text }}; text-decoration:none; font-size:11px; white-space:nowrap;">3D · constellation</a>
+          <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · time axis</a>
+        </div>
+      </sc-if>
+    </div>
+    <button onclick="{{ togglePanel }}" style="background:{{ panelBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">tune</button>
+  </div>
+
+  <sc-if value="{{ infoOpen }}" hint-placeholder-val="{{ false }}">
+    <div class="dag-overlay" style="position:absolute; top:58px; right:26px; width:312px; display:flex; flex-direction:column; gap:10px; padding:16px 18px 18px; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+      <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">What you're looking at</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">A causal DAG of an agent session, drawn in 3D. Solid edges are the canonical backbone; color and glyph carry status, while outline shape carries node kind. Dashed arrows are annotation links between branches.</div>
+      <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">How to interact</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Drag to orbit, scroll to zoom. Hover a node or a dashed arrow — the card at bottom-left shows its story. tune sets theme, orbit, fog, and focus blur.</div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ panelOpen }}" hint-placeholder-val="{{ false }}">
+    <div class="dag-overlay" style="position:absolute; top:58px; right:26px; width:232px; display:flex; flex-direction:column; gap:13px; padding:15px 16px 17px; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+      <div style="display:flex; flex-direction:column; gap:6px; color:{{ th.sub }}; font-size:11px;">
+        theme
+        <div style="display:flex; gap:6px;">
+          <button onclick="{{ setCosmic }}" style="flex:1; background:{{ cosmicBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 0; font-size:11px; font-family:inherit; cursor:pointer;">cosmic</button>
+          <button onclick="{{ setMisty }}" style="flex:1; background:{{ mistyBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 0; font-size:11px; font-family:inherit; cursor:pointer;">misty</button>
+        </div>
+      </div>
+      <label style="display:flex; align-items:center; justify-content:space-between; color:{{ th.sub }}; font-size:11px; cursor:pointer;">auto orbit
+        <input type="checkbox" checked="{{ uiAuto }}" onchange="{{ setAuto }}" style="accent-color:#82b4f2; cursor:pointer;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
+        <span style="display:flex; justify-content:space-between;"><span>orbit speed</span><span style="color:{{ th.faint }};">{{ uiSpd }}</span></span>
+        <input type="range" min="0" max="1" step="0.05" value="{{ uiSpd }}" onchange="{{ setSpd }}" style="accent-color:#82b4f2; width:100%; margin:0;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
+        <span style="display:flex; justify-content:space-between;"><span>fog</span><span style="color:{{ th.faint }};">{{ uiFog }}</span></span>
+        <input type="range" min="0" max="0.85" step="0.05" value="{{ uiFog }}" onchange="{{ setFog }}" style="accent-color:#82b4f2; width:100%; margin:0;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
+        <span style="display:flex; justify-content:space-between;"><span>focus blur</span><span style="color:{{ th.faint }};">{{ uiDof }}px</span></span>
+        <input type="range" min="0" max="4" step="0.5" value="{{ uiDof }}" onchange="{{ setDof }}" style="accent-color:#82b4f2; width:100%; margin:0;">
+      </label>
+    </div>
+  </sc-if>
+
+  <div class="dag-hint" style="position:absolute; bottom:42px; right:26px; color:{{ th.hint }}; font-size:11px; pointer-events:none; white-space:nowrap;">drag to orbit · scroll to zoom · hover a node or a dashed arc</div>
+
+  <div class="dag-legend" style="position:absolute; bottom:18px; right:26px; display:flex; align-items:center; gap:14px; font-size:11px; color:{{ th.sub }}; pointer-events:none;">
+    <sc-for list="{{ legend }}" as="g" hint-placeholder-count="0">
+      <span style="display:flex; align-items:center; gap:6px;"><span style="color:{{ g.col }};">{{ g.glyph }}</span>{{ g.label }}</span>
+    </sc-for>
+  </div>
+
+  <sc-if value="{{ ready }}" hint-placeholder-val="{{ true }}">
+    <div class="dag-card" style="position:absolute; bottom:52px; left:26px; width:340px; display:flex; flex-direction:column; gap:9px; padding:15px 17px 16px; background:{{ th.cardBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px); pointer-events:none;">
+      <div style="display:flex; flex-wrap:nowrap; gap:8px; align-items:baseline; font-size:11.5px; white-space:nowrap;">
+        <span style="font-size:15px; color:{{ sel.color }};">{{ sel.glyph }}</span>
+        <span style="color:{{ sel.color }};">{{ sel.statusWord }}</span>
+        <span style="color:{{ th.sub }}; flex:none;">· {{ sel.kind }}</span>
+        <span style="margin-left:auto; color:{{ th.sub }}; flex:none;">{{ sel.conf }}</span>
+      </div>
+      <div style="color:{{ th.text }}; font-size:13px; font-weight:600; line-height:1.4;">{{ sel.title }}</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.55;">{{ sel.summary }}</div>
+      <div style="color:{{ th.faint }}; font-size:10.5px;">evidence {{ sel.ev }}</div>
+      <sc-for list="{{ sel.links }}" as="l" hint-placeholder-count="0">
+        <div style="color:{{ th.sub }}; font-size:10.5px; line-height:1.5;">{{ l.txt }}</div>
+      </sc-for>
+    </div>
+  </sc-if>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script="" data-props="{
+  &quot;theme&quot;: { &quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;cosmic&quot;, &quot;misty&quot;], &quot;default&quot;: &quot;cosmic&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;Theme&quot; },
+  &quot;autoOrbit&quot;: { &quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Camera&quot; },
+  &quot;orbitSpeed&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.35, &quot;min&quot;: 0, &quot;max&quot;: 1, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Camera&quot; },
+  &quot;fog&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.55, &quot;min&quot;: 0, &quot;max&quot;: 0.85, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Depth&quot; },
+  &quot;dofBlur&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.5, &quot;min&quot;: 0, &quot;max&quot;: 4, &quot;step&quot;: 0.5, &quot;unit&quot;: &quot;px&quot;, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Depth&quot; }
+}">
+const __DAG = /*__EULER_DAG__*/;
+const TOKENS = /*__EULER_PALETTE__*/;
+const STATUS_ORDER = TOKENS.status_order;
+const DAY = Object.fromEntries(STATUS_ORDER.map((s) => [s, TOKENS.statuses[s].day]));
+const NIGHT = Object.fromEntries(STATUS_ORDER.map((s) => [s, TOKENS.statuses[s].night]));
+const GLYPH = Object.fromEntries(STATUS_ORDER.map((s) => [s, TOKENS.statuses[s].glyph]));
+const WORD = Object.fromEntries(STATUS_ORDER.map((s) => [s, TOKENS.statuses[s].label]));
+const OPACITY = Object.fromEntries(STATUS_ORDER.map((s) => [s, 1]));
+const ARC_DAY = TOKENS.cross_arcs.kinds;
+const ARC_NIGHT = TOKENS.cross_arcs.kinds;
+const ARCC = TOKENS.cross_arcs.kinds;
+const KIND = TOKENS.kinds;
+const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
+
+function hexA(hex, alpha) {
+  const value = parseInt(hex.slice(1), 16);
+  return 'rgba(' + (value >> 16) + ',' + ((value >> 8) & 255) + ',' + (value & 255) + ',' + alpha + ')';
+}
+
+function drawKindOutline(ctx, x, y, radius, kind, color, alpha) {
+  const token = KIND[kind] || KIND.attempt;
+  const r = radius * token.scale + 2;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.strokeStyle = hexA(color, alpha);
+  ctx.lineWidth = token.shape === 'ring' ? 2 : 1;
+  ctx.beginPath();
+  if (token.shape === 'diamond') {
+    ctx.moveTo(0, -r); ctx.lineTo(r, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0); ctx.closePath();
+  } else if (token.shape === 'square') {
+    ctx.rect(-r, -r, r * 2, r * 2);
+  } else {
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+  }
+  ctx.stroke();
+  if (token.shape === 'double_ring') {
+    ctx.beginPath(); ctx.arc(0, 0, r + 3, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+class Component extends DCLogic {
+  state = { ready: false, selId: null, selArc: null, panel: false, nav2d: false, nav3d: false, uiAuto: null, uiSpd: null, uiFog: null, uiDof: null, uiTheme: null };
+
+  isMisty() { return (this.state.uiTheme ?? this.props.theme ?? 'cosmic') === 'misty'; }
+  fogDefault() { return this.isMisty() ? 0.85 : (this.props.fog ?? 0.55); }
+  fogValue() { return this.state.uiFog ?? this.fogDefault(); }
+  dofValue() { return this.state.uiDof ?? this.props.dofBlur ?? 0.5; }
+
+  componentDidMount() {
+    this.yaw = 0.8; this.pitch = 0.42; this.zoom = 1;
+    this.drag = null; this.lastPointer = 0;
+    this.dag = __DAG; this.prepare();
+    const selected = this.dag.active_root || this.dag.roots[0] || (this.dag.nodes[0] && this.dag.nodes[0].id) || null;
+    this.setState({ ready: Boolean(selected), selId: selected });
+    this.raf = requestAnimationFrame(this.tick);
+    this.bindCanvas();
+  }
+
+  // React's pointer-event props don't bind in this runtime — attach natively
+  bindCanvas() {
+    const cv = this.canvasRef && this.canvasRef.current;
+    if (!cv || this.bound) return;
+    this.bound = true;
+    cv.addEventListener('pointerdown', (e) => {
+      this.lastPointer = performance.now();
+      this.drag = { x: e.clientX, y: e.clientY };
+      try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+      const hit = this.pick(e);
+      if (hit) this.applyPick(hit);
+    });
+    cv.addEventListener('pointermove', (e) => {
+      this.lastPointer = performance.now();
+      if (this.drag) {
+        this.yaw -= (e.clientX - this.drag.x) * 0.005;
+        this.pitch = clamp(this.pitch + (e.clientY - this.drag.y) * 0.004, 0.05, 1.25);
+        this.drag = { x: e.clientX, y: e.clientY };
+      } else {
+        const hit = this.pick(e);
+        if (hit) this.applyPick(hit);
+      }
+    });
+    const up = () => { this.drag = null; };
+    cv.addEventListener('pointerup', up);
+    cv.addEventListener('pointercancel', up);
+  }
+  componentWillUnmount() { cancelAnimationFrame(this.raf); }
+
+  prepare() {
+    const { nodes, arcs } = this.dag;
+    const byId = {}, kids = {};
+    nodes.forEach((n) => { byId[n.id] = n; kids[n.id] = []; });
+    nodes.forEach((n) => { if (n.parent) kids[n.parent].push(n.id); });
+    this.byId = byId;
+    const leaves = {};
+    const countLeaves = (id) => {
+      const ks = kids[id];
+      leaves[id] = ks.length ? ks.reduce((s, c) => s + countLeaves(c), 0) : 1;
+      return leaves[id];
+    };
+    const roots = this.dag.roots.filter((id) => byId[id]);
+    roots.forEach(countLeaves);
+    const hash = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; };
+    const jit = (id, k) => ((hash(id + k) % 1000) / 1000 - 0.5) * 12;
+    const P = {};
+    const place = (id, a0, a1, d) => {
+      const am = (a0 + a1) / 2, r = d * 52;
+      P[id] = { x: Math.cos(am) * r + jit(id, 'x'), y: -d * 46 + jit(id, 'y'), z: Math.sin(am) * r + jit(id, 'z') };
+      let a = a0;
+      kids[id].forEach((c) => { const w = (a1 - a0) * leaves[c] / leaves[id]; place(c, a, a + w, d + 1); a += w; });
+    };
+    const totalLeaves = roots.reduce((sum, id) => sum + leaves[id], 0) || 1;
+    let angle = 0;
+    roots.forEach((root) => {
+      const width = Math.PI * 2 * leaves[root] / totalLeaves;
+      place(root, angle, angle + width, roots.length > 1 ? 1 : 0);
+      angle += width;
+    });
+    let cy = 0;
+    nodes.forEach((n) => { cy += P[n.id].y; });
+    cy /= Math.max(1, nodes.length);
+    nodes.forEach((n) => { P[n.id].y -= cy; });
+    this.P = P;
+    this.pts = nodes.map((n) => ({
+      id: n.id, p: P[n.id], st: n.status, kind: n.kind,
+      big: n.kind === 'root' || n.kind === 'synthesis'
+    }));
+    this.edges = nodes.filter((n) => n.parent).map((n) => [n.parent, n.id]);
+    this.arcs3 = arcs.map((a) => [a.from, a.to]);
+  }
+
+  tick = (t) => {
+    const auto = this.state.uiAuto ?? this.props.autoOrbit ?? true;
+    const spd = this.state.uiSpd ?? this.props.orbitSpeed ?? 0.35;
+    if (auto && !this.drag && t - this.lastPointer > 2200) this.yaw += 0.005 * spd;
+    this.draw();
+    this.raf = requestAnimationFrame(this.tick);
+  };
+
+  project(w, h) {
+    const cosY = Math.cos(this.yaw), sinY = Math.sin(this.yaw);
+    const cosP = Math.cos(this.pitch), sinP = -Math.sin(this.pitch);
+    const camD = 1250 / this.zoom, f = 1050;
+    const S = {};
+    let minZ = 1e9, maxZ = -1e9;
+    for (const id in this.P) {
+      const p = this.P[id];
+      const x1 = p.x * cosY + p.z * sinY;
+      const z1 = -p.x * sinY + p.z * cosY;
+      const y1 = p.y * cosP - z1 * sinP;
+      const z2 = p.y * sinP + z1 * cosP;
+      const cz = z2 + camD, s = f / cz;
+      S[id] = { x: w / 2 + x1 * s, y: h / 2 - y1 * s, cz, s };
+      if (cz < minZ) minZ = cz;
+      if (cz > maxZ) maxZ = cz;
+    }
+    const fog = this.fogValue();
+    const dof = this.dofValue();
+    const span = Math.max(1, maxZ - minZ);
+    const focusSpan = Math.max(120, span * 0.5);
+    for (const id in S) {
+      S[id].a = 1 - fog * ((S[id].cz - minZ) / span);
+      S[id].blur = dof ? Math.round(clamp(dof * Math.abs(S[id].cz - camD) / focusSpan, 0, dof) * 2) / 2 : 0;
+    }
+    return S;
+  }
+
+  proj3(p, w, h, camD, f) {
+    const cosY = Math.cos(this.yaw), sinY = Math.sin(this.yaw);
+    const cosP = Math.cos(this.pitch), sinP = -Math.sin(this.pitch);
+    const x1 = p.x * cosY + p.z * sinY;
+    const z1 = -p.x * sinY + p.z * cosY;
+    const y1 = p.y * cosP - z1 * sinP;
+    const z2 = p.y * sinP + z1 * cosP;
+    const cz = z2 + camD, s = f / cz;
+    return { x: w / 2 + x1 * s, y: h / 2 - y1 * s };
+  }
+
+  draw() {
+    const cv = this.canvasRef && this.canvasRef.current;
+    if (!cv || !this.P) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (!w || !h) return;
+    if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+      cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const misty = this.isMisty();
+    const PAL = misty ? DAY : NIGHT;
+    const edgeRGB = misty ? '28,27,24' : '236,234,226';
+    ctx.fillStyle = misty ? '#fdfcf9' : '#050507';
+    ctx.fillRect(0, 0, w, h);
+    const S = this.project(w, h);
+    const camD = 1250 / this.zoom, f = 1050;
+
+    // backbone edges: white, gap at both ends
+    ctx.lineWidth = 1;
+    for (const [a, b] of this.edges) {
+      const A = S[a], B = S[b];
+      const dx = B.x - A.x, dy = B.y - A.y, L = Math.hypot(dx, dy) || 1;
+      const rA = clamp(5.5 * A.s, 1.5, 11) + 5, rB = clamp(5.5 * B.s, 1.5, 11) + 5;
+      if (L < rA + rB + 4) continue;
+      const al = 0.55 * Math.min(A.a, B.a);
+      ctx.strokeStyle = 'rgba(' + edgeRGB + ',' + al.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(A.x + dx / L * rA, A.y + dy / L * rA);
+      ctx.lineTo(B.x - dx / L * rB, B.y - dy / L * rB);
+      ctx.stroke();
+    }
+
+    // cross-arcs: dashed 3D beziers, subordinate; selectable
+    ctx.setLineDash([3, 7]);
+    this.arcHit = [];
+    this.arcs3.forEach(([a, b], ai) => {
+      const pa = this.P[a], pb = this.P[b];
+      const mid = { x: (pa.x + pb.x) / 2 * 1.45, y: (pa.y + pb.y) / 2 + 30, z: (pa.z + pb.z) / 2 * 1.45 };
+      const on = this.state.selArc === ai;
+      const kind = this.dag.arcs[ai].kind;
+      const arcColor = on ? (ARCC[kind] || TOKENS.cross_arcs.rest) : TOKENS.cross_arcs.rest;
+      const al = (on ? 0.95 : TOKENS.cross_arcs.opacity) * Math.min(S[a].a, S[b].a);
+      const pts = [];
+      for (let i = 0; i <= 20; i++) {
+        const u = i / 20, v = 1 - u;
+        const q = {
+          x: v * v * pa.x + 2 * v * u * mid.x + u * u * pb.x,
+          y: v * v * pa.y + 2 * v * u * mid.y + u * u * pb.y,
+          z: v * v * pa.z + 2 * v * u * mid.z + u * u * pb.z
+        };
+        const sp = this.proj3(q, w, h, camD, f);
+        pts.push(sp);
+      }
+      const strokeArc = () => {
+        ctx.beginPath();
+        pts.forEach((point, i) => { if (i === 0) ctx.moveTo(point.x, point.y); else ctx.lineTo(point.x, point.y); });
+        ctx.stroke();
+      };
+      ctx.strokeStyle = hexA(arcColor, al * 0.2);
+      ctx.lineWidth = on ? 5 : 3;
+      strokeArc();
+      ctx.strokeStyle = hexA(arcColor, al);
+      ctx.lineWidth = on ? 1.75 : 1.1;
+      strokeArc();
+      // arrowhead near the target end, for directionality
+      if (pts.length >= 3) {
+        const pe = pts[pts.length - 1], pp = pts[pts.length - 3];
+        let ax = pe.x - pp.x, ay = pe.y - pp.y;
+        const AL = Math.hypot(ax, ay) || 1;
+        ax /= AL; ay /= AL;
+        const tx2 = pe.x - ax * 14, ty2 = pe.y - ay * 14;
+        ctx.setLineDash([]);
+        ctx.fillStyle = hexA(arcColor, Math.min(1, al * 1.6));
+        ctx.beginPath();
+        ctx.moveTo(tx2, ty2);
+        ctx.lineTo(tx2 - ax * 8 - ay * 4, ty2 - ay * 8 + ax * 4);
+        ctx.lineTo(tx2 - ax * 8 + ay * 4, ty2 - ay * 8 - ax * 4);
+        ctx.closePath(); ctx.fill();
+        ctx.setLineDash([3, 7]);
+      }
+      this.arcHit.push(pts);
+    });
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
+
+    // nodes, back to front
+    const order = [...this.pts].sort((p, q) => S[q.id].cz - S[p.id].cz);
+    this.hit = [];
+    for (const n of order) {
+      const s = S[n.id];
+      n.col = PAL[n.st];
+      const r = clamp((n.big ? 7.5 : 5.5) * s.s, 1.5, 12);
+      const a = clamp(s.a, 0.12, 1);
+      // fake bokeh: out-of-focus nodes render as bigger, softer, dimmer discs
+      // (radial gradients only — no canvas filter, which is far too slow)
+      const bl = s.blur || 0;
+      const rr = r + bl * 2.2;
+      const soft = clamp(bl / 3, 0, 0.85);
+      const glow = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, rr * 3.4);
+      glow.addColorStop(0, hexA(n.col, 0.55 * a / (1 + bl * 0.5)));
+      glow.addColorStop(1, hexA(n.col, 0));
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(s.x, s.y, rr * 3.4, 0, Math.PI * 2); ctx.fill();
+      const core = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, rr);
+      core.addColorStop(0, hexA(n.col, 0.95 * a / (1 + bl * 0.6)));
+      core.addColorStop(clamp(1 - soft, 0.15, 1), hexA(n.col, 0.9 * a / (1 + bl * 0.6)));
+      core.addColorStop(1, hexA(n.col, 0));
+      ctx.fillStyle = core;
+      ctx.beginPath(); ctx.arc(s.x, s.y, rr, 0, Math.PI * 2); ctx.fill();
+      if (bl < 1.5) {
+        ctx.fillStyle = 'rgba(255,255,255,' + (0.8 * a * (1 - bl / 1.5)).toFixed(3) + ')';
+        ctx.beginPath(); ctx.arc(s.x, s.y, r * 0.35, 0, Math.PI * 2); ctx.fill();
+      }
+      drawKindOutline(ctx, s.x, s.y, r, n.kind, n.col, 0.9 * a);
+      if (r >= 4) {
+        ctx.font = Math.max(7, r * 1.15).toFixed(1) + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = misty ? 'rgba(253,252,249,0.95)' : 'rgba(5,5,7,0.9)';
+        ctx.fillText(GLYPH[n.st], s.x, s.y + 0.5);
+        ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+      }
+      if (n.id === this.state.selId) {
+        ctx.strokeStyle = 'rgba(' + edgeRGB + ',0.75)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(s.x, s.y, r + 5, 0, Math.PI * 2); ctx.stroke();
+        const ttl = this.byId[n.id].title;
+        ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillStyle = 'rgba(' + edgeRGB + ',0.9)';
+        ctx.fillText(ttl.length > 42 ? ttl.slice(0, 41) + '…' : ttl, s.x + r + 12, s.y + 4);
+      }
+      this.hit.push({ id: n.id, x: s.x, y: s.y, r: Math.max(r, 7) });
+    }
+  }
+
+  pick(e) {
+    const cv = this.canvasRef.current;
+    if (!cv || !this.hit) return null;
+    const rect = cv.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    let best = null, bd = 16;
+    for (const hh of this.hit) {
+      const d = Math.hypot(hh.x - mx, hh.y - my);
+      if (d < bd + hh.r - 7) { bd = d; best = { type: 'node', id: hh.id }; }
+    }
+    if (best) return best;
+    // arcs: distance to sampled polyline segments
+    if (this.arcHit) {
+      let abd = 7;
+      this.arcHit.forEach((pts, ai) => {
+        for (let i = 0; i + 1 < pts.length; i++) {
+          const ax = pts[i].x, ay = pts[i].y, bx = pts[i + 1].x, by = pts[i + 1].y;
+          const vx = bx - ax, vy = by - ay, L2 = vx * vx + vy * vy || 1;
+          const t = clamp(((mx - ax) * vx + (my - ay) * vy) / L2, 0, 1);
+          const d = Math.hypot(ax + vx * t - mx, ay + vy * t - my);
+          if (d < abd) { abd = d; best = { type: 'arc', ai }; }
+        }
+      });
+    }
+    return best;
+  }
+
+  renderVals() {
+    this.canvasRef = this.canvasRef || React.createRef();
+    const vals = {
+      ready: this.state.ready,
+      graphTitle: this.dag ? this.dag.title : 'Causal DAG',
+      graphMeta: this.dag ? 'causal DAG · ' + this.dag.nodes.length + ' nodes · ' + this.dag.arcs.filter((a) => a.class === 'annotation').length + ' cross-arcs · ' + this.dag.operation : 'causal DAG',
+      canvasRef: this.canvasRef,
+      onWheel: (e) => {
+        this.lastPointer = performance.now();
+        this.zoom = clamp(this.zoom * Math.exp(-e.deltaY * 0.0012), 0.45, 2.8);
+      },
+      sel: {},
+      th: this.isMisty() ? {
+        bg: '#fdfcf9', text: '#26251f', sub: '#8a887f', body: '#4a4840', faint: '#b0aea4',
+        border: 'rgba(0,0,0,0.14)', menuBg: 'rgba(255,255,255,0.92)', cardBg: 'rgba(255,255,255,0.88)',
+        hint: 'rgba(28,27,24,0.4)'
+      } : {
+        bg: '#050507', text: '#eceae2', sub: '#8f92a3', body: '#a9abb8', faint: '#6d7080',
+        border: 'rgba(255,255,255,0.16)', menuBg: 'rgba(10,11,14,0.92)', cardBg: 'rgba(10,11,14,0.72)',
+        hint: 'rgba(236,234,226,0.35)'
+      },
+      legend: STATUS_ORDER.map((s) => ({
+        glyph: GLYPH[s],
+        col: (this.isMisty() ? DAY : NIGHT)[s],
+        label: WORD[s]
+      })),
+      cosmicBg: !this.isMisty() ? 'rgba(255,255,255,0.14)' : 'none',
+      mistyBg: this.isMisty() ? 'rgba(0,0,0,0.1)' : 'none',
+      setCosmic: () => this.setState({ uiTheme: 'cosmic', uiFog: 0.55 }),
+      setMisty: () => this.setState({ uiTheme: 'misty', uiFog: 0.85 }),
+      infoOpen: this.state.info || false,
+      infoBg: this.state.info ? (this.isMisty() ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.12)') : 'none',
+      toggleInfo: () => this.setState({ info: !this.state.info, panel: false, nav2d: false, nav3d: false }),
+      panelOpen: this.state.panel,
+      panelBg: this.state.panel ? 'rgba(255,255,255,0.12)' : 'none',
+      togglePanel: () => this.setState({ panel: !this.state.panel, nav2d: false, nav3d: false, info: false }),
+      nav2d: this.state.nav2d || false,
+      nav3d: this.state.nav3d || false,
+      nav2dBg: this.state.nav2d ? 'rgba(255,255,255,0.12)' : 'none',
+      nav3dBg: this.state.nav3d ? 'rgba(255,255,255,0.12)' : 'none',
+      toggle2d: () => this.setState({ nav2d: !this.state.nav2d, nav3d: false, panel: false, info: false }),
+      toggle3d: () => this.setState({ nav3d: !this.state.nav3d, nav2d: false, panel: false, info: false }),
+      uiAuto: this.state.uiAuto ?? this.props.autoOrbit ?? true,
+      uiSpd: this.state.uiSpd ?? this.props.orbitSpeed ?? 0.35,
+      uiFog: this.fogValue(),
+      uiDof: this.dofValue(),
+      setAuto: (e) => this.setState({ uiAuto: e.target.checked }),
+      setSpd: (e) => this.setState({ uiSpd: parseFloat(e.target.value) }),
+      setFog: (e) => this.setState({ uiFog: parseFloat(e.target.value) }),
+      setDof: (e) => this.setState({ uiDof: parseFloat(e.target.value) })
+    };
+    if (this.dag && this.dag.nodes.length) {
+      const PAL = this.isMisty() ? DAY : NIGHT;
+      const AC = this.isMisty() ? ARC_DAY : ARCC;
+      if (this.state.selArc != null) {
+        const a = this.dag.arcs[this.state.selArc];
+        vals.sel = {
+          glyph: '⤳', color: AC[a.kind] || '#8f92a3', statusWord: a.kind, kind: 'cross-arc',
+          conf: '', title: this.byId[a.from].title + '  →  ' + this.byId[a.to].title,
+          summary: a.note || '', ev: '—',
+          links: []
+        };
+      } else {
+        const n = this.byId[this.state.selId];
+        const links = [];
+        this.dag.arcs.forEach((a) => {
+          if (a.from === n.id) links.push({ txt: a.kind + ' → ' + this.byId[a.to].title });
+          if (a.to === n.id) links.push({ txt: a.kind + ' ← ' + this.byId[a.from].title });
+        });
+        vals.sel = {
+          glyph: GLYPH[n.status], color: PAL[n.status], statusWord: WORD[n.status],
+          kind: n.kind, conf: 'conf ' + n.conf.toFixed(2),
+          title: n.title, summary: n.summary, ev: n.ev, links
+        };
+      }
+    }
+    return vals;
+  }
+
+  applyPick(hit) {
+    if (hit.type === 'node') {
+      if (this.state.selId !== hit.id || this.state.selArc != null) this.setState({ selId: hit.id, selArc: null });
+    } else {
+      if (this.state.selArc !== hit.ai) this.setState({ selArc: hit.ai });
+    }
+  }
+}
+
+</script>
+
+
+</body></html>

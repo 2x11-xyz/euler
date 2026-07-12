@@ -2532,8 +2532,11 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#""runtime_kind":"native-rust","capabilities":["provenance-read","#,
                 r#""artifact-write","fs-read","fs-write","agent-record","agent-spawn","context-slot"],"commands":[{{"name":"export","#,
                 r#""display_name":"Export causal DAG","#,
-                r#""summary":"Export a deterministic Causal DAG artifact from bounded provenance.","#,
-                r#""required_capabilities":["provenance-read","artifact-write"]}},{{"name":"update","#,
+                r#""summary":"Export the active Causal DAG as HTML, JSON, SVG, DOT, Markdown, or summary.","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write"]}},{{"name":"view","#,
+                r#""display_name":"View causal DAG","#,
+                r#""summary":"Show the active path, open frontier, and dead ends without writing a file.","#,
+                r#""required_capabilities":["fs-read","fs-write"]}},{{"name":"update","#,
                 r#""display_name":"Update causal DAG","#,
                 r#""summary":"Run one durable checkpointed Causal DAG projection tick.","#,
                 r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"]}},{{"name":"catch-up","#,
@@ -2846,13 +2849,14 @@ fn extension_search_reports_deterministic_bundled_metadata_json() {
         ])
     );
     assert_eq!(result["commands"][0]["name"], "export");
-    assert_eq!(result["commands"][1]["name"], "update");
-    assert_eq!(result["commands"][2]["name"], "catch-up");
-    assert_eq!(result["commands"][3]["name"], "observe");
-    assert_eq!(result["commands"][4]["name"], "refresh");
-    assert_eq!(result["commands"][5]["name"], "observer-brief");
-    assert_eq!(result["commands"][6]["name"], "observer-apply");
-    assert_eq!(result["commands"][7]["name"], "record-observation");
+    assert_eq!(result["commands"][1]["name"], "view");
+    assert_eq!(result["commands"][2]["name"], "update");
+    assert_eq!(result["commands"][3]["name"], "catch-up");
+    assert_eq!(result["commands"][4]["name"], "observe");
+    assert_eq!(result["commands"][5]["name"], "refresh");
+    assert_eq!(result["commands"][6]["name"], "observer-brief");
+    assert_eq!(result["commands"][7]["name"], "observer-apply");
+    assert_eq!(result["commands"][8]["name"], "record-observation");
     assert!(!stdout.contains(home.path().to_string_lossy().as_ref()));
 
     let summary_search = command_with_home(exe, &home)
@@ -3649,12 +3653,17 @@ fn extension_cli_enable_and_run_causal_dag_export() {
     let artifact_event = events_after.last().expect("extension artifact event");
     let projection_watermark = events_before.last().expect("projection watermark");
 
-    assert_eq!(stdout["schema"], serde_json::json!("euler.causal_dag.v2"));
     assert_eq!(
-        stdout["event_count"],
-        serde_json::json!(events_before.len())
+        stdout["schema"],
+        serde_json::json!("euler.causal_dag.export.v1")
     );
-    assert_eq!(stdout["degraded"], serde_json::json!(false));
+    assert_eq!(
+        stdout["source_schema"],
+        serde_json::json!("euler.causal_dag.v2")
+    );
+    assert_eq!(stdout["format"], serde_json::json!("json"));
+    assert_eq!(stdout["active_graph"], serde_json::json!(false));
+    assert_eq!(stdout["node_count"], serde_json::json!(events_before.len()));
     assert!(relative_path.starts_with(&format!(
         "sessions/{session_id}/extensions/causal-dag/artifacts/"
     )));
@@ -3789,7 +3798,7 @@ fn extension_cli_enable_and_run_causal_dag_export() {
     let empty_artifact: serde_json::Value =
         serde_json::from_slice(&empty_artifact_bytes).expect("empty artifact json");
 
-    assert_eq!(empty_stdout["event_count"], serde_json::json!(0));
+    assert_eq!(empty_stdout["node_count"], serde_json::json!(0));
     assert_eq!(
         empty_artifact["generated_at"],
         serde_json::json!("1970-01-01T00:00:00Z")

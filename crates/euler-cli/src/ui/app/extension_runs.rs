@@ -22,32 +22,6 @@ impl ExtensionRunRequest {
 }
 
 impl AppCore {
-    pub(super) fn dag_export(&mut self) -> CoreEffect {
-        let enabled = match &self.state {
-            AppState::Idle { session } => session.extension_enabled("causal-dag"),
-            _ => {
-                // Check registry/session context when not idle.
-                self.current_extension_context()
-                    .0
-                    .iter()
-                    .find(|item| item.id == "causal-dag")
-                    .is_some_and(|item| item.enabled)
-            }
-        };
-        if !enabled {
-            return self.teach_notice(crate::ui::commands::disabled_extension_teach(
-                "/dag",
-                "causal-dag",
-            ));
-        }
-        self.extension_run(
-            "causal-dag".to_owned(),
-            "export".to_owned(),
-            serde_json::Value::Object(serde_json::Map::new()),
-            None,
-        )
-    }
-
     pub(super) fn open_extension_manager(&mut self) -> CoreEffect {
         self.rebuild_bottom_surface();
         self.bottom.open_extension_manager();

@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 
 mod active_state;
 mod construction;
+mod export;
 mod observer_apply;
 mod observer_brief;
 mod projection;
@@ -16,6 +17,8 @@ mod record_observation;
 mod refresh;
 mod revision;
 mod slot_summary;
+mod view;
+use export::{CausalDagExportCommand, EXPORT_COMMAND_NAME};
 use observer_apply::{CausalDagObserverApplyCommand, OBSERVER_APPLY_COMMAND_NAME};
 use observer_brief::{CausalDagObserverBriefCommand, OBSERVER_BRIEF_COMMAND_NAME};
 use projection::Projection;
@@ -31,10 +34,10 @@ use revision::{execute_observe_projection, ObservationCommit};
 use slot_summary::{publish_graph_slot, with_slot_publication, SlotPublication};
 #[cfg(test)]
 use slot_summary::{render_slot_summary, GRAPH_SLOT_NAME};
+use view::{CausalDagViewCommand, VIEW_COMMAND_NAME};
 
 const EXTENSION_ID: &str = "causal-dag";
 const DISPLAY_NAME: &str = "Causal DAG";
-const COMMAND_NAME: &str = "export";
 const UPDATE_COMMAND_NAME: &str = "update";
 const CATCH_UP_COMMAND_NAME: &str = "catch-up";
 const OBSERVE_COMMAND_NAME: &str = "observe";
@@ -80,7 +83,8 @@ impl Extension for CausalDagExtension {
     }
 
     fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
-        registrar.register_command(COMMAND_NAME, Box::new(CausalDagExportCommand));
+        registrar.register_command(EXPORT_COMMAND_NAME, Box::new(CausalDagExportCommand));
+        registrar.register_command(VIEW_COMMAND_NAME, Box::new(CausalDagViewCommand));
         registrar.register_command(UPDATE_COMMAND_NAME, Box::new(CausalDagUpdateCommand));
         registrar.register_command(CATCH_UP_COMMAND_NAME, Box::new(CausalDagCatchUpCommand));
         registrar.register_command(OBSERVE_COMMAND_NAME, Box::new(CausalDagObserveCommand));
@@ -98,60 +102,6 @@ impl Extension for CausalDagExtension {
             Box::new(CausalDagRecordObservationCommand),
         );
         Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CausalDagExportCommand;
-
-impl ExtensionCommand for CausalDagExportCommand {
-    fn descriptor(&self) -> CommandDescriptor {
-        CommandDescriptor {
-            name: COMMAND_NAME.to_owned(),
-            display_name: "Export causal DAG".to_owned(),
-            summary: "Export a deterministic Causal DAG artifact from bounded provenance."
-                .to_owned(),
-            required_capabilities: UPDATE_CAPABILITIES[..2].to_vec(),
-            args: provenance_query_args(true, true),
-            accepts_session_id: true,
-        }
-    }
-
-    fn execute(
-        &self,
-        context: CommandContext,
-        host: &dyn HostApi,
-    ) -> Result<Value, ExtensionError> {
-        let input = ExportInput::parse(&context.input)?;
-        let page = host.query_provenance(input.query())?;
-        let split = split_update_events(&page.events)?;
-        let projection = Projection::from_events(
-            &split.source_events,
-            input.session_id.as_deref(),
-            !page.truncated,
-        )?;
-        let source_event_ids = event_ids(&split.source_events);
-        let event_count = source_event_ids.len();
-        let record = write_projection_artifact(host, &projection, &page, source_event_ids)?;
-
-        Ok(json!({
-            "schema": SCHEMA_NAME,
-            "persisted_event_id": record.persisted_event_id,
-            "relative_path": record.relative_path,
-            "sha256": record.sha256,
-            "byte_len": record.byte_len,
-            "event_count": event_count,
-            "node_count": projection.node_count(),
-            "edge_count": projection.edge_count(),
-            "degraded": projection.degraded(),
-            "truncated": page.truncated,
-            "applied_limit": page.applied_limit,
-            "applied_scan_limit": page.applied_scan_limit,
-            "scanned_events": page.scanned_events,
-            "next_after_event_id": page.next_after_event_id,
-            "watermark_event_id": projection.watermark_event_id(),
-            "query_watermark_event_id": page.watermark_event_id,
-        }))
     }
 }
 
@@ -303,56 +253,6 @@ fn watermark_arg() -> ArgSpec {
         value_kind: ArgValueKind::BoundedString { max_bytes: 128 },
         required: false,
         repeatable: false,
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ExportInput {
-    limit: usize,
-    scan_limit: Option<usize>,
-    after_event_id: Option<String>,
-    kinds: Vec<String>,
-    session_id: Option<String>,
-}
-
-impl ExportInput {
-    fn parse(value: &Value) -> Result<Self, ExtensionError> {
-        if value.is_null() {
-            return Ok(Self::default());
-        }
-        let object = value
-            .as_object()
-            .ok_or_else(|| input_error("causal-dag export input must be a JSON object"))?;
-        reject_unknown_fields(object, false)?;
-        Ok(Self {
-            limit: parse_limit(object)?,
-            scan_limit: parse_optional_positive_usize(object, "scan_limit")?,
-            after_event_id: optional_string(object, "after_event_id")?,
-            kinds: optional_string_array(object, "kinds")?,
-            session_id: optional_non_empty_string(object, "session_id")?,
-        })
-    }
-
-    fn query(&self) -> ProvenanceQuery {
-        let mut query = ProvenanceQuery::new(self.limit);
-        if let Some(scan_limit) = self.scan_limit {
-            query.scan_limit = scan_limit;
-        }
-        query.after_event_id.clone_from(&self.after_event_id);
-        query.kinds.clone_from(&self.kinds);
-        query
-    }
-}
-
-impl Default for ExportInput {
-    fn default() -> Self {
-        Self {
-            limit: DEFAULT_LIMIT,
-            scan_limit: None,
-            after_event_id: None,
-            kinds: Vec::new(),
-            session_id: None,
-        }
     }
 }
 

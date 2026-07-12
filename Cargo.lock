@@ -516,6 +516,7 @@ dependencies = [
  "euler-event",
  "euler-provider",
  "euler-sdk",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",

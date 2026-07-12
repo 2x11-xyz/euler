@@ -2511,7 +2511,7 @@ fn disabled_extension_notice_renders_every_entrance_without_dedup() {
     // is entered — typed, via palette, or via the extension run form — not
     // just once per session.
     let theme = Theme::default();
-    let message = crate::ui::commands::disabled_extension_teach("/dag", "causal-dag");
+    let message = crate::ui::commands::disabled_extension_teach("/causal-dag", "causal-dag");
     let items = vec![
         TranscriptItem::Notice(message.clone()),
         TranscriptItem::Notice(message.clone()),

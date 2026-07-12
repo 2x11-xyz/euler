@@ -644,7 +644,7 @@ fn extension_parse_accepts_causal_dag_record_observation_run() {
 }
 
 #[test]
-fn causal_dag_catalog_lists_observe_command() {
+fn causal_dag_catalog_lists_registered_commands() {
     let descriptor = bundled_extensions::bundled_descriptor_by_id("causal-dag")
         .expect("descriptor load")
         .expect("causal-dag");
@@ -658,6 +658,7 @@ fn causal_dag_catalog_lists_observe_command() {
         commands,
         vec![
             "export",
+            "view",
             "update",
             "catch-up",
             "observe",

@@ -1,5 +1,5 @@
-use crate::projection::Projection;
-use euler_sdk::HostApi;
+use crate::{input_error, projection::Projection};
+use euler_sdk::{ExtensionError, HostApi};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -37,9 +37,84 @@ struct SummaryParts {
 }
 
 pub(crate) fn render_slot_summary(projection: &Projection) -> String {
-    let mut parts = SummaryParts::from_projection(projection);
+    let graph = SummaryGraph::from_projection(projection);
+    render_graph_summary(&graph)
+}
+
+pub(crate) fn render_artifact_summary(artifact: &Value) -> Result<String, ExtensionError> {
+    let graph = SummaryGraph::from_artifact(artifact)?;
+    Ok(render_graph_summary(&graph))
+}
+
+fn render_graph_summary(graph: &SummaryGraph) -> String {
+    let mut parts = SummaryParts::from_graph(graph);
     parts.fit_to_budget();
     parts.render()
+}
+
+struct SummaryGraph {
+    active_root: Option<String>,
+    roots: Vec<String>,
+    nodes: Vec<Value>,
+    edges: Vec<Value>,
+}
+
+impl SummaryGraph {
+    fn from_projection(projection: &Projection) -> Self {
+        Self {
+            active_root: projection.active_root_id().map(str::to_owned),
+            roots: projection.root_ids().map(str::to_owned).collect(),
+            nodes: projection.nodes().to_vec(),
+            edges: projection.edges().to_vec(),
+        }
+    }
+
+    fn from_artifact(artifact: &Value) -> Result<Self, ExtensionError> {
+        let forest = artifact
+            .get("forest")
+            .and_then(Value::as_object)
+            .ok_or_else(|| input_error("causal-dag artifact is missing `forest`"))?;
+        let roots = forest
+            .get("roots")
+            .and_then(Value::as_array)
+            .ok_or_else(|| input_error("causal-dag artifact is missing `forest.roots`"))?
+            .iter()
+            .map(|root| {
+                root.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| input_error("causal-dag forest.roots must contain strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let active_root = match forest.get("active_root") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(root)) => Some(root.clone()),
+            _ => return Err(input_error("causal-dag forest.active_root is invalid")),
+        };
+        let nodes = forest
+            .get("nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| input_error("causal-dag artifact is missing `forest.nodes`"))?;
+        let edges = forest
+            .get("edges")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| input_error("causal-dag artifact is missing `forest.edges`"))?;
+        Ok(Self {
+            active_root,
+            roots,
+            nodes,
+            edges,
+        })
+    }
+
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,10 +166,10 @@ pub(crate) fn with_slot_publication(mut output: Value, publication: SlotPublicat
 }
 
 impl SummaryParts {
-    fn from_projection(projection: &Projection) -> Self {
-        let ordering = BackboneOrdering::from_projection(projection);
-        let nodes = projection_nodes(projection, &ordering.order);
-        let root_title = root_title(projection, &nodes);
+    fn from_graph(graph: &SummaryGraph) -> Self {
+        let ordering = BackboneOrdering::from_graph(graph);
+        let nodes = projection_nodes(graph, &ordering.order);
+        let root_title = root_title(graph, &nodes);
         let mut active_path = ordering
             .active_path
             .iter()
@@ -113,8 +188,8 @@ impl SummaryParts {
             header: format!(
                 "GRAPH: {} ({} nodes, {} edges)",
                 bounded_text(&root_title, ROOT_TITLE_BYTES),
-                projection.node_count(),
-                projection.edge_count()
+                graph.node_count(),
+                graph.edge_count()
             ),
             active_path,
             active_hidden,
@@ -205,16 +280,17 @@ struct BackboneOrdering {
 }
 
 impl BackboneOrdering {
-    fn from_projection(projection: &Projection) -> Self {
-        let children = backbone_children(projection.edges());
-        let roots = ordered_roots(projection);
+    fn from_graph(graph: &SummaryGraph) -> Self {
+        let children = backbone_children(&graph.edges);
+        let roots = ordered_roots(graph);
         let mut order = BTreeMap::new();
         let mut next = 0usize;
         for root in &roots {
             assign_order(root, &children, &mut order, &mut next);
         }
-        let active_root = projection
-            .active_root_id()
+        let active_root = graph
+            .active_root
+            .as_deref()
             .or_else(|| roots.first().map(String::as_str));
         let active_path = active_root.map_or_else(Vec::new, |root| best_path(root, &children));
         Self { order, active_path }
@@ -222,11 +298,11 @@ impl BackboneOrdering {
 }
 
 fn projection_nodes(
-    projection: &Projection,
+    graph: &SummaryGraph,
     backbone_order: &BTreeMap<String, usize>,
 ) -> BTreeMap<String, NodeSummary> {
-    projection
-        .nodes()
+    graph
+        .nodes
         .iter()
         .filter_map(|node| {
             let id = string_field(node, "id")?;
@@ -247,11 +323,12 @@ fn projection_nodes(
         .collect()
 }
 
-fn root_title(projection: &Projection, nodes: &BTreeMap<String, NodeSummary>) -> String {
-    projection
-        .active_root_id()
+fn root_title(graph: &SummaryGraph, nodes: &BTreeMap<String, NodeSummary>) -> String {
+    graph
+        .active_root
+        .as_deref()
         .and_then(|id| nodes.get(id))
-        .or_else(|| projection.root_ids().find_map(|id| nodes.get(id)))
+        .or_else(|| graph.roots.iter().find_map(|id| nodes.get(id)))
         .map(|node| node.title.clone())
         .unwrap_or_else(|| "empty graph".to_owned())
 }
@@ -276,8 +353,8 @@ fn backbone_children(edges: &[Value]) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-fn ordered_roots(projection: &Projection) -> Vec<String> {
-    projection.root_ids().map(str::to_owned).collect()
+fn ordered_roots(graph: &SummaryGraph) -> Vec<String> {
+    graph.roots.clone()
 }
 
 fn assign_order(
