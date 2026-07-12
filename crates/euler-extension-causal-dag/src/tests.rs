@@ -44,6 +44,7 @@ fn manifest_and_command_registration_are_stable() {
             CATCH_UP_COMMAND_NAME,
             OBSERVE_COMMAND_NAME,
             OBSERVER_BRIEF_COMMAND_NAME,
+            OBSERVER_APPLY_COMMAND_NAME,
             RECORD_OBSERVATION_COMMAND_NAME
         ]
     );
@@ -138,6 +139,120 @@ fn observer_brief_over_knuth_fixture_builds_bounded_agent_task() {
         "Every non-root node must have exactly one incoming canonical_backbone structural edge"
     ));
     assert!(output["observe_window"]["watermark_event_id"].is_string());
+    // Round-observer apply passthrough: the same window (plus the session
+    // assertion), echoed by core into observer-apply untouched.
+    assert_eq!(output["apply"]["limit"], json!(64));
+    assert_eq!(
+        output["apply"]["watermark_event_id"],
+        output["observe_window"]["watermark_event_id"]
+    );
+    assert_eq!(output["apply"]["session_id"], json!("session-knuth"));
+    assert!(output["apply"].get("causal_dag").is_none());
+}
+
+#[test]
+fn observer_apply_folds_companion_hints_and_echoes_attribution() {
+    let (mut events, _) = load_knuth_fixture();
+    let hints = extract_observer_hints(&mut events);
+    let watermark = events.last().expect("events").id.clone();
+    let host = RecordingHost::new(recording_page(events, DEFAULT_LIMIT, None, false));
+
+    let output = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "apply": {
+                        "limit": 64,
+                        "watermark_event_id": watermark,
+                        "session_id": "session-knuth"
+                    },
+                    "companion": {
+                        "ok": true,
+                        "summary": "companion completed",
+                        "output": serde_json::to_string(&hints).expect("hints text"),
+                        "error": null,
+                        "child_agent_id": "agent-observer",
+                        "spawn_event_id": "evt-spawn",
+                        "result_event_id": "evt-result"
+                    }
+                }),
+            },
+            &host,
+        )
+        .expect("observer apply");
+
+    assert_eq!(output["schema"], json!(SCHEMA_NAME));
+    assert_eq!(output["command"], json!("observer-apply"));
+    assert_eq!(output["degraded"], json!(false));
+    assert_eq!(output["slot_published"], json!(true));
+    assert_eq!(
+        output["companion"]["child_agent_id"],
+        json!("agent-observer")
+    );
+    assert_eq!(output["companion"]["spawn_event_id"], json!("evt-spawn"));
+    assert_eq!(output["companion"]["result_event_id"], json!("evt-result"));
+    assert_eq!(host.writes.lock().expect("writes").len(), 1);
+    let slots = host.slots.lock().expect("slots");
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].0, GRAPH_SLOT_NAME);
+}
+
+#[test]
+fn observer_apply_accepts_fenced_companion_output() {
+    let (mut events, _) = load_knuth_fixture();
+    let hints = extract_observer_hints(&mut events);
+    let host = RecordingHost::new(recording_page(events, DEFAULT_LIMIT, None, false));
+    let fenced = format!(
+        "```json\n{}\n```",
+        serde_json::to_string(&hints).expect("hints text")
+    );
+
+    let output = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "apply": {"session_id": "session-knuth"},
+                    "companion": {"ok": true, "output": fenced}
+                }),
+            },
+            &host,
+        )
+        .expect("observer apply");
+
+    assert_eq!(output["command"], json!("observer-apply"));
+    assert_eq!(host.writes.lock().expect("writes").len(), 1);
+}
+
+#[test]
+fn observer_apply_rejects_failed_companion_without_query_or_write() {
+    let host = RecordingHost::empty();
+
+    let error = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "apply": {"session_id": "session-knuth"},
+                    "companion": {
+                        "ok": false,
+                        "summary": "companion failed",
+                        "output": null,
+                        "error": "budget exhausted: max_tokens"
+                    }
+                }),
+            },
+            &host,
+        )
+        .expect_err("failed companion must not project");
+
+    assert!(
+        error
+            .to_string()
+            .contains("companion failed: budget exhausted"),
+        "error names the companion failure: {error}"
+    );
+    assert!(host.queries.lock().expect("queries").is_empty());
+    assert!(host.writes.lock().expect("writes").is_empty());
+    assert!(host.slots.lock().expect("slots").is_empty());
 }
 
 #[test]

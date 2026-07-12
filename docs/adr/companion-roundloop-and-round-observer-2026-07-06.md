@@ -91,6 +91,46 @@ Boundary defense: core schedules and plumbs three things core already owns
 extension; the primitive is generic over any (brief, apply) command pair.
 causal-dag is the first consumer, not the design.
 
+Amendment (2026-07-12, observer-loop repair): the loop's authority split and
+envelope contract are now explicit, fixing the two defects that kept the
+in-session loop from ever closing.
+
+- **Observer companion capabilities: none.** The companion is a one-turn
+  generation task — it PRODUCES the observation and performs no writes, so
+  its `AgentTask` carries an empty capability set. Granting the extension's
+  manifest set to the companion (the previous behavior) failed companion
+  subset validation against the parent session's tool-permission
+  capabilities — extension-host capabilities (artifact-write, context-slot,
+  agent-record, provenance-read) are never in that set — and rejected every
+  spawn before `agent.spawn`. All writes happen in the apply command, which
+  core executes with the extension's manifest grant (the existing
+  capability-gated path); the brief and apply commands keep that grant
+  unchanged.
+- **Brief envelope**: a JSON object with `task` (required string), optional
+  `provider`/`model` (both or neither), optional `system_prompt` (string,
+  becomes the companion's system instructions — this is how the extension
+  teaches the observer its output schema), optional `budget`
+  (`max_turns`/`max_tool_calls`/`max_tokens`), and an opaque `apply` value.
+  Unknown fields are ignored; a malformed envelope fails the tick fail-open
+  (`failed_stage="envelope"` semantics under the brief stage).
+- **Apply envelope**: core calls the apply command with exactly
+  `{ "apply": <brief apply value untouched>, "companion": { ok, summary,
+  output, error, child_agent_id, spawn_event_id, result_event_id } }`.
+  The extension owns both halves: the brief must thread whatever
+  window/checkpoint context its apply step needs through `apply`, and the
+  apply step extracts the companion's `output` itself.
+- **causal-dag pairing**: `(observer-brief, observer-apply)`. The brief's
+  `apply` passthrough is its observe window (`limit`, optional
+  `scan_limit`/`after_event_id`, `watermark_event_id`, optional
+  `session_id`); `observer-apply` parses the companion output as raw
+  `euler.causal_dag.hints.v1` JSON (one surrounding markdown fence is
+  stripped), folds it over the same bounded window cut at the brief's
+  watermark, writes the graph artifact, and publishes the `graph` context
+  slot. A failed companion or non-hints output is an apply error — recorded
+  fail-open, never laundered into a degraded projection. The previous
+  pairing (`record-observation` as apply) could not consume the envelope at
+  all: it is a post-hoc audit command and stays one.
+
 ## Future (v0.2, explicitly out of scope now)
 
 Manifest-declared extension ticks and HostApi::run_companion as the

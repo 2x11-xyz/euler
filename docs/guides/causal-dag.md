@@ -88,6 +88,26 @@ euler extension run causal-dag.observer-brief ./session.jsonl --limit 64 --max-t
 
 Flags: `--limit`, `--scan-limit`, `--after-event-id`, `--max-tokens`.
 
+The brief output carries an `apply` object (the observe window plus the
+session assertion) that the in-session round observer echoes untouched into
+`observer-apply`.
+
+### `observer-apply`
+
+Apply half of the in-session round-observer loop; not meant for direct CLI
+use. Core invokes it after the observer companion turn with the envelope
+
+```json
+{ "apply": <observer-brief apply object>,
+  "companion": { "ok": true, "output": "<raw hints JSON>", "...": "..." } }
+```
+
+It parses the companion output as raw `euler.causal_dag.hints.v1` JSON (a
+single surrounding markdown code fence is tolerated), folds the hints over
+the brief's bounded window (cut at the brief watermark), writes a graph
+artifact, and publishes the `graph` context slot. A failed companion or
+non-hints output is a command error; the driver turn continues fail-open.
+
 ### `observe`
 
 Fold an observer-produced hints JSON file over a bounded provenance page and
@@ -200,6 +220,23 @@ Backbone rule:
 Use `metadata: {}` unless a bounded derived annotation is necessary.
 
 ## Workflows
+
+### In-session automated observer
+
+Run the round-boundary observer during the session itself:
+
+```sh
+euler exec --extensions causal-dag --observe causal-dag --observe-cadence 8 \
+  "Read BRIEF.md and carry it out."
+```
+
+At every `--observe-cadence` completed driver rounds (default 8), core runs
+`observer-brief`, spawns a one-turn zero-capability observer companion with
+the brief's task and system prompt, and hands the companion's raw hints
+output to `observer-apply`, which writes the graph artifact and publishes
+the `graph` context slot into the driver's own context. The chain is
+fail-open: any brief/companion/apply failure is recorded to diagnostics
+(`round_observer_end`) and never fails the driver turn.
 
 ### Post-hoc graph from a completed run
 

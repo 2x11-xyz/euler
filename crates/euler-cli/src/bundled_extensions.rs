@@ -50,7 +50,7 @@ impl BundledExtension {
 
 pub(crate) static BUNDLED_EXTENSIONS: &[BundledExtension] = &[
     BundledExtension::new(&SessionExportExtension),
-    BundledExtension::with_observer(&CausalDagExtension, "observer-brief", "record-observation"),
+    BundledExtension::with_observer(&CausalDagExtension, "observer-brief", "observer-apply"),
     BundledExtension::new(&CodeSwarmExtension),
     BundledExtension::new(&DiagnosticsReportExtension),
     BundledExtension::new(&AutoresearchExtension),

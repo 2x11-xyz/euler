@@ -184,6 +184,16 @@ fn output_value(
         "watermark_event_id".to_owned(),
         watermark_event_id.clone().into(),
     );
+    // Round-observer apply passthrough: core echoes this value untouched
+    // into the observer-apply command as the `apply` field. It is exactly
+    // the observe window (plus the session assertion) so the apply step
+    // folds the companion's hints over the same bounded page the brief
+    // listed — replay fidelity between what the observer saw and what the
+    // projection covers.
+    let mut apply = observe_window.clone();
+    if let Some(session_id) = &input.session_id {
+        apply.insert("session_id".to_owned(), session_id.clone().into());
+    }
 
     let mut output = Map::new();
     output.insert("schema".to_owned(), OBSERVER_BRIEF_SCHEMA_NAME.into());
@@ -198,6 +208,7 @@ fn output_value(
         json!({"max_turns": 1, "max_tool_calls": 0, "max_tokens": input.max_tokens}),
     );
     output.insert("observe_window".to_owned(), Value::Object(observe_window));
+    output.insert("apply".to_owned(), Value::Object(apply));
     output.insert("watermark_event_id".to_owned(), watermark_event_id.into());
     output.insert(
         "after_event_id_echo".to_owned(),

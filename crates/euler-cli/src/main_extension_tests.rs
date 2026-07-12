@@ -616,6 +616,7 @@ fn causal_dag_catalog_lists_observe_command() {
             "catch-up",
             "observe",
             "observer-brief",
+            "observer-apply",
             "record-observation"
         ]
     );

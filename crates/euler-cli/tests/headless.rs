@@ -408,6 +408,128 @@ fn diagnostics_bind_failure_does_not_fail_headless_session() {
 }
 
 #[test]
+fn exec_observe_causal_dag_spawns_observer_companion_and_stays_fail_open() {
+    // A static fixture script cannot cite runtime event ids, so the apply
+    // stage rejects the scripted hints; the load-bearing semantic-tier proof
+    // (round_observer_end ok=true, DEAD ENDS slot) lives in
+    // euler-extension-causal-dag/tests/observer_loop.rs. This test pins the
+    // CLI wiring end-to-end: --observe causal-dag reaches the round
+    // observer, the observer companion SPAWNS as a zero-capability task
+    // (the loop used to die at the companion stage before any agent.spawn),
+    // the companion consumes ITS response instead of stealing the driver's,
+    // and a failing apply never breaks the driver turn (fail-open).
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    fs::write(root.path().join("input.txt"), "observer input\n").expect("write input");
+    let script = write_fixture_script(
+        root.path(),
+        "observer-loop.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        {
+          "tool_call": {
+            "id": "call-read",
+            "name": "read_file",
+            "input": { "path": "input.txt" }
+          }
+        },
+        { "finished": { "stop_reason": "tool_use" } }
+      ]
+    },
+    {
+      "events": [
+        { "text_delta": "{\"schema\":\"euler.causal_dag.hints.v1\",\"nodes\":[],\"edges\":[]}" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    },
+    {
+      "events": [
+        { "text_delta": "driver done" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+
+    let output = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("exec")
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provider-option")
+        .arg(format!("event-script={}", path_str(&script)))
+        .arg("--provenance")
+        .arg(path_str(&log))
+        .arg("--extensions")
+        .arg("causal-dag")
+        .arg("--observe")
+        .arg("causal-dag")
+        .arg("--observe-cadence")
+        .arg("1")
+        .arg("--auto-approve")
+        .arg("trusted-local")
+        .arg("read input.txt and summarize")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run exec with observer");
+
+    assert!(
+        output.status.success(),
+        "fail-open: observer apply failure must not fail the exec turn; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("assistant: driver done"),
+        "driver turn completes with its own final response: {stdout}"
+    );
+
+    let events = read_jsonl(&log);
+    let spawns = events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
+        .collect::<Vec<_>>();
+    assert_eq!(spawns.len(), 1, "observer companion must spawn");
+    assert_eq!(spawns[0].payload["persona"], "round-observer");
+    assert_eq!(
+        spawns[0].payload["capabilities"],
+        serde_json::json!([]),
+        "observer companion is a zero-capability generation task"
+    );
+    let results = events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].payload["ok"], true);
+    assert!(
+        results[0].payload["output"]
+            .as_str()
+            .expect("observer output")
+            .contains("euler.causal_dag.hints.v1"),
+        "observer companion consumed the observer-scripted response"
+    );
+
+    let lines = read_diagnostics_jsonl(&root.path().join("diagnostics.jsonl"));
+    let observer_end = lines
+        .iter()
+        .find(|line| line["event"] == "round_observer_end")
+        .expect("round_observer_end diagnostic");
+    assert_eq!(
+        observer_end["failed_stage"], "apply",
+        "companion stage passes; the statically scripted hints are honestly rejected at apply: {observer_end}"
+    );
+}
+
+#[test]
 fn diagnostics_canary_excludes_user_tool_payloads_and_secret_sentinels() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
@@ -2420,7 +2542,10 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#""required_capabilities":["provenance-read","artifact-write","context-slot"]}},{{"name":"observer-brief","#,
                 r#""display_name":"Build observer brief","#,
                 r#""summary":"Build a bounded companion AgentTask for observing a provenance window.","#,
-                r#""required_capabilities":["provenance-read"]}},{{"name":"record-observation","#,
+                r#""required_capabilities":["provenance-read"]}},{{"name":"observer-apply","#,
+                r#""display_name":"Apply observer output","#,
+                r#""summary":"Fold a round-observer companion's hints output into a Causal DAG projection.","#,
+                r#""required_capabilities":["provenance-read","artifact-write","context-slot"]}},{{"name":"record-observation","#,
                 r#""display_name":"Record Causal DAG observation","#,
                 r#""summary":"Record post-hoc observer audit metadata for an existing Causal DAG artifact.","#,
                 r#""required_capabilities":["provenance-read","agent-record"]}}]}}"#,
@@ -2718,7 +2843,8 @@ fn extension_search_reports_deterministic_bundled_metadata_json() {
     assert_eq!(result["commands"][2]["name"], "catch-up");
     assert_eq!(result["commands"][3]["name"], "observe");
     assert_eq!(result["commands"][4]["name"], "observer-brief");
-    assert_eq!(result["commands"][5]["name"], "record-observation");
+    assert_eq!(result["commands"][5]["name"], "observer-apply");
+    assert_eq!(result["commands"][6]["name"], "record-observation");
     assert!(!stdout.contains(home.path().to_string_lossy().as_ref()));
 
     let summary_search = command_with_home(exe, &home)
