@@ -36,7 +36,7 @@ use tracing_subscriber::{Layer, Registry};
 const EXTENSION_ID: &str = "causal-dag";
 const SESSION_ID: &str = "session-observer-loop";
 const OBSERVER_TASK_MARKER: &str = "Observe this bounded Euler event window";
-const NEW_EVENTS_MARKER: &str = "NEW EVENTS (new claims cite these event ids):";
+const NEW_EVENTS_MARKER: &str = "NEW EVENTS (use the source alias as source_ref.event_id):";
 const DEAD_END_TITLE: &str = "Raise the timeout";
 const DEAD_END_REASON: &str = "Raising the timeout did not fix the flaky failure.";
 const REFRESH_CAPABILITIES: [Capability; 6] = [
@@ -146,7 +146,7 @@ fn stream(events: Vec<ModelStreamEvent>) -> ProviderStream {
 }
 
 /// Build valid semantic hints exactly the way a live observer would: cite
-/// only event ids from the task's NEW EVENTS listing.
+/// only source aliases from the task's NEW EVENTS listing.
 fn hints_from_listing(task: &str) -> String {
     let mut listed_ids = task
         .lines()
@@ -155,17 +155,17 @@ fn hints_from_listing(task: &str) -> String {
         .filter_map(|line| line.split_whitespace().next())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    for line in task.lines().filter(|line| line.starts_with("N ")) {
-        let Some(sources) = line
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix("sources="))
-        else {
-            continue;
-        };
-        for source in sources.split(',').filter(|source| !source.is_empty()) {
-            if !listed_ids.iter().any(|listed| listed == source) {
-                listed_ids.push(source.to_owned());
-            }
+    for source in task
+        .lines()
+        .take_while(|line| *line != NEW_EVENTS_MARKER)
+        .flat_map(str::split_whitespace)
+        .filter_map(|part| {
+            part.strip_prefix("src=")
+                .or_else(|| part.strip_prefix("es="))
+        })
+    {
+        if !listed_ids.iter().any(|listed| listed == source) {
+            listed_ids.push(source.to_owned());
         }
     }
     assert!(

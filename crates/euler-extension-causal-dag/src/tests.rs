@@ -1,7 +1,7 @@
 use super::*;
 use crate::active_state::ActiveGraphState;
 use crate::construction::Construction;
-use crate::observer_brief::{build_task, ObserverBriefMode};
+use crate::observer_brief::{build_full_task, ObserverBriefMode};
 use euler_agents::{AgentTask, MAX_TASK_BYTES};
 use euler_core::extensions::{ExtensionHost, ExtensionHostError};
 use euler_core::{read_provenance, ProvenanceWriter};
@@ -179,6 +179,7 @@ fn observer_brief_over_knuth_fixture_builds_bounded_agent_task() {
         output["observe_window"]["watermark_event_id"]
     );
     assert_eq!(output["apply"]["session_id"], json!("session-knuth"));
+    assert!(output["apply"]["source_aliases"].is_object());
     assert!(output["apply"].get("causal_dag").is_none());
 }
 
@@ -706,9 +707,14 @@ fn reframe_can_replace_parentage_and_introduce_a_second_root() {
         "artifact-event"
     );
     let tasks = host.spawn_tasks.lock().expect("spawn tasks");
-    assert!(tasks[0]
+    let child_line = tasks[0]
         .task
-        .contains("parent=node-root via=edge-child:structural:continuation edge_source=event-2"));
+        .lines()
+        .find(|line| line.starts_with("N ") && line.contains(" attempt/open "))
+        .expect("replacement task child line");
+    assert!(child_line.contains(" p=n"));
+    assert!(child_line.contains(" v=v"));
+    assert!(child_line.contains(" es=s"));
 }
 
 #[test]
@@ -776,6 +782,57 @@ fn incremental_refresh_bootstraps_a_truncated_session() {
     assert_eq!(output["feed"]["truncated"], true);
     assert_eq!(output["feed"]["next_after_event_id"], "event-1");
     assert_eq!(host.writes.lock().expect("writes").len(), 1);
+}
+
+#[test]
+fn incremental_refresh_fits_an_oversized_page_and_reports_remaining_feed() {
+    let events = (0..1000)
+        .map(|index| {
+            fixture_event(
+                "session-1",
+                &format!("refresh-events-{index:03}"),
+                EventKind::USER_MESSAGE,
+                "",
+            )
+        })
+        .collect::<Vec<_>>();
+    let host = RecordingHost::new(recording_page(events.clone(), events.len(), None, false))
+        .with_spawn_outcomes(vec![successful_agent_outcome(
+            single_root_hints("e0"),
+            "fitted",
+        )]);
+
+    let output = CausalDagRefreshCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-1",
+                    "operation": "incremental",
+                    "limit": events.len()
+                }),
+            },
+            &host,
+        )
+        .expect("refresh fits the observer task to a provenance prefix");
+    let tasks = host.spawn_tasks.lock().expect("spawn tasks");
+    let task = &tasks[0].task;
+    let active_cursor = output["active_cursor_event_id"]
+        .as_str()
+        .expect("active cursor");
+
+    assert!(task.len() <= MAX_TASK_BYTES);
+    assert_ne!(active_cursor, events.last().expect("last event").id);
+    assert!(task.contains("e0 user.message"));
+    assert_eq!(output["truncated"], false);
+    assert_eq!(output["feed"]["truncated"], true);
+    assert_eq!(output["feed"]["next_after_event_id"], active_cursor);
+    assert_eq!(output["feed"]["watermark_event_id"], active_cursor);
+    let writes = host.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0]
+        .source_event_ids
+        .iter()
+        .any(|event_id| event_id == "refresh-events-000"));
 }
 
 #[test]
@@ -967,7 +1024,12 @@ fn observer_brief_filter_policy_matrix_includes_only_work_events() {
     let output = CausalDagObserverBriefCommand
         .execute(CommandContext { input: json!({}) }, &host)
         .expect("observer brief");
-    let task = output["task"].as_str().expect("task string");
+    let aliased_event_ids = output["apply"]["source_aliases"]
+        .as_object()
+        .expect("source aliases")
+        .values()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
 
     for included in [
         "user",
@@ -977,7 +1039,10 @@ fn observer_brief_filter_policy_matrix_includes_only_work_events() {
         "file-change",
         "foreign-artifact",
     ] {
-        assert!(task.contains(included), "missing included id {included}");
+        assert!(
+            aliased_event_ids.contains(included),
+            "missing included id {included}"
+        );
     }
     for excluded in [
         "session-start",
@@ -991,7 +1056,7 @@ fn observer_brief_filter_policy_matrix_includes_only_work_events() {
         "self-artifact",
     ] {
         assert!(
-            !task.contains(excluded),
+            !aliased_event_ids.contains(excluded),
             "unexpected excluded id {excluded}"
         );
     }
@@ -1044,10 +1109,15 @@ fn observer_brief_excludes_its_companion_cognition() {
     let output = CausalDagObserverBriefCommand
         .execute(CommandContext { input: json!({}) }, &host)
         .expect("observer brief");
-    let task = output["task"].as_str().expect("task string");
+    let aliased_event_ids = output["apply"]["source_aliases"]
+        .as_object()
+        .expect("source aliases")
+        .values()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
 
-    assert!(!task.contains("observer-cognition"));
-    assert!(task.contains("driver-cognition"));
+    assert!(!aliased_event_ids.contains("observer-cognition"));
+    assert!(aliased_event_ids.contains("driver-cognition"));
     assert_eq!(output["listed_event_count"], 1);
 }
 
@@ -1149,7 +1219,8 @@ fn observer_brief_does_not_advance_into_an_incomplete_observer_span() {
         )
         .expect("complete observer span can be skipped");
     assert_eq!(brief["listed_event_count"], 1);
-    assert!(brief["task"].as_str().expect("task").contains("event-2"));
+    assert!(brief["task"].as_str().expect("task").contains("e0 "));
+    assert_eq!(brief["apply"]["source_aliases"]["e0"], "event-2");
     assert!(!brief["task"]
         .as_str()
         .expect("task")
@@ -1200,12 +1271,14 @@ fn observer_brief_adapts_extracts_to_the_real_agent_task_boundary() {
     let task = output["task"].as_str().expect("task");
     assert!(task.len() <= MAX_TASK_BYTES);
     assert_eq!(output["listed_event_count"], events.len());
-    for event in &events {
-        assert!(task.contains(&event.id), "missing event id {}", event.id);
+    for (index, event) in events.iter().enumerate() {
+        let alias = format!("e{index}");
+        assert_eq!(output["apply"]["source_aliases"][&alias], event.id);
+        assert!(task.contains(&format!("{alias} user.message")));
     }
     let extract_lengths = task
         .lines()
-        .filter(|line| line.starts_with("event-budget-"))
+        .filter(|line| line.starts_with('e') && line.contains(" user.message "))
         .map(|line| line.splitn(3, ' ').nth(2).unwrap_or("").chars().count())
         .collect::<Vec<_>>();
     assert_eq!(extract_lengths.len(), events.len());
@@ -1216,7 +1289,7 @@ fn observer_brief_adapts_extracts_to_the_real_agent_task_boundary() {
 }
 
 #[test]
-fn observer_brief_compacts_backbone_without_losing_stable_record_ids() {
+fn observer_brief_compacts_backbone_with_reversible_record_aliases() {
     let host = RecordingHost::empty();
     let (_, artifact) = load_knuth_fixture();
     let record = ArtifactRecord {
@@ -1234,36 +1307,87 @@ fn observer_brief_compacts_backbone_without_losing_stable_record_ids() {
         "continue",
     );
 
-    let task = build_task(&[event], Some(&active), ObserverBriefMode::Incremental)
+    let fitted = build_full_task(&[event], Some(&active), ObserverBriefMode::Incremental)
         .expect("compact observer task");
+    let task = &fitted.task;
     assert!(task.len() <= MAX_TASK_BYTES);
-    for node in artifact["forest"]["nodes"].as_array().expect("nodes") {
+    for (index, node) in artifact["forest"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .enumerate()
+    {
         let id = node["id"].as_str().expect("node id");
+        let alias = format!("n{index}");
+        assert_eq!(fitted.node_aliases[&alias], id);
         assert!(
             task.lines()
-                .any(|line| line.starts_with(&format!("N {id} "))),
-            "missing node id {id}"
+                .any(|line| line.starts_with(&format!("N {alias} "))),
+            "missing node alias {alias}"
         );
     }
-    for edge in artifact["forest"]["edges"].as_array().expect("edges") {
+    for (index, edge) in artifact["forest"]["edges"]
+        .as_array()
+        .expect("edges")
+        .iter()
+        .enumerate()
+    {
         let id = edge["id"].as_str().expect("edge id");
+        let alias = format!("v{index}");
+        assert_eq!(fitted.edge_aliases[&alias], id);
         if edge["canonical_backbone"] == true {
             assert!(
-                task.contains(&format!("via={id}:")),
-                "missing folded edge {id}"
+                task.contains(&format!("v={alias}:")),
+                "missing folded edge alias {alias}"
             );
         } else {
             assert!(
                 task.lines()
-                    .any(|line| line.starts_with(&format!("E {id} "))),
-                "missing non-backbone edge {id}"
+                    .any(|line| line.starts_with(&format!("E {alias} "))),
+                "missing non-backbone edge alias {alias}"
             );
         }
     }
 }
 
 #[test]
-fn observer_brief_count_overflow_fails_without_dropping_events() {
+fn replacement_brief_fits_a_large_graph_without_dropping_provenance() {
+    let events = synthetic_summary_events(48);
+    let hints = synthetic_pressure_hints(&events, 44);
+    let projection = Projection::from_observer_revision(
+        &events,
+        &hints,
+        Some("session-1"),
+        None,
+        Construction::snapshot(),
+    )
+    .expect("large projection");
+    let artifact = projection.artifact_value();
+    let host = RecordingHost::empty();
+    let record = ArtifactRecord {
+        persisted_event_id: "source-artifact-event".to_owned(),
+        relative_path: "extensions/causal-dag/artifacts/source.json".to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: 1,
+    };
+    let active = ActiveGraphState::commit(&host, &record, artifact, None).expect("active graph");
+
+    let fitted = build_full_task(&[], Some(&active), ObserverBriefMode::Replacement)
+        .expect("replacement brief");
+
+    assert!(fitted.task.len() <= MAX_TASK_BYTES);
+    assert_eq!(fitted.listed_event_count, 0);
+    assert_eq!(fitted.node_aliases.len(), 48);
+    assert_eq!(fitted.edge_aliases.len(), 47);
+    assert_eq!(fitted.source_aliases.len(), 48);
+    assert!(fitted.task.contains("MODE REPLACEMENT"));
+    assert!(fitted.task.contains("src=s0"));
+    AgentTask::new_inheriting_target(fitted.task, OBSERVER_PERSONA)
+        .expect("replacement brief must satisfy the real companion task contract");
+}
+
+#[test]
+fn observer_brief_pages_count_overflow_without_dropping_events() {
     let events = (0..1000)
         .map(|index| {
             fixture_event(
@@ -1276,17 +1400,33 @@ fn observer_brief_count_overflow_fails_without_dropping_events() {
         .collect::<Vec<_>>();
     let host = RecordingHost::new(recording_page(events.clone(), events.len(), None, false));
 
-    let error = CausalDagObserverBriefCommand
+    let output = CausalDagObserverBriefCommand
         .execute(
             CommandContext {
                 input: json!({"limit": events.len()}),
             },
             &host,
         )
-        .expect_err("count overflow fails");
-    let message = error.to_string();
-    assert!(message.contains(&format!("{} listed events", events.len())));
-    assert!(message.contains("reduce limit"));
+        .expect("count overflow is fitted to a replayable prefix");
+    let listed = output["listed_event_count"].as_u64().expect("listed count") as usize;
+    let task = output["task"].as_str().expect("task");
+
+    assert!(listed > 0);
+    assert!(listed < events.len());
+    assert!(task.len() <= MAX_TASK_BYTES);
+    assert_eq!(output["watermark_event_id"], events[listed - 1].id);
+    assert_eq!(output["apply"]["watermark_event_id"], events[listed - 1].id);
+    assert_eq!(
+        output["apply"]["source_aliases"][format!("e{}", listed - 1)],
+        events[listed - 1].id
+    );
+    assert!(output["apply"]["source_aliases"]
+        .get(format!("e{listed}"))
+        .is_none());
+    assert!(task.contains(&format!("e{} user.message", listed - 1)));
+    assert!(!task.contains(&format!("e{listed} user.message")));
+    AgentTask::new_inheriting_target(task, output["persona"].as_str().expect("persona"))
+        .expect("fitted brief must satisfy the real companion task contract");
 }
 
 #[test]
@@ -1318,7 +1458,7 @@ fn observer_brief_normalizes_extracts_before_truncating() {
     let task = output["task"].as_str().expect("task");
     let line = task
         .lines()
-        .find(|line| line.starts_with("messy "))
+        .find(|line| line.starts_with("e0 "))
         .expect("event line");
     let extract = line.splitn(3, ' ').nth(2).expect("extract");
     assert_eq!(extract.chars().count(), 240);

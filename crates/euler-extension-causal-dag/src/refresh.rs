@@ -8,7 +8,8 @@ use crate::active_state::ActiveGraphState;
 use crate::construction::{ConstructionOperation, ConstructionPolicy, ConstructionTrigger};
 use crate::observer_apply::parse_hints_output;
 use crate::observer_brief::{
-    build_task, listed_events, observer_page_fence, observer_system_prompt, ObserverBriefMode,
+    build_full_task, fit_task, listed_events, observer_page_fence, observer_system_prompt,
+    resolve_record_aliases, resolve_source_aliases, FittedObserverTask, ObserverBriefMode,
     DEFAULT_MAX_TOKENS, OBSERVER_PERSONA,
 };
 use euler_event::EventEnvelope;
@@ -54,20 +55,25 @@ impl ExtensionCommand for CausalDagRefreshCommand {
         let policy = input
             .policy
             .unwrap_or_else(|| ConstructionPolicy::from_active(active.as_ref()));
-        let window = prepare_refresh_window(host, &input, active.as_ref(), operation)?;
+        let mut window = prepare_refresh_window(host, &input, active.as_ref(), operation)?;
         let mode = if operation == ConstructionOperation::Incremental {
             ObserverBriefMode::Incremental
         } else {
             ObserverBriefMode::Replacement
         };
-        let task = build_task(&window.listed, active.as_ref(), mode)?;
-        let (outcome, hints) = run_refresh_observer(host, &input, task)?;
+        let fitted = if input.operation == ConstructionOperation::Incremental {
+            fit_task(&window.listed, active.as_ref(), mode)?
+        } else {
+            build_full_task(&window.listed, active.as_ref(), mode)?
+        };
+        window.restrict_to_fitted_prefix(fitted.listed_event_count)?;
+        let (outcome, hints) = run_refresh_observer(host, &input, fitted)?;
         let observe = ObserveInput {
             limit: input.limit,
             scan_limit: input.scan_limit,
-            after_event_id: window.after_event_id,
-            watermark_event_id: window.observed_watermark_event_id,
-            session_id: input.session_id,
+            after_event_id: window.after_event_id.clone(),
+            watermark_event_id: window.observed_watermark_event_id.clone(),
+            session_id: input.session_id.clone(),
             hints,
         };
         let expected_predecessor_artifact_event_id = active
@@ -93,7 +99,7 @@ impl ExtensionCommand for CausalDagRefreshCommand {
                 observer_result_event_id: outcome.result_event_id.clone(),
             },
         )?;
-        Ok(with_refresh_attribution(output, &outcome, &window.page))
+        Ok(with_refresh_attribution(output, &outcome, &window))
     }
 }
 
@@ -102,6 +108,29 @@ struct RefreshWindow {
     listed: Vec<EventEnvelope>,
     after_event_id: Option<String>,
     observed_watermark_event_id: Option<String>,
+    prefix_truncated: bool,
+}
+
+impl RefreshWindow {
+    fn restrict_to_fitted_prefix(
+        &mut self,
+        listed_event_count: usize,
+    ) -> Result<(), ExtensionError> {
+        if listed_event_count >= self.listed.len() {
+            return Ok(());
+        }
+        let watermark = self
+            .listed
+            .get(listed_event_count.saturating_sub(1))
+            .map(|event| event.id.clone())
+            .ok_or_else(|| {
+                input_error("causal-dag refresh task cannot fit one observable event")
+            })?;
+        self.listed.truncate(listed_event_count);
+        self.observed_watermark_event_id = Some(watermark);
+        self.prefix_truncated = true;
+        Ok(())
+    }
 }
 
 fn prepare_refresh_window(
@@ -136,23 +165,32 @@ fn prepare_refresh_window(
             "causal-dag reframe/final has unobserved provenance backlog; run incremental refresh until caught up",
         ));
     }
-    let listed = listed_events(&page.events)?;
+    let listed = listed_events(&page.events[..fence.listable_len])?;
     if listed.is_empty() && active.is_none() {
         return Err(input_error("causal-dag refresh found no observable events"));
     }
+    let prefix_truncated = fence.listable_len < page.events.len();
     Ok(RefreshWindow {
         page,
         listed,
         after_event_id,
         observed_watermark_event_id: fence.watermark_event_id,
+        prefix_truncated,
     })
 }
 
 fn run_refresh_observer(
     host: &dyn HostApi,
     input: &RefreshInput,
-    task: String,
+    fitted: FittedObserverTask,
 ) -> Result<(AgentOutcome, Value), ExtensionError> {
+    let FittedObserverTask {
+        task,
+        source_aliases,
+        node_aliases,
+        edge_aliases,
+        ..
+    } = fitted;
     let outcome = host.spawn_agent(input.observer_task(task, observer_system_prompt()?))?;
     if !outcome.ok {
         return Err(input_error(format!(
@@ -165,7 +203,9 @@ fn run_refresh_observer(
             "causal-dag refresh observer output exceeds {OBSERVER_HINT_MAX_BYTES} bytes"
         )));
     }
-    let hints = parse_hints_output(&outcome.output)?;
+    let mut hints = parse_hints_output(&outcome.output)?;
+    resolve_source_aliases(&mut hints, &source_aliases);
+    resolve_record_aliases(&mut hints, &node_aliases, &edge_aliases);
     Ok((outcome, hints))
 }
 
@@ -384,7 +424,7 @@ fn optional_enum_string<'a>(
 fn with_refresh_attribution(
     mut output: Value,
     outcome: &euler_sdk::AgentOutcome,
-    page: &euler_sdk::ProvenancePage,
+    window: &RefreshWindow,
 ) -> Value {
     let object = output
         .as_object_mut()
@@ -399,12 +439,23 @@ fn with_refresh_attribution(
             "result_event_id": outcome.result_event_id,
         }),
     );
+    let truncated = window.page.truncated || window.prefix_truncated;
+    let next_after_event_id = if window.prefix_truncated {
+        window.observed_watermark_event_id.as_ref()
+    } else {
+        window.page.next_after_event_id.as_ref()
+    };
+    let watermark_event_id = if window.prefix_truncated {
+        window.observed_watermark_event_id.as_ref()
+    } else {
+        window.page.watermark_event_id.as_ref()
+    };
     object.insert(
         "feed".to_owned(),
         json!({
-            "truncated": page.truncated,
-            "next_after_event_id": page.next_after_event_id,
-            "watermark_event_id": page.watermark_event_id,
+            "truncated": truncated,
+            "next_after_event_id": next_after_event_id,
+            "watermark_event_id": watermark_event_id,
         }),
     );
     output
