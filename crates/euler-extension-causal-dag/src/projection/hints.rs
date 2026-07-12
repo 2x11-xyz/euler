@@ -42,6 +42,7 @@ const EDGE_FIELDS: &[&str] = &[
 const SOURCE_REF_FIELDS: &[&str] = &["id", "event_id", "payload_pointer"];
 const CONFIDENCE_FIELDS: &[&str] = &["level", "score"];
 const BASIS_FIELDS: &[&str] = &["kind", "summary"];
+pub(super) const OCCURRENCE_SOURCE_REF_ID: &str = "occurrence_source_ref_id";
 
 #[derive(Debug)]
 pub(super) struct SemanticGraph {
@@ -247,6 +248,7 @@ fn hinted_node(
     let confidence = hinted_confidence(object)?;
     let basis = hinted_basis(object, &source_ref_ids)?;
     let metadata = optional_object(object, "metadata", "causal-dag node hint")?;
+    validate_occurrence_source_ref(&metadata, &source_ref_ids)?;
 
     Ok(json!({
         "id": id,
@@ -260,6 +262,26 @@ fn hinted_node(
         "basis": basis,
         "metadata": metadata
     }))
+}
+
+fn validate_occurrence_source_ref(
+    metadata: &Value,
+    source_ref_ids: &[String],
+) -> Result<(), ExtensionError> {
+    let Some(value) = metadata.get(OCCURRENCE_SOURCE_REF_ID) else {
+        return Ok(());
+    };
+    let Some(id) = value.as_str() else {
+        return Err(input_error(format!(
+            "causal-dag node metadata.{OCCURRENCE_SOURCE_REF_ID} must be a string"
+        )));
+    };
+    if !source_ref_ids.iter().any(|candidate| candidate == id) {
+        return Err(input_error(format!(
+            "causal-dag node metadata.{OCCURRENCE_SOURCE_REF_ID} references missing source ref `{id}`"
+        )));
+    }
+    Ok(())
 }
 
 fn hinted_edge(

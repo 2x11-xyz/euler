@@ -18,10 +18,14 @@ document.addEventListener('click', function (e) {
 <helmet>
   <style>
     html, body { margin: 0; }
+    .dag-toolbar { align-items:stretch !important; }
+    .dag-toolbar > div { height:30px; }
+    .dag-toolbar > button, .dag-toolbar > div > button { height:30px; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; line-height:1; }
     @media (max-width: 600px) {
       .dag-heading { top:14px !important; left:14px !important; right:14px !important; }
       .dag-heading > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .dag-toolbar { top:58px !important; left:14px !important; right:auto !important; gap:5px !important; }
+      .dag-menu-3d { left:0 !important; right:auto !important; }
       .dag-overlay { top:96px !important; left:14px !important; right:14px !important; width:auto !important; box-sizing:border-box; }
       .dag-card { left:14px !important; right:14px !important; bottom:74px !important; width:auto !important; max-height:38vh; overflow:hidden; box-sizing:border-box; }
       .dag-hint { display:none !important; }
@@ -82,7 +86,7 @@ document.addEventListener('click', function (e) {
     <div style="position:relative;">
       <button onclick="{{ toggle3d }}" style="background:{{ nav3dBg }}; color:{{ th.sub }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">3D ▾</button>
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
-        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+        <div class="dag-menu-3d" style="position:absolute; top:34px; right:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3D · constellation</a>
           <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · sequence axis</a>
         </div>

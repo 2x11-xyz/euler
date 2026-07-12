@@ -189,35 +189,71 @@ fn viewer_node(
 
 fn assign_sequence(nodes: &mut [ViewerNode], raw_nodes: &[Value], active_root: Option<&str>) {
     let anchors = raw_nodes.iter().map(sequence_anchor).collect::<Vec<_>>();
-    let mut order = (0..nodes.len()).collect::<Vec<_>>();
-    order.sort_by(|&left, &right| {
-        let left_is_root = active_root == Some(nodes[left].id.as_str());
-        let right_is_root = active_root == Some(nodes[right].id.as_str());
-        left_is_root
-            .cmp(&right_is_root)
-            .reverse()
-            .then_with(|| match (&anchors[left], &anchors[right]) {
-                (Some(left), Some(right)) => left.cmp(right),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
+    let indices = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = vec![true; nodes.len()];
+    for sequence in 0..nodes.len() {
+        let index = (0..nodes.len())
+            .filter(|&candidate| {
+                pending[candidate]
+                    && nodes[candidate].parent.as_deref().is_none_or(|parent| {
+                        !pending[*indices
+                            .get(parent)
+                            .expect("validated backbone parent must exist")]
+                    })
             })
-            .then(left.cmp(&right))
-    });
-    for (sequence, index) in order.into_iter().enumerate() {
+            .min_by(|&left, &right| sequence_order(left, right, nodes, &anchors, active_root))
+            .expect("validated acyclic backbone must have a sequence candidate");
         nodes[index].sequence = sequence;
+        pending[index] = false;
     }
 }
 
+fn sequence_order(
+    left: usize,
+    right: usize,
+    nodes: &[ViewerNode],
+    anchors: &[Option<String>],
+    active_root: Option<&str>,
+) -> std::cmp::Ordering {
+    let left_is_root = active_root == Some(nodes[left].id.as_str());
+    let right_is_root = active_root == Some(nodes[right].id.as_str());
+    left_is_root
+        .cmp(&right_is_root)
+        .reverse()
+        .then_with(|| match (&anchors[left], &anchors[right]) {
+            (Some(left), Some(right)) => left.cmp(right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
+        .then(left.cmp(&right))
+}
+
 fn sequence_anchor(node: &Value) -> Option<String> {
-    node.get("source_refs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|source| source.get("event_id").and_then(Value::as_str))
+    let source_refs = node.get("source_refs").and_then(Value::as_array)?;
+    let explicit = node
+        .pointer("/metadata/occurrence_source_ref_id")
+        .and_then(Value::as_str)
+        .and_then(|occurrence_id| {
+            source_refs
+                .iter()
+                .find(|source| source.get("id").and_then(Value::as_str) == Some(occurrence_id))
+        })
+        .and_then(|source| source.get("event_id").and_then(Value::as_str))
         .filter(|event_id| is_ulid(event_id))
-        .map(str::to_owned)
-        .min()
+        .map(str::to_owned);
+    explicit.or_else(|| {
+        source_refs
+            .iter()
+            .filter_map(|source| source.get("event_id").and_then(Value::as_str))
+            .filter(|event_id| is_ulid(event_id))
+            .map(str::to_owned)
+            .min()
+    })
 }
 
 fn is_ulid(value: &str) -> bool {
@@ -559,7 +595,7 @@ fn short_event_id(event_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{filename_session_id, validate_backbone, ViewerDag};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::collections::BTreeMap;
 
     fn artifact() -> Value {
@@ -603,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn viewer_sequence_uses_first_provenance_occurrence_without_reordering_nodes() {
+    fn viewer_sequence_uses_explicit_occurrence_and_keeps_parents_before_children() {
         let mut artifact = artifact();
         let anchors = BTreeMap::from([
             ("node-knuth-secondary-root", "01KXBWCZTJDB6N4X35BEF8KT5Z"),
@@ -618,17 +654,23 @@ mod tests {
             .iter()
             .map(|node| node["id"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>();
-        for node in raw_nodes {
+        for node in raw_nodes.iter_mut() {
             let id = node["id"].as_str().expect("node id");
-            node["source_refs"] = if id == "node-knuth-verify" {
+            node["source_refs"] = if id == "node-knuth-repair" {
                 serde_json::json!([
-                    {"event_id": "01KXBZKZR6DGEM1FPHKFS5JR7K"},
-                    {"event_id": anchors[id]}
+                    {"id": "documentation", "event_id": "01KXBZKZR6DGEM1FPHKFS5JR7K"},
+                    {"id": "occurrence", "event_id": anchors[id]}
                 ])
             } else {
-                serde_json::json!([{"event_id": anchors[id]}])
+                serde_json::json!([{"id": "occurrence", "event_id": anchors[id]}])
             };
+            node["metadata"]["occurrence_source_ref_id"] = json!("occurrence");
         }
+        raw_nodes
+            .iter_mut()
+            .find(|node| node["id"] == "node-knuth-repair")
+            .expect("repair node")["source_refs"][1]["event_id"] =
+            json!("01KXBWD1DYZGR226TBZNH3WG78");
 
         let dag = ViewerDag::from_artifact(&artifact).expect("viewer DAG");
         assert_eq!(
@@ -647,8 +689,8 @@ mod tests {
         assert_eq!(sequence["node-knuth-root"], 0);
         assert_eq!(sequence["node-knuth-secondary-root"], 1);
         assert_eq!(sequence["node-knuth-deadend"], 2);
-        assert_eq!(sequence["node-knuth-sibling"], 3);
-        assert_eq!(sequence["node-knuth-repair"], 4);
+        assert_eq!(sequence["node-knuth-repair"], 3);
+        assert_eq!(sequence["node-knuth-sibling"], 4);
         assert_eq!(sequence["node-knuth-verify"], 5);
     }
 

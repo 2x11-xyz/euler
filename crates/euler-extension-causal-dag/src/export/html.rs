@@ -177,6 +177,16 @@ mod tests {
 
     #[test]
     fn viewer_templates_preserve_the_reference_node_grammar() {
+        let templates = [
+            TOP_DOWN,
+            INDENTED_SPINE,
+            CONSTELLATION_3D,
+            CONSTELLATION_3_5D,
+        ];
+        for template in templates {
+            assert!(template.contains(".dag-toolbar > div { height:30px; }"));
+            assert!(template.contains("top:34px; right:0; min-width:158px"));
+        }
         for template in [TOP_DOWN, INDENTED_SPINE] {
             assert!(!template.contains("kindVisual"));
             assert!(!template.contains("border:{{ n.bw }}"));
@@ -189,8 +199,11 @@ mod tests {
             assert!(!template.contains("{{ g.glyph }}"));
             assert!(template.contains("width:8px; height:8px; border-radius:50%"));
             assert!(template.contains("TOKENS.root.day"));
+            assert!(template.contains("nodeDistance"));
+            assert!(template.contains("setDistance"));
         }
         assert!(CONSTELLATION_3_5D.contains("idx[n.id] = n.sequence ?? i"));
+        assert!(CONSTELLATION_3_5D.contains("Math.sqrt(elapsed) * 18 * spacing"));
         assert!(!CONSTELLATION_3D.contains("n.sequence"));
     }
 }

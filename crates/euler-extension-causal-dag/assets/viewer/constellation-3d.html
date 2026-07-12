@@ -18,10 +18,14 @@ document.addEventListener('click', function (e) {
 <helmet>
   <style>
     html, body { margin: 0; background: #050507; }
+    .dag-toolbar { align-items:stretch !important; }
+    .dag-toolbar > div { height:30px; }
+    .dag-toolbar > button, .dag-toolbar > div > button { height:30px; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; line-height:1; }
     @media (max-width: 600px) {
       .dag-heading { top:14px !important; left:14px !important; right:14px !important; }
       .dag-heading > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .dag-toolbar { top:58px !important; left:14px !important; right:auto !important; gap:5px !important; }
+      .dag-menu-3d { left:0 !important; right:auto !important; }
       .dag-overlay { top:96px !important; left:14px !important; right:14px !important; width:auto !important; box-sizing:border-box; }
       .dag-card { left:14px !important; right:14px !important; bottom:74px !important; width:auto !important; max-height:38vh; overflow:hidden; box-sizing:border-box; }
       .dag-hint { display:none !important; }
@@ -52,7 +56,7 @@ document.addEventListener('click', function (e) {
     <div style="position:relative;">
       <button onclick="{{ toggle3d }}" style="background:{{ nav3dBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">3D ▾</button>
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
-        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+        <div class="dag-menu-3d" style="position:absolute; top:34px; right:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.text }}; text-decoration:none; font-size:11px; white-space:nowrap;">3D · constellation</a>
           <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · sequence axis</a>
         </div>
@@ -66,7 +70,7 @@ document.addEventListener('click', function (e) {
       <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">What you're looking at</div>
       <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">A causal DAG of an agent session, drawn in 3D. Solid edges are the canonical backbone; node color carries status. Dashed arrows are annotation links between branches.</div>
       <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">How to interact</div>
-      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Drag to orbit, scroll to zoom. Hover a node or a dashed arrow — the card at bottom-left shows its story. tune sets theme, orbit, fog, and focus blur.</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Drag to orbit, scroll to zoom. Hover a node or a dashed arrow — the card at bottom-left shows its story. tune sets theme, spacing, orbit, fog, and focus blur.</div>
     </div>
   </sc-if>
 
@@ -81,6 +85,10 @@ document.addEventListener('click', function (e) {
       </div>
       <label style="display:flex; align-items:center; justify-content:space-between; color:{{ th.sub }}; font-size:11px; cursor:pointer;">auto orbit
         <input type="checkbox" checked="{{ uiAuto }}" onchange="{{ setAuto }}" style="accent-color:#82b4f2; cursor:pointer;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
+        <span style="display:flex; justify-content:space-between;"><span>node distance</span><span style="color:{{ th.faint }};">{{ uiDistance }}×</span></span>
+        <input type="range" min="0.75" max="2" step="0.05" value="{{ uiDistance }}" onchange="{{ setDistance }}" style="accent-color:#82b4f2; width:100%; margin:0;">
       </label>
       <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
         <span style="display:flex; justify-content:space-between;"><span>orbit speed</span><span style="color:{{ th.faint }};">{{ uiSpd }}</span></span>
@@ -128,6 +136,7 @@ document.addEventListener('click', function (e) {
   &quot;theme&quot;: { &quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;cosmic&quot;, &quot;misty&quot;], &quot;default&quot;: &quot;cosmic&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;Theme&quot; },
   &quot;autoOrbit&quot;: { &quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Camera&quot; },
   &quot;orbitSpeed&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.35, &quot;min&quot;: 0, &quot;max&quot;: 1, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Camera&quot; },
+  &quot;nodeDistance&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 1.4, &quot;min&quot;: 0.75, &quot;max&quot;: 2, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Layout&quot; },
   &quot;fog&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.55, &quot;min&quot;: 0, &quot;max&quot;: 0.85, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Depth&quot; },
   &quot;dofBlur&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.5, &quot;min&quot;: 0, &quot;max&quot;: 4, &quot;step&quot;: 0.5, &quot;unit&quot;: &quot;px&quot;, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Depth&quot; }
 }">
@@ -150,12 +159,13 @@ function hexA(hex, alpha) {
 }
 
 class Component extends DCLogic {
-  state = { ready: false, selId: null, selArc: null, panel: false, nav2d: false, nav3d: false, uiAuto: null, uiSpd: null, uiFog: null, uiDof: null, uiTheme: null };
+  state = { ready: false, selId: null, selArc: null, panel: false, nav2d: false, nav3d: false, uiAuto: null, uiSpd: null, uiDistance: null, uiFog: null, uiDof: null, uiTheme: null };
 
   isMisty() { return (this.state.uiTheme ?? this.props.theme ?? 'cosmic') === 'misty'; }
   fogDefault() { return this.isMisty() ? 0.85 : (this.props.fog ?? 0.55); }
   fogValue() { return this.state.uiFog ?? this.fogDefault(); }
   dofValue() { return this.state.uiDof ?? this.props.dofBlur ?? 0.5; }
+  distanceValue() { return this.state.uiDistance ?? this.props.nodeDistance ?? 1.4; }
 
   componentDidMount() {
     this.yaw = 0.8; this.pitch = 0.42; this.zoom = 1;
@@ -212,10 +222,10 @@ class Component extends DCLogic {
     roots.forEach(countLeaves);
     const hash = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; };
     const jit = (id, k) => ((hash(id + k) % 1000) / 1000 - 0.5) * 12;
-    const P = {};
+    const P = {}, spacing = this.distanceValue();
     const place = (id, a0, a1, d) => {
-      const am = (a0 + a1) / 2, r = d * 52;
-      P[id] = { x: Math.cos(am) * r + jit(id, 'x'), y: -d * 46 + jit(id, 'y'), z: Math.sin(am) * r + jit(id, 'z') };
+      const am = (a0 + a1) / 2, r = d * 52 * spacing;
+      P[id] = { x: Math.cos(am) * r + jit(id, 'x'), y: -d * 46 * spacing + jit(id, 'y'), z: Math.sin(am) * r + jit(id, 'z') };
       let a = a0;
       kids[id].forEach((c) => { const w = (a1 - a0) * leaves[c] / leaves[id]; place(c, a, a + w, d + 1); a += w; });
     };
@@ -485,10 +495,12 @@ class Component extends DCLogic {
       toggle3d: () => this.setState({ nav3d: !this.state.nav3d, nav2d: false, panel: false, info: false }),
       uiAuto: this.state.uiAuto ?? this.props.autoOrbit ?? true,
       uiSpd: this.state.uiSpd ?? this.props.orbitSpeed ?? 0.35,
+      uiDistance: this.distanceValue(),
       uiFog: this.fogValue(),
       uiDof: this.dofValue(),
       setAuto: (e) => this.setState({ uiAuto: e.target.checked }),
       setSpd: (e) => this.setState({ uiSpd: parseFloat(e.target.value) }),
+      setDistance: (e) => this.setState({ uiDistance: parseFloat(e.target.value) }, () => this.prepare()),
       setFog: (e) => this.setState({ uiFog: parseFloat(e.target.value) }),
       setDof: (e) => this.setState({ uiDof: parseFloat(e.target.value) })
     };

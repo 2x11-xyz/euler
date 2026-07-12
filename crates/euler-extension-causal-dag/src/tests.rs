@@ -167,6 +167,8 @@ fn observer_brief_over_knuth_fixture_builds_bounded_agent_task() {
     assert!(system_prompt.contains("Use schema euler.causal_dag.hints.v1"));
     assert!(system_prompt.contains("use payload_pointer /payload exactly"));
     assert!(system_prompt.contains("Do not repeat CURRENT GRAPH source refs"));
+    assert!(system_prompt.contains("metadata.occurrence_source_ref_id"));
+    assert!(system_prompt.contains("add a successor checkpoint or synthesis"));
     assert!(system_prompt.contains(
         "Every non-root node must have exactly one incoming canonical_backbone structural edge"
     ));
@@ -399,6 +401,8 @@ fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
         recording_page(vec![first_event], DEFAULT_LIMIT, None, false),
         recording_page(vec![second_event], DEFAULT_LIMIT, None, false),
     ]);
+    let mut initial = single_root_hints("event-1");
+    initial["nodes"][0]["metadata"]["occurrence_source_ref_id"] = json!("src-root");
     CausalDagObserverApplyCommand
         .execute(
             CommandContext {
@@ -408,7 +412,7 @@ fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
                         "session_id": "session-1",
                         "expected_predecessor_artifact_event_id": null
                     }),
-                    single_root_hints("event-1"),
+                    initial,
                     "evt-result-1",
                 ),
             },
@@ -454,6 +458,24 @@ fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
             "event_id": "event-2",
             "payload_pointer": "/payload/content"
         }));
+    let mut moved_anchor = revision.clone();
+    moved_anchor["nodes"][0]["metadata"]["occurrence_source_ref_id"] = json!("src-root-new");
+    let error = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(apply.clone(), moved_anchor, "evt-result-moved-anchor"),
+            },
+            &host,
+        )
+        .expect_err("occurrence anchor is immutable");
+    assert_eq!(
+        error,
+        ExtensionError::Message(
+            "causal-dag node occurrence anchor changed during revision".to_owned()
+        )
+    );
+    assert_eq!(host.writes.lock().expect("writes").len(), 1);
+
     CausalDagObserverApplyCommand
         .execute(
             CommandContext {
@@ -476,6 +498,10 @@ fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
     assert!(source_refs
         .iter()
         .all(|source| source["id"] != "src-root-renamed"));
+    assert_eq!(
+        artifact["forest"]["nodes"][0]["metadata"]["occurrence_source_ref_id"],
+        json!("src-root")
+    );
 }
 
 #[test]
@@ -2892,10 +2918,20 @@ fn observe_allows_metadata_fields_inside_hint_records() {
     let (mut events, _) = load_knuth_fixture();
     let mut hints = extract_observer_hints(&mut events);
     assert_no_embedded_causal_dag_hints(&events);
+    let occurrence_source_ref_id = hints["nodes"][0]["source_refs"][0]["id"]
+        .as_str()
+        .expect("source ref id")
+        .to_owned();
     hints["nodes"][0]
         .as_object_mut()
         .expect("node object")
-        .insert("metadata".to_owned(), json!({"observer_note": "kept"}));
+        .insert(
+            "metadata".to_owned(),
+            json!({
+                "observer_note": "kept",
+                "occurrence_source_ref_id": occurrence_source_ref_id
+            }),
+        );
     hints["edges"][0]
         .as_object_mut()
         .expect("edge object")
@@ -2923,11 +2959,47 @@ fn observe_allows_metadata_fields_inside_hint_records() {
         .expect("nodes")
         .iter()
         .any(|node| node["metadata"]["observer_note"] == json!("kept")));
+    assert!(artifact["forest"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .any(
+            |node| node["metadata"]["occurrence_source_ref_id"] == json!(occurrence_source_ref_id)
+        ));
     assert!(artifact["forest"]["edges"]
         .as_array()
         .expect("edges")
         .iter()
         .any(|edge| edge["metadata"]["edge_note"] == json!("kept")));
+}
+
+#[test]
+fn observe_rejects_unresolved_occurrence_source_ref() {
+    let (mut events, _) = load_knuth_fixture();
+    let mut hints = extract_observer_hints(&mut events);
+    hints["nodes"][0]["metadata"]["occurrence_source_ref_id"] = json!("missing-source");
+    let host = RecordingHost::new(recording_page(events, DEFAULT_LIMIT, None, false));
+
+    let error = CausalDagObserveCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-knuth",
+                    "causal_dag": hints
+                }),
+            },
+            &host,
+        )
+        .expect_err("unresolved occurrence source ref");
+
+    assert_eq!(
+        error,
+        ExtensionError::Message(
+            "causal-dag node metadata.occurrence_source_ref_id references missing source ref `missing-source`"
+                .to_owned()
+        )
+    );
+    assert!(host.writes.lock().expect("writes").is_empty());
 }
 
 #[test]

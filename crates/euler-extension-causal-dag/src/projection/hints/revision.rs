@@ -1,6 +1,6 @@
 //! Prior-graph loading and evidence merging for semantic revisions.
 
-use super::{object_value, required_json_str, required_str};
+use super::{object_value, required_json_str, required_str, OCCURRENCE_SOURCE_REF_ID};
 use crate::active_state::ActiveGraphState;
 use crate::input_error;
 use euler_sdk::ExtensionError;
@@ -79,6 +79,7 @@ pub(super) fn merge_record_sources(
     previous: &Value,
     revised: &mut Value,
 ) -> Result<(), ExtensionError> {
+    preserve_occurrence_anchor(previous, revised)?;
     let previous_refs = previous
         .get("source_refs")
         .and_then(Value::as_array)
@@ -121,6 +122,30 @@ pub(super) fn merge_record_sources(
         .collect::<Vec<_>>();
     revised["source_refs"] = Value::Array(merged.into_values().collect());
     revised["basis"]["source_ref_ids"] = Value::Array(source_ref_ids);
+    Ok(())
+}
+
+fn preserve_occurrence_anchor(previous: &Value, revised: &mut Value) -> Result<(), ExtensionError> {
+    if previous.get("root_id").is_none() {
+        return Ok(());
+    }
+    let previous_anchor = previous
+        .get("metadata")
+        .and_then(|metadata| metadata.get(OCCURRENCE_SOURCE_REF_ID))
+        .and_then(Value::as_str);
+    let revised_anchor = revised
+        .get("metadata")
+        .and_then(|metadata| metadata.get(OCCURRENCE_SOURCE_REF_ID))
+        .and_then(Value::as_str);
+    let Some(previous_anchor) = previous_anchor else {
+        return Ok(());
+    };
+    if revised_anchor.is_some_and(|anchor| anchor != previous_anchor) {
+        return Err(input_error(
+            "causal-dag node occurrence anchor changed during revision",
+        ));
+    }
+    revised["metadata"][OCCURRENCE_SOURCE_REF_ID] = Value::String(previous_anchor.to_owned());
     Ok(())
 }
 

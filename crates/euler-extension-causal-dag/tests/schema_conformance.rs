@@ -200,6 +200,17 @@ fn causal_dag_rejects_metadata_shadowing() {
 }
 
 #[test]
+fn causal_dag_rejects_unresolved_occurrence_anchor() {
+    assert_knuth_mutation_fails(
+        |artifact| {
+            node_mut(artifact, "node-knuth-repair")["metadata"] =
+                json!({"occurrence_source_ref_id": "missing-source"});
+        },
+        "occurrence-source-ref",
+    );
+}
+
+#[test]
 fn causal_dag_accepts_materialized_backbone_labels() {
     let mut case = load_fixture("knuth_style_search");
     set_node_label(&mut case.artifact, "node-knuth-deadend", json!("A"));
@@ -1196,6 +1207,20 @@ impl<'a> Validator<'a> {
                 &confidence_level,
                 "node",
             );
+            if let Some(anchor) = metadata.get("occurrence_source_ref_id") {
+                match anchor.as_str() {
+                    Some(anchor)
+                        if source_refs.iter().any(|source_ref| source_ref.id == anchor) => {}
+                    Some(_) => self.report.fail(
+                        "occurrence-source-ref",
+                        "node metadata.occurrence_source_ref_id references a missing source ref",
+                    ),
+                    None => self.report.fail(
+                        "occurrence-source-ref",
+                        "node metadata.occurrence_source_ref_id must be a string",
+                    ),
+                }
+            }
             self.validate_basis_source_refs(object.get("basis"), &source_refs, "node");
             self.validate_evidence_shape(&basis_kind, &confidence_level, &source_refs, "node");
             self.validate_opaque_reasoning(&basis_kind, &source_refs, "node");

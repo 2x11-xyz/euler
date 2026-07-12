@@ -303,7 +303,13 @@ Backbone rule:
 - Root nodes must use their own `id` as `root_id` and have no backbone parent.
 - Backbone edges must not cross roots or form cycles.
 
-Use `metadata: {}` unless a bounded derived annotation is necessary.
+For each new node, set `metadata.occurrence_source_ref_id` to the local
+`source_refs[].id` for the event where that material state first occurred, not
+a later documentation or verification event. The host preserves this anchor
+when a stable node is revised. When later work creates a materially new
+integrated or verified state, add a successor checkpoint or synthesis rather
+than folding that state into an earlier node. Other metadata remains optional
+and bounded.
 
 ## Workflows
 
@@ -447,9 +453,12 @@ The viewer contract follows the canonical reference at
 - both 2D views use bare status glyphs without enclosing kind shapes;
 - both constellation views use bare glowing dots and dot-only status legends;
 - every plotted root is gold while its detail card retains the true status;
-- 3.5D alone uses first-occurrence sequence for vertical position, tree depth
-  for radius, and branch identity for angle; a resumed branch may therefore
-  have a long parent-child edge across intervening sequence positions; and
+- 3.5D alone uses explicit occurrence sequence for vertical position (falling
+  back to the earliest source event for legacy artifacts), while enforcing
+  parent-before-child order; tree depth and elapsed branch sequence fan nodes
+  away from the central axis, while branch identity determines angle;
+- both constellation views expose node distance under `tune`, without changing
+  the graph's structure or sequence;
 - layout, density, camera, and interaction behavior otherwise remain faithful
   to the reference.
 
