@@ -74,6 +74,48 @@ pub fn load_pre_image(root: &Path, sha256: &str) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+/// Scrub `secrets` out of a stored pre-image (issue #100).
+///
+/// If the checkpoint blob `sha256` exists and holds any secret, rewrite it
+/// scrubbed under a new content-addressed hash, remove the original file, and
+/// return the new hash so the caller can re-point the `file.change` event.
+/// Returns `Ok(None)` when there is nothing to do — the blob is missing, its
+/// hash is malformed, or it holds no secret. A checkpoint whose bytes changed
+/// out from under us (hash mismatch) is treated as not-ours and left alone.
+pub fn scrub_pre_image(
+    root: &Path,
+    sha256: &str,
+    secrets: &[String],
+) -> io::Result<Option<String>> {
+    if !is_sha256_hex(sha256) {
+        return Ok(None);
+    }
+    let old_path = checkpoint_blob_path(root, sha256);
+    let bytes = match fs::read(&old_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if hash_bytes(&bytes) != sha256 {
+        return Ok(None);
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Ok(None);
+    };
+    let (scrubbed, replacements) = crate::redaction::scrub_secrets_in_text(&content, secrets);
+    if replacements == 0 {
+        return Ok(None);
+    }
+    let new_hash = hash_bytes(scrubbed.as_bytes());
+    write_blob_durable(&checkpoint_blob_path(root, &new_hash), scrubbed.as_bytes())?;
+    // New pre-image is durable before the old (secret-bearing) file goes; the
+    // caller re-points the event to `new_hash` under the same commit.
+    if new_hash != *sha256 {
+        let _ = fs::remove_file(&old_path);
+    }
+    Ok(Some(new_hash))
+}
+
 /// Scan session events for `file.change` rows that carry a restorable pre-image.
 /// Newest first for the `/rollback` picker.
 pub fn list_from_events(events: &[EventEnvelope]) -> Vec<WorkspaceCheckpointRef> {

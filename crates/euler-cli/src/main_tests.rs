@@ -1709,6 +1709,25 @@ fn provider_options_are_fresh_session_only_for_first_slice() {
 }
 
 #[test]
+fn scrub_command_parses_session_and_values() {
+    let args = parse_args_without_env(["scrub", "my-session", "sk-live-value-0123456789"]);
+    let Command::Scrub(scrub) = args.command else {
+        panic!("expected scrub command");
+    };
+    assert_eq!(scrub.session, "my-session");
+    assert_eq!(scrub.values, vec!["sk-live-value-0123456789".to_owned()]);
+}
+
+#[test]
+fn scrub_command_requires_at_least_one_value() {
+    let error = parse_args_error(["scrub", "my-session"]);
+    assert!(
+        error.to_string().contains("requires at least one value"),
+        "{error}"
+    );
+}
+
+#[test]
 fn observe_flag_parses_valid_extension_and_default_cadence() {
     let args = parse_without_env(["--observe", "causal-dag"]);
 
@@ -2175,6 +2194,7 @@ fn unwrap_run(args: Args) -> RunArgs {
         Command::Models(_) => panic!("expected run args"),
         Command::SessionExport(_) => panic!("expected run args"),
         Command::Extension(_) => panic!("expected run args"),
+        Command::Scrub(_) => panic!("expected run args"),
     }
 }
 

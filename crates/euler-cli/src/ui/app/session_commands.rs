@@ -214,6 +214,30 @@ impl AppCore {
         }
     }
 
+    /// `/scrub [value]` (issue #100): remove a credential from every
+    /// provenance surface of the live session. Bare form scrubs the values
+    /// detected in tool-call arguments this session (the ones the exposure
+    /// warning flagged); an explicit value scrubs exactly that string.
+    pub(super) fn scrub_current_session(&mut self, value: Option<String>) -> CoreEffect {
+        let AppState::Idle { session } = &mut self.state else {
+            return self.notice_item("scrub waits for the active turn".to_owned());
+        };
+        let secrets = match value {
+            Some(value) => vec![value],
+            None => session.scrub_candidates().to_vec(),
+        };
+        if secrets.is_empty() {
+            return self.notice_item(
+                "scrub: no credential detected this session — pass a value: /scrub <value>"
+                    .to_owned(),
+            );
+        }
+        match session.scrub_live(&secrets) {
+            Ok(report) => self.notice_item(report.summary_line()),
+            Err(error) => self.error_item(format!("scrub failed: {error}")),
+        }
+    }
+
     pub(super) fn switch_model(&mut self, provider: String, model: String) -> CoreEffect {
         let AppState::Idle { session } = &mut self.state else {
             return self.notice_item("model switch waits for the active turn".to_owned());

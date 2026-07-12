@@ -153,6 +153,54 @@ redaction chokepoints: provenance keeps model cognition faithful.
 Secrets are caught where they enter (tool results, provider errors,
 extension content) rather than by rewriting what the model said.
 
+## Exposure Detection & Scrub
+
+The counterpart to faithful cognition: euler never silently redacts a
+tool-call argument, so a live credential can land there. It is made visible
+and removable, never rewritten behind the user's back.
+
+### Detection (read-only)
+
+At `tool.call` emission the argument payload is scanned with the same
+known-value + token-shape layer used for redaction (`SecretRedactor::detect`).
+Detection **never modifies the event** — the argument stays verbatim. A hit
+emits a `secret.exposure.detected` audit event carrying the shape labels and a
+pointer to the exposing event (`{ event, field, shapes, count }`) — **never the
+value** — and buffers the detected values in memory (never persisted) so a bare
+`/scrub` knows what to remove. The TUI renders the event as a non-blocking `⚠`
+heads-up on the spine. Tool RESULTS are not a detection site: they are already
+redacted at the entry boundary.
+
+### Scrub (explicit, user-initiated)
+
+One surface-sweeping engine (`euler_core::scrub`), two entry points:
+
+- **live** — `/scrub [value]` during a session (`Session::scrub_live`). Bare
+  form scrubs the buffered detection candidates; an explicit value scrubs that
+  string. Also scrubs the in-memory event bus so the running session stops
+  carrying the value.
+- **post-close** — `euler scrub <session> <value>…` (`scrub_closed_session`),
+  for exposure noticed after the session ended. A closed session has no live
+  candidate, so at least one explicit value is required.
+
+Both remove every occurrence from **every persistent surface**:
+
+- `events.jsonl` payloads, including the inline `projection_blob` compaction
+  state (recursive string-leaf walk);
+- externalized `blobs/` — a blob holding a secret is rewritten under a fresh
+  content hash, re-pointed, and the superseded file removed;
+- workspace `.euler/checkpoints` pre-images — rewritten and re-pointed the
+  same way when the session's root is known;
+- the `session.json` title sidecar and the store `index.jsonl` entry.
+
+Event ids, timestamps, kinds, and ordering are preserved; the log rewrite is
+atomic (fsync + rename) under the session append lock, with new blobs durable
+before the commit and superseded blobs removed after. Occurrences are replaced
+with the `[scrubbed]` marker — distinct from the emit-time `[redacted-secret]`
+marker so the record shows WHICH mechanism removed a value. A `secret.scrubbed`
+audit event records per-surface counts (never the value) and notes that
+**already-exported or pushed copies cannot be recalled**.
+
 ## Non-Goals
 
 Euler is not a multi-user secrets manager.

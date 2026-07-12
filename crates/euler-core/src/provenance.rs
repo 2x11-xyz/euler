@@ -137,6 +137,177 @@ impl ProvenanceWriter {
         Ok(())
     }
 
+    /// Scrub `secrets` out of the durable ledger (issue #100).
+    ///
+    /// Rewrites the accepted prefix of the log in place: every occurrence in an
+    /// event payload (including inline `projection_blob` compaction state) is
+    /// replaced with the scrub marker, externalized blobs holding a secret are
+    /// rewritten under a fresh content hash and re-pointed, and — when
+    /// `workspace_root` is known — `file.change` pre-image checkpoints are
+    /// rewritten the same way. Event ids, timestamps, kinds, and ordering are
+    /// preserved, so the only tail movement is the appended `secret.scrubbed`
+    /// audit event (counts only, never the value).
+    ///
+    /// Held under the append lock so no concurrent append races. Atomic: the
+    /// new log is fsynced and renamed over the old; new blobs are durable
+    /// before the log commit; superseded blobs are removed after it. Returns a
+    /// no-op result (`audit_event_id: None`) when no surface held a secret.
+    pub fn scrub_and_audit(
+        &self,
+        secrets: &[String],
+        workspace_root: Option<&Path>,
+        session_id: &str,
+        agent: &str,
+    ) -> io::Result<LogScrubStats> {
+        let mut durable_tail = recover_mutex(&self.append_lock);
+
+        let content = match fs::read_to_string(&self.log_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let mut events = accepted_prefix_lines(&content)
+            .into_iter()
+            .map(EventEnvelope::from_json_line)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?;
+
+        let mut pass = ScrubPass::default();
+        for event in &mut events {
+            self.scrub_one_event(event, secrets, workspace_root, &mut pass)?;
+        }
+        if !pass.stats.touched_anything() {
+            return Ok(pass.stats);
+        }
+
+        let audit = EventEnvelope::new(
+            session_id,
+            agent,
+            events.last().map(|event| event.id.clone()),
+            EventKind::new(EventKind::SECRET_SCRUBBED),
+            scrub_audit_payload(secrets.len(), &pass.stats),
+        );
+        pass.stats.audit_event_id = Some(audit.id.clone());
+        events.push(audit);
+
+        // New blobs are durable before the log commit; superseded ones removed
+        // after, so a crash never strands a secret-bearing blob the committed
+        // log still points at.
+        for (path, bytes) in &pass.new_blobs {
+            write_blob_durable(path, bytes)?;
+        }
+        self.commit_scrubbed_log(&events)?;
+        for path in &pass.retired_blobs {
+            let _ = fs::remove_file(path);
+        }
+        if !pass.new_blobs.is_empty() {
+            let _ = sync_dir(&self.blob_dir);
+        }
+
+        *durable_tail = events.last().map(|event| event.id.clone());
+        self.event_wakes.notify_advanced();
+        Ok(pass.stats)
+    }
+
+    /// Scrub one event's payload, externalized blobs, and (when the workspace
+    /// root is known) `file.change` pre-image checkpoint in place, recording
+    /// deferred blob side effects and counts into `pass`.
+    fn scrub_one_event(
+        &self,
+        event: &mut EventEnvelope,
+        secrets: &[String],
+        workspace_root: Option<&Path>,
+        pass: &mut ScrubPass,
+    ) -> io::Result<()> {
+        let mut replacements = 0;
+        for value in event.payload.values_mut() {
+            replacements += crate::redaction::scrub_secrets_in_value(value, secrets);
+        }
+        if replacements > 0 {
+            pass.stats.events_rewritten += 1;
+            pass.stats.replacements += replacements;
+        }
+
+        for (field, hash) in event.blobs.clone() {
+            let Some(new_hash) = self.scrub_one_blob(&hash, secrets, pass) else {
+                continue;
+            };
+            event.blobs.insert(field.clone(), new_hash.clone());
+            event
+                .payload
+                .insert(field.clone(), format!("blob:{new_hash}").into());
+            pass.stats.blobs_rewritten += 1;
+        }
+
+        if let Some(root) = workspace_root {
+            if event.kind.as_str() == EventKind::FILE_CHANGE {
+                if let Some(old_hash) = event
+                    .payload
+                    .get("pre_image_blob")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|hash| !hash.is_empty())
+                    .map(str::to_owned)
+                {
+                    if let Some(new_hash) =
+                        crate::checkpoints::scrub_pre_image(root, &old_hash, secrets)?
+                    {
+                        event
+                            .payload
+                            .insert("pre_image_blob".to_owned(), new_hash.into());
+                        pass.stats.checkpoints_rewritten += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite an externalized blob that holds a secret, returning the new
+    /// content hash to re-point at. `None` when the blob is missing, non-UTF-8,
+    /// or holds no secret. Same content hashes to the same value, so a blob
+    /// shared by several events is read and rewritten once (cached in `pass`).
+    fn scrub_one_blob(&self, hash: &str, secrets: &[String], pass: &mut ScrubPass) -> Option<String> {
+        if let Some(new_hash) = pass.blob_rewrites.get(hash) {
+            return Some(new_hash.clone());
+        }
+        let path = self.blob_dir.join(hash);
+        let text = String::from_utf8(fs::read(&path).ok()?).ok()?;
+        let (scrubbed, count) = crate::redaction::scrub_secrets_in_text(&text, secrets);
+        if count == 0 {
+            return None;
+        }
+        pass.stats.replacements += count;
+        let new_hash = hash_bytes(scrubbed.as_bytes());
+        pass.new_blobs
+            .push((self.blob_dir.join(&new_hash), scrubbed.into_bytes()));
+        if new_hash != hash {
+            pass.retired_blobs.push(path);
+        }
+        pass.blob_rewrites.insert(hash.to_owned(), new_hash.clone());
+        Some(new_hash)
+    }
+
+    /// Atomically replace the log with `events`: fsync a temp file and rename
+    /// it over the log, then fsync the directory.
+    fn commit_scrubbed_log(&self, events: &[EventEnvelope]) -> io::Result<()> {
+        let temp_path = temp_path_with_suffix(&self.log_path, ".scrub.tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        for event in events {
+            let line = event.to_json_line().map_err(io::Error::other)?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        file.sync_data()?;
+        drop(file);
+        fs::rename(&temp_path, &self.log_path)?;
+        sync_dir(containing_dir(&self.log_path))
+    }
+
     fn append_locked(
         &self,
         state: &mut AppendState,
@@ -964,6 +1135,54 @@ pub fn event_is_runtime_only(kind: &str) -> bool {
 fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
+}
+
+/// Per-surface tally from [`ProvenanceWriter::scrub_and_audit`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LogScrubStats {
+    /// Distinct events whose payload was rewritten.
+    pub events_rewritten: usize,
+    /// Externalized blobs rewritten under a fresh content hash.
+    pub blobs_rewritten: usize,
+    /// Workspace pre-image checkpoints rewritten.
+    pub checkpoints_rewritten: usize,
+    /// Total substring replacements across payloads and blobs.
+    pub replacements: usize,
+    /// Id of the appended `secret.scrubbed` audit event, or `None` for a no-op.
+    pub audit_event_id: Option<String>,
+}
+
+impl LogScrubStats {
+    fn touched_anything(&self) -> bool {
+        self.events_rewritten > 0 || self.blobs_rewritten > 0 || self.checkpoints_rewritten > 0
+    }
+}
+
+/// Mutable accumulator threaded through a scrub over the log's events: running
+/// counts plus deferred blob side effects (written/removed around the atomic
+/// log commit) and a per-hash rewrite cache so a shared blob is handled once.
+#[derive(Default)]
+struct ScrubPass {
+    stats: LogScrubStats,
+    new_blobs: Vec<(PathBuf, Vec<u8>)>,
+    retired_blobs: Vec<PathBuf>,
+    blob_rewrites: std::collections::HashMap<String, String>,
+}
+
+fn scrub_audit_payload(values: usize, stats: &LogScrubStats) -> euler_event::JsonObject {
+    let mut surfaces = serde_json::Map::new();
+    surfaces.insert("events".to_owned(), stats.events_rewritten.into());
+    surfaces.insert("blobs".to_owned(), stats.blobs_rewritten.into());
+    surfaces.insert("checkpoints".to_owned(), stats.checkpoints_rewritten.into());
+    let mut payload = serde_json::Map::new();
+    payload.insert("values".to_owned(), values.into());
+    payload.insert("replacements".to_owned(), stats.replacements.into());
+    payload.insert("surfaces".to_owned(), surfaces.into());
+    payload.insert(
+        "note".to_owned(),
+        "already-exported or pushed copies cannot be recalled".into(),
+    );
+    payload
 }
 
 #[cfg(test)]

@@ -37,6 +37,7 @@ impl<D: PermissionDecider> Session<D> {
             ]),
             Some(model_result_id),
         )?;
+        self.flag_tool_call_exposure(&tool_call_event_id, &call.input)?;
         sink.flush(self.bus.events());
 
         let mut covered_grant_source: Option<crate::GrantSource> = None;

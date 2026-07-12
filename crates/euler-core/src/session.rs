@@ -239,6 +239,10 @@ pub enum SessionError {
     InvalidCompanionTask(String),
     #[error("companion spawn requires provenance writer")]
     CompanionProvenanceUnavailable,
+    #[error("scrub requires provenance writer")]
+    ScrubRequiresProvenance,
+    #[error(transparent)]
+    Scrub(#[from] crate::scrub::ScrubError),
     #[error("checkpoint not found: {event_id}")]
     CheckpointNotFound { event_id: String },
     #[error("checkpoint has no restorable pre-image: {event_id}")]
@@ -310,6 +314,10 @@ pub struct Session<D> {
     /// Wired code-swarm extension backing the `code_swarm_review` tool; the
     /// tool is advertised to the root session's model only when this is set.
     code_swarm_extension: Option<Arc<dyn Extension>>,
+    /// Credentials detected in faithful tool-call arguments this session
+    /// (issue #100). In-memory only — NEVER persisted — so a bare `/scrub`
+    /// knows what to remove after the warning. Holds the values, not labels.
+    scrub_candidates: Vec<String>,
 }
 
 /// Session-side adapter driving the shared [`RoundLoop`]: bundles the
@@ -576,6 +584,7 @@ impl<D> Session<D> {
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
             code_swarm_extension: None,
+            scrub_candidates: Vec::new(),
         };
         session.install_provider_secret_sink();
         session
@@ -931,6 +940,7 @@ impl<D> Session<D> {
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
             code_swarm_extension: None,
+            scrub_candidates: Vec::new(),
         };
         session.install_provider_secret_sink();
         session
@@ -1620,6 +1630,85 @@ impl<D: PermissionDecider> Session<D> {
         ]);
         payload.insert("category".to_owned(), error.category().as_str().into());
         self.emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))
+    }
+
+    /// Read-only exposure detection on a faithful tool-call argument (issue
+    /// #100). Euler never redacts model cognition, so a credential the model
+    /// puts in a tool-call argument stays in the record verbatim — but the user
+    /// is made AWARE. Emits a `secret.exposure.detected` marker carrying shape
+    /// labels and a pointer to the exposing event (never the value), and
+    /// buffers the detected values so a later bare `/scrub` knows what to
+    /// remove. The tool-call payload itself is left untouched.
+    fn flag_tool_call_exposure(
+        &mut self,
+        tool_call_event_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<(), SessionError> {
+        let hits = self.redactor.detect(&input.to_string());
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let mut shapes: Vec<String> = hits.iter().map(|hit| hit.label.clone()).collect();
+        shapes.sort();
+        shapes.dedup();
+        for hit in &hits {
+            if !self.scrub_candidates.contains(&hit.value) {
+                self.scrub_candidates.push(hit.value.clone());
+            }
+        }
+        self.emit_with_parent(
+            EventKind::SECRET_EXPOSURE_DETECTED,
+            object([
+                ("event", tool_call_event_id.to_owned().into()),
+                ("field", "input".into()),
+                ("shapes", shapes.into()),
+                ("count", hits.len().into()),
+            ]),
+            Some(tool_call_event_id.to_owned()),
+        )?;
+        Ok(())
+    }
+
+    /// Credentials detected in faithful tool-call arguments this session that a
+    /// bare `/scrub` would remove. In-memory only; never the value on disk.
+    pub fn scrub_candidates(&self) -> &[String] {
+        &self.scrub_candidates
+    }
+
+    /// Live scrub (issue #100): remove `secrets` from the running session's
+    /// durable surfaces (ledger, blobs, workspace checkpoints, title sidecar)
+    /// AND its in-memory event bus, append a `secret.scrubbed` audit event, and
+    /// drop any matching detection candidates. Requires a provenance writer.
+    pub fn scrub_live(
+        &mut self,
+        secrets: &[String],
+    ) -> Result<crate::scrub::ScrubReport, SessionError> {
+        let Some(writer) = self.provenance.clone() else {
+            return Err(SessionError::ScrubRequiresProvenance);
+        };
+        let stats = writer.scrub_and_audit(
+            secrets,
+            Some(self.config.root.as_path()),
+            &self.config.session_id,
+            &self.config.agent_id,
+        )?;
+        let mut report = crate::scrub::report_from_log_stats(stats);
+        if let Some(session_dir) = writer.log_path().parent() {
+            crate::scrub::finish_non_log_surfaces(
+                session_dir,
+                crate::scrub::ScrubSurfaces::default(),
+                secrets,
+                &mut report,
+            )?;
+        }
+        // The running session must stop carrying the value: the durable log is
+        // already scrubbed, so align the in-memory bus so no later render,
+        // compaction, or persist re-emits it. Ids and count are unchanged, so
+        // the persisted-events cursor stays valid.
+        self.bus.scrub_payloads(secrets);
+        self.scrub_candidates
+            .retain(|candidate| !secrets.contains(candidate));
+        Ok(report)
     }
 
     fn emit(&mut self, kind: &'static str, payload: JsonObject) -> Result<String, SessionError> {

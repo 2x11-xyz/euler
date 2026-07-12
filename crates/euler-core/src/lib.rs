@@ -20,6 +20,7 @@ pub mod permissions;
 pub mod provenance;
 pub mod redaction;
 pub mod resume;
+pub mod scrub;
 pub mod session;
 pub mod session_kind;
 mod session_name;
@@ -120,5 +121,19 @@ impl EventBus {
 
     pub fn events(&self) -> &[EventEnvelope] {
         &self.events
+    }
+
+    /// Scrub `secrets` from every in-memory event payload (issue #100), so a
+    /// live scrub stops the running session from re-rendering, compacting, or
+    /// re-persisting a value already removed from the durable log. Event ids
+    /// and order are untouched. Returns the total replacements made.
+    pub fn scrub_payloads(&mut self, secrets: &[String]) -> usize {
+        let mut count = 0;
+        for event in &mut self.events {
+            for value in event.payload.values_mut() {
+                count += redaction::scrub_secrets_in_value(value, secrets);
+            }
+        }
+        count
     }
 }
