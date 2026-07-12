@@ -1,5 +1,5 @@
 use super::graph::{ViewerDag, ViewerNode};
-use super::palette::{KindToken, Palette};
+use super::palette::Palette;
 use crate::input_error;
 use euler_sdk::ExtensionError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -195,7 +195,17 @@ fn render_nodes(
             continue;
         };
         let status = palette.status(&node.status)?;
-        let kind = palette.kind(&node.kind)?;
+        let is_root = node.kind == "root";
+        let color = if is_root {
+            palette.root.day.as_str()
+        } else {
+            status.day.as_str()
+        };
+        let glyph = if is_root {
+            "○"
+        } else {
+            status.glyph.as_str()
+        };
         svg.push_str("<g>");
         svg.push_str(&format!(
             "<title>{} · {} · confidence {:.2}\n{}\nEvidence: {}</title>",
@@ -205,14 +215,14 @@ fn render_nodes(
             escape_xml(&node.summary),
             escape_xml(&node.ev)
         ));
-        render_kind_shape(svg, point, &status.day, &palette.backgrounds.day, kind);
         svg.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-family=\"ui-monospace,monospace\" font-size=\"14\" font-weight=\"{}\" fill=\"{}\">{}</text>",
+            "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-family=\"ui-monospace,monospace\" font-size=\"{}\" font-weight=\"{}\" fill=\"{}\">{}</text>",
             point.x,
             point.y,
-            kind.weight,
-            status.day,
-            escape_xml(&status.glyph)
+            if is_root { 20 } else { 17 },
+            if is_root { 600 } else { 400 },
+            color,
+            escape_xml(glyph)
         ));
         svg.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" font-family=\"ui-monospace,monospace\" font-size=\"11\" fill=\"#4a4840\">{}</text></g>\n",
@@ -222,52 +232,6 @@ fn render_nodes(
         ));
     }
     Ok(())
-}
-
-fn render_kind_shape(
-    svg: &mut String,
-    point: &Point,
-    color: &str,
-    background: &str,
-    kind: &KindToken,
-) {
-    let radius = 14.0 * kind.scale;
-    match kind.shape.as_str() {
-        "diamond" => svg.push_str(&format!(
-            "<path d=\"M {:.1} {:.1} L {:.1} {:.1} L {:.1} {:.1} L {:.1} {:.1} Z\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"1.5\"/>",
-            point.x,
-            point.y - radius,
-            point.x + radius,
-            point.y,
-            point.x,
-            point.y + radius,
-            point.x - radius,
-            point.y
-        )),
-        "square" => svg.push_str(&format!(
-            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"1.5\"/>",
-            point.x - radius,
-            point.y - radius,
-            radius * 2.0,
-            radius * 2.0
-        )),
-        "double_ring" => svg.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"1.5\"/><circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1\"/>",
-            point.x,
-            point.y,
-            point.x,
-            point.y,
-            radius + 4.0
-        )),
-        "ring" => svg.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"2.5\"/>",
-            point.x, point.y
-        )),
-        _ => svg.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"1.25\"/>",
-            point.x, point.y
-        )),
-    }
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -291,4 +255,35 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_svg;
+    use crate::export::{graph::ViewerDag, palette::Palette};
+    use serde_json::Value;
+
+    #[test]
+    fn static_svg_uses_bare_status_marks_and_a_gold_root() {
+        let mut artifact: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/causal_dag/knuth_style_search/expected.causal-dag.json"
+        ))
+        .expect("fixture artifact");
+        let root = artifact["forest"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|node| node["kind"] == "root")
+            .expect("root");
+        root["status"] = Value::String("verified".to_owned());
+
+        let dag = ViewerDag::from_artifact(&artifact).expect("viewer DAG");
+        let svg = String::from_utf8(
+            render_svg(&dag, &Palette::load().expect("palette")).expect("SVG render"),
+        )
+        .expect("UTF-8 SVG");
+
+        assert!(svg.contains("fill=\"#E8B931\">○</text>"));
+        assert!(!svg.contains("<circle"));
+    }
 }

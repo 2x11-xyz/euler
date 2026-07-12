@@ -20,6 +20,7 @@ pub(crate) struct ViewerDag {
 pub(super) struct ViewerNode {
     pub(super) id: String,
     pub(super) parent: Option<String>,
+    pub(super) sequence: usize,
     pub(super) status: String,
     pub(super) kind: String,
     pub(super) title: String,
@@ -75,7 +76,7 @@ impl ViewerDag {
         }
 
         let parents = backbone_parents(raw_edges, &node_ids)?;
-        let nodes = raw_nodes
+        let mut nodes = raw_nodes
             .iter()
             .map(|node| viewer_node(node, &parents))
             .collect::<Result<Vec<_>, _>>()?;
@@ -89,6 +90,10 @@ impl ViewerDag {
                 "causal-dag artifact active_root is not one of forest.roots",
             ));
         }
+        let sequence_root = active_root
+            .as_deref()
+            .or_else(|| roots.first().map(String::as_str));
+        assign_sequence(&mut nodes, raw_nodes, sequence_root);
         let arcs = raw_edges
             .iter()
             .filter(|edge| edge.get("canonical_backbone").and_then(Value::as_bool) != Some(true))
@@ -172,6 +177,7 @@ fn viewer_node(
     Ok(ViewerNode {
         parent: parents.get(&id).cloned(),
         id,
+        sequence: 0,
         status,
         kind,
         title: required_string(node, "title", "node")?,
@@ -179,6 +185,48 @@ fn viewer_node(
         conf: confidence_score(node),
         ev: evidence_label(node),
     })
+}
+
+fn assign_sequence(nodes: &mut [ViewerNode], raw_nodes: &[Value], active_root: Option<&str>) {
+    let anchors = raw_nodes.iter().map(sequence_anchor).collect::<Vec<_>>();
+    let mut order = (0..nodes.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        let left_is_root = active_root == Some(nodes[left].id.as_str());
+        let right_is_root = active_root == Some(nodes[right].id.as_str());
+        left_is_root
+            .cmp(&right_is_root)
+            .reverse()
+            .then_with(|| match (&anchors[left], &anchors[right]) {
+                (Some(left), Some(right)) => left.cmp(right),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then(left.cmp(&right))
+    });
+    for (sequence, index) in order.into_iter().enumerate() {
+        nodes[index].sequence = sequence;
+    }
+}
+
+fn sequence_anchor(node: &Value) -> Option<String> {
+    node.get("source_refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|source| source.get("event_id").and_then(Value::as_str))
+        .filter(|event_id| is_ulid(event_id))
+        .map(str::to_owned)
+        .min()
+}
+
+fn is_ulid(value: &str) -> bool {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    value.len() == 26
+        && matches!(value.as_bytes()[0], b'0'..=b'7')
+        && value
+            .bytes()
+            .all(|byte| ALPHABET.contains(&byte.to_ascii_uppercase()))
 }
 
 fn viewer_arc(edge: &Value, node_ids: &BTreeSet<String>) -> Result<ViewerArc, ExtensionError> {
@@ -552,6 +600,56 @@ mod tests {
         let dag = ViewerDag::from_artifact(&artifact).expect("viewer DAG");
         assert_eq!(dag.nodes[0].status, "inconclusive");
         assert_eq!(dag.nodes[1].status, "dead_end");
+    }
+
+    #[test]
+    fn viewer_sequence_uses_first_provenance_occurrence_without_reordering_nodes() {
+        let mut artifact = artifact();
+        let anchors = BTreeMap::from([
+            ("node-knuth-secondary-root", "01KXBWCZTJDB6N4X35BEF8KT5Z"),
+            ("node-knuth-deadend", "01KXBWD3DYZGR226TBZNH3WG78"),
+            ("node-knuth-sibling", "01KXBWD7KTYX4ESC5NGEBGDWA7"),
+            ("node-knuth-repair", "01KXBWDC1M6CBTXCDPJRN6R0FX"),
+            ("node-knuth-verify", "01KXBWY3XJR68XH9PA3YGG8MQX"),
+            ("node-knuth-root", "01KXBXD1ABFCG2A9PT2K0E8ATW"),
+        ]);
+        let raw_nodes = artifact["forest"]["nodes"].as_array_mut().expect("nodes");
+        let storage_order = raw_nodes
+            .iter()
+            .map(|node| node["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        for node in raw_nodes {
+            let id = node["id"].as_str().expect("node id");
+            node["source_refs"] = if id == "node-knuth-verify" {
+                serde_json::json!([
+                    {"event_id": "01KXBZKZR6DGEM1FPHKFS5JR7K"},
+                    {"event_id": anchors[id]}
+                ])
+            } else {
+                serde_json::json!([{"event_id": anchors[id]}])
+            };
+        }
+
+        let dag = ViewerDag::from_artifact(&artifact).expect("viewer DAG");
+        assert_eq!(
+            dag.nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>(),
+            storage_order,
+            "sequence metadata must not change structural viewer order"
+        );
+        let sequence = dag
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.sequence))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(sequence["node-knuth-root"], 0);
+        assert_eq!(sequence["node-knuth-secondary-root"], 1);
+        assert_eq!(sequence["node-knuth-deadend"], 2);
+        assert_eq!(sequence["node-knuth-sibling"], 3);
+        assert_eq!(sequence["node-knuth-repair"], 4);
+        assert_eq!(sequence["node-knuth-verify"], 5);
     }
 
     #[test]

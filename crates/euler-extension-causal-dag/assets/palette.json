@@ -9,6 +9,10 @@
     "day": "#1c1b18",
     "night": "#eceae2"
   },
+  "root": {
+    "day": "#E8B931",
+    "night": "#f0cb52"
+  },
   "status_order": [
     "verified",
     "success",
@@ -67,33 +71,6 @@
       "night": "#e79fc4",
       "glyph": "⊗",
       "label": "abandoned"
-    }
-  },
-  "kinds": {
-    "root": {
-      "shape": "ring",
-      "scale": 1.35,
-      "weight": 600
-    },
-    "attempt": {
-      "shape": "circle",
-      "scale": 1.0,
-      "weight": 400
-    },
-    "claim": {
-      "shape": "diamond",
-      "scale": 1.0,
-      "weight": 500
-    },
-    "checkpoint": {
-      "shape": "square",
-      "scale": 1.05,
-      "weight": 500
-    },
-    "synthesis": {
-      "shape": "double_ring",
-      "scale": 1.2,
-      "weight": 600
     }
   },
   "cross_arcs": {

@@ -15,7 +15,6 @@ const STATUSES: [&str; 8] = [
     "superseded",
     "abandoned",
 ];
-const KINDS: [&str; 5] = ["root", "attempt", "claim", "checkpoint", "synthesis"];
 const ARC_KINDS: [&str; 6] = [
     "pivot",
     "evidence",
@@ -30,9 +29,9 @@ pub(super) struct Palette {
     schema: String,
     pub(super) backgrounds: Backgrounds,
     pub(super) structural_edges: ThemeColors,
+    pub(super) root: ThemeColors,
     status_order: Vec<String>,
     pub(super) statuses: BTreeMap<String, StatusToken>,
-    pub(super) kinds: BTreeMap<String, KindToken>,
     pub(super) cross_arcs: CrossArcTokens,
 }
 
@@ -58,13 +57,6 @@ pub(super) struct StatusToken {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub(super) struct KindToken {
-    pub(super) shape: String,
-    pub(super) scale: f64,
-    pub(super) weight: u16,
-}
-
-#[derive(Clone, Debug, Deserialize)]
 pub(super) struct CrossArcTokens {
     pub(super) rest: String,
     pub(super) opacity: f64,
@@ -83,12 +75,6 @@ impl Palette {
         self.statuses.get(status).ok_or_else(|| {
             input_error(format!("causal-dag palette has no status token `{status}`"))
         })
-    }
-
-    pub(super) fn kind(&self, kind: &str) -> Result<&KindToken, ExtensionError> {
-        self.kinds
-            .get(kind)
-            .ok_or_else(|| input_error(format!("causal-dag palette has no kind token `{kind}`")))
     }
 
     fn validate(&self) -> Result<(), ExtensionError> {
@@ -115,26 +101,14 @@ impl Palette {
                 )));
             }
         }
-        for kind in KINDS {
-            let token = self.kind(kind)?;
-            if !matches!(
-                token.shape.as_str(),
-                "ring" | "circle" | "diamond" | "square" | "double_ring"
-            ) || !(0.5..=2.0).contains(&token.scale)
-                || token.weight == 0
-            {
-                return Err(input_error(format!(
-                    "causal-dag palette kind `{kind}` has invalid shape tokens"
-                )));
-            }
-        }
-        require_exact_keys("kind", self.kinds.keys().map(String::as_str), &KINDS)?;
         for color in [
             &self.backgrounds.day,
             &self.backgrounds.night,
             &self.backgrounds.constellation,
             &self.structural_edges.day,
             &self.structural_edges.night,
+            &self.root.day,
+            &self.root.night,
             &self.cross_arcs.rest,
         ] {
             validate_color(color)?;
@@ -195,12 +169,11 @@ mod tests {
     fn canonical_palette_covers_the_schema_without_overloading_kind() {
         let palette = Palette::load().expect("palette");
         assert_eq!(palette.statuses.len(), 8);
-        assert_eq!(palette.kinds.len(), 5);
         assert_eq!(palette.status("verified").unwrap().day, "#0072B2");
         assert_eq!(palette.status("dead_end").unwrap().night, "#ff8a52");
         assert_eq!(palette.status("abandoned").unwrap().glyph, "⊗");
-        assert_eq!(palette.kind("claim").unwrap().shape, "diamond");
-        assert_eq!(palette.kind("synthesis").unwrap().shape, "double_ring");
+        assert_eq!(palette.root.day, "#E8B931");
+        assert_eq!(palette.root.night, "#f0cb52");
         assert_eq!(palette.cross_arcs.rest, "#7f97a8");
         assert_eq!(palette.cross_arcs.opacity, 0.45);
         assert_eq!(palette.cross_arcs.kinds["refutation"], "#D55E00");

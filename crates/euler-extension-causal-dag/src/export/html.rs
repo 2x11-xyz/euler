@@ -115,7 +115,10 @@ showView(initial);
 
 #[cfg(test)]
 mod tests {
-    use super::{render_html, script_safe_json};
+    use super::{
+        render_html, script_safe_json, CONSTELLATION_3D, CONSTELLATION_3_5D, INDENTED_SPINE,
+        TOP_DOWN,
+    };
     use crate::export::graph::ViewerDag;
     use serde_json::Value;
 
@@ -170,5 +173,24 @@ mod tests {
         assert!(html.contains("\\u003c/script\\u003e\\u003cscript\\u003ewindow.pwned"));
         assert!(html.contains("#7f97a8"));
         assert!(html.contains("connect-src 'none'"));
+    }
+
+    #[test]
+    fn viewer_templates_preserve_the_reference_node_grammar() {
+        for template in [TOP_DOWN, INDENTED_SPINE] {
+            assert!(!template.contains("kindVisual"));
+            assert!(!template.contains("border:{{ n.bw }}"));
+            assert!(template.contains("'○'"));
+            assert!(template.contains("TOKENS.root.day"));
+        }
+        for template in [CONSTELLATION_3D, CONSTELLATION_3_5D] {
+            assert!(!template.contains("drawKindOutline"));
+            assert!(!template.contains("ctx.fillText(GLYPH[n.st]"));
+            assert!(!template.contains("{{ g.glyph }}"));
+            assert!(template.contains("width:8px; height:8px; border-radius:50%"));
+            assert!(template.contains("TOKENS.root.day"));
+        }
+        assert!(CONSTELLATION_3_5D.contains("idx[n.id] = n.sequence ?? i"));
+        assert!(!CONSTELLATION_3D.contains("n.sequence"));
     }
 }

@@ -53,9 +53,7 @@ document.addEventListener('click', function (e) {
           </sc-if>
         </svg>
         <sc-for list="{{ nodes }}" as="n" hint-placeholder-count="0">
-          <span data-status="{{ n.status }}" data-kind="{{ n.kind }}" onmouseenter="{{ n.enter }}" style="position:absolute; left:{{ n.x }}px; top:{{ n.y }}px; transform:translate(-50%,-50%) rotate({{ n.rot }}deg); width:{{ n.sz }}px; height:{{ n.sz }}px; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:{{ n.bw }}px solid {{ n.col }}; border-radius:{{ n.radius }}; box-shadow:{{ n.shadow }}; font:{{ n.w }} 13px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:{{ n.col }}; opacity:{{ n.op }}; cursor:pointer;">
-            <span style="transform:rotate({{ n.invRot }}deg);">{{ n.glyph }}</span>
-          </span>
+          <span data-status="{{ n.status }}" data-kind="{{ n.kind }}" onmouseenter="{{ n.enter }}" style="position:absolute; left:{{ n.x }}px; top:{{ n.y }}px; transform:translate(-50%,-50%); font:15px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:{{ n.col }}; opacity:{{ n.op }}; cursor:pointer; padding:5px;">{{ n.glyph }}</span>
           <span onmouseenter="{{ n.enter }}" style="position:absolute; left:{{ n.lx }}px; top:{{ n.y }}px; transform:translateY(-50%); font:{{ n.w }} 13px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:{{ th.text }}; white-space:nowrap; cursor:pointer; padding:6px 4px;">{{ n.title }}</span>
         </sc-for>
       </div>
@@ -84,7 +82,7 @@ document.addEventListener('click', function (e) {
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
         <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3D · constellation</a>
-          <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · time axis</a>
+          <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · sequence axis</a>
         </div>
       </sc-if>
     </div>
@@ -162,22 +160,6 @@ const OPACITY = Object.fromEntries(STATUS_ORDER.map((s) => [s, 1]));
 const ARC_DAY = TOKENS.cross_arcs.kinds;
 const ARC_NIGHT = TOKENS.cross_arcs.kinds;
 const ARCC = TOKENS.cross_arcs.kinds;
-const KIND = TOKENS.kinds;
-
-function kindVisual(kind, selected) {
-  const token = KIND[kind] || KIND.attempt;
-  const size = Math.round((selected ? 27 : 23) * token.scale);
-  const diamond = token.shape === 'diamond';
-  return {
-    size,
-    rotate: diamond ? 45 : 0,
-    inverse: diamond ? -45 : 0,
-    radius: token.shape === 'circle' || token.shape === 'ring' || token.shape === 'double_ring' ? '50%' : '2px',
-    border: token.shape === 'ring' ? 2.5 : 1.25,
-    shadow: token.shape === 'double_ring' ? '0 0 0 3px currentColor' : 'none',
-    weight: token.weight
-  };
-}
 
 class Component extends DCLogic {
   state = { dag: null, hover: null, panel: false, nav2d: false, nav3d: false, uiTheme: null, uiGap: null, uiArcs: null, vx: null, vy: null, vs: 1 };
@@ -215,6 +197,7 @@ class Component extends DCLogic {
   renderVals() {
     const dark = (this.state.uiTheme ?? this.props.theme ?? 'light') === 'dark';
     const PAL = dark ? NIGHT : DAY;
+    const ROOT = dark ? TOKENS.root.night : TOKENS.root.day;
     const ARCC = dark ? ARC_NIGHT : ARC_DAY;
     const th = dark ? {
       bg: TOKENS.backgrounds.night, edge: TOKENS.structural_edges.night, text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
@@ -283,7 +266,7 @@ class Component extends DCLogic {
     dag.nodes.forEach((n) => { byId[n.id] = n; kids[n.id] = []; });
     dag.nodes.forEach((n) => { if (n.parent) kids[n.parent].push(n.id); });
 
-    const rowH = 34, indent = 28, padX = 60, padY = 10;
+    const rowH = 28, indent = 24, padX = 60, padY = 10;
     const rows = [], depth = {};
     const walk = (id, d) => { depth[id] = d; rows.push(id); kids[id].forEach((c) => walk(c, d + 1)); };
     dag.roots.filter((id) => byId[id]).forEach((root) => walk(root, 0));
@@ -293,13 +276,11 @@ class Component extends DCLogic {
     const nodes = rows.map((id) => {
       const n = byId[id], p = pos[id];
       const selected = this.state.hover === id;
-      const shape = kindVisual(n.kind, selected);
       tW = Math.max(tW, p.x + 17 + n.title.length * 7.85 + 20);
       return {
-        x: p.x, y: p.y, lx: p.x + shape.size / 2 + 8,
-        status: n.status, kind: n.kind, glyph: GLYPH[n.status], title: n.title, col: PAL[n.status], op: OPACITY[n.status],
-        w: selected ? '600' : String(shape.weight), sz: shape.size, rot: shape.rotate, invRot: shape.inverse,
-        radius: shape.radius, bw: shape.border, shadow: shape.shadow,
+        x: p.x, y: p.y, lx: p.x + 17,
+        status: n.status, kind: n.kind, glyph: n.kind === 'root' ? '○' : GLYPH[n.status], title: n.title, col: n.kind === 'root' ? ROOT : PAL[n.status], op: OPACITY[n.status],
+        w: selected ? '600' : '400',
         enter: () => this.setState({ hover: id })
       };
     });

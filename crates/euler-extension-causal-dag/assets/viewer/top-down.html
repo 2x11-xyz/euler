@@ -53,9 +53,7 @@ document.addEventListener('click', function (e) {
           </sc-if>
         </svg>
         <sc-for list="{{ nodes }}" as="n" hint-placeholder-count="0">
-          <span data-status="{{ n.status }}" data-kind="{{ n.kind }}" onmouseenter="{{ n.enter }}" style="position:absolute; left:{{ n.x }}px; top:{{ n.y }}px; transform:translate(-50%,-50%) rotate({{ n.rot }}deg); width:{{ n.sz }}px; height:{{ n.sz }}px; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:{{ n.bw }}px solid {{ n.col }}; border-radius:{{ n.radius }}; box-shadow:{{ n.shadow }}; font:{{ n.w }} {{ n.fs }}px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:{{ n.col }}; opacity:{{ n.op }}; cursor:pointer; transition:width 0.12s,height 0.12s;">
-            <span style="transform:rotate({{ n.invRot }}deg);">{{ n.glyph }}</span>
-          </span>
+          <span data-status="{{ n.status }}" data-kind="{{ n.kind }}" onmouseenter="{{ n.enter }}" style="position:absolute; left:{{ n.x }}px; top:{{ n.y }}px; transform:translate(-50%,-50%); font:{{ n.w }} {{ n.fs }}px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:{{ n.col }}; opacity:{{ n.op }}; cursor:pointer; padding:6px; transition:font-size 0.12s;">{{ n.glyph }}</span>
           <sc-if value="{{ showLabels }}" hint-placeholder-val="{{ false }}">
             <span style="position:absolute; left:{{ n.x }}px; top:{{ n.ty }}px; transform:translateX(-50%); font:9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:{{ th.sub }}; white-space:nowrap; pointer-events:none;">{{ n.short }}</span>
           </sc-if>
@@ -86,7 +84,7 @@ document.addEventListener('click', function (e) {
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
         <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3D · constellation</a>
-          <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · time axis</a>
+          <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · sequence axis</a>
         </div>
       </sc-if>
     </div>
@@ -168,22 +166,6 @@ const OPACITY = Object.fromEntries(STATUS_ORDER.map((s) => [s, 1]));
 const ARC_DAY = TOKENS.cross_arcs.kinds;
 const ARC_NIGHT = TOKENS.cross_arcs.kinds;
 const ARCC = TOKENS.cross_arcs.kinds;
-const KIND = TOKENS.kinds;
-
-function kindVisual(kind, selected) {
-  const token = KIND[kind] || KIND.attempt;
-  const size = Math.round((selected ? 34 : 28) * token.scale);
-  const diamond = token.shape === 'diamond';
-  return {
-    size,
-    rotate: diamond ? 45 : 0,
-    inverse: diamond ? -45 : 0,
-    radius: token.shape === 'circle' ? '50%' : token.shape === 'ring' || token.shape === 'double_ring' ? '50%' : '2px',
-    border: token.shape === 'ring' ? 2.5 : 1.25,
-    shadow: token.shape === 'double_ring' ? '0 0 0 3px currentColor' : 'none',
-    weight: token.weight
-  };
-}
 
 class Component extends DCLogic {
   state = { dag: null, hover: null, panel: false, nav2d: false, nav3d: false, uiTheme: null, uiGap: null, uiArcs: null, uiLabels: null, vx: null, vy: null, vs: 1 };
@@ -221,6 +203,7 @@ class Component extends DCLogic {
   renderVals() {
     const dark = (this.state.uiTheme ?? this.props.theme ?? 'light') === 'dark';
     const PAL = dark ? NIGHT : DAY;
+    const ROOT = dark ? TOKENS.root.night : TOKENS.root.day;
     const ARCC = dark ? ARC_NIGHT : ARC_DAY;
     const th = dark ? {
       bg: TOKENS.backgrounds.night, edge: TOKENS.structural_edges.night, text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
@@ -298,12 +281,11 @@ class Component extends DCLogic {
     const nodes = rows.map((id) => {
       const n = byId[id], p = pos[id];
       const on = this.state.hover === id;
-      const shape = kindVisual(n.kind, on);
+      const root = n.kind === 'root';
       return {
         x: p.x, y: p.y, ty: p.y + 22,
-        status: n.status, kind: n.kind, glyph: GLYPH[n.status], col: PAL[n.status], op: OPACITY[n.status],
-        fs: on ? 17 : 14, w: shape.weight, sz: shape.size, rot: shape.rotate, invRot: shape.inverse,
-        radius: shape.radius, bw: shape.border, shadow: shape.shadow,
+        status: n.status, kind: n.kind, glyph: root ? '○' : GLYPH[n.status], col: root ? ROOT : PAL[n.status], op: OPACITY[n.status],
+        fs: on ? 22 : 17, w: on ? '600' : '400',
         short: n.title.length > 15 ? n.title.slice(0, 14) + '…' : n.title,
         enter: () => this.setState({ hover: id })
       };

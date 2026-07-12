@@ -16,15 +16,25 @@ pub(super) fn render_dot(dag: &ViewerDag, palette: &Palette) -> Result<Vec<u8>, 
     dot.push_str("  edge [fontname=\"monospace\", fontsize=9];\n");
     for node in &dag.nodes {
         let status = palette.status(&node.status)?;
-        let kind = palette.kind(&node.kind)?;
+        let is_root = node.kind == "root";
+        let color = if is_root {
+            palette.root.day.as_str()
+        } else {
+            status.day.as_str()
+        };
+        let glyph = if is_root {
+            "○"
+        } else {
+            status.glyph.as_str()
+        };
         dot.push_str(&format!(
             "  \"{}\" [label=\"{} {}\", shape={}, color=\"{}\", fontcolor=\"{}\", penwidth={}];\n",
             dot_escape(&node.id),
-            dot_escape(&status.glyph),
+            dot_escape(glyph),
             dot_escape(&node.title),
-            graphviz_shape(&kind.shape),
-            status.day,
-            status.day,
+            graphviz_shape(&node.kind),
+            color,
+            color,
             if node.kind == "root" || node.kind == "synthesis" {
                 "2"
             } else {
@@ -168,12 +178,13 @@ fn push_status_nodes<'a>(output: &mut String, nodes: impl Iterator<Item = &'a Vi
     }
 }
 
-fn graphviz_shape(shape: &str) -> &'static str {
-    match shape {
-        "diamond" => "diamond",
-        "square" => "box",
-        "double_ring" => "doublecircle",
-        "ring" => "circle",
+fn graphviz_shape(kind: &str) -> &'static str {
+    match kind {
+        "root" => "circle",
+        "attempt" => "circle",
+        "claim" => "diamond",
+        "checkpoint" => "box",
+        "synthesis" => "doublecircle",
         _ => "ellipse",
     }
 }

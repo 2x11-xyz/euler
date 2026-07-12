@@ -18,8 +18,10 @@ Internally, graph nodes use these statuses:
 - `abandoned`
 
 Visualization preserves all eight states. Status is encoded redundantly by
-color and glyph; kind (`root`, `attempt`, `claim`, `checkpoint`, `synthesis`)
-is encoded by outline shape, scale, and weight. The canonical tokens live in
+color and glyph in 2D and by color in the constellation views. Plotted roots
+are always gold; their true status and kind (`root`, `attempt`, `claim`,
+`checkpoint`, `synthesis`) remain available in the detail surface and raw
+artifact. The canonical color and glyph tokens live in
 `crates/euler-extension-causal-dag/assets/palette.json` and are injected into
 every generated viewer.
 
@@ -433,10 +435,23 @@ consumer; this extension contract supplies the versioned graph and lineage it
 renders.
 
 The HTML export contains four switchable views: 2D top-down, 2D indented
-spine, 3D constellation, and 3.5D constellation with event order on the
-central axis. Annotation cross-arcs rest at `#7f97a8` with `0.45` opacity and
-switch to relationship-kind color on selection. Structural backbone edges
-remain neutral.
+spine, 3D constellation, and 3.5D constellation with first-occurrence node
+sequence on the central axis. Chronology affects only 3.5D; the other views
+remain structural. Annotation cross-arcs rest at `#7f97a8` with `0.45`
+opacity and switch to relationship-kind color on selection. Structural
+backbone edges remain neutral.
+
+The viewer contract follows the canonical reference at
+<https://euler-8dg.pages.dev/>:
+
+- both 2D views use bare status glyphs without enclosing kind shapes;
+- both constellation views use bare glowing dots and dot-only status legends;
+- every plotted root is gold while its detail card retains the true status;
+- 3.5D alone uses first-occurrence sequence for vertical position, tree depth
+  for radius, and branch identity for angle; a resumed branch may therefore
+  have a long parent-child edge across intervening sequence positions; and
+- layout, density, camera, and interaction behavior otherwise remain faithful
+  to the reference.
 
 The committed example is generated from the semantic fixture through the
 same command path. Run against a copy because offline extension execution

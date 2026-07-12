@@ -54,7 +54,7 @@ document.addEventListener('click', function (e) {
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
         <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.text }}; text-decoration:none; font-size:11px; white-space:nowrap;">3D · constellation</a>
-          <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · time axis</a>
+          <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · sequence axis</a>
         </div>
       </sc-if>
     </div>
@@ -64,7 +64,7 @@ document.addEventListener('click', function (e) {
   <sc-if value="{{ infoOpen }}" hint-placeholder-val="{{ false }}">
     <div class="dag-overlay" style="position:absolute; top:58px; right:26px; width:312px; display:flex; flex-direction:column; gap:10px; padding:16px 18px 18px; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
       <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">What you're looking at</div>
-      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">A causal DAG of an agent session, drawn in 3D. Solid edges are the canonical backbone; color and glyph carry status, while outline shape carries node kind. Dashed arrows are annotation links between branches.</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">A causal DAG of an agent session, drawn in 3D. Solid edges are the canonical backbone; node color carries status. Dashed arrows are annotation links between branches.</div>
       <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">How to interact</div>
       <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Drag to orbit, scroll to zoom. Hover a node or a dashed arrow — the card at bottom-left shows its story. tune sets theme, orbit, fog, and focus blur.</div>
     </div>
@@ -101,7 +101,7 @@ document.addEventListener('click', function (e) {
 
   <div class="dag-legend" style="position:absolute; bottom:18px; right:26px; display:flex; align-items:center; gap:14px; font-size:11px; color:{{ th.sub }}; pointer-events:none;">
     <sc-for list="{{ legend }}" as="g" hint-placeholder-count="0">
-      <span style="display:flex; align-items:center; gap:6px;"><span style="color:{{ g.col }};">{{ g.glyph }}</span>{{ g.label }}</span>
+      <span style="display:flex; align-items:center; gap:6px;"><span style="width:8px; height:8px; border-radius:50%; background:{{ g.col }};"></span>{{ g.label }}</span>
     </sc-for>
   </div>
 
@@ -142,34 +142,11 @@ const OPACITY = Object.fromEntries(STATUS_ORDER.map((s) => [s, 1]));
 const ARC_DAY = TOKENS.cross_arcs.kinds;
 const ARC_NIGHT = TOKENS.cross_arcs.kinds;
 const ARCC = TOKENS.cross_arcs.kinds;
-const KIND = TOKENS.kinds;
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 
 function hexA(hex, alpha) {
   const value = parseInt(hex.slice(1), 16);
   return 'rgba(' + (value >> 16) + ',' + ((value >> 8) & 255) + ',' + (value & 255) + ',' + alpha + ')';
-}
-
-function drawKindOutline(ctx, x, y, radius, kind, color, alpha) {
-  const token = KIND[kind] || KIND.attempt;
-  const r = radius * token.scale + 2;
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.strokeStyle = hexA(color, alpha);
-  ctx.lineWidth = token.shape === 'ring' ? 2 : 1;
-  ctx.beginPath();
-  if (token.shape === 'diamond') {
-    ctx.moveTo(0, -r); ctx.lineTo(r, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0); ctx.closePath();
-  } else if (token.shape === 'square') {
-    ctx.rect(-r, -r, r * 2, r * 2);
-  } else {
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-  }
-  ctx.stroke();
-  if (token.shape === 'double_ring') {
-    ctx.beginPath(); ctx.arc(0, 0, r + 3, 0, Math.PI * 2); ctx.stroke();
-  }
-  ctx.restore();
 }
 
 class Component extends DCLogic {
@@ -402,7 +379,7 @@ class Component extends DCLogic {
     this.hit = [];
     for (const n of order) {
       const s = S[n.id];
-      n.col = PAL[n.st];
+      n.col = n.kind === 'root' ? (misty ? TOKENS.root.day : TOKENS.root.night) : PAL[n.st];
       const r = clamp((n.big ? 7.5 : 5.5) * s.s, 1.5, 12);
       const a = clamp(s.a, 0.12, 1);
       // fake bokeh: out-of-focus nodes render as bigger, softer, dimmer discs
@@ -424,14 +401,6 @@ class Component extends DCLogic {
       if (bl < 1.5) {
         ctx.fillStyle = 'rgba(255,255,255,' + (0.8 * a * (1 - bl / 1.5)).toFixed(3) + ')';
         ctx.beginPath(); ctx.arc(s.x, s.y, r * 0.35, 0, Math.PI * 2); ctx.fill();
-      }
-      drawKindOutline(ctx, s.x, s.y, r, n.kind, n.col, 0.9 * a);
-      if (r >= 4) {
-        ctx.font = Math.max(7, r * 1.15).toFixed(1) + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillStyle = hexA(backgroundColor, misty ? 0.95 : 0.9);
-        ctx.fillText(GLYPH[n.st], s.x, s.y + 0.5);
-        ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
       }
       if (n.id === this.state.selId) {
         ctx.strokeStyle = hexA(edgeColor, 0.75);
@@ -495,7 +464,6 @@ class Component extends DCLogic {
         hint: 'rgba(236,234,226,0.35)'
       },
       legend: STATUS_ORDER.map((s) => ({
-        glyph: GLYPH[s],
         col: (this.isMisty() ? DAY : NIGHT)[s],
         label: WORD[s]
       })),
