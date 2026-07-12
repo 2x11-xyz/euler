@@ -10,20 +10,15 @@ use crate::compaction::{
     build_compaction_candidate, heuristic_projection, select_layer1_candidates, should_compact,
     validate_candidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
 };
-use crate::file_diff::{
-    file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
-};
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
 use crate::guardian::PermissionReviewer;
-use crate::permissions::{
-    ApprovalMode, GrantSource, PermissionDecider, PermissionGate,
-};
+use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
 use crate::provenance::ProvenanceWriter;
 use crate::redaction::SecretRedactor;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
-use crate::tools::{PatchEvents, ReteachTracker, ToolError, ToolRegistry};
+use crate::tools::{ReteachTracker, ToolError, ToolRegistry};
 use crate::EventBus;
 use euler_agents::{generated_agent_id, AgentError, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
@@ -53,6 +48,7 @@ mod parallel_spawn;
 mod permissions_gate;
 mod round_loop;
 mod swarm_tool;
+mod tool_dispatch;
 pub use background::{
     AgentReporter, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
 };
@@ -61,6 +57,7 @@ pub use observer::RoundObserverConfig;
 pub(crate) use permissions_gate::{
     approval_mode_str, permission_decision_payload, permission_request_for_tool, PermissionRuling,
 };
+pub(crate) use tool_dispatch::{file_change_payload, file_diff_payload, maybe_store_pre_image};
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
 const CONTEXT_LIMIT_MESSAGE: &str =
@@ -1517,269 +1514,6 @@ impl<D: PermissionDecider> Session<D> {
         .map(Some)
     }
 
-    #[allow(clippy::too_many_lines)] // ratchet: 114 lines, refactor target
-    fn execute_tool_call<F>(
-        &mut self,
-        call: ToolCall,
-        model_result_id: String,
-        sink: &mut EventSink<'_, F>,
-        turn_state: &mut TurnState,
-    ) -> Result<(), SessionError>
-    where
-        F: FnMut(&EventEnvelope),
-    {
-        let tool_call_event_id = self.emit_with_parent(
-            EventKind::TOOL_CALL,
-            object([
-                ("id", call.id.clone().into()),
-                ("name", call.name.clone().into()),
-                ("input", call.input.clone()),
-            ]),
-            Some(model_result_id),
-        )?;
-        sink.flush(self.bus.events());
-
-        let mut covered_grant_source: Option<crate::GrantSource> = None;
-        let mut static_safe = false;
-        if let Some(capability) = self
-            .tools
-            .required_capability_for_input(&call.name, &call.input)
-        {
-            if turn_state.denied(capability) {
-                self.emit_permission_denied_tool_result(
-                    call,
-                    tool_call_event_id,
-                    &format!(
-                        "permission denied: {} was denied earlier this turn and \
-                         remains denied for the rest of it — do not retry {} \
-                         commands; use a different tool or ask the user",
-                        capability.as_str(),
-                        capability.as_str()
-                    ),
-                )?;
-                return Ok(());
-            }
-            let request = permission_request_for_tool(
-                capability,
-                &self.tools.permission_reason(&call.name, &call.input),
-                &call.name,
-                &call.input,
-                &self.tools,
-            );
-            let mode = self.permissions.mode(capability);
-            // Statically-safe read-only shell commands run under `ask`
-            // without a prompt (issue #78): recorded as a fresh
-            // permission.decision with mode "static-safe" — allowed-once
-            // semantics, no grant installed, parented to the tool call. The
-            // check sits before grant coverage so the ledger attributes the
-            // run to the analysis, not to an unrelated grant. It never
-            // applies under always-deny, and a denial earlier this turn
-            // still short-circuits above. A TRUNCATED command is never
-            // analyzed: the bounded prefix could parse as safe while
-            // `sh -c` runs the full string (security review, #66 class) —
-            // decomposing a truncated command is decomposing a lie.
-            static_safe = mode == ApprovalMode::Ask
-                && capability == Capability::ShellExec
-                && !request.command_truncated
-                && request.command.as_deref().is_some_and(|command| {
-                    crate::command_safety::is_statically_safe_command(command, self.tools.root())
-                });
-            if static_safe {
-                self.emit_static_safe_decision(capability, tool_call_event_id.clone())?;
-            }
-            // A request covered by an existing session/project grant runs
-            // under THAT decision: no prompt, and no fresh permission.decision
-            // event — recording "allowed once" here would misstate what the
-            // user actually granted (review v2 §8). The tool result carries a
-            // `grant_source` tag so the ledger can show `· session grant`.
-            covered_grant_source = if mode == ApprovalMode::Ask && !static_safe {
-                self.permissions.granted_source(&request)
-            } else {
-                None
-            };
-            if covered_grant_source.is_none() && !static_safe {
-                match self.decide_uncovered_permission(
-                    &request,
-                    mode,
-                    &tool_call_event_id,
-                    sink,
-                    turn_state,
-                )? {
-                    PermissionRuling::Allowed => {}
-                    PermissionRuling::Denied { message } => {
-                        self.emit_permission_denied_tool_result(
-                            call,
-                            tool_call_event_id,
-                            &message,
-                        )?;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        if call.name == swarm_tool::CODE_SWARM_REVIEW_TOOL {
-            return self.execute_code_swarm_review_tool(
-                call,
-                tool_call_event_id,
-                covered_grant_source,
-                sink,
-            );
-        }
-
-        let tool_name = call.name.clone();
-        let tool_started = Instant::now();
-        match self
-            .tools
-            .execute_with_events(&call.name, &call.input, self.bus.events())
-        {
-            Ok(execution) => {
-                // The input format was accepted: reset this tool's re-teach
-                // streak even if a later write fails for environmental
-                // reasons (the streak tracks format competence, issue #94).
-                self.tool_reteach
-                    .record_success(self.tools.reteach_identity(&call.name, &call.input));
-                if let Some(patch) = execution.patch {
-                    let mut payload = object([
-                        ("path", patch.path.clone().into()),
-                        ("old", patch.before.clone().into()),
-                        ("new", patch.after.clone().into()),
-                    ]);
-                    self.redactor
-                        .redact_payload_fields(&mut payload, &["old", "new"]);
-                    let patch_proposed_id = self.emit_with_parent(
-                        EventKind::PATCH_PROPOSED,
-                        payload.clone(),
-                        Some(tool_call_event_id.clone()),
-                    )?;
-                    if let Err(error) = self.tools.apply_patch(&patch) {
-                        self.emit_failed_tool_result(
-                            call.id,
-                            execution.name,
-                            error.to_string(),
-                            tool_call_event_id,
-                            tool_started,
-                        )?;
-                        return Ok(());
-                    }
-                    let patch_applied_id = self.emit_with_parent(
-                        EventKind::PATCH_APPLIED,
-                        payload,
-                        Some(patch_proposed_id),
-                    )?;
-                    let pre_image_blob = maybe_store_pre_image(self.config.root.as_path(), &patch);
-                    let file_change_id = self.emit_with_parent(
-                        EventKind::FILE_CHANGE,
-                        file_change_payload(&call.id, &patch, pre_image_blob.as_deref()),
-                        Some(patch_applied_id.clone()),
-                    )?;
-                    let mut diff_payload = file_diff_payload(&call.id, &file_change_id, &patch);
-                    self.redactor
-                        .redact_payload_fields(&mut diff_payload, &["diff"]);
-                    self.emit_with_parent(
-                        EventKind::FILE_DIFF,
-                        diff_payload,
-                        Some(patch_applied_id),
-                    )?;
-                }
-                for change in &execution.file_changes {
-                    let file_change_id = self.emit_with_parent(
-                        EventKind::FILE_CHANGE,
-                        observed_file_change_payload(&call.id, "run_shell", change),
-                        Some(tool_call_event_id.clone()),
-                    )?;
-                    let mut observed_diff =
-                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change);
-                    self.redactor
-                        .redact_payload_fields(&mut observed_diff, &["diff"]);
-                    self.emit_with_parent(
-                        EventKind::FILE_DIFF,
-                        observed_diff,
-                        Some(tool_call_event_id.clone()),
-                    )?;
-                }
-                let mut payload = object([
-                    ("id", call.id.into()),
-                    ("name", execution.name.into()),
-                    ("ok", true.into()),
-                    ("output", self.redactor.redact(&execution.output).into()),
-                ]);
-                if let Some(exit_code) = execution.exit_code {
-                    payload.insert("exit_code".to_owned(), exit_code.into());
-                }
-                if let Some(source) = covered_grant_source {
-                    // Ran under an existing grant — the ledger shows a dim
-                    // `· session grant` on the tool header instead of a fresh
-                    // decision record (review v2 §8).
-                    payload.insert("grant_source".to_owned(), source.as_str().into());
-                }
-                if static_safe {
-                    // Ran under static command-safety analysis — the ledger
-                    // shows a dim `· safe` on the tool header (the decision
-                    // record itself is suppressed like covered grants).
-                    payload.insert("static_safe".to_owned(), true.into());
-                }
-                self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
-                crate::diagnostics::tool_exec_end(
-                    &self.config.session_id,
-                    &tool_name,
-                    elapsed_ms(tool_started),
-                    true,
-                );
-            }
-            Err(error) => {
-                // Rung-2 re-teaching (issue #94): repeated consecutive
-                // failures of a formatted tool append its full-format
-                // payload to the error the model reads next.
-                let error = self.tools.teach_on_failure(
-                    &mut self.tool_reteach,
-                    &call.name,
-                    &call.input,
-                    error.to_string(),
-                );
-                self.emit_failed_tool_result(
-                    call.id,
-                    call.name,
-                    error,
-                    tool_call_event_id,
-                    tool_started,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Failed tool-result emission shared by the execution-error and
-    /// patch-write-failure paths of [`Self::execute_tool_call`].
-    fn emit_failed_tool_result(
-        &mut self,
-        call_id: String,
-        name: String,
-        error: String,
-        tool_call_event_id: String,
-        tool_started: Instant,
-    ) -> Result<(), SessionError> {
-        self.emit_with_parent(
-            EventKind::TOOL_RESULT,
-            object([
-                ("id", call_id.into()),
-                ("name", name.clone().into()),
-                ("ok", false.into()),
-                // Preserve the failed-error redaction main applies
-                // (#67): a tool error may echo a secret-bearing arg.
-                ("error", self.redactor.redact(&error).into()),
-            ]),
-            Some(tool_call_event_id),
-        )?;
-        crate::diagnostics::tool_exec_end(
-            &self.config.session_id,
-            &name,
-            elapsed_ms(tool_started),
-            false,
-        );
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)] // ratchet: 7 args, refactor target
     fn emit_model_result(
         &mut self,
@@ -1808,7 +1542,7 @@ impl<D: PermissionDecider> Session<D> {
                 ("content", content.to_owned().into()),
                 ("tool_calls", calls.into()),
                 ("stop_reason", stop_reason.as_str().into()),
-                ("usage", usage_payload(usage)),
+                ("usage", companion::usage_payload(usage)),
             ]),
             Some(parent),
         )
@@ -2113,24 +1847,6 @@ fn reasoning_fidelity(value: &str) -> ReasoningFidelity {
         _ => ReasoningFidelity::Summary,
     }
 }
-fn usage_payload(usage: Option<&Usage>) -> Value {
-    match usage {
-        Some(usage) => {
-            let mut value = object([
-                ("input_tokens", usage.input_tokens.into()),
-                ("output_tokens", usage.output_tokens.into()),
-            ]);
-            if let Some(cached_tokens) = usage.cached_tokens {
-                value.insert("cached_tokens".to_owned(), cached_tokens.into());
-            }
-            if let Some(reasoning_tokens) = usage.reasoning_tokens {
-                value.insert("reasoning_tokens".to_owned(), reasoning_tokens.into());
-            }
-            Value::Object(value)
-        }
-        None => Value::Null,
-    }
-}
 fn used_tokens(usage: &Usage) -> u64 {
     usage.input_tokens.saturating_add(usage.output_tokens)
 }
@@ -2159,74 +1875,6 @@ fn effective_stub_budget(
     }
     let token_proxy_budget = limit.saturating_sub(reserve_tokens).saturating_mul(4);
     configured_budget_bytes.min(token_proxy_budget)
-}
-
-fn file_change_payload(
-    tool_call_id: &str,
-    patch: &PatchEvents,
-    pre_image_blob: Option<&str>,
-) -> JsonObject {
-    let mut payload = object([
-        ("tool_call_id", tool_call_id.to_owned().into()),
-        ("origin", patch.origin.into()),
-        ("action", patch.action.into()),
-        ("path", patch.path.clone().into()),
-        ("old_path", Value::Null),
-        (
-            "before_sha256",
-            patch
-                .before_sha256
-                .as_ref()
-                .map_or(Value::Null, |sha| sha.clone().into()),
-        ),
-        ("after_sha256", patch.after_sha256.clone().into()),
-        ("before_byte_len", patch.before_byte_len.into()),
-        ("after_byte_len", patch.after_byte_len.into()),
-        ("diff_redaction", "omitted".into()),
-    ]);
-    if let Some(hash) = pre_image_blob {
-        payload.insert("pre_image_blob".to_owned(), hash.into());
-    }
-    payload
-}
-
-pub(crate) fn maybe_store_pre_image(root: &std::path::Path, patch: &PatchEvents) -> Option<String> {
-    // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
-    if patch.action != "modify" || patch.before.is_empty() {
-        return None;
-    }
-    checkpoints::store_pre_image(root, &patch.path, &patch.before)
-}
-
-fn file_diff_payload(tool_call_id: &str, file_change_id: &str, patch: &PatchEvents) -> JsonObject {
-    let projection = file_diff_projection(FileDiffSource {
-        path: &patch.path,
-        action: patch.action,
-        before: &patch.before,
-        after: &patch.after,
-    });
-    object([
-        ("tool_call_id", tool_call_id.to_owned().into()),
-        ("file_change_id", file_change_id.to_owned().into()),
-        ("path", patch.path.clone().into()),
-        ("old_path", Value::Null),
-        ("action", patch.action.into()),
-        ("origin", patch.origin.into()),
-        (
-            "diff",
-            projection
-                .diff
-                .map_or(Value::Null, std::convert::Into::into),
-        ),
-        ("truncated", projection.truncated.into()),
-        ("truncation", projection.truncation.into()),
-        (
-            "omitted_reason",
-            projection
-                .omitted_reason
-                .map_or(Value::Null, std::convert::Into::into),
-        ),
-    ])
 }
 
 pub fn fold_model_target(

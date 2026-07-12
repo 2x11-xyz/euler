@@ -71,14 +71,8 @@ impl<D: PermissionDecider> Session<D> {
         // task agent.spawn + canvas.snapshot + model.call and the request.
         let canvas = assemble_canvas(self.bus.events(), &self.config.auto_compaction);
         if let Some(error) = context_budget_exhausted(self.config.auto_compaction, &canvas) {
-            ParentedAppender {
-                writer: &writer,
-                bus: &mut self.bus,
-                persisted_events: &mut self.persisted_events,
-                session_id: &self.config.session_id.clone(),
-                agent_id: &self.config.agent_id.clone(),
-            }
-            .append(
+            let agent_id = self.config.agent_id.clone();
+            self.appender_as(&writer, &agent_id).append(
                 EventKind::ERROR,
                 object([
                     ("source", "companion".into()),
@@ -129,18 +123,12 @@ impl<D: PermissionDecider> Session<D> {
     ) -> Result<PreparedReviewer, SessionError> {
         let target = self.resolve_companion_target(&task)?;
         let spawned = self.record_companion_spawn(&task, &target, writer)?;
-        let session_id = self.config.session_id.clone();
         let child_agent_id = spawned.child_agent_id().to_owned();
-        let mut appender = ParentedAppender {
-            writer,
-            bus: &mut self.bus,
-            persisted_events: &mut self.persisted_events,
-            session_id: &session_id,
-            agent_id: &child_agent_id,
-        };
-        appender.append(
+        let snapshot_payload =
+            canvas_snapshot_payload(canvas, self.config.auto_compaction, None, None);
+        self.appender_as(writer, &child_agent_id).append(
             EventKind::CANVAS_SNAPSHOT,
-            canvas_snapshot_payload(canvas, self.config.auto_compaction, None, None),
+            snapshot_payload,
             None,
         )?;
         // The task budget's max_tokens bounds the provider call itself,
@@ -167,7 +155,10 @@ impl<D: PermissionDecider> Session<D> {
         if let Some(max_output_tokens) = max_output_tokens {
             model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
         }
-        let model_call_id = appender.append(EventKind::MODEL_CALL, model_call, None)?.id;
+        let model_call_id = self
+            .appender_as(writer, &child_agent_id)
+            .append(EventKind::MODEL_CALL, model_call, None)?
+            .id;
         let mut input = canvas_input.to_vec();
         input.push(ModelInputItem::Message {
             role: ModelRole::User,
@@ -208,38 +199,34 @@ impl<D: PermissionDecider> Session<D> {
             model_call_id,
             request: _,
         } = reviewer;
-        let session_id = self.config.session_id.clone();
         let child_agent_id = spawned.child_agent_id().to_owned();
-        let result = {
-            let mut appender = ParentedAppender {
-                writer,
-                bus: &mut self.bus,
-                persisted_events: &mut self.persisted_events,
-                session_id: &session_id,
-                agent_id: &child_agent_id,
-            };
-            if let Some((mut payload, parent)) = outcome.buffered_error {
-                // Workers buffer the raw provider error (they carry no
-                // redactor); this session-thread append is the emission
-                // site, so redact here — provider HTTP error bodies can
-                // echo request fragments (secrets contract).
-                self.redactor
-                    .redact_payload_fields(&mut payload, &["message"]);
-                appender.append(EventKind::ERROR, payload, Some(parent))?;
-            }
-            match outcome.round {
-                // The worker's terminal error carries the raw provider
-                // message (HTTP error bodies can echo request fragments —
-                // secrets contract). This failure string becomes the
-                // agent.result error field and AgentOutcome.error, and from
-                // there the code-swarm tool output and consolidated
-                // artifact; redacting at this conversion point makes every
-                // downstream sink inherit it. Reviewer findings (success
-                // output) are model cognition and stay faithful.
-                Err(error) => companion_failure(self.redactor.redact(&error.to_string())),
-                Ok(data) => {
-                    record_reviewer_round(&mut appender, &target, &model_call_id, &data, &task)?
-                }
+        if let Some((mut payload, parent)) = outcome.buffered_error {
+            // Workers buffer the raw provider error (they carry no
+            // redactor); this session-thread append is the emission
+            // site, so redact here — provider HTTP error bodies can
+            // echo request fragments (secrets contract). Redact before
+            // borrowing the session for the appender.
+            self.redactor
+                .redact_payload_fields(&mut payload, &["message"]);
+            self.appender_as(writer, &child_agent_id).append(
+                EventKind::ERROR,
+                payload,
+                Some(parent),
+            )?;
+        }
+        let result = match outcome.round {
+            // The worker's terminal error carries the raw provider
+            // message (HTTP error bodies can echo request fragments —
+            // secrets contract). This failure string becomes the
+            // agent.result error field and AgentOutcome.error, and from
+            // there the code-swarm tool output and consolidated
+            // artifact; redacting at this conversion point makes every
+            // downstream sink inherit it. Reviewer findings (success
+            // output) are model cognition and stay faithful.
+            Err(error) => companion_failure(self.redactor.redact(&error.to_string())),
+            Ok(data) => {
+                let mut appender = self.appender_as(writer, &child_agent_id);
+                record_reviewer_round(&mut appender, &target, &model_call_id, &data, &task)?
             }
         };
         let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
