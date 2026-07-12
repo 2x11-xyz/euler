@@ -141,7 +141,7 @@ the prompt is read from piped stdin.
 Options:
 {SESSION_OPTIONS}  \
 --auto-approve <tier>      read-only or trusted-local (default: read-only)
-  --reasoning-effort <e>     xsmall, small, medium, large, or xlarge
+  --reasoning-effort <e>     xsmall, small, medium, large, xlarge, or max
   --max-output-tokens <n>    Cap output tokens per model response
   --max-tool-rounds <n>      Cap tool rounds per turn (default: unlimited)
   --auto-compaction <tier>   off or stubs (default: stubs)
