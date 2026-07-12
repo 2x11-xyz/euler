@@ -261,6 +261,35 @@ pub fn resume_session_from_folded_prefix<D>(
         folded.events.push(closure);
         recovery_closure_appended = true;
     }
+    // Durable resume marker (issue #6): a new lifetime begins here. Appended to
+    // the LOG only, NOT the in-memory bus — so it is a leaf annotation off the
+    // resume boundary rather than an inline chain link. This keeps the resumed
+    // session's event view and the conversation's parent chain identical to an
+    // uninterrupted run (the first continued turn still parents off the real
+    // tail, not the marker), while the boundary stays durably auditable. Same
+    // append-to-disk-not-bus pattern as the scrub audit event. Recorded after
+    // any recovery closure (interrupted-lifetime cleanup) so the log order
+    // reads close-old-turn -> resume. Never carries user or model content.
+    // Idempotence: if the accepted tail is already a resume marker, nothing
+    // continued the lifetime since the last resume — this is a pure
+    // re-inspection, so a second marker would only grow the log. Skip it so
+    // repeated open-and-inspect resumes stay byte-identical.
+    let already_marked = folded
+        .events
+        .last()
+        .is_some_and(|event| event.kind.as_str() == EventKind::SESSION_RESUMED);
+    if !already_marked {
+        let marker = session_resumed_marker(
+            &config.session_id,
+            &config.agent_id,
+            &active_target,
+            folded.events.last().map(|event| event.id.clone()),
+            events_folded,
+        );
+        writer
+            .append(std::slice::from_ref(&marker))
+            .map_err(ResumeError::Append)?;
+    }
     let events_len = folded.events.len();
     let mut config = config;
     config.reasoning_effort = reasoning_effort;
@@ -338,6 +367,32 @@ fn verify_and_rehydrate_blobs(
     }
 
     Ok(event)
+}
+
+/// Build the durable `session.resumed` marker for a resume boundary (issue
+/// #6). Payload is audit metadata only — provider/model, the count of folded
+/// events, and the tail event id continued from — never user or model content.
+fn session_resumed_marker(
+    session_id: &str,
+    agent_id: &str,
+    target: &ModelTarget,
+    resumed_from_event_id: Option<String>,
+    events_folded: usize,
+) -> EventEnvelope {
+    let mut payload = euler_event::JsonObject::new();
+    payload.insert("provider".to_owned(), target.provider.clone().into());
+    payload.insert("model".to_owned(), target.model.clone().into());
+    payload.insert("events_folded".to_owned(), events_folded.into());
+    if let Some(from) = &resumed_from_event_id {
+        payload.insert("resumed_from_event_id".to_owned(), from.clone().into());
+    }
+    EventEnvelope::new(
+        session_id.to_owned(),
+        agent_id.to_owned(),
+        resumed_from_event_id,
+        EventKind::SESSION_RESUMED,
+        payload,
+    )
 }
 
 fn recovery_closure(events: &[EventEnvelope]) -> Option<EventEnvelope> {
