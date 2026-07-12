@@ -5,6 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+euler-agents = { path = "../euler-agents" }
 euler-event = { path = "../euler-event" }
 euler-sdk = { path = "../euler-sdk" }
 serde.workspace = true

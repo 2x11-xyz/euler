@@ -1,6 +1,7 @@
 use super::*;
 use crate::active_state::ActiveGraphState;
 use crate::construction::Construction;
+use euler_agents::{AgentTask, MAX_TASK_BYTES};
 use euler_core::extensions::{ExtensionHost, ExtensionHostError};
 use euler_core::{read_provenance, ProvenanceWriter};
 use euler_event::{object, EventEnvelope, EventKind};
@@ -158,7 +159,7 @@ fn observer_brief_over_knuth_fixture_builds_bounded_agent_task() {
     assert_eq!(output["budget"]["max_turns"], json!(1));
     assert_eq!(output["budget"]["max_tool_calls"], json!(0));
     let task = output["task"].as_str().expect("task string");
-    assert!(task.len() <= 8192);
+    assert!(task.len() <= MAX_TASK_BYTES);
     assert!(!task.contains("agent-spawn"));
     assert!(!task.contains("self-artifact"));
     let system_prompt = output["system_prompt"].as_str().expect("system prompt");
@@ -1172,42 +1173,43 @@ fn observer_brief_rejects_unknown_input_fields() {
 }
 
 #[test]
-fn observer_brief_task_size_boundary_is_enforced() {
-    let exact = observer_brief_events_with_target_task_len(24 * 1024);
-    let host = RecordingHost::new(recording_page(exact.clone(), exact.len(), None, false));
+fn observer_brief_adapts_extracts_to_the_real_agent_task_boundary() {
+    let events = (0..64)
+        .map(|index| {
+            fixture_event(
+                "session-1",
+                &format!("event-budget-{index:02}"),
+                EventKind::USER_MESSAGE,
+                &"x".repeat(240),
+            )
+        })
+        .collect::<Vec<_>>();
+    let host = RecordingHost::new(recording_page(events.clone(), events.len(), None, false));
 
     let output = CausalDagObserverBriefCommand
         .execute(
             CommandContext {
-                input: json!({"limit": exact.len()}),
+                input: json!({"limit": events.len()}),
             },
             &host,
         )
-        .expect("exact boundary passes");
-    assert_eq!(output["task"].as_str().expect("task").len(), 24 * 1024);
-
-    let mut over = exact.clone();
-    let event = over
-        .iter_mut()
-        .find(|event| event.payload["content"].as_str().unwrap().len() < 240)
-        .expect("room for one more byte");
-    let content = event.payload["content"].as_str().unwrap();
-    event
-        .payload
-        .insert("content".to_owned(), format!("{content}x").into());
-    let host = RecordingHost::new(recording_page(over.clone(), over.len(), None, false));
-    let error = CausalDagObserverBriefCommand
-        .execute(
-            CommandContext {
-                input: json!({"limit": over.len()}),
-            },
-            &host,
-        )
-        .expect_err("over boundary fails");
-    let message = error.to_string();
-    assert!(message.contains("24577 bytes"));
-    assert!(message.contains(&format!("{} listed events", over.len())));
-    assert!(message.contains("reduce limit"));
+        .expect("adaptive brief");
+    let task = output["task"].as_str().expect("task");
+    assert!(task.len() <= MAX_TASK_BYTES);
+    assert_eq!(output["listed_event_count"], events.len());
+    for event in &events {
+        assert!(task.contains(&event.id), "missing event id {}", event.id);
+    }
+    let extract_lengths = task
+        .lines()
+        .filter(|line| line.starts_with("event-budget-"))
+        .map(|line| line.splitn(3, ' ').nth(2).unwrap_or("").chars().count())
+        .collect::<Vec<_>>();
+    assert_eq!(extract_lengths.len(), events.len());
+    assert!(extract_lengths.iter().all(|length| *length > 0));
+    assert!(extract_lengths.iter().all(|length| *length < 240));
+    AgentTask::new_inheriting_target(task, output["persona"].as_str().expect("persona"))
+        .expect("brief must satisfy the real companion task contract");
 }
 
 #[test]
@@ -5031,48 +5033,6 @@ fn parented_event(id: &str, kind: &'static str, content: &str, parent: &str) -> 
     let mut event = fixture_event("session-1", id, kind, content);
     event.parent = Some(parent.to_owned());
     event
-}
-
-fn observer_brief_events_with_target_task_len(target: usize) -> Vec<EventEnvelope> {
-    let mut events = (0..100)
-        .map(|index| {
-            fixture_event(
-                "session-1",
-                &format!("event-{index:02}"),
-                EventKind::USER_MESSAGE,
-                "",
-            )
-        })
-        .collect::<Vec<_>>();
-    let base_len = observer_brief_task_len(&events);
-    assert!(base_len <= target, "test fixture overshot target task size");
-    let mut remaining = target - base_len;
-    for event in &mut events {
-        let content_len = remaining.min(240);
-        event
-            .payload
-            .insert("content".to_owned(), "x".repeat(content_len).into());
-        remaining -= content_len;
-        if remaining == 0 {
-            break;
-        }
-    }
-    assert_eq!(remaining, 0, "test fixture cannot reach target task size");
-    assert_eq!(observer_brief_task_len(&events), target);
-    events
-}
-
-fn observer_brief_task_len(events: &[EventEnvelope]) -> usize {
-    let host = RecordingHost::new(recording_page(events.to_vec(), events.len(), None, false));
-    let output = CausalDagObserverBriefCommand
-        .execute(
-            CommandContext {
-                input: json!({"limit": events.len()}),
-            },
-            &host,
-        )
-        .expect("observer brief task length");
-    output["task"].as_str().expect("task").len()
 }
 
 fn causal_dag_graph_artifact_event(session_id: &str, id: &str) -> EventEnvelope {

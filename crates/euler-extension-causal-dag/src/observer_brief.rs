@@ -1,5 +1,6 @@
 use super::{input_error, is_causal_dag_self_event, OBSERVER_BRIEF_SCHEMA_NAME};
 use crate::active_state::ActiveGraphState;
+use euler_agents::{MAX_SYSTEM_PROMPT_BYTES, MAX_TASK_BYTES};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{
     ArgSpec, Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError,
@@ -17,8 +18,6 @@ const DEFAULT_LIMIT: usize = 64;
 // 2664 in + 6726 out, so the default leaves
 // headroom for both.
 pub(super) const DEFAULT_MAX_TOKENS: u64 = 24_576;
-const MAX_TASK_BYTES: usize = 24 * 1024;
-const MAX_SYSTEM_PROMPT_BYTES: usize = 8 * 1024;
 const EXTRACT_CHARS: usize = 240;
 pub(super) const OBSERVER_PERSONA: &str = "causal-dag-observer";
 
@@ -436,17 +435,60 @@ pub(super) fn build_task(
     } else {
         lines.push("No graph exists yet; return the complete initial graph.".to_owned());
     }
+    lines.push("Event extracts may be shortened to fit the agent-task contract; event ids and kinds remain complete.".to_owned());
     lines.push("NEW EVENTS (new claims cite these event ids):".to_owned());
-    lines.extend(events.iter().map(event_line));
-    let task = lines.join("\n");
-    let actual = task.len();
-    if actual > MAX_TASK_BYTES {
+    let event_lines = events.iter().map(EventTaskLine::from).collect::<Vec<_>>();
+    let minimum = render_task(&lines, &event_lines, 0);
+    if minimum.len() > MAX_TASK_BYTES {
         return Err(input_error(format!(
-            "observer-brief task listing is {actual} bytes for {} listed events; reduce limit or replace the active graph with a smaller manual reframe",
+            "observer-brief minimum task listing is {} bytes for {} listed events; reduce limit or replace the active graph with a smaller manual reframe",
+            minimum.len(),
             events.len()
         )));
     }
-    Ok(task)
+    let complete = render_task(&lines, &event_lines, EXTRACT_CHARS);
+    if complete.len() <= MAX_TASK_BYTES {
+        return Ok(complete);
+    }
+    let mut lower = 0usize;
+    let mut upper = EXTRACT_CHARS;
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        if render_task(&lines, &event_lines, candidate).len() <= MAX_TASK_BYTES {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    Ok(render_task(&lines, &event_lines, lower))
+}
+
+struct EventTaskLine {
+    prefix: String,
+    extract: String,
+}
+
+impl From<&EventEnvelope> for EventTaskLine {
+    fn from(event: &EventEnvelope) -> Self {
+        Self {
+            prefix: format!("{} {}", event.id, event.kind.as_str()),
+            extract: payload_extract(event),
+        }
+    }
+}
+
+fn render_task(prefix: &[String], events: &[EventTaskLine], extract_chars: usize) -> String {
+    let mut task = prefix.join("\n");
+    for event in events {
+        task.push('\n');
+        task.push_str(&event.prefix);
+        let extract = truncate_chars(&event.extract, extract_chars);
+        if !extract.is_empty() {
+            task.push(' ');
+            task.push_str(&extract);
+        }
+    }
+    task
 }
 
 fn compact_graph_lines(artifact: &Value) -> Result<Vec<String>, ExtensionError> {
@@ -510,15 +552,6 @@ fn graph_source_ids(value: &Value) -> Result<Vec<&str>, ExtensionError> {
                 .ok_or_else(|| input_error("active causal-dag source ref has invalid event_id"))
         })
         .collect()
-}
-
-fn event_line(event: &EventEnvelope) -> String {
-    format!(
-        "{} {} {}",
-        event.id,
-        event.kind.as_str(),
-        payload_extract(event)
-    )
 }
 
 fn payload_extract(event: &EventEnvelope) -> String {
@@ -657,7 +690,9 @@ pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
     ]
     .join("\n");
     if prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
-        return Err(input_error("observer system_prompt exceeds 8192 bytes"));
+        return Err(input_error(format!(
+            "observer system_prompt exceeds {MAX_SYSTEM_PROMPT_BYTES} bytes"
+        )));
     }
     Ok(prompt)
 }
