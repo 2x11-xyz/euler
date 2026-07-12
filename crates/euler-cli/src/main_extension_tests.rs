@@ -249,7 +249,7 @@ fn headless_companion_run_capability_escalation_fails_cleanly() {
 }
 
 #[test]
-fn headless_observer_companion_observe_composition_persists_artifact() {
+fn headless_observer_companion_apply_composition_persists_artifact() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("workspace");
     std::fs::create_dir(&root).expect("workspace");
@@ -275,17 +275,21 @@ fn headless_observer_companion_observe_composition_persists_artifact() {
         .run_turn("unrelated event after brief")
         .expect("append after brief");
 
-    let hints: Value = serde_json::from_str(
-        companion_line["result"]["output"]
-            .as_str()
-            .expect("companion output"),
-    )
-    .expect("hints json");
-    let mut observe_input = brief["observe_window"].clone();
-    observe_input["causal_dag"] = hints;
+    let apply_input = json!({
+        "apply": brief["apply"].clone(),
+        "companion": {
+            "ok": companion_line["result"]["ok"].clone(),
+            "summary": companion_line["result"]["summary"].clone(),
+            "output": companion_line["result"]["output"].clone(),
+            "error": companion_line["result"]["error"].clone(),
+            "child_agent_id": companion_line["child_agent_id"].clone(),
+            "spawn_event_id": companion_line["spawn_event_id"].clone(),
+            "result_event_id": companion_line["result_event_id"].clone()
+        }
+    });
     let observe_line = execute_headless_extension_run(
         &mut session,
-        &format!("causal-dag.observe {}", observe_input),
+        &format!("causal-dag.observer-apply {apply_input}"),
     );
 
     assert_eq!(observe_line["type"], json!("extension_run_result"));
@@ -317,9 +321,33 @@ fn headless_observer_companion_observe_composition_persists_artifact() {
         })
         .map(|event| event.id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    assert!(source_ids
+    let result_event_id = companion_line["result_event_id"]
+        .as_str()
+        .expect("result event id");
+    let spawn_event_id = companion_line["spawn_event_id"]
+        .as_str()
+        .expect("spawn event id");
+    assert!(source_ids.contains(&result_event_id));
+    assert!(!source_ids.contains(&spawn_event_id));
+
+    // The observer result is construction lineage for the artifact, but it
+    // must never become evidence for a graph node or edge.
+    let relative_path = artifact.payload["path"].as_str().expect("artifact path");
+    let graph: Value = serde_json::from_slice(
+        &std::fs::read(temp.path().join(relative_path)).expect("artifact bytes"),
+    )
+    .expect("artifact json");
+    for record in graph["forest"]["nodes"]
+        .as_array()
+        .expect("graph nodes")
         .iter()
-        .all(|event_id| !companion_machinery.contains(event_id)));
+        .chain(graph["forest"]["edges"].as_array().expect("graph edges"))
+    {
+        for source_ref in record["source_refs"].as_array().expect("source refs") {
+            let event_id = source_ref["event_id"].as_str().expect("source event id");
+            assert!(!companion_machinery.contains(event_id));
+        }
+    }
 }
 
 #[test]

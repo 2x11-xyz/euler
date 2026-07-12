@@ -2929,7 +2929,11 @@ fn slash_palette_trailing_noise_correction_submits_visible_effort_argument() {
 
 #[test]
 fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
-    let mut core = core_with_provider_model_at(ChatGptEchoProvider, "gpt-5.5", ".");
+    let mut core = core_with_fixture_catalog(
+        ChatGptEchoProvider,
+        "gpt-5.5",
+        MergedModelCatalog::built_in(),
+    );
 
     core.handle_input(key(KeyCode::Char('/')));
     for ch in "model".chars() {
@@ -2964,7 +2968,10 @@ fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
         panic!("model picker should own surface");
     };
     let rendered = picker.render_lines(80).join("\n");
-    assert!(rendered.contains("chatgpt::gpt-5.5 — 272K ctx, reasoning ✓"));
+    assert!(
+        rendered.contains("chatgpt::gpt-5.5 — 272K ctx, reasoning ✓"),
+        "rendered picker:\n{rendered}"
+    );
 }
 
 #[test]
