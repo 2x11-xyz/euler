@@ -13,11 +13,11 @@ pub(crate) const TIMESTAMP_GUTTER_WIDTH: usize = 9;
 const BLANK_GUTTER: &str = "           "; // 9 (timestamps) + 2 (spine)
 const TREE_GUTTER_LAST: &str = "         └ ";
 const TREE_GUTTER_MID: &str = "         ├ ";
-const TREE_GUTTER_PIPE: &str = "         | ";
+const TREE_GUTTER_HAIRLINE: &str = "         ▏ ";
 // Spine-only nesting: children indent inside the parent at the content column.
 const TREE_GUTTER_LAST_NARROW: &str = "  └ ";
 const TREE_GUTTER_MID_NARROW: &str = "  ├ ";
-const TREE_GUTTER_PIPE_NARROW: &str = "  | ";
+const TREE_GUTTER_HAIRLINE_NARROW: &str = "  ▏ ";
 
 thread_local! {
     // v2: timestamps are opt-in; the spine carries the ledger (§1).
@@ -78,11 +78,11 @@ pub(crate) fn tree_gutter_mid() -> &'static str {
     }
 }
 
-pub(crate) fn tree_gutter_pipe() -> &'static str {
+pub(crate) fn tree_gutter_hairline() -> &'static str {
     if timestamp_gutter_shown() {
-        TREE_GUTTER_PIPE
+        TREE_GUTTER_HAIRLINE
     } else {
-        TREE_GUTTER_PIPE_NARROW
+        TREE_GUTTER_HAIRLINE_NARROW
     }
 }
 
@@ -136,7 +136,7 @@ pub(crate) fn is_ledger_gutter(gutter: &str) -> bool {
         width == SPINE_WIDTH
             || gutter == TREE_GUTTER_LAST_NARROW
             || gutter == TREE_GUTTER_MID_NARROW
-            || gutter == TREE_GUTTER_PIPE_NARROW
+            || gutter == TREE_GUTTER_HAIRLINE_NARROW
     }
 }
 
@@ -364,7 +364,7 @@ mod tests {
                 TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
             );
             assert_eq!(
-                display_width(tree_gutter_pipe()),
+                display_width(tree_gutter_hairline()),
                 TIMESTAMP_GUTTER_WIDTH + SPINE_WIDTH
             );
             assert_eq!(timestamp_gutter(None), " ".repeat(TIMESTAMP_GUTTER_WIDTH));

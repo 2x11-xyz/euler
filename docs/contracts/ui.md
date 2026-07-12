@@ -233,6 +233,13 @@ Short activity/status lines may show intent while the agent works (not boxed
 chrome). Full provider-exposed reasoning is a separate collapsible ledger
 element driven by `model.reasoning`, subject to the reasoning policy below.
 
+The expanded reasoning body indents behind a single continuous **hairline**
+rail (`▏`, faint gutter color), not a per-line `|` pipe: one vertical
+rule regardless of wrap, distinct by weight from the bold user `▌` rail,
+and never a box-drawing border (`│` and friends stay reserved for the
+approval panel). Collapsed reasoning is a single dim line
+(`✱ thought for Ns — gist · ctrl+o expand`), no rail.
+
 ## Canvas separation
 
 Visible terminal activity is **not** automatically part of the next model
