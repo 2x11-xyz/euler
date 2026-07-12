@@ -132,7 +132,7 @@ impl AppCore {
         // the HUD and the composer, so it's dropped whenever the HUD is
         // active; a *real* notice (e.g. "resume waits for the active turn")
         // still renders, directly below the HUD.
-        if self.push_visual_activity_block(width, &mut blocks) {
+        if self.push_visual_activity_block(&mut blocks) {
             let notice = self.transient_notice_text();
             if !notice.is_empty() {
                 push_visual_block(
@@ -217,19 +217,20 @@ impl AppCore {
     /// Returns whether the HUD is active (and therefore was pushed), so the
     /// caller can skip the transient-notice placeholder row that would
     /// otherwise land between the HUD and the composer.
-    fn push_visual_activity_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) -> bool {
-        let Some(hud) = self.working_hud_line(width) else {
+    fn push_visual_activity_block(&self, blocks: &mut Vec<VisualBlock>) -> bool {
+        let Some(hud) = self.working_hud_line() else {
             return false;
         };
+        // One line, always: reasoning text belongs to the transcript's live
+        // card, never the HUD.
         let lines = match hud {
             HudLine::Plain(text) => vec![CanvasLine::plain_lossy(text)],
             HudLine::Working {
                 spinner,
                 verb,
                 suffix,
-                reasoning_tail,
             } => {
-                let mut lines = vec![CanvasLine::from_spans(vec![
+                vec![CanvasLine::from_spans(vec![
                     // Gold (warning-token) spinner — routed through Theme, never
                     // a literal hex (issue #27).
                     CanvasSpan::styled_lossy(
@@ -243,17 +244,7 @@ impl AppCore {
                         TextRole::Plain,
                         Style::default().fg(self.theme.palette.muted),
                     ),
-                ])];
-                // #47: dim italic continuation lines of the reasoning text
-                // currently streaming, directly under the thinking line.
-                lines.extend(reasoning_tail.into_iter().map(|text| {
-                    CanvasLine::from_spans(vec![CanvasSpan::styled_lossy(
-                        format!("  {text}"),
-                        TextRole::Plain,
-                        self.theme.transcript.reasoning,
-                    )])
-                }));
-                lines
+                ])]
             }
         };
         push_visual_block(blocks, VisualBlockRole::Activity, lines);

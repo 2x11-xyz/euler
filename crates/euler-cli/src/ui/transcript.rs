@@ -46,9 +46,13 @@ pub enum TranscriptItem {
         content: String,
     },
     /// Transient while the model reasons: elapsed streamed-reasoning time,
-    /// derived from delta event timestamps (never local wall clock).
+    /// derived from delta event timestamps (never local wall clock), plus
+    /// the reasoning text streamed so far. The body lives only in the
+    /// inline viewport (`live_mutable_items`) — it must never commit to
+    /// native scrollback; only the finalized `ModelReasoning` gist does.
     ModelReasoningLive {
         elapsed: String,
+        content: String,
     },
     ToolCall {
         name: String,
@@ -332,12 +336,43 @@ fn checkpoint_event_ids(events: &[EventEnvelope]) -> std::collections::HashSet<S
         .collect()
 }
 
+/// UI-contract bound on the LIVE streaming reasoning body
+/// (`docs/contracts/ui.md`: reasoning is "collapsible and bounded"): after
+/// each delta the body is trimmed to this many trailing chars — roughly 16
+/// wrapped lines at a typical ~120-col content width — so the per-repaint
+/// clone+wrap stays O(bound) and memory can't grow with an unbounded
+/// reasoning stream. Older text scrolls away, which is exactly what a
+/// terminal tail does. The finalized `MODEL_REASONING` event carries the
+/// FULL text (see `project_event_with_checkpoints`), so bounding the live
+/// display never truncates the persisted, collapsible/expandable thought.
+pub(crate) const REASONING_LIVE_BODY_MAX_CHARS: usize = 2000;
+
+/// Keeps only the trailing `max_chars` characters of `text`, dropping from
+/// the front. Operates on `char`s (never a raw byte index), so it can never
+/// split a multibyte glyph.
+fn truncate_left_to_chars(text: &mut String, max_chars: usize) {
+    let overflow = text.chars().count().saturating_sub(max_chars);
+    if overflow == 0 {
+        return;
+    }
+    let byte_offset = text
+        .char_indices()
+        .nth(overflow)
+        .map_or(text.len(), |(index, _)| index);
+    text.drain(..byte_offset);
+}
+
 #[derive(Clone, Debug)]
 pub struct TranscriptState {
     events: Vec<EventEnvelope>,
     live_tail: String,
     stream: MarkdownStreamCollector,
     reasoning_live: Option<(DateTime<Local>, DateTime<Local>)>,
+    /// Bounded trailing window (`REASONING_LIVE_BODY_MAX_CHARS`) of the
+    /// reasoning text streamed so far this round; rides the transient
+    /// `ModelReasoningLive` item and is cleared wherever `reasoning_live`
+    /// resets so a stale body can never outlive its thinking line.
+    reasoning_body: String,
     scroll_offset: usize,
     auto_follow: bool,
 }
@@ -349,6 +384,7 @@ impl Default for TranscriptState {
             live_tail: String::new(),
             stream: MarkdownStreamCollector::default(),
             reasoning_live: None,
+            reasoning_body: String::new(),
             scroll_offset: 0,
             auto_follow: true,
         }
@@ -368,6 +404,7 @@ impl TranscriptState {
             // The finalized thought item replaces the live thinking line.
             EventKind::MODEL_REASONING => {
                 self.reasoning_live = None;
+                self.reasoning_body.clear();
             }
             _ => {}
         }
@@ -470,10 +507,12 @@ impl TranscriptState {
         self.live_tail.clear();
         self.stream.clear();
         self.reasoning_live = None;
+        self.reasoning_body.clear();
     }
 
     fn preserve_tool_call_live_tail(&mut self, event: &EventEnvelope) {
         self.reasoning_live = None;
+        self.reasoning_body.clear();
         if let Some(content) =
             payload_string(event, "content").filter(|content| !content.is_empty())
         {
@@ -501,10 +540,23 @@ impl TranscriptState {
                     let start = self.reasoning_live.map_or(time, |(start, _)| start);
                     self.reasoning_live = Some((start, time));
                 }
+                // The reasoning text streams live behind the hairline rail;
+                // it stays viewport-only until the finalized gist replaces
+                // it, and is bounded to a trailing window — the full text
+                // arrives on the finalized `MODEL_REASONING` event.
+                if let Some(delta) = event
+                    .payload
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.reasoning_body.push_str(delta);
+                    truncate_left_to_chars(&mut self.reasoning_body, REASONING_LIVE_BODY_MAX_CHARS);
+                }
             }
             Some("text") => {
                 // First answer text ends the thinking phase.
                 self.reasoning_live = None;
+                self.reasoning_body.clear();
                 if let Some(delta) = event
                     .payload
                     .get("delta")
@@ -535,6 +587,7 @@ impl TranscriptState {
         let (start, last) = self.reasoning_live?;
         Some(TranscriptItem::ModelReasoningLive {
             elapsed: format_elapsed(start, last),
+            content: self.reasoning_body.clone(),
         })
     }
 }

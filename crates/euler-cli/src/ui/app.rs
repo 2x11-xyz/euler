@@ -129,15 +129,13 @@ pub(super) enum HudLine {
     /// Unstyled one-liner (interrupted / turn-failed).
     Plain(String),
     /// Spinner glyph, phase verb, and dim suffix rendered as distinct spans.
+    /// One line, always: reasoning TEXT is owned by the transcript's live
+    /// card — the HUD carries only the global status (verb, turn timer, and
+    /// the sole esc-to-interrupt affordance).
     Working {
         spinner: &'static str,
         verb: String,
         suffix: String,
-        /// #47: already-wrapped continuation lines of the reasoning text
-        /// currently streaming, rendered dim italic under the spinner line.
-        /// Empty unless the phase is "thinking" and a fidelity-permitting
-        /// provider is streaming reasoning content.
-        reasoning_tail: Vec<String>,
     },
 }
 
@@ -245,15 +243,6 @@ pub struct AppCore {
     /// running bash/running tests), derived from streamed turn events.
     /// `None` falls back to the generic "working" label.
     current_phase_verb: Option<String>,
-    /// #47: a bounded tail of the reasoning text currently streaming under
-    /// the live `thinking · Ns` HUD line (readable-fidelity providers only).
-    /// Cleared the moment a text delta arrives, a `MODEL_REASONING` item
-    /// finalizes, or the turn ends — a late reasoning delta must never
-    /// reopen it once answer text has started.
-    reasoning_stream_tail: String,
-    /// Set once an answer text delta has streamed this turn; while set, a
-    /// late reasoning delta is ignored rather than reopening the tail.
-    reasoning_tail_locked: bool,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     /// Launch `--auth-file` override; consulted when an in-app resume
@@ -815,8 +804,6 @@ impl AppCore {
             spinner_frame: 0,
             spinner_last_tick: None,
             current_phase_verb: None,
-            reasoning_stream_tail: String::new(),
-            reasoning_tail_locked: false,
             extensions: boot.extensions,
             observe: boot.observe,
             auth_file: boot.auth_file,
@@ -1727,8 +1714,6 @@ impl AppCore {
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
         self.current_phase_verb = None;
-        self.reasoning_stream_tail.clear();
-        self.reasoning_tail_locked = false;
         self.spinner_frame = 0;
         self.spinner_last_tick = None;
         self.interrupted_guidance = false;
@@ -2367,7 +2352,7 @@ impl AppCore {
     /// cases are unstyled one-liners; the working case carries the spinner,
     /// phase verb, and dim suffix as separate pieces so the real path can
     /// color them independently (gold spinner, dim elapsed/hint).
-    fn working_hud_line(&self, width: u16) -> Option<HudLine> {
+    fn working_hud_line(&self) -> Option<HudLine> {
         if matches!(
             self.modal,
             Some(Modal::Permission(_) | Modal::PatchApproval(_))
@@ -2396,7 +2381,6 @@ impl AppCore {
                 spinner,
                 verb: format!("running {label}"),
                 suffix: format!(" · {secs}s · not cancellable"),
-                reasoning_tail: Vec::new(),
             });
         }
         let verb = if label == "turn" {
@@ -2406,33 +2390,11 @@ impl AppCore {
         } else {
             format!("working {label}")
         };
-        let reasoning_tail = if verb == "thinking" {
-            self.reasoning_tail_lines(width)
-        } else {
-            Vec::new()
-        };
         Some(HudLine::Working {
             spinner,
             verb,
             suffix: format!(" · {secs}s · esc to interrupt"),
-            reasoning_tail,
         })
-    }
-
-    /// #47: wraps the bounded streaming-reasoning tail to `width`, keeping
-    /// only the last 3 wrapped lines — the live line shows a readable
-    /// preview, not the full reasoning transcript.
-    fn reasoning_tail_lines(&self, width: u16) -> Vec<String> {
-        const MAX_WRAPPED_LINES: usize = 3;
-        if self.reasoning_stream_tail.is_empty() {
-            return Vec::new();
-        }
-        let content_width = usize::from(width).saturating_sub(2).max(1);
-        let mut wrapped = crate::ui::text::wrap_text(&self.reasoning_stream_tail, content_width);
-        if wrapped.len() > MAX_WRAPPED_LINES {
-            wrapped = wrapped.split_off(wrapped.len() - MAX_WRAPPED_LINES);
-        }
-        wrapped
     }
 
     /// Plain-text flattening of `working_hud_line`, kept for the legacy
@@ -2440,13 +2402,12 @@ impl AppCore {
     /// that predates the visual-canvas renderer and does not carry styled spans.
     #[cfg(test)]
     fn live_status_line(&self) -> Option<String> {
-        Some(match self.working_hud_line(80)? {
+        Some(match self.working_hud_line()? {
             HudLine::Plain(text) => text,
             HudLine::Working {
                 spinner,
                 verb,
                 suffix,
-                reasoning_tail: _,
             } => format!("{spinner} {verb}{suffix}"),
         })
     }

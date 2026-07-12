@@ -217,7 +217,9 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     );
                 }
             }
-            TranscriptItem::ModelReasoningLive { elapsed } => {
+            TranscriptItem::ModelReasoningLive { elapsed, content } => {
+                // No interrupt hint here: the esc affordance is advertised
+                // exactly once, on the one-line HUD status — never twice.
                 push_wrapped(
                     &mut lines,
                     blank_gutter(),
@@ -226,6 +228,20 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     theme,
                     width,
                 );
+                // Streaming state (Euler Thinking State design): the body
+                // streamed so far rides the same continuous hairline as the
+                // expanded finalized thought. This item is viewport-only —
+                // only the finalized gist ever commits to scrollback.
+                if !content.is_empty() {
+                    push_wrapped(
+                        &mut lines,
+                        tree_gutter_hairline(),
+                        content,
+                        theme.transcript.reasoning,
+                        theme,
+                        width,
+                    );
+                }
             }
             TranscriptItem::ToolCall { name } => {
                 push_wrapped(
@@ -1171,6 +1187,61 @@ mod tests {
                 "rail must not be a box-drawing border: {gutter:?}"
             );
         }
+    }
+
+    #[test]
+    fn live_streaming_reasoning_renders_header_and_hairline_body() {
+        // Streaming state (Euler Thinking State design): while the model
+        // reasons, the header carries the elapsed timer only — the esc
+        // affordance lives on the HUD status line, not here — and the body
+        // streamed so far rides the same hairline rail as the expanded
+        // finalized thought.
+        let item = TranscriptItem::ModelReasoningLive {
+            elapsed: "3s".to_owned(),
+            content: "one two three four five six seven eight nine ten \
+                      eleven twelve thirteen fourteen fifteen sixteen"
+                .to_owned(),
+        };
+        let lines = render_projected_items(
+            std::slice::from_ref(&item),
+            &Theme::default(),
+            48,
+            TranscriptRenderLimits::default(),
+        );
+        let text = plain_text(&lines);
+        assert!(text.contains("thinking · 3s"), "text: {text:?}");
+        assert!(
+            !text.contains("esc interrupt"),
+            "the live header must not advertise esc — that hint is the HUD's: {text:?}"
+        );
+        let body_rows: Vec<String> = lines
+            .iter()
+            .filter_map(|line| line.spans.first().map(|s| s.content.to_string()))
+            .filter(|gutter| gutter == tree_gutter_hairline())
+            .collect();
+        assert!(
+            body_rows.len() >= 2,
+            "expected the streamed body wrapped behind the hairline: {text:?}"
+        );
+
+        // Before any delta text arrives, the card is the header line alone.
+        let empty = TranscriptItem::ModelReasoningLive {
+            elapsed: "0s".to_owned(),
+            content: String::new(),
+        };
+        let lines = render_projected_items(
+            std::slice::from_ref(&empty),
+            &Theme::default(),
+            48,
+            TranscriptRenderLimits::default(),
+        );
+        assert!(
+            !lines.iter().any(|line| line
+                .spans
+                .first()
+                .is_some_and(|s| s.content.as_ref() == tree_gutter_hairline())),
+            "empty body must not render a hairline rail"
+        );
     }
 
     #[test]

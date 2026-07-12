@@ -7657,6 +7657,132 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
 }
 
 #[test]
+fn tui_pty_streaming_reasoning_body_stays_viewport_only_until_the_gist_commits() {
+    // Euler Thinking State design, "streaming" state: while the model
+    // reasons, the delta text types out live behind the hairline in the
+    // inline viewport. The growing body must NEVER commit to native
+    // scrollback row-by-row — after finalize, exactly the ONE-LINE
+    // collapsed gist lands in committed history and the body vanishes.
+    let temp = tempfile::tempdir().expect("temp dir");
+    // Sentence 1 becomes the collapsed gist; the zeta-probe tokens live
+    // only in the streamed body and must not survive into the final state.
+    let script = write_fixture_script(
+        temp.path(),
+        "reasoning-stream.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"reasoning_delta": "Weighing the residue lemma. "},
+                {"sleep_ms": 200},
+                {"reasoning_delta": "Cross-checking the modular tower against zeta-probe-alpha and "},
+                {"sleep_ms": 200},
+                {"reasoning_delta": "zeta-probe-bravo before the contradiction closes."},
+                // Observation window: the fully streamed body stays on
+                // screen long enough for the harness to see it.
+                {"sleep_ms": 2500},
+                {"text_delta": "Answer: the lemma holds."},
+                {"finished": {"stop_reason": "completed"}},
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
+    tui.write("prove it\r");
+
+    // The streaming body is visible in the inline viewport while the model
+    // reasons, under the live thinking header. A glimpse (not a
+    // stable-screen wait): the ~90ms HUD spinner repaints never let the
+    // screen go quiet while the transient body is up.
+    assert!(
+        tui.wait_for_screen_glimpse("zeta-probe-bravo"),
+        "streamed reasoning body did not render live:\n{}",
+        tui.screen_text()
+    );
+    let streaming_screen = tui.screen_text();
+    assert!(
+        streaming_screen.contains("thinking ·"),
+        "live thinking header missing during streaming:\n{streaming_screen}"
+    );
+    // The one-line HUD carries the thinking status and the SOLE esc
+    // affordance during the delta phase; the transcript header is the
+    // timer alone — the interrupt hint must not be advertised twice.
+    assert!(
+        streaming_screen.contains("esc to interrupt"),
+        "HUD interrupt affordance missing during streaming:\n{streaming_screen}"
+    );
+    assert!(
+        streaming_screen
+            .lines()
+            .any(|line| line.contains("thinking ·") && !line.contains("esc")),
+        "transcript thinking header must carry no esc hint:\n{streaming_screen}"
+    );
+    assert!(
+        !streaming_screen
+            .lines()
+            .any(|line| line.contains("thinking ·") && line.contains("esc interrupt")),
+        "the old transcript-header esc hint is gone:\n{streaming_screen}"
+    );
+
+    // Finalize: the answer replaces the body; the thought collapses to the
+    // one-line gist.
+    assert!(
+        tui.wait_for_screen("Answer: the lemma holds."),
+        "answer did not render:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.wait_for_screen("thought summary for"),
+        "collapsed gist did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    // Load-bearing invariant: reconstruct scrollback + screen. The gist
+    // line committed exactly once; no intermediate growing-body row leaked
+    // into committed history, and the live header hint is gone.
+    let final_state = pty_final_state_text(&tui.output, 24, 80);
+    let gist_lines = final_state
+        .lines()
+        .filter(|line| line.contains("Weighing the residue lemma"))
+        .count();
+    assert_eq!(
+        gist_lines, 1,
+        "gist must commit exactly once:\n{final_state}"
+    );
+    let collapsed_lines = final_state
+        .lines()
+        .filter(|line| line.contains("thought summary for"))
+        .count();
+    assert_eq!(
+        collapsed_lines, 1,
+        "collapsed thought header must appear exactly once:\n{final_state}"
+    );
+    let body_leaks = final_state
+        .lines()
+        .filter(|line| line.contains("zeta-probe"))
+        .count();
+    assert_eq!(
+        body_leaks, 0,
+        "streamed reasoning body leaked into committed history:\n{final_state}"
+    );
+    assert!(
+        !final_state.contains("thinking ·") && !final_state.contains("esc to interrupt"),
+        "live thinking header / HUD status leaked into committed history:\n{final_state}"
+    );
+}
+
+#[test]
 #[ignore = "diagnostic: set EULER_RAW_CAPTURE to a raw PTY byte file"]
 fn diag_reconstruct_final_state_from_capture() {
     let path = std::env::var("EULER_RAW_CAPTURE").expect("EULER_RAW_CAPTURE");
@@ -8626,6 +8752,23 @@ impl PtyHarness {
 
     fn wait_for_screen(&mut self, needle: &str) -> bool {
         self.wait_for_stable_screen(Duration::from_secs(5), |screen| screen.contains(needle))
+    }
+
+    /// Like `wait_for_screen` but without the quiet-interval requirement:
+    /// returns as soon as the needle is visible at all. Needed for
+    /// transient mid-turn content (e.g. the live streaming reasoning body)
+    /// that is on screen while the working HUD spinner repaints every
+    /// ~90ms — those repaint chunks reset the 100ms quiet window, so a
+    /// stable-screen wait can starve until the transient content is gone.
+    fn wait_for_screen_glimpse(&mut self, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.screen_text().contains(needle) {
+                return true;
+            }
+            self.read_next_chunk(deadline);
+        }
+        self.screen_text().contains(needle)
     }
 
     fn wait_ready_composer(&mut self) -> bool {
