@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod catalog;
 mod chat_completions;
+mod chat_completions_provider;
 pub mod chatgpt;
 mod chatgpt_device;
 pub mod custom_provider;
@@ -16,6 +17,8 @@ pub mod xai;
 
 #[cfg(test)]
 mod conformance_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod custom_provider_test;
 #[cfg(test)]

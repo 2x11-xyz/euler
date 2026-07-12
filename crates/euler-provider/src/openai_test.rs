@@ -2,21 +2,8 @@ use super::*;
 use crate::{
     ModelInputItem, ModelRole, ModelStreamEvent, StopReason, ToolCall, ToolDefinition, Usage,
 };
+use crate::test_support::{StaticApiKey, TestServer};
 use serde_json::json;
-
-#[derive(Debug)]
-struct StaticApiKey(&'static str);
-
-impl ApiKeyAuth for StaticApiKey {
-    fn load_api_key(
-        &self,
-        _provider_id: &'static str,
-        _env_key_name: &'static str,
-        _display_name: &'static str,
-    ) -> Result<SecretString, ProviderError> {
-        Ok(SecretString::new(self.0))
-    }
-}
 
 #[test]
 fn request_maps_system_text_tools_and_tool_loop() {
@@ -240,9 +227,8 @@ fn api_key_debug_redacts_value() {
         Some(std::ffi::OsString::from("openai-secret")),
     )
     .expect("api key");
-    let key = OpenAiApiKey::new(value);
 
-    let formatted = format!("{key:?}");
+    let formatted = format!("{value:?}");
 
     assert!(formatted.contains("[redacted]"));
     assert!(!formatted.contains("openai-secret"));
@@ -289,50 +275,4 @@ fn provider_sends_openai_headers_without_openrouter_headers() {
     assert!(!captured.contains("openrouter.ai"));
     assert!(!captured.contains("http-referer:"));
     assert!(!captured.contains("x-title:"));
-}
-
-struct TestServer {
-    endpoint: String,
-    request: std::sync::mpsc::Receiver<String>,
-    join: Option<std::thread::JoinHandle<()>>,
-}
-
-impl TestServer {
-    fn start() -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let join = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut buffer = [0_u8; 8192];
-            let read = std::io::Read::read(&mut stream, &mut buffer).expect("read");
-            let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
-            sender.send(request).expect("send request");
-            let body =
-                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
-        });
-        Self {
-            endpoint: format!("http://{addr}/v1/chat/completions"),
-            request: receiver,
-            join: Some(join),
-        }
-    }
-
-    fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    fn request(mut self) -> String {
-        let request = self.request.recv().expect("request");
-        if let Some(join) = self.join.take() {
-            join.join().expect("join");
-        }
-        request
-    }
 }

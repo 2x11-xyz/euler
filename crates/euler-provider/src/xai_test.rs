@@ -1,20 +1,7 @@
 use super::*;
 use crate::{ModelInputItem, ModelRole, ModelStreamEvent, StopReason, ToolDefinition};
+use crate::test_support::{StaticApiKey, TestServer};
 use serde_json::json;
-
-#[derive(Debug)]
-struct StaticApiKey(&'static str);
-
-impl ApiKeyAuth for StaticApiKey {
-    fn load_api_key(
-        &self,
-        _provider_id: &'static str,
-        _env_key_name: &'static str,
-        _display_name: &'static str,
-    ) -> Result<SecretString, ProviderError> {
-        Ok(SecretString::new(self.0))
-    }
-}
 
 #[test]
 fn request_maps_system_text_and_tools_without_compat_extensions() {
@@ -179,88 +166,9 @@ fn api_key_debug_redacts_value() {
         Some(std::ffi::OsString::from("xai-secret")),
     )
     .expect("api key");
-    let key = XaiApiKey::new(value);
 
-    let formatted = format!("{key:?}");
+    let formatted = format!("{value:?}");
 
     assert!(formatted.contains("[redacted]"));
     assert!(!formatted.contains("xai-secret"));
-}
-
-/// Single-request capture server. Unlike the openai_test.rs server (issue
-/// #37: one read() then close), this reads the full request — headers plus
-/// the Content-Length body — before responding.
-struct TestServer {
-    endpoint: String,
-    request: std::sync::mpsc::Receiver<String>,
-    join: Option<std::thread::JoinHandle<()>>,
-}
-
-impl TestServer {
-    fn start() -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let join = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let request = read_full_request(&mut stream).to_ascii_lowercase();
-            sender.send(request).expect("send request");
-            let body =
-                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
-        });
-        Self {
-            endpoint: format!("http://{addr}/v1/chat/completions"),
-            request: receiver,
-            join: Some(join),
-        }
-    }
-
-    fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    fn request(mut self) -> String {
-        let request = self.request.recv().expect("request");
-        if let Some(join) = self.join.take() {
-            join.join().expect("join");
-        }
-        request
-    }
-}
-
-fn read_full_request(stream: &mut std::net::TcpStream) -> String {
-    let mut collected = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let header_end = loop {
-        let read = std::io::Read::read(stream, &mut buffer).expect("read headers");
-        assert!(read > 0, "connection closed before headers completed");
-        collected.extend_from_slice(&buffer[..read]);
-        if let Some(position) = find_subsequence(&collected, b"\r\n\r\n") {
-            break position + 4;
-        }
-    };
-    let headers = String::from_utf8_lossy(&collected[..header_end]).to_ascii_lowercase();
-    let content_length = headers
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length:"))
-        .map(|value| value.trim().parse::<usize>().expect("content length"))
-        .unwrap_or(0);
-    while collected.len() < header_end + content_length {
-        let read = std::io::Read::read(stream, &mut buffer).expect("read body");
-        assert!(read > 0, "connection closed before body completed");
-        collected.extend_from_slice(&buffer[..read]);
-    }
-    String::from_utf8_lossy(&collected).into_owned()
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
