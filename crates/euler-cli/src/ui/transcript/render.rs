@@ -218,10 +218,12 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 }
             }
             TranscriptItem::ModelReasoningLive { elapsed, content } => {
+                // No interrupt hint here: the esc affordance is advertised
+                // exactly once, on the one-line HUD status — never twice.
                 push_wrapped(
                     &mut lines,
                     blank_gutter(),
-                    &format!("thinking · {elapsed} · esc interrupt"),
+                    &format!("thinking · {elapsed}"),
                     theme.transcript.reasoning,
                     theme,
                     width,
@@ -1190,9 +1192,10 @@ mod tests {
     #[test]
     fn live_streaming_reasoning_renders_header_and_hairline_body() {
         // Streaming state (Euler Thinking State design): while the model
-        // reasons, the header carries the elapsed timer plus the interrupt
-        // hint, and the body streamed so far rides the same hairline rail
-        // as the expanded finalized thought.
+        // reasons, the header carries the elapsed timer only — the esc
+        // affordance lives on the HUD status line, not here — and the body
+        // streamed so far rides the same hairline rail as the expanded
+        // finalized thought.
         let item = TranscriptItem::ModelReasoningLive {
             elapsed: "3s".to_owned(),
             content: "one two three four five six seven eight nine ten \
@@ -1206,9 +1209,10 @@ mod tests {
             TranscriptRenderLimits::default(),
         );
         let text = plain_text(&lines);
+        assert!(text.contains("thinking · 3s"), "text: {text:?}");
         assert!(
-            text.contains("thinking · 3s · esc interrupt"),
-            "text: {text:?}"
+            !text.contains("esc interrupt"),
+            "the live header must not advertise esc — that hint is the HUD's: {text:?}"
         );
         let body_rows: Vec<String> = lines
             .iter()

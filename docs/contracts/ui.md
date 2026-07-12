@@ -230,8 +230,17 @@ dashboards, and boilerplate panels in the core CLI.
 ## Activity and thinking
 
 Short activity/status lines may show intent while the agent works (not boxed
-chrome). Full provider-exposed reasoning is a separate collapsible ledger
-element driven by `model.reasoning`, subject to the reasoning policy below.
+chrome). The working HUD is exactly **one line** — spinner, phase verb, turn
+timer, and the esc-to-interrupt affordance (`thinking · Ns · esc to
+interrupt` while reasoning streams, driven by the live `model.reasoning`
+deltas, cleared when answer text starts or the reasoning finalizes). It
+never carries reasoning body text, and the esc affordance is advertised
+there **exactly once** — nowhere else, including the transcript's live
+thinking header.
+
+Reasoning TEXT is owned solely by the transcript: a separate collapsible
+ledger element driven by `model.reasoning`, subject to the reasoning policy
+below.
 
 Reasoning has three states, all riding the same single continuous
 **hairline** rail (`▏`, faint gutter color) — never a per-line `|` pipe
@@ -240,10 +249,14 @@ user `▌` rail, and never a box-drawing border; `│` and friends stay
 reserved for the approval panel):
 
 - **Streaming (live)**: while reasoning deltas arrive, the header
-  `✱ thinking · Ns · esc interrupt` shows the event-derived elapsed time
-  and the text streamed so far types out behind the hairline. This body is
-  **viewport-only** (the transient/mutable inline region): it must never
-  commit to native scrollback row-by-row.
+  `✱ thinking · Ns` shows the event-derived elapsed time (no esc hint —
+  that affordance belongs to the HUD) and the text streamed so far types
+  out behind the hairline. This live body is **bounded**: a trailing tail
+  window (a fixed char cap, ~16 wrapped lines), never the unbounded full
+  stream — the finalized `model.reasoning` event carries the full text, so
+  the bound never truncates the committed/expanded thought. The body is
+  also **viewport-only** (the transient/mutable inline region): it must
+  never commit to native scrollback row-by-row.
 - **Collapsed gist**: on finalize the live body is replaced by a single
   dim committed line (`✱ thought for Ns — gist · ctrl+o expand`), no
   rail. This one line is the only reasoning content that enters

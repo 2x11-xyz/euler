@@ -3153,9 +3153,12 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
     };
     assert_eq!(core.current_phase_verb, None);
 
+    // "thinking" comes from the live reasoning DELTAS — deltas arrive before
+    // the finalized MODEL_REASONING event, so this is the moment the model
+    // is actually thinking.
     core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_REASONING,
-        object([("content", "hmm".into())]),
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "hmm".into())]),
     )));
     assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
 
@@ -3274,10 +3277,13 @@ fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
     assert_eq!(core.current_phase_verb, None);
 }
 
-/// #47(a): while reasoning streams, the dim-italic reasoning text itself
-/// renders as continuation lines under the live `thinking · Ns` line.
+/// Ownership: reasoning TEXT renders only in the transcript's live card
+/// behind the hairline; the HUD is a single status line carrying the sole
+/// esc affordance. Event order here is the REAL one — reasoning deltas
+/// first, the finalized `MODEL_REASONING` after — so the HUD must show
+/// `thinking · Ns` DURING streaming, not only after finalize.
 #[test]
-fn reasoning_stream_tail_renders_under_the_thinking_line() {
+fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -3287,23 +3293,77 @@ fn reasoning_stream_tail_renders_under_the_thinking_line() {
     };
 
     core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "weighing the residue lemma".into()),
+        ]),
+    )));
+    assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
+    let status = core.live_status_line().expect("working HUD line");
+    assert!(status.contains("thinking"), "{status}");
+    assert!(status.contains("esc to interrupt"), "{status}");
+
+    let frame = core.render_visual_canvas(80);
+    let lines: Vec<String> = frame
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .collect();
+    let text = lines.join("\n");
+
+    // The streamed reasoning text renders exactly once — the transcript's
+    // live card — never duplicated under the HUD.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("weighing the residue lemma"))
+            .count(),
+        1,
+        "{text}"
+    );
+    // The esc affordance is advertised exactly once, on the HUD status
+    // line; the transcript's live thinking header carries the timer only.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("esc to interrupt"))
+            .count(),
+        1,
+        "{text}"
+    );
+    let transcript_header = lines
+        .iter()
+        .find(|line| line.contains("thinking ·") && !line.contains("esc"))
+        .expect("transcript live thinking header without an esc hint");
+    assert!(
+        !transcript_header.contains("weighing"),
+        "the header is the timer line, not the body: {transcript_header}"
+    );
+    let hud_line = lines
+        .iter()
+        .find(|line| line.contains("esc to interrupt"))
+        .expect("HUD status line");
+    assert!(
+        !hud_line.contains("residue lemma"),
+        "the HUD must not carry reasoning text: {hud_line}"
+    );
+
+    // Finalize collapses the transcript card to the committed gist and
+    // clears the HUD thinking status back to the "working" fallback.
+    core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_REASONING,
-        object([("content", "hmm".into())]),
-    )));
-    core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_DELTA,
         object([
-            ("kind", "reasoning".into()),
-            ("delta", "let me check the ".into()),
+            ("fidelity", "raw".into()),
+            (
+                "content",
+                "weighing the residue lemma against the tower".into(),
+            ),
         ]),
     )));
-    core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_DELTA,
-        object([
-            ("kind", "reasoning".into()),
-            ("delta", "call site first".into()),
-        ]),
-    )));
+    assert_eq!(core.current_phase_verb, None);
+    let status = core.live_status_line().expect("working HUD line");
+    assert!(status.contains("working"), "{status}");
 
     let frame = core.render_visual_canvas(80);
     let text = frame
@@ -3312,26 +3372,15 @@ fn reasoning_stream_tail_renders_under_the_thinking_line() {
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("let me check the call site first"), "{text}");
-
-    // The HUD tail is the single-span indented continuation line; the live
-    // transcript card renders the same text separately behind the hairline
-    // gutter, so select the tail by shape, not by first match.
-    let reasoning_line = frame
-        .active_frame_lines
-        .iter()
-        .find(|line| line.plain_text().contains("let me check") && line.spans.len() == 1)
-        .expect("reasoning continuation line present");
-    assert_eq!(
-        reasoning_line.spans[0].style,
-        core.theme.transcript.reasoning
-    );
+    assert!(text.contains("thought for"), "{text}");
+    assert!(!text.contains("thinking ·"), "{text}");
 }
 
-/// #47(a): the tail clears the moment answer text starts streaming, and a
-/// late reasoning delta afterward must never reopen it.
+/// The HUD thinking status clears the moment answer text starts streaming
+/// — while streamed text deltas leave a tool-phase verb alone (issue #27:
+/// no mid-phase flicker).
 #[test]
-fn reasoning_stream_tail_clears_when_answer_text_starts_and_never_reopens() {
+fn hud_thinking_status_clears_when_answer_text_starts() {
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -3341,118 +3390,37 @@ fn reasoning_stream_tail_clears_when_answer_text_starts_and_never_reopens() {
     };
 
     core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_REASONING,
-        object([("content", "hmm".into())]),
-    )));
-    core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_DELTA,
-        object([
-            ("kind", "reasoning".into()),
-            ("delta", "thinking...".into()),
-        ]),
+        object([("kind", "reasoning".into()), ("delta", "hmm".into())]),
     )));
-    assert_eq!(core.reasoning_stream_tail, "thinking...");
+    assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_DELTA,
         object([("kind", "text".into()), ("delta", "answer".into())]),
     )));
-    assert_eq!(core.reasoning_stream_tail, "");
+    assert_eq!(core.current_phase_verb, None);
 
-    // A late reasoning delta (unusual, but must not reopen the tail).
+    // A tool phase set later is NOT clobbered by further text deltas.
     core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_DELTA,
-        object([("kind", "reasoning".into()), ("delta", "too late".into())]),
-    )));
-    assert_eq!(core.reasoning_stream_tail, "");
-}
-
-/// #47(a): the tail also clears the moment the reasoning item finalizes
-/// (`MODEL_REASONING`), and it never survives past the turn's end.
-#[test]
-fn reasoning_stream_tail_clears_on_finalize_and_turn_end() {
-    let mut core = core();
-    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
-        panic!("core should start idle");
-    };
-    let (_tx, worker_rx) = mpsc::channel();
-    core.state = AppState::TurnInFlight {
-        worker_rx,
-        interrupt_flag: Arc::new(AtomicBool::new(false)),
-        started_at: Instant::now(),
-    };
-
-    core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_REASONING,
-        object([("content", "hmm".into())]),
-    )));
-    core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_DELTA,
+        EventKind::TOOL_CALL,
         object([
-            ("kind", "reasoning".into()),
-            ("delta", "thinking...".into()),
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("input", json!({"path": "src/lib.rs"})),
         ]),
     )));
-    assert_eq!(core.reasoning_stream_tail, "thinking...");
-
-    // A second `MODEL_REASONING` (e.g. a further reasoning round after a
-    // tool call) finalizes the current item and clears the live tail.
-    core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_REASONING,
-        object([("content", "final thought".into())]),
-    )));
-    assert_eq!(core.reasoning_stream_tail, "");
-
+    assert_eq!(
+        core.current_phase_verb.as_deref(),
+        Some("reading src/lib.rs")
+    );
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_DELTA,
-        object([
-            ("kind", "reasoning".into()),
-            ("delta", "one more round".into()),
-        ]),
+        object([("kind", "text".into()), ("delta", "more".into())]),
     )));
-    assert_eq!(core.reasoning_stream_tail, "one more round");
-
-    core.handle_turn_event(TurnEvent::TurnDone {
-        outcome: TurnOutcome::Complete,
-        session,
-    });
-    assert_eq!(core.reasoning_stream_tail, "");
-}
-
-/// #47(a): the streamed tail is bounded (~400 chars) and truncates from the
-/// left on a char boundary — never splitting a multibyte glyph.
-#[test]
-fn reasoning_stream_tail_is_bounded_and_multibyte_safe() {
-    let mut core = core();
-    let (_tx, worker_rx) = mpsc::channel();
-    core.state = AppState::TurnInFlight {
-        worker_rx,
-        interrupt_flag: Arc::new(AtomicBool::new(false)),
-        started_at: Instant::now(),
-    };
-    core.handle_turn_event(TurnEvent::Event(event(
-        EventKind::MODEL_REASONING,
-        object([("content", "hmm".into())]),
-    )));
-
-    // Push enough multibyte deltas to overflow the 400-char bound.
-    for _ in 0..30 {
-        core.handle_turn_event(TurnEvent::Event(event(
-            EventKind::MODEL_DELTA,
-            object([
-                ("kind", "reasoning".into()),
-                ("delta", "こんにちは世界 ".into()),
-            ]),
-        )));
-    }
-
-    assert!(core.reasoning_stream_tail.chars().count() <= 400);
-    assert!(
-        core.reasoning_stream_tail
-            .chars()
-            .all(|ch| ch != '\u{fffd}'),
-        "{:?}",
-        core.reasoning_stream_tail
+    assert_eq!(
+        core.current_phase_verb.as_deref(),
+        Some("reading src/lib.rs")
     );
 }
 

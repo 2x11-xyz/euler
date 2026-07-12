@@ -71,7 +71,6 @@ impl AppCore {
                 self.record_in_flight_error(&event);
                 self.update_token_usage_from_event(&event);
                 self.update_phase_verb(&event);
-                self.update_reasoning_stream_tail(&event);
                 self.transcript.push_event(event);
                 self.queue_finalized_visual_output_for_latest_event();
                 if is_tool_call {
@@ -130,17 +129,41 @@ impl AppCore {
 
     /// Working HUD phase verb (issue #27, #62): thinking / exploring /
     /// reading X / writing X / running bash / running tests, falling back to
-    /// "working" only when nothing more specific applies. Reasoning and
-    /// tool-call events set a new phase; a tool result — success, failure,
-    /// *or* auto-denial via the turn denial cache (#62) — clears it back to
-    /// `None` so the HUD falls back to the live phase (working, or whatever
-    /// the next reasoning/tool-call event sets) instead of parroting the verb
-    /// of a tool call that has already finished. Streamed text deltas leave
-    /// the verb alone so it doesn't flicker mid-phase.
+    /// "working" only when nothing more specific applies. Tool-call events
+    /// set a new phase; a tool result — success, failure, *or* auto-denial
+    /// via the turn denial cache (#62) — clears it back to `None` so the HUD
+    /// falls back to the live phase (working, or whatever the next
+    /// reasoning/tool-call event sets) instead of parroting the verb of a
+    /// tool call that has already finished.
+    ///
+    /// "thinking" is driven by the live `model.reasoning` DELTAS, not the
+    /// finalized `MODEL_REASONING` event: deltas arrive first, so keying off
+    /// finalize showed the verb only after thinking had already ended. It
+    /// clears when answer text starts streaming or the reasoning finalizes
+    /// (turn end resets it in `accept_worker_session_or_continue`). Answer
+    /// text deltas otherwise leave the verb alone so a tool phase doesn't
+    /// flicker mid-stream.
     fn update_phase_verb(&mut self, event: &EventEnvelope) {
         match event.kind.as_str() {
+            EventKind::MODEL_DELTA => {
+                match event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("reasoning") => {
+                        self.current_phase_verb = Some("thinking".to_owned());
+                    }
+                    Some("text") if self.current_phase_verb.as_deref() == Some("thinking") => {
+                        self.current_phase_verb = None;
+                    }
+                    _ => {}
+                }
+            }
             EventKind::MODEL_REASONING => {
-                self.current_phase_verb = Some("thinking".to_owned());
+                if self.current_phase_verb.as_deref() == Some("thinking") {
+                    self.current_phase_verb = None;
+                }
             }
             EventKind::TOOL_CALL => {
                 self.current_phase_verb = Some(phase_verb_for_tool_call(event));
@@ -148,52 +171,6 @@ impl AppCore {
             EventKind::TOOL_RESULT => {
                 self.current_phase_verb = None;
             }
-            _ => {}
-        }
-    }
-
-    /// #47: accumulate a bounded tail of the reasoning text streaming under
-    /// the live thinking line. `MODEL_DELTA{kind: "reasoning"}` deltas append;
-    /// a `MODEL_DELTA{kind: "text"}` (answer text has started) or a
-    /// finalized `MODEL_REASONING` item clears it — the same moments the
-    /// live thinking line itself clears — so a late reasoning delta can
-    /// never reopen it once the answer has begun streaming.
-    fn update_reasoning_stream_tail(&mut self, event: &EventEnvelope) {
-        match event.kind.as_str() {
-            EventKind::MODEL_DELTA => {
-                let Some(kind) = event
-                    .payload
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    return;
-                };
-                match kind {
-                    "reasoning" => {
-                        if self.reasoning_tail_locked {
-                            return;
-                        }
-                        if let Some(delta) = event
-                            .payload
-                            .get("delta")
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            self.reasoning_stream_tail
-                                .push_str(&delta.replace('\n', " "));
-                            truncate_reasoning_tail_left(
-                                &mut self.reasoning_stream_tail,
-                                REASONING_STREAM_TAIL_MAX_CHARS,
-                            );
-                        }
-                    }
-                    "text" => {
-                        self.reasoning_stream_tail.clear();
-                        self.reasoning_tail_locked = true;
-                    }
-                    _ => {}
-                }
-            }
-            EventKind::MODEL_REASONING => self.reasoning_stream_tail.clear(),
             _ => {}
         }
     }
@@ -232,8 +209,6 @@ impl AppCore {
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
         self.current_phase_verb = None;
-        self.reasoning_stream_tail.clear();
-        self.reasoning_tail_locked = false;
         self.spinner_frame = 0;
         self.spinner_last_tick = None;
     }
@@ -490,26 +465,6 @@ fn code_swarm_summary_line(output: &serde_json::Value) -> String {
     } else {
         format!("✗ code-swarm review · {ok_count}/{total} reviewers succeeded · artifact {path}")
     }
-}
-
-/// #47: bounded tail length for the live streaming-reasoning preview under
-/// the thinking HUD line — enough for a couple of wrapped lines at typical
-/// composer widths, never the full reasoning transcript.
-pub(super) const REASONING_STREAM_TAIL_MAX_CHARS: usize = 400;
-
-/// Keeps only the trailing `max_chars` characters of `tail`, dropping from
-/// the front. Operates on `char`s (never a byte index), so it can never
-/// split a multibyte glyph.
-fn truncate_reasoning_tail_left(tail: &mut String, max_chars: usize) {
-    let overflow = tail.chars().count().saturating_sub(max_chars);
-    if overflow == 0 {
-        return;
-    }
-    let byte_offset = tail
-        .char_indices()
-        .nth(overflow)
-        .map_or(tail.len(), |(index, _)| index);
-    tail.drain(..byte_offset);
 }
 
 #[cfg(test)]

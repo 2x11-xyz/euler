@@ -7575,9 +7575,9 @@ fn tui_pty_streaming_reasoning_body_stays_viewport_only_until_the_gist_commits()
     tui.write("prove it\r");
 
     // The streaming body is visible in the inline viewport while the model
-    // reasons, under the live thinking header with the interrupt hint. A
-    // glimpse (not a stable-screen wait): the ~90ms HUD spinner repaints
-    // never let the screen go quiet while the transient body is up.
+    // reasons, under the live thinking header. A glimpse (not a
+    // stable-screen wait): the ~90ms HUD spinner repaints never let the
+    // screen go quiet while the transient body is up.
     assert!(
         tui.wait_for_screen_glimpse("zeta-probe-bravo"),
         "streamed reasoning body did not render live:\n{}",
@@ -7585,8 +7585,27 @@ fn tui_pty_streaming_reasoning_body_stays_viewport_only_until_the_gist_commits()
     );
     let streaming_screen = tui.screen_text();
     assert!(
-        streaming_screen.contains("thinking ·") && streaming_screen.contains("esc interrupt"),
+        streaming_screen.contains("thinking ·"),
         "live thinking header missing during streaming:\n{streaming_screen}"
+    );
+    // The one-line HUD carries the thinking status and the SOLE esc
+    // affordance during the delta phase; the transcript header is the
+    // timer alone — the interrupt hint must not be advertised twice.
+    assert!(
+        streaming_screen.contains("esc to interrupt"),
+        "HUD interrupt affordance missing during streaming:\n{streaming_screen}"
+    );
+    assert!(
+        streaming_screen
+            .lines()
+            .any(|line| line.contains("thinking ·") && !line.contains("esc")),
+        "transcript thinking header must carry no esc hint:\n{streaming_screen}"
+    );
+    assert!(
+        !streaming_screen
+            .lines()
+            .any(|line| line.contains("thinking ·") && line.contains("esc interrupt")),
+        "the old transcript-header esc hint is gone:\n{streaming_screen}"
     );
 
     // Finalize: the answer replaces the body; the thought collapses to the
@@ -7632,8 +7651,8 @@ fn tui_pty_streaming_reasoning_body_stays_viewport_only_until_the_gist_commits()
         "streamed reasoning body leaked into committed history:\n{final_state}"
     );
     assert!(
-        !final_state.contains("esc interrupt"),
-        "live thinking header leaked into committed history:\n{final_state}"
+        !final_state.contains("thinking ·") && !final_state.contains("esc to interrupt"),
+        "live thinking header / HUD status leaked into committed history:\n{final_state}"
     );
 }
 
