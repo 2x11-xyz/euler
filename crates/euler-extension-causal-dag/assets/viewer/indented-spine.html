@@ -36,19 +36,19 @@ document.addEventListener('click', function (e) {
     <sc-if value="{{ ready }}" hint-placeholder-val="{{ true }}">
       <div style="position:absolute; left:0; top:0; transform:{{ view }}; transform-origin:0 0;">
       <div style="position:relative; width:{{ tW }}px; height:{{ tH }}px;">
-        <svg width="{{ tW }}" height="{{ tH }}" style="position:absolute; inset:0; display:block; overflow:visible;">
+        <svg width="1" data-dc-bind-width="{{ tW }}" height="1" data-dc-bind-height="{{ tH }}" style="position:absolute; inset:0; display:block; overflow:visible;">
           <defs>
             <marker id="arr" viewBox="0 0 8 6" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse">
               <path d="M 0 0 L 8 3 L 0 6 z" style="fill:context-stroke;"></path>
             </marker>
           </defs>
           <sc-for list="{{ conns }}" as="p" hint-placeholder-count="0">
-            <path d="{{ p.d }}" style="fill:none; stroke:{{ th.edge }}; stroke-width:1;"></path>
+            <path d="M 0 0" data-dc-bind-d="{{ p.d }}" style="fill:none; stroke:{{ th.edge }}; stroke-width:1;"></path>
           </sc-for>
           <sc-if value="{{ showArcs }}" hint-placeholder-val="{{ true }}">
             <sc-for list="{{ arcs }}" as="a" hint-placeholder-count="0">
-              <path d="{{ a.d }}" style="fill:none; stroke:{{ a.col }}; stroke-width:{{ a.sw }}; stroke-dasharray:2 4; opacity:{{ a.op }}; marker-end:url(#arr);"></path>
-              <path d="{{ a.d }}" style="fill:none; stroke:transparent; stroke-width:10; pointer-events:stroke; cursor:pointer;" onmouseenter="{{ a.enter }}"></path>
+              <path d="M 0 0" data-dc-bind-d="{{ a.d }}" style="fill:none; stroke:{{ a.col }}; stroke-width:{{ a.sw }}; stroke-dasharray:2 4; opacity:{{ a.op }}; marker-end:url(#arr);"></path>
+              <path d="M 0 0" data-dc-bind-d="{{ a.d }}" style="fill:none; stroke:transparent; stroke-width:10; pointer-events:stroke; cursor:pointer;" onmouseenter="{{ a.enter }}"></path>
             </sc-for>
           </sc-if>
         </svg>
@@ -217,11 +217,11 @@ class Component extends DCLogic {
     const PAL = dark ? NIGHT : DAY;
     const ARCC = dark ? ARC_NIGHT : ARC_DAY;
     const th = dark ? {
-      bg: '#121212', edge: '#eceae2', text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
+      bg: TOKENS.backgrounds.night, edge: TOKENS.structural_edges.night, text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
       faint: '#6d6b64', border: 'rgba(255,255,255,0.14)', menuBg: 'rgba(22,22,22,0.92)',
       cardBg: 'rgba(22,22,22,0.85)', hint: 'rgba(236,234,226,0.35)'
     } : {
-      bg: '#fdfcf9', edge: '#1c1b18', text: '#26251f', sub: '#8a887f', body: '#4a4840',
+      bg: TOKENS.backgrounds.day, edge: TOKENS.structural_edges.day, text: '#26251f', sub: '#8a887f', body: '#4a4840',
       faint: '#b0aea4', border: 'rgba(0,0,0,0.12)', menuBg: 'rgba(255,255,255,0.92)',
       cardBg: 'rgba(255,255,255,0.88)', hint: 'rgba(28,27,24,0.4)'
     };

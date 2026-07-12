@@ -704,6 +704,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     for (const { name, value } of [...node.attributes]) {
       if (name === "sc-name" || name === "data-dc-tpl") continue;
       let key = name;
+      if (key.startsWith("data-dc-bind-"))
+        key = kebabToCamel(key.slice("data-dc-bind-".length));
       if (key.startsWith(CAMEL_ATTR))
         key = kebabToCamel(key.slice(CAMEL_ATTR.length));
       if (key === "hint-size") {
@@ -1929,19 +1931,19 @@ document.addEventListener('click', function (e) {
     <sc-if value="{{ ready }}" hint-placeholder-val="{{ true }}">
       <div style="position:absolute; left:0; top:0; transform:{{ view }}; transform-origin:0 0;">
       <div style="position:relative; width:{{ tW }}px; height:{{ tH }}px;">
-        <svg width="{{ tW }}" height="{{ tH }}" style="position:absolute; inset:0; display:block; overflow:visible;">
+        <svg width="1" data-dc-bind-width="{{ tW }}" height="1" data-dc-bind-height="{{ tH }}" style="position:absolute; inset:0; display:block; overflow:visible;">
           <defs>
             <marker id="arr" viewBox="0 0 8 6" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse">
               <path d="M 0 0 L 8 3 L 0 6 z" style="fill:context-stroke;"></path>
             </marker>
           </defs>
           <sc-for list="{{ edges }}" as="e" hint-placeholder-count="0">
-            <line x1="{{ e.x1 }}" y1="{{ e.y1 }}" x2="{{ e.x2 }}" y2="{{ e.y2 }}" style="stroke:{{ th.edge }}; stroke-width:1;"></line>
+            <line x1="0" data-dc-bind-x1="{{ e.x1 }}" y1="0" data-dc-bind-y1="{{ e.y1 }}" x2="0" data-dc-bind-x2="{{ e.x2 }}" y2="0" data-dc-bind-y2="{{ e.y2 }}" style="stroke:{{ th.edge }}; stroke-width:1;"></line>
           </sc-for>
           <sc-if value="{{ showArcs }}" hint-placeholder-val="{{ true }}">
             <sc-for list="{{ arcs }}" as="a" hint-placeholder-count="0">
-              <path d="{{ a.d }}" style="fill:none; stroke:{{ a.col }}; stroke-width:{{ a.sw }}; stroke-dasharray:2 4; opacity:{{ a.op }}; marker-end:url(#arr);"></path>
-              <path d="{{ a.d }}" style="fill:none; stroke:transparent; stroke-width:10; pointer-events:stroke; cursor:pointer;" onmouseenter="{{ a.enter }}"></path>
+              <path d="M 0 0" data-dc-bind-d="{{ a.d }}" style="fill:none; stroke:{{ a.col }}; stroke-width:{{ a.sw }}; stroke-dasharray:2 4; opacity:{{ a.op }}; marker-end:url(#arr);"></path>
+              <path d="M 0 0" data-dc-bind-d="{{ a.d }}" style="fill:none; stroke:transparent; stroke-width:10; pointer-events:stroke; cursor:pointer;" onmouseenter="{{ a.enter }}"></path>
             </sc-for>
           </sc-if>
         </svg>
@@ -2226,11 +2228,11 @@ class Component extends DCLogic {
     const PAL = dark ? NIGHT : DAY;
     const ARCC = dark ? ARC_NIGHT : ARC_DAY;
     const th = dark ? {
-      bg: '#121212', edge: '#eceae2', text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
+      bg: TOKENS.backgrounds.night, edge: TOKENS.structural_edges.night, text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
       faint: '#6d6b64', border: 'rgba(255,255,255,0.14)', menuBg: 'rgba(22,22,22,0.92)',
       cardBg: 'rgba(22,22,22,0.85)', hint: 'rgba(236,234,226,0.35)'
     } : {
-      bg: '#fdfcf9', edge: '#1c1b18', text: '#26251f', sub: '#8a887f', body: '#4a4840',
+      bg: TOKENS.backgrounds.day, edge: TOKENS.structural_edges.day, text: '#26251f', sub: '#8a887f', body: '#4a4840',
       faint: '#b0aea4', border: 'rgba(0,0,0,0.12)', menuBg: 'rgba(255,255,255,0.92)',
       cardBg: 'rgba(255,255,255,0.88)', hint: 'rgba(28,27,24,0.4)'
     };
@@ -3086,6 +3088,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     for (const { name, value } of [...node.attributes]) {
       if (name === "sc-name" || name === "data-dc-tpl") continue;
       let key = name;
+      if (key.startsWith("data-dc-bind-"))
+        key = kebabToCamel(key.slice("data-dc-bind-".length));
       if (key.startsWith(CAMEL_ATTR))
         key = kebabToCamel(key.slice(CAMEL_ATTR.length));
       if (key === "hint-size") {
@@ -4311,19 +4315,19 @@ document.addEventListener('click', function (e) {
     <sc-if value="{{ ready }}" hint-placeholder-val="{{ true }}">
       <div style="position:absolute; left:0; top:0; transform:{{ view }}; transform-origin:0 0;">
       <div style="position:relative; width:{{ tW }}px; height:{{ tH }}px;">
-        <svg width="{{ tW }}" height="{{ tH }}" style="position:absolute; inset:0; display:block; overflow:visible;">
+        <svg width="1" data-dc-bind-width="{{ tW }}" height="1" data-dc-bind-height="{{ tH }}" style="position:absolute; inset:0; display:block; overflow:visible;">
           <defs>
             <marker id="arr" viewBox="0 0 8 6" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse">
               <path d="M 0 0 L 8 3 L 0 6 z" style="fill:context-stroke;"></path>
             </marker>
           </defs>
           <sc-for list="{{ conns }}" as="p" hint-placeholder-count="0">
-            <path d="{{ p.d }}" style="fill:none; stroke:{{ th.edge }}; stroke-width:1;"></path>
+            <path d="M 0 0" data-dc-bind-d="{{ p.d }}" style="fill:none; stroke:{{ th.edge }}; stroke-width:1;"></path>
           </sc-for>
           <sc-if value="{{ showArcs }}" hint-placeholder-val="{{ true }}">
             <sc-for list="{{ arcs }}" as="a" hint-placeholder-count="0">
-              <path d="{{ a.d }}" style="fill:none; stroke:{{ a.col }}; stroke-width:{{ a.sw }}; stroke-dasharray:2 4; opacity:{{ a.op }}; marker-end:url(#arr);"></path>
-              <path d="{{ a.d }}" style="fill:none; stroke:transparent; stroke-width:10; pointer-events:stroke; cursor:pointer;" onmouseenter="{{ a.enter }}"></path>
+              <path d="M 0 0" data-dc-bind-d="{{ a.d }}" style="fill:none; stroke:{{ a.col }}; stroke-width:{{ a.sw }}; stroke-dasharray:2 4; opacity:{{ a.op }}; marker-end:url(#arr);"></path>
+              <path d="M 0 0" data-dc-bind-d="{{ a.d }}" style="fill:none; stroke:transparent; stroke-width:10; pointer-events:stroke; cursor:pointer;" onmouseenter="{{ a.enter }}"></path>
             </sc-for>
           </sc-if>
         </svg>
@@ -4602,11 +4606,11 @@ class Component extends DCLogic {
     const PAL = dark ? NIGHT : DAY;
     const ARCC = dark ? ARC_NIGHT : ARC_DAY;
     const th = dark ? {
-      bg: '#121212', edge: '#eceae2', text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
+      bg: TOKENS.backgrounds.night, edge: TOKENS.structural_edges.night, text: '#d6d4cc', sub: '#8a887f', body: '#a9a7a0',
       faint: '#6d6b64', border: 'rgba(255,255,255,0.14)', menuBg: 'rgba(22,22,22,0.92)',
       cardBg: 'rgba(22,22,22,0.85)', hint: 'rgba(236,234,226,0.35)'
     } : {
-      bg: '#fdfcf9', edge: '#1c1b18', text: '#26251f', sub: '#8a887f', body: '#4a4840',
+      bg: TOKENS.backgrounds.day, edge: TOKENS.structural_edges.day, text: '#26251f', sub: '#8a887f', body: '#4a4840',
       faint: '#b0aea4', border: 'rgba(0,0,0,0.12)', menuBg: 'rgba(255,255,255,0.92)',
       cardBg: 'rgba(255,255,255,0.88)', hint: 'rgba(28,27,24,0.4)'
     };
@@ -5433,6 +5437,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     for (const { name, value } of [...node.attributes]) {
       if (name === "sc-name" || name === "data-dc-tpl") continue;
       let key = name;
+      if (key.startsWith("data-dc-bind-"))
+        key = kebabToCamel(key.slice("data-dc-bind-".length));
       if (key.startsWith(CAMEL_ATTR))
         key = kebabToCamel(key.slice(CAMEL_ATTR.length));
       if (key === "hint-size") {
@@ -7054,8 +7060,9 @@ class Component extends DCLogic {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const misty = this.isMisty();
     const PAL = misty ? DAY : NIGHT;
-    const edgeRGB = misty ? '28,27,24' : '236,234,226';
-    ctx.fillStyle = misty ? '#fdfcf9' : '#050507';
+    const edgeColor = misty ? TOKENS.structural_edges.day : TOKENS.structural_edges.night;
+    const backgroundColor = misty ? TOKENS.backgrounds.day : TOKENS.backgrounds.constellation;
+    ctx.fillStyle = backgroundColor;
     ctx.fillRect(0, 0, w, h);
     const S = this.project(w, h);
     const camD = 1250 / this.zoom, f = 1050;
@@ -7068,7 +7075,7 @@ class Component extends DCLogic {
       const rA = clamp(5.5 * A.s, 1.5, 11) + 5, rB = clamp(5.5 * B.s, 1.5, 11) + 5;
       if (L < rA + rB + 4) continue;
       const al = 0.55 * Math.min(A.a, B.a);
-      ctx.strokeStyle = 'rgba(' + edgeRGB + ',' + al.toFixed(3) + ')';
+      ctx.strokeStyle = hexA(edgeColor, al);
       ctx.beginPath();
       ctx.moveTo(A.x + dx / L * rA, A.y + dy / L * rA);
       ctx.lineTo(B.x - dx / L * rB, B.y - dy / L * rB);
@@ -7160,17 +7167,17 @@ class Component extends DCLogic {
       if (r >= 4) {
         ctx.font = Math.max(7, r * 1.15).toFixed(1) + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
         ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillStyle = misty ? 'rgba(253,252,249,0.95)' : 'rgba(5,5,7,0.9)';
+        ctx.fillStyle = hexA(backgroundColor, misty ? 0.95 : 0.9);
         ctx.fillText(GLYPH[n.st], s.x, s.y + 0.5);
         ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
       }
       if (n.id === this.state.selId) {
-        ctx.strokeStyle = 'rgba(' + edgeRGB + ',0.75)';
+        ctx.strokeStyle = hexA(edgeColor, 0.75);
         ctx.lineWidth = 1;
         ctx.beginPath(); ctx.arc(s.x, s.y, r + 5, 0, Math.PI * 2); ctx.stroke();
         const ttl = this.byId[n.id].title;
         ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-        ctx.fillStyle = 'rgba(' + edgeRGB + ',0.9)';
+        ctx.fillStyle = hexA(edgeColor, 0.9);
         ctx.fillText(ttl.length > 42 ? ttl.slice(0, 41) + '…' : ttl, s.x + r + 12, s.y + 4);
       }
       this.hit.push({ id: n.id, x: s.x, y: s.y, r: Math.max(r, 7) });
@@ -7217,11 +7224,11 @@ class Component extends DCLogic {
       },
       sel: {},
       th: this.isMisty() ? {
-        bg: '#fdfcf9', text: '#26251f', sub: '#8a887f', body: '#4a4840', faint: '#b0aea4',
+        bg: TOKENS.backgrounds.day, text: '#26251f', sub: '#8a887f', body: '#4a4840', faint: '#b0aea4',
         border: 'rgba(0,0,0,0.14)', menuBg: 'rgba(255,255,255,0.92)', cardBg: 'rgba(255,255,255,0.88)',
         hint: 'rgba(28,27,24,0.4)'
       } : {
-        bg: '#050507', text: '#eceae2', sub: '#8f92a3', body: '#a9abb8', faint: '#6d7080',
+        bg: TOKENS.backgrounds.constellation, text: '#eceae2', sub: '#8f92a3', body: '#a9abb8', faint: '#6d7080',
         border: 'rgba(255,255,255,0.16)', menuBg: 'rgba(10,11,14,0.92)', cardBg: 'rgba(10,11,14,0.72)',
         hint: 'rgba(236,234,226,0.35)'
       },
@@ -7993,6 +8000,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     for (const { name, value } of [...node.attributes]) {
       if (name === "sc-name" || name === "data-dc-tpl") continue;
       let key = name;
+      if (key.startsWith("data-dc-bind-"))
+        key = kebabToCamel(key.slice("data-dc-bind-".length));
       if (key.startsWith(CAMEL_ATTR))
         key = kebabToCamel(key.slice(CAMEL_ATTR.length));
       if (key === "hint-size") {
@@ -9658,8 +9667,9 @@ class Component extends DCLogic {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const misty = this.isMisty();
     const PAL = misty ? DAY : NIGHT;
-    const edgeRGB = misty ? '28,27,24' : '236,234,226';
-    ctx.fillStyle = misty ? '#fdfcf9' : '#050507';
+    const edgeColor = misty ? TOKENS.structural_edges.day : TOKENS.structural_edges.night;
+    const backgroundColor = misty ? TOKENS.backgrounds.day : TOKENS.backgrounds.constellation;
+    ctx.fillStyle = backgroundColor;
     ctx.fillRect(0, 0, w, h);
     const S = this.project(w, h);
     const camD = 1250 / this.zoom, f = 1050;
@@ -9668,10 +9678,10 @@ class Component extends DCLogic {
     const aT = this.proj3(this.axisTop, w, h, camD, f);
     const aB = this.proj3(this.axisBot, w, h, camD, f);
     if (aT.cz > 60 && aB.cz > 60) {
-      ctx.strokeStyle = 'rgba(' + edgeRGB + ',0.32)';
+      ctx.strokeStyle = hexA(edgeColor, 0.32);
       ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(aT.x, aT.y); ctx.lineTo(aB.x, aB.y); ctx.stroke();
-      ctx.strokeStyle = 'rgba(' + edgeRGB + ',0.12)';
+      ctx.strokeStyle = hexA(edgeColor, 0.12);
       for (const tk of this.ticks) {
         const sp = this.proj3(tk, w, h, camD, f);
         if (sp.cz < 60 || sp.x < -20 || sp.x > w + 20 || sp.y < -20 || sp.y > h + 20) continue;
@@ -9705,7 +9715,7 @@ class Component extends DCLogic {
       const al = 0.55 * Math.min(A.a, B.a);
       const eb = Math.min(A.blur ?? B.blur, B.blur);
       ctx.lineWidth = 1 + eb * 0.8;
-      ctx.strokeStyle = 'rgba(' + edgeRGB + ',' + (al / (1 + eb * 0.9)).toFixed(3) + ')';
+      ctx.strokeStyle = hexA(edgeColor, al / (1 + eb * 0.9));
       ctx.beginPath();
       ctx.moveTo(A.x + dx / L * rA, A.y + dy / L * rA);
       ctx.lineTo(B.x - dx / L * rB, B.y - dy / L * rB);
@@ -9803,17 +9813,17 @@ class Component extends DCLogic {
       if (r >= 4) {
         ctx.font = Math.max(7, r * 1.15).toFixed(1) + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
         ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillStyle = misty ? 'rgba(253,252,249,0.95)' : 'rgba(5,5,7,0.9)';
+        ctx.fillStyle = hexA(backgroundColor, misty ? 0.95 : 0.9);
         ctx.fillText(GLYPH[n.st], s.x, s.y + 0.5);
         ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
       }
       if (n.id === this.state.selId) {
-        ctx.strokeStyle = 'rgba(' + edgeRGB + ',0.75)';
+        ctx.strokeStyle = hexA(edgeColor, 0.75);
         ctx.lineWidth = 1;
         ctx.beginPath(); ctx.arc(s.x, s.y, r + 5, 0, Math.PI * 2); ctx.stroke();
         const ttl = this.byId[n.id].title;
         ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-        ctx.fillStyle = 'rgba(' + edgeRGB + ',0.9)';
+        ctx.fillStyle = hexA(edgeColor, 0.9);
         ctx.fillText(ttl.length > 42 ? ttl.slice(0, 41) + '…' : ttl, s.x + r + 12, s.y + 4);
       }
       this.hit.push({ id: n.id, x: s.x, y: s.y, r: Math.max(r, 7) });
@@ -9920,11 +9930,11 @@ class Component extends DCLogic {
       },
       sel: {},
       th: this.isMisty() ? {
-        bg: '#fdfcf9', text: '#26251f', sub: '#8a887f', body: '#4a4840', faint: '#b0aea4',
+        bg: TOKENS.backgrounds.day, text: '#26251f', sub: '#8a887f', body: '#4a4840', faint: '#b0aea4',
         border: 'rgba(0,0,0,0.14)', menuBg: 'rgba(255,255,255,0.92)', cardBg: 'rgba(255,255,255,0.88)',
         hint: 'rgba(28,27,24,0.4)'
       } : {
-        bg: '#050507', text: '#eceae2', sub: '#8f92a3', body: '#a9abb8', faint: '#6d7080',
+        bg: TOKENS.backgrounds.constellation, text: '#eceae2', sub: '#8f92a3', body: '#a9abb8', faint: '#6d7080',
         border: 'rgba(255,255,255,0.16)', menuBg: 'rgba(10,11,14,0.92)', cardBg: 'rgba(10,11,14,0.72)',
         hint: 'rgba(236,234,226,0.35)'
       },

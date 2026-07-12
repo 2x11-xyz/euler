@@ -154,6 +154,18 @@ mod tests {
         assert!(!html.contains("unpkg.com"));
         assert!(!html.contains("fonts.googleapis"));
         assert!(!html.contains("<script src="));
+        for invalid_svg_binding in [
+            " width=\"{{",
+            " height=\"{{",
+            " x1=\"{{",
+            " y1=\"{{",
+            " x2=\"{{",
+            " y2=\"{{",
+            " d=\"{{",
+        ] {
+            assert!(!html.contains(invalid_svg_binding));
+        }
+        assert!(html.contains("data-dc-bind-d=\"{{"));
         assert!(!html.contains("</script><script>window.pwned"));
         assert!(html.contains("\\u003c/script\\u003e\\u003cscript\\u003ewindow.pwned"));
         assert!(html.contains("#7f97a8"));

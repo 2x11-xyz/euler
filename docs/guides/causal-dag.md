@@ -63,7 +63,9 @@ Formats:
 Flags: `--format`, `--out`, `--limit`, `--scan-limit`, `--after-event-id`,
 repeatable `--kind`. The default format is `json`. `--out` accepts a
 workspace-relative, no-clobber file path; the provenance-backed extension
-artifact is still written first.
+artifact is still written first. Provenance-window flags apply only to the
+fallback projection when no active graph exists; an active revision is always
+exported whole.
 
 ### `view`
 
@@ -366,8 +368,8 @@ Before choosing the next approach, query the current graph:
 euler extension run causal-dag.export ./session.jsonl --limit 512
 ```
 
-Use the artifact to avoid already-dead branches and to continue from verified or
-promising paths.
+Use the artifact to avoid already-dead branches and to continue from verified,
+successful, or still-open paths.
 
 ## Output artifact
 

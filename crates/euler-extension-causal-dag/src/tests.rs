@@ -4783,6 +4783,109 @@ fn corrupt_active_graph_state_self_heals_instead_of_bricking_the_loop() {
     );
 }
 
+#[test]
+fn active_view_and_exports_share_the_selected_graph_artifact() {
+    let host = RecordingHost::empty();
+    let (_, artifact) = load_knuth_fixture();
+    let source_record = ArtifactRecord {
+        persisted_event_id: "source-artifact-event".to_owned(),
+        relative_path: "sessions/session-knuth/extensions/causal-dag/artifacts/source-graph.json"
+            .to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: serde_json::to_vec(&artifact).expect("artifact bytes").len() + 1,
+    };
+    ActiveGraphState::commit(&host, &source_record, artifact, None).expect("active state");
+
+    let view = CausalDagViewCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-knuth"}),
+            },
+            &host,
+        )
+        .expect("view active graph");
+    assert_eq!(view["source_artifact_event_id"], "source-artifact-event");
+    assert_eq!(view["node_count"], 6);
+    assert!(view["summary"]
+        .as_str()
+        .is_some_and(|text| text.starts_with("GRAPH:")));
+
+    let json_export = CausalDagExportCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-knuth", "format": "json"}),
+            },
+            &host,
+        )
+        .expect("export active JSON");
+    assert_eq!(json_export["active_graph"], true);
+    assert_eq!(json_export["format"], "json");
+    assert_eq!(json_export["relative_path"], source_record.relative_path);
+    assert!(host.writes.lock().expect("writes").is_empty());
+
+    let html_export = CausalDagExportCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-knuth", "format": "html"}),
+            },
+            &host,
+        )
+        .expect("export active HTML");
+    assert_eq!(
+        html_export["source_artifact_event_id"],
+        "source-artifact-event"
+    );
+    assert_eq!(html_export["self_contained"], true);
+    let writes = host.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].source_event_ids, ["source-artifact-event"]);
+    assert_eq!(writes[0].metadata["format"], "html");
+    assert!(writes[0].bytes.starts_with(b"<!DOCTYPE html>"));
+}
+
+#[test]
+fn active_state_without_artifact_path_reexports_raw_json() {
+    let host = RecordingHost::empty();
+    let (_, artifact) = load_knuth_fixture();
+    let source_record = ArtifactRecord {
+        persisted_event_id: "source-artifact-event".to_owned(),
+        relative_path: "sessions/session-knuth/extensions/causal-dag/artifacts/source-graph.json"
+            .to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: serde_json::to_vec(&artifact).expect("artifact bytes").len() + 1,
+    };
+    ActiveGraphState::commit(&host, &source_record, artifact, None).expect("active state");
+    let path = host.state.path().join("active-graph.json");
+    let mut legacy: Value =
+        serde_json::from_slice(&fs::read(&path).expect("state bytes")).expect("state JSON");
+    legacy
+        .as_object_mut()
+        .expect("state object")
+        .remove("artifact_relative_path");
+    fs::write(&path, serde_json::to_vec(&legacy).expect("legacy bytes"))
+        .expect("write legacy state");
+
+    let loaded = ActiveGraphState::load(&host)
+        .expect("load legacy state")
+        .expect("active graph");
+    assert_eq!(loaded.artifact_relative_path(), None);
+    let output = CausalDagExportCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-knuth", "format": "json"}),
+            },
+            &host,
+        )
+        .expect("re-export legacy active graph");
+
+    assert_eq!(output["active_graph"], true);
+    assert_eq!(output["source_artifact_event_id"], "source-artifact-event");
+    let writes = host.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 1);
+    let exported: Value = serde_json::from_slice(&writes[0].bytes).expect("exported graph JSON");
+    assert_eq!(exported["schema"], SCHEMA_NAME);
+}
+
 fn recording_page(
     events: Vec<EventEnvelope>,
     applied_limit: usize,

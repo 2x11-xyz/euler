@@ -82,22 +82,16 @@ impl ExtensionCommand for CausalDagExportCommand {
         let palette = Palette::load()?;
         let bytes = input.format.render(&source.artifact, &dag, &palette)?;
         let suggested_name = format!("{}.{}", dag.suggested_stem(), input.format.extension());
-        let record = if input.format == ExportFormat::Json && source.record.is_some() {
-            source.record.clone().expect("record presence checked")
-        } else {
-            write_view_artifact(
-                host,
-                &source,
-                &dag,
-                input.format,
-                &suggested_name,
-                bytes.clone(),
-            )?
+        let materialized_bytes = input.out.as_ref().map(|_| bytes.clone());
+        let record = match (input.format, source.record.as_ref()) {
+            (ExportFormat::Json, Some(record)) => record.clone(),
+            _ => write_view_artifact(host, &source, &dag, input.format, &suggested_name, bytes)?,
         };
         let out_path = input
             .out
             .as_deref()
-            .map(|path| materialize_copy(path, &bytes))
+            .zip(materialized_bytes.as_deref())
+            .map(|(path, bytes)| materialize_copy(path, bytes))
             .transpose()?;
         Ok(export_output(
             &dag,

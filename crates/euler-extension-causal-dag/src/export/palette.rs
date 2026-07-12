@@ -16,6 +16,14 @@ const STATUSES: [&str; 8] = [
     "abandoned",
 ];
 const KINDS: [&str; 5] = ["root", "attempt", "claim", "checkpoint", "synthesis"];
+const ARC_KINDS: [&str; 6] = [
+    "pivot",
+    "evidence",
+    "supersedes",
+    "refutation",
+    "related",
+    "artifact_use",
+];
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct Palette {
@@ -92,6 +100,11 @@ impl Palette {
                 "causal-dag palette status order does not match the v2 status set",
             ));
         }
+        require_exact_keys(
+            "status",
+            self.statuses.keys().map(String::as_str),
+            &STATUSES,
+        )?;
         for status in STATUSES {
             let token = self.status(status)?;
             validate_color(&token.day)?;
@@ -104,12 +117,18 @@ impl Palette {
         }
         for kind in KINDS {
             let token = self.kind(kind)?;
-            if token.shape.is_empty() || !(0.5..=2.0).contains(&token.scale) {
+            if !matches!(
+                token.shape.as_str(),
+                "ring" | "circle" | "diamond" | "square" | "double_ring"
+            ) || !(0.5..=2.0).contains(&token.scale)
+                || token.weight == 0
+            {
                 return Err(input_error(format!(
                     "causal-dag palette kind `{kind}` has invalid shape tokens"
                 )));
             }
         }
+        require_exact_keys("kind", self.kinds.keys().map(String::as_str), &KINDS)?;
         for color in [
             &self.backgrounds.day,
             &self.backgrounds.night,
@@ -125,10 +144,34 @@ impl Palette {
                 "causal-dag palette cross-arc opacity must be between zero and one",
             ));
         }
-        for color in self.cross_arcs.kinds.values() {
-            validate_color(color)?;
+        require_exact_keys(
+            "cross-arc kind",
+            self.cross_arcs.kinds.keys().map(String::as_str),
+            &ARC_KINDS,
+        )?;
+        for kind in ARC_KINDS {
+            validate_color(&self.cross_arcs.kinds[kind])?;
         }
         Ok(())
+    }
+}
+
+fn require_exact_keys<'a, const N: usize>(
+    owner: &str,
+    actual: impl Iterator<Item = &'a str>,
+    expected: &[&str; N],
+) -> Result<(), ExtensionError> {
+    let actual = actual.collect::<std::collections::BTreeSet<_>>();
+    let expected = expected
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(input_error(format!(
+            "causal-dag palette {owner} keys do not match the canonical set"
+        )))
     }
 }
 

@@ -35,7 +35,10 @@ pub(super) fn render_svg(dag: &ViewerDag, palette: &Palette) -> Result<Vec<u8>, 
         "<rect width=\"100%\" height=\"100%\" fill=\"{}\"/>\n",
         palette.backgrounds.day
     ));
-    svg.push_str("<defs><marker id=\"arrow\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"6\" markerHeight=\"6\" orient=\"auto-start-reverse\"><path d=\"M 0 0 L 10 5 L 0 10 z\" fill=\"#7f97a8\"/></marker></defs>\n");
+    svg.push_str(&format!(
+        "<defs><marker id=\"arrow\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"6\" markerHeight=\"6\" orient=\"auto-start-reverse\"><path d=\"M 0 0 L 10 5 L 0 10 z\" fill=\"{}\" fill-opacity=\"{:.2}\"/></marker></defs>\n",
+        palette.cross_arcs.rest, palette.cross_arcs.opacity
+    ));
     svg.push_str(&format!(
         "<text x=\"40\" y=\"42\" font-family=\"ui-monospace,monospace\" font-size=\"18\" font-weight=\"600\" fill=\"#26251f\">{}</text>\n",
         escape_xml(&dag.title)
@@ -202,7 +205,7 @@ fn render_nodes(
             escape_xml(&node.summary),
             escape_xml(&node.ev)
         ));
-        render_kind_shape(svg, point, &status.day, kind);
+        render_kind_shape(svg, point, &status.day, &palette.backgrounds.day, kind);
         svg.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-family=\"ui-monospace,monospace\" font-size=\"14\" font-weight=\"{}\" fill=\"{}\">{}</text>",
             point.x,
@@ -221,11 +224,17 @@ fn render_nodes(
     Ok(())
 }
 
-fn render_kind_shape(svg: &mut String, point: &Point, color: &str, kind: &KindToken) {
+fn render_kind_shape(
+    svg: &mut String,
+    point: &Point,
+    color: &str,
+    background: &str,
+    kind: &KindToken,
+) {
     let radius = 14.0 * kind.scale;
     match kind.shape.as_str() {
         "diamond" => svg.push_str(&format!(
-            "<path d=\"M {:.1} {:.1} L {:.1} {:.1} L {:.1} {:.1} L {:.1} {:.1} Z\" fill=\"#fdfcf9\" stroke=\"{color}\" stroke-width=\"1.5\"/>",
+            "<path d=\"M {:.1} {:.1} L {:.1} {:.1} L {:.1} {:.1} L {:.1} {:.1} Z\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"1.5\"/>",
             point.x,
             point.y - radius,
             point.x + radius,
@@ -236,14 +245,14 @@ fn render_kind_shape(svg: &mut String, point: &Point, color: &str, kind: &KindTo
             point.y
         )),
         "square" => svg.push_str(&format!(
-            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"#fdfcf9\" stroke=\"{color}\" stroke-width=\"1.5\"/>",
+            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"1.5\"/>",
             point.x - radius,
             point.y - radius,
             radius * 2.0,
             radius * 2.0
         )),
         "double_ring" => svg.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"#fdfcf9\" stroke=\"{color}\" stroke-width=\"1.5\"/><circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1\"/>",
+            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"1.5\"/><circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1\"/>",
             point.x,
             point.y,
             point.x,
@@ -251,11 +260,11 @@ fn render_kind_shape(svg: &mut String, point: &Point, color: &str, kind: &KindTo
             radius + 4.0
         )),
         "ring" => svg.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"#fdfcf9\" stroke=\"{color}\" stroke-width=\"2.5\"/>",
+            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"2.5\"/>",
             point.x, point.y
         )),
         _ => svg.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"#fdfcf9\" stroke=\"{color}\" stroke-width=\"1.25\"/>",
+            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{radius:.1}\" fill=\"{background}\" stroke=\"{color}\" stroke-width=\"1.25\"/>",
             point.x, point.y
         )),
     }

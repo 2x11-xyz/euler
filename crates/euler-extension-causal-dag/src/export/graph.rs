@@ -66,6 +66,13 @@ impl ViewerDag {
         if node_ids.len() != raw_nodes.len() {
             return Err(input_error("causal-dag artifact has duplicate node ids"));
         }
+        let edge_ids = raw_edges
+            .iter()
+            .map(|edge| required_string(edge, "id", "edge"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if edge_ids.len() != raw_edges.len() {
+            return Err(input_error("causal-dag artifact has duplicate edge ids"));
+        }
 
         let parents = backbone_parents(raw_edges, &node_ids)?;
         let nodes = raw_nodes
@@ -126,7 +133,7 @@ impl ViewerDag {
     }
 
     pub(super) fn suggested_stem(&self) -> String {
-        format!("dag-{}", short_session_id(&self.session_id))
+        format!("dag-{}", filename_session_id(&self.session_id))
     }
 
     pub(super) fn node_by_id(&self, id: &str) -> Option<&ViewerNode> {
@@ -176,8 +183,16 @@ fn viewer_node(
 
 fn viewer_arc(edge: &Value, node_ids: &BTreeSet<String>) -> Result<ViewerArc, ExtensionError> {
     let id = required_string(edge, "id", "edge")?;
+    if edge.get("canonical_backbone").and_then(Value::as_bool) != Some(false) {
+        return Err(input_error(format!(
+            "causal-dag edge `{id}` has invalid canonical_backbone"
+        )));
+    }
     let from = required_string(edge, "from", "edge")?;
     let to = required_string(edge, "to", "edge")?;
+    let class = required_string(edge, "class", "edge")?;
+    let kind = required_string(edge, "kind", "edge")?;
+    validate_edge_class_kind(&id, &class, &kind, false)?;
     if !node_ids.contains(&from) || !node_ids.contains(&to) {
         return Err(input_error(format!(
             "causal-dag edge `{id}` references a missing node"
@@ -187,8 +202,8 @@ fn viewer_arc(edge: &Value, node_ids: &BTreeSet<String>) -> Result<ViewerArc, Ex
         id,
         from,
         to,
-        class: required_string(edge, "class", "edge")?,
-        kind: required_string(edge, "kind", "edge")?,
+        class,
+        kind,
         note: edge
             .pointer("/basis/summary")
             .and_then(Value::as_str)
@@ -209,6 +224,9 @@ fn backbone_parents(
         let id = required_string(edge, "id", "edge")?;
         let from = required_string(edge, "from", "edge")?;
         let to = required_string(edge, "to", "edge")?;
+        let class = required_string(edge, "class", "edge")?;
+        let kind = required_string(edge, "kind", "edge")?;
+        validate_edge_class_kind(&id, &class, &kind, true)?;
         if !node_ids.contains(&from) || !node_ids.contains(&to) {
             return Err(input_error(format!(
                 "causal-dag backbone edge `{id}` references a missing node"
@@ -223,6 +241,43 @@ fn backbone_parents(
     Ok(parents)
 }
 
+fn validate_edge_class_kind(
+    id: &str,
+    class: &str,
+    kind: &str,
+    canonical_backbone: bool,
+) -> Result<(), ExtensionError> {
+    let valid = match class {
+        "structural" => matches!(
+            kind,
+            "continuation"
+                | "refinement"
+                | "repair"
+                | "fork"
+                | "decomposition"
+                | "integration"
+                | "verification"
+        ),
+        "annotation" => matches!(
+            kind,
+            "evidence" | "refutation" | "artifact_use" | "pivot" | "related" | "supersedes"
+        ),
+        "chronology" => kind == "sequence",
+        _ => false,
+    };
+    if !valid {
+        return Err(input_error(format!(
+            "causal-dag edge `{id}` has invalid class/kind `{class}/{kind}`"
+        )));
+    }
+    if canonical_backbone && class == "annotation" {
+        return Err(input_error(format!(
+            "causal-dag annotation edge `{id}` cannot be a backbone parent"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_roots(
     roots: &[String],
     nodes: &[ViewerNode],
@@ -231,6 +286,13 @@ fn validate_roots(
     let root_set = roots.iter().collect::<BTreeSet<_>>();
     if root_set.len() != roots.len() {
         return Err(input_error("causal-dag artifact has duplicate roots"));
+    }
+    for root in roots {
+        if !nodes.iter().any(|node| node.id == *root) {
+            return Err(input_error(format!(
+                "causal-dag forest root `{root}` does not name a node"
+            )));
+        }
     }
     for node in nodes {
         let is_root = root_set.contains(&node.id);
@@ -286,6 +348,11 @@ fn validate_backbone(
         if !root_set.contains(current) {
             return Err(input_error(format!(
                 "causal-dag node `{id}` is unreachable from a forest root"
+            )));
+        }
+        if node_roots.get(id).map(String::as_str) != Some(current) {
+            return Err(input_error(format!(
+                "causal-dag node `{id}` root_id disagrees with its backbone root"
             )));
         }
     }
@@ -406,6 +473,26 @@ fn short_session_id(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
 
+fn filename_session_id(session_id: &str) -> String {
+    let slug = session_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(8)
+        .collect::<String>();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "session".to_owned()
+    } else {
+        slug.to_owned()
+    }
+}
+
 fn short_event_id(event_id: &str) -> String {
     if event_id.chars().count() <= 10 {
         event_id.to_owned()
@@ -423,7 +510,7 @@ fn short_event_id(event_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_backbone, ViewerDag};
+    use super::{filename_session_id, validate_backbone, ViewerDag};
     use serde_json::Value;
     use std::collections::BTreeMap;
 
@@ -490,5 +577,55 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("crosses roots"));
+
+        let mislabeled = vec![
+            serde_json::json!({"id": "r1", "root_id": "r2"}),
+            serde_json::json!({"id": "r2", "root_id": "r2"}),
+        ];
+        assert!(validate_backbone(&mislabeled, &roots, &BTreeMap::new())
+            .unwrap_err()
+            .to_string()
+            .contains("root_id disagrees"));
+    }
+
+    #[test]
+    fn renderer_rejects_missing_forest_root_nodes() {
+        let mut artifact = artifact();
+        artifact["forest"]["roots"] = serde_json::json!(["missing-root"]);
+        artifact["forest"]["active_root"] = serde_json::json!("missing-root");
+
+        assert!(ViewerDag::from_artifact(&artifact)
+            .unwrap_err()
+            .to_string()
+            .contains("does not name a node"));
+    }
+
+    #[test]
+    fn renderer_rejects_duplicate_and_annotation_backbone_edges() {
+        let mut duplicate = artifact();
+        let first = duplicate["forest"]["edges"][0].clone();
+        duplicate["forest"]["edges"]
+            .as_array_mut()
+            .expect("edges")
+            .push(first);
+        assert!(ViewerDag::from_artifact(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate edge ids"));
+
+        let mut annotation_backbone = artifact();
+        let edge = &mut annotation_backbone["forest"]["edges"][4];
+        edge["canonical_backbone"] = serde_json::json!(true);
+        assert!(ViewerDag::from_artifact(&annotation_backbone)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be a backbone parent"));
+    }
+
+    #[test]
+    fn suggested_filename_session_ids_are_short_and_portable() {
+        assert_eq!(filename_session_id("01KX8VEXAMPLE"), "01KX8VEX");
+        assert_eq!(filename_session_id("session-knuth"), "session");
+        assert_eq!(filename_session_id("///"), "session");
     }
 }

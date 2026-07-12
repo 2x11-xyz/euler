@@ -5,10 +5,14 @@ use std::collections::BTreeSet;
 
 pub(super) fn render_dot(dag: &ViewerDag, palette: &Palette) -> Result<Vec<u8>, ExtensionError> {
     let mut dot = String::from("digraph causal_dag {\n");
-    dot.push_str(
-        "  graph [rankdir=TB, bgcolor=\"#fdfcf9\", pad=0.25, nodesep=0.35, ranksep=0.6];\n",
-    );
-    dot.push_str("  node [fontname=\"monospace\", style=\"filled\", fillcolor=\"#fdfcf9\"];\n");
+    dot.push_str(&format!(
+        "  graph [rankdir=TB, bgcolor=\"{}\", pad=0.25, nodesep=0.35, ranksep=0.6];\n",
+        palette.backgrounds.day
+    ));
+    dot.push_str(&format!(
+        "  node [fontname=\"monospace\", style=\"filled\", fillcolor=\"{}\"];\n",
+        palette.backgrounds.day
+    ));
     dot.push_str("  edge [fontname=\"monospace\", fontsize=9];\n");
     for node in &dag.nodes {
         let status = palette.status(&node.status)?;

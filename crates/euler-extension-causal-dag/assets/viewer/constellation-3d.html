@@ -322,8 +322,9 @@ class Component extends DCLogic {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const misty = this.isMisty();
     const PAL = misty ? DAY : NIGHT;
-    const edgeRGB = misty ? '28,27,24' : '236,234,226';
-    ctx.fillStyle = misty ? '#fdfcf9' : '#050507';
+    const edgeColor = misty ? TOKENS.structural_edges.day : TOKENS.structural_edges.night;
+    const backgroundColor = misty ? TOKENS.backgrounds.day : TOKENS.backgrounds.constellation;
+    ctx.fillStyle = backgroundColor;
     ctx.fillRect(0, 0, w, h);
     const S = this.project(w, h);
     const camD = 1250 / this.zoom, f = 1050;
@@ -336,7 +337,7 @@ class Component extends DCLogic {
       const rA = clamp(5.5 * A.s, 1.5, 11) + 5, rB = clamp(5.5 * B.s, 1.5, 11) + 5;
       if (L < rA + rB + 4) continue;
       const al = 0.55 * Math.min(A.a, B.a);
-      ctx.strokeStyle = 'rgba(' + edgeRGB + ',' + al.toFixed(3) + ')';
+      ctx.strokeStyle = hexA(edgeColor, al);
       ctx.beginPath();
       ctx.moveTo(A.x + dx / L * rA, A.y + dy / L * rA);
       ctx.lineTo(B.x - dx / L * rB, B.y - dy / L * rB);
@@ -428,17 +429,17 @@ class Component extends DCLogic {
       if (r >= 4) {
         ctx.font = Math.max(7, r * 1.15).toFixed(1) + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
         ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillStyle = misty ? 'rgba(253,252,249,0.95)' : 'rgba(5,5,7,0.9)';
+        ctx.fillStyle = hexA(backgroundColor, misty ? 0.95 : 0.9);
         ctx.fillText(GLYPH[n.st], s.x, s.y + 0.5);
         ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
       }
       if (n.id === this.state.selId) {
-        ctx.strokeStyle = 'rgba(' + edgeRGB + ',0.75)';
+        ctx.strokeStyle = hexA(edgeColor, 0.75);
         ctx.lineWidth = 1;
         ctx.beginPath(); ctx.arc(s.x, s.y, r + 5, 0, Math.PI * 2); ctx.stroke();
         const ttl = this.byId[n.id].title;
         ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-        ctx.fillStyle = 'rgba(' + edgeRGB + ',0.9)';
+        ctx.fillStyle = hexA(edgeColor, 0.9);
         ctx.fillText(ttl.length > 42 ? ttl.slice(0, 41) + '…' : ttl, s.x + r + 12, s.y + 4);
       }
       this.hit.push({ id: n.id, x: s.x, y: s.y, r: Math.max(r, 7) });
@@ -485,11 +486,11 @@ class Component extends DCLogic {
       },
       sel: {},
       th: this.isMisty() ? {
-        bg: '#fdfcf9', text: '#26251f', sub: '#8a887f', body: '#4a4840', faint: '#b0aea4',
+        bg: TOKENS.backgrounds.day, text: '#26251f', sub: '#8a887f', body: '#4a4840', faint: '#b0aea4',
         border: 'rgba(0,0,0,0.14)', menuBg: 'rgba(255,255,255,0.92)', cardBg: 'rgba(255,255,255,0.88)',
         hint: 'rgba(28,27,24,0.4)'
       } : {
-        bg: '#050507', text: '#eceae2', sub: '#8f92a3', body: '#a9abb8', faint: '#6d7080',
+        bg: TOKENS.backgrounds.constellation, text: '#eceae2', sub: '#8f92a3', body: '#a9abb8', faint: '#6d7080',
         border: 'rgba(255,255,255,0.16)', menuBg: 'rgba(10,11,14,0.92)', cardBg: 'rgba(10,11,14,0.72)',
         hint: 'rgba(236,234,226,0.35)'
       },
