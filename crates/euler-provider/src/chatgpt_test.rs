@@ -355,4 +355,12 @@ fn request_forwards_reasoning_effort_compat_level() {
     xlarge.reasoning_effort = crate::ReasoningEffort::XLarge;
     let body = request_body(&xlarge);
     assert_eq!(body["reasoning"]["effort"], "xhigh");
+
+    for model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+        let mut max = xlarge.clone();
+        max.model = model.to_owned();
+        max.reasoning_effort = crate::ReasoningEffort::Max;
+        let body = request_body(&max);
+        assert_eq!(body["reasoning"]["effort"], "max", "model {model}");
+    }
 }

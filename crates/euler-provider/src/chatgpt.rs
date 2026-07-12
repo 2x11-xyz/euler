@@ -94,6 +94,17 @@ impl ModelProvider for ChatGptProvider {
     }
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if !crate::catalog::model_supports_reasoning_effort(
+            crate::catalog::CHATGPT_PROVIDER_ID,
+            &request.model,
+            request.reasoning_effort,
+        ) {
+            return Err(ProviderError::rejected(format!(
+                "reasoning effort `{}` is not supported by chatgpt/{}",
+                request.reasoning_effort.as_str(),
+                request.model
+            )));
+        }
         let credentials = self.auth.load()?;
         let body = request_body(&request);
         let agent = ureq::builder().redirects(0).build();

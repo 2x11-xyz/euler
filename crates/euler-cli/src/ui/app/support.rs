@@ -130,7 +130,7 @@ pub(super) fn command_context(
     CommandContext {
         model_choices,
         code_swarm_model_choices,
-        effort_choices: effort_choices(parts.current_effort),
+        effort_choices: effort_choices(parts.current_effort, provider, model),
         theme_choices: theme_choices(parts.current_theme),
         resume_items: resume_items_from_home(parts.current_session_id.as_deref()),
         checkpoint_items: parts.checkpoint_items,
@@ -174,9 +174,10 @@ pub(super) fn causal_dag_stats_from_events(
     }
 }
 
-fn effort_choices(current: ReasoningEffort) -> Vec<EffortChoice> {
-    ReasoningEffort::ALL
-        .into_iter()
+fn effort_choices(current: ReasoningEffort, provider: &str, model: &str) -> Vec<EffortChoice> {
+    euler_provider::catalog::supported_reasoning_efforts(provider, model)
+        .iter()
+        .copied()
         .map(|effort| EffortChoice::new(effort, current))
         .collect()
 }
@@ -541,6 +542,34 @@ mod tests {
         assert_eq!(
             current[0].label,
             "openrouter::new/model-not-in-local-catalog"
+        );
+    }
+
+    #[test]
+    fn effort_choices_expose_max_only_for_supported_models() {
+        let standard = effort_choices(ReasoningEffort::Medium, "chatgpt", "gpt-5.5");
+        let gpt_5_6 = effort_choices(ReasoningEffort::Max, "chatgpt", "gpt-5.6-sol");
+
+        assert_eq!(
+            standard
+                .iter()
+                .map(|choice| choice.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["xsmall", "small", "medium", "large", "xlarge"]
+        );
+        assert_eq!(
+            gpt_5_6
+                .iter()
+                .map(|choice| (choice.effort.as_str(), choice.current))
+                .collect::<Vec<_>>(),
+            [
+                ("xsmall", false),
+                ("small", false),
+                ("medium", false),
+                ("large", false),
+                ("xlarge", false),
+                ("max", true),
+            ]
         );
     }
 

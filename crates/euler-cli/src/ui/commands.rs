@@ -241,7 +241,8 @@ impl EffortChoice {
             ReasoningEffort::Small => "small - light reasoning",
             ReasoningEffort::Medium => "medium - balanced default",
             ReasoningEffort::Large => "large - deeper reasoning",
-            ReasoningEffort::XLarge => "xlarge - maximum reasoning",
+            ReasoningEffort::XLarge => "xlarge - extra-high reasoning",
+            ReasoningEffort::Max => "max - maximum reasoning",
         };
         Self {
             effort,
@@ -1094,9 +1095,9 @@ fn effort_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
     };
     match ReasoningEffort::parse(level) {
         Some(effort) => CommandEffect::Action(CommandAction::SetReasoningEffort { effort }),
-        None => {
-            CommandEffect::Message("usage: /effort <xsmall|small|medium|large|xlarge>".to_owned())
-        }
+        None => CommandEffect::Message(
+            "usage: /effort <xsmall|small|medium|large|xlarge|max>".to_owned(),
+        ),
     }
 }
 
@@ -1253,6 +1254,12 @@ mod tests {
             dispatch_command("/effort xlarge", &context),
             CommandEffect::Action(CommandAction::SetReasoningEffort {
                 effort: ReasoningEffort::XLarge,
+            })
+        );
+        assert_eq!(
+            dispatch_command("/effort max", &context),
+            CommandEffect::Action(CommandAction::SetReasoningEffort {
+                effort: ReasoningEffort::Max,
             })
         );
         assert_eq!(
@@ -1700,7 +1707,9 @@ mod tests {
         );
         assert_eq!(
             dispatch_command("/effort extra-high", &context),
-            CommandEffect::Message("usage: /effort <xsmall|small|medium|large|xlarge>".to_owned())
+            CommandEffect::Message(
+                "usage: /effort <xsmall|small|medium|large|xlarge|max>".to_owned(),
+            )
         );
         assert_eq!(
             dispatch_command("/theme gruvbox", &context),

@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::ReasoningEffort;
+
 pub const FIXTURE_PROVIDER_ID: &str = "fixture";
 pub const CHATGPT_PROVIDER_ID: &str = "chatgpt";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
@@ -18,6 +20,21 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = crate::anthropic::DEFAULT_MODEL;
 pub const DEFAULT_OPENROUTER_MODEL: &str = crate::openrouter::DEFAULT_MODEL;
 pub const DEFAULT_XAI_MODEL: &str = crate::xai::DEFAULT_MODEL;
 
+const STANDARD_REASONING_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::XSmall,
+    ReasoningEffort::Small,
+    ReasoningEffort::Medium,
+    ReasoningEffort::Large,
+    ReasoningEffort::XLarge,
+];
+const MAX_REASONING_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::XSmall,
+    ReasoningEffort::Small,
+    ReasoningEffort::Medium,
+    ReasoningEffort::Large,
+    ReasoningEffort::XLarge,
+    ReasoningEffort::Max,
+];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuiltInModelDescriptor {
     pub id: &'static str,
@@ -2602,6 +2619,24 @@ pub fn built_in_model_supports_reasoning(provider: &str, model: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn supported_reasoning_efforts(provider: &str, model: &str) -> &'static [ReasoningEffort] {
+    match (provider, model) {
+        (
+            CHATGPT_PROVIDER_ID | OPENAI_PROVIDER_ID,
+            "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra",
+        ) => MAX_REASONING_EFFORTS,
+        _ => STANDARD_REASONING_EFFORTS,
+    }
+}
+
+pub fn model_supports_reasoning_effort(
+    provider: &str,
+    model: &str,
+    effort: ReasoningEffort,
+) -> bool {
+    supported_reasoning_efforts(provider, model).contains(&effort)
+}
+
 pub fn parse_model_spec(input: &str) -> Result<ModelSpec, CatalogError> {
     if input.trim().is_empty() {
         return Err(CatalogError::EmptyModel);
@@ -2636,6 +2671,27 @@ mod tests {
 
     #[path = "catalog_extra_tests.rs"]
     mod catalog_extra_tests;
+
+    #[test]
+    fn gpt_5_6_reasoning_efforts_match_route_capabilities() {
+        assert!(model_supports_reasoning_effort(
+            CHATGPT_PROVIDER_ID,
+            "gpt-5.6-luna",
+            ReasoningEffort::Max
+        ));
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra"] {
+            assert!(model_supports_reasoning_effort(
+                CHATGPT_PROVIDER_ID,
+                model,
+                ReasoningEffort::Max
+            ));
+        }
+        assert!(!model_supports_reasoning_effort(
+            CHATGPT_PROVIDER_ID,
+            "gpt-5.5",
+            ReasoningEffort::Max
+        ));
+    }
 
     #[test]
     fn built_in_catalog_pins_current_defaults_and_auth_file_support() {

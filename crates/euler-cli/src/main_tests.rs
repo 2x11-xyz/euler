@@ -2339,13 +2339,13 @@ fn extensions_flag_is_rejected_where_no_session_exists() {
 
 #[test]
 fn exec_reasoning_effort_parses_and_reaches_run_args() {
-    let mut args = ["exec", "--reasoning-effort", "xlarge", "hello"]
+    let mut args = ["exec", "--reasoning-effort", "max", "hello"]
         .iter()
         .map(|s| (*s).to_owned());
     let parsed = Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse");
     match parsed.command {
         Command::Exec(exec) => {
-            assert_eq!(exec.run.reasoning_effort, Some(ReasoningEffort::XLarge));
+            assert_eq!(exec.run.reasoning_effort, Some(ReasoningEffort::Max));
         }
         _ => panic!("expected exec command"),
     }
@@ -2447,7 +2447,7 @@ fn reasoning_effort_rejected_outside_exec_and_bad_values() {
         ),
         (
             &["exec", "--reasoning-effort", "ultra", "hi"][..],
-            "--reasoning-effort must be one of xsmall|small|medium|large|xlarge",
+            "--reasoning-effort must be one of xsmall|small|medium|large|xlarge|max",
         ),
         (
             &[

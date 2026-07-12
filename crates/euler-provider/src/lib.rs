@@ -106,15 +106,17 @@ pub enum ReasoningEffort {
     Medium,
     Large,
     XLarge,
+    Max,
 }
 
 impl ReasoningEffort {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::XSmall,
         Self::Small,
         Self::Medium,
         Self::Large,
         Self::XLarge,
+        Self::Max,
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -124,6 +126,7 @@ impl ReasoningEffort {
             "medium" => Some(Self::Medium),
             "large" => Some(Self::Large),
             "xlarge" => Some(Self::XLarge),
+            "max" => Some(Self::Max),
             _ => None,
         }
     }
@@ -135,6 +138,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::Large => "large",
             Self::XLarge => "xlarge",
+            Self::Max => "max",
         }
     }
 
@@ -145,6 +149,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::Large => "high",
             Self::XLarge => "xhigh",
+            Self::Max => "max",
         }
     }
 }

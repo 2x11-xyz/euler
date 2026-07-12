@@ -101,7 +101,7 @@ euler exec --provider openrouter --model anthropic/claude-sonnet-5 \
   "Read BRIEF.md in this directory and carry it out fully."
 ```
 
-Useful exec flags: `--reasoning-effort xsmall..xlarge`,
+Useful exec flags: `--reasoning-effort xsmall|small|medium|large|xlarge|max`,
 `--auto-compaction off|stubs`, `--extensions <list|none>`,
 `--auto-approve read-only|trusted-local`, `--provenance <path>`.
 
