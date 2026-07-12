@@ -116,7 +116,8 @@ fn transcript_state_streams_live_thinking_line_until_text_arrives() {
     assert_eq!(
         state.live_mutable_items(),
         vec![TranscriptItem::ModelReasoningLive {
-            elapsed: "0s".to_owned()
+            elapsed: "0s".to_owned(),
+            content: "hmm".to_owned(),
         }]
     );
 
@@ -126,11 +127,13 @@ fn transcript_state_streams_live_thinking_line_until_text_arrives() {
         "2026-07-05T00:00:07.000Z",
     ));
 
-    // Elapsed advances with the delta timestamps, not the local clock.
+    // Elapsed advances with the delta timestamps, not the local clock, and
+    // the streamed reasoning body accumulates on the live item.
     assert_eq!(
         state.live_mutable_items(),
         vec![TranscriptItem::ModelReasoningLive {
-            elapsed: "7s".to_owned()
+            elapsed: "7s".to_owned(),
+            content: "hmmdeeper".to_owned(),
         }]
     );
 
@@ -161,7 +164,8 @@ fn transcript_state_late_reasoning_delta_does_not_hide_streamed_text() {
     assert_eq!(
         state.live_mutable_items(),
         vec![TranscriptItem::ModelReasoningLive {
-            elapsed: "0s".to_owned()
+            elapsed: "0s".to_owned(),
+            content: "hmm".to_owned(),
         }]
     );
 
@@ -228,6 +232,50 @@ fn transcript_state_clears_live_thinking_on_finalized_reasoning_and_results() {
         .live_items()
         .iter()
         .all(|item| !matches!(item, TranscriptItem::ModelReasoningLive { .. })));
+}
+
+#[test]
+fn transcript_state_finalize_replaces_live_body_and_clears_it_for_the_next_round() {
+    // The transient streamed body hands off to the committed collapsed
+    // thought; a later thinking round must start with an empty body, not
+    // the previous round's stale text.
+    let mut state = TranscriptState::default();
+    state.push_event(event_at(
+        EventKind::MODEL_DELTA,
+        object([
+            ("kind", "reasoning".into()),
+            ("delta", "first round".into()),
+        ]),
+        "2026-07-05T00:00:00.000Z",
+    ));
+    state.push_event(event(
+        EventKind::MODEL_REASONING,
+        object([
+            ("fidelity", "raw".into()),
+            ("content", "first round".into()),
+        ]),
+    ));
+
+    // The live body is gone; only the committed thought remains.
+    assert!(state.live_mutable_items().is_empty());
+    assert!(state.items().iter().any(|item| matches!(
+        item,
+        TranscriptItem::ModelReasoning { content, .. } if content == "first round"
+    )));
+
+    // A new thinking round starts from scratch — no stale body carryover.
+    state.push_event(event_at(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "second".into())]),
+        "2026-07-05T00:00:10.000Z",
+    ));
+    assert_eq!(
+        state.live_mutable_items(),
+        vec![TranscriptItem::ModelReasoningLive {
+            elapsed: "0s".to_owned(),
+            content: "second".to_owned(),
+        }]
+    );
 }
 
 #[test]

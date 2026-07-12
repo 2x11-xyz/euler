@@ -3314,10 +3314,13 @@ fn reasoning_stream_tail_renders_under_the_thinking_line() {
         .join("\n");
     assert!(text.contains("let me check the call site first"), "{text}");
 
+    // The HUD tail is the single-span indented continuation line; the live
+    // transcript card renders the same text separately behind the hairline
+    // gutter, so select the tail by shape, not by first match.
     let reasoning_line = frame
         .active_frame_lines
         .iter()
-        .find(|line| line.plain_text().contains("let me check"))
+        .find(|line| line.plain_text().contains("let me check") && line.spans.len() == 1)
         .expect("reasoning continuation line present");
     assert_eq!(
         reasoning_line.spans[0].style,

@@ -46,9 +46,13 @@ pub enum TranscriptItem {
         content: String,
     },
     /// Transient while the model reasons: elapsed streamed-reasoning time,
-    /// derived from delta event timestamps (never local wall clock).
+    /// derived from delta event timestamps (never local wall clock), plus
+    /// the reasoning text streamed so far. The body lives only in the
+    /// inline viewport (`live_mutable_items`) — it must never commit to
+    /// native scrollback; only the finalized `ModelReasoning` gist does.
     ModelReasoningLive {
         elapsed: String,
+        content: String,
     },
     ToolCall {
         name: String,
@@ -338,6 +342,10 @@ pub struct TranscriptState {
     live_tail: String,
     stream: MarkdownStreamCollector,
     reasoning_live: Option<(DateTime<Local>, DateTime<Local>)>,
+    /// Reasoning text streamed so far this round; rides the transient
+    /// `ModelReasoningLive` item and is cleared wherever `reasoning_live`
+    /// resets so a stale body can never outlive its thinking line.
+    reasoning_body: String,
     scroll_offset: usize,
     auto_follow: bool,
 }
@@ -349,6 +357,7 @@ impl Default for TranscriptState {
             live_tail: String::new(),
             stream: MarkdownStreamCollector::default(),
             reasoning_live: None,
+            reasoning_body: String::new(),
             scroll_offset: 0,
             auto_follow: true,
         }
@@ -368,6 +377,7 @@ impl TranscriptState {
             // The finalized thought item replaces the live thinking line.
             EventKind::MODEL_REASONING => {
                 self.reasoning_live = None;
+                self.reasoning_body.clear();
             }
             _ => {}
         }
@@ -470,10 +480,12 @@ impl TranscriptState {
         self.live_tail.clear();
         self.stream.clear();
         self.reasoning_live = None;
+        self.reasoning_body.clear();
     }
 
     fn preserve_tool_call_live_tail(&mut self, event: &EventEnvelope) {
         self.reasoning_live = None;
+        self.reasoning_body.clear();
         if let Some(content) =
             payload_string(event, "content").filter(|content| !content.is_empty())
         {
@@ -501,10 +513,20 @@ impl TranscriptState {
                     let start = self.reasoning_live.map_or(time, |(start, _)| start);
                     self.reasoning_live = Some((start, time));
                 }
+                // The reasoning text streams live behind the hairline rail;
+                // it stays viewport-only until the finalized gist replaces it.
+                if let Some(delta) = event
+                    .payload
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.reasoning_body.push_str(delta);
+                }
             }
             Some("text") => {
                 // First answer text ends the thinking phase.
                 self.reasoning_live = None;
+                self.reasoning_body.clear();
                 if let Some(delta) = event
                     .payload
                     .get("delta")
@@ -535,6 +557,7 @@ impl TranscriptState {
         let (start, last) = self.reasoning_live?;
         Some(TranscriptItem::ModelReasoningLive {
             elapsed: format_elapsed(start, last),
+            content: self.reasoning_body.clone(),
         })
     }
 }
