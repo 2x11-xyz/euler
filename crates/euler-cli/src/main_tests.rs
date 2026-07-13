@@ -1863,8 +1863,8 @@ fn chatgpt_56_catalog_limit_uses_effective_window_and_provider_compaction_thresh
     apply_catalog_context_limit(&mut config, &MergedModelCatalog::built_in());
 
     let limit = config.context_limit.expect("catalog context limit");
-    assert_eq!(limit.limit_tokens(), 258_400);
-    assert_eq!(limit.auto_compact_token_limit(), Some(244_800));
+    assert_eq!(limit.limit_tokens(), 353_400);
+    assert_eq!(limit.auto_compact_token_limit(), Some(334_800));
 }
 
 #[test]

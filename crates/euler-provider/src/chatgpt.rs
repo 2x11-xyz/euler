@@ -10,6 +10,7 @@ pub use crate::chatgpt_device::{
 };
 
 use crate::auth::{AuthFile, ChatGptCredentials};
+use crate::chatgpt_websocket::{self, ConnectError};
 use crate::sse::SseParser;
 use crate::{
     ModelInputItem, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ProviderStream,
@@ -107,6 +108,16 @@ impl ModelProvider for ChatGptProvider {
         }
         let credentials = self.auth.load()?;
         let body = request_body(&request);
+        if request_uses_websocket(&request.model) {
+            return chatgpt_websocket::connect(
+                &self.endpoint,
+                body,
+                credentials.access_token.expose(),
+                credentials.account_id.expose(),
+                credentials.redaction_values.clone(),
+            )
+            .map_err(|error| websocket_provider_error(error, &credentials));
+        }
         let agent = ureq::builder().redirects(0).build();
         let response = agent
             .post(&self.endpoint)
@@ -144,12 +155,38 @@ impl ModelProvider for ChatGptProvider {
             Err(error) => {
                 return Err(ProviderError::transport(format!(
                     "ChatGPT provider request failed: {}",
-                    scrub_error_message(error.to_string(), &credentials)
+                    scrub_error_message(error.to_string(), &credentials.redaction_values)
                 )));
             }
         };
 
         Ok(Box::new(ChatGptStream::new(response.into_reader())))
+    }
+}
+
+fn request_uses_websocket(model: &str) -> bool {
+    model == "gpt-5.6-luna"
+}
+
+fn websocket_provider_error(
+    error: ConnectError,
+    credentials: &ChatGptRequestCredentials,
+) -> ProviderError {
+    match error {
+        ConnectError::HttpStatus(401) => unauthorized_error(),
+        ConnectError::HttpStatus(429) => {
+            ProviderError::rate_limit("ChatGPT provider rate limit was reached")
+        }
+        ConnectError::HttpStatus(status @ 400..=499) => ProviderError::rejected(format!(
+            "ChatGPT provider WebSocket rejected the request with HTTP {status}"
+        )),
+        ConnectError::HttpStatus(status) => {
+            ProviderError::transport(format!("ChatGPT provider WebSocket returned HTTP {status}"))
+        }
+        ConnectError::Transport(message) => ProviderError::transport(format!(
+            "ChatGPT WebSocket request failed: {}",
+            scrub_error_message(message, &credentials.redaction_values)
+        )),
     }
 }
 
@@ -295,9 +332,11 @@ fn chatgpt_relogin_error(problem: &str) -> ProviderError {
     ))
 }
 
-fn scrub_error_message(message: String, credentials: &ChatGptRequestCredentials) -> String {
-    credentials
-        .redaction_values
+pub(crate) fn scrub_error_message(
+    message: String,
+    redaction_values: &[crate::auth::SecretString],
+) -> String {
+    redaction_values
         .iter()
         .map(crate::auth::SecretString::expose)
         .filter(|secret| !secret.is_empty())

@@ -19,7 +19,7 @@ fn unauthorized_error_does_not_contain_token_substring() {
         ChatGptRequestCredentials::from_legacy(credentials).expect("request credentials");
     let scrubbed = scrub_error_message(
         format!("request failed with token {token}"),
-        &request_credentials,
+        &request_credentials.redaction_values,
     );
 
     assert!(!error.contains(token));
@@ -53,6 +53,14 @@ fn request_uses_responses_shape() {
     assert_eq!(body["tool_choice"], "auto");
     assert_eq!(body["stream"], true);
     assert_eq!(body["store"], false);
+}
+
+#[test]
+fn websocket_transport_is_reserved_for_luna() {
+    assert!(request_uses_websocket("gpt-5.6-luna"));
+    assert!(!request_uses_websocket("gpt-5.6-sol"));
+    assert!(!request_uses_websocket("gpt-5.6-terra"));
+    assert!(!request_uses_websocket("gpt-5.5"));
 }
 
 #[test]
@@ -208,10 +216,31 @@ fn stored_euler_auth_scrubs_request_error_messages() {
 
     let scrubbed = scrub_error_message(
         "transport failed with stored-access-secret for acct-secret".to_owned(),
-        &credentials,
+        &credentials.redaction_values,
     );
 
     assert_eq!(scrubbed, "transport failed with [redacted] for [redacted]");
+}
+
+#[test]
+fn websocket_transport_errors_scrub_request_credentials() {
+    let credentials = ChatGptRequestCredentials::from_stored(ChatGptStoredCredential {
+        access_token: crate::auth::SecretString::new("stored-access-secret"),
+        account_id: "acct-secret".to_owned(),
+    })
+    .expect("credentials");
+
+    let error = websocket_provider_error(
+        ConnectError::Transport(
+            "socket failed for stored-access-secret and acct-secret".to_owned(),
+        ),
+        &credentials,
+    );
+
+    let message = error.to_string();
+    assert!(message.contains("[redacted]"));
+    assert!(!message.contains("stored-access-secret"));
+    assert!(!message.contains("acct-secret"));
 }
 
 #[test]

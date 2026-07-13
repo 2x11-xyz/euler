@@ -32,9 +32,9 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
         ("gpt-5.4", 272_000),
         ("gpt-5.4-mini", 272_000),
         ("gpt-5.5", 272_000),
-        ("gpt-5.6-luna", 272_000),
-        ("gpt-5.6-sol", 272_000),
-        ("gpt-5.6-terra", 272_000),
+        ("gpt-5.6-luna", 372_000),
+        ("gpt-5.6-sol", 372_000),
+        ("gpt-5.6-terra", 372_000),
     ] {
         let model = chatgpt
             .models()
@@ -56,7 +56,7 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
             .models()
             .find(|model| model.id() == model_id)
             .expect("OpenAI GPT-5.6 model");
-        assert_eq!(chatgpt_model.context_window_tokens(), Some(272_000));
+        assert_eq!(chatgpt_model.context_window_tokens(), Some(372_000));
         assert_eq!(openai_model.context_window_tokens(), Some(272_000));
         assert_eq!(
             openai_model.effective_context_window_tokens(),
@@ -116,9 +116,9 @@ fn generated_refresh_catalog_cannot_override_chatgpt_route_metadata() {
         .expect("ChatGPT Sol");
     assert_eq!(chatgpt.default_model(), DEFAULT_CHATGPT_MODEL);
     assert_eq!(sol.source(), ModelDescriptorSource::BuiltIn);
-    assert_eq!(sol.context_window_tokens(), Some(272_000));
-    assert_eq!(sol.effective_context_window_tokens(), Some(258_400));
-    assert_eq!(sol.auto_compact_token_limit(), Some(244_800));
+    assert_eq!(sol.context_window_tokens(), Some(372_000));
+    assert_eq!(sol.effective_context_window_tokens(), Some(353_400));
+    assert_eq!(sol.auto_compact_token_limit(), Some(334_800));
 
     let openai_sol = catalog
         .provider("openai")

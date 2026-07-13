@@ -36,6 +36,7 @@ fs4 = "1"
 libc = "0.2"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 url = "2"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
 
 [workspace.lints.rust]
 warnings = "deny"
