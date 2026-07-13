@@ -1851,6 +1851,23 @@ fn observer_wiring_uses_bundled_command_pair() {
 }
 
 #[test]
+fn chatgpt_56_catalog_limit_uses_effective_window_and_provider_compaction_threshold() {
+    let root = tempfile::tempdir().expect("root");
+    let mut config = session_config(
+        root.path().to_path_buf(),
+        "chatgpt".to_owned(),
+        "gpt-5.6-luna".to_owned(),
+        "session-id".to_owned(),
+    );
+
+    apply_catalog_context_limit(&mut config, &MergedModelCatalog::built_in());
+
+    let limit = config.context_limit.expect("catalog context limit");
+    assert_eq!(limit.limit_tokens(), 258_400);
+    assert_eq!(limit.auto_compact_token_limit(), Some(244_800));
+}
+
+#[test]
 fn echo_provider_alias_uses_fixture_provider_id() {
     let args = parse_without_env(["--provider", "echo"]);
 

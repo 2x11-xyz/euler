@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use euler_provider::catalog::{
-    DEFAULT_ANTHROPIC_MODEL, DEFAULT_CHATGPT_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENROUTER_MODEL,
-    DEFAULT_XAI_MODEL,
+    DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENROUTER_MODEL, DEFAULT_XAI_MODEL,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -80,12 +79,6 @@ pub(crate) fn translate_modelsdev_json(contents: &str) -> Result<(Value, Vec<Str
         &mut providers,
         &mut warnings,
     );
-    if let Some(openai) = providers.remove("openai") {
-        let mut chatgpt = openai.clone();
-        chatgpt["default_model"] = Value::String(DEFAULT_CHATGPT_MODEL.to_owned());
-        providers.insert("chatgpt".to_owned(), chatgpt);
-        providers.insert("openai".to_owned(), openai);
-    }
     insert_provider(
         root,
         "openrouter",

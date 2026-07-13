@@ -271,9 +271,13 @@ impl AppCore {
                 descriptor
                     .models()
                     .find(|entry| entry.id() == model)
-                    .and_then(|entry| entry.context_window_tokens())
-            })
-            .and_then(euler_core::ContextLimitConfig::from_catalog_window);
+                    .and_then(|entry| {
+                        euler_core::ContextLimitConfig::from_catalog_model(
+                            entry.effective_context_window_tokens()?,
+                            entry.auto_compact_token_limit(),
+                        )
+                    })
+            });
         let previous_effort = session.reasoning_effort();
         let result = session.switch_model(&provider, &model, "user", context_limit);
         let current_effort = session.reasoning_effort();
