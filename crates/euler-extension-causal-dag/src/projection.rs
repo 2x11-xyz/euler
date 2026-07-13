@@ -1,4 +1,6 @@
 use super::{input_error, EMPTY_GENERATED_AT, EXTENSION_ID, MEDIA_TYPE_JSON, SCHEMA_NAME};
+use crate::active_state::ActiveGraphState;
+use crate::construction::{Construction, ConstructionOperation};
 use euler_event::EventEnvelope;
 use euler_sdk::{ExtensionError, ProvenancePage};
 use serde_json::{json, Map, Value};
@@ -23,6 +25,7 @@ pub(super) struct Projection {
     event_range_end: Value,
     event_range_complete: bool,
     watermark_event_id: Value,
+    construction: Construction,
     roots: Vec<Value>,
     active_root: Value,
     nodes: Vec<Value>,
@@ -85,17 +88,25 @@ impl Projection {
         Ok(Self::chronology(events, session_id, event_range_complete))
     }
 
-    pub(super) fn from_observer_hints(
+    pub(super) fn from_observer_revision(
         events: &[EventEnvelope],
         hints: &Value,
         input_session_id: Option<&str>,
+        active: Option<&ActiveGraphState>,
+        construction: Construction,
     ) -> Result<Self, ExtensionError> {
-        if events.is_empty() {
-            return Err(input_error(
-                "causal-dag observe requires a non-empty bounded event page",
-            ));
-        }
-        let session_id = events[0].session.clone();
+        let session_id = events
+            .first()
+            .map(|event| event.session.clone())
+            .or_else(|| {
+                active
+                    .and_then(|active| active.artifact().pointer("/session/id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                input_error("causal-dag observer revision requires events or an active graph")
+            })?;
         if let Some(input_session_id) = input_session_id {
             if input_session_id != session_id {
                 return Err(input_error("session_id does not match bounded event page"));
@@ -103,11 +114,29 @@ impl Projection {
         }
         if events.iter().any(|event| event.session != session_id) {
             return Err(input_error(
-                "causal-dag observe requires events from one session",
+                "causal-dag observer revision requires events from one session",
             ));
         }
-        let graph = SemanticGraph::from_hint_value(events, hints)?;
-        Ok(Self::semantic_graph(events, session_id, true, graph))
+        if let Some(active_session) = active
+            .and_then(|active| active.artifact().pointer("/session/id"))
+            .and_then(Value::as_str)
+        {
+            if active_session != session_id {
+                return Err(input_error(
+                    "active causal-dag graph belongs to a different session",
+                ));
+            }
+        }
+        let fold_prior = construction.operation() == ConstructionOperation::Incremental;
+        let graph = SemanticGraph::from_hint_value(events, hints, active, fold_prior)?;
+        Ok(Self::semantic_graph(
+            events,
+            session_id,
+            true,
+            graph,
+            construction,
+            active,
+        ))
     }
 
     pub(super) fn validate_observer_hint_header(hints: &Value) -> Result<(), ExtensionError> {
@@ -131,6 +160,8 @@ impl Projection {
             session_id,
             event_range_complete,
             graph,
+            Construction::snapshot(),
+            None,
         ))
     }
 
@@ -139,18 +170,53 @@ impl Projection {
         session_id: String,
         event_range_complete: bool,
         graph: SemanticGraph,
+        construction: Construction,
+        active: Option<&ActiveGraphState>,
     ) -> Self {
-        let watermark = events.last().expect("non-empty events");
         let node_count = graph.nodes.len();
         let edge_count = graph.edges.len();
+        let event_range_start = active
+            .and_then(|active| active.artifact().pointer("/session/event_range/start"))
+            .cloned()
+            .or_else(|| events.first().map(|event| json!(event.id)))
+            .unwrap_or(Value::Null);
+        let generated_at = events
+            .last()
+            .map(|event| event.ts.clone())
+            .or_else(|| {
+                active
+                    .and_then(|active| active.artifact().get("generated_at"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| EMPTY_GENERATED_AT.to_owned());
+        let event_range_end = events
+            .last()
+            .map(|event| json!(event.id))
+            .or_else(|| {
+                active
+                    .and_then(|active| active.artifact().pointer("/session/event_range/end"))
+                    .cloned()
+            })
+            .unwrap_or(Value::Null);
+        let watermark_event_id = events
+            .last()
+            .map(|event| json!(event.id))
+            .or_else(|| {
+                active
+                    .and_then(|active| active.artifact().pointer("/projection/watermark_event_id"))
+                    .cloned()
+            })
+            .unwrap_or(Value::Null);
 
         Self {
             session_id,
-            generated_at: watermark.ts.clone(),
-            event_range_start: json!(events[0].id),
-            event_range_end: json!(watermark.id),
+            generated_at,
+            event_range_start,
+            event_range_end,
             event_range_complete,
-            watermark_event_id: json!(watermark.id),
+            watermark_event_id,
+            construction,
             roots: graph.roots.iter().map(|root| json!(root)).collect(),
             active_root: graph.roots.first().map_or(Value::Null, |root| json!(root)),
             node_count,
@@ -194,6 +260,7 @@ impl Projection {
             event_range_end: json!(watermark.id),
             event_range_complete,
             watermark_event_id: json!(watermark.id),
+            construction: Construction::snapshot(),
             roots: vec![json!(root_id)],
             active_root: json!(root_id),
             node_count,
@@ -236,6 +303,7 @@ impl Projection {
             event_range_end: json!(watermark.id),
             event_range_complete,
             watermark_event_id: json!(watermark.id),
+            construction: Construction::snapshot(),
             roots: vec![json!(root_id.clone())],
             active_root: json!(root_id),
             node_count: nodes.len(),
@@ -281,6 +349,10 @@ impl Projection {
         self.watermark_event_id.clone()
     }
 
+    pub(super) fn construction_value(&self) -> Value {
+        self.construction.to_value()
+    }
+
     pub(super) fn cited_event_ids(&self) -> BTreeSet<String> {
         self.nodes
             .iter()
@@ -290,7 +362,7 @@ impl Projection {
     }
 
     pub(super) fn artifact_bytes(&self) -> Result<Vec<u8>, ExtensionError> {
-        let mut bytes = serde_json::to_vec(&self.artifact())
+        let mut bytes = serde_json::to_vec(&self.artifact_value())
             .map_err(|error| ExtensionError::Message(error.to_string()))?;
         bytes.push(b'\n');
         Ok(bytes)
@@ -311,6 +383,7 @@ impl Projection {
                 optional_json_string(&page.next_after_event_id),
             ),
             json_pair("watermark_event_id", self.watermark_event_id.clone()),
+            json_pair("construction", self.construction.to_value()),
             json_pair(
                 "query_watermark_event_id",
                 optional_json_string(&page.watermark_event_id),
@@ -329,6 +402,7 @@ impl Projection {
             event_range_end: Value::Null,
             event_range_complete: true,
             watermark_event_id: Value::Null,
+            construction: Construction::snapshot(),
             roots: Vec::new(),
             active_root: Value::Null,
             nodes: Vec::new(),
@@ -349,7 +423,7 @@ impl Projection {
         })
     }
 
-    fn artifact(&self) -> Value {
+    pub(super) fn artifact_value(&self) -> Value {
         json!({
             "schema": SCHEMA_NAME,
             "media_type": MEDIA_TYPE_JSON,
@@ -368,6 +442,7 @@ impl Projection {
                 "basis": "bounded_provenance_query",
                 "degraded": self.degraded
             },
+            "construction": self.construction.to_value(),
             "forest": {
                 "roots": self.roots,
                 "active_root": self.active_root,

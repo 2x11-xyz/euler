@@ -1,3 +1,4 @@
+use crate::active_state::ActiveGraphState;
 use crate::input_error;
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::ExtensionError;
@@ -5,6 +6,11 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::ProjectionDiagnostics;
+use revision::{
+    merge_record_sources, prior_graph, require_current_evidence, PriorGraph, PriorSourceIndex,
+};
+
+mod revision;
 
 const HINTS_KEY: &str = "causal_dag";
 const HINTS_SCHEMA: &str = "euler.causal_dag.hints.v1";
@@ -45,58 +51,118 @@ pub(super) struct SemanticGraph {
     pub(super) diagnostics: ProjectionDiagnostics,
 }
 
+struct HintCollector<'a> {
+    events: &'a [EventEnvelope],
+    event_indices: BTreeMap<String, usize>,
+    prior_sources: PriorSourceIndex,
+    allow_prior_replacement: bool,
+    seen_node_ids: BTreeSet<String>,
+    seen_edge_ids: BTreeSet<String>,
+    nodes: BTreeMap<String, Value>,
+    edges: BTreeMap<String, Value>,
+}
+
+impl<'a> HintCollector<'a> {
+    fn new(
+        events: &'a [EventEnvelope],
+        mut prior: PriorGraph,
+        allow_prior_replacement: bool,
+    ) -> Result<Self, ExtensionError> {
+        if !allow_prior_replacement {
+            prior.nodes.clear();
+            prior.edges.clear();
+        }
+        Ok(Self {
+            events,
+            event_indices: event_indices(events)?,
+            prior_sources: prior.sources,
+            allow_prior_replacement,
+            seen_node_ids: BTreeSet::new(),
+            seen_edge_ids: BTreeSet::new(),
+            nodes: prior.nodes,
+            edges: prior.edges,
+        })
+    }
+
+    fn collect(&mut self, hints: &Value) -> Result<(), ExtensionError> {
+        let object = object_value(hints, "causal-dag hint")?;
+        validate_hint_schema(object)?;
+        for node_hint in optional_array(object, "nodes", "causal-dag hint")? {
+            let mut node = hinted_node(
+                node_hint,
+                self.events,
+                &self.event_indices,
+                &self.prior_sources,
+            )?;
+            let id = required_json_str(&node, "id", "causal-dag node")?.to_owned();
+            if self.allow_prior_replacement {
+                require_current_evidence(&node, &self.event_indices, "node", &id)?;
+            }
+            if !self.seen_node_ids.insert(id.clone()) {
+                return Err(input_error(format!("duplicate causal-dag node id `{id}`")));
+            }
+            if let Some(previous) = self.nodes.get(&id) {
+                if !self.allow_prior_replacement {
+                    return Err(input_error(format!("duplicate causal-dag node id `{id}`")));
+                }
+                merge_record_sources(previous, &mut node)?;
+            }
+            self.nodes.insert(id, node);
+        }
+        for edge_hint in optional_array(object, "edges", "causal-dag hint")? {
+            let mut edge = hinted_edge(
+                edge_hint,
+                self.events,
+                &self.event_indices,
+                &self.prior_sources,
+            )?;
+            let id = required_json_str(&edge, "id", "causal-dag edge")?.to_owned();
+            if self.allow_prior_replacement {
+                require_current_evidence(&edge, &self.event_indices, "edge", &id)?;
+            }
+            if !self.seen_edge_ids.insert(id.clone()) {
+                return Err(input_error(format!("duplicate causal-dag edge id `{id}`")));
+            }
+            if let Some(previous) = self.edges.get(&id) {
+                if !self.allow_prior_replacement {
+                    return Err(input_error(format!("duplicate causal-dag edge id `{id}`")));
+                }
+                merge_record_sources(previous, &mut edge)?;
+            }
+            self.edges.insert(id, edge);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<SemanticGraph, ExtensionError> {
+        finish_graph(self.nodes, self.edges)
+    }
+}
+
 impl SemanticGraph {
     pub(super) fn from_events(events: &[EventEnvelope]) -> Result<Self, ExtensionError> {
-        let event_indices = event_indices(events)?;
-        let mut nodes = BTreeMap::new();
-        let mut edges = BTreeMap::new();
+        let mut collector = HintCollector::new(events, PriorGraph::default(), false)?;
 
         for event in events {
             let Some(hints) = event.payload.get(HINTS_KEY) else {
                 continue;
             };
-            collect_hints(hints, events, &event_indices, &mut nodes, &mut edges)?;
+            collector.collect(hints)?;
         }
 
-        finish_graph(nodes, edges)
+        collector.finish()
     }
 
     pub(super) fn from_hint_value(
         events: &[EventEnvelope],
         hints: &Value,
+        active: Option<&ActiveGraphState>,
+        fold_prior: bool,
     ) -> Result<Self, ExtensionError> {
-        let event_indices = event_indices(events)?;
-        let mut nodes = BTreeMap::new();
-        let mut edges = BTreeMap::new();
-        collect_hints(hints, events, &event_indices, &mut nodes, &mut edges)?;
-        finish_graph(nodes, edges)
+        let mut collector = HintCollector::new(events, prior_graph(active)?, fold_prior)?;
+        collector.collect(hints)?;
+        collector.finish()
     }
-}
-
-fn collect_hints(
-    hints: &Value,
-    events: &[EventEnvelope],
-    event_indices: &BTreeMap<String, usize>,
-    nodes: &mut BTreeMap<String, Value>,
-    edges: &mut BTreeMap<String, Value>,
-) -> Result<(), ExtensionError> {
-    let object = object_value(hints, "causal-dag hint")?;
-    validate_hint_schema(object)?;
-    for node_hint in optional_array(object, "nodes", "causal-dag hint")? {
-        let node = hinted_node(node_hint, events, event_indices)?;
-        let id = required_json_str(&node, "id", "causal-dag node")?.to_owned();
-        if nodes.insert(id.clone(), node).is_some() {
-            return Err(input_error(format!("duplicate causal-dag node id `{id}`")));
-        }
-    }
-    for edge_hint in optional_array(object, "edges", "causal-dag hint")? {
-        let edge = hinted_edge(edge_hint, events, event_indices)?;
-        let id = required_json_str(&edge, "id", "causal-dag edge")?.to_owned();
-        if edges.insert(id.clone(), edge).is_some() {
-            return Err(input_error(format!("duplicate causal-dag edge id `{id}`")));
-        }
-    }
-    Ok(())
 }
 
 fn finish_graph(
@@ -164,6 +230,7 @@ fn hinted_node(
     value: &Value,
     events: &[EventEnvelope],
     event_indices: &BTreeMap<String, usize>,
+    prior_sources: &BTreeMap<(String, Option<String>), Value>,
 ) -> Result<Value, ExtensionError> {
     let object = object_value(value, "causal-dag node hint")?;
     reject_unknown_fields(object, NODE_FIELDS, "causal-dag node hint")?;
@@ -175,7 +242,7 @@ fn hinted_node(
     let summary = required_str(object, "summary", "causal-dag node hint")?;
     validate_node_kind(kind)?;
     validate_status(status)?;
-    let source_refs = hinted_source_refs(object, events, event_indices)?;
+    let source_refs = hinted_source_refs(object, events, event_indices, prior_sources)?;
     let source_ref_ids = source_ref_ids(&source_refs)?;
     let confidence = hinted_confidence(object)?;
     let basis = hinted_basis(object, &source_ref_ids)?;
@@ -199,6 +266,7 @@ fn hinted_edge(
     value: &Value,
     events: &[EventEnvelope],
     event_indices: &BTreeMap<String, usize>,
+    prior_sources: &BTreeMap<(String, Option<String>), Value>,
 ) -> Result<Value, ExtensionError> {
     let object = object_value(value, "causal-dag edge hint")?;
     reject_unknown_fields(object, EDGE_FIELDS, "causal-dag edge hint")?;
@@ -209,7 +277,7 @@ fn hinted_edge(
     let kind = required_str(object, "kind", "causal-dag edge hint")?;
     let canonical_backbone = required_bool(object, "canonical_backbone", "causal-dag edge hint")?;
     validate_edge_kind(class, kind, canonical_backbone)?;
-    let source_refs = hinted_source_refs(object, events, event_indices)?;
+    let source_refs = hinted_source_refs(object, events, event_indices, prior_sources)?;
     let source_ref_ids = source_ref_ids(&source_refs)?;
     let confidence = hinted_confidence(object)?;
     let basis = hinted_basis(object, &source_ref_ids)?;
@@ -233,6 +301,7 @@ fn hinted_source_refs(
     object: &Map<String, Value>,
     events: &[EventEnvelope],
     event_indices: &BTreeMap<String, usize>,
+    prior_sources: &BTreeMap<(String, Option<String>), Value>,
 ) -> Result<Vec<Value>, ExtensionError> {
     let hints = required_array(object, "source_refs", "causal-dag hint record")?;
     if hints.is_empty() {
@@ -240,7 +309,7 @@ fn hinted_source_refs(
     }
     hints
         .iter()
-        .map(|hint| source_ref_from_hint(hint, events, event_indices))
+        .map(|hint| source_ref_from_hint(hint, events, event_indices, prior_sources))
         .collect()
 }
 
@@ -248,18 +317,25 @@ fn source_ref_from_hint(
     value: &Value,
     events: &[EventEnvelope],
     event_indices: &BTreeMap<String, usize>,
+    prior_sources: &BTreeMap<(String, Option<String>), Value>,
 ) -> Result<Value, ExtensionError> {
     let object = object_value(value, "causal-dag source ref hint")?;
     reject_unknown_fields(object, SOURCE_REF_FIELDS, "causal-dag source ref hint")?;
     let id = required_str(object, "id", "causal-dag source ref hint")?;
     let event_id = required_str(object, "event_id", "causal-dag source ref hint")?;
+    let payload_pointer = optional_payload_pointer(object)?;
     let Some(event_index) = event_indices.get(event_id).copied() else {
-        return Err(input_error(format!(
-            "causal-dag source ref `{id}` references unknown event `{event_id}`"
-        )));
+        let key = (event_id.to_owned(), payload_pointer.clone());
+        let Some(previous) = prior_sources.get(&key) else {
+            return Err(input_error(format!(
+                "causal-dag source ref `{id}` references unknown event `{event_id}`"
+            )));
+        };
+        let mut reused = previous.clone();
+        reused["id"] = json!(id);
+        return Ok(reused);
     };
     let event = &events[event_index];
-    let payload_pointer = optional_payload_pointer(object)?;
     if let Some(pointer) = payload_pointer.as_deref() {
         validate_payload_pointer(event, pointer, id)?;
     }

@@ -10,7 +10,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-const OBSERVER_PERSONA: &str = "round-observer";
+const DEFAULT_OBSERVER_PERSONA: &str = "round-observer";
 
 /// Cadence and command pair for the round-boundary observer. Core stays
 /// generic over any (brief, apply) command pair on the wired extension;
@@ -99,9 +99,24 @@ fn observer_task(brief: &Value) -> Result<(AgentTask, Value), &'static str> {
         .ok_or("envelope")?;
     let provider = brief.get("provider").and_then(Value::as_str).unwrap_or("");
     let model = brief.get("model").and_then(Value::as_str).unwrap_or("");
+    // The observer spawns under the persona the brief declares (falling back
+    // to the generic default). The extension's self-event exclusion and
+    // incomplete-span fence key off this persona — hardcoding a different
+    // one silently defeats them, feeding the previous observer's own hints
+    // back into the next observation window as evidence (review #105 F1).
+    // The observer spawns under the persona the brief declares (falling back
+    // to the generic default). The extension's self-event exclusion and
+    // incomplete-span fence key off this persona — hardcoding a different
+    // one silently defeats them, feeding the previous observer's own hints
+    // back into the next observation window as evidence (review #105 F1).
+    let persona = brief
+        .get("persona")
+        .and_then(Value::as_str)
+        .filter(|persona| !persona.is_empty())
+        .unwrap_or(DEFAULT_OBSERVER_PERSONA);
     let mut task = match (provider.is_empty(), model.is_empty()) {
-        (true, true) => AgentTask::new_inheriting_target(text, OBSERVER_PERSONA),
-        (false, false) => AgentTask::new(text, OBSERVER_PERSONA, provider, model),
+        (true, true) => AgentTask::new_inheriting_target(text, persona),
+        (false, false) => AgentTask::new(text, persona, provider, model),
         _ => return Err("envelope"),
     }
     .map_err(|_| "envelope")?;

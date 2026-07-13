@@ -18,7 +18,10 @@
 //! publishes the `graph` context slot. The companion never writes: every
 //! write happens here, under the extension's manifest grant.
 
-use super::{execute_observe_projection, input_error, ObserveInput, OBSERVER_HINT_MAX_BYTES};
+use super::{
+    execute_observe_projection, input_error, ObservationCommit, ObserveInput,
+    OBSERVER_HINT_MAX_BYTES,
+};
 use crate::projection::Projection;
 use euler_sdk::{
     Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError, HostApi,
@@ -43,6 +46,8 @@ impl ExtensionCommand for CausalDagObserverApplyCommand {
             required_capabilities: vec![
                 Capability::ProvenanceRead,
                 Capability::ArtifactWrite,
+                Capability::FsRead,
+                Capability::FsWrite,
                 Capability::ContextSlot,
             ],
             // Core-invoked envelope command: input is the round-observer
@@ -58,7 +63,20 @@ impl ExtensionCommand for CausalDagObserverApplyCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let input = ObserverApplyInput::parse(&context.input)?;
-        let output = execute_observe_projection(host, &input.observe, OBSERVER_APPLY_COMMAND_NAME)?;
+        let observer_result_event_id =
+            input.companion.result_event_id.clone().ok_or_else(|| {
+                input_error("causal-dag observer-apply companion is missing `result_event_id`")
+            })?;
+        let output = execute_observe_projection(
+            host,
+            &input.observe,
+            OBSERVER_APPLY_COMMAND_NAME,
+            ObservationCommit::Rolling {
+                expected_predecessor_artifact_event_id: input
+                    .expected_predecessor_artifact_event_id,
+                observer_result_event_id,
+            },
+        )?;
         Ok(with_companion_attribution(output, &input.companion))
     }
 }
@@ -67,6 +85,7 @@ impl ExtensionCommand for CausalDagObserverApplyCommand {
 pub(super) struct ObserverApplyInput {
     observe: ObserveInput,
     companion: CompanionAttribution,
+    expected_predecessor_artifact_event_id: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -109,11 +128,15 @@ impl ObserverApplyInput {
             })?;
         let hints = companion_hints(companion)?;
 
+        let expected_predecessor_artifact_event_id =
+            optional_apply_string(apply, "expected_predecessor_artifact_event_id")?;
         let mut observe_value = apply.clone();
+        observe_value.remove("expected_predecessor_artifact_event_id");
         observe_value.insert("causal_dag".to_owned(), hints);
         Ok(Self {
             observe: ObserveInput::parse(&Value::Object(observe_value))?,
             companion: CompanionAttribution::from_payload(companion),
+            expected_predecessor_artifact_event_id,
         })
     }
 }
@@ -155,6 +178,10 @@ fn companion_hints(companion: &Map<String, Value>) -> Result<Value, ExtensionErr
         .ok_or_else(|| {
             input_error("causal-dag observer-apply companion produced no text output")
         })?;
+    parse_hints_output(output)
+}
+
+pub(super) fn parse_hints_output(output: &str) -> Result<Value, ExtensionError> {
     let text = strip_json_fence(output.trim());
     if text.len() > OBSERVER_HINT_MAX_BYTES {
         return Err(input_error(format!(
@@ -215,6 +242,21 @@ fn with_companion_attribution(mut output: Value, companion: &CompanionAttributio
 
 fn payload_string(object: &Map<String, Value>, key: &str) -> Option<String> {
     object.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn optional_apply_string(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, ExtensionError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 128 => {
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(input_error(format!(
+            "causal-dag observer-apply `{key}` must be a bounded non-empty string or null"
+        ))),
+    }
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
