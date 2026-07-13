@@ -47,6 +47,13 @@ impl EventKind {
     pub const CANVAS_SWAP: &'static str = "canvas.swap";
     pub const CANVAS_CANDIDATE_DISCARDED: &'static str = "canvas.candidate.discarded";
     pub const SECRET_REDACTED: &'static str = "secret.redacted";
+    /// A credential shape was detected in a faithful tool-call argument.
+    /// Read-only marker: the payload is NOT modified.
+    /// Carries shape labels + a pointer to the exposing event, never the value.
+    pub const SECRET_EXPOSURE_DETECTED: &'static str = "secret.exposure.detected";
+    /// A user-initiated scrub removed a value from every session-owned
+    /// persistent surface. Audit only: carries counts, never the value.
+    pub const SECRET_SCRUBBED: &'static str = "secret.scrubbed";
     pub const EXTENSION_ARTIFACT: &'static str = "extension.artifact";
     pub const AGENT_SPAWN: &'static str = "agent.spawn";
     pub const AGENT_MESSAGE: &'static str = "agent.message";
@@ -87,6 +94,8 @@ impl EventKind {
         Self::CANVAS_SWAP,
         Self::CANVAS_CANDIDATE_DISCARDED,
         Self::SECRET_REDACTED,
+        Self::SECRET_EXPOSURE_DETECTED,
+        Self::SECRET_SCRUBBED,
         Self::EXTENSION_ARTIFACT,
         Self::AGENT_SPAWN,
         Self::AGENT_MESSAGE,
@@ -419,6 +428,8 @@ mod tests {
             EventKind::CANVAS_SWAP,
             EventKind::CANVAS_CANDIDATE_DISCARDED,
             EventKind::SECRET_REDACTED,
+            EventKind::SECRET_EXPOSURE_DETECTED,
+            EventKind::SECRET_SCRUBBED,
             EventKind::EXTENSION_ARTIFACT,
             EventKind::AGENT_SPAWN,
             EventKind::AGENT_MESSAGE,

@@ -3,8 +3,8 @@ use anyhow::{anyhow, Result};
 use euler_core::permissions::{DeciderVerdict, PermissionRequest};
 use euler_core::{
     fold_session, read_provenance, read_resume_prefix, resume_session_from_folded_prefix,
-    CompactionTier, ModelTarget, PermissionDecider, PermissionReviewer, ProvenanceWriter, Session,
-    SessionConfig, SessionKind,
+    CompactionTier, EulerHome, ModelTarget, PermissionDecider, PermissionReviewer,
+    ProvenanceWriter, Session, SessionConfig, SessionKind, SessionStore,
 };
 use euler_event::EventKind;
 use euler_provider::anthropic::AnthropicProvider;
@@ -137,6 +137,7 @@ fn main() -> Result<()> {
             )
         }
         Command::Extension(extension) => run_extension_command(extension),
+        Command::Scrub(scrub) => run_scrub(scrub),
     }
 }
 
@@ -826,6 +827,95 @@ enum Command {
     Models(ModelsCommand),
     SessionExport(ProvenanceExportArgs),
     Extension(ExtensionArgs),
+    Scrub(ScrubArgs),
+}
+
+/// `euler scrub <session>` — post-close credential removal (issue #100).
+/// Resolves a closed session by id or name and reads exact values from stdin,
+/// keeping them out of shell history and the process command line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScrubArgs {
+    session: String,
+}
+
+impl ScrubArgs {
+    fn parse(args: &mut impl Iterator<Item = String>) -> Result<Self> {
+        let Some(session) = args.next() else {
+            return Err(anyhow!(
+                "usage: euler scrub <session>  (secret values are read from stdin, one per line)"
+            ));
+        };
+        // Values are NEVER accepted as arguments: argv lands in shell history
+        // and the process command line (`ps`), which is exactly where a secret
+        // must not go. Read them from stdin instead.
+        if args.next().is_some() {
+            return Err(anyhow!(
+                "euler scrub reads secret values from stdin (one per line), not arguments — \
+                 passing a secret on the command line would leak it into shell history and `ps`"
+            ));
+        }
+        Ok(Self { session })
+    }
+}
+
+/// Resolve a closed session by id or name and scrub the given values from every
+/// persistent surface (issue #100). Prints a counts-only summary and the
+/// un-recall caveat; the value never reaches stdout.
+fn run_scrub(args: ScrubArgs) -> Result<()> {
+    let home = EulerHome::resolve()?;
+    let store = SessionStore::new(home)?;
+    let Some(record) = store.resolve_session_reference(&args.session)? else {
+        return Err(anyhow!("no session found with id or name {}", args.session));
+    };
+    let values = read_scrub_values_from_stdin()?;
+    let surfaces = euler_core::scrub::ScrubSurfaces {
+        workspace_root: record.root(),
+    };
+    let report = euler_core::scrub::scrub_closed_session(
+        record.session_dir(),
+        record.id(),
+        surfaces,
+        &values,
+    )?;
+    println!("{}", report.summary_line());
+    Ok(())
+}
+
+/// Read the secret values to scrub from stdin (one per line) — never argv, so
+/// they cannot leak into shell history or the process command line.
+fn read_scrub_values_from_stdin() -> Result<Vec<String>> {
+    if io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "euler scrub reads secret values from stdin; pipe them in, one per line \
+             (e.g. `printf '%s\\n' \"$SECRET\" | euler scrub <session>`)"
+        ));
+    }
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    parse_scrub_values(&input)
+}
+
+fn parse_scrub_values(input: &str) -> Result<Vec<String>> {
+    let values: Vec<String> = input
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    if values.is_empty() {
+        return Err(anyhow!("no secret values provided on stdin"));
+    }
+    if let Some(short) = values
+        .iter()
+        .find(|value| value.len() < euler_core::scrub::MIN_SCRUB_VALUE_LEN)
+    {
+        return Err(anyhow!(
+            "scrub value is too short ({} chars); the minimum is {} to avoid mangling \
+             unrelated content",
+            short.len(),
+            euler_core::scrub::MIN_SCRUB_VALUE_LEN
+        ));
+    }
+    Ok(values)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -845,6 +935,7 @@ enum TopLevelCommand {
     Models,
     SessionExport,
     Extension,
+    Scrub,
 }
 
 impl TopLevelCommand {
@@ -859,6 +950,7 @@ impl TopLevelCommand {
             Self::Models => "models",
             Self::SessionExport => "session-export",
             Self::Extension => "extension",
+            Self::Scrub => "scrub",
         }
     }
 }
@@ -1091,70 +1183,15 @@ impl Args {
         }
         let mut default_interactive = false;
         validate_replay_resume_conflicts(&parsed)?;
-        let command = if parsed.login {
-            Command::Login(build_login_args(&parsed)?)
-        } else if parsed.logout {
-            Command::Logout(build_logout_args(&parsed)?)
-        } else if parsed.auth_status {
-            build_auth_status_args(&parsed)?;
-            Command::AuthStatus
-        } else if parsed.models {
-            build_models_args(&parsed)?;
-            Command::Models(parsed.models_command)
-        } else if parsed.exec {
-            let preference = load_known_model_preference(preference_path);
-            let model_catalog = load_known_model_catalog(model_catalog_path);
-            let custom_providers = load_custom_provider_config(provider_config_path);
-            Command::Exec(build_exec_args(
-                &parsed,
-                preference.as_ref(),
-                &model_catalog,
-                &custom_providers,
-            )?)
-        } else if parsed.session_export.is_active() {
-            ensure_no_provider_options(&parsed, "session-export")?;
-            Command::SessionExport(build_session_export_args(&parsed)?)
-        } else if let Some(extension) = parsed.extension.as_ref() {
-            ensure_no_provider_options(&parsed, "extension")?;
-            validate_extension_args(&parsed)?;
-            Command::Extension(extension.clone())
-        } else if parsed.tui {
-            if parsed.no_tty {
-                return Err(anyhow!("tui cannot be combined with --no-tty"));
-            }
-            let preference = load_known_model_preference(preference_path);
-            let model_catalog = load_known_model_catalog(model_catalog_path);
-            let custom_providers = load_custom_provider_config(provider_config_path);
-            Command::Tui(build_run_args(
-                &parsed,
-                preference.as_ref(),
-                &model_catalog,
-                &custom_providers,
-            )?)
-        } else if let Some(path) = parsed.replay_path.clone() {
-            ensure_no_provider_options(&parsed, "--replay")?;
-            ensure_no_extensions(&parsed, "--replay")?;
-            Command::Replay { path }
-        } else if let Some(path) = parsed.resume_path.clone() {
-            ensure_no_provider_options(&parsed, "--resume")?;
-            let model_catalog = load_known_model_catalog(model_catalog_path);
-            let custom_providers = load_custom_provider_config(provider_config_path);
-            Command::Resume {
-                path,
-                run: build_run_args(&parsed, None, &model_catalog, &custom_providers)?,
-            }
-        } else {
-            let preference = load_known_model_preference(preference_path);
-            let model_catalog = load_known_model_catalog(model_catalog_path);
-            let custom_providers = load_custom_provider_config(provider_config_path);
-            default_interactive = !parsed.explicit_run;
-            Command::Run(build_run_args(
-                &parsed,
-                preference.as_ref(),
-                &model_catalog,
-                &custom_providers,
-            )?)
-        };
+        let command = build_command_from_parsed(
+            &parsed,
+            CatalogPaths {
+                preference: preference_path,
+                model_catalog: model_catalog_path,
+                provider_config: provider_config_path,
+            },
+            &mut default_interactive,
+        )?;
 
         Ok(Self {
             provenance_path: parsed.provenance_path,
@@ -1164,6 +1201,92 @@ impl Args {
             no_tty: parsed.no_tty,
         })
     }
+}
+
+/// The three optional on-disk config paths threaded into command building.
+#[derive(Clone, Copy)]
+struct CatalogPaths<'a> {
+    preference: Option<&'a Path>,
+    model_catalog: Option<&'a Path>,
+    provider_config: Option<&'a Path>,
+}
+
+/// Resolve the parsed flags into a single [`Command`], setting
+/// `default_interactive` when the bare (no explicit `run`) interactive path is
+/// taken. Extracted from the parser so each stays within the line budget.
+fn build_command_from_parsed(
+    parsed: &RawArgs,
+    paths: CatalogPaths<'_>,
+    default_interactive: &mut bool,
+) -> Result<Command> {
+    let command = if parsed.login {
+        Command::Login(build_login_args(parsed)?)
+    } else if parsed.logout {
+        Command::Logout(build_logout_args(parsed)?)
+    } else if parsed.auth_status {
+        build_auth_status_args(parsed)?;
+        Command::AuthStatus
+    } else if parsed.models {
+        build_models_args(parsed)?;
+        Command::Models(parsed.models_command)
+    } else if parsed.exec {
+        let preference = load_known_model_preference(paths.preference);
+        let model_catalog = load_known_model_catalog(paths.model_catalog);
+        let custom_providers = load_custom_provider_config(paths.provider_config);
+        Command::Exec(build_exec_args(
+            parsed,
+            preference.as_ref(),
+            &model_catalog,
+            &custom_providers,
+        )?)
+    } else if parsed.session_export.is_active() {
+        ensure_no_provider_options(parsed, "session-export")?;
+        Command::SessionExport(build_session_export_args(parsed)?)
+    } else if let Some(extension) = parsed.extension.as_ref() {
+        ensure_no_provider_options(parsed, "extension")?;
+        validate_extension_args(parsed)?;
+        Command::Extension(extension.clone())
+    } else if let Some(scrub) = parsed.scrub.as_ref() {
+        ensure_no_provider_options(parsed, "scrub")?;
+        Command::Scrub(scrub.clone())
+    } else if parsed.tui {
+        if parsed.no_tty {
+            return Err(anyhow!("tui cannot be combined with --no-tty"));
+        }
+        let preference = load_known_model_preference(paths.preference);
+        let model_catalog = load_known_model_catalog(paths.model_catalog);
+        let custom_providers = load_custom_provider_config(paths.provider_config);
+        Command::Tui(build_run_args(
+            parsed,
+            preference.as_ref(),
+            &model_catalog,
+            &custom_providers,
+        )?)
+    } else if let Some(path) = parsed.replay_path.clone() {
+        ensure_no_provider_options(parsed, "--replay")?;
+        ensure_no_extensions(parsed, "--replay")?;
+        Command::Replay { path }
+    } else if let Some(path) = parsed.resume_path.clone() {
+        ensure_no_provider_options(parsed, "--resume")?;
+        let model_catalog = load_known_model_catalog(paths.model_catalog);
+        let custom_providers = load_custom_provider_config(paths.provider_config);
+        Command::Resume {
+            path,
+            run: build_run_args(parsed, None, &model_catalog, &custom_providers)?,
+        }
+    } else {
+        let preference = load_known_model_preference(paths.preference);
+        let model_catalog = load_known_model_catalog(paths.model_catalog);
+        let custom_providers = load_custom_provider_config(paths.provider_config);
+        *default_interactive = !parsed.explicit_run;
+        Command::Run(build_run_args(
+            parsed,
+            preference.as_ref(),
+            &model_catalog,
+            &custom_providers,
+        )?)
+    };
+    Ok(command)
 }
 
 fn validate_replay_resume_conflicts(parsed: &RawArgs) -> Result<()> {
@@ -1234,6 +1357,7 @@ struct RawArgs {
     models_command: ModelsCommand,
     session_export: RawProvenanceExportArgs,
     extension: Option<ExtensionArgs>,
+    scrub: Option<ScrubArgs>,
     no_tty: bool,
     linefeed_history_insert: Option<bool>,
 }
@@ -1303,6 +1427,7 @@ impl RawArgsParser {
                 models_command: ModelsCommand::List,
                 session_export: RawProvenanceExportArgs::default(),
                 extension: None,
+                scrub: None,
                 no_tty: false,
                 linefeed_history_insert: None,
             },
@@ -1340,6 +1465,7 @@ impl RawArgsParser {
             "models" if !self.parsed.exec => self.parse_models_command(args),
             "session-export" if !self.parsed.exec => self.parse_session_export_command(args),
             "extension" if !self.parsed.exec => self.parse_extension_command(args),
+            "scrub" if !self.parsed.exec => self.parse_scrub_command(args),
             "--provenance" => self.parse_provenance(args),
             "--provider" => self.parse_provider(args),
             "--model" => self.parse_model(args),
@@ -1465,6 +1591,15 @@ impl RawArgsParser {
     ) -> Result<ArgParseFlow> {
         accept_top_level_command(&mut self.top_level_command, TopLevelCommand::Extension)?;
         self.parsed.extension = Some(ExtensionArgs::parse(args)?);
+        Ok(ArgParseFlow::Stop)
+    }
+
+    fn parse_scrub_command(
+        &mut self,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<ArgParseFlow> {
+        accept_top_level_command(&mut self.top_level_command, TopLevelCommand::Scrub)?;
+        self.parsed.scrub = Some(ScrubArgs::parse(args)?);
         Ok(ArgParseFlow::Stop)
     }
 

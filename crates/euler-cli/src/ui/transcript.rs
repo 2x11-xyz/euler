@@ -722,8 +722,37 @@ fn project_event_with_checkpoints(
         EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
         EventKind::AGENT_MESSAGE => project_agent_message(event, None),
         EventKind::AGENT_RESULT => project_agent_result(event, None),
+        EventKind::SECRET_EXPOSURE_DETECTED => Some(TranscriptItem::Notice(exposure_notice_text())),
+        EventKind::SECRET_SCRUBBED => Some(TranscriptItem::Notice(scrub_notice_text(event))),
         _ => None,
     }
+}
+
+/// Non-blocking heads-up for a credential detected in a faithful tool-call
+/// argument (issue #100). Provenance stays faithful; scrub is opt-in.
+pub(crate) fn exposure_notice_text() -> String {
+    format!(
+        "{} heads up — a tool-call argument looks like it may hold a credential. \
+         Euler keeps it faithfully in provenance; remove it with /scrub now, or \
+         scrub the session later.",
+        super::glyphs::warning()
+    )
+}
+
+/// Audit line for a completed scrub, projected on replay/resume. Counts only —
+/// the payload never carries the value.
+fn scrub_notice_text(event: &EventEnvelope) -> String {
+    let replacements = event
+        .payload
+        .get("replacements")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    format!(
+        "{} scrubbed — {replacements} occurrence{} removed from session data; \
+         already-exported, copied, terminal-scrollback, or pushed data cannot be recalled.",
+        super::glyphs::check(),
+        if replacements == 1 { "" } else { "s" },
+    )
 }
 
 pub(crate) fn project_latest_event_for_ui(events: &[EventEnvelope]) -> Option<TranscriptItem> {

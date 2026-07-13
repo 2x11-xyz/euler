@@ -1772,6 +1772,7 @@ impl AppCore {
                 self.code_swarm_review(prompt, personas)
             }
             CommandAction::ShowStatus => self.show_status(),
+            CommandAction::Scrub { value } => self.scrub_current_session(value),
             CommandAction::Login { provider } => self.login_guidance(provider),
             CommandAction::Logout { provider } => self.logout_guidance(provider),
             CommandAction::SetTheme { choice } => self.set_theme(choice),

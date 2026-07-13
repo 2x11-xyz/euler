@@ -1709,6 +1709,39 @@ fn provider_options_are_fresh_session_only_for_first_slice() {
 }
 
 #[test]
+fn scrub_command_parses_session_only() {
+    let args = parse_args_without_env(["scrub", "my-session"]);
+    let Command::Scrub(scrub) = args.command else {
+        panic!("expected scrub command");
+    };
+    assert_eq!(scrub.session, "my-session");
+}
+
+#[test]
+fn scrub_command_rejects_secret_values_in_argv() {
+    // A value on the command line would leak into shell history / `ps`; scrub
+    // reads secrets from stdin instead.
+    let error = parse_args_error(["scrub", "my-session", "sk-live-value-0123456789"]);
+    assert!(
+        error.to_string().contains("reads secret values from stdin"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scrub_stdin_preserves_exact_leading_and_trailing_whitespace() {
+    let values = parse_scrub_values("  secret-value  \nsecond-secret\r\n").expect("values");
+
+    assert_eq!(values, ["  secret-value  ", "second-secret"]);
+}
+
+#[test]
+fn scrub_stdin_rejects_empty_lines_and_short_values() {
+    assert!(parse_scrub_values("\n   \n\r\n").is_err());
+    assert!(parse_scrub_values("abc\n").is_err());
+}
+
+#[test]
 fn observe_flag_parses_valid_extension_and_default_cadence() {
     let args = parse_without_env(["--observe", "causal-dag"]);
 
@@ -2175,6 +2208,7 @@ fn unwrap_run(args: Args) -> RunArgs {
         Command::Models(_) => panic!("expected run args"),
         Command::SessionExport(_) => panic!("expected run args"),
         Command::Extension(_) => panic!("expected run args"),
+        Command::Scrub(_) => panic!("expected run args"),
     }
 }
 

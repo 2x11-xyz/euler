@@ -380,6 +380,12 @@ pub enum CommandAction {
         personas: Option<Vec<String>>,
     },
     ShowStatus,
+    /// Remove a credential from every provenance surface (issue #100). Bare
+    /// (`value: None`) scrubs the values detected in tool-call arguments this
+    /// session; an explicit value scrubs exactly that string.
+    Scrub {
+        value: Option<String>,
+    },
     Login {
         provider: String,
     },
@@ -553,6 +559,11 @@ const COMMAND_TABLE: &[CommandSpec] = &[
         token: "/status",
         summary: "show session status",
         args: "",
+    },
+    CommandSpec {
+        token: "/scrub",
+        summary: "remove a detected credential from provenance",
+        args: "[value]",
     },
     CommandSpec {
         token: "/hotkeys",
@@ -809,6 +820,9 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/extension" => extension_effect(parsed.arg, context),
         "/companion" => companion_effect(parsed.arg),
         "/status" => CommandEffect::Action(CommandAction::ShowStatus),
+        "/scrub" => CommandEffect::Action(CommandAction::Scrub {
+            value: parsed.arg.map(str::to_owned),
+        }),
         "/hotkeys" => CommandEffect::Action(CommandAction::ShowHelp {
             text: hotkeys_text(),
         }),

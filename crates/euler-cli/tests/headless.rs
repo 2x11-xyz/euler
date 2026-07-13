@@ -8755,6 +8755,58 @@ fn tui_resume_picker_lists_home_sessions() {
     assert!(replayed.contains("user: after tui resume\n"));
 }
 
+#[test]
+fn closed_session_scrub_reads_exact_value_from_stdin_and_appends_audit() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let euler_home = euler_core::EulerHome::from_root(home.path().join(".euler")).expect("home");
+    let store = euler_core::SessionStore::new(euler_home).expect("store");
+    let record = store.create_session().expect("session");
+    let secret = "  closed-session-secret-1234  ";
+    let event = EventEnvelope::new(
+        record.id(),
+        "root",
+        None,
+        EventKind::TOOL_CALL,
+        object([(
+            "input",
+            serde_json::json!({"command": format!("echo {secret}")}),
+        )]),
+    );
+    let writer = euler_core::ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(&[event]).expect("append");
+    drop(writer);
+
+    let mut child = command_with_home(exe, &home)
+        .arg("scrub")
+        .arg(record.id())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn scrub");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(format!("{secret}\n").as_bytes())
+        .expect("write secret");
+    let output = child.wait_with_output().expect("wait scrub");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output
+        .stdout
+        .windows(secret.len())
+        .any(|bytes| bytes == secret.as_bytes()));
+    let raw = fs::read_to_string(record.events_path()).expect("events");
+    assert!(!raw.contains(secret));
+    assert!(raw.contains(EventKind::SECRET_SCRUBBED));
+}
+
 const BLOB_HASH: &str = "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721";
 const ANTHROPIC_API_KEY_SENTINEL: &str = "euler-secret-boundary-anthropic-api-key-2315";
 const OPENAI_API_KEY_SENTINEL: &str = "euler-secret-boundary-openai-api-key-2315";

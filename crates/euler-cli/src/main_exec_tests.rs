@@ -311,5 +311,6 @@ fn unwrap_exec(args: Args) -> ExecArgs {
         Command::Models(_) => panic!("expected exec args"),
         Command::SessionExport(_) => panic!("expected exec args"),
         Command::Extension(_) => panic!("expected exec args"),
+        Command::Scrub(_) => panic!("expected exec args"),
     }
 }

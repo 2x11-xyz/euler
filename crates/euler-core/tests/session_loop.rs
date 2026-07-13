@@ -4457,6 +4457,81 @@ fn finished(stop_reason: StopReason) -> Result<ModelStreamEvent, ProviderError> 
     })
 }
 
+#[test]
+fn credential_in_tool_call_argument_warns_stays_faithful_and_scrubs_on_demand() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    // Built at runtime so no token-shaped literal lives in the source tree.
+    let token = format!("sk-ant-{}", "api03-livecredential0123456789");
+    let command = format!("echo {token}");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-shell".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({ "command": command }),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+
+    session.run_turn("run it").expect("turn");
+
+    let events = logged_events(&log);
+    // 1. Detection emitted a faithful warning marker — labels only, no value.
+    let exposure = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SECRET_EXPOSURE_DETECTED)
+        .expect("exposure detected event");
+    assert!(!exposure.to_json_line().unwrap().contains(&token));
+    assert_eq!(
+        exposure.payload["shapes"],
+        json!(["sk-ant-"]),
+        "shape label recorded, not the value"
+    );
+
+    // 2. The tool-call ARGUMENT stays faithful (cognition is never redacted).
+    let tool_call = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .expect("tool call");
+    assert!(
+        tool_call.to_json_line().unwrap().contains(&token),
+        "tool-call argument must stay verbatim"
+    );
+    // 3. The tool RESULT was redacted at the entry boundary.
+    let tool_result = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    assert!(!tool_result.to_json_line().unwrap().contains(&token));
+
+    // 4. The detected value is buffered for a bare `/scrub`.
+    assert_eq!(session.scrub_candidates(), std::slice::from_ref(&token));
+
+    // 5. Scrub on demand removes it from the faithful argument too.
+    let report = session
+        .scrub_live(std::slice::from_ref(&token))
+        .expect("scrub");
+    assert!(report.anything_scrubbed());
+    let after = logged_events(&log);
+    assert!(
+        !fs::read_to_string(&log).unwrap().contains(&token),
+        "no surface retains the value after scrub"
+    );
+    assert_eq!(count_kind(&after, EventKind::SECRET_SCRUBBED), 1);
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| !event.to_json_line().unwrap().contains(&token)));
+    assert_eq!(count_kind(session.events(), EventKind::SECRET_SCRUBBED), 1);
+    assert!(session.scrub_candidates().is_empty());
+}
+
 fn logged_kinds(path: &std::path::Path) -> Vec<String> {
     logged_events(path)
         .into_iter()

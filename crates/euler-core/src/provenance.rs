@@ -14,6 +14,8 @@ pub const DEFAULT_PROVENANCE_QUERY_EVENT_LIMIT: usize = 256;
 pub const DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT: usize = 1024;
 pub const DEFAULT_PROVENANCE_QUERY_BLOB_BYTE_LIMIT: usize = 1024 * 1024;
 
+mod scrub;
+
 pub type EventId = String;
 
 #[derive(Debug)]

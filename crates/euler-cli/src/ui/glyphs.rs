@@ -183,6 +183,10 @@ pub(crate) fn interrupt() -> &'static str {
     glyph_set().interrupt()
 }
 
+pub(crate) fn warning() -> &'static str {
+    glyph_set().warning()
+}
+
 pub(crate) fn revert() -> &'static str {
     glyph_set().revert()
 }

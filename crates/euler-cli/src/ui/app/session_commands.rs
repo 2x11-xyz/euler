@@ -214,6 +214,52 @@ impl AppCore {
         }
     }
 
+    /// `/scrub [value]` (issue #100): remove a credential from every
+    /// provenance surface of the live session. Bare form scrubs the values
+    /// detected in tool-call arguments this session (the ones the exposure
+    /// warning flagged); an explicit value scrubs exactly that string.
+    pub(super) fn scrub_current_session(&mut self, value: Option<String>) -> CoreEffect {
+        let secrets = match (&self.state, value) {
+            (AppState::Idle { .. }, Some(value)) => vec![value],
+            (AppState::Idle { session }, None) => session.scrub_candidates().to_vec(),
+            _ => return self.notice_item("scrub waits for the active turn".to_owned()),
+        };
+        if secrets.is_empty() {
+            return self.notice_item(
+                "scrub: no credential detected this session — pass a value: /scrub <value>"
+                    .to_owned(),
+            );
+        }
+        let prepared = euler_core::scrub::prepare_secrets(&secrets);
+        if prepared.is_empty() {
+            return self.notice_item(format!(
+                "scrub value must be at least {} characters",
+                euler_core::scrub::MIN_SCRUB_VALUE_LEN
+            ));
+        }
+        let result = match &mut self.state {
+            AppState::Idle { session } => session
+                .scrub_live(&prepared)
+                .map(|report| (report, session.events().to_vec())),
+            _ => unreachable!("state checked above"),
+        };
+        let (report, events) = match result {
+            Ok(result) => result,
+            Err(error) => return self.error_item(format!("scrub failed: {error}")),
+        };
+
+        if let Some(name) = self.status.session_name.as_mut() {
+            *name = euler_core::redaction::scrub_secrets_in_text(name, &prepared).0;
+        }
+        self.rebuild_transcript_from_events(&events);
+        self.rebuild_bottom_surface();
+        if report.audit_event_id.is_some() {
+            CoreEffect::Render
+        } else {
+            self.notice_item(report.summary_line())
+        }
+    }
+
     pub(super) fn switch_model(&mut self, provider: String, model: String) -> CoreEffect {
         let AppState::Idle { session } = &mut self.state else {
             return self.notice_item("model switch waits for the active turn".to_owned());

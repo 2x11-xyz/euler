@@ -20,6 +20,7 @@ pub mod permissions;
 pub mod provenance;
 pub mod redaction;
 pub mod resume;
+pub mod scrub;
 pub mod session;
 pub mod session_kind;
 mod session_name;
@@ -120,5 +121,57 @@ impl EventBus {
 
     pub fn events(&self) -> &[EventEnvelope] {
         &self.events
+    }
+
+    /// Scrub `secrets` from every in-memory event payload (issue #100), so a
+    /// live scrub stops the running session from re-rendering, compacting, or
+    /// re-persisting a value already removed from the durable log. Event ids
+    /// and order are untouched. Returns the total replacements made.
+    pub fn scrub_payloads(&mut self, secrets: &[String]) -> usize {
+        let mut count = 0;
+        for event in &mut self.events {
+            count += redaction::scrub_secrets_in_object(&mut event.payload, secrets);
+        }
+        count
+    }
+
+    /// Align the live bus with a successful durable scrub. Full tool-result
+    /// payloads stay in memory (the writer externalizes only its clone), while
+    /// content-addressed pointers are copied from the rewritten log and the
+    /// log-only resume marker remains excluded.
+    pub(crate) fn reconcile_scrubbed_log(&mut self, durable: &[EventEnvelope], secrets: &[String]) {
+        self.scrub_payloads(secrets);
+        let durable_by_id = durable
+            .iter()
+            .map(|event| (event.id.as_str(), event))
+            .collect::<std::collections::HashMap<_, _>>();
+        for event in &mut self.events {
+            let Some(rewritten) = durable_by_id.get(event.id.as_str()) else {
+                continue;
+            };
+            event.blobs.clone_from(&rewritten.blobs);
+            match event.kind.as_str() {
+                euler_event::EventKind::EXTENSION_ARTIFACT => {
+                    event.payload.clone_from(&rewritten.payload);
+                }
+                euler_event::EventKind::FILE_CHANGE => {
+                    if let Some(hash) = rewritten.payload.get("pre_image_blob") {
+                        event
+                            .payload
+                            .insert("pre_image_blob".to_owned(), hash.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(audit) = durable
+            .iter()
+            .rev()
+            .find(|event| event.kind.as_str() == euler_event::EventKind::SECRET_SCRUBBED)
+        {
+            if !self.events.iter().any(|event| event.id == audit.id) {
+                self.events.push(audit.clone());
+            }
+        }
     }
 }
