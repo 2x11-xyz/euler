@@ -70,8 +70,11 @@ fn render_page(
     );
     Ok(template
         .replace(RUNTIME_MARKER, &runtime)
-        .replace(DAG_MARKER, dag_json)
-        .replace(PALETTE_MARKER, palette_json))
+        .replace(PALETTE_MARKER, palette_json)
+        // The DAG contains untrusted model/user text. Insert it last so text
+        // matching a trusted template marker remains data, not a second
+        // injection point.
+        .replace(DAG_MARKER, dag_json))
 }
 
 fn script_safe_json(json: &str) -> String {
@@ -117,7 +120,7 @@ showView(initial);
 mod tests {
     use super::{
         render_html, script_safe_json, CONSTELLATION_3D, CONSTELLATION_3_5D, INDENTED_SPINE,
-        TOP_DOWN,
+        PALETTE_MARKER, TOP_DOWN,
     };
     use crate::export::graph::ViewerDag;
     use serde_json::Value;
@@ -173,6 +176,22 @@ mod tests {
         assert!(html.contains("\\u003c/script\\u003e\\u003cscript\\u003ewindow.pwned"));
         assert!(html.contains("#7f97a8"));
         assert!(html.contains("connect-src 'none'"));
+    }
+
+    #[test]
+    fn dag_text_matching_the_palette_marker_remains_data() {
+        let mut artifact: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/causal_dag/knuth_style_search/expected.causal-dag.json"
+        ))
+        .expect("fixture artifact");
+        artifact["forest"]["nodes"][1]["title"] = Value::String(PALETTE_MARKER.to_owned());
+        let dag = ViewerDag::from_artifact(&artifact).expect("viewer DAG");
+
+        let html = String::from_utf8(render_html(&dag).expect("HTML render")).expect("UTF-8");
+
+        let marker_as_node_title = format!("\"title\":\"{PALETTE_MARKER}\"");
+        assert_eq!(html.matches(&marker_as_node_title).count(), 4);
+        assert_eq!(html.matches("const TOKENS = {").count(), 4);
     }
 
     #[test]

@@ -3140,6 +3140,7 @@ fn accepted_model_switch_is_persisted_before_next_user_and_next_call_uses_target
     let mut config = SessionConfig::new(temp.path());
     config.provider = "fixture".to_owned();
     config.model = "echo".to_owned();
+    config.reasoning_effort = ReasoningEffort::Max;
     let mut session = Session::new_with_providers(config, providers, ScriptedDecider::new(vec![]))
         .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
 
@@ -3153,6 +3154,7 @@ fn accepted_model_switch_is_persisted_before_next_user_and_next_call_uses_target
     let other_requests = request_log_guard(&other_requests);
     assert_eq!(other_requests.len(), 1);
     assert_eq!(other_requests[0].model, "second-model");
+    assert_eq!(other_requests[0].reasoning_effort, ReasoningEffort::Max);
 
     let events = logged_events(&log);
     let switch = find_kind(&events, EventKind::MODEL_SWITCHED);
@@ -3192,6 +3194,60 @@ fn accepted_model_switch_is_persisted_before_next_user_and_next_call_uses_target
     assert_eq!(payload_str(reasoning, "model"), Some("second-model"));
     assert_eq!(payload_str(result, "provider"), Some("other"));
     assert_eq!(payload_str(result, "model"), Some("second-model"));
+}
+
+#[test]
+fn model_switch_clamps_stale_max_effort_before_the_next_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let requests = request_log();
+    let mut providers = ProviderSet::new();
+    providers.insert(CapturingProvider::new(
+        "chatgpt",
+        vec![vec![
+            Ok(ModelStreamEvent::TextDelta("done".to_owned())),
+            Ok(ModelStreamEvent::Finished {
+                stop_reason: StopReason::Completed,
+                usage: None,
+            }),
+        ]],
+        requests.clone(),
+    ));
+    let mut config = SessionConfig::new(temp.path());
+    config.provider = "chatgpt".to_owned();
+    config.model = "gpt-5.6-sol".to_owned();
+    config.reasoning_effort = ReasoningEffort::Max;
+    let mut session = Session::new_with_providers(config, providers, ScriptedDecider::new(vec![]))
+        .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+
+    assert!(session
+        .switch_model("chatgpt", "gpt-5.5", "user", None)
+        .expect("switch"));
+    assert_eq!(session.reasoning_effort(), ReasoningEffort::XLarge);
+    session.run_turn("continue").expect("turn");
+
+    assert_eq!(
+        request_log_guard(&requests)[0].reasoning_effort,
+        ReasoningEffort::XLarge
+    );
+    let events = logged_events(&log);
+    let switched = find_kind(&events, EventKind::MODEL_SWITCHED);
+    let switched_index = event_index(&events, &switched.id);
+    let effort = &events[switched_index + 1];
+    assert_eq!(effort.kind.as_str(), EventKind::MODEL_EFFORT_CHANGED);
+    assert_eq!(effort.parent.as_deref(), Some(switched.id.as_str()));
+    assert_eq!(payload_str(effort, "from_effort"), Some("max"));
+    assert_eq!(payload_str(effort, "to_effort"), Some("xlarge"));
+    assert_eq!(payload_str(effort, "reason"), Some("model-switch"));
+    let next_call = events
+        .iter()
+        .skip(switched_index + 2)
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("next model call");
+    assert_eq!(
+        payload_str(next_call, "requested_reasoning_effort"),
+        Some("xlarge")
+    );
 }
 
 #[test]
@@ -3362,6 +3418,7 @@ fn failed_switch_append_leaves_previous_target_active_without_accepted_event() {
     let mut config = SessionConfig::new(temp.path());
     config.provider = "fixture".to_owned();
     config.model = "echo".to_owned();
+    config.reasoning_effort = ReasoningEffort::Max;
     let mut session = Session::new_with_providers(config, providers, ScriptedDecider::new(vec![]))
         .with_provenance(ProvenanceWriter::new(log).expect("provenance writer"));
 
@@ -3374,6 +3431,7 @@ fn failed_switch_append_leaves_previous_target_active_without_accepted_event() {
         session.active_target(),
         &ModelTarget::new("fixture", "echo")
     );
+    assert_eq!(session.reasoning_effort(), ReasoningEffort::Max);
     assert_eq!(count_kind(session.events(), EventKind::MODEL_SWITCHED), 0);
     assert!(request_log_guard(&other_requests).is_empty());
     assert!(request_log_guard(&fixture_requests).is_empty());

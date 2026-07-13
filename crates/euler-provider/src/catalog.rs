@@ -411,6 +411,8 @@ const OPENAI_MODELS: &[BuiltInModelDescriptor] = &[
 
 /// ChatGPT-subscription backend models (pi reference: openai-codex.models.ts —
 /// the codex backend exposes a different, smaller set than the platform API).
+/// GPT-5.6 has a 372K window on this Codex route; the same model ids on the
+/// OpenAI platform API remain 272K. Keep the route-specific values distinct.
 const CHATGPT_MODELS: &[BuiltInModelDescriptor] = &[
     built_in_model(
         "gpt-5.3-codex-spark",
@@ -2637,6 +2639,36 @@ pub fn model_supports_reasoning_effort(
     supported_reasoning_efforts(provider, model).contains(&effort)
 }
 
+/// Preserve a requested effort for targets outside the built-in catalog or
+/// when the known target supports it. Otherwise degrade to the known target's
+/// highest advertised level. Effort lists are ordered from least to most
+/// intensive and are never empty.
+pub fn clamp_reasoning_effort(
+    provider: &str,
+    model: &str,
+    requested: ReasoningEffort,
+) -> ReasoningEffort {
+    let known_model = provider_descriptor(provider).ok().is_some_and(|provider| {
+        provider
+            .models
+            .iter()
+            .any(|candidate| candidate.id == model)
+    });
+    if !known_model {
+        return requested;
+    }
+
+    let supported = supported_reasoning_efforts(provider, model);
+    if supported.contains(&requested) {
+        requested
+    } else {
+        supported
+            .last()
+            .copied()
+            .expect("reasoning effort catalog must not be empty")
+    }
+}
+
 pub fn parse_model_spec(input: &str) -> Result<ModelSpec, CatalogError> {
     if input.trim().is_empty() {
         return Err(CatalogError::EmptyModel);
@@ -2691,6 +2723,18 @@ mod tests {
             "gpt-5.5",
             ReasoningEffort::Max
         ));
+        assert_eq!(
+            clamp_reasoning_effort(CHATGPT_PROVIDER_ID, "gpt-5.6-sol", ReasoningEffort::Max),
+            ReasoningEffort::Max
+        );
+        assert_eq!(
+            clamp_reasoning_effort(CHATGPT_PROVIDER_ID, "gpt-5.5", ReasoningEffort::Max),
+            ReasoningEffort::XLarge
+        );
+        assert_eq!(
+            clamp_reasoning_effort("custom", "model", ReasoningEffort::Max),
+            ReasoningEffort::Max
+        );
     }
 
     #[test]

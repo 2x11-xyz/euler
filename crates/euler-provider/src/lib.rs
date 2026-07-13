@@ -562,6 +562,22 @@ impl ProviderSet {
             .and_then(|provider| provider.reasoning_effort(model))
     }
 
+    /// Normalize a carried user-selectable effort against the destination
+    /// model's provider catalog. Targets outside the built-in catalog are left
+    /// unchanged; switch validation reports unconfigured providers separately.
+    pub fn clamp_reasoning_effort(
+        &self,
+        provider: &str,
+        model: &str,
+        requested: ReasoningEffort,
+    ) -> ReasoningEffort {
+        if self.providers.contains_key(provider) {
+            catalog::clamp_reasoning_effort(provider, model, requested)
+        } else {
+            requested
+        }
+    }
+
     pub fn invoke(
         &self,
         provider: &str,

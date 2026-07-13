@@ -228,9 +228,15 @@ impl AppCore {
                     .and_then(|entry| entry.context_window_tokens())
             })
             .and_then(euler_core::ContextLimitConfig::from_catalog_window);
-        match session.switch_model(&provider, &model, "user", context_limit) {
-            Ok(true) => self.accept_model_switch(provider, model, true),
-            Ok(false) => self.accept_model_switch(provider, model, false),
+        let previous_effort = session.reasoning_effort();
+        let result = session.switch_model(&provider, &model, "user", context_limit);
+        let current_effort = session.reasoning_effort();
+        match result {
+            Ok(switched) => {
+                self.status.reasoning_effort = Some(current_effort.as_str().to_owned());
+                let effort_changed = (current_effort != previous_effort).then_some(current_effort);
+                self.accept_model_switch(provider, model, switched, effort_changed)
+            }
             Err(error) => self.error_item(format!("model switch rejected: {error}")),
         }
     }
@@ -240,6 +246,7 @@ impl AppCore {
         provider: String,
         model: String,
         switched: bool,
+        effort_changed: Option<ReasoningEffort>,
     ) -> CoreEffect {
         self.status.provider = provider.clone();
         self.status.model = model.clone();
@@ -251,7 +258,13 @@ impl AppCore {
         }
         self.rebuild_bottom_surface();
         match model_preference::save_model_preference_to_default(&provider, &model) {
-            Ok(()) => self.notice_item(format!("model set to {provider}/{model}")),
+            Ok(()) => {
+                let mut message = format!("model set to {provider}/{model}");
+                if let Some(effort) = effort_changed {
+                    message.push_str(&format!(" · reasoning reduced to {}", effort.as_str()));
+                }
+                self.notice_item(message)
+            }
             Err(error) => self.error_item(format!("model set; preference not saved: {error}")),
         }
     }

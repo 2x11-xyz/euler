@@ -337,9 +337,12 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `model.result`, `model.reasoning`, and `model.delta` parent their
   `model.call`.
 - `assistant.message` parents its `model.result`.
-- `model.switched`, `context.limit`, `context.slot.updated`, `canvas.swap`, and
-  `canvas.candidate.discarded` parent the previous persisted event (they are
-  session-level control events).
+- `model.switched`, `model.effort.changed`, `context.limit`,
+  `context.slot.updated`, `canvas.swap`, and `canvas.candidate.discarded`
+  parent the previous persisted event (they are session-level control events).
+  When a model switch requires an automatic effort downgrade, the
+  `model.effort.changed` event parents that `model.switched` event and both are
+  accepted in one durable batch.
 - `session.start` has parent null. It is always the session's first
   persisted event.
 - `extension.artifact` parents the previous persisted event at append time.
