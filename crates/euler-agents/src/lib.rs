@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use thiserror::Error;
 
 pub const MAX_TASK_BYTES: usize = 8 * 1024;
+pub const MAX_EXPLICIT_CONTEXT_BYTES: usize = 256 * 1024;
 pub const MAX_SYSTEM_PROMPT_BYTES: usize = 8 * 1024;
 pub const MAX_PERSONA_BYTES: usize = 128;
 pub const MAX_PROVIDER_BYTES: usize = 128;
@@ -120,6 +121,8 @@ pub struct AgentTask {
     provider: String,
     model: String,
     system_prompt: Option<String>,
+    explicit_context: Option<String>,
+    include_parent_canvas: bool,
     capabilities: Vec<Capability>,
     budget: AgentBudget,
     result_schema: Option<Value>,
@@ -138,6 +141,8 @@ impl AgentTask {
             provider: bounded_required("provider", provider.as_ref(), MAX_PROVIDER_BYTES)?,
             model: bounded_required("model", model.as_ref(), MAX_MODEL_BYTES)?,
             system_prompt: None,
+            explicit_context: None,
+            include_parent_canvas: true,
             capabilities: Vec::new(),
             budget: AgentBudget::default(),
             result_schema: None,
@@ -154,6 +159,8 @@ impl AgentTask {
             provider: String::new(),
             model: String::new(),
             system_prompt: None,
+            explicit_context: None,
+            include_parent_canvas: true,
             capabilities: Vec::new(),
             budget: AgentBudget::default(),
             result_schema: None,
@@ -182,6 +189,20 @@ impl AgentTask {
         Ok(self)
     }
 
+    pub fn with_parent_canvas(mut self, include: bool) -> Self {
+        self.include_parent_canvas = include;
+        self
+    }
+
+    pub fn with_explicit_context(mut self, context: impl AsRef<str>) -> Result<Self, AgentError> {
+        self.explicit_context = Some(bounded_required(
+            "explicit_context",
+            context.as_ref(),
+            MAX_EXPLICIT_CONTEXT_BYTES,
+        )?);
+        Ok(self)
+    }
+
     pub fn with_result_schema(mut self, schema: Value) -> Result<Self, AgentError> {
         validate_result_schema(Some(&schema))?;
         self.result_schema = Some(schema);
@@ -206,6 +227,14 @@ impl AgentTask {
 
     pub fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
+    }
+
+    pub fn includes_parent_canvas(&self) -> bool {
+        self.include_parent_canvas
+    }
+
+    pub fn explicit_context(&self) -> Option<&str> {
+        self.explicit_context.as_deref()
     }
 
     pub fn capabilities(&self) -> &[Capability] {
@@ -385,6 +414,13 @@ pub fn agent_spawn_payload(task: &AgentTask, child_agent_id: &str) -> JsonObject
     payload.insert("model".to_owned(), task.model().to_owned().into());
     if let Some(system_prompt) = task.system_prompt() {
         payload.insert("system_prompt".to_owned(), system_prompt.to_owned().into());
+    }
+    payload.insert(
+        "include_parent_canvas".to_owned(),
+        task.includes_parent_canvas().into(),
+    );
+    if let Some(context) = task.explicit_context() {
+        payload.insert("explicit_context_bytes".to_owned(), context.len().into());
     }
     payload.insert(
         "capabilities".to_owned(),

@@ -171,9 +171,11 @@ the batch sibling of `spawn_agent`, built for reviewer fan-out (issue #32);
   success, `error` on provider failure) and its terminal `agent.result`.
   Event order is a pure function of the batch order — never of provider
   completion timing — so fixture-driven logs replay deterministically.
-- **Shared canvas snapshot**: every batch child reviews the same parent
-  canvas, assembled once before the first spawn event. Later batch
-  children do not see earlier batch children's events.
+- **Explicit parent-context policy**: each batch task declares whether it
+  receives the parent canvas. Canvas-enabled children share one snapshot,
+  assembled before the first spawn event; later children never see earlier
+  children's events. Canvas-disabled children receive only their explicit
+  task brief. CodeSwarm disables parent-canvas inheritance by default.
 - **Parent chain intact**: queued extension events are published into the
   bus before the batch's first spawn event, exactly as the sequential
   spawn path publishes before each spawn.
@@ -253,16 +255,21 @@ override.
 A session-level tool advertised **only** to the root session when the
 `code-swarm` extension is wired and enabled — companions never see it
 (depth one). It is a stage-agnostic review gate: plans, diffs, analyses,
-drafts — the optional focus prompt carries the subject.
+drafts — the required focus prompt carries the complete bounded subject.
 
-- **No required arguments.** Optional: `focus` (bounded string carried into
-  every reviewer brief), `personas` (reviewer charter names), `models`
+- **Required context.** `focus` is the complete bounded explicit review
+  context carried into every reviewer brief (up to 256 KiB). Optional:
+  `personas` (reviewer charter names), `models`
   (`provider::model` one-shot override — only when the user explicitly
   named targets; the tool must not guess providers), `max_tokens`. On this
   model-facing surface, an empty `models` array names no explicit target and
   is treated as omission so persisted config can resolve. Explicit CLI/TUI
   one-off lists and direct extension inputs remain strict 1–5 target lists and
   reject empty input.
+- **No ambient canvas**: reviewers receive the explicit `focus`/command
+  context only. They do not inherit parent session history, tool output, or
+  compacted-result stubs. Callers assemble the plan, diff, file excerpts, PR
+  material, analysis, or draft before invoking the gate.
 - **Gate**: `Capability::AgentSpawn` through the ordinary tool permission
   machinery (prompt/grant/deny; covered grants do not re-prompt, so
   repeated checkpoint-loop calls pay no repeat approval). The extension

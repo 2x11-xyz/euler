@@ -124,6 +124,18 @@ runs a batch of single-round, tool-free, empty-capability child briefs
 quota. Determinism, event ordering, and failure honesty for both live in the
 multi-agent contract; hosts without live spawn support reject both calls.
 
+`SpawnAgentTask::include_parent_canvas` is an explicit context boundary.
+Native extensions set it to `true` only when their child workflow requires
+the active parent canvas; self-contained workflows such as CodeSwarm set it
+to `false` and carry all bounded context in `task`. This field was added to
+the pre-1.0 SDK as a source-breaking struct-field change rather than hiding a
+privacy-sensitive default in the host bridge.
+
+`SpawnAgentTask::explicit_context` carries up to 256 KiB of caller-assembled
+context as a separate child input item for both single and parallel spawn.
+Spawn provenance records its byte count, not its contents, so a multi-reviewer
+batch does not duplicate the review subject in every `agent.spawn` event.
+
 ## Context Slot Update v0
 
 `HostApi::update_context_slot(slot, content)` appends a canonical

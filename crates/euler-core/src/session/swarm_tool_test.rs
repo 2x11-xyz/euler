@@ -75,6 +75,8 @@ impl ExtensionCommand for FakeReviewCommand {
                     provider: provider.to_owned(),
                     model: model.to_owned(),
                     system_prompt: String::new(),
+                    explicit_context: None,
+                    include_parent_canvas: false,
                     capabilities: Vec::new(),
                     max_turns: Some(1),
                     max_tool_calls: Some(0),
@@ -420,7 +422,8 @@ fn malformed_nonempty_model_override_does_not_fall_back_to_config() {
     let mut harness = harness(
         vec![
             FixtureResponse::ToolCalls(vec![review_tool_call(json!({
-                "models": ["missing-separator"]
+                "models": ["missing-separator"],
+                "focus": "explicit review subject"
             }))]),
             FixtureResponse::Assistant("relayed".to_owned()),
         ],
@@ -548,7 +551,9 @@ fn failed_reviewer_error_is_redacted_but_findings_stay_faithful() {
 fn unconfigured_tool_call_fails_honestly_with_both_remediation_paths() {
     let mut harness = harness(
         vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("relayed".to_owned()),
         ],
         &[],
@@ -568,7 +573,7 @@ fn unconfigured_tool_call_fails_honestly_with_both_remediation_paths() {
         "TUI one-off override path: {error}"
     );
     assert!(
-        error.contains("extension_run code-swarm.review {\"models\":[\"provider::model\"]}"),
+        error.contains("extension_run code-swarm.review {\"models\":[\"provider::model\"],\"prompt\":\"explicit review context\"}"),
         "headless one-off override path: {error}"
     );
     assert!(
@@ -590,7 +595,7 @@ fn explicit_models_override_wins_over_persisted_config() {
     let mut harness = harness(
         vec![
             FixtureResponse::ToolCalls(vec![review_tool_call(
-                json!({"models": ["p2::override-model"]}),
+                json!({"models": ["p2::override-model"], "focus": "explicit review subject"}),
             )]),
             FixtureResponse::Assistant("done".to_owned()),
         ],
@@ -623,7 +628,9 @@ fn explicit_models_override_wins_over_persisted_config() {
 fn user_tier_config_is_the_fallback_when_project_tier_is_absent() {
     let mut harness = harness(
         vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("done".to_owned()),
         ],
         &[(
@@ -704,7 +711,9 @@ fn repeat_invocations_succeed_with_fresh_quota_and_no_reprompt() {
 fn unconfigured_provider_target_fails_honestly_naming_login() {
     let mut harness = harness(
         vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("relayed".to_owned()),
         ],
         &[],
@@ -726,7 +735,9 @@ fn unconfigured_provider_target_fails_honestly_naming_login() {
 fn denied_agent_spawn_is_a_failed_tool_result() {
     let mut harness = harness(
         vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("adapted".to_owned()),
         ],
         &[],
@@ -826,7 +837,9 @@ fn unwired_tool_call_fails_honestly() {
     let providers = ProviderSet::single_named(
         "fixture",
         ScriptedProvider::new(vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("relayed".to_owned()),
         ]),
     );

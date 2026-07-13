@@ -26,18 +26,18 @@ pub(super) const CODE_SWARM_REVIEW_TOOL: &str = "code_swarm_review";
 pub(super) const EXTENSION_ID: &str = "code-swarm";
 const REVIEW_COMMAND: &str = "review";
 /// Matches the extension's `--prompt` ArgSpec bound.
-const MAX_FOCUS_BYTES: usize = 2000;
+const MAX_FOCUS_BYTES: usize = 256 * 1024;
 
 pub(super) fn code_swarm_review_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: CODE_SWARM_REVIEW_TOOL.to_owned(),
-        description: "Run the user's configured CodeSwarm reviewer models over the current session and return every reviewer's findings for you to adjudicate. This is a stage-agnostic review gate: call it at checkpoints — after drafting a plan, after implementing a change, after preparing a diff, or before finalizing an analysis or draft — and call it again after revisions. Pass `focus` to name the subject under review. The result carries a K-of-N success summary, a consolidated artifact reference, and each reviewer's raw findings; judge validity yourself and report a triaged conclusion — the tool does not filter or vote. Reviewer models come from the user's persisted /code-swarm configuration; only pass `models` when the user explicitly named one-off targets, never guessed ones. If the tool reports that no reviewers are configured, relay its remediation options to the user.".to_owned(),
+        description: "Run the user's configured CodeSwarm reviewer models over explicit context and return every reviewer's findings for you to adjudicate. This is a stage-agnostic review gate: call it at checkpoints after assembling the plan, diff, files, PR material, analysis, or draft that reviewers need. Ambient session canvas is never included. Put the complete bounded review subject in `focus`; reviewers cannot inspect omitted session history or use tools. The result carries a K-of-N success summary, a consolidated artifact reference, and each reviewer's raw findings; judge validity yourself and report a triaged conclusion — the tool does not filter or vote. Reviewer models come from the user's persisted /code-swarm configuration; only pass `models` when the user explicitly named one-off targets, never guessed ones. If the tool reports that no reviewers are configured, relay its remediation options to the user.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "focus": {
                     "type": "string",
-                    "description": "What to review (a plan, a diff, an analysis, ...); carried into every reviewer brief."
+                    "description": "Complete bounded context to review, at most 262144 UTF-8 bytes (plan, diff, file excerpts, PR material, analysis, or draft). Ambient session canvas is not included."
                 },
                 "personas": {
                     "type": "array",
@@ -124,6 +124,13 @@ impl<D: PermissionDecider> Session<D> {
 
     fn run_code_swarm_review(&mut self, input: &Value) -> Result<String, ReviewToolFailure> {
         let args = parse_review_tool_args(input).map_err(ReviewToolFailure::Honest)?;
+        if args.focus.is_none() {
+            return Err(ReviewToolFailure::Honest(
+                "code-swarm review requires explicit focus context; provide the bounded plan, \
+                 diff, file excerpts, PR material, analysis, or draft to review"
+                    .to_owned(),
+            ));
+        }
         let Some(extension) = self.code_swarm_extension.clone() else {
             return Err(ReviewToolFailure::Honest(
                 "the code_swarm_review tool is not wired into this session (the code-swarm \
@@ -271,12 +278,15 @@ fn parse_review_tool_args(input: &Value) -> Result<ReviewToolArgs, String> {
         }
     }
     let focus = optional_string(object, "focus")?;
+    if focus.as_ref().is_some_and(|focus| focus.trim().is_empty()) {
+        return Err("focus must contain explicit review context".to_owned());
+    }
     if focus
         .as_ref()
         .is_some_and(|focus| focus.len() > MAX_FOCUS_BYTES)
     {
         return Err(format!(
-            "focus exceeds {MAX_FOCUS_BYTES} bytes; shorten it — reviewers see the session canvas already"
+            "focus exceeds {MAX_FOCUS_BYTES} bytes; shorten or select the most relevant explicit excerpts"
         ));
     }
     // An empty model-facing optional list names no one-off override, so let

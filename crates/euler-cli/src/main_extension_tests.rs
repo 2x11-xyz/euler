@@ -366,7 +366,7 @@ fn headless_code_swarm_review_spawns_reviewer_and_persists_report_artifact() {
 
     let report_line = execute_headless_extension_run(
         &mut session,
-        "code-swarm.review {\"models\":[\"fixture::echo\"],\"reviewers\":[\"tests\"],\"max_tokens\":2048}",
+        "code-swarm.review {\"models\":[\"fixture::echo\"],\"reviewers\":[\"tests\"],\"prompt\":\"Review the explicit tiny-change summary.\",\"max_tokens\":2048}",
     );
 
     assert_eq!(report_line["type"], json!("extension_run_result"));

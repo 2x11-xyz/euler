@@ -11,6 +11,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REVIEW_COMMAND: &str = "review";
 const REVIEW_REPORT_SCHEMA: &str = "euler.code_swarm.review_report.v1";
 const REVIEW_REPORT_MEDIA_TYPE: &str = "application/vnd.euler.code-swarm.review.v1+json";
+const MAX_REVIEW_CONTEXT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_TOKENS: u64 = 8192;
 const PERSONA_PREFIX: &str = "code-swarm-";
 /// Hard cap on reviewer agents per swarm (matches the prototype's limit).
@@ -52,7 +53,7 @@ impl ExtensionCommand for ReviewCommand {
         CommandDescriptor {
             name: REVIEW_COMMAND.to_owned(),
             display_name: "Run CodeSwarm review".to_owned(),
-            summary: "Run 1-5 review-only agents over the current session and write a consolidated review artifact.".to_owned(),
+            summary: "Run 1-5 review-only agents over explicit bounded context and write a consolidated review artifact.".to_owned(),
             required_capabilities: vec![Capability::AgentSpawn, Capability::ArtifactWrite],
             args: review_args(),
             accepts_session_id: false,
@@ -166,7 +167,7 @@ const CHARTERS: &[Charter] = &[
 
 const CORRECTNESS_PROMPT: &str = r#"You are the CodeSwarm correctness reviewer for Euler.
 Stay review-only: do not ask to edit files, run tools, change workflow policy, or take over implementation.
-Inspect the work visible in the current session canvas and look for bugs, broken invariants, edge cases, inconsistent data shapes, missing error paths, and places where the implementation only satisfies the obvious happy path.
+Inspect only the explicit review context in the task brief and look for bugs, broken invariants, edge cases, inconsistent data shapes, missing error paths, and places where the implementation only satisfies the obvious happy path.
 Check whether the implementation respects the contracts named by the user, whether identifiers and schemas line up across boundaries, and whether bounded inputs still behave correctly at zero, one, maximum, and malformed values.
 Call out any place where the design seems to encode a test assertion instead of a real invariant, or where two owners now exist for one concept.
 Prefer concrete findings tied to visible evidence. If a concern is speculative, label it as such and say what evidence would confirm it.
@@ -174,7 +175,7 @@ Return a concise plaintext review with: summary, findings, and any blocking reco
 
 const SAFETY_PROMPT: &str = r#"You are the CodeSwarm safety reviewer for Euler.
 Stay review-only: do not ask to edit files, run tools, change workflow policy, or take over implementation.
-Inspect the work visible in the current session canvas for security and trust-boundary risks: secret handling, prompt or command injection surfaces, capability escalation, provenance leakage, unbounded output, filesystem authority, and unsafe interpretation of provider-owned artifacts.
+Inspect only the explicit review context in the task brief for security and trust-boundary risks: secret handling, prompt or command injection surfaces, capability escalation, provenance leakage, unbounded output, filesystem authority, and unsafe interpretation of provider-owned artifacts.
 Check least-privilege declarations against the actual host APIs used. Treat resolved secrets, provider-opaque reasoning, raw filesystem authority, and extension/agent boundaries as high-signal review targets.
 Do not invent a sandbox guarantee for native extensions; focus on honest capability surfaces, redaction, and whether persisted artifacts could amplify sensitive material already present in provenance.
 Prefer precise, actionable findings. Distinguish an actual leak or bypass from a general hardening idea.
@@ -182,7 +183,7 @@ Return a concise plaintext review with: summary, findings, and any blocking reco
 
 const TESTS_PROMPT: &str = r#"You are the CodeSwarm tests reviewer for Euler.
 Stay review-only: do not ask to edit files, run tools, change workflow policy, or take over implementation.
-Inspect the work visible in the current session canvas for coverage honesty: assertions that only mirror implementation, laundered fixtures, missing adversarial cases, untested stop conditions, under-specified failure paths, and tests that require production-only compatibility shims.
+Inspect only the explicit review context in the task brief for coverage honesty: assertions that only mirror implementation, laundered fixtures, missing adversarial cases, untested stop conditions, under-specified failure paths, and tests that require production-only compatibility shims.
 Check that tests exercise the real public composition path, not just private helpers. Prefer tests that would fail for wrong pairing keys, missing capability declarations, bad unknown-field handling, and accidental inclusion of unrelated agent results.
 Call out any requirement that cannot be tested honestly against production shapes without adding compatibility shims or test-only fields.
 Prefer findings that would catch real regressions. Say when existing coverage is sufficient.
@@ -218,10 +219,18 @@ impl ReviewInput {
         if models.is_empty() {
             return Err(input_error(UNCONFIGURED_MESSAGE));
         }
+        let prompt = optional_string(object, "prompt")?
+            .filter(|prompt| !prompt.trim().is_empty())
+            .ok_or_else(|| input_error("code-swarm review requires explicit prompt context"))?;
+        if prompt.len() > MAX_REVIEW_CONTEXT_BYTES {
+            return Err(input_error(format!(
+                "prompt exceeds the {MAX_REVIEW_CONTEXT_BYTES}-byte review context limit"
+            )));
+        }
         Ok(Self {
             charters: parse_charters(object.get("reviewers"))?,
             models,
-            prompt: optional_string(object, "prompt")?.filter(|prompt| !prompt.trim().is_empty()),
+            prompt: Some(prompt),
             max_tokens: parse_positive_u64(object, "max_tokens", DEFAULT_MAX_TOKENS)?,
         })
     }
@@ -345,7 +354,9 @@ fn review_args() -> Vec<ArgSpec> {
         ArgSpec {
             flag: "prompt".to_owned(),
             input_key: "prompt".to_owned(),
-            value_kind: ArgValueKind::BoundedString { max_bytes: 2000 },
+            value_kind: ArgValueKind::BoundedString {
+                max_bytes: MAX_REVIEW_CONTEXT_BYTES,
+            },
             required: false,
             repeatable: false,
         },
@@ -365,22 +376,21 @@ fn charter_task(
     prompt: Option<&str>,
     max_tokens: u64,
 ) -> SpawnAgentTask {
-    // Stage-agnostic brief: the subject may be a plan, a code change, an
-    // analysis, or a draft — the review focus names it when given.
-    let mut task = format!(
-        "Review the subject visible in this session as the {} reviewer. Companion agents see the session canvas; no event listing is needed. The subject may be a plan, a code change, an analysis, or a draft. Stay review-only and return findings: specific, checkable claims tied to a location in the subject (file, section, or step), not a prose essay.",
+    // Stage-agnostic, self-contained brief: callers explicitly assemble the
+    // plan, files, diff, or PR context they want reviewed. CodeSwarm never
+    // smuggles the ambient parent canvas into reviewer requests.
+    let task = format!(
+        "Review only the explicit subject supplied in the separate context message as the {} reviewer. Do not assume access to the parent session or infer omitted context. The subject may be a plan, a code change, an analysis, or a draft. Stay review-only and return findings: specific, checkable claims tied to a location in the subject (file, section, or step), not a prose essay.",
         charter.name
     );
-    if let Some(prompt) = prompt {
-        task.push_str("\nReview focus: ");
-        task.push_str(prompt);
-    }
     SpawnAgentTask {
         task,
         persona: format!("{PERSONA_PREFIX}{}", charter.name),
         provider: target.provider.clone(),
         model: target.model.clone(),
         system_prompt: charter.system_prompt.to_owned(),
+        explicit_context: prompt.map(str::to_owned),
+        include_parent_canvas: false,
         capabilities: Vec::new(),
         max_turns: Some(1),
         max_tool_calls: Some(0),
@@ -507,7 +517,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn models_input(models: &[&str]) -> Value {
-        json!({ "models": models })
+        json!({ "models": models, "prompt": "review this explicit subject" })
     }
 
     #[test]
@@ -552,13 +562,20 @@ mod tests {
         // Fourth agent cycles back to the first charter.
         assert_eq!(tasks[3].persona, "code-swarm-correctness");
         for task in tasks.iter() {
-            assert!(task.task.contains("Review focus: focus on the parser"));
+            assert_eq!(
+                task.explicit_context.as_deref(),
+                Some("focus on the parser")
+            );
             assert!(
                 task.task
                     .contains("plan, a code change, an analysis, or a draft"),
                 "brief must stay stage-agnostic"
             );
             assert!(task.task.contains("findings"), "brief demands findings");
+            assert!(
+                !task.include_parent_canvas,
+                "review context must be explicit"
+            );
             assert!(task.capabilities.is_empty(), "reviewers stay review-only");
             assert_eq!(task.max_turns, Some(1));
             assert_eq!(task.max_tool_calls, Some(0));
@@ -644,7 +661,7 @@ mod tests {
     #[test]
     fn review_selects_requested_charter_and_budget() {
         let host = MockHost::default();
-        let input = json!({"models": ["a::b"], "reviewers": ["tests"], "max_tokens": 123});
+        let input = json!({"models": ["a::b"], "reviewers": ["tests"], "max_tokens": 123, "prompt": "explicit subject"});
         let _ = ReviewCommand
             .execute(CommandContext { input }, &host)
             .expect("review output");
@@ -686,13 +703,14 @@ mod tests {
     #[test]
     fn review_rejects_over_cap_reviewer_lists_and_unknown_personas() {
         let host = MockHost::default();
-        let input = json!({"models": ["a::b"], "reviewers": ["tests", "tests", "tests", "tests", "tests", "tests"]});
+        let input = json!({"models": ["a::b"], "reviewers": ["tests", "tests", "tests", "tests", "tests", "tests"], "prompt": "explicit subject"});
         let error = ReviewCommand
             .execute(CommandContext { input }, &host)
             .expect_err("over-cap reviewers");
         assert!(error.to_string().contains("cap is 5"));
 
-        let input = json!({"models": ["a::b"], "reviewers": ["astrology"]});
+        let input =
+            json!({"models": ["a::b"], "reviewers": ["astrology"], "prompt": "explicit subject"});
         let error = ReviewCommand
             .execute(CommandContext { input }, &host)
             .expect_err("unknown persona");
@@ -709,7 +727,7 @@ mod tests {
         let error = ReviewCommand
             .execute(
                 CommandContext {
-                    input: json!({"models": ["a::b"], "extra": true}),
+                    input: json!({"models": ["a::b"], "prompt": "explicit subject", "extra": true}),
                 },
                 &MockHost::default(),
             )

@@ -209,6 +209,13 @@ pub struct SpawnAgentTask {
     pub provider: String,
     pub model: String,
     pub system_prompt: String,
+    /// Bounded caller-assembled context sent to the child but represented in
+    /// provenance by metadata rather than duplicated verbatim per child.
+    pub explicit_context: Option<String>,
+    /// Whether the child request receives the parent's active canvas before
+    /// its explicit task brief. Self-contained review workflows leave this
+    /// false so unrelated session history is not sent implicitly.
+    pub include_parent_canvas: bool,
     pub capabilities: Vec<Capability>,
     pub max_turns: Option<u64>,
     pub max_tool_calls: Option<u64>,

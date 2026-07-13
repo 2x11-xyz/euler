@@ -67,25 +67,32 @@ impl<D: PermissionDecider> Session<D> {
             .ok_or(SessionError::CompanionProvenanceUnavailable)?;
         self.persist_new_events()?;
 
-        // Phase 1 (session thread, batch order): shared canvas, then per
-        // task agent.spawn + canvas.snapshot + model.call and the request.
-        let canvas = assemble_canvas(self.bus.events(), &self.config.auto_compaction);
-        if let Some(error) = context_budget_exhausted(self.config.auto_compaction, &canvas) {
-            let agent_id = self.config.agent_id.clone();
-            self.appender_as(&writer, &agent_id).append(
-                EventKind::ERROR,
-                object([
-                    ("source", "companion".into()),
-                    ("message", error.to_string().into()),
-                ]),
-                None,
-            )?;
-            return Err(error);
+        // Phase 1 (session thread, batch order): assemble the parent canvas
+        // only when at least one task explicitly requests it. Self-contained
+        // review briefs do not inherit ambient session history.
+        let include_parent_canvas = tasks.iter().any(AgentTask::includes_parent_canvas);
+        let canvas = if include_parent_canvas {
+            assemble_canvas(self.bus.events(), &self.config.auto_compaction)
+        } else {
+            Vec::new()
+        };
+        if include_parent_canvas {
+            if let Some(error) = context_budget_exhausted(self.config.auto_compaction, &canvas) {
+                let agent_id = self.config.agent_id.clone();
+                self.appender_as(&writer, &agent_id).append(
+                    EventKind::ERROR,
+                    object([
+                        ("source", "companion".into()),
+                        ("message", error.to_string().into()),
+                    ]),
+                    None,
+                )?;
+                return Err(error);
+            }
         }
-        let canvas_input: Vec<ModelInputItem> = canvas.iter().map(model_input_item).collect();
         let mut prepared = Vec::with_capacity(tasks.len());
         for task in tasks {
-            prepared.push(self.prepare_reviewer(task, &writer, &canvas, &canvas_input)?);
+            prepared.push(self.prepare_reviewer(task, &writer, &canvas)?);
         }
 
         // Phase 2 (worker threads): concurrent provider calls. Workers
@@ -119,13 +126,17 @@ impl<D: PermissionDecider> Session<D> {
         task: AgentTask,
         writer: &Arc<crate::provenance::ProvenanceWriter>,
         canvas: &[crate::CanvasItem],
-        canvas_input: &[ModelInputItem],
     ) -> Result<PreparedReviewer, SessionError> {
         let target = self.resolve_companion_target(&task)?;
         let spawned = self.record_companion_spawn(&task, &target, writer)?;
         let child_agent_id = spawned.child_agent_id().to_owned();
+        let task_canvas = if task.includes_parent_canvas() {
+            canvas
+        } else {
+            &[]
+        };
         let snapshot_payload =
-            canvas_snapshot_payload(canvas, self.config.auto_compaction, None, None);
+            canvas_snapshot_payload(task_canvas, self.config.auto_compaction, None, None);
         self.appender_as(writer, &child_agent_id).append(
             EventKind::CANVAS_SNAPSHOT,
             snapshot_payload,
@@ -140,7 +151,7 @@ impl<D: PermissionDecider> Session<D> {
         let mut model_call = object([
             ("provider", target.provider.clone().into()),
             ("model", target.model.clone().into()),
-            ("canvas_items", canvas.len().into()),
+            ("canvas_items", task_canvas.len().into()),
             (
                 "requested_reasoning_effort",
                 self.config.reasoning_effort.as_str().into(),
@@ -159,7 +170,13 @@ impl<D: PermissionDecider> Session<D> {
             .appender_as(writer, &child_agent_id)
             .append(EventKind::MODEL_CALL, model_call, None)?
             .id;
-        let mut input = canvas_input.to_vec();
+        let mut input: Vec<ModelInputItem> = task_canvas.iter().map(model_input_item).collect();
+        if let Some(context) = task.explicit_context() {
+            input.push(ModelInputItem::Message {
+                role: ModelRole::User,
+                content: context.to_owned(),
+            });
+        }
         input.push(ModelInputItem::Message {
             role: ModelRole::User,
             content: task.task().to_owned(),

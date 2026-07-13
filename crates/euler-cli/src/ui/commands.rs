@@ -857,9 +857,9 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
 /// No arg: open the reviewer-model checklist picker (selection IS the
 /// count); the save persists to the project tier, or the user tier with
 /// `--user`. `clear [--user]` removes one tier's config.
-/// `review [--personas a,b,c] [--prompt <text…>]`: run the swarm.
+/// `review [--personas a,b,c] --prompt <text…>`: run the swarm.
 fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
-    const USAGE: &str = "usage: /code-swarm [--user]  ·  /code-swarm clear [--user]  ·  /code-swarm review [--personas correctness,safety,tests] [--prompt <focus…>]";
+    const USAGE: &str = "usage: /code-swarm [--user]  ·  /code-swarm clear [--user]  ·  /code-swarm review [--personas correctness,safety,tests] --prompt <explicit context…>";
     let enabled = context
         .extension_items
         .iter()
@@ -894,9 +894,15 @@ fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffe
                 return CommandEffect::Message(USAGE.to_owned());
             }
             match parse_code_swarm_review_args(rest.trim_start()) {
-                Ok((prompt, personas)) => {
-                    CommandEffect::Action(CommandAction::CodeSwarmReview { prompt, personas })
+                Ok((Some(prompt), personas)) => {
+                    CommandEffect::Action(CommandAction::CodeSwarmReview {
+                        prompt: Some(prompt),
+                        personas,
+                    })
                 }
+                Ok((None, _)) => CommandEffect::Message(format!(
+                    "code-swarm review requires --prompt with explicit review context\n{USAGE}"
+                )),
                 Err(message) => CommandEffect::Message(format!("{message}\n{USAGE}")),
             }
         }
@@ -958,6 +964,20 @@ fn extension_slash_or_unknown(
             Ok(values) => values,
             Err(message) => return CommandEffect::Message(message),
         };
+        if cmd.extension_id == "code-swarm" && cmd.command == "review" {
+            let has_json_prompt = input
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|prompt| !prompt.trim().is_empty());
+            let has_flag_prompt = raw_args
+                .as_deref()
+                .is_some_and(|args| args.split_whitespace().any(|arg| arg == "--prompt"));
+            if !has_json_prompt && !has_flag_prompt {
+                return CommandEffect::Message(format!(
+                    "{token} requires explicit review context: pass --prompt <context> or JSON with a non-empty prompt"
+                ));
+            }
+        }
         return CommandEffect::Action(CommandAction::ExtensionRun {
             id: cmd.extension_id.clone(),
             command: cmd.command.clone(),
@@ -1570,10 +1590,9 @@ mod tests {
         );
         assert_eq!(
             dispatch_command("/code-swarm review", &context),
-            CommandEffect::Action(CommandAction::CodeSwarmReview {
-                prompt: None,
-                personas: None,
-            })
+            CommandEffect::Message(
+                "code-swarm review requires --prompt with explicit review context\nusage: /code-swarm [--user]  ·  /code-swarm clear [--user]  ·  /code-swarm review [--personas correctness,safety,tests] --prompt <explicit context…>".to_owned()
+            )
         );
         assert!(matches!(
             dispatch_command("/code-swarm review --bogus", &context),
@@ -1620,22 +1639,30 @@ mod tests {
 
         // JSON argument parses into the input.
         assert_eq!(
-            dispatch_command("/review {\"reviewers\":[\"tests\"]}", &context),
+            dispatch_command(
+                "/review {\"reviewers\":[\"tests\"],\"prompt\":\"explicit subject\"}",
+                &context
+            ),
             CommandEffect::Action(CommandAction::ExtensionRun {
                 id: "code-swarm".to_owned(),
                 command: "review".to_owned(),
-                input: serde_json::json!({"reviewers": ["tests"]}),
+                input: serde_json::json!({"reviewers": ["tests"], "prompt": "explicit subject"}),
                 raw_args: None,
             })
         );
         // Flag arguments travel to resolve-time ArgSpec parsing.
         assert_eq!(
-            dispatch_command("/review --reviewer tests --model a::b", &context),
+            dispatch_command(
+                "/review --reviewer tests --model a::b --prompt explicit-subject",
+                &context
+            ),
             CommandEffect::Action(CommandAction::ExtensionRun {
                 id: "code-swarm".to_owned(),
                 command: "review".to_owned(),
                 input: serde_json::json!({}),
-                raw_args: Some("--reviewer tests --model a::b".to_owned()),
+                raw_args: Some(
+                    "--reviewer tests --model a::b --prompt explicit-subject".to_owned()
+                ),
             })
         );
         // Invalid JSON is an error, not a silent default run.
@@ -1648,16 +1675,10 @@ mod tests {
             dispatch_command("/review tests please", &context),
             CommandEffect::Message(message) if message.contains("usage:")
         ));
-        // No argument still dispatches with empty input.
-        assert_eq!(
+        assert!(matches!(
             dispatch_command("/review", &context),
-            CommandEffect::Action(CommandAction::ExtensionRun {
-                id: "code-swarm".to_owned(),
-                command: "review".to_owned(),
-                input: serde_json::json!({}),
-                raw_args: None,
-            })
-        );
+            CommandEffect::Message(message) if message.contains("requires explicit review context")
+        ));
     }
 
     #[test]

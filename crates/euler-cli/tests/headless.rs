@@ -2782,7 +2782,7 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#""runtime_kind":"native-rust","capabilities":["agent-spawn","#,
                 r#""artifact-write"],"commands":[{{"name":"review","#,
                 r#""display_name":"Run CodeSwarm review","#,
-                r#""summary":"Run 1-5 review-only agents over the current session and write a consolidated review artifact.","#,
+                r#""summary":"Run 1-5 review-only agents over explicit bounded context and write a consolidated review artifact.","#,
                 r#""required_capabilities":["agent-spawn","artifact-write"]}}]}}"#,
                 "\n"
             ),
@@ -3423,6 +3423,8 @@ fn extension_cli_code_swarm_review_validates_input_and_stays_live_only() {
             &session_id,
             "--model",
             "fixture::fixture-model",
+            "--prompt",
+            "explicit offline review subject",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3573,7 +3575,14 @@ fn headless_run_code_swarm_review_uses_persisted_project_config() {
 "#,
     );
 
-    let result = run_headless_code_swarm_review(exe, &home, root.path(), &script, &log, "{}");
+    let result = run_headless_code_swarm_review(
+        exe,
+        &home,
+        root.path(),
+        &script,
+        &log,
+        r#"{"prompt":"explicit configured review subject"}"#,
+    );
     assert_eq!(result["type"], serde_json::json!("extension_run_result"));
     let reviewers = &result["result"]["reviewers"];
     assert_eq!(reviewers[0]["model"], serde_json::json!("config-model"));
@@ -3617,7 +3626,7 @@ fn headless_run_code_swarm_review_explicit_models_override_persisted_config() {
         root.path(),
         &script,
         &log,
-        "{\"models\":[\"fixture::override-model\"]}",
+        "{\"models\":[\"fixture::override-model\"],\"prompt\":\"explicit override review subject\"}",
     );
     let reviewers = &result["result"]["reviewers"];
     assert_eq!(reviewers[0]["model"], serde_json::json!("override-model"));

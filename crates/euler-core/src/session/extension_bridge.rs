@@ -135,6 +135,12 @@ fn convert_spawn_task(task: SpawnAgentTask) -> Result<AgentTask, ExtensionError>
             .with_system_prompt(&task.system_prompt)
             .map_err(invalid_spawn_task)?;
     }
+    if let Some(context) = &task.explicit_context {
+        agent_task = agent_task
+            .with_explicit_context(context)
+            .map_err(invalid_spawn_task)?;
+    }
+    agent_task = agent_task.with_parent_canvas(task.include_parent_canvas);
     let budget = AgentBudget::new(
         budget_u32("max_turns", task.max_turns)?,
         budget_u32("max_tool_calls", task.max_tool_calls)?,

@@ -272,6 +272,8 @@ impl RefreshInput {
             provider: self.provider.clone(),
             model: self.model.clone(),
             system_prompt,
+            explicit_context: None,
+            include_parent_canvas: true,
             capabilities: Vec::new(),
             max_turns: Some(1),
             max_tool_calls: Some(0),

@@ -711,6 +711,12 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         }
         let model_call_id = self.append(EventKind::MODEL_CALL, model_call, None)?.id;
         let mut input = canvas.iter().map(model_input_item).collect::<Vec<_>>();
+        if let Some(context) = self.task.explicit_context() {
+            input.push(ModelInputItem::Message {
+                role: ModelRole::User,
+                content: context.to_owned(),
+            });
+        }
         input.push(ModelInputItem::Message {
             role: ModelRole::User,
             content: self.task.task().to_owned(),
