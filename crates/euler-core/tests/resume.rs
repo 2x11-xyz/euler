@@ -437,31 +437,34 @@ fn model_call_tail_appends_nothing() {
     .expect("resume");
 
     assert_eq!(session.events().len(), 1);
-    assert_eq!(line_count(&log), 2);
+    assert_eq!(line_count(&log), 1);
 }
 
 #[test]
-fn resume_appends_a_durable_session_resumed_marker() {
-    // Issue #6: resuming appends a durable SESSION_RESUMED marker to the log
-    // recording the tail it continued from and the active provider/model. The
-    // marker is a log-leaf — it is NOT in the resumed session's in-memory event
-    // view, so it never enters the conversation's causal chain.
+fn resume_marker_is_a_log_leaf_emitted_at_the_first_continued_turn() {
+    // Issue #6: the durable SESSION_RESUMED marker is emitted lazily at the
+    // FIRST continued turn (not at resume-open), as a LOG-LEAF — it records the
+    // tail it continued from, is absent from the session's in-memory event view,
+    // and parents off the real tail rather than becoming the parent of the
+    // continued turn (so the causal chain matches an uninterrupted run).
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
     let seed = model_call(None);
     let seed_id = seed.id.clone();
     write_events(&log, &[seed]);
 
-    let session = resume_session(
+    let mut session = resume_session(
         SessionConfig::new(temp.path()),
-        ProviderSet::single(ScriptedProvider::new(vec![])),
+        ProviderSet::single(ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "done".to_owned(),
+        )])),
         CountingDecider::default(),
         &log,
     )
     .expect("resume");
+    session.run_turn("continue").expect("turn");
 
-    // Durable in the log, but absent from the in-memory session view.
-    assert_eq!(session.events().len(), 1);
+    // Absent from the in-memory session view — it is a log-leaf, not in the bus.
     assert!(session
         .events()
         .iter()
@@ -481,14 +484,33 @@ fn resume_appends_a_durable_session_resumed_marker() {
         "marker records the tail it continued from"
     );
     assert_eq!(marker.parent.as_deref(), Some(seed_id.as_str()));
+    // The continued turn parents off the SAME real tail — the marker is a
+    // sibling leaf, never the parent of the conversation.
+    let user_message = logged
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .expect("continued user message");
+    assert_eq!(user_message.parent.as_deref(), Some(seed_id.as_str()));
     assert!(marker
         .payload
         .get("provider")
         .and_then(serde_json::Value::as_str)
         .is_some());
-    assert!(marker.payload.get("model").and_then(serde_json::Value::as_str).is_some());
+    assert!(marker
+        .payload
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
     // Audit metadata only — never conversation content.
     assert!(marker.payload.get("content").is_none());
+    // Exactly one marker per resumed lifetime.
+    assert_eq!(
+        logged
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::SESSION_RESUMED)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -509,7 +531,7 @@ fn model_call_then_reasoning_tail_appends_nothing() {
 
     assert!(recovery_closures(session.events()).is_empty());
     assert_eq!(session.events().len(), 2);
-    assert_eq!(line_count(&log), 3);
+    assert_eq!(line_count(&log), 2);
 }
 
 #[test]
@@ -527,7 +549,7 @@ fn user_message_tail_appends_nothing() {
     .expect("resume");
 
     assert_eq!(session.events().len(), 1);
-    assert_eq!(line_count(&log), 2);
+    assert_eq!(line_count(&log), 1);
 }
 
 #[test]
@@ -670,7 +692,7 @@ fn resume_ignores_missing_extension_artifact_file() {
     assert!(!outcome.recovery_closure_appended);
     assert!(recovery_closures(outcome.session.events()).is_empty());
     assert_eq!(outcome.session.events()[1].id, artifact.id);
-    assert_eq!(line_count(&log), 3);
+    assert_eq!(line_count(&log), 2);
 }
 
 #[test]
@@ -706,7 +728,7 @@ fn resume_ignores_corrupt_extension_artifact_file() {
         fs::read(&artifact_path).expect("artifact still present"),
         b"corrupt artifact bytes"
     );
-    assert_eq!(line_count(&log), 3);
+    assert_eq!(line_count(&log), 2);
 }
 
 #[test]
@@ -766,7 +788,7 @@ fn tail_unmatched_prompt_warns_and_is_not_synthesized() {
     .expect("resume");
 
     assert!(recovery_closures(session.events()).is_empty());
-    assert_eq!(line_count(&log), 3);
+    assert_eq!(line_count(&log), 2);
 }
 
 #[test]
@@ -842,7 +864,7 @@ fn mid_stream_unmatched_tool_call_is_not_synthesized() {
     .expect("resume");
 
     assert!(recovery_closures(session.events()).is_empty());
-    assert_eq!(line_count(&log), 3);
+    assert_eq!(line_count(&log), 2);
 }
 
 #[test]

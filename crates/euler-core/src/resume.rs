@@ -261,35 +261,24 @@ pub fn resume_session_from_folded_prefix<D>(
         folded.events.push(closure);
         recovery_closure_appended = true;
     }
-    // Durable resume marker (issue #6): a new lifetime begins here. Appended to
-    // the LOG only, NOT the in-memory bus — so it is a leaf annotation off the
-    // resume boundary rather than an inline chain link. This keeps the resumed
-    // session's event view and the conversation's parent chain identical to an
-    // uninterrupted run (the first continued turn still parents off the real
-    // tail, not the marker), while the boundary stays durably auditable. Same
-    // append-to-disk-not-bus pattern as the scrub audit event. Recorded after
-    // any recovery closure (interrupted-lifetime cleanup) so the log order
-    // reads close-old-turn -> resume. Never carries user or model content.
-    // Idempotence: if the accepted tail is already a resume marker, nothing
-    // continued the lifetime since the last resume — this is a pure
-    // re-inspection, so a second marker would only grow the log. Skip it so
-    // repeated open-and-inspect resumes stay byte-identical.
-    let already_marked = folded
-        .events
-        .last()
-        .is_some_and(|event| event.kind.as_str() == EventKind::SESSION_RESUMED);
-    if !already_marked {
-        let marker = session_resumed_marker(
-            &config.session_id,
-            &config.agent_id,
-            &active_target,
-            folded.events.last().map(|event| event.id.clone()),
-            events_folded,
-        );
-        writer
-            .append(std::slice::from_ref(&marker))
-            .map_err(ResumeError::Append)?;
-    }
+    // Durable resume marker (issue #6): the marker is ARMED here but NOT
+    // appended — it is emitted lazily to the LOG only (never the bus) at the
+    // FIRST continued turn. Consequences:
+    //   * an open-and-inspect resume that never continues appends nothing, so
+    //     repeated inspection is byte-identical (idempotent);
+    //   * a continuation records exactly one marker per resumed lifetime;
+    //   * as a log-leaf off the real tail, the marker never becomes the parent
+    //     of the first continued turn, so the resumed session's event view and
+    //     causal chain stay identical to an uninterrupted run.
+    // Built now because it needs the config ids and the accepted tail, before
+    // `config` is moved into the session. Never carries user or model content.
+    let resume_marker = session_resumed_marker(
+        &config.session_id,
+        &config.agent_id,
+        &active_target,
+        folded.events.last().map(|event| event.id.clone()),
+        events_folded,
+    );
     let events_len = folded.events.len();
     let mut config = config;
     config.reasoning_effort = reasoning_effort;
@@ -303,6 +292,7 @@ pub fn resume_session_from_folded_prefix<D>(
         folded.context_limit_emitted,
     )
     .with_provenance(writer);
+    session.arm_resume_marker(resume_marker);
     for capability in session_allowed {
         session.set_permission_mode(capability, ApprovalMode::SessionAllow);
     }
