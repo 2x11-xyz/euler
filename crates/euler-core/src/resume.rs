@@ -261,6 +261,27 @@ pub fn resume_session_from_folded_prefix<D>(
         folded.events.push(closure);
         recovery_closure_appended = true;
     }
+    // Durable resume marker (issue #6): the marker is ARMED here but NOT
+    // appended — the provenance writer emits it lazily to the LOG only (never
+    // the bus) with the FIRST durable activity after resume. Consequences:
+    //   * an open-and-inspect resume that never continues appends nothing, so
+    //     repeated inspection is byte-identical (idempotent);
+    //   * a continuation records exactly one marker per resumed lifetime;
+    //   * as a log-leaf off the real tail, the marker never becomes the parent
+    //     of the first continued turn, so the resumed session's event view and
+    //     causal chain stay identical to an uninterrupted run.
+    // Built now because it needs the config ids and the accepted tail, before
+    // `config` is moved into the session. Never carries user or model content.
+    let resume_marker = session_resumed_marker(
+        &config.session_id,
+        &config.agent_id,
+        &active_target,
+        folded.events.last().map(|event| event.id.clone()),
+        events_folded,
+    );
+    writer
+        .arm_resume_marker(resume_marker)
+        .map_err(ResumeError::Append)?;
     let events_len = folded.events.len();
     let mut config = config;
     config.reasoning_effort = reasoning_effort;
@@ -338,6 +359,32 @@ fn verify_and_rehydrate_blobs(
     }
 
     Ok(event)
+}
+
+/// Build the durable `session.resumed` marker for a resume boundary (issue
+/// #6). Payload is audit metadata only — provider/model, the count of folded
+/// events, and the tail event id continued from — never user or model content.
+fn session_resumed_marker(
+    session_id: &str,
+    agent_id: &str,
+    target: &ModelTarget,
+    resumed_from_event_id: Option<String>,
+    events_folded: usize,
+) -> EventEnvelope {
+    let mut payload = euler_event::JsonObject::new();
+    payload.insert("provider".to_owned(), target.provider.clone().into());
+    payload.insert("model".to_owned(), target.model.clone().into());
+    payload.insert("events_folded".to_owned(), events_folded.into());
+    if let Some(from) = &resumed_from_event_id {
+        payload.insert("resumed_from_event_id".to_owned(), from.clone().into());
+    }
+    EventEnvelope::new(
+        session_id.to_owned(),
+        agent_id.to_owned(),
+        resumed_from_event_id,
+        EventKind::SESSION_RESUMED,
+        payload,
+    )
 }
 
 fn recovery_closure(events: &[EventEnvelope]) -> Option<EventEnvelope> {

@@ -713,6 +713,8 @@ fn project_event_with_checkpoints(
         EventKind::SESSION_SUMMARY => payload_string(event, "summary")
             .or_else(|| payload_string(event, "content"))
             .map(TranscriptItem::SessionSummary),
+        // SESSION_RESUMED is a durable provenance-only audit marker (issue #6);
+        // it is not rendered into the conversation transcript.
         EventKind::ERROR => Some(TranscriptItem::Error {
             source: payload_string(event, "source").unwrap_or_default(),
             message: payload_string(event, "message").unwrap_or_default(),

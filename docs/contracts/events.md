@@ -58,6 +58,7 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `agent.message`
 - `agent.result`
 - `session.start`
+- `session.resumed`
 - `session.renamed`
 - `session.summary`
 - `error`
@@ -258,6 +259,13 @@ envelope `v` per `docs/contracts/persistence.md`.
   hard-stop checks. It is telemetry and config projection only; resume
   authority remains the event stream and active model target. Omitted in older
   streams means unknown.
+- `session.resumed`: `provider`, `model`, `events_folded`, optional
+  `resumed_from_event_id`. A durable audit marker recording that the session
+  lifetime was continued, against which target and from which tail event.
+  Audit metadata only — never user or model content. Emitted with the first
+  durable activity of a resumed session (an open-and-inspect resume that never
+  mutates or continues emits none). It is a LOG-LEAF: appended to the log but
+  not the in-memory bus, so it never becomes the parent of continued activity.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,
@@ -345,6 +353,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   accepted in one durable batch.
 - `session.start` has parent null. It is always the session's first
   persisted event.
+- `session.resumed` parents the accepted tail it continued from (the same
+  event the first continued turn parents off). It is a sibling LEAF of that
+  continuation, never its parent — so a resumed lifetime's causal chain is
+  identical to an uninterrupted run.
 - `extension.artifact` parents the previous persisted event at append time.
   Source attribution belongs in `source_event_ids`; those ids do not choose the
   artifact event's parent.

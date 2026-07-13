@@ -559,10 +559,17 @@ fn interrupted_model_tail_resume_idle_equivalence() {
         },
     );
     let resumed_events = read_resume_prefix(&resumed_log).expect("resumed read");
+    // The only thing appended before the frontier turn is the durable resume
+    // marker (issue #6) — no prior exploration is re-burned.
     assert_eq!(
         resumed_events[cut + 1].kind.as_str(),
+        EventKind::SESSION_RESUMED,
+        "interrupted_model_tail records a resume marker at the boundary"
+    );
+    assert_eq!(
+        resumed_events[cut + 2].kind.as_str(),
         EventKind::USER_MESSAGE,
-        "interrupted_model_tail must append nothing before the explicit frontier turn"
+        "interrupted_model_tail frontier turn follows the resume marker"
     );
     assert_eq!(
         recovery_closure_count(&resumed_events),
@@ -905,7 +912,15 @@ fn assert_equivalent_projections(name: &str, expected: &[EventEnvelope], actual:
 fn transcript_projection(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
     events
         .iter()
-        .filter(|event| event.kind.as_str() != EventKind::CANVAS_SNAPSHOT)
+        // CANVAS_SNAPSHOT is layout, SESSION_RESUMED is a resume-boundary audit
+        // marker (issue #6) — neither is conversation content, so equivalence
+        // between a resumed and an uninterrupted run ignores both.
+        .filter(|event| {
+            !matches!(
+                event.kind.as_str(),
+                EventKind::CANVAS_SNAPSHOT | EventKind::SESSION_RESUMED
+            )
+        })
         .cloned()
         .collect()
 }

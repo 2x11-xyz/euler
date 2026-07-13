@@ -22,9 +22,15 @@ pub struct ProvenanceWriter {
     blob_dir: PathBuf,
     threshold: usize,
     policy: PersistPolicy,
-    append_lock: Mutex<Option<EventId>>,
+    append_lock: Mutex<AppendState>,
     event_wakes: EventWakeRegistry,
     _lock: SessionLock,
+}
+
+#[derive(Debug)]
+struct AppendState {
+    durable_tail: Option<EventId>,
+    pending_resume_marker: Option<EventEnvelope>,
 }
 
 impl ProvenanceWriter {
@@ -65,7 +71,10 @@ impl ProvenanceWriter {
             blob_dir,
             threshold,
             policy: PersistPolicy,
-            append_lock: Mutex::new(durable_tail),
+            append_lock: Mutex::new(AppendState {
+                durable_tail,
+                pending_resume_marker: None,
+            }),
             event_wakes: EventWakeRegistry::default(),
             _lock: lock,
         })
@@ -86,7 +95,7 @@ impl ProvenanceWriter {
         build: impl FnOnce(Option<EventId>) -> Vec<EventEnvelope>,
     ) -> io::Result<Vec<EventEnvelope>> {
         let mut append_guard = recover_mutex(&self.append_lock);
-        let tail_at_acquisition = append_guard.clone();
+        let tail_at_acquisition = append_guard.durable_tail.clone();
         let mut events = build(tail_at_acquisition.clone());
         self.assign_batch_parents(&mut events, tail_at_acquisition);
         self.append_locked(&mut append_guard, &events)?;
@@ -97,12 +106,40 @@ impl ProvenanceWriter {
     }
 
     pub fn durable_tail(&self) -> Option<EventId> {
-        recover_mutex(&self.append_lock).clone()
+        recover_mutex(&self.append_lock).durable_tail.clone()
+    }
+
+    /// Arm one log-only resume marker to precede the next durable append.
+    /// Keeping it under the append lock makes the boundary cover every writer
+    /// client (turns, control actions, extensions, and child agents) without
+    /// making the marker part of the session bus or the conversation chain.
+    pub(crate) fn arm_resume_marker(&self, marker: EventEnvelope) -> io::Result<()> {
+        if marker.kind.as_str() != EventKind::SESSION_RESUMED {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pending resume marker has the wrong event kind",
+            ));
+        }
+        let mut state = recover_mutex(&self.append_lock);
+        if state.pending_resume_marker.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a resume marker is already pending",
+            ));
+        }
+        if marker.parent != state.durable_tail {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resume marker does not parent the durable tail",
+            ));
+        }
+        state.pending_resume_marker = Some(marker);
+        Ok(())
     }
 
     fn append_locked(
         &self,
-        durable_tail: &mut Option<EventId>,
+        state: &mut AppendState,
         events: &[EventEnvelope],
     ) -> io::Result<usize> {
         let started = Instant::now();
@@ -113,18 +150,20 @@ impl ProvenanceWriter {
         if persisted_events.is_empty() {
             return Ok(0);
         }
-        let session_id = persisted_events
-            .first()
-            .map(|event| event.session.as_str())
-            .unwrap_or("unknown");
+        let pending_resume_marker = state.pending_resume_marker.clone();
+        let session_id = pending_resume_marker
+            .as_ref()
+            .or_else(|| persisted_events.first().copied())
+            .map_or("unknown", |event| event.session.as_str());
         let log_dir = containing_dir(&self.log_path);
         create_dir_all_durable(log_dir)?;
         create_dir_all_durable(&self.blob_dir)?;
-        let events = persisted_events
-            .into_iter()
+        let event_count = persisted_events.len() + usize::from(pending_resume_marker.is_some());
+        let events = pending_resume_marker
+            .iter()
+            .chain(persisted_events)
             .map(|event| self.externalize_large_payloads(event))
             .collect::<io::Result<Vec<_>>>()?;
-        let event_count = events.len();
         let new_tail = events.last().map(|event| event.id.clone());
         let mut file = OpenOptions::new()
             .create(true)
@@ -147,7 +186,8 @@ impl ProvenanceWriter {
         // pre-append value and the writer surfaces the error. Callers treat
         // append failure as session-fatal, so the stale-tail window is never
         // built upon.
-        *durable_tail = new_tail;
+        state.durable_tail = new_tail;
+        state.pending_resume_marker = None;
         self.event_wakes.notify_advanced();
         crate::diagnostics::provenance_append_end(
             session_id,
@@ -160,7 +200,7 @@ impl ProvenanceWriter {
 
     pub fn open_event_wake(&self) -> Result<EventWakeRegistration, EventWakeError> {
         let append_guard = recover_mutex(&self.append_lock);
-        let baseline_event_id = append_guard.clone();
+        let baseline_event_id = append_guard.durable_tail.clone();
         self.event_wakes.open(baseline_event_id)
     }
 

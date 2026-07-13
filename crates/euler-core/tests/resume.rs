@@ -441,6 +441,120 @@ fn model_call_tail_appends_nothing() {
 }
 
 #[test]
+fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
+    // Issue #6: the durable SESSION_RESUMED marker is emitted lazily at the
+    // FIRST continued turn (not at resume-open), as a LOG-LEAF — it records the
+    // tail it continued from, is absent from the session's in-memory event view,
+    // and parents off the real tail rather than becoming the parent of the
+    // continued turn (so the causal chain matches an uninterrupted run).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let seed = model_call(None);
+    let seed_id = seed.id.clone();
+    write_events(&log, &[seed]);
+
+    let mut session = resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "done".to_owned(),
+        )])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    session.run_turn("continue").expect("turn");
+
+    // Absent from the in-memory session view — it is a log-leaf, not in the bus.
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::SESSION_RESUMED));
+
+    let logged = read_resume_prefix(&log).expect("read log");
+    let marker = logged
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_RESUMED)
+        .expect("resume marker persisted");
+    assert_eq!(
+        marker
+            .payload
+            .get("resumed_from_event_id")
+            .and_then(serde_json::Value::as_str),
+        Some(seed_id.as_str()),
+        "marker records the tail it continued from"
+    );
+    assert_eq!(marker.parent.as_deref(), Some(seed_id.as_str()));
+    // The continued turn parents off the SAME real tail — the marker is a
+    // sibling leaf, never the parent of the conversation.
+    let user_message = logged
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .expect("continued user message");
+    assert_eq!(user_message.parent.as_deref(), Some(seed_id.as_str()));
+    assert!(marker
+        .payload
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
+    assert!(marker
+        .payload
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
+    // Audit metadata only — never conversation content.
+    assert!(marker.payload.get("content").is_none());
+    // Exactly one marker per resumed lifetime.
+    assert_eq!(
+        logged
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::SESSION_RESUMED)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn resume_marker_precedes_non_turn_control_activity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let seed = model_call(None);
+    let seed_id = seed.id.clone();
+    write_events(&log, &[seed]);
+
+    let mut session = resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(Vec::new())),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    session.rename_session("continued work").expect("rename");
+
+    let logged = read_resume_prefix(&log).expect("read log");
+    let marker_index = logged
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::SESSION_RESUMED)
+        .expect("resume marker");
+    let rename_index = logged
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::SESSION_RENAMED)
+        .expect("rename event");
+    assert_eq!(marker_index + 1, rename_index);
+    assert_eq!(
+        logged[marker_index].parent.as_deref(),
+        Some(seed_id.as_str())
+    );
+    assert_eq!(
+        logged[rename_index].parent.as_deref(),
+        Some(seed_id.as_str())
+    );
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::SESSION_RESUMED));
+}
+
+#[test]
 fn model_call_then_reasoning_tail_appends_nothing() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");

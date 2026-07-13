@@ -52,6 +52,10 @@ impl EventKind {
     pub const AGENT_MESSAGE: &'static str = "agent.message";
     pub const AGENT_RESULT: &'static str = "agent.result";
     pub const SESSION_START: &'static str = "session.start";
+    /// A durable marker appended at a resume boundary (issue #6): records that
+    /// the session lifetime was continued, against which provider/model, and
+    /// from which tail event. Makes resumed lifetimes auditable in provenance.
+    pub const SESSION_RESUMED: &'static str = "session.resumed";
     pub const SESSION_RENAMED: &'static str = "session.renamed";
     pub const SESSION_SUMMARY: &'static str = "session.summary";
     pub const ERROR: &'static str = "error";
@@ -88,6 +92,7 @@ impl EventKind {
         Self::AGENT_MESSAGE,
         Self::AGENT_RESULT,
         Self::SESSION_START,
+        Self::SESSION_RESUMED,
         Self::SESSION_RENAMED,
         Self::SESSION_SUMMARY,
         Self::ERROR,
@@ -419,6 +424,7 @@ mod tests {
             EventKind::AGENT_MESSAGE,
             EventKind::AGENT_RESULT,
             EventKind::SESSION_START,
+            EventKind::SESSION_RESUMED,
             EventKind::SESSION_RENAMED,
             EventKind::SESSION_SUMMARY,
             EventKind::ERROR,
