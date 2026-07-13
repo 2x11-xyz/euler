@@ -586,12 +586,94 @@ fn exec_renders_each_turn_event_to_stdout_in_order() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
-    let user_at = stdout.find("user: summarize note").expect("user line streamed");
-    let read_at = stdout.find("tool.call: read_file").expect("tool call streamed");
-    let assistant_at = stdout.find("assistant: all done").expect("assistant line streamed");
+    let user_at = stdout
+        .find("user: summarize note")
+        .expect("user line streamed");
+    let read_at = stdout
+        .find("tool.call: read_file")
+        .expect("tool call streamed");
+    let assistant_at = stdout
+        .find("assistant: all done")
+        .expect("assistant line streamed");
     // The whole turn is on stdout, in order — not just the final response.
     assert!(user_at < read_at, "user before tool: {stdout}");
     assert!(read_at < assistant_at, "tool before assistant: {stdout}");
+}
+
+#[test]
+fn exec_streams_events_before_a_blocking_tool_completes() {
+    // Regression for #7 that actually tests INCREMENTAL streaming (not just
+    // final ordering): a tool blocks on a signal file that only this test
+    // creates. The `tool.call` line must reach stdout WHILE the tool is still
+    // blocked — a buffered implementation writes nothing until the whole turn
+    // (including the blocked shell) finishes, so it would deadlock here and the
+    // recv would time out.
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    let signal = root.path().join("unblock");
+    let command = format!(
+        "while [ ! -f '{}' ]; do sleep 0.02; done",
+        signal.to_str().expect("signal path utf8")
+    );
+    let script = write_fixture_script(
+        root.path(),
+        "stream-block.json",
+        &format!(
+            r#"{{
+  "version": 1,
+  "responses": [
+    {{ "events": [ {{ "tool_call": {{ "id": "c1", "name": "run_shell", "input": {{ "command": {} }} }} }}, {{ "finished": {{ "stop_reason": "tool_use" }} }} ] }},
+    {{ "events": [ {{ "text_delta": "done" }}, {{ "finished": {{ "stop_reason": "completed" }} }} ] }}
+  ]
+}}"#,
+            serde_json::to_string(&command).expect("encode command")
+        ),
+    );
+
+    let mut child = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("exec")
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provider-option")
+        .arg(format!("event-script={}", path_str(&script)))
+        .arg("--provenance")
+        .arg(path_str(&log))
+        .arg("--auto-approve")
+        .arg("trusted-local")
+        .arg("run it")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    let rx = spawn_line_reader(child.stdout.take().expect("stdout"));
+
+    let mut streamed = false;
+    loop {
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(line) if line.contains("tool.call: run_shell") => {
+                streamed = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    // Always unblock the shell so the process can exit, even on failure.
+    fs::write(&signal, b"go").expect("write signal");
+    let output = child.wait_with_output().expect("wait for euler");
+
+    assert!(
+        streamed,
+        "tool.call must reach stdout before the blocked tool completes (streaming, not buffered)"
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

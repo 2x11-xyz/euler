@@ -259,19 +259,34 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
 /// (issue #7). Provenance JSONL remains the canonical, detailed event stream;
 /// stdout is the human-facing progress view. Each event renders standalone, so
 /// the stream is strictly append-only (no retroactive coalescing to unprint).
-fn run_turn_streaming<D: PermissionDecider>(
-    session: &mut Session<D>,
-    prompt: &str,
-) -> Result<()> {
+fn run_turn_streaming<D: PermissionDecider>(session: &mut Session<D>, prompt: &str) -> Result<()> {
     let mut stdout = io::stdout();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Capture the FIRST stdout write/flush failure rather than silently
+    // dropping it: a disk-full redirect must not exit 0 with lost output. Once
+    // a write fails, stop trying (later writes would just re-fail).
+    let mut write_error: Option<io::Error> = None;
     session.run_turn_with_sink(prompt, cancel, |event| {
+        if write_error.is_some() {
+            return;
+        }
         let line = render_line_oriented(std::slice::from_ref(event));
         if !line.is_empty() {
-            let _ = stdout.write_all(line.as_bytes());
-            let _ = stdout.flush();
+            if let Err(error) = stdout
+                .write_all(line.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
+                write_error = Some(error);
+            }
         }
     })?;
+    // A broken pipe is the normal "downstream closed" case (e.g. `| head`);
+    // exit cleanly. Any other write failure is real and must surface.
+    if let Some(error) = write_error {
+        if error.kind() != io::ErrorKind::BrokenPipe {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 
