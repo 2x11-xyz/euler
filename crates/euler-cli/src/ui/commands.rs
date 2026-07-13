@@ -791,6 +791,7 @@ pub fn permission_choices_with_grants(
             Capability::FsRead,
             Capability::FsWrite,
             Capability::ShellExec,
+            Capability::AgentSpawn,
         ]
         .into_iter()
         .flat_map(permission_modes),

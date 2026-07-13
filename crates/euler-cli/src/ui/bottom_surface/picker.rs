@@ -837,6 +837,9 @@ fn human_permission_label(capability: Capability, mode: ApprovalMode) -> &'stati
         (Capability::ShellExec, ApprovalMode::Ask) => "Ask before running shell commands",
         (Capability::ShellExec, ApprovalMode::SessionAllow) => "Allow shell commands this session",
         (Capability::ShellExec, ApprovalMode::AlwaysDeny) => "Always deny shell commands",
+        (Capability::AgentSpawn, ApprovalMode::Ask) => "Ask before spawning agents",
+        (Capability::AgentSpawn, ApprovalMode::SessionAllow) => "Allow agent spawning this session",
+        (Capability::AgentSpawn, ApprovalMode::AlwaysDeny) => "Always deny agent spawning",
         (_, ApprovalMode::Ask) => "Ask before using capability",
         (_, ApprovalMode::SessionAllow) => "Allow capability this session",
         (_, ApprovalMode::AlwaysDeny) => "Always deny capability",
@@ -848,6 +851,7 @@ fn capability_group_label(capability: Capability) -> &'static str {
         Capability::FsRead => "Files: read",
         Capability::FsWrite => "Files: write",
         Capability::ShellExec => "Shell",
+        Capability::AgentSpawn => "Agents",
         _ => "Extensions",
     }
 }

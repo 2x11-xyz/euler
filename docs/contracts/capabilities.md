@@ -350,4 +350,9 @@ extension command to append bounded `context.slot.updated` events for slots
 namespaced to that extension id. It does not grant raw provenance reads,
 arbitrary canvas control, or cross-extension slot writes.
 
-`fs-read` defaults to `session-allow`: read tools execute without prompting, but every execution records a permission decision event. `fs-write` and `shell-exec` default to `ask`.
+`fs-read` defaults to `session-allow`: read tools execute without prompting,
+but every execution records a permission decision event. `fs-write`,
+`shell-exec`, and root-session `agent-spawn` default to `ask`. Unconfigured
+capabilities remain `always-deny`; child-agent gates start deny-all and inherit
+only their explicit attenuated envelope. Headless auto-approve tiers override
+these root defaults with the explicit mapping above.
