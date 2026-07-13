@@ -76,6 +76,28 @@ pub(super) struct ParentedAppender<'a> {
     pub(super) agent_id: &'a str,
 }
 
+impl<D> Session<D> {
+    /// Assemble a [`ParentedAppender`] over this session's bus and
+    /// persistence cursor, attributing appended events to `agent_id` under
+    /// this session's id. Callers appending under the session's own agent
+    /// pass a clone of `config.agent_id`; the reviewer phases pass the child
+    /// agent id. The returned appender exclusively borrows the session, so
+    /// build the event payload before calling this.
+    pub(super) fn appender_as<'a>(
+        &'a mut self,
+        writer: &'a Arc<crate::provenance::ProvenanceWriter>,
+        agent_id: &'a str,
+    ) -> ParentedAppender<'a> {
+        ParentedAppender {
+            writer,
+            bus: &mut self.bus,
+            persisted_events: &mut self.persisted_events,
+            session_id: &self.config.session_id,
+            agent_id,
+        }
+    }
+}
+
 struct ModelResultRecord<'a> {
     content: &'a str,
     tool_calls: &'a [ToolCall],
@@ -171,14 +193,10 @@ impl<D: PermissionDecider> Session<D> {
         let mut payload = euler_agents::agent_spawn_payload(task, &child_agent_id);
         payload.insert("provider".to_owned(), target.provider.clone().into());
         payload.insert("model".to_owned(), target.model.clone().into());
-        let mut appender = ParentedAppender {
-            writer,
-            bus: &mut self.bus,
-            persisted_events: &mut self.persisted_events,
-            session_id: &self.config.session_id,
-            agent_id: &self.config.agent_id,
-        };
-        let event = appender.append(EventKind::AGENT_SPAWN, payload, None)?;
+        let agent_id = self.config.agent_id.clone();
+        let event =
+            self.appender_as(writer, &agent_id)
+                .append(EventKind::AGENT_SPAWN, payload, None)?;
         self.open_agent_spawns
             .insert(event.id.clone(), child_agent_id.clone());
         Ok(SpawnedAgent::new(child_agent_id, event.id))

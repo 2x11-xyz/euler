@@ -10,26 +10,18 @@ use crate::compaction::{
     build_compaction_candidate, heuristic_projection, select_layer1_candidates, should_compact,
     validate_candidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
 };
-use crate::file_diff::{
-    file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
-};
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
-use crate::guardian::{self, GuardianRuling, PermissionReviewer};
-use crate::permissions::{
-    ApprovalMode, GrantDecision, GrantSource, PermissionDecider, PermissionGate, PermissionRequest,
-};
+use crate::guardian::PermissionReviewer;
+use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
 use crate::provenance::ProvenanceWriter;
 use crate::redaction::SecretRedactor;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
-use crate::tools::{PatchEvents, ReteachTracker, ToolError, ToolRegistry};
+use crate::tools::{ReteachTracker, ToolError, ToolRegistry};
 use crate::EventBus;
-use euler_agents::{
-    generated_agent_id, AgentError, AgentReportPayload, AgentResult, AgentTask, SpawnedAgent,
-    REPORT_QUEUE_CAPACITY,
-};
-use euler_event::{now_rfc3339_millis, object, EventEnvelope, EventKind, JsonObject};
+use euler_agents::{generated_agent_id, AgentError, AgentResult, AgentTask, SpawnedAgent};
+use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{
     ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent, ProviderError,
     ProviderSet, ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason,
@@ -40,26 +32,32 @@ use round_loop::{
     EventSink, ModelRoundData, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, TurnState,
 };
 use serde_json::{json, Value};
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Once};
-use std::thread;
+use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
+mod background;
 mod companion;
 mod extension_bridge;
 pub use extension_bridge::MAX_SPAWNS_PER_COMMAND;
 mod observer;
 mod parallel_spawn;
+mod permissions_gate;
 mod round_loop;
 mod swarm_tool;
+mod tool_dispatch;
+pub use background::{
+    AgentReporter, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
+};
 pub use companion::AgentResultSummary;
 pub use observer::RoundObserverConfig;
+pub(crate) use permissions_gate::{
+    approval_mode_str, permission_decision_payload, permission_request_for_tool, PermissionRuling,
+};
+pub(crate) use tool_dispatch::{file_change_payload, file_diff_payload, maybe_store_pre_image};
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
 const CONTEXT_LIMIT_MESSAGE: &str =
@@ -67,19 +65,6 @@ const CONTEXT_LIMIT_MESSAGE: &str =
 const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
 const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. To create a new file, prefer write_file. For code and text file updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff. Write plain prose without emoji or decorative symbols; the terminal ledger renders a fixed glyph vocabulary only.";
-const BACKGROUND_AGENT_PANIC_SUMMARY: &str = "background agent panicked";
-const BACKGROUND_AGENT_PANIC_ERROR: &str = "background-agent-panic";
-const BACKGROUND_AGENT_DISCONNECTED_SUMMARY: &str = "background agent disconnected";
-const BACKGROUND_AGENT_DISCONNECTED_ERROR: &str = "background-agent-disconnected";
-const BACKGROUND_AGENT_LAUNCH_SUMMARY: &str = "background agent failed to start";
-const BACKGROUND_AGENT_LAUNCH_ERROR: &str = "background-agent-launch-failed";
-
-thread_local! {
-    static BACKGROUND_AGENT_WORKER: Cell<bool> = const { Cell::new(false) };
-}
-
-static BACKGROUND_AGENT_PANIC_HOOK_INSTALLED: Once = Once::new();
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContextLimitConfig {
     limit_tokens: u64,
@@ -262,16 +247,6 @@ pub enum SessionError {
     CheckpointBlob(String),
 }
 
-/// Outcome of one uncovered permission decision inside tool dispatch.
-enum PermissionRuling {
-    Allowed,
-    /// Denied; `message` is the tool-result error text (plain
-    /// `permission denied` or guardian teaching).
-    Denied {
-        message: String,
-    },
-}
-
 /// Outcome of a successful workspace restore (`/rollback`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceRestoreOutcome {
@@ -305,155 +280,6 @@ pub enum ExtensionExecutionError {
     /// publishing already-durable queued extension events into the live bus.
     #[error(transparent)]
     Session(#[from] SessionError),
-}
-
-#[must_use]
-#[derive(Debug, Eq, PartialEq)]
-pub enum BackgroundAgentPoll {
-    Pending,
-    Recorded { result_event_id: String },
-    AlreadyRecorded { result_event_id: String },
-}
-
-#[must_use]
-#[derive(Debug, Eq, PartialEq)]
-pub enum BackgroundAgentReportDrain {
-    Empty,
-    Closed,
-    Drained { message_event_id: String },
-}
-
-pub struct AgentReporter {
-    child_agent_id: String,
-    parent_agent_id: String,
-    spawn_event_id: String,
-    report_tx: SyncSender<QueuedAgentReport>,
-    worker_live: Arc<AtomicBool>,
-}
-
-impl AgentReporter {
-    fn new(
-        child_agent_id: String,
-        parent_agent_id: String,
-        spawn_event_id: String,
-        report_tx: SyncSender<QueuedAgentReport>,
-        worker_live: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            child_agent_id,
-            parent_agent_id,
-            spawn_event_id,
-            report_tx,
-            worker_live,
-        }
-    }
-
-    pub fn child_agent_id(&self) -> &str {
-        &self.child_agent_id
-    }
-
-    pub fn parent_agent_id(&self) -> &str {
-        &self.parent_agent_id
-    }
-
-    pub fn spawn_event_id(&self) -> &str {
-        &self.spawn_event_id
-    }
-
-    pub fn report(&self, payload: Value) -> Result<(), AgentError> {
-        if !self.worker_live.load(Ordering::Acquire) {
-            return Err(AgentError::MessageSenderClosed);
-        }
-        let payload = AgentReportPayload::new(payload)?;
-        let report = QueuedAgentReport {
-            from_agent_id: self.child_agent_id.clone(),
-            to_agent_id: self.parent_agent_id.clone(),
-            spawn_event_id: self.spawn_event_id.clone(),
-            queued_ts: now_rfc3339_millis(),
-            payload,
-        };
-        match self.report_tx.try_send(report) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(AgentError::MessageQueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(AgentError::MessageSenderClosed),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct QueuedAgentReport {
-    from_agent_id: String,
-    to_agent_id: String,
-    spawn_event_id: String,
-    queued_ts: String,
-    payload: AgentReportPayload,
-}
-
-/// Current-process background child handle.
-///
-/// The handle is the only path for recording the worker's result. Dropping it
-/// before polling completion loses that result in v0.
-#[must_use]
-pub struct BackgroundAgent {
-    spawned: SpawnedAgent,
-    result_rx: Receiver<AgentResult>,
-    pending_result: Option<AgentResult>,
-    recorded_result_event_id: Option<String>,
-    session_id: String,
-    parent_agent_id: String,
-    report_rx: Option<Receiver<QueuedAgentReport>>,
-    pending_report: Option<QueuedAgentReport>,
-}
-
-impl BackgroundAgent {
-    fn new(
-        spawned: SpawnedAgent,
-        result_rx: Receiver<AgentResult>,
-        session_id: String,
-        parent_agent_id: String,
-    ) -> Self {
-        Self {
-            spawned,
-            result_rx,
-            pending_result: None,
-            recorded_result_event_id: None,
-            session_id,
-            parent_agent_id,
-            report_rx: None,
-            pending_report: None,
-        }
-    }
-
-    fn new_with_reporter(
-        spawned: SpawnedAgent,
-        result_rx: Receiver<AgentResult>,
-        session_id: String,
-        parent_agent_id: String,
-        report_rx: Receiver<QueuedAgentReport>,
-    ) -> Self {
-        Self {
-            spawned,
-            result_rx,
-            pending_result: None,
-            recorded_result_event_id: None,
-            session_id,
-            parent_agent_id,
-            report_rx: Some(report_rx),
-            pending_report: None,
-        }
-    }
-
-    pub fn child_agent_id(&self) -> &str {
-        self.spawned.child_agent_id()
-    }
-
-    pub fn spawn_event_id(&self) -> &str {
-        self.spawned.spawn_event_id()
-    }
-
-    pub fn recorded_result_event_id(&self) -> Option<&str> {
-        self.recorded_result_event_id.as_deref()
-    }
 }
 
 pub struct Session<D> {
@@ -1112,104 +938,6 @@ impl<D> Session<D> {
 }
 
 impl<D: PermissionDecider> Session<D> {
-    pub fn spawn_background_agent<F>(
-        &mut self,
-        task: AgentTask,
-        parent_capabilities: impl IntoIterator<Item = euler_sdk::Capability>,
-        work: F,
-    ) -> Result<BackgroundAgent, SessionError>
-    where
-        F: FnOnce() -> AgentResult + Send + 'static,
-    {
-        install_background_agent_panic_hook();
-        let (result_tx, result_rx) = mpsc::channel();
-        let mut spawned = self.spawn_agent(task, parent_capabilities)?;
-        let worker = thread::Builder::new()
-            .name("euler-background-agent".to_owned())
-            .spawn(move || {
-                let result = run_background_agent_work(work);
-                let _ = result_tx.send(result);
-            });
-        match worker {
-            Ok(handle) => {
-                // Detach the worker. Completion is observed only through result_rx.
-                drop(handle);
-                Ok(BackgroundAgent::new(
-                    spawned,
-                    result_rx,
-                    self.config.session_id.clone(),
-                    self.config.agent_id.clone(),
-                ))
-            }
-            Err(error) => {
-                self.record_agent_result(
-                    &mut spawned,
-                    fixed_background_agent_failure(
-                        BACKGROUND_AGENT_LAUNCH_SUMMARY,
-                        BACKGROUND_AGENT_LAUNCH_ERROR,
-                    ),
-                )?;
-                Err(error.into())
-            }
-        }
-    }
-
-    pub fn spawn_background_agent_with_reporter<F>(
-        &mut self,
-        task: AgentTask,
-        parent_capabilities: impl IntoIterator<Item = euler_sdk::Capability>,
-        work: F,
-    ) -> Result<BackgroundAgent, SessionError>
-    where
-        F: FnOnce(AgentReporter) -> AgentResult + Send + 'static,
-    {
-        install_background_agent_panic_hook();
-        let (result_tx, result_rx) = mpsc::channel();
-        let (report_tx, report_rx) = mpsc::sync_channel(REPORT_QUEUE_CAPACITY);
-        let mut spawned = self.spawn_agent(task, parent_capabilities)?;
-        let session_id = self.config.session_id.clone();
-        let parent_agent_id = self.config.agent_id.clone();
-        let worker_live = Arc::new(AtomicBool::new(true));
-        let reporter = AgentReporter::new(
-            spawned.child_agent_id().to_owned(),
-            parent_agent_id.clone(),
-            spawned.spawn_event_id().to_owned(),
-            report_tx,
-            Arc::clone(&worker_live),
-        );
-        let worker_live_for_worker = Arc::clone(&worker_live);
-        let worker = thread::Builder::new()
-            .name("euler-background-agent".to_owned())
-            .spawn(move || {
-                let result =
-                    run_background_agent_reporter_work(work, reporter, worker_live_for_worker);
-                let _ = result_tx.send(result);
-            });
-        match worker {
-            Ok(handle) => {
-                // Detach the worker. Completion is observed only through result_rx.
-                drop(handle);
-                Ok(BackgroundAgent::new_with_reporter(
-                    spawned,
-                    result_rx,
-                    session_id,
-                    parent_agent_id,
-                    report_rx,
-                ))
-            }
-            Err(error) => {
-                self.record_agent_result(
-                    &mut spawned,
-                    fixed_background_agent_failure(
-                        BACKGROUND_AGENT_LAUNCH_SUMMARY,
-                        BACKGROUND_AGENT_LAUNCH_ERROR,
-                    ),
-                )?;
-                Err(error.into())
-            }
-        }
-    }
-
     pub fn spawn_agent(
         &mut self,
         task: AgentTask,
@@ -1272,106 +1000,6 @@ impl<D: PermissionDecider> Session<D> {
         self.open_agent_spawns.remove(spawned.spawn_event_id());
         spawned.mark_result_recorded();
         Ok(result_event_id)
-    }
-
-    pub fn poll_background_agent(
-        &mut self,
-        background: &mut BackgroundAgent,
-    ) -> Result<BackgroundAgentPoll, SessionError> {
-        self.ensure_background_agent_affinity(background)?;
-        if let Some(result_event_id) = background.recorded_result_event_id.as_ref() {
-            return Ok(BackgroundAgentPoll::AlreadyRecorded {
-                result_event_id: result_event_id.clone(),
-            });
-        }
-        let result = match background.pending_result.take() {
-            Some(result) => result,
-            None => match background.result_rx.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => return Ok(BackgroundAgentPoll::Pending),
-                Err(TryRecvError::Disconnected) => fixed_background_agent_failure(
-                    BACKGROUND_AGENT_DISCONNECTED_SUMMARY,
-                    BACKGROUND_AGENT_DISCONNECTED_ERROR,
-                ),
-            },
-        };
-        let retry_result = result.clone();
-        match self.record_agent_result(&mut background.spawned, result) {
-            Ok(result_event_id) => {
-                background.recorded_result_event_id = Some(result_event_id.clone());
-                Ok(BackgroundAgentPoll::Recorded { result_event_id })
-            }
-            Err(error) => {
-                background.pending_result = Some(retry_result);
-                Err(error)
-            }
-        }
-    }
-
-    pub fn drain_background_agent_report(
-        &mut self,
-        background: &mut BackgroundAgent,
-    ) -> Result<BackgroundAgentReportDrain, SessionError> {
-        self.ensure_background_agent_affinity(background)?;
-        if let Some(report) = background.pending_report.take() {
-            return self.persist_background_agent_report(background, report);
-        }
-        let Some(report_rx) = background.report_rx.as_ref() else {
-            return Ok(BackgroundAgentReportDrain::Closed);
-        };
-        let report = match report_rx.try_recv() {
-            Ok(report) => report,
-            Err(TryRecvError::Empty) => return Ok(BackgroundAgentReportDrain::Empty),
-            Err(TryRecvError::Disconnected) => return Ok(BackgroundAgentReportDrain::Closed),
-        };
-        self.persist_background_agent_report(background, report)
-    }
-
-    fn persist_background_agent_report(
-        &mut self,
-        background: &mut BackgroundAgent,
-        report: QueuedAgentReport,
-    ) -> Result<BackgroundAgentReportDrain, SessionError> {
-        match self.record_agent_message(&report) {
-            Ok(message_event_id) => Ok(BackgroundAgentReportDrain::Drained { message_event_id }),
-            Err(error) => {
-                background.pending_report = Some(report);
-                Err(error)
-            }
-        }
-    }
-
-    fn ensure_background_agent_affinity(
-        &self,
-        background: &BackgroundAgent,
-    ) -> Result<(), SessionError> {
-        if background.session_id == self.config.session_id
-            && background.parent_agent_id == self.config.agent_id
-        {
-            Ok(())
-        } else {
-            Err(AgentError::MessageSessionMismatch.into())
-        }
-    }
-
-    fn record_agent_message(&mut self, report: &QueuedAgentReport) -> Result<String, SessionError> {
-        self.persist_new_events()?;
-        let event = EventEnvelope::new(
-            self.config.session_id.clone(),
-            self.config.agent_id.clone(),
-            self.previous_persisted_event_id(),
-            EventKind::AGENT_MESSAGE,
-            object([
-                ("from_agent_id", report.from_agent_id.clone().into()),
-                ("to_agent_id", report.to_agent_id.clone().into()),
-                ("spawn_event_id", report.spawn_event_id.clone().into()),
-                ("queued_ts", report.queued_ts.clone().into()),
-                ("payload", report.payload.value().clone()),
-            ]),
-        );
-        let message_event_id = event.id.clone();
-        self.accept_control_event(event)?;
-        Ok(message_event_id)
     }
 
     pub fn switch_model(
@@ -1886,462 +1514,6 @@ impl<D: PermissionDecider> Session<D> {
         .map(Some)
     }
 
-    #[allow(clippy::too_many_lines)] // ratchet: 114 lines, refactor target
-    fn execute_tool_call<F>(
-        &mut self,
-        call: ToolCall,
-        model_result_id: String,
-        sink: &mut EventSink<'_, F>,
-        turn_state: &mut TurnState,
-    ) -> Result<(), SessionError>
-    where
-        F: FnMut(&EventEnvelope),
-    {
-        let tool_call_event_id = self.emit_with_parent(
-            EventKind::TOOL_CALL,
-            object([
-                ("id", call.id.clone().into()),
-                ("name", call.name.clone().into()),
-                ("input", call.input.clone()),
-            ]),
-            Some(model_result_id),
-        )?;
-        sink.flush(self.bus.events());
-
-        let mut covered_grant_source: Option<crate::GrantSource> = None;
-        let mut static_safe = false;
-        if let Some(capability) = self
-            .tools
-            .required_capability_for_input(&call.name, &call.input)
-        {
-            if turn_state.denied(capability) {
-                self.emit_permission_denied_tool_result(
-                    call,
-                    tool_call_event_id,
-                    &format!(
-                        "permission denied: {} was denied earlier this turn and \
-                         remains denied for the rest of it — do not retry {} \
-                         commands; use a different tool or ask the user",
-                        capability.as_str(),
-                        capability.as_str()
-                    ),
-                )?;
-                return Ok(());
-            }
-            let request = permission_request_for_tool(
-                capability,
-                &self.tools.permission_reason(&call.name, &call.input),
-                &call.name,
-                &call.input,
-                &self.tools,
-            );
-            let mode = self.permissions.mode(capability);
-            // Statically-safe read-only shell commands run under `ask`
-            // without a prompt (issue #78): recorded as a fresh
-            // permission.decision with mode "static-safe" — allowed-once
-            // semantics, no grant installed, parented to the tool call. The
-            // check sits before grant coverage so the ledger attributes the
-            // run to the analysis, not to an unrelated grant. It never
-            // applies under always-deny, and a denial earlier this turn
-            // still short-circuits above. A TRUNCATED command is never
-            // analyzed: the bounded prefix could parse as safe while
-            // `sh -c` runs the full string (security review, #66 class) —
-            // decomposing a truncated command is decomposing a lie.
-            static_safe = mode == ApprovalMode::Ask
-                && capability == Capability::ShellExec
-                && !request.command_truncated
-                && request.command.as_deref().is_some_and(|command| {
-                    crate::command_safety::is_statically_safe_command(command, self.tools.root())
-                });
-            if static_safe {
-                self.emit_static_safe_decision(capability, tool_call_event_id.clone())?;
-            }
-            // A request covered by an existing session/project grant runs
-            // under THAT decision: no prompt, and no fresh permission.decision
-            // event — recording "allowed once" here would misstate what the
-            // user actually granted (review v2 §8). The tool result carries a
-            // `grant_source` tag so the ledger can show `· session grant`.
-            covered_grant_source = if mode == ApprovalMode::Ask && !static_safe {
-                self.permissions.granted_source(&request)
-            } else {
-                None
-            };
-            if covered_grant_source.is_none() && !static_safe {
-                match self.decide_uncovered_permission(
-                    &request,
-                    mode,
-                    &tool_call_event_id,
-                    sink,
-                    turn_state,
-                )? {
-                    PermissionRuling::Allowed => {}
-                    PermissionRuling::Denied { message } => {
-                        self.emit_permission_denied_tool_result(
-                            call,
-                            tool_call_event_id,
-                            &message,
-                        )?;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        if call.name == swarm_tool::CODE_SWARM_REVIEW_TOOL {
-            return self.execute_code_swarm_review_tool(
-                call,
-                tool_call_event_id,
-                covered_grant_source,
-                sink,
-            );
-        }
-
-        let tool_name = call.name.clone();
-        let tool_started = Instant::now();
-        match self
-            .tools
-            .execute_with_events(&call.name, &call.input, self.bus.events())
-        {
-            Ok(execution) => {
-                // The input format was accepted: reset this tool's re-teach
-                // streak even if a later write fails for environmental
-                // reasons (the streak tracks format competence, issue #94).
-                self.tool_reteach
-                    .record_success(self.tools.reteach_identity(&call.name, &call.input));
-                if let Some(patch) = execution.patch {
-                    let mut payload = object([
-                        ("path", patch.path.clone().into()),
-                        ("old", patch.before.clone().into()),
-                        ("new", patch.after.clone().into()),
-                    ]);
-                    self.redactor
-                        .redact_payload_fields(&mut payload, &["old", "new"]);
-                    let patch_proposed_id = self.emit_with_parent(
-                        EventKind::PATCH_PROPOSED,
-                        payload.clone(),
-                        Some(tool_call_event_id.clone()),
-                    )?;
-                    if let Err(error) = self.tools.apply_patch(&patch) {
-                        self.emit_failed_tool_result(
-                            call.id,
-                            execution.name,
-                            error.to_string(),
-                            tool_call_event_id,
-                            tool_started,
-                        )?;
-                        return Ok(());
-                    }
-                    let patch_applied_id = self.emit_with_parent(
-                        EventKind::PATCH_APPLIED,
-                        payload,
-                        Some(patch_proposed_id),
-                    )?;
-                    let pre_image_blob = maybe_store_pre_image(self.config.root.as_path(), &patch);
-                    let file_change_id = self.emit_with_parent(
-                        EventKind::FILE_CHANGE,
-                        file_change_payload(&call.id, &patch, pre_image_blob.as_deref()),
-                        Some(patch_applied_id.clone()),
-                    )?;
-                    let mut diff_payload = file_diff_payload(&call.id, &file_change_id, &patch);
-                    self.redactor
-                        .redact_payload_fields(&mut diff_payload, &["diff"]);
-                    self.emit_with_parent(
-                        EventKind::FILE_DIFF,
-                        diff_payload,
-                        Some(patch_applied_id),
-                    )?;
-                }
-                for change in &execution.file_changes {
-                    let file_change_id = self.emit_with_parent(
-                        EventKind::FILE_CHANGE,
-                        observed_file_change_payload(&call.id, "run_shell", change),
-                        Some(tool_call_event_id.clone()),
-                    )?;
-                    let mut observed_diff =
-                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change);
-                    self.redactor
-                        .redact_payload_fields(&mut observed_diff, &["diff"]);
-                    self.emit_with_parent(
-                        EventKind::FILE_DIFF,
-                        observed_diff,
-                        Some(tool_call_event_id.clone()),
-                    )?;
-                }
-                let mut payload = object([
-                    ("id", call.id.into()),
-                    ("name", execution.name.into()),
-                    ("ok", true.into()),
-                    ("output", self.redactor.redact(&execution.output).into()),
-                ]);
-                if let Some(exit_code) = execution.exit_code {
-                    payload.insert("exit_code".to_owned(), exit_code.into());
-                }
-                if let Some(source) = covered_grant_source {
-                    // Ran under an existing grant — the ledger shows a dim
-                    // `· session grant` on the tool header instead of a fresh
-                    // decision record (review v2 §8).
-                    payload.insert("grant_source".to_owned(), source.as_str().into());
-                }
-                if static_safe {
-                    // Ran under static command-safety analysis — the ledger
-                    // shows a dim `· safe` on the tool header (the decision
-                    // record itself is suppressed like covered grants).
-                    payload.insert("static_safe".to_owned(), true.into());
-                }
-                self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
-                crate::diagnostics::tool_exec_end(
-                    &self.config.session_id,
-                    &tool_name,
-                    elapsed_ms(tool_started),
-                    true,
-                );
-            }
-            Err(error) => {
-                // Rung-2 re-teaching (issue #94): repeated consecutive
-                // failures of a formatted tool append its full-format
-                // payload to the error the model reads next.
-                let error = self.tools.teach_on_failure(
-                    &mut self.tool_reteach,
-                    &call.name,
-                    &call.input,
-                    error.to_string(),
-                );
-                self.emit_failed_tool_result(
-                    call.id,
-                    call.name,
-                    error,
-                    tool_call_event_id,
-                    tool_started,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Record the allowed-once decision for a statically-safe shell command
-    /// (issue #78): mode `static-safe`, no prompt, no grant installed,
-    /// parented to the tool call.
-    fn emit_static_safe_decision(
-        &mut self,
-        capability: Capability,
-        tool_call_event_id: String,
-    ) -> Result<String, SessionError> {
-        crate::diagnostics::permission_decision(
-            &self.config.session_id,
-            capability.as_str(),
-            "static-safe",
-            true,
-        );
-        self.emit_with_parent(
-            EventKind::PERMISSION_DECISION,
-            object([
-                ("capability", capability.as_str().into()),
-                ("mode", "static-safe".into()),
-                ("allowed", true.into()),
-                ("decision", "allowed".into()),
-                ("grant_scope", "once".into()),
-            ]),
-            Some(tool_call_event_id),
-        )
-    }
-
-    /// Resolve an uncovered `ask`/`session-allow`/`always-deny` permission
-    /// decision: emits the `permission.prompt` (for asks) and the
-    /// `permission.decision`, routes asks through the guardian when
-    /// configured (ADR 0011), and reports whether the tool may run.
-    fn decide_uncovered_permission<F>(
-        &mut self,
-        request: &PermissionRequest,
-        mode: ApprovalMode,
-        tool_call_event_id: &str,
-        sink: &mut EventSink<'_, F>,
-        turn_state: &mut TurnState,
-    ) -> Result<PermissionRuling, SessionError>
-    where
-        F: FnMut(&EventEnvelope),
-    {
-        let capability = request.capability;
-        let needs_prompt = mode == ApprovalMode::Ask;
-        let prompt_id = if needs_prompt {
-            let prompt_id = self.emit(
-                EventKind::PERMISSION_PROMPT,
-                object([
-                    ("capability", capability.as_str().into()),
-                    ("reason", request.reason.clone().into()),
-                ]),
-            )?;
-            sink.flush(self.bus.events());
-            Some(prompt_id)
-        } else {
-            None
-        };
-        let decision_parent = prompt_id.unwrap_or_else(|| tool_call_event_id.to_owned());
-        // A non-verbatim-briefable request (truncated command / over-bound
-        // field) never consults the guardian — adjudicating a command it
-        // cannot see exactly would judge a lie (ADR 0011 amendment, security
-        // review F3). The ask goes to the human decider below instead.
-        if needs_prompt
-            && self.config.permission_reviewer == PermissionReviewer::Guardian
-            && guardian::adjudicates_verbatim(request)
-        {
-            if let Some(ruling) =
-                self.guardian_permission_ruling(request, &decision_parent, sink, turn_state)?
-            {
-                return Ok(ruling);
-            }
-            // Guardian abstained: fall through to the configured decider.
-        }
-        let decision = self.permissions.decide_detailed(request, mode);
-        let allowed = decision.allowed();
-        let mode_label = approval_mode_str(mode);
-        let payload = permission_decision_payload(&decision, mode_label, mode);
-        self.emit_with_parent(
-            EventKind::PERMISSION_DECISION,
-            payload,
-            Some(decision_parent),
-        )?;
-        crate::diagnostics::permission_decision(
-            &self.config.session_id,
-            capability.as_str(),
-            mode_label,
-            allowed,
-        );
-        if allowed {
-            Ok(PermissionRuling::Allowed)
-        } else {
-            turn_state.record_denial(capability);
-            Ok(PermissionRuling::Denied {
-                message: format!(
-                    "permission denied by the user; {} is denied for \
-                     the rest of this turn — do not retry {} commands; \
-                     use a different tool or ask the user",
-                    capability.as_str(),
-                    capability.as_str()
-                ),
-            })
-        }
-    }
-
-    /// Guardian review for one ask (ADR 0011). Returns `None` on abstain —
-    /// the configured decider then resolves the ask. Every failure path
-    /// (task build, spawn, companion failure, unparseable verdict) resolves
-    /// to a deny; guardian denials never fall back to the decider. Three
-    /// consecutive guardian denials trip the circuit breaker, which
-    /// interrupts the turn after the denied tool result is recorded.
-    fn guardian_permission_ruling<F>(
-        &mut self,
-        request: &PermissionRequest,
-        decision_parent: &str,
-        sink: &mut EventSink<'_, F>,
-        turn_state: &mut TurnState,
-    ) -> Result<Option<PermissionRuling>, SessionError>
-    where
-        F: FnMut(&EventEnvelope),
-    {
-        let capability = request.capability;
-        let ruling = match guardian::guardian_task(request) {
-            Ok(task) => match self.spawn_companion(task) {
-                Ok(summary) => guardian::ruling_for_result(&summary.result),
-                Err(error) => {
-                    guardian::deny_failure(format!("guardian review failed to run: {error}"))
-                }
-            },
-            Err(error) => guardian::deny_failure(format!("guardian task rejected: {error}")),
-        };
-        sink.flush(self.bus.events());
-        let (allowed, rationale, verdict) = match &ruling {
-            GuardianRuling::Abstain(_) => {
-                turn_state.reset_guardian_denials();
-                return Ok(None);
-            }
-            GuardianRuling::Allow(verdict) => (true, verdict.rationale.clone(), Some(verdict)),
-            GuardianRuling::Deny { rationale, verdict } => {
-                (false, rationale.clone(), verdict.as_ref())
-            }
-        };
-        // The rationale is the guardian model's own reasoning about the
-        // command — model cognition. Euler provenance captures cognition
-        // faithfully; it is NOT redacted (owner decision, 2026-07-11). A
-        // credential the guardian quotes is surfaced to the user via the
-        // credential-exposure warning and removed on demand by the scrub
-        // operation, never by silently corrupting the record.
-        self.emit_with_parent(
-            EventKind::PERMISSION_DECISION,
-            guardian::guardian_decision_payload(capability, allowed, &rationale, verdict),
-            Some(decision_parent.to_owned()),
-        )?;
-        sink.flush(self.bus.events());
-        crate::diagnostics::permission_decision(
-            &self.config.session_id,
-            capability.as_str(),
-            "ask",
-            allowed,
-        );
-        if allowed {
-            turn_state.reset_guardian_denials();
-            return Ok(Some(PermissionRuling::Allowed));
-        }
-        let denials = turn_state.record_guardian_denial();
-        if denials >= guardian::MAX_CONSECUTIVE_GUARDIAN_DENIALS_PER_TURN {
-            turn_state.mark_guardian_interrupted();
-        }
-        Ok(Some(PermissionRuling::Denied {
-            message: guardian::guardian_denial_teaching(&rationale),
-        }))
-    }
-
-    /// Denied tool result. `error` is the plain `permission denied` string,
-    /// or teaching text (guardian denials tell the model not to work around
-    /// the block).
-    /// Failed tool-result emission shared by the execution-error and
-    /// patch-write-failure paths of [`Self::execute_tool_call`].
-    fn emit_failed_tool_result(
-        &mut self,
-        call_id: String,
-        name: String,
-        error: String,
-        tool_call_event_id: String,
-        tool_started: Instant,
-    ) -> Result<(), SessionError> {
-        self.emit_with_parent(
-            EventKind::TOOL_RESULT,
-            object([
-                ("id", call_id.into()),
-                ("name", name.clone().into()),
-                ("ok", false.into()),
-                // Preserve the failed-error redaction main applies
-                // (#67): a tool error may echo a secret-bearing arg.
-                ("error", self.redactor.redact(&error).into()),
-            ]),
-            Some(tool_call_event_id),
-        )?;
-        crate::diagnostics::tool_exec_end(
-            &self.config.session_id,
-            &name,
-            elapsed_ms(tool_started),
-            false,
-        );
-        Ok(())
-    }
-
-    fn emit_permission_denied_tool_result(
-        &mut self,
-        call: ToolCall,
-        tool_call_event_id: String,
-        error: &str,
-    ) -> Result<String, SessionError> {
-        self.emit_with_parent(
-            EventKind::TOOL_RESULT,
-            object([
-                ("id", call.id.into()),
-                ("name", call.name.into()),
-                ("ok", false.into()),
-                ("error", error.to_owned().into()),
-            ]),
-            Some(tool_call_event_id),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)] // ratchet: 7 args, refactor target
     fn emit_model_result(
         &mut self,
@@ -2370,7 +1542,7 @@ impl<D: PermissionDecider> Session<D> {
                 ("content", content.to_owned().into()),
                 ("tool_calls", calls.into()),
                 ("stop_reason", stop_reason.as_str().into()),
-                ("usage", usage_payload(usage)),
+                ("usage", companion::usage_payload(usage)),
             ]),
             Some(parent),
         )
@@ -2585,79 +1757,6 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn install_background_agent_panic_hook() {
-    BACKGROUND_AGENT_PANIC_HOOK_INSTALLED.call_once(|| {
-        let previous = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            let suppress = BACKGROUND_AGENT_WORKER.with(|flag| flag.get());
-            if !suppress {
-                previous(info);
-            }
-        }));
-    });
-}
-
-fn run_background_agent_work<F>(work: F) -> AgentResult
-where
-    F: FnOnce() -> AgentResult,
-{
-    let _guard = BackgroundAgentWorkerGuard::enter();
-    panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| {
-        fixed_background_agent_failure(BACKGROUND_AGENT_PANIC_SUMMARY, BACKGROUND_AGENT_PANIC_ERROR)
-    })
-}
-
-fn run_background_agent_reporter_work<F>(
-    work: F,
-    reporter: AgentReporter,
-    worker_live: Arc<AtomicBool>,
-) -> AgentResult
-where
-    F: FnOnce(AgentReporter) -> AgentResult,
-{
-    let _live_guard = BackgroundAgentReporterLiveGuard::new(worker_live);
-    let _guard = BackgroundAgentWorkerGuard::enter();
-    panic::catch_unwind(AssertUnwindSafe(|| work(reporter))).unwrap_or_else(|_| {
-        fixed_background_agent_failure(BACKGROUND_AGENT_PANIC_SUMMARY, BACKGROUND_AGENT_PANIC_ERROR)
-    })
-}
-
-struct BackgroundAgentWorkerGuard;
-
-impl BackgroundAgentWorkerGuard {
-    fn enter() -> Self {
-        BACKGROUND_AGENT_WORKER.with(|flag| flag.set(true));
-        Self
-    }
-}
-
-struct BackgroundAgentReporterLiveGuard {
-    worker_live: Arc<AtomicBool>,
-}
-
-impl BackgroundAgentReporterLiveGuard {
-    fn new(worker_live: Arc<AtomicBool>) -> Self {
-        Self { worker_live }
-    }
-}
-
-impl Drop for BackgroundAgentReporterLiveGuard {
-    fn drop(&mut self) {
-        self.worker_live.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for BackgroundAgentWorkerGuard {
-    fn drop(&mut self) {
-        BACKGROUND_AGENT_WORKER.with(|flag| flag.set(false));
-    }
-}
-
-fn fixed_background_agent_failure(summary: &'static str, error: &'static str) -> AgentResult {
-    AgentResult::failure(summary, error, Option::<&str>::None)
-        .expect("fixed background agent failure strings should be valid")
-}
-
 fn push_reasoning_chunk(reasoning: &mut Vec<ReasoningChunk>, chunk: ReasoningChunk) {
     if chunk.content.is_empty() && chunk.artifact.is_none() {
         return;
@@ -2748,24 +1847,6 @@ fn reasoning_fidelity(value: &str) -> ReasoningFidelity {
         _ => ReasoningFidelity::Summary,
     }
 }
-fn usage_payload(usage: Option<&Usage>) -> Value {
-    match usage {
-        Some(usage) => {
-            let mut value = object([
-                ("input_tokens", usage.input_tokens.into()),
-                ("output_tokens", usage.output_tokens.into()),
-            ]);
-            if let Some(cached_tokens) = usage.cached_tokens {
-                value.insert("cached_tokens".to_owned(), cached_tokens.into());
-            }
-            if let Some(reasoning_tokens) = usage.reasoning_tokens {
-                value.insert("reasoning_tokens".to_owned(), reasoning_tokens.into());
-            }
-            Value::Object(value)
-        }
-        None => Value::Null,
-    }
-}
 fn used_tokens(usage: &Usage) -> u64 {
     usage.input_tokens.saturating_add(usage.output_tokens)
 }
@@ -2794,169 +1875,6 @@ fn effective_stub_budget(
     }
     let token_proxy_budget = limit.saturating_sub(reserve_tokens).saturating_mul(4);
     configured_budget_bytes.min(token_proxy_budget)
-}
-
-fn file_change_payload(
-    tool_call_id: &str,
-    patch: &PatchEvents,
-    pre_image_blob: Option<&str>,
-) -> JsonObject {
-    let mut payload = object([
-        ("tool_call_id", tool_call_id.to_owned().into()),
-        ("origin", patch.origin.into()),
-        ("action", patch.action.into()),
-        ("path", patch.path.clone().into()),
-        ("old_path", Value::Null),
-        (
-            "before_sha256",
-            patch
-                .before_sha256
-                .as_ref()
-                .map_or(Value::Null, |sha| sha.clone().into()),
-        ),
-        ("after_sha256", patch.after_sha256.clone().into()),
-        ("before_byte_len", patch.before_byte_len.into()),
-        ("after_byte_len", patch.after_byte_len.into()),
-        ("diff_redaction", "omitted".into()),
-    ]);
-    if let Some(hash) = pre_image_blob {
-        payload.insert("pre_image_blob".to_owned(), hash.into());
-    }
-    payload
-}
-
-pub(crate) fn maybe_store_pre_image(root: &std::path::Path, patch: &PatchEvents) -> Option<String> {
-    // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
-    if patch.action != "modify" || patch.before.is_empty() {
-        return None;
-    }
-    checkpoints::store_pre_image(root, &patch.path, &patch.before)
-}
-
-fn file_diff_payload(tool_call_id: &str, file_change_id: &str, patch: &PatchEvents) -> JsonObject {
-    let projection = file_diff_projection(FileDiffSource {
-        path: &patch.path,
-        action: patch.action,
-        before: &patch.before,
-        after: &patch.after,
-    });
-    object([
-        ("tool_call_id", tool_call_id.to_owned().into()),
-        ("file_change_id", file_change_id.to_owned().into()),
-        ("path", patch.path.clone().into()),
-        ("old_path", Value::Null),
-        ("action", patch.action.into()),
-        ("origin", patch.origin.into()),
-        (
-            "diff",
-            projection
-                .diff
-                .map_or(Value::Null, std::convert::Into::into),
-        ),
-        ("truncated", projection.truncated.into()),
-        ("truncation", projection.truncation.into()),
-        (
-            "omitted_reason",
-            projection
-                .omitted_reason
-                .map_or(Value::Null, std::convert::Into::into),
-        ),
-    ])
-}
-
-fn approval_mode_str(mode: ApprovalMode) -> &'static str {
-    match mode {
-        ApprovalMode::Ask => "ask",
-        ApprovalMode::SessionAllow => "session-allow",
-        ApprovalMode::AlwaysDeny => "always-deny",
-    }
-}
-
-fn permission_decision_str(allowed: bool) -> &'static str {
-    if allowed {
-        "allowed"
-    } else {
-        "denied"
-    }
-}
-
-pub(crate) fn permission_request_for_tool(
-    capability: Capability,
-    reason: &str,
-    tool_name: &str,
-    input: &Value,
-    tools: &crate::tools::ToolRegistry,
-) -> PermissionRequest {
-    let mut request =
-        PermissionRequest::new(capability, reason.to_owned()).with_workspace_root(tools.root());
-    match tool_name {
-        "run_shell" => {
-            if let Some(command) = input.get("command").and_then(Value::as_str) {
-                request = request.with_command(command);
-            }
-        }
-        "edit_file" | "write_file" | "read_file" | "apply_patch" => {
-            if let Some(path) = input.get("path").and_then(Value::as_str) {
-                request = request.with_path(path);
-            }
-        }
-        _ => {}
-    }
-    // Scoped fs-write grants match the canonicalized workspace-relative
-    // path (`..`/symlinks resolved exactly as the write resolves them), so
-    // `src/../Cargo.toml` or a symlink inside the granted subtree cannot
-    // borrow its grant. An unresolvable path clears the field: scoped
-    // grants then never match and the request falls back to the ask path.
-    // Living HERE means every permission gate — root session AND companion
-    // loop — gets the same resolution; a caller-side fix-up covers one gate
-    // and silently misses the twin (security audit finding).
-    if capability == Capability::FsWrite {
-        request.path = request
-            .path
-            .as_deref()
-            .and_then(|path| tools.workspace_relative_path(&path.to_string_lossy()));
-    }
-    request
-}
-
-/// Build a permission.decision payload including optional grant scope fields.
-pub(crate) fn permission_decision_payload(
-    decision: &GrantDecision,
-    mode_label: &str,
-    mode: ApprovalMode,
-) -> JsonObject {
-    let allowed = decision.allowed();
-    let mut payload = object([
-        ("capability", decision.capability.as_str().into()),
-        ("mode", mode_label.into()),
-        ("allowed", allowed.into()),
-        ("decision", permission_decision_str(allowed).into()),
-    ]);
-    if allowed {
-        // grant_scope is additive; keep legacy `scope: "session"` for unscoped
-        // session grants created under Ask so resume continues to fold
-        // capability-wide allows (see resume fold rules).
-        payload.insert(
-            "grant_scope".to_owned(),
-            decision.grant_scope_label().into(),
-        );
-        if let Some(pattern) = decision.grant_pattern() {
-            payload.insert("grant_pattern".to_owned(), pattern.into());
-        }
-        let unscoped_session_grant = mode == ApprovalMode::Ask
-            && matches!(
-                &decision.scope,
-                crate::grants::GrantScope::Session(p) if p.is_unscoped()
-            );
-        if unscoped_session_grant {
-            payload.insert("scope".to_owned(), "session".into());
-        }
-    } else if let Some(instruction) = decision.instruction.as_ref() {
-        if !instruction.is_empty() {
-            payload.insert("instruction".to_owned(), instruction.clone().into());
-        }
-    }
-    payload
 }
 
 pub fn fold_model_target(
