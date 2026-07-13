@@ -66,13 +66,11 @@ impl AppCore {
                 )
             })
         });
-        // Active turns may commit finalized history and the markdown-stable
-        // live transcript prefix. If no live prefix exists, keep the boundary
-        // at finalized history so completed tool artifacts can enter native
-        // scrollback while mutable assistant text stays app-owned.
-        if self.turn_in_flight() && self.transcript.live_committed_items().is_empty() {
-            frame.committable_rows = frame.committable_rows.min(frame.history_rows);
-        }
+        // Only finalized event projections enter native scrollback. Even a
+        // newline-stable live prefix remains app-owned until MODEL_RESULT;
+        // otherwise its rows cannot be atomically replaced by the canonical
+        // round content and are duplicated or spliced across tool rounds.
+        frame.committable_rows = frame.committable_rows.min(frame.history_rows);
         let height = self.last_history_viewport.1.max(1);
         let top = frame
             .history_rows
@@ -111,7 +109,7 @@ impl AppCore {
                 )
             }));
         self.apply_search_highlights(&mut history);
-        push_visual_block(&mut blocks, VisualBlockRole::Transcript, history);
+        push_visual_block(&mut blocks, VisualBlockRole::LiveTranscript, history);
         push_visual_block(
             &mut blocks,
             VisualBlockRole::LiveTranscript,

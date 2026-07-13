@@ -7821,6 +7821,72 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
 }
 
 #[test]
+fn tui_pty_tool_round_commits_canonical_narration_without_corruption() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let script = write_fixture_script(
+        temp.path(),
+        "tool-round-transcript.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [
+                {"events": [
+                    {"text_delta": "## Provider "},
+                    {"text_delta": "map α"},
+                    {"text_delta": "β\n\n| API | Pur"},
+                    {"text_delta": "pose |\n|---|---|\n| invoke_"},
+                    {"text_delta": "http_error | 😀 faithful |\n"},
+                    {"tool_call": {
+                        "id": "call-read",
+                        "name": "read_file",
+                        "input": {"path": "Cargo.toml"}
+                    }},
+                    {"finished": {"stop_reason": "tool_use"}}
+                ]},
+                {"events": [
+                    {"text_delta": "Final: `eet"},
+                    {"text_delta": "ionsStream` remains intact."},
+                    {"finished": {"stop_reason": "completed"}}
+                ]}
+            ]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("/ commands"));
+    tui.write("inspect the provider\r");
+    assert!(
+        tui.wait_for_screen("Final: eetionsStream remains intact."),
+        "tool round did not finish:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let final_state = pty_final_state_with_resizes(&tui.output, (24, 80), &tui.resizes);
+    for needle in [
+        "Provider map αβ",
+        "invoke_http_error",
+        "😀 faithful",
+        "Final: eetionsStream remains intact.",
+    ] {
+        assert_eq!(
+            final_state.matches(needle).count(),
+            1,
+            "`{needle}` was lost, duplicated, or corrupted:\n{final_state}"
+        );
+    }
+}
+
+#[test]
 fn tui_pty_streaming_reasoning_body_stays_viewport_only_until_the_gist_commits() {
     // Euler Thinking State design, "streaming" state: while the model
     // reasons, the delta text types out live behind the hairline in the
