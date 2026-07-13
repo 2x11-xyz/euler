@@ -690,7 +690,7 @@ fn permissions_picker_selects_existing_capability_and_mode() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Permissions (1/9)"));
+    assert!(rendered.contains("Permissions (1/12)"));
     assert!(rendered.contains("Files: read - Ask before reading files"));
     assert!(!rendered.contains('%'));
     for _ in 0..4 {
@@ -702,6 +702,28 @@ fn permissions_picker_selects_existing_capability_and_mode() {
         SurfaceEvent::Action(CommandAction::SetPermissionMode {
             capability: Capability::FsWrite,
             mode: ApprovalMode::SessionAllow,
+        })
+    );
+}
+
+#[test]
+fn permissions_picker_exposes_agent_spawn_controls() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_picker(PickerSpec::Permissions(permission_choices()));
+    for _ in 0..9 {
+        surface.move_selection_down();
+    }
+
+    let rendered = surface
+        .surface_lines(80)
+        .expect("permissions picker")
+        .join("\n");
+    assert!(rendered.contains("Agents - Ask before spawning agents"));
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::SetPermissionMode {
+            capability: Capability::AgentSpawn,
+            mode: ApprovalMode::Ask,
         })
     );
 }

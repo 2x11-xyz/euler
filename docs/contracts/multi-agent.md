@@ -258,7 +258,11 @@ drafts — the optional focus prompt carries the subject.
 - **No required arguments.** Optional: `focus` (bounded string carried into
   every reviewer brief), `personas` (reviewer charter names), `models`
   (`provider::model` one-shot override — only when the user explicitly
-  named targets; the tool must not guess providers), `max_tokens`.
+  named targets; the tool must not guess providers), `max_tokens`. On this
+  model-facing surface, an empty `models` array names no explicit target and
+  is treated as omission so persisted config can resolve. Explicit CLI/TUI
+  one-off lists and direct extension inputs remain strict 1–5 target lists and
+  reject empty input.
 - **Gate**: `Capability::AgentSpawn` through the ordinary tool permission
   machinery (prompt/grant/deny; covered grants do not re-prompt, so
   repeated checkpoint-loop calls pay no repeat approval). The extension

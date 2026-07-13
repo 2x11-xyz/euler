@@ -224,6 +224,7 @@ impl<D> PermissionGate<D> {
                 (Capability::FsRead, ApprovalMode::SessionAllow),
                 (Capability::FsWrite, ApprovalMode::Ask),
                 (Capability::ShellExec, ApprovalMode::Ask),
+                (Capability::AgentSpawn, ApprovalMode::Ask),
             ]),
             session_grants: GrantList::new(),
             project_grants: GrantList::new(),
@@ -622,6 +623,17 @@ mod tests {
 
         assert_eq!(mode, ApprovalMode::AlwaysDeny);
         assert!(!decision);
+    }
+
+    #[test]
+    fn root_agent_spawn_defaults_to_ask() {
+        let gate = PermissionGate::new(PanicDecider);
+
+        assert_eq!(
+            gate.configured_mode(Capability::AgentSpawn),
+            Some(ApprovalMode::Ask)
+        );
+        assert_eq!(gate.mode(Capability::AgentSpawn), ApprovalMode::Ask);
     }
 
     #[test]

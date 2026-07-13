@@ -216,6 +216,18 @@ fn subagent_tiers_map_to_existing_approval_modes() {
         SubagentDecider::approval_mode(AutoApproveTier::TrustedLocal, Capability::ShellExec),
         ApprovalMode::SessionAllow
     );
+    assert_eq!(
+        SubagentDecider::approval_mode(AutoApproveTier::ReadOnly, Capability::AgentSpawn),
+        ApprovalMode::SessionAllow
+    );
+    assert_eq!(
+        SubagentDecider::approval_mode(AutoApproveTier::TrustedLocal, Capability::AgentSpawn),
+        ApprovalMode::SessionAllow
+    );
+    assert_eq!(
+        SubagentDecider::approval_mode(AutoApproveTier::TrustedLocal, Capability::Network),
+        ApprovalMode::AlwaysDeny
+    );
 }
 
 #[test]

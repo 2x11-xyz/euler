@@ -1,5 +1,5 @@
 use super::*;
-use crate::permissions::{ApprovalMode, ScriptedDecider};
+use crate::permissions::{ApprovalMode, DeciderVerdict, ScriptedDecider};
 use crate::swarm::{SwarmConfig, SwarmConfigStore};
 use crate::{ProvenanceWriter, SessionConfig};
 use euler_provider::{
@@ -141,16 +141,43 @@ fn harness(
     main_script: Vec<FixtureResponse>,
     reviewers: &[(&str, Vec<FixtureResponse>)],
 ) -> Harness {
+    harness_with_providers(main_script, reviewer_provider_set(reviewers))
+}
+
+fn interactive_harness(
+    main_script: Vec<FixtureResponse>,
+    reviewers: &[(&str, Vec<FixtureResponse>)],
+) -> Harness {
+    harness_with_permission(
+        main_script,
+        reviewer_provider_set(reviewers),
+        vec![DeciderVerdict::AllowSession],
+        None,
+    )
+}
+
+fn reviewer_provider_set(reviewers: &[(&str, Vec<FixtureResponse>)]) -> ProviderSet {
     let mut providers = ProviderSet::new();
     for (name, script) in reviewers {
         providers.insert_named((*name).to_owned(), ScriptedProvider::new(script.clone()));
     }
-    harness_with_providers(main_script, providers)
+    providers
 }
 
-fn harness_with_providers(
+fn harness_with_providers(main_script: Vec<FixtureResponse>, providers: ProviderSet) -> Harness {
+    harness_with_permission(
+        main_script,
+        providers,
+        Vec::new(),
+        Some(ApprovalMode::SessionAllow),
+    )
+}
+
+fn harness_with_permission(
     main_script: Vec<FixtureResponse>,
     mut providers: ProviderSet,
+    decisions: Vec<DeciderVerdict>,
+    agent_spawn_mode: Option<ApprovalMode>,
 ) -> Harness {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("workspace");
@@ -168,10 +195,12 @@ fn harness_with_providers(
     let user_config = temp.path().join("home").join("code-swarm.json");
     config.code_swarm_user_config_path = Some(user_config.clone());
     let mut session =
-        Session::new_with_providers(config, providers, ScriptedDecider::new(Vec::new()))
+        Session::new_with_providers(config, providers, ScriptedDecider::new(decisions))
             .with_provenance(writer);
     session.set_code_swarm_extension(Arc::new(FakeCodeSwarm));
-    session.set_permission_mode(Capability::AgentSpawn, ApprovalMode::SessionAllow);
+    if let Some(mode) = agent_spawn_mode {
+        session.set_permission_mode(Capability::AgentSpawn, mode);
+    }
     Harness {
         _temp: temp,
         session,
@@ -245,6 +274,176 @@ fn tool_call_with_project_config_spawns_reviewers_and_returns_honest_summary() {
         .filter(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
         .count();
     assert_eq!(spawns, 2, "one spawn per configured reviewer");
+}
+
+#[test]
+fn interactive_tool_call_prompts_for_agent_spawn_and_runs_after_approval() {
+    let mut harness = interactive_harness(
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(json!({"focus": "the plan"}))]),
+            FixtureResponse::Assistant("adjudicated".to_owned()),
+        ],
+        &[(
+            "p1",
+            vec![FixtureResponse::Assistant("approved finding".to_owned())],
+        )],
+    );
+    write_project_config(&harness.root, &["p1::m1"]);
+
+    harness.session.run_turn("review my plan").expect("turn");
+
+    let tool_call = harness
+        .session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::TOOL_CALL
+                && event.payload["name"] == json!("code_swarm_review")
+        })
+        .expect("tool call");
+    let prompt = harness
+        .session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
+        .expect("interactive permission prompt");
+    assert_eq!(prompt.parent.as_deref(), Some(tool_call.id.as_str()));
+    assert_eq!(prompt.payload["capability"], json!("agent-spawn"));
+    assert_eq!(prompt.payload["reason"], json!("tool code_swarm_review"));
+
+    let decision = harness
+        .session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .expect("permission decision");
+    assert_eq!(decision.parent.as_deref(), Some(prompt.id.as_str()));
+    assert_eq!(decision.payload["capability"], json!("agent-spawn"));
+    assert_eq!(decision.payload["mode"], json!("ask"));
+    assert_eq!(decision.payload["allowed"], json!(true));
+    assert_eq!(decision.payload["grant_scope"], json!("session"));
+
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].payload["ok"], json!(true));
+    assert!(results[0].payload["output"]
+        .as_str()
+        .expect("output")
+        .contains("approved finding"));
+}
+
+#[test]
+fn empty_model_tool_override_uses_persisted_project_config() {
+    let mut harness = harness(
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(json!({
+                "focus": "the diff",
+                "models": [],
+                "personas": ["correctness", "safety", "tests"],
+                "max_tokens": 12000
+            }))]),
+            FixtureResponse::Assistant("adjudicated".to_owned()),
+        ],
+        &[
+            (
+                "p1",
+                vec![FixtureResponse::Assistant(
+                    "persisted reviewer finding one".to_owned(),
+                )],
+            ),
+            (
+                "p2",
+                vec![FixtureResponse::Assistant(
+                    "persisted reviewer finding two".to_owned(),
+                )],
+            ),
+            (
+                "p3",
+                vec![FixtureResponse::Assistant(
+                    "persisted reviewer finding three".to_owned(),
+                )],
+            ),
+        ],
+    );
+    write_project_config(
+        &harness.root,
+        &[
+            "p1::persisted-model-1",
+            "p2::persisted-model-2",
+            "p3::persisted-model-3",
+        ],
+    );
+
+    harness.session.run_turn("review my diff").expect("turn");
+
+    let resolved_targets = harness
+        .session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
+        .map(|event| {
+            format!(
+                "{}::{}",
+                event.payload["provider"].as_str().expect("provider"),
+                event.payload["model"].as_str().expect("model")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved_targets,
+        [
+            "p1::persisted-model-1",
+            "p2::persisted-model-2",
+            "p3::persisted-model-3",
+        ]
+    );
+    let results = tool_results(&harness.session);
+    assert_eq!(results[0].payload["ok"], json!(true));
+    let output = results[0].payload["output"].as_str().expect("output");
+    assert!(output.contains("3/3 reviewers succeeded"), "{output}");
+    assert!(
+        output.contains("persisted reviewer finding one"),
+        "{output}"
+    );
+    assert!(
+        output.contains("persisted reviewer finding two"),
+        "{output}"
+    );
+    assert!(
+        output.contains("persisted reviewer finding three"),
+        "{output}"
+    );
+}
+
+#[test]
+fn malformed_nonempty_model_override_does_not_fall_back_to_config() {
+    let mut harness = harness(
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(json!({
+                "models": ["missing-separator"]
+            }))]),
+            FixtureResponse::Assistant("relayed".to_owned()),
+        ],
+        &[(
+            "p1",
+            vec![FixtureResponse::Assistant("must stay unused".to_owned())],
+        )],
+    );
+    write_project_config(&harness.root, &["p1::configured-model"]);
+
+    harness.session.run_turn("review").expect("turn");
+
+    assert!(harness
+        .session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::AGENT_SPAWN));
+    let results = tool_results(&harness.session);
+    assert_eq!(results[0].payload["ok"], json!(false));
+    assert!(results[0].payload["error"]
+        .as_str()
+        .expect("error")
+        .contains("provider::model"));
 }
 
 #[test]

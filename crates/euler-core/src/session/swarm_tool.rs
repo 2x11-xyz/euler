@@ -279,10 +279,13 @@ fn parse_review_tool_args(input: &Value) -> Result<ReviewToolArgs, String> {
             "focus exceeds {MAX_FOCUS_BYTES} bytes; shorten it — reviewers see the session canvas already"
         ));
     }
-    let models = optional_string_list(object, "models")?;
+    // An empty model-facing optional list names no one-off override, so let
+    // the persisted resolution chain run. Explicit CLI/extension invocations
+    // bypass this parser and continue to reject empty model lists.
+    let models = optional_string_list(object, "models")?.filter(|models| !models.is_empty());
     if models
         .as_ref()
-        .is_some_and(|models| models.is_empty() || models.len() > MAX_SWARM_REVIEWERS)
+        .is_some_and(|models| models.len() > MAX_SWARM_REVIEWERS)
     {
         return Err(format!(
             "models must list 1-{MAX_SWARM_REVIEWERS} provider::model targets when provided"
