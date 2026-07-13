@@ -1,4 +1,4 @@
-use super::{input_error, is_causal_dag_self_event, OBSERVER_BRIEF_SCHEMA_NAME};
+use super::{input_error, is_causal_dag_self_event, HINTS_SCHEMA_NAME, OBSERVER_BRIEF_SCHEMA_NAME};
 use crate::active_state::ActiveGraphState;
 use euler_agents::{MAX_SYSTEM_PROMPT_BYTES, MAX_TASK_BYTES};
 use euler_event::{EventEnvelope, EventKind};
@@ -1028,11 +1028,13 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
+    let schema_instruction = format!("Use schema {HINTS_SCHEMA_NAME} and this shape:");
+    let schema_shape = format!(r#"{{"schema":"{HINTS_SCHEMA_NAME}","nodes":[],"edges":[]}}"#);
     let prompt = [
         "You are a generic Causal DAG observer for Euler.",
         "Return exactly one raw JSON object. Do not use markdown fences.",
-        "Use schema euler.causal_dag.hints.v1 and this shape:",
-        "{\"schema\":\"euler.causal_dag.hints.v1\",\"nodes\":[],\"edges\":[]}",
+        &schema_instruction,
+        &schema_shape,
         "The task may include a committed CURRENT GRAPH followed by NEW EVENTS.",
         "CURRENT GRAPH uses N <node-alias> <kind>/<status> p=<parent-alias> v=<edge-alias>:<kind> t=<title>; E lines are non-backbone edges.",
         "REPLACEMENT N lines also carry r=<root-alias>, src=<node-source-alias>, and es=<parent-edge-source-alias>; E lines carry src=<edge-source-alias>.",
@@ -1050,10 +1052,9 @@ pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
         "The host resolves source aliases to canonical provenance event ids before committing the graph.",
         "Do not use old archive knowledge, fixture oracle labels, or target edge lists.",
         "Omit unsupported claims rather than inventing structure.",
-        "Node keys are exactly: id, root_id, kind, status, title, summary, source_refs, confidence, basis, metadata.",
-        "Edge keys are exactly: id, from, to, class, kind, canonical_backbone, source_refs, confidence, basis, metadata.",
+        "Node keys are exactly: id, root_id, kind, status, title, summary, source_refs, basis, metadata.",
+        "Edge keys are exactly: id, from, to, class, kind, canonical_backbone, source_refs, basis, metadata.",
         "Every source_ref uses exactly: id, event_id, payload_pointer.",
-        "Every confidence uses exactly {\"level\":\"high|medium|low\",\"score\":0.0..1.0}.",
         "Every basis uses exactly {\"kind\":\"direct|cluster|inferred|chronology|operator\",\"summary\":\"...\"}.",
         "For each new node, set metadata.occurrence_source_ref_id to its local source_ref id for the event where that material state first occurred, not later documentation or verification.",
         "For existing node revisions use metadata: {}; the host preserves the immutable occurrence anchor.",

@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_lines)]
 
-// This conformance suite validates the `euler.causal_dag.v2` artifact schema
+// This conformance suite validates the `euler.causal_dag.v3` artifact schema
 // against canonical Euler events only. It deliberately imports `euler_event`,
 // not the causal-dag extension implementation, so schema validity stays
 // independent from the current projector code.
@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCHEMA: &str = "euler.causal_dag.v2";
-const MEDIA_TYPE: &str = "application/vnd.euler.causal-dag.v2+json";
+const SCHEMA: &str = "euler.causal_dag.v3";
+const MEDIA_TYPE: &str = "application/vnd.euler.causal-dag.v3+json";
 
 #[test]
 fn causal_dag_positive_fixtures_validate() {
@@ -687,7 +687,6 @@ struct EdgeRecord {
     kind: String,
     canonical_backbone: bool,
     basis_kind: String,
-    confidence_level: String,
     source_refs: Vec<SourceRefRecord>,
     source_backed: bool,
 }
@@ -1164,7 +1163,6 @@ impl<'a> Validator<'a> {
                     "title",
                     "summary",
                     "source_refs",
-                    "confidence",
                     "basis",
                     "metadata",
                 ],
@@ -1199,14 +1197,9 @@ impl<'a> Validator<'a> {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            let (confidence_level, _) = self.parse_confidence(object.get("confidence"), "node");
             let basis_kind = self.parse_basis(object.get("basis"), "node");
-            let source_refs = self.parse_source_refs(
-                object.get("source_refs"),
-                &basis_kind,
-                &confidence_level,
-                "node",
-            );
+            let source_refs =
+                self.parse_source_refs(object.get("source_refs"), &basis_kind, "node");
             if let Some(anchor) = metadata.get("occurrence_source_ref_id") {
                 match anchor.as_str() {
                     Some(anchor)
@@ -1222,7 +1215,7 @@ impl<'a> Validator<'a> {
                 }
             }
             self.validate_basis_source_refs(object.get("basis"), &source_refs, "node");
-            self.validate_evidence_shape(&basis_kind, &confidence_level, &source_refs, "node");
+            self.validate_evidence_shape(&basis_kind, &source_refs, "node");
             self.validate_opaque_reasoning(&basis_kind, &source_refs, "node");
             let record = NodeRecord {
                 id: id.clone(),
@@ -1275,7 +1268,6 @@ impl<'a> Validator<'a> {
                     "kind",
                     "canonical_backbone",
                     "source_refs",
-                    "confidence",
                     "basis",
                     "metadata",
                 ],
@@ -1286,16 +1278,11 @@ impl<'a> Validator<'a> {
             let kind = self.required_str(object, "kind", "edge").to_owned();
             self.validate_edge_kind(&class, &kind);
             self.validate_metadata(object.get("metadata"), "edge");
-            let (confidence_level, _) = self.parse_confidence(object.get("confidence"), "edge");
             let basis_kind = self.parse_basis(object.get("basis"), "edge");
-            let source_refs = self.parse_source_refs(
-                object.get("source_refs"),
-                &basis_kind,
-                &confidence_level,
-                "edge",
-            );
+            let source_refs =
+                self.parse_source_refs(object.get("source_refs"), &basis_kind, "edge");
             self.validate_basis_source_refs(object.get("basis"), &source_refs, "edge");
-            self.validate_evidence_shape(&basis_kind, &confidence_level, &source_refs, "edge");
+            self.validate_evidence_shape(&basis_kind, &source_refs, "edge");
             self.validate_opaque_reasoning(&basis_kind, &source_refs, "edge");
             let source_backed = source_refs
                 .iter()
@@ -1309,7 +1296,6 @@ impl<'a> Validator<'a> {
                 kind,
                 canonical_backbone: self.required_bool(object, "canonical_backbone", "edge"),
                 basis_kind,
-                confidence_level,
                 source_refs,
                 source_backed,
             };
@@ -1324,7 +1310,6 @@ impl<'a> Validator<'a> {
         &mut self,
         value: Option<&Value>,
         basis_kind: &str,
-        confidence_level: &str,
         owner: &str,
     ) -> Vec<SourceRefRecord> {
         let Some(array) = value.and_then(Value::as_array) else {
@@ -1383,12 +1368,6 @@ impl<'a> Validator<'a> {
             }
             if kind == "blob" {
                 self.validate_blob_ref(&event_id, object);
-            }
-            if confidence_level == "high" && matches!(basis_kind, "inferred" | "chronology") {
-                self.report.fail(
-                    "confidence-basis",
-                    format!("{owner} has high confidence with degraded basis"),
-                );
             }
             sources.push(SourceRefRecord {
                 id,
@@ -1597,42 +1576,21 @@ impl<'a> Validator<'a> {
     fn validate_evidence_shape(
         &mut self,
         basis_kind: &str,
-        confidence_level: &str,
         source_refs: &[SourceRefRecord],
         owner: &str,
     ) {
         match basis_kind {
-            "direct" | "cluster" | "operator" => {
-                if source_refs.is_empty() {
-                    self.report.fail(
-                        "source-ref-required",
-                        format!("{owner} requires source refs"),
-                    );
-                }
-            }
-            "inferred" | "chronology" => {
-                if source_refs.is_empty() && !self.projection_degraded {
-                    self.report.fail(
-                        "degraded-required",
-                        format!(
-                            "{owner} empty degraded-basis source refs require degraded projection"
-                        ),
-                    );
-                }
-                if confidence_level == "high" {
-                    self.report.fail(
-                        "confidence-basis",
-                        format!("{owner} degraded basis must not be high confidence"),
-                    );
-                }
+            "direct" | "cluster" | "operator" if source_refs.is_empty() => self.report.fail(
+                "source-ref-required",
+                format!("{owner} requires source refs"),
+            ),
+            "inferred" | "chronology" if source_refs.is_empty() && !self.projection_degraded => {
+                self.report.fail(
+                    "degraded-required",
+                    format!("{owner} empty degraded-basis source refs require degraded projection"),
+                );
             }
             _ => {}
-        }
-        if source_refs.is_empty() && confidence_level == "high" {
-            self.report.fail(
-                "confidence-source",
-                format!("{owner} empty source refs must not be high confidence"),
-            );
         }
     }
 
@@ -1786,12 +1744,6 @@ impl<'a> Validator<'a> {
                     self.report.fail(
                         "sequence-unmarked",
                         "sequence fallback requires degraded projection and diagnostics",
-                    );
-                }
-                if edge.confidence_level == "high" {
-                    self.report.fail(
-                        "sequence-confidence",
-                        "sequence edges must not be high confidence",
                     );
                 }
             }
@@ -2301,27 +2253,6 @@ impl<'a> Validator<'a> {
         warnings
     }
 
-    fn parse_confidence(&mut self, value: Option<&Value>, owner: &str) -> (String, Option<f64>) {
-        let Some(confidence) = value.and_then(Value::as_object) else {
-            self.report.fail(
-                "required-field",
-                format!("{owner}.confidence must be an object"),
-            );
-            return (String::new(), None);
-        };
-        self.check_keys(confidence, &["level", "score"], "confidence");
-        let level = self
-            .required_str(confidence, "level", "confidence")
-            .to_owned();
-        self.check_allowed("confidence-level", &level, &["high", "medium", "low"]);
-        let score = confidence.get("score").and_then(Value::as_f64);
-        if score.is_some_and(|score| !(0.0..=1.0).contains(&score)) {
-            self.report
-                .fail("confidence-score", "confidence.score must be in 0.0..=1.0");
-        }
-        (level, score)
-    }
-
     fn parse_basis(&mut self, value: Option<&Value>, owner: &str) -> String {
         let Some(basis) = value.and_then(Value::as_object) else {
             self.report
@@ -2353,7 +2284,6 @@ impl<'a> Validator<'a> {
                 "kind",
                 "status",
                 "source_refs",
-                "confidence",
                 "basis",
                 "class",
                 "from",
@@ -2863,7 +2793,6 @@ fn synthetic_edge(
         kind: kind.to_owned(),
         canonical_backbone,
         basis_kind: "direct".to_owned(),
-        confidence_level: "high".to_owned(),
         source_refs: Vec::new(),
         source_backed: false,
     }

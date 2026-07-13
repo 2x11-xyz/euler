@@ -651,10 +651,6 @@ fn structural_node(
         "title": format!("Event {:06}: {}", index + 1, event.kind.as_str()),
         "summary": format!("Projected from parent-linked provenance event {} at {}.", event.kind.as_str(), event.ts),
         "source_refs": [event_source_ref(source_ref_id.clone(), event)],
-        "confidence": {
-            "level": "medium",
-            "score": 0.75
-        },
         "basis": {
             "kind": "direct",
             "summary": "v0 structural projection from EventEnvelope.parent links in the bounded provenance page",
@@ -692,10 +688,6 @@ fn structural_edge(
         "kind": "continuation",
         "canonical_backbone": true,
         "source_refs": [event_source_ref(source_ref_id.clone(), child)],
-        "confidence": {
-            "level": "medium",
-            "score": 0.75
-        },
         "basis": {
             "kind": "direct",
             "summary": format!(
@@ -723,10 +715,6 @@ fn node(index: usize, event: &EventEnvelope, root_id: &str) -> Value {
         "title": format!("Event {:06}: {}", index + 1, event.kind.as_str()),
         "summary": format!("Projected from bounded provenance event {} at {}.", event.kind.as_str(), event.ts),
         "source_refs": [event_source_ref(source_ref_id.clone(), event)],
-        "confidence": {
-            "level": "low",
-            "score": 0.25
-        },
         "basis": {
             "kind": "chronology",
             "summary": "v0 chronology projection from bounded provenance order; not causal lineage",
@@ -746,10 +734,6 @@ fn edge(index: usize, from_event: &EventEnvelope, to_event: &EventEnvelope) -> V
         "kind": "sequence",
         "canonical_backbone": true,
         "source_refs": [event_source_ref(source_ref_id.clone(), to_event)],
-        "confidence": {
-            "level": "low",
-            "score": 0.1
-        },
         "basis": {
             "kind": "chronology",
             "summary": format!(

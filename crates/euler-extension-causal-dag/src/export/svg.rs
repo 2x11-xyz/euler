@@ -208,10 +208,9 @@ fn render_nodes(
         };
         svg.push_str("<g>");
         svg.push_str(&format!(
-            "<title>{} · {} · confidence {:.2}\n{}\nEvidence: {}</title>",
+            "<title>{} · {}\n{}\nEvidence: {}</title>",
             escape_xml(&node.title),
             escape_xml(&status.label),
-            node.conf,
             escape_xml(&node.summary),
             escape_xml(&node.ev)
         ));

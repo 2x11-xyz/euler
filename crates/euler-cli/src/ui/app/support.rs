@@ -152,7 +152,7 @@ pub(super) fn causal_dag_stats_from_events(
             return None;
         }
         let metadata = event.payload.get("metadata")?.as_object()?;
-        (metadata.get("schema").and_then(Value::as_str) == Some("euler.causal_dag.v2"))
+        (metadata.get("schema").and_then(Value::as_str) == Some("euler.causal_dag.v3"))
             .then_some(metadata)
     });
     CausalDagStats {
@@ -425,7 +425,7 @@ mod tests {
                 (
                     "metadata",
                     serde_json::json!({
-                        "schema": "euler.causal_dag.v2",
+                        "schema": "euler.causal_dag.v3",
                         "node_count": 35,
                         "annotation_edge_count": 7
                     }),

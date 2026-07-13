@@ -1913,10 +1913,14 @@ document.addEventListener('click', function (e) {
 <helmet>
   <style>
     html, body { margin: 0; }
+    .dag-toolbar { align-items:stretch !important; }
+    .dag-toolbar > div { height:30px; }
+    .dag-toolbar > button, .dag-toolbar > div > button { height:30px; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; line-height:1; }
     @media (max-width: 600px) {
       .dag-heading { top:14px !important; left:14px !important; right:14px !important; }
       .dag-heading > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .dag-toolbar { top:58px !important; left:14px !important; right:auto !important; gap:5px !important; }
+      .dag-menu-3d { left:0 !important; right:auto !important; }
       .dag-overlay { top:96px !important; left:14px !important; right:14px !important; width:auto !important; box-sizing:border-box; }
       .dag-card { left:14px !important; right:14px !important; bottom:74px !important; width:auto !important; max-height:38vh; overflow:hidden; box-sizing:border-box; }
       .dag-hint { display:none !important; }
@@ -1977,7 +1981,7 @@ document.addEventListener('click', function (e) {
     <div style="position:relative;">
       <button onclick="{{ toggle3d }}" style="background:{{ nav3dBg }}; color:{{ th.sub }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">3D ▾</button>
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
-        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+        <div class="dag-menu-3d" style="position:absolute; top:34px; right:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3D · constellation</a>
           <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · sequence axis</a>
         </div>
@@ -2023,7 +2027,6 @@ document.addEventListener('click', function (e) {
         <span style="font-size:15px; color:{{ sel.color }}; opacity:{{ sel.op }};">{{ sel.glyph }}</span>
         <span style="color:{{ sel.color }}; opacity:{{ sel.op }};">{{ sel.statusWord }}</span>
         <span style="color:{{ th.sub }}; flex:none;">· {{ sel.kind }}</span>
-        <span style="margin-left:auto; color:{{ th.sub }}; flex:none;">{{ sel.conf }}</span>
       </div>
       <div style="color:{{ th.text }}; font-size:13.5px; font-weight:600; line-height:1.4; font-family:Georgia, serif;">{{ sel.title }}</div>
       <div style="color:{{ th.body }}; font-size:12.5px; line-height:1.55; font-family:Georgia, serif;">{{ sel.summary }}</div>
@@ -2050,7 +2053,7 @@ document.addEventListener('click', function (e) {
   &quot;showCrossArcs&quot;: { &quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Edges&quot; },
   &quot;showLabels&quot;: { &quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: false, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Labels&quot; }
 }">
-const __DAG = {"schema":"euler.causal_dag.viewer.v1","session_id":"session-knuth","title":"Knuth-style search","operation":"snapshot","active_root":"node-knuth-root","roots":["node-knuth-root","node-knuth-secondary-root"],"nodes":[{"id":"node-knuth-deadend","parent":"node-knuth-root","sequence":1,"status":"dead_end","kind":"attempt","title":"Rejected recurrence branch","summary":"The left branch failed because the recurrence assumption contradicted the generated table.","conf":0.95,"ev":"eft-tool"},{"id":"node-knuth-repair","parent":"node-knuth-deadend","sequence":2,"status":"success","kind":"attempt","title":"Repair with invariant factoring","summary":"The repair reused the failed recurrence material and switched to invariant factoring.","conf":0.93,"ev":"-command"},{"id":"node-knuth-root","parent":null,"sequence":0,"status":"open","kind":"root","title":"Knuth-style search","summary":"Primary search objective for a compact solution path.","conf":0.98,"ev":"bjective"},{"id":"node-knuth-secondary-root","parent":null,"sequence":3,"status":"open","kind":"root","title":"Notation clean-up","summary":"Related but separate root for notation clean-up.","conf":0.9,"ev":"bjective"},{"id":"node-knuth-sibling","parent":"node-knuth-root","sequence":4,"status":"open","kind":"attempt","title":"Sibling invariant branch","summary":"A sibling branch pursues invariant factoring without becoming a child of the failed attempt.","conf":0.88,"ev":"ng-check"},{"id":"node-knuth-verify","parent":"node-knuth-repair","sequence":5,"status":"verified","kind":"synthesis","title":"Verified repair path","summary":"The repaired branch is verified by the invariant check and note artifact.","conf":0.92,"ev":"ng-check"}],"arcs":[{"id":"edge-knuth-artifact-use","from":"node-knuth-repair","to":"node-knuth-verify","class":"annotation","kind":"artifact_use","note":"The note artifact records the repaired path."},{"id":"edge-knuth-cross-root","from":"node-knuth-secondary-root","to":"node-knuth-root","class":"annotation","kind":"related","note":"The second root is explicitly related to the primary search."},{"id":"edge-knuth-pivot","from":"node-knuth-deadend","to":"node-knuth-sibling","class":"annotation","kind":"pivot","note":"The sibling branch is inspired by the failure but is not a structural child of it."}]};
+const __DAG = {"schema":"euler.causal_dag.viewer.v2","session_id":"session-knuth","title":"Knuth-style search","operation":"snapshot","active_root":"node-knuth-root","roots":["node-knuth-root","node-knuth-secondary-root"],"nodes":[{"id":"node-knuth-deadend","parent":"node-knuth-root","sequence":1,"status":"dead_end","kind":"attempt","title":"Rejected recurrence branch","summary":"The left branch failed because the recurrence assumption contradicted the generated table.","ev":"eft-tool"},{"id":"node-knuth-repair","parent":"node-knuth-deadend","sequence":2,"status":"success","kind":"attempt","title":"Repair with invariant factoring","summary":"The repair reused the failed recurrence material and switched to invariant factoring.","ev":"-command"},{"id":"node-knuth-root","parent":null,"sequence":0,"status":"open","kind":"root","title":"Knuth-style search","summary":"Primary search objective for a compact solution path.","ev":"bjective"},{"id":"node-knuth-secondary-root","parent":null,"sequence":3,"status":"open","kind":"root","title":"Notation clean-up","summary":"Related but separate root for notation clean-up.","ev":"bjective"},{"id":"node-knuth-sibling","parent":"node-knuth-root","sequence":4,"status":"open","kind":"attempt","title":"Sibling invariant branch","summary":"A sibling branch pursues invariant factoring without becoming a child of the failed attempt.","ev":"ng-check"},{"id":"node-knuth-verify","parent":"node-knuth-repair","sequence":5,"status":"verified","kind":"synthesis","title":"Verified repair path","summary":"The repaired branch is verified by the invariant check and note artifact.","ev":"ng-check"}],"arcs":[{"id":"edge-knuth-artifact-use","from":"node-knuth-repair","to":"node-knuth-verify","class":"annotation","kind":"artifact_use","note":"The note artifact records the repaired path."},{"id":"edge-knuth-cross-root","from":"node-knuth-secondary-root","to":"node-knuth-root","class":"annotation","kind":"related","note":"The second root is explicitly related to the primary search."},{"id":"edge-knuth-pivot","from":"node-knuth-deadend","to":"node-knuth-sibling","class":"annotation","kind":"pivot","note":"The sibling branch is inspired by the failure but is not a structural child of it."}]};
 const TOKENS = {
   "schema": "euler.causal_dag.palette.v1",
   "backgrounds": {
@@ -2303,7 +2306,7 @@ class Component extends DCLogic {
     if (String(this.state.hover).indexOf('arc:') === 0) {
       const a = dag.arcs[+this.state.hover.slice(4)];
       sel = {
-        glyph: '⤳', color: ARCC[a.kind] || th.sub, op: 1, statusWord: a.kind, kind: 'cross-arc', conf: '',
+        glyph: '⤳', color: ARCC[a.kind] || th.sub, op: 1, statusWord: a.kind, kind: 'cross-arc',
         title: byId[a.from].title + '  →  ' + byId[a.to].title,
         summary: a.note || '', ev: '—', links: []
       };
@@ -2316,7 +2319,7 @@ class Component extends DCLogic {
       });
       sel = {
         glyph: GLYPH[n.status], color: PAL[n.status], op: OPACITY[n.status], statusWord: WORD[n.status],
-        kind: n.kind, conf: 'conf ' + n.conf.toFixed(2),
+        kind: n.kind,
         title: n.title, summary: n.summary, ev: n.ev, links
       };
     }
@@ -4256,10 +4259,14 @@ document.addEventListener('click', function (e) {
 <helmet>
   <style>
     html, body { margin: 0; }
+    .dag-toolbar { align-items:stretch !important; }
+    .dag-toolbar > div { height:30px; }
+    .dag-toolbar > button, .dag-toolbar > div > button { height:30px; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; line-height:1; }
     @media (max-width: 600px) {
       .dag-heading { top:14px !important; left:14px !important; right:14px !important; }
       .dag-heading > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .dag-toolbar { top:58px !important; left:14px !important; right:auto !important; gap:5px !important; }
+      .dag-menu-3d { left:0 !important; right:auto !important; }
       .dag-overlay { top:96px !important; left:14px !important; right:14px !important; width:auto !important; box-sizing:border-box; }
       .dag-card { left:14px !important; right:14px !important; bottom:74px !important; width:auto !important; max-height:38vh; overflow:hidden; box-sizing:border-box; }
       .dag-hint { display:none !important; }
@@ -4318,7 +4325,7 @@ document.addEventListener('click', function (e) {
     <div style="position:relative;">
       <button onclick="{{ toggle3d }}" style="background:{{ nav3dBg }}; color:{{ th.sub }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">3D ▾</button>
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
-        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+        <div class="dag-menu-3d" style="position:absolute; top:34px; right:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3D · constellation</a>
           <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · sequence axis</a>
         </div>
@@ -4361,7 +4368,6 @@ document.addEventListener('click', function (e) {
         <span style="font-size:15px; color:{{ sel.color }}; opacity:{{ sel.op }};">{{ sel.glyph }}</span>
         <span style="color:{{ sel.color }}; opacity:{{ sel.op }};">{{ sel.statusWord }}</span>
         <span style="color:{{ th.sub }}; flex:none;">· {{ sel.kind }}</span>
-        <span style="margin-left:auto; color:{{ th.sub }}; flex:none;">{{ sel.conf }}</span>
       </div>
       <div style="color:{{ th.text }}; font-size:13.5px; font-weight:600; line-height:1.4; font-family:Georgia, serif;">{{ sel.title }}</div>
       <div style="color:{{ th.body }}; font-size:12.5px; line-height:1.55; font-family:Georgia, serif;">{{ sel.summary }}</div>
@@ -4387,7 +4393,7 @@ document.addEventListener('click', function (e) {
   &quot;edgeGap&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 9, &quot;min&quot;: 2, &quot;max&quot;: 16, &quot;step&quot;: 1, &quot;unit&quot;: &quot;px&quot;, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Edges&quot; },
   &quot;showCrossArcs&quot;: { &quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Edges&quot; }
 }">
-const __DAG = {"schema":"euler.causal_dag.viewer.v1","session_id":"session-knuth","title":"Knuth-style search","operation":"snapshot","active_root":"node-knuth-root","roots":["node-knuth-root","node-knuth-secondary-root"],"nodes":[{"id":"node-knuth-deadend","parent":"node-knuth-root","sequence":1,"status":"dead_end","kind":"attempt","title":"Rejected recurrence branch","summary":"The left branch failed because the recurrence assumption contradicted the generated table.","conf":0.95,"ev":"eft-tool"},{"id":"node-knuth-repair","parent":"node-knuth-deadend","sequence":2,"status":"success","kind":"attempt","title":"Repair with invariant factoring","summary":"The repair reused the failed recurrence material and switched to invariant factoring.","conf":0.93,"ev":"-command"},{"id":"node-knuth-root","parent":null,"sequence":0,"status":"open","kind":"root","title":"Knuth-style search","summary":"Primary search objective for a compact solution path.","conf":0.98,"ev":"bjective"},{"id":"node-knuth-secondary-root","parent":null,"sequence":3,"status":"open","kind":"root","title":"Notation clean-up","summary":"Related but separate root for notation clean-up.","conf":0.9,"ev":"bjective"},{"id":"node-knuth-sibling","parent":"node-knuth-root","sequence":4,"status":"open","kind":"attempt","title":"Sibling invariant branch","summary":"A sibling branch pursues invariant factoring without becoming a child of the failed attempt.","conf":0.88,"ev":"ng-check"},{"id":"node-knuth-verify","parent":"node-knuth-repair","sequence":5,"status":"verified","kind":"synthesis","title":"Verified repair path","summary":"The repaired branch is verified by the invariant check and note artifact.","conf":0.92,"ev":"ng-check"}],"arcs":[{"id":"edge-knuth-artifact-use","from":"node-knuth-repair","to":"node-knuth-verify","class":"annotation","kind":"artifact_use","note":"The note artifact records the repaired path."},{"id":"edge-knuth-cross-root","from":"node-knuth-secondary-root","to":"node-knuth-root","class":"annotation","kind":"related","note":"The second root is explicitly related to the primary search."},{"id":"edge-knuth-pivot","from":"node-knuth-deadend","to":"node-knuth-sibling","class":"annotation","kind":"pivot","note":"The sibling branch is inspired by the failure but is not a structural child of it."}]};
+const __DAG = {"schema":"euler.causal_dag.viewer.v2","session_id":"session-knuth","title":"Knuth-style search","operation":"snapshot","active_root":"node-knuth-root","roots":["node-knuth-root","node-knuth-secondary-root"],"nodes":[{"id":"node-knuth-deadend","parent":"node-knuth-root","sequence":1,"status":"dead_end","kind":"attempt","title":"Rejected recurrence branch","summary":"The left branch failed because the recurrence assumption contradicted the generated table.","ev":"eft-tool"},{"id":"node-knuth-repair","parent":"node-knuth-deadend","sequence":2,"status":"success","kind":"attempt","title":"Repair with invariant factoring","summary":"The repair reused the failed recurrence material and switched to invariant factoring.","ev":"-command"},{"id":"node-knuth-root","parent":null,"sequence":0,"status":"open","kind":"root","title":"Knuth-style search","summary":"Primary search objective for a compact solution path.","ev":"bjective"},{"id":"node-knuth-secondary-root","parent":null,"sequence":3,"status":"open","kind":"root","title":"Notation clean-up","summary":"Related but separate root for notation clean-up.","ev":"bjective"},{"id":"node-knuth-sibling","parent":"node-knuth-root","sequence":4,"status":"open","kind":"attempt","title":"Sibling invariant branch","summary":"A sibling branch pursues invariant factoring without becoming a child of the failed attempt.","ev":"ng-check"},{"id":"node-knuth-verify","parent":"node-knuth-repair","sequence":5,"status":"verified","kind":"synthesis","title":"Verified repair path","summary":"The repaired branch is verified by the invariant check and note artifact.","ev":"ng-check"}],"arcs":[{"id":"edge-knuth-artifact-use","from":"node-knuth-repair","to":"node-knuth-verify","class":"annotation","kind":"artifact_use","note":"The note artifact records the repaired path."},{"id":"edge-knuth-cross-root","from":"node-knuth-secondary-root","to":"node-knuth-root","class":"annotation","kind":"related","note":"The second root is explicitly related to the primary search."},{"id":"edge-knuth-pivot","from":"node-knuth-deadend","to":"node-knuth-sibling","class":"annotation","kind":"pivot","note":"The sibling branch is inspired by the failure but is not a structural child of it."}]};
 const TOKENS = {
   "schema": "euler.causal_dag.palette.v1",
   "backgrounds": {
@@ -4631,7 +4637,7 @@ class Component extends DCLogic {
     if (String(this.state.hover).indexOf('arc:') === 0) {
       const a = dag.arcs[+this.state.hover.slice(4)];
       sel = {
-        glyph: '⤳', color: ARCC[a.kind] || th.sub, op: 1, statusWord: a.kind, kind: 'cross-arc', conf: '',
+        glyph: '⤳', color: ARCC[a.kind] || th.sub, op: 1, statusWord: a.kind, kind: 'cross-arc',
         title: byId[a.from].title + '  →  ' + byId[a.to].title,
         summary: a.note || '', ev: '—', links: []
       };
@@ -4644,7 +4650,7 @@ class Component extends DCLogic {
       });
       sel = {
         glyph: GLYPH[n.status], color: PAL[n.status], op: OPACITY[n.status], statusWord: WORD[n.status],
-        kind: n.kind, conf: 'conf ' + n.conf.toFixed(2),
+        kind: n.kind,
         title: n.title, summary: n.summary, ev: n.ev, links
       };
     }
@@ -6563,10 +6569,14 @@ document.addEventListener('click', function (e) {
 <helmet>
   <style>
     html, body { margin: 0; background: #050507; }
+    .dag-toolbar { align-items:stretch !important; }
+    .dag-toolbar > div { height:30px; }
+    .dag-toolbar > button, .dag-toolbar > div > button { height:30px; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; line-height:1; }
     @media (max-width: 600px) {
       .dag-heading { top:14px !important; left:14px !important; right:14px !important; }
       .dag-heading > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .dag-toolbar { top:58px !important; left:14px !important; right:auto !important; gap:5px !important; }
+      .dag-menu-3d { left:0 !important; right:auto !important; }
       .dag-overlay { top:96px !important; left:14px !important; right:14px !important; width:auto !important; box-sizing:border-box; }
       .dag-card { left:14px !important; right:14px !important; bottom:74px !important; width:auto !important; max-height:38vh; overflow:hidden; box-sizing:border-box; }
       .dag-hint { display:none !important; }
@@ -6597,7 +6607,7 @@ document.addEventListener('click', function (e) {
     <div style="position:relative;">
       <button onclick="{{ toggle3d }}" style="background:{{ nav3dBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">3D ▾</button>
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
-        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+        <div class="dag-menu-3d" style="position:absolute; top:34px; right:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.text }}; text-decoration:none; font-size:11px; white-space:nowrap;">3D · constellation</a>
           <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3.5D · sequence axis</a>
         </div>
@@ -6611,7 +6621,7 @@ document.addEventListener('click', function (e) {
       <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">What you're looking at</div>
       <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">A causal DAG of an agent session, drawn in 3D. Solid edges are the canonical backbone; node color carries status. Dashed arrows are annotation links between branches.</div>
       <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">How to interact</div>
-      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Drag to orbit, scroll to zoom. Hover a node or a dashed arrow — the card at bottom-left shows its story. tune sets theme, orbit, fog, and focus blur.</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Drag to orbit, scroll to zoom. Hover a node or a dashed arrow — the card at bottom-left shows its story. tune sets theme, spacing, orbit, fog, and focus blur.</div>
     </div>
   </sc-if>
 
@@ -6626,6 +6636,10 @@ document.addEventListener('click', function (e) {
       </div>
       <label style="display:flex; align-items:center; justify-content:space-between; color:{{ th.sub }}; font-size:11px; cursor:pointer;">auto orbit
         <input type="checkbox" checked="{{ uiAuto }}" onchange="{{ setAuto }}" style="accent-color:#82b4f2; cursor:pointer;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
+        <span style="display:flex; justify-content:space-between;"><span>node distance</span><span style="color:{{ th.faint }};">{{ uiDistance }}×</span></span>
+        <input type="range" min="0.75" max="2" step="0.05" value="{{ uiDistance }}" onchange="{{ setDistance }}" style="accent-color:#82b4f2; width:100%; margin:0;">
       </label>
       <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
         <span style="display:flex; justify-content:space-between;"><span>orbit speed</span><span style="color:{{ th.faint }};">{{ uiSpd }}</span></span>
@@ -6656,7 +6670,6 @@ document.addEventListener('click', function (e) {
         <span style="font-size:15px; color:{{ sel.color }};">{{ sel.glyph }}</span>
         <span style="color:{{ sel.color }};">{{ sel.statusWord }}</span>
         <span style="color:{{ th.sub }}; flex:none;">· {{ sel.kind }}</span>
-        <span style="margin-left:auto; color:{{ th.sub }}; flex:none;">{{ sel.conf }}</span>
       </div>
       <div style="color:{{ th.text }}; font-size:13px; font-weight:600; line-height:1.4;">{{ sel.title }}</div>
       <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.55;">{{ sel.summary }}</div>
@@ -6673,10 +6686,11 @@ document.addEventListener('click', function (e) {
   &quot;theme&quot;: { &quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;cosmic&quot;, &quot;misty&quot;], &quot;default&quot;: &quot;cosmic&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;Theme&quot; },
   &quot;autoOrbit&quot;: { &quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Camera&quot; },
   &quot;orbitSpeed&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.35, &quot;min&quot;: 0, &quot;max&quot;: 1, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Camera&quot; },
+  &quot;nodeDistance&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 1.4, &quot;min&quot;: 0.75, &quot;max&quot;: 2, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Layout&quot; },
   &quot;fog&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.55, &quot;min&quot;: 0, &quot;max&quot;: 0.85, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Depth&quot; },
   &quot;dofBlur&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.5, &quot;min&quot;: 0, &quot;max&quot;: 4, &quot;step&quot;: 0.5, &quot;unit&quot;: &quot;px&quot;, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Depth&quot; }
 }">
-const __DAG = {"schema":"euler.causal_dag.viewer.v1","session_id":"session-knuth","title":"Knuth-style search","operation":"snapshot","active_root":"node-knuth-root","roots":["node-knuth-root","node-knuth-secondary-root"],"nodes":[{"id":"node-knuth-deadend","parent":"node-knuth-root","sequence":1,"status":"dead_end","kind":"attempt","title":"Rejected recurrence branch","summary":"The left branch failed because the recurrence assumption contradicted the generated table.","conf":0.95,"ev":"eft-tool"},{"id":"node-knuth-repair","parent":"node-knuth-deadend","sequence":2,"status":"success","kind":"attempt","title":"Repair with invariant factoring","summary":"The repair reused the failed recurrence material and switched to invariant factoring.","conf":0.93,"ev":"-command"},{"id":"node-knuth-root","parent":null,"sequence":0,"status":"open","kind":"root","title":"Knuth-style search","summary":"Primary search objective for a compact solution path.","conf":0.98,"ev":"bjective"},{"id":"node-knuth-secondary-root","parent":null,"sequence":3,"status":"open","kind":"root","title":"Notation clean-up","summary":"Related but separate root for notation clean-up.","conf":0.9,"ev":"bjective"},{"id":"node-knuth-sibling","parent":"node-knuth-root","sequence":4,"status":"open","kind":"attempt","title":"Sibling invariant branch","summary":"A sibling branch pursues invariant factoring without becoming a child of the failed attempt.","conf":0.88,"ev":"ng-check"},{"id":"node-knuth-verify","parent":"node-knuth-repair","sequence":5,"status":"verified","kind":"synthesis","title":"Verified repair path","summary":"The repaired branch is verified by the invariant check and note artifact.","conf":0.92,"ev":"ng-check"}],"arcs":[{"id":"edge-knuth-artifact-use","from":"node-knuth-repair","to":"node-knuth-verify","class":"annotation","kind":"artifact_use","note":"The note artifact records the repaired path."},{"id":"edge-knuth-cross-root","from":"node-knuth-secondary-root","to":"node-knuth-root","class":"annotation","kind":"related","note":"The second root is explicitly related to the primary search."},{"id":"edge-knuth-pivot","from":"node-knuth-deadend","to":"node-knuth-sibling","class":"annotation","kind":"pivot","note":"The sibling branch is inspired by the failure but is not a structural child of it."}]};
+const __DAG = {"schema":"euler.causal_dag.viewer.v2","session_id":"session-knuth","title":"Knuth-style search","operation":"snapshot","active_root":"node-knuth-root","roots":["node-knuth-root","node-knuth-secondary-root"],"nodes":[{"id":"node-knuth-deadend","parent":"node-knuth-root","sequence":1,"status":"dead_end","kind":"attempt","title":"Rejected recurrence branch","summary":"The left branch failed because the recurrence assumption contradicted the generated table.","ev":"eft-tool"},{"id":"node-knuth-repair","parent":"node-knuth-deadend","sequence":2,"status":"success","kind":"attempt","title":"Repair with invariant factoring","summary":"The repair reused the failed recurrence material and switched to invariant factoring.","ev":"-command"},{"id":"node-knuth-root","parent":null,"sequence":0,"status":"open","kind":"root","title":"Knuth-style search","summary":"Primary search objective for a compact solution path.","ev":"bjective"},{"id":"node-knuth-secondary-root","parent":null,"sequence":3,"status":"open","kind":"root","title":"Notation clean-up","summary":"Related but separate root for notation clean-up.","ev":"bjective"},{"id":"node-knuth-sibling","parent":"node-knuth-root","sequence":4,"status":"open","kind":"attempt","title":"Sibling invariant branch","summary":"A sibling branch pursues invariant factoring without becoming a child of the failed attempt.","ev":"ng-check"},{"id":"node-knuth-verify","parent":"node-knuth-repair","sequence":5,"status":"verified","kind":"synthesis","title":"Verified repair path","summary":"The repaired branch is verified by the invariant check and note artifact.","ev":"ng-check"}],"arcs":[{"id":"edge-knuth-artifact-use","from":"node-knuth-repair","to":"node-knuth-verify","class":"annotation","kind":"artifact_use","note":"The note artifact records the repaired path."},{"id":"edge-knuth-cross-root","from":"node-knuth-secondary-root","to":"node-knuth-root","class":"annotation","kind":"related","note":"The second root is explicitly related to the primary search."},{"id":"edge-knuth-pivot","from":"node-knuth-deadend","to":"node-knuth-sibling","class":"annotation","kind":"pivot","note":"The sibling branch is inspired by the failure but is not a structural child of it."}]};
 const TOKENS = {
   "schema": "euler.causal_dag.palette.v1",
   "backgrounds": {
@@ -6782,12 +6796,13 @@ function hexA(hex, alpha) {
 }
 
 class Component extends DCLogic {
-  state = { ready: false, selId: null, selArc: null, panel: false, nav2d: false, nav3d: false, uiAuto: null, uiSpd: null, uiFog: null, uiDof: null, uiTheme: null };
+  state = { ready: false, selId: null, selArc: null, panel: false, nav2d: false, nav3d: false, uiAuto: null, uiSpd: null, uiDistance: null, uiFog: null, uiDof: null, uiTheme: null };
 
   isMisty() { return (this.state.uiTheme ?? this.props.theme ?? 'cosmic') === 'misty'; }
   fogDefault() { return this.isMisty() ? 0.85 : (this.props.fog ?? 0.55); }
   fogValue() { return this.state.uiFog ?? this.fogDefault(); }
   dofValue() { return this.state.uiDof ?? this.props.dofBlur ?? 0.5; }
+  distanceValue() { return this.state.uiDistance ?? this.props.nodeDistance ?? 1.4; }
 
   componentDidMount() {
     this.yaw = 0.8; this.pitch = 0.42; this.zoom = 1;
@@ -6844,10 +6859,10 @@ class Component extends DCLogic {
     roots.forEach(countLeaves);
     const hash = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; };
     const jit = (id, k) => ((hash(id + k) % 1000) / 1000 - 0.5) * 12;
-    const P = {};
+    const P = {}, spacing = this.distanceValue();
     const place = (id, a0, a1, d) => {
-      const am = (a0 + a1) / 2, r = d * 52;
-      P[id] = { x: Math.cos(am) * r + jit(id, 'x'), y: -d * 46 + jit(id, 'y'), z: Math.sin(am) * r + jit(id, 'z') };
+      const am = (a0 + a1) / 2, r = d * 52 * spacing;
+      P[id] = { x: Math.cos(am) * r + jit(id, 'x'), y: -d * 46 * spacing + jit(id, 'y'), z: Math.sin(am) * r + jit(id, 'z') };
       let a = a0;
       kids[id].forEach((c) => { const w = (a1 - a0) * leaves[c] / leaves[id]; place(c, a, a + w, d + 1); a += w; });
     };
@@ -7117,10 +7132,12 @@ class Component extends DCLogic {
       toggle3d: () => this.setState({ nav3d: !this.state.nav3d, nav2d: false, panel: false, info: false }),
       uiAuto: this.state.uiAuto ?? this.props.autoOrbit ?? true,
       uiSpd: this.state.uiSpd ?? this.props.orbitSpeed ?? 0.35,
+      uiDistance: this.distanceValue(),
       uiFog: this.fogValue(),
       uiDof: this.dofValue(),
       setAuto: (e) => this.setState({ uiAuto: e.target.checked }),
       setSpd: (e) => this.setState({ uiSpd: parseFloat(e.target.value) }),
+      setDistance: (e) => this.setState({ uiDistance: parseFloat(e.target.value) }, () => this.prepare()),
       setFog: (e) => this.setState({ uiFog: parseFloat(e.target.value) }),
       setDof: (e) => this.setState({ uiDof: parseFloat(e.target.value) })
     };
@@ -7131,7 +7148,7 @@ class Component extends DCLogic {
         const a = this.dag.arcs[this.state.selArc];
         vals.sel = {
           glyph: '⤳', color: AC[a.kind] || '#8f92a3', statusWord: a.kind, kind: 'cross-arc',
-          conf: '', title: this.byId[a.from].title + '  →  ' + this.byId[a.to].title,
+          title: this.byId[a.from].title + '  →  ' + this.byId[a.to].title,
           summary: a.note || '', ev: '—',
           links: []
         };
@@ -7144,7 +7161,7 @@ class Component extends DCLogic {
         });
         vals.sel = {
           glyph: GLYPH[n.status], color: PAL[n.status], statusWord: WORD[n.status],
-          kind: n.kind, conf: 'conf ' + n.conf.toFixed(2),
+          kind: n.kind,
           title: n.title, summary: n.summary, ev: n.ev, links
         };
       }
@@ -9071,10 +9088,14 @@ document.addEventListener('click', function (e) {
 <helmet>
   <style>
     html, body { margin: 0; background: #050507; }
+    .dag-toolbar { align-items:stretch !important; }
+    .dag-toolbar > div { height:30px; }
+    .dag-toolbar > button, .dag-toolbar > div > button { height:30px; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; line-height:1; }
     @media (max-width: 600px) {
       .dag-heading { top:14px !important; left:14px !important; right:14px !important; }
       .dag-heading > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .dag-toolbar { top:58px !important; left:14px !important; right:auto !important; gap:5px !important; }
+      .dag-menu-3d { left:0 !important; right:auto !important; }
       .dag-overlay { top:96px !important; left:14px !important; right:14px !important; width:auto !important; box-sizing:border-box; }
       .dag-card { left:14px !important; right:14px !important; bottom:74px !important; width:auto !important; max-height:38vh; overflow:hidden; box-sizing:border-box; }
       .dag-hint { display:none !important; }
@@ -9105,7 +9126,7 @@ document.addEventListener('click', function (e) {
     <div style="position:relative;">
       <button onclick="{{ toggle3d }}" style="background:{{ nav3dBg }}; color:{{ th.text }}; border:1px solid {{ th.border }}; padding:6px 11px; font-size:11px; font-family:inherit; cursor:pointer;">3D ▾</button>
       <sc-if value="{{ nav3d }}" hint-placeholder-val="{{ false }}">
-        <div style="position:absolute; top:34px; left:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
+        <div class="dag-menu-3d" style="position:absolute; top:34px; right:0; min-width:158px; display:flex; flex-direction:column; background:{{ th.menuBg }}; border:1px solid {{ th.border }}; backdrop-filter:blur(8px);">
           <a href="Constellation%203D.dc.html" style="display:block; padding:9px 13px; color:{{ th.sub }}; text-decoration:none; font-size:11px; white-space:nowrap;" style-hover="color:{{ th.text }};">3D · constellation</a>
           <a href="Constellation%203.5D.dc.html" style="display:block; padding:9px 13px; color:{{ th.text }}; text-decoration:none; font-size:11px; white-space:nowrap;">3.5D · sequence axis</a>
         </div>
@@ -9119,7 +9140,7 @@ document.addEventListener('click', function (e) {
       <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">What you're looking at</div>
       <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">A causal DAG of an agent session, drawn against first-occurrence order. The central axis runs from earliest to latest; radial distance shows tree depth and angle identifies a branch. Solid edges are the canonical backbone, node color carries status, and dashed arrows are annotation links.</div>
       <div style="color:{{ th.text }}; font-size:12px; font-weight:600;">How to interact</div>
-      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Drag to orbit, scroll to zoom. Hover a node or a dashed arrow for its story. Click a node to zoom its family; click an arrow to frame the two nodes it connects; click again to reset. tune sets theme, orbit, fog, and focus blur.</div>
+      <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.6;">Drag to orbit, scroll to zoom. Hover a node or a dashed arrow for its story. Click a node to zoom its family; click an arrow to frame the two nodes it connects; click again to reset. tune sets theme, spacing, orbit, fog, and focus blur.</div>
     </div>
   </sc-if>
 
@@ -9134,6 +9155,10 @@ document.addEventListener('click', function (e) {
       </div>
       <label style="display:flex; align-items:center; justify-content:space-between; color:{{ th.sub }}; font-size:11px; cursor:pointer;">auto orbit
         <input type="checkbox" checked="{{ uiAuto }}" onchange="{{ setAuto }}" style="accent-color:#82b4f2; cursor:pointer;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
+        <span style="display:flex; justify-content:space-between;"><span>node distance</span><span style="color:{{ th.faint }};">{{ uiDistance }}×</span></span>
+        <input type="range" min="0.75" max="2" step="0.05" value="{{ uiDistance }}" onchange="{{ setDistance }}" style="accent-color:#82b4f2; width:100%; margin:0;">
       </label>
       <label style="display:flex; flex-direction:column; gap:5px; color:{{ th.sub }}; font-size:11px;">
         <span style="display:flex; justify-content:space-between;"><span>orbit speed</span><span style="color:{{ th.faint }};">{{ uiSpd }}</span></span>
@@ -9164,7 +9189,6 @@ document.addEventListener('click', function (e) {
         <span style="font-size:15px; color:{{ sel.color }};">{{ sel.glyph }}</span>
         <span style="color:{{ sel.color }};">{{ sel.statusWord }}</span>
         <span style="color:{{ th.sub }}; flex:none;">· {{ sel.kind }}</span>
-        <span style="margin-left:auto; color:{{ th.sub }}; flex:none;">{{ sel.conf }}</span>
       </div>
       <div style="color:{{ th.text }}; font-size:13px; font-weight:600; line-height:1.4;">{{ sel.title }}</div>
       <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.55;">{{ sel.summary }}</div>
@@ -9181,10 +9205,11 @@ document.addEventListener('click', function (e) {
   &quot;theme&quot;: { &quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;cosmic&quot;, &quot;misty&quot;], &quot;default&quot;: &quot;cosmic&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;Theme&quot; },
   &quot;autoOrbit&quot;: { &quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Camera&quot; },
   &quot;orbitSpeed&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.35, &quot;min&quot;: 0, &quot;max&quot;: 1, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Camera&quot; },
+  &quot;nodeDistance&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 1.2, &quot;min&quot;: 0.75, &quot;max&quot;: 2, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Layout&quot; },
   &quot;fog&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.55, &quot;min&quot;: 0, &quot;max&quot;: 0.85, &quot;step&quot;: 0.05, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Depth&quot; },
   &quot;dofBlur&quot;: { &quot;editor&quot;: &quot;range&quot;, &quot;default&quot;: 0.5, &quot;min&quot;: 0, &quot;max&quot;: 4, &quot;step&quot;: 0.5, &quot;unit&quot;: &quot;px&quot;, &quot;tsType&quot;: &quot;number&quot;, &quot;section&quot;: &quot;Depth&quot; }
 }">
-const __DAG = {"schema":"euler.causal_dag.viewer.v1","session_id":"session-knuth","title":"Knuth-style search","operation":"snapshot","active_root":"node-knuth-root","roots":["node-knuth-root","node-knuth-secondary-root"],"nodes":[{"id":"node-knuth-deadend","parent":"node-knuth-root","sequence":1,"status":"dead_end","kind":"attempt","title":"Rejected recurrence branch","summary":"The left branch failed because the recurrence assumption contradicted the generated table.","conf":0.95,"ev":"eft-tool"},{"id":"node-knuth-repair","parent":"node-knuth-deadend","sequence":2,"status":"success","kind":"attempt","title":"Repair with invariant factoring","summary":"The repair reused the failed recurrence material and switched to invariant factoring.","conf":0.93,"ev":"-command"},{"id":"node-knuth-root","parent":null,"sequence":0,"status":"open","kind":"root","title":"Knuth-style search","summary":"Primary search objective for a compact solution path.","conf":0.98,"ev":"bjective"},{"id":"node-knuth-secondary-root","parent":null,"sequence":3,"status":"open","kind":"root","title":"Notation clean-up","summary":"Related but separate root for notation clean-up.","conf":0.9,"ev":"bjective"},{"id":"node-knuth-sibling","parent":"node-knuth-root","sequence":4,"status":"open","kind":"attempt","title":"Sibling invariant branch","summary":"A sibling branch pursues invariant factoring without becoming a child of the failed attempt.","conf":0.88,"ev":"ng-check"},{"id":"node-knuth-verify","parent":"node-knuth-repair","sequence":5,"status":"verified","kind":"synthesis","title":"Verified repair path","summary":"The repaired branch is verified by the invariant check and note artifact.","conf":0.92,"ev":"ng-check"}],"arcs":[{"id":"edge-knuth-artifact-use","from":"node-knuth-repair","to":"node-knuth-verify","class":"annotation","kind":"artifact_use","note":"The note artifact records the repaired path."},{"id":"edge-knuth-cross-root","from":"node-knuth-secondary-root","to":"node-knuth-root","class":"annotation","kind":"related","note":"The second root is explicitly related to the primary search."},{"id":"edge-knuth-pivot","from":"node-knuth-deadend","to":"node-knuth-sibling","class":"annotation","kind":"pivot","note":"The sibling branch is inspired by the failure but is not a structural child of it."}]};
+const __DAG = {"schema":"euler.causal_dag.viewer.v2","session_id":"session-knuth","title":"Knuth-style search","operation":"snapshot","active_root":"node-knuth-root","roots":["node-knuth-root","node-knuth-secondary-root"],"nodes":[{"id":"node-knuth-deadend","parent":"node-knuth-root","sequence":1,"status":"dead_end","kind":"attempt","title":"Rejected recurrence branch","summary":"The left branch failed because the recurrence assumption contradicted the generated table.","ev":"eft-tool"},{"id":"node-knuth-repair","parent":"node-knuth-deadend","sequence":2,"status":"success","kind":"attempt","title":"Repair with invariant factoring","summary":"The repair reused the failed recurrence material and switched to invariant factoring.","ev":"-command"},{"id":"node-knuth-root","parent":null,"sequence":0,"status":"open","kind":"root","title":"Knuth-style search","summary":"Primary search objective for a compact solution path.","ev":"bjective"},{"id":"node-knuth-secondary-root","parent":null,"sequence":3,"status":"open","kind":"root","title":"Notation clean-up","summary":"Related but separate root for notation clean-up.","ev":"bjective"},{"id":"node-knuth-sibling","parent":"node-knuth-root","sequence":4,"status":"open","kind":"attempt","title":"Sibling invariant branch","summary":"A sibling branch pursues invariant factoring without becoming a child of the failed attempt.","ev":"ng-check"},{"id":"node-knuth-verify","parent":"node-knuth-repair","sequence":5,"status":"verified","kind":"synthesis","title":"Verified repair path","summary":"The repaired branch is verified by the invariant check and note artifact.","ev":"ng-check"}],"arcs":[{"id":"edge-knuth-artifact-use","from":"node-knuth-repair","to":"node-knuth-verify","class":"annotation","kind":"artifact_use","note":"The note artifact records the repaired path."},{"id":"edge-knuth-cross-root","from":"node-knuth-secondary-root","to":"node-knuth-root","class":"annotation","kind":"related","note":"The second root is explicitly related to the primary search."},{"id":"edge-knuth-pivot","from":"node-knuth-deadend","to":"node-knuth-sibling","class":"annotation","kind":"pivot","note":"The sibling branch is inspired by the failure but is not a structural child of it."}]};
 const TOKENS = {
   "schema": "euler.causal_dag.palette.v1",
   "backgrounds": {
@@ -9290,12 +9315,13 @@ function hexA(hex, alpha) {
 }
 
 class Component extends DCLogic {
-  state = { ready: false, selId: null, selArc: null, panel: false, nav2d: false, nav3d: false, uiAuto: null, uiSpd: null, uiFog: null, uiDof: null, uiTheme: null };
+  state = { ready: false, selId: null, selArc: null, panel: false, nav2d: false, nav3d: false, uiAuto: null, uiSpd: null, uiDistance: null, uiFog: null, uiDof: null, uiTheme: null };
 
   isMisty() { return (this.state.uiTheme ?? this.props.theme ?? 'cosmic') === 'misty'; }
   fogDefault() { return this.isMisty() ? 0.85 : (this.props.fog ?? 0.55); }
   fogValue() { return this.state.uiFog ?? this.fogDefault(); }
   dofValue() { return this.state.uiDof ?? this.props.dofBlur ?? 0.5; }
+  distanceValue() { return this.state.uiDistance ?? this.props.nodeDistance ?? 1.2; }
 
   componentDidMount() {
     this.yaw = 0.8; this.pitch = 0.28; this.zoom = 0.8;
@@ -9365,24 +9391,26 @@ class Component extends DCLogic {
     roots.forEach(countLeaves);
     const hash = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; };
     const jit = (id, k) => ((hash(id + k) % 1000) / 1000 - 0.5) * 10;
-    // sequence axis: y descends with first-occurrence order; radius = tree depth, angle = branch sector
-    const stepY = 27, stepR = 46;
+    // Sequence descends on the center axis; later branch nodes fan outward.
+    const spacing = this.distanceValue(), stepY = 27 * spacing, stepR = 46 * spacing;
     const P = {};
-    const place = (id, a0, a1, d) => {
-      const am = (a0 + a1) / 2, r = d * stepR;
+    const place = (id, a0, a1, d, rootSequence) => {
+      const am = (a0 + a1) / 2;
+      const elapsed = Math.max(0, idx[id] - rootSequence);
+      const r = d * stepR + (d === 0 ? 0 : Math.sqrt(elapsed) * 18 * spacing);
       P[id] = {
         x: d === 0 ? 0 : Math.cos(am) * r + jit(id, 'x'),
         y: -idx[id] * stepY,
         z: d === 0 ? 0 : Math.sin(am) * r + jit(id, 'z')
       };
       let a = a0;
-      kids[id].forEach((c) => { const w = (a1 - a0) * leaves[c] / leaves[id]; place(c, a, a + w, d + 1); a += w; });
+      kids[id].forEach((c) => { const w = (a1 - a0) * leaves[c] / leaves[id]; place(c, a, a + w, d + 1, rootSequence); a += w; });
     };
     const totalLeaves = roots.reduce((sum, id) => sum + leaves[id], 0) || 1;
     let angle = 0;
     roots.forEach((root) => {
       const width = Math.PI * 2 * leaves[root] / totalLeaves;
-      place(root, angle, angle + width, 0);
+      place(root, angle, angle + width, 0, idx[root]);
       angle += width;
     });
     let cy = 0;
@@ -9768,10 +9796,12 @@ class Component extends DCLogic {
       toggle3d: () => this.setState({ nav3d: !this.state.nav3d, nav2d: false, panel: false, info: false }),
       uiAuto: this.state.uiAuto ?? this.props.autoOrbit ?? true,
       uiSpd: this.state.uiSpd ?? this.props.orbitSpeed ?? 0.35,
+      uiDistance: this.distanceValue(),
       uiFog: this.fogValue(),
       uiDof: this.dofValue(),
       setAuto: (e) => this.setState({ uiAuto: e.target.checked }),
       setSpd: (e) => this.setState({ uiSpd: parseFloat(e.target.value) }),
+      setDistance: (e) => this.setState({ uiDistance: parseFloat(e.target.value) }, () => this.prepare()),
       setFog: (e) => this.setState({ uiFog: parseFloat(e.target.value) }),
       setDof: (e) => this.setState({ uiDof: parseFloat(e.target.value) })
     };
@@ -9782,7 +9812,7 @@ class Component extends DCLogic {
         const a = this.dag.arcs[this.state.selArc];
         vals.sel = {
           glyph: '⤳', color: AC[a.kind] || '#8f92a3', statusWord: a.kind, kind: 'cross-arc',
-          conf: '', title: this.byId[a.from].title + '  →  ' + this.byId[a.to].title,
+          title: this.byId[a.from].title + '  →  ' + this.byId[a.to].title,
           summary: a.note || '', ev: '—', links: [], sequence: '—'
         };
       } else {
@@ -9794,7 +9824,7 @@ class Component extends DCLogic {
         });
         vals.sel = {
           glyph: GLYPH[n.status], color: PAL[n.status], statusWord: WORD[n.status],
-          kind: n.kind, conf: 'conf ' + n.conf.toFixed(2),
+          kind: n.kind,
           title: n.title, summary: n.summary, ev: n.ev, links,
           sequence: this.idx[n.id] + ' / ' + (this.dag.nodes.length - 1)
         };

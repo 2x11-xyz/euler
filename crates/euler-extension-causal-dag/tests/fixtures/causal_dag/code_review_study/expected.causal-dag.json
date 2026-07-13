@@ -1,6 +1,6 @@
 {
-  "schema": "euler.causal_dag.v2",
-  "media_type": "application/vnd.euler.causal-dag.v2+json",
+  "schema": "euler.causal_dag.v3",
+  "media_type": "application/vnd.euler.causal-dag.v3+json",
   "generated_at": "2026-06-29T02:04:00.000Z",
   "session": {
     "id": "session-review",
@@ -48,10 +48,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.87
-        },
         "basis": {
           "kind": "direct",
           "summary": "The tool result records the superseded finding.",
@@ -79,10 +75,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.95
-        },
         "basis": {
           "kind": "direct",
           "summary": "The check result verifies the registry slice.",
@@ -110,10 +102,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.72
-        },
         "basis": {
           "kind": "direct",
           "summary": "The session start anchors the review fixture.",
@@ -145,10 +133,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.91
-        },
         "basis": {
           "kind": "direct",
           "summary": "The review report artifact records final triage.",
@@ -176,10 +160,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.9
-        },
         "basis": {
           "kind": "direct",
           "summary": "The agent.spawn event records the review work.",
@@ -209,10 +189,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.87
-        },
         "basis": {
           "kind": "direct",
           "summary": "The tool result creates the first finding.",
@@ -240,10 +216,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.94
-        },
         "basis": {
           "kind": "direct",
           "summary": "The check result creates the verified finding branch.",
@@ -271,10 +243,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.86
-        },
         "basis": {
           "kind": "direct",
           "summary": "The passing test refutes the stale finding.",
@@ -306,10 +274,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.9
-        },
         "basis": {
           "kind": "direct",
           "summary": "The report artifact supports the accepted finding.",
@@ -337,10 +301,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.88
-        },
         "basis": {
           "kind": "direct",
           "summary": "The spawned agent decomposes the review objective into work.",
@@ -368,10 +328,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.78
-        },
         "basis": {
           "kind": "direct",
           "summary": "The tool output says the initial finding was superseded.",
@@ -399,10 +355,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.93
-        },
         "basis": {
           "kind": "direct",
           "summary": "The passing test verifies the final synthesis.",

@@ -95,7 +95,7 @@ pub(super) fn format_items() -> Vec<PickerItem> {
         ),
         (
             "json",
-            "Raw DAG object — euler.causal_dag.v2 artifact",
+            "Raw DAG object — euler.causal_dag.v3 artifact",
             ".json",
         ),
         ("svg", "Static vector render of graph", ".svg"),

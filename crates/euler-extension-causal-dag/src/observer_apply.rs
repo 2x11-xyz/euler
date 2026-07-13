@@ -12,7 +12,7 @@
 //!
 //! The `apply` value is the observe window the brief echoed (limit,
 //! scan_limit, after_event_id, watermark_event_id, session_id); the
-//! companion `output` is the observer's raw `euler.causal_dag.hints.v1`
+//! companion `output` is the observer's raw `euler.causal_dag.hints.v2`
 //! JSON. This command extracts the hints, folds them over the same bounded
 //! window via the shared observe path, writes the graph artifact, and
 //! publishes the `graph` context slot. The companion never writes: every
@@ -322,7 +322,7 @@ mod tests {
     use serde_json::json;
 
     const HEADER_ONLY_HINTS: &str =
-        r#"{"schema":"euler.causal_dag.hints.v1","nodes":[],"edges":[]}"#;
+        r#"{"schema":"euler.causal_dag.hints.v2","nodes":[],"edges":[]}"#;
 
     fn envelope(apply: Value, companion: Value) -> Value {
         json!({"apply": apply, "companion": companion})
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(parsed.observe.session_id.as_deref(), Some("session-1"));
         assert_eq!(
             parsed.observe.hints["schema"],
-            json!("euler.causal_dag.hints.v1")
+            json!("euler.causal_dag.hints.v2")
         );
         assert_eq!(
             parsed.companion.child_agent_id.as_deref(),
@@ -392,7 +392,7 @@ mod tests {
             let parsed = ObserverApplyInput::parse(&input).expect("parse fenced output");
             assert_eq!(
                 parsed.observe.hints["schema"],
-                json!("euler.causal_dag.hints.v1"),
+                json!("euler.causal_dag.hints.v2"),
                 "input: {fenced:?}"
             );
         }
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn resolves_brief_source_and_record_aliases_before_observe_validation() {
         let hints = json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "nodes": [{
                 "id": "n0",
                 "root_id": "n0",
@@ -449,7 +449,7 @@ mod tests {
             ),
             (
                 envelope(
-                    json!({"causal_dag": {"schema": "euler.causal_dag.hints.v1"}}),
+                    json!({"causal_dag": {"schema": "euler.causal_dag.hints.v2"}}),
                     ok_companion(HEADER_ONLY_HINTS),
                 ),
                 "must not carry `causal_dag`",
@@ -520,7 +520,7 @@ mod tests {
     fn rejects_oversized_companion_output() {
         let padding = "n".repeat(OBSERVER_HINT_MAX_BYTES);
         let oversized =
-            format!(r#"{{"schema":"euler.causal_dag.hints.v1","nodes":["{padding}"],"edges":[]}}"#);
+            format!(r#"{{"schema":"euler.causal_dag.hints.v2","nodes":["{padding}"],"edges":[]}}"#);
         let input = envelope(json!({}), json!({"ok": true, "output": oversized}));
 
         let error = ObserverApplyInput::parse(&input)

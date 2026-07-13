@@ -3659,7 +3659,7 @@ fn extension_cli_enable_and_run_causal_dag_export() {
     );
     assert_eq!(
         stdout["source_schema"],
-        serde_json::json!("euler.causal_dag.v2")
+        serde_json::json!("euler.causal_dag.v3")
     );
     assert_eq!(stdout["format"], serde_json::json!("json"));
     assert_eq!(stdout["active_graph"], serde_json::json!(false));
@@ -3671,10 +3671,10 @@ fn extension_cli_enable_and_run_causal_dag_export() {
         !contains_bytes(&artifact_bytes, sentinel),
         "causal DAG artifact must not copy event payload content"
     );
-    assert_eq!(artifact["schema"], serde_json::json!("euler.causal_dag.v2"));
+    assert_eq!(artifact["schema"], serde_json::json!("euler.causal_dag.v3"));
     assert_eq!(
         artifact["media_type"],
-        serde_json::json!("application/vnd.euler.causal-dag.v2+json")
+        serde_json::json!("application/vnd.euler.causal-dag.v3+json")
     );
     assert_eq!(
         artifact["generated_at"],
@@ -3887,13 +3887,13 @@ fn extension_cli_causal_dag_observe_projects_model_hint_file_headlessly() {
         .expect("extension artifact event");
 
     assert_eq!(stdout["command"], serde_json::json!("observe"));
-    assert_eq!(stdout["schema"], serde_json::json!("euler.causal_dag.v2"));
+    assert_eq!(stdout["schema"], serde_json::json!("euler.causal_dag.v3"));
     assert_causal_dag_observation_matches_expected(&artifact, &expected, &durable, artifact_event);
     assert_eq!(artifact_event.kind.as_str(), EventKind::EXTENSION_ARTIFACT);
     assert_eq!(
         artifact_event.payload.get("media_type"),
         Some(&serde_json::json!(
-            "application/vnd.euler.causal-dag.v2+json"
+            "application/vnd.euler.causal-dag.v3+json"
         ))
     );
     assert_no_embedded_causal_dag_hints(&durable[..durable.len() - 1]);
@@ -9580,7 +9580,7 @@ fn is_causal_dag_self_event(event: &EventEnvelope) -> bool {
                     .payload
                     .get("media_type")
                     .and_then(serde_json::Value::as_str)
-                    == Some("application/vnd.euler.causal-dag.v2+json")
+                    == Some("application/vnd.euler.causal-dag.v3+json")
         }
         EventKind::AGENT_SPAWN | EventKind::AGENT_RESULT | EventKind::PERMISSION_DECISION => {
             event
@@ -9647,7 +9647,7 @@ fn extract_knuth_observer_hints(events: &mut [EventEnvelope]) -> serde_json::Val
         );
     }
     serde_json::json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": nodes,
         "edges": edges
     })
@@ -9666,7 +9666,7 @@ fn assert_knuth_observer_hints_cover_expected(
 ) {
     assert_eq!(
         hints["schema"],
-        serde_json::json!("euler.causal_dag.hints.v1")
+        serde_json::json!("euler.causal_dag.hints.v2")
     );
     let hint_nodes = hints["nodes"].as_array().expect("hint nodes");
     let hint_edges = hints["edges"].as_array().expect("hint edges");
@@ -9748,14 +9748,14 @@ fn causal_dag_graph_artifact_events(events: &[EventEnvelope]) -> Vec<&EventEnvel
                     .payload
                     .get("media_type")
                     .and_then(serde_json::Value::as_str)
-                    == Some("application/vnd.euler.causal-dag.v2+json")
+                    == Some("application/vnd.euler.causal-dag.v3+json")
                 && event
                     .payload
                     .get("metadata")
                     .and_then(serde_json::Value::as_object)
                     .and_then(|metadata| metadata.get("schema"))
                     .and_then(serde_json::Value::as_str)
-                    == Some("euler.causal_dag.v2")
+                    == Some("euler.causal_dag.v3")
         })
         .collect()
 }

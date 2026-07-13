@@ -42,14 +42,16 @@ const UPDATE_COMMAND_NAME: &str = "update";
 const CATCH_UP_COMMAND_NAME: &str = "catch-up";
 const OBSERVE_COMMAND_NAME: &str = "observe";
 pub(crate) const OBSERVER_BRIEF_SCHEMA_NAME: &str = "euler.causal_dag.observer_brief.v1";
+const HINTS_SCHEMA_NAME: &str = "euler.causal_dag.hints.v2";
 const UPDATE_CHECKPOINT_NAME: &str = "main";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_LIMIT: usize = 64;
 const DEFAULT_MAX_CATCH_UP_TICKS: usize = 16;
 const MAX_CATCH_UP_TICKS: usize = 128;
 pub const OBSERVER_HINT_MAX_BYTES: usize = 64 * 1024;
-const SCHEMA_NAME: &str = "euler.causal_dag.v2";
-const MEDIA_TYPE_JSON: &str = "application/vnd.euler.causal-dag.v2+json";
+const SCHEMA_NAME: &str = "euler.causal_dag.v3";
+const MEDIA_TYPE_JSON: &str = "application/vnd.euler.causal-dag.v3+json";
+const PRIOR_MEDIA_TYPE_JSON: &str = "application/vnd.euler.causal-dag.v2+json";
 const LEGACY_MEDIA_TYPE_JSON: &str = "application/vnd.euler.causal-dag.v1+json";
 const EMPTY_GENERATED_AT: &str = "1970-01-01T00:00:00Z";
 const UPDATE_CAPABILITIES: [Capability; 5] = [
@@ -442,7 +444,10 @@ fn is_causal_dag_graph_artifact(event: &EventEnvelope) -> Result<bool, Extension
     let extension_id = required_artifact_payload_string(event, "extension_id")?;
     let media_type = required_artifact_payload_string(event, "media_type")?;
     Ok(extension_id == EXTENSION_ID
-        && matches!(media_type, MEDIA_TYPE_JSON | LEGACY_MEDIA_TYPE_JSON))
+        && matches!(
+            media_type,
+            MEDIA_TYPE_JSON | PRIOR_MEDIA_TYPE_JSON | LEGACY_MEDIA_TYPE_JSON
+        ))
 }
 
 fn is_causal_dag_record_observation_event(event: &EventEnvelope) -> bool {

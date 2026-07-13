@@ -1,5 +1,5 @@
 use crate::active_state::ActiveGraphState;
-use crate::input_error;
+use crate::{input_error, HINTS_SCHEMA_NAME};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::ExtensionError;
 use serde_json::{json, Map, Value};
@@ -13,7 +13,6 @@ use revision::{
 mod revision;
 
 const HINTS_KEY: &str = "causal_dag";
-const HINTS_SCHEMA: &str = "euler.causal_dag.hints.v1";
 const HINT_FIELDS: &[&str] = &["schema", "nodes", "edges"];
 const NODE_FIELDS: &[&str] = &[
     "id",
@@ -23,7 +22,6 @@ const NODE_FIELDS: &[&str] = &[
     "title",
     "summary",
     "source_refs",
-    "confidence",
     "basis",
     "metadata",
 ];
@@ -35,12 +33,10 @@ const EDGE_FIELDS: &[&str] = &[
     "kind",
     "canonical_backbone",
     "source_refs",
-    "confidence",
     "basis",
     "metadata",
 ];
 const SOURCE_REF_FIELDS: &[&str] = &["id", "event_id", "payload_pointer"];
-const CONFIDENCE_FIELDS: &[&str] = &["level", "score"];
 const BASIS_FIELDS: &[&str] = &["kind", "summary"];
 pub(super) const OCCURRENCE_SOURCE_REF_ID: &str = "occurrence_source_ref_id";
 
@@ -206,9 +202,9 @@ pub(super) fn validate_semantic_hint_value_header(hints: &Value) -> Result<(), E
 
 fn validate_hint_schema(object: &Map<String, Value>) -> Result<(), ExtensionError> {
     let schema = required_str(object, "schema", "causal-dag hint")?;
-    if schema != HINTS_SCHEMA {
+    if schema != HINTS_SCHEMA_NAME {
         return Err(input_error(format!(
-            "causal-dag hint schema must be {HINTS_SCHEMA}"
+            "causal-dag hint schema must be {HINTS_SCHEMA_NAME}"
         )));
     }
     reject_unknown_fields(object, HINT_FIELDS, "causal-dag hint")?;
@@ -245,7 +241,6 @@ fn hinted_node(
     validate_status(status)?;
     let source_refs = hinted_source_refs(object, events, event_indices, prior_sources)?;
     let source_ref_ids = source_ref_ids(&source_refs)?;
-    let confidence = hinted_confidence(object)?;
     let basis = hinted_basis(object, &source_ref_ids)?;
     let metadata = optional_object(object, "metadata", "causal-dag node hint")?;
     validate_occurrence_source_ref(&metadata, &source_ref_ids)?;
@@ -258,7 +253,6 @@ fn hinted_node(
         "title": title,
         "summary": summary,
         "source_refs": source_refs,
-        "confidence": confidence,
         "basis": basis,
         "metadata": metadata
     }))
@@ -301,7 +295,6 @@ fn hinted_edge(
     validate_edge_kind(class, kind, canonical_backbone)?;
     let source_refs = hinted_source_refs(object, events, event_indices, prior_sources)?;
     let source_ref_ids = source_ref_ids(&source_refs)?;
-    let confidence = hinted_confidence(object)?;
     let basis = hinted_basis(object, &source_ref_ids)?;
     let metadata = optional_object(object, "metadata", "causal-dag edge hint")?;
 
@@ -313,7 +306,6 @@ fn hinted_edge(
         "kind": kind,
         "canonical_backbone": canonical_backbone,
         "source_refs": source_refs,
-        "confidence": confidence,
         "basis": basis,
         "metadata": metadata
     }))
@@ -416,28 +408,6 @@ fn artifact_ref(event: &EventEnvelope) -> Result<Value, ExtensionError> {
         "path": path,
         "sha256": sha256,
         "byte_len": byte_len
-    }))
-}
-
-fn hinted_confidence(object: &Map<String, Value>) -> Result<Value, ExtensionError> {
-    let confidence = object_value(
-        required_value(object, "confidence", "causal-dag hint record")?,
-        "causal-dag confidence",
-    )?;
-    reject_unknown_fields(confidence, CONFIDENCE_FIELDS, "causal-dag confidence")?;
-    let level = required_str(confidence, "level", "causal-dag confidence")?;
-    if !matches!(level, "high" | "medium" | "low") {
-        return Err(input_error(format!(
-            "unknown causal-dag confidence level `{level}`"
-        )));
-    }
-    let score = required_f64(confidence, "score", "causal-dag confidence")?;
-    if !(0.0..=1.0).contains(&score) {
-        return Err(input_error("causal-dag confidence score out of range"));
-    }
-    Ok(json!({
-        "level": level,
-        "score": score
     }))
 }
 
@@ -723,16 +693,6 @@ fn required_u64(
     required_value(object, key, context)?
         .as_u64()
         .ok_or_else(|| input_error(format!("{context}.{key} must be an unsigned integer")))
-}
-
-fn required_f64(
-    object: &Map<String, Value>,
-    key: &str,
-    context: &str,
-) -> Result<f64, ExtensionError> {
-    required_value(object, key, context)?
-        .as_f64()
-        .ok_or_else(|| input_error(format!("{context}.{key} must be a number")))
 }
 
 fn required_array<'a>(

@@ -25,7 +25,6 @@ pub(super) struct ViewerNode {
     pub(super) kind: String,
     pub(super) title: String,
     pub(super) summary: String,
-    pub(super) conf: f64,
     pub(super) ev: String,
 }
 
@@ -111,7 +110,7 @@ impl ViewerDag {
             .to_owned();
         let title = graph_title(&nodes, active_root.as_deref(), &roots, &session_id);
         Ok(Self {
-            schema: "euler.causal_dag.viewer.v1",
+            schema: "euler.causal_dag.viewer.v2",
             session_id,
             title,
             operation,
@@ -182,7 +181,6 @@ fn viewer_node(
         kind,
         title: required_string(node, "title", "node")?,
         summary: required_string(node, "summary", "node")?,
-        conf: confidence_score(node),
         ev: evidence_label(node),
     })
 }
@@ -476,19 +474,6 @@ fn evidence_label(value: &Value) -> String {
         1..=3 => ids.join(", "),
         count => format!("{} +{}", ids[..3].join(", "), count - 3),
     }
-}
-
-fn confidence_score(value: &Value) -> f64 {
-    value
-        .pointer("/confidence/score")
-        .and_then(Value::as_f64)
-        .unwrap_or_else(
-            || match value.pointer("/confidence/level").and_then(Value::as_str) {
-                Some("high") => 0.9,
-                Some("medium") => 0.6,
-                _ => 0.3,
-            },
-        )
 }
 
 fn normalize_status(status: &str) -> Result<String, ExtensionError> {

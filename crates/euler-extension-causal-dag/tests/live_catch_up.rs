@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 const EXTENSION_ID: &str = "causal-dag";
 const CATCH_UP_COMMAND_NAME: &str = "catch-up";
 const CHECKPOINT_NAME: &str = "main";
-const SCHEMA_NAME: &str = "euler.causal_dag.v2";
+const SCHEMA_NAME: &str = "euler.causal_dag.v3";
 const SESSION_ID: &str = "session-live";
 const AGENT_ID: &str = "agent-live";
 const OBSERVER_CANARY: &str = "EULER_OBSERVER_CANARY_7b9c0d_PAYLOAD";

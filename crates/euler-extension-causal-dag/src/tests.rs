@@ -164,7 +164,7 @@ fn observer_brief_over_knuth_fixture_builds_bounded_agent_task() {
     assert!(!task.contains("agent-spawn"));
     assert!(!task.contains("self-artifact"));
     let system_prompt = output["system_prompt"].as_str().expect("system prompt");
-    assert!(system_prompt.contains("Use schema euler.causal_dag.hints.v1"));
+    assert!(system_prompt.contains("Use schema euler.causal_dag.hints.v2"));
     assert!(system_prompt.contains("use payload_pointer /payload exactly"));
     assert!(system_prompt.contains("Do not repeat CURRENT GRAPH source refs"));
     assert!(system_prompt.contains("metadata.occurrence_source_ref_id"));
@@ -2008,7 +2008,7 @@ fn slot_summary_empty_and_all_open_projections_render_deterministically() {
 fn slot_summary_strips_control_characters() {
     let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "hello");
     let hints = json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-root",
             "root_id": "node-root",
@@ -2021,7 +2021,6 @@ fn slot_summary_strips_control_characters() {
                 "event_id": "event-1",
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "operator", "summary": "Observer supplied the root."},
             "metadata": {}
         }],
@@ -2130,7 +2129,7 @@ fn observe_rejects_truncated_page_without_writing_artifact() {
 fn observe_dangling_source_ref_fails_without_fallback() {
     let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "hello");
     let hints = json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-root",
             "root_id": "node-root",
@@ -2143,7 +2142,6 @@ fn observe_dangling_source_ref_fails_without_fallback() {
                 "event_id": "event-missing",
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "direct", "summary": "Observer supplied the root."},
             "metadata": {}
         }],
@@ -2184,15 +2182,15 @@ fn observe_rejects_invalid_and_oversized_hint_input_before_query() {
         (
             json!({
                 "session_id": "session-1",
-                "causal_dag": {"schema": "euler.causal_dag.hints.v2"}
+                "causal_dag": {"schema": "euler.causal_dag.hints.v1"}
             }),
-            "causal-dag hint schema must be euler.causal_dag.hints.v1".to_owned(),
+            "causal-dag hint schema must be euler.causal_dag.hints.v2".to_owned(),
         ),
         (
             json!({
                 "session_id": "session-1",
                 "kinds": [EventKind::USER_MESSAGE],
-                "causal_dag": {"schema": "euler.causal_dag.hints.v1"}
+                "causal_dag": {"schema": "euler.causal_dag.hints.v2"}
             }),
             "unknown input field `kinds`".to_owned(),
         ),
@@ -2200,7 +2198,7 @@ fn observe_rejects_invalid_and_oversized_hint_input_before_query() {
             json!({
                 "session_id": "session-1",
                 "causal_dag": {
-                    "schema": "euler.causal_dag.hints.v1",
+                    "schema": "euler.causal_dag.hints.v2",
                     "nodes": [{
                         "id": "node-root",
                         "root_id": "node-root",
@@ -2209,7 +2207,6 @@ fn observe_rejects_invalid_and_oversized_hint_input_before_query() {
                         "title": "Root",
                         "summary": oversized_summary,
                         "source_refs": [],
-                        "confidence": {"level": "high", "score": 0.9},
                         "basis": {"kind": "direct", "summary": "Oversized."},
                         "metadata": {}
                     }],
@@ -2526,7 +2523,7 @@ fn observe_rejects_empty_page_and_empty_hints_without_writing_artifact() {
                 input: json!({
                     "session_id": "session-1",
                     "causal_dag": {
-                        "schema": "euler.causal_dag.hints.v1",
+                        "schema": "euler.causal_dag.hints.v2",
                         "nodes": [],
                         "edges": []
                     }
@@ -2553,7 +2550,7 @@ fn observe_rejects_empty_page_and_empty_hints_without_writing_artifact() {
                 input: json!({
                     "session_id": "session-1",
                     "causal_dag": {
-                        "schema": "euler.causal_dag.hints.v1",
+                        "schema": "euler.causal_dag.hints.v2",
                         "nodes": [],
                         "edges": []
                     }
@@ -2740,7 +2737,7 @@ fn observe_does_not_copy_source_payload_secret_or_host_paths() {
     let secret = "OBSERVE_SOURCE_SECRET_DO_NOT_COPY";
     let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, secret);
     let hints = json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-root",
             "root_id": "node-root",
@@ -2753,7 +2750,6 @@ fn observe_does_not_copy_source_payload_secret_or_host_paths() {
                 "event_id": "event-1",
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "operator", "summary": "Observer supplied the root."},
             "metadata": {}
         }],
@@ -2812,7 +2808,7 @@ fn export_semantic_hint_wrong_schema_fails_without_generic_fallback() {
     );
     event.payload.insert(
         "causal_dag".to_owned(),
-        json!({"schema": "euler.causal_dag.hints.v2"}),
+        json!({"schema": "euler.causal_dag.hints.v1"}),
     );
     let host = RecordingHost::new(recording_page(
         vec![
@@ -2836,7 +2832,7 @@ fn export_semantic_hint_wrong_schema_fails_without_generic_fallback() {
     assert_eq!(
         error,
         ExtensionError::Message(
-            "causal-dag hint schema must be euler.causal_dag.hints.v1".to_owned()
+            "causal-dag hint schema must be euler.causal_dag.hints.v2".to_owned()
         )
     );
     assert!(host.writes.lock().expect("writes").is_empty());
@@ -2872,12 +2868,6 @@ fn observe_rejects_unknown_hint_fields_outside_metadata() {
         .expect("source ref object")
         .insert("path".to_owned(), json!("/payload/content"));
 
-    let mut confidence = hints.clone();
-    confidence["nodes"][0]["confidence"]
-        .as_object_mut()
-        .expect("confidence object")
-        .insert("reason".to_owned(), json!("looks right"));
-
     let mut basis = hints;
     basis["nodes"][0]["basis"]
         .as_object_mut()
@@ -2892,7 +2882,6 @@ fn observe_rejects_unknown_hint_fields_outside_metadata() {
             source_ref,
             "causal-dag source ref hint unknown field `path`",
         ),
-        (confidence, "causal-dag confidence unknown field `reason`"),
         (basis, "causal-dag basis unknown field `source_ref_ids`"),
     ] {
         let host = RecordingHost::new(recording_page(events.clone(), DEFAULT_LIMIT, None, false));
@@ -3013,7 +3002,7 @@ fn export_rejects_unknown_semantic_hint_field_without_generic_fallback() {
     event.payload.insert(
         "causal_dag".to_owned(),
         json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "label": "loose graph",
             "nodes": [],
             "edges": []
@@ -3157,7 +3146,7 @@ fn export_mixed_hint_page_uses_semantic_mode_without_generic_nodes() {
     hinted.payload.insert(
         "causal_dag".to_owned(),
         json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "nodes": [{
                 "id": "node-mixed-root",
                 "root_id": "node-mixed-root",
@@ -3170,7 +3159,6 @@ fn export_mixed_hint_page_uses_semantic_mode_without_generic_nodes() {
                     "event_id": "event-2",
                     "payload_pointer": "/payload/content"
                 }],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {
                     "kind": "direct",
                     "summary": "The hint explicitly opens the root."
@@ -3221,7 +3209,7 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
     root.payload.insert(
         "causal_dag".to_owned(),
         json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "nodes": [{
                 "id": "node-alpha-root",
                 "root_id": "node-alpha-root",
@@ -3234,7 +3222,6 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
                     "event_id": "event-alpha-root",
                     "payload_pointer": "/payload/content"
                 }],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "The root hint is explicit."},
                 "metadata": {}
             }],
@@ -3250,7 +3237,7 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
     branch.payload.insert(
         "causal_dag".to_owned(),
         json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "nodes": [{
                 "id": "node-alpha-branch",
                 "root_id": "node-alpha-root",
@@ -3263,7 +3250,6 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
                     "event_id": "event-alpha-branch",
                     "payload_pointer": "/payload/content"
                 }],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "The branch hint is explicit."},
                 "metadata": {}
             }],
@@ -3279,7 +3265,6 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
                     "event_id": "event-alpha-branch",
                     "payload_pointer": "/payload/content"
                 }],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "The fork hint is explicit."},
                 "metadata": {}
             }]
@@ -5385,7 +5370,7 @@ fn string_set<const N: usize>(values: [&str; N]) -> BTreeSet<String> {
 
 fn single_root_hints(event_id: &str) -> Value {
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-root",
             "root_id": "node-root",
@@ -5398,7 +5383,6 @@ fn single_root_hints(event_id: &str) -> Value {
                 "event_id": event_id,
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "operator", "summary": "Observer supplied the root."},
             "metadata": {}
         }],
@@ -5408,7 +5392,7 @@ fn single_root_hints(event_id: &str) -> Value {
 
 fn child_revision_hints(event_id: &str) -> Value {
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-child",
             "root_id": "node-root",
@@ -5421,7 +5405,6 @@ fn child_revision_hints(event_id: &str) -> Value {
                 "event_id": event_id,
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "direct", "summary": "The new event states this attempt."},
             "metadata": {}
         }],
@@ -5437,7 +5420,6 @@ fn child_revision_hints(event_id: &str) -> Value {
                 "event_id": event_id,
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "direct", "summary": "The new attempt continues the root."},
             "metadata": {}
         }]
@@ -5481,7 +5463,6 @@ fn two_root_reframe_hints() -> Value {
                 "event_id": "event-2",
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "direct", "summary": "The prior event supports a separate root."},
             "metadata": {}
         }));
@@ -5539,7 +5520,6 @@ fn synthetic_pressure_hints(events: &[EventEnvelope], open_count: usize) -> Valu
         "title": "Pressure root",
         "summary": "Root for pressure rendering.",
         "source_refs": [source_ref_hint("src-root", &events[0].id)],
-        "confidence": {"level": "high", "score": 0.9},
         "basis": {"kind": "operator", "summary": "Synthetic root."},
         "metadata": {}
     })];
@@ -5559,7 +5539,6 @@ fn synthetic_pressure_hints(events: &[EventEnvelope], open_count: usize) -> Valu
             "title": title,
             "summary": format!("Reason {index}: this approach was abandoned because it repeated a falsified search pattern with no new evidence."),
             "source_refs": [source_ref_hint(&format!("src-dead-{index}"), &events[index].id)],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "operator", "summary": "Synthetic dead-end."},
             "metadata": {}
         }));
@@ -5583,7 +5562,6 @@ fn synthetic_pressure_hints(events: &[EventEnvelope], open_count: usize) -> Valu
             "title": format!("Open branch {index:03} with a deliberately long title to create slot byte pressure"),
             "summary": "Still open.",
             "source_refs": [source_ref_hint(&format!("src-open-{index:03}"), &events[event_index].id)],
-            "confidence": {"level": "medium", "score": 0.7},
             "basis": {"kind": "operator", "summary": "Synthetic open node."},
             "metadata": {}
         }));
@@ -5597,7 +5575,7 @@ fn synthetic_pressure_hints(events: &[EventEnvelope], open_count: usize) -> Valu
     }
 
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": nodes,
         "edges": edges
     })
@@ -5626,7 +5604,6 @@ fn backbone_edge_hint(
         "kind": "fork",
         "canonical_backbone": true,
         "source_refs": [source_ref_hint(source_ref_id, event_id)],
-        "confidence": {"level": "medium", "score": 0.7},
         "basis": {"kind": "operator", "summary": "Synthetic backbone edge."},
         "metadata": {}
     })
@@ -5740,7 +5717,7 @@ fn extract_observer_hints(events: &mut [EventEnvelope]) -> Value {
         );
     }
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": nodes,
         "edges": edges
     })

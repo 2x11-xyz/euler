@@ -132,7 +132,6 @@ document.addEventListener('click', function (e) {
         <span style="font-size:15px; color:{{ sel.color }}; opacity:{{ sel.op }};">{{ sel.glyph }}</span>
         <span style="color:{{ sel.color }}; opacity:{{ sel.op }};">{{ sel.statusWord }}</span>
         <span style="color:{{ th.sub }}; flex:none;">· {{ sel.kind }}</span>
-        <span style="margin-left:auto; color:{{ th.sub }}; flex:none;">{{ sel.conf }}</span>
       </div>
       <div style="color:{{ th.text }}; font-size:13.5px; font-weight:600; line-height:1.4; font-family:Georgia, serif;">{{ sel.title }}</div>
       <div style="color:{{ th.body }}; font-size:12.5px; line-height:1.55; font-family:Georgia, serif;">{{ sel.summary }}</div>
@@ -325,7 +324,7 @@ class Component extends DCLogic {
     if (String(this.state.hover).indexOf('arc:') === 0) {
       const a = dag.arcs[+this.state.hover.slice(4)];
       sel = {
-        glyph: '⤳', color: ARCC[a.kind] || th.sub, op: 1, statusWord: a.kind, kind: 'cross-arc', conf: '',
+        glyph: '⤳', color: ARCC[a.kind] || th.sub, op: 1, statusWord: a.kind, kind: 'cross-arc',
         title: byId[a.from].title + '  →  ' + byId[a.to].title,
         summary: a.note || '', ev: '—', links: []
       };
@@ -338,7 +337,7 @@ class Component extends DCLogic {
       });
       sel = {
         glyph: GLYPH[n.status], color: PAL[n.status], op: OPACITY[n.status], statusWord: WORD[n.status],
-        kind: n.kind, conf: 'conf ' + n.conf.toFixed(2),
+        kind: n.kind,
         title: n.title, summary: n.summary, ev: n.ev, links
       };
     }

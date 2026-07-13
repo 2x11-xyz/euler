@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const ACTIVE_STATE_SCHEMA: &str = "euler.causal_dag.active.v2";
+const ACTIVE_STATE_SCHEMA: &str = "euler.causal_dag.active.v3";
 const ACTIVE_STATE_FILE: &str = "active-graph.json";
 const MAX_ACTIVE_STATE_BYTES: u64 = 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);

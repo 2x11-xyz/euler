@@ -41,7 +41,7 @@ euler extension run causal-dag.<command> <session.jsonl|session-id|session-name>
 
 ### `export`
 
-Export the active `euler.causal_dag.v2` artifact. If no active semantic graph
+Export the active `euler.causal_dag.v3` artifact. If no active semantic graph
 exists, the command first projects the requested bounded provenance window and
 uses that immutable artifact as the source.
 
@@ -55,7 +55,7 @@ Formats:
 
 - `html`: self-contained interactive 2D/3D viewer with inline code and data;
   it performs no external requests.
-- `json`: the raw `euler.causal_dag.v2` artifact for analysis and training
+- `json`: the raw `euler.causal_dag.v3` artifact for analysis and training
   pipelines.
 - `svg`: deterministic static vector view for documents and slides.
 - `dot`: Graphviz source for external layout tooling.
@@ -119,7 +119,7 @@ accepted value is `128`.
 
 Build a one-turn companion-agent task from the compact active graph plus the
 next bounded event window. The companion returns raw
-`euler.causal_dag.hints.v1` JSON.
+`euler.causal_dag.hints.v2` JSON.
 
 ```sh
 euler extension run causal-dag.observer-brief ./session.jsonl --limit 64 --max-tokens 24576
@@ -146,7 +146,7 @@ use. Core invokes it after the observer companion turn with the envelope
   "companion": { "ok": true, "output": "<raw hints JSON>", "...": "..." } }
 ```
 
-It parses the companion output as raw `euler.causal_dag.hints.v1` JSON (a
+It parses the companion output as raw `euler.causal_dag.hints.v2` JSON (a
 single surrounding markdown code fence is tolerated), folds the hints over
 the brief's bounded window (cut at the brief watermark), writes a complete
 graph artifact, advances the active pointer, and publishes the `graph` context
@@ -227,18 +227,18 @@ euler extension run causal-dag.record-observation ./session.jsonl \
 Flags: `--artifact-event-id` (required), `--limit`, `--scan-limit`,
 `--after-event-id`, `--observer-provider`, `--observer-model`.
 
-## Hints schema: `euler.causal_dag.hints.v1`
+## Hints schema: `euler.causal_dag.hints.v2`
 
 Top level:
 
 ```json
-{"schema":"euler.causal_dag.hints.v1","nodes":[],"edges":[]}
+{"schema":"euler.causal_dag.hints.v2","nodes":[],"edges":[]}
 ```
 
 Node keys are exactly:
 
 ```text
-id, root_id, kind, status, title, summary, source_refs, confidence, basis, metadata
+id, root_id, kind, status, title, summary, source_refs, basis, metadata
 ```
 
 Allowed node kinds:
@@ -256,7 +256,7 @@ open, blocked, dead_end, inconclusive, success, verified, superseded, abandoned
 Edge keys are exactly:
 
 ```text
-id, from, to, class, kind, canonical_backbone, source_refs, confidence, basis, metadata
+id, from, to, class, kind, canonical_backbone, source_refs, basis, metadata
 ```
 
 Allowed edge classes and kinds:
@@ -278,14 +278,6 @@ id, event_id, payload_pointer
 `payload_pointer` is either `null` or a JSON Pointer against the whole event
 object, usually `/payload/content` or `/payload/output`. Artifact source refs
 must use `null`.
-
-Every `confidence` uses exactly:
-
-```json
-{"level":"high|medium|low","score":0.0}
-```
-
-with `score` in `0.0..=1.0`.
 
 Every `basis` uses exactly:
 
@@ -359,7 +351,7 @@ graph is another immutable revision, not a rewrite of rolling history.
 Keep a raw hints file as the worker's current hypothesis:
 
 ```json
-{"schema":"euler.causal_dag.hints.v1","nodes":[],"edges":[]}
+{"schema":"euler.causal_dag.hints.v2","nodes":[],"edges":[]}
 ```
 
 As the session grows, fold it into a graph:
@@ -381,8 +373,8 @@ successful, or still-open paths.
 
 ## Output artifact
 
-Graph artifacts use schema `euler.causal_dag.v2` and media type
-`application/vnd.euler.causal-dag.v2+json`.
+Graph artifacts use schema `euler.causal_dag.v3` and media type
+`application/vnd.euler.causal-dag.v3+json`.
 
 Top-level artifact shape:
 
@@ -432,7 +424,7 @@ cursor is operational state, not graph evidence, and is intentionally absent
 from the portable artifact.
 
 The JSON artifact is the high-fidelity scientific record: complete nodes and
-edges, evidence references, confidence and basis, diagnostics, construction
+edges, evidence references and basis, diagnostics, construction
 method, and immutable lineage. HTML, SVG, DOT, Markdown, and summary exports
 are views over that artifact. They may omit or progressively reveal detail for
 human legibility, but must not invent graph semantics or become the source of

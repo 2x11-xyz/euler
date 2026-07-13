@@ -503,7 +503,7 @@ mod tests {
         let (artifact, dag, palette) = fixture();
         let cases = [
             (ExportFormat::Html, "<!DOCTYPE html>"),
-            (ExportFormat::Json, "\"schema\":\"euler.causal_dag.v2\""),
+            (ExportFormat::Json, "\"schema\":\"euler.causal_dag.v3\""),
             (ExportFormat::Svg, "<svg "),
             (ExportFormat::Dot, "digraph causal_dag"),
             (ExportFormat::Markdown, "## Backbone"),

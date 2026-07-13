@@ -179,7 +179,7 @@ fn extension_parse_accepts_management_commands() {
 #[test]
 fn headless_companion_run_happy_path_with_scripted_provider() {
     let (_temp, mut session) = companion_test_session(vec![FixtureResponse::Assistant(
-        "{\"schema\":\"euler.causal_dag.hints.v1\",\"nodes\":[],\"edges\":[]}".to_owned(),
+        "{\"schema\":\"euler.causal_dag.hints.v2\",\"nodes\":[],\"edges\":[]}".to_owned(),
     )]);
     let request = json!({
         "task": "observe listed events",
@@ -206,7 +206,7 @@ fn headless_companion_run_happy_path_with_scripted_provider() {
     assert!(output["result"]["output"]
         .as_str()
         .unwrap()
-        .contains("euler.causal_dag.hints.v1"));
+        .contains("euler.causal_dag.hints.v2"));
 }
 
 #[test]
@@ -1244,7 +1244,7 @@ fn dynamic_observer_hints(prompt: &str) -> String {
         "observer task should list at least two source ids"
     );
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [
             {
                 "id": "node-root",
@@ -1254,7 +1254,6 @@ fn dynamic_observer_hints(prompt: &str) -> String {
                 "title": "Started attempt",
                 "summary": "The session started a task.",
                 "source_refs": [{"id": "src-root", "event_id": ids[0], "payload_pointer": "/payload/content"}],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "Listed event starts the attempt."},
                 "metadata": {}
             },
@@ -1266,7 +1265,6 @@ fn dynamic_observer_hints(prompt: &str) -> String {
                 "title": "Dead end",
                 "summary": "The attempted path was abandoned.",
                 "source_refs": [{"id": "src-dead", "event_id": ids[1], "payload_pointer": "/payload/content"}],
-                "confidence": {"level": "medium", "score": 0.7},
                 "basis": {"kind": "direct", "summary": "Listed event closes this branch."},
                 "metadata": {}
             }
@@ -1279,7 +1277,6 @@ fn dynamic_observer_hints(prompt: &str) -> String {
             "kind": "continuation",
             "canonical_backbone": true,
             "source_refs": [{"id": "src-edge", "event_id": ids[1], "payload_pointer": "/payload/content"}],
-            "confidence": {"level": "medium", "score": 0.7},
             "basis": {"kind": "direct", "summary": "The later listed event follows the first."},
             "metadata": {}
         }]

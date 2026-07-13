@@ -119,7 +119,6 @@ document.addEventListener('click', function (e) {
         <span style="font-size:15px; color:{{ sel.color }};">{{ sel.glyph }}</span>
         <span style="color:{{ sel.color }};">{{ sel.statusWord }}</span>
         <span style="color:{{ th.sub }}; flex:none;">· {{ sel.kind }}</span>
-        <span style="margin-left:auto; color:{{ th.sub }}; flex:none;">{{ sel.conf }}</span>
       </div>
       <div style="color:{{ th.text }}; font-size:13px; font-weight:600; line-height:1.4;">{{ sel.title }}</div>
       <div style="color:{{ th.body }}; font-size:11.5px; line-height:1.55;">{{ sel.summary }}</div>
@@ -656,7 +655,7 @@ class Component extends DCLogic {
         const a = this.dag.arcs[this.state.selArc];
         vals.sel = {
           glyph: '⤳', color: AC[a.kind] || '#8f92a3', statusWord: a.kind, kind: 'cross-arc',
-          conf: '', title: this.byId[a.from].title + '  →  ' + this.byId[a.to].title,
+          title: this.byId[a.from].title + '  →  ' + this.byId[a.to].title,
           summary: a.note || '', ev: '—', links: [], sequence: '—'
         };
       } else {
@@ -668,7 +667,7 @@ class Component extends DCLogic {
         });
         vals.sel = {
           glyph: GLYPH[n.status], color: PAL[n.status], statusWord: WORD[n.status],
-          kind: n.kind, conf: 'conf ' + n.conf.toFixed(2),
+          kind: n.kind,
           title: n.title, summary: n.summary, ev: n.ev, links,
           sequence: this.idx[n.id] + ' / ' + (this.dag.nodes.length - 1)
         };
