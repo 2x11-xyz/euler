@@ -380,7 +380,7 @@ fn compacted_canvas_compacts_old_eligible_results_and_keeps_recent_verbatim() {
 }
 
 #[test]
-fn auto_compaction_emits_layer1_swap_and_next_turn_uses_compacted_canvas() {
+fn provider_derived_compaction_threshold_emits_layer1_swap() {
     let temp = tempfile::tempdir().expect("temp dir");
     fs::write(
         temp.path().join("note.txt"),
@@ -398,11 +398,17 @@ fn auto_compaction_emits_layer1_swap_and_next_turn_uses_compacted_canvas() {
     let mut config = SessionConfig::new(temp.path());
     assert_eq!(config.compaction_reserve_tokens, 16_384);
     assert_eq!(config.compaction_keep_recent, 4);
-    config.context_limit = Some(ContextLimitConfig::new(1000, 1.0).expect("valid limit"));
-    // Threshold = window - reserve. Usage is ~951 tokens so reserve 50 forces
-    // compaction; leave enough headroom that layer-1 (bytes/4 estimate) can
-    // satisfy the threshold before falling through to full projection swap.
-    config.compaction_reserve_tokens = 50;
+    config.context_limit = ContextLimitConfig::from_catalog_model(1000, Some(950));
+    assert_eq!(
+        config
+            .context_limit
+            .expect("catalog limit")
+            .auto_compact_token_limit(),
+        Some(950)
+    );
+    // The fallback reserve would trigger at 990. Usage is 951, proving the
+    // provider-derived threshold is the value that causes compaction.
+    config.compaction_reserve_tokens = 10;
     config.compaction_keep_recent = 1;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
@@ -4137,6 +4143,15 @@ fn context_limit_config_rejects_invalid_values() {
     let config = ContextLimitConfig::new(4096, 0.75).expect("valid limit");
     assert_eq!(config.limit_tokens(), 4096);
     assert_eq!(config.threshold(), 0.75);
+
+    for invalid_threshold in [0, 100, 101] {
+        let config = ContextLimitConfig::from_catalog_model(100, Some(invalid_threshold))
+            .expect("valid catalog window");
+        assert_eq!(config.auto_compact_token_limit(), None);
+    }
+    let config = ContextLimitConfig::from_catalog_model(100, Some(90))
+        .expect("valid catalog window and compaction threshold");
+    assert_eq!(config.auto_compact_token_limit(), Some(90));
 }
 
 #[test]

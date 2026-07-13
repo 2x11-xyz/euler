@@ -163,12 +163,15 @@ pub(crate) fn apply_catalog_context_limit(
     if config.context_limit.is_some() {
         return;
     }
-    let Some(limit_tokens) = catalog
+    let Some(model) = catalog
         .provider(&config.provider)
         .and_then(|provider| provider.models().find(|model| model.id() == config.model))
-        .and_then(|model| model.context_window_tokens())
     else {
         return;
     };
-    config.context_limit = ContextLimitConfig::from_catalog_window(limit_tokens);
+    let Some(limit_tokens) = model.effective_context_window_tokens() else {
+        return;
+    };
+    config.context_limit =
+        ContextLimitConfig::from_catalog_model(limit_tokens, model.auto_compact_token_limit());
 }

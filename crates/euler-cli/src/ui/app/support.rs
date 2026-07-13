@@ -34,7 +34,7 @@ pub(super) fn context_window_tokens_for(
     model_catalog
         .provider(provider)
         .and_then(|descriptor| descriptor.models().find(|entry| entry.id() == model))
-        .and_then(|entry| entry.context_window_tokens())
+        .and_then(|entry| entry.effective_context_window_tokens())
 }
 
 pub(super) fn update_token_usage(
@@ -231,7 +231,7 @@ fn catalog_model_choice(
     let mut choice = ModelChoice::with_metadata(
         provider,
         model.id(),
-        model.context_window_tokens(),
+        model.effective_context_window_tokens(),
         model.supports_reasoning(),
     );
     choice.current = provider == current_provider && model.id() == current_model;
@@ -521,6 +521,27 @@ mod tests {
                 && choice.label == "local-ollama::qwen3:32b"
         }));
         assert!(!format!("{choices:?}").contains("SHOULD_NOT_LEAK"));
+    }
+
+    #[test]
+    fn chatgpt_56_usage_and_picker_use_effective_context_window() {
+        let catalog = MergedModelCatalog::built_in();
+
+        assert_eq!(
+            context_window_tokens_for(&catalog, "chatgpt", "gpt-5.6-terra"),
+            Some(258_400)
+        );
+        let choices = model_choices(
+            &catalog,
+            &ProviderConfigRegistry::default(),
+            "chatgpt",
+            "gpt-5.6-terra",
+        );
+        let terra = choices
+            .iter()
+            .find(|choice| choice.provider == "chatgpt" && choice.model == "gpt-5.6-terra")
+            .expect("Terra choice");
+        assert!(terra.label.contains("258K ctx"), "{}", terra.label);
     }
 
     #[test]

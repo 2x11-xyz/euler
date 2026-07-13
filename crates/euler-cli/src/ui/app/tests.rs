@@ -2969,7 +2969,7 @@ fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
     };
     let rendered = picker.render_lines(80).join("\n");
     assert!(
-        rendered.contains("chatgpt::gpt-5.5 — 272K ctx, reasoning ✓"),
+        rendered.contains("chatgpt::gpt-5.5 — 258K ctx, reasoning ✓"),
         "rendered picker:\n{rendered}"
     );
 }

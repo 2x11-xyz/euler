@@ -33,10 +33,7 @@ fn translates_tool_call_models_to_overlay_schema() {
         overlay["providers"]["openai"]["models"][0]["context_window_tokens"],
         1_050_000
     );
-    assert_eq!(
-        overlay["providers"]["chatgpt"]["models"][0]["id"],
-        "gpt-5.5"
-    );
+    assert!(overlay["providers"].get("chatgpt").is_none());
     assert_eq!(
         overlay["providers"]["openrouter"]["models"][0]["id"],
         "z-ai/glm-5.2"
@@ -80,11 +77,14 @@ fn refresh_overlay_round_trips_through_merged_catalog_without_warnings() {
         .expect("openrouter")
         .models()
         .any(|model| model.id() == "z-ai/glm-5.2"));
-    assert!(catalog
+    let chatgpt_model = catalog
         .provider("chatgpt")
         .expect("chatgpt")
         .models()
-        .any(|model| model.id() == "gpt-5.5"));
+        .find(|model| model.id() == "gpt-5.5")
+        .expect("built-in ChatGPT model");
+    assert_eq!(chatgpt_model.context_window_tokens(), Some(272_000));
+    assert_eq!(chatgpt_model.source().as_str(), "built-in");
     assert!(catalog
         .provider("xai")
         .expect("xai")

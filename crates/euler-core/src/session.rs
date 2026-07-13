@@ -69,6 +69,7 @@ const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provid
 pub struct ContextLimitConfig {
     limit_tokens: u64,
     threshold: f64,
+    auto_compact_token_limit: Option<u64>,
 }
 
 impl ContextLimitConfig {
@@ -79,6 +80,7 @@ impl ContextLimitConfig {
         Some(Self {
             limit_tokens,
             threshold,
+            auto_compact_token_limit: None,
         })
     }
 
@@ -88,12 +90,28 @@ impl ContextLimitConfig {
         Self::new(limit_tokens, 1.0)
     }
 
+    /// Catalog-derived effective window plus an optional provider-specific
+    /// automatic-compaction threshold.
+    pub fn from_catalog_model(
+        limit_tokens: u64,
+        auto_compact_token_limit: Option<u64>,
+    ) -> Option<Self> {
+        let mut config = Self::from_catalog_window(limit_tokens)?;
+        config.auto_compact_token_limit = auto_compact_token_limit
+            .filter(|threshold| *threshold > 0 && *threshold < limit_tokens);
+        Some(config)
+    }
+
     pub fn limit_tokens(&self) -> u64 {
         self.limit_tokens
     }
 
     pub fn threshold(&self) -> f64 {
         self.threshold
+    }
+
+    pub fn auto_compact_token_limit(&self) -> Option<u64> {
+        self.auto_compact_token_limit
     }
 }
 
@@ -1453,29 +1471,32 @@ impl<D: PermissionDecider> Session<D> {
         {
             return Ok(false);
         }
-        let Some(window) = self.compaction_context_window() else {
+        let Some(threshold) = self.compaction_trigger_tokens() else {
             return Ok(false);
         };
         let Some(usage) = &self.latest_model_usage else {
             return Ok(false);
         };
-        if !should_compact(
-            usage.used_tokens as usize,
-            window,
-            self.config.compaction_reserve_tokens,
-        ) {
+        if !should_compact(usage.used_tokens as usize, threshold, 0) {
             return Ok(false);
         }
-        Ok(self.compact_for_threshold(window))
+        Ok(self.compact_for_threshold(threshold))
     }
 
-    fn compaction_context_window(&self) -> Option<usize> {
-        let window = self.config.context_limit?.limit_tokens() as usize;
-        Some(window)
+    fn compaction_trigger_tokens(&self) -> Option<usize> {
+        let limit = self.config.context_limit?;
+        Some(
+            limit
+                .auto_compact_token_limit()
+                .map(|threshold| threshold as usize)
+                .unwrap_or_else(|| {
+                    (limit.limit_tokens() as usize)
+                        .saturating_sub(self.config.compaction_reserve_tokens)
+                }),
+        )
     }
 
-    fn compact_for_threshold(&mut self, window: usize) -> bool {
-        let threshold = window.saturating_sub(self.config.compaction_reserve_tokens);
+    fn compact_for_threshold(&mut self, threshold: usize) -> bool {
         let candidates =
             select_layer1_candidates(self.bus.events(), self.config.compaction_keep_recent, 4);
         let policy = self.effective_stub_policy();

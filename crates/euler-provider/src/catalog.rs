@@ -19,6 +19,7 @@ pub const DEFAULT_OPENAI_MODEL: &str = crate::openai::DEFAULT_MODEL;
 pub const DEFAULT_ANTHROPIC_MODEL: &str = crate::anthropic::DEFAULT_MODEL;
 pub const DEFAULT_OPENROUTER_MODEL: &str = crate::openrouter::DEFAULT_MODEL;
 pub const DEFAULT_XAI_MODEL: &str = crate::xai::DEFAULT_MODEL;
+const EULER_MODELS_REFRESH_GENERATOR: &str = "euler models refresh";
 
 const STANDARD_REASONING_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::XSmall,
@@ -43,6 +44,8 @@ pub struct BuiltInModelDescriptor {
     pub max_output_tokens: Option<u64>,
     pub supports_tools: Option<bool>,
     pub supports_reasoning: Option<bool>,
+    pub effective_context_window_percent: Option<u8>,
+    pub auto_compact_token_limit: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +82,8 @@ pub struct ModelDescriptor {
     max_output_tokens: Option<u64>,
     supports_tools: Option<bool>,
     supports_reasoning: Option<bool>,
+    effective_context_window_percent: Option<u8>,
+    auto_compact_token_limit: Option<u64>,
 }
 
 impl ModelDescriptor {
@@ -96,6 +101,18 @@ impl ModelDescriptor {
 
     pub fn context_window_tokens(&self) -> Option<u64> {
         self.context_window_tokens
+    }
+
+    pub fn effective_context_window_tokens(&self) -> Option<u64> {
+        let raw = self.context_window_tokens?;
+        Some(match self.effective_context_window_percent {
+            Some(percent) => raw.saturating_mul(u64::from(percent)) / 100,
+            None => raw,
+        })
+    }
+
+    pub fn auto_compact_token_limit(&self) -> Option<u64> {
+        self.auto_compact_token_limit
     }
 
     pub fn max_output_tokens(&self) -> Option<u64> {
@@ -161,6 +178,8 @@ pub const BUILTIN_PROVIDERS: &[ProviderDescriptor] = &[
             max_output_tokens: None,
             supports_tools: None,
             supports_reasoning: None,
+            effective_context_window_percent: None,
+            auto_compact_token_limit: None,
         }],
     },
     ProviderDescriptor {
@@ -411,22 +430,46 @@ const OPENAI_MODELS: &[BuiltInModelDescriptor] = &[
 
 /// ChatGPT-subscription backend models (pi reference: openai-codex.models.ts —
 /// the codex backend exposes a different, smaller set than the platform API).
-/// GPT-5.6 has a 372K window on this Codex route; the same model ids on the
-/// OpenAI platform API remain 272K. Keep the route-specific values distinct.
+/// Route-specific operational limits stay here rather than being copied from
+/// the OpenAI API catalog. Codex reserves 5% of each raw window for runtime
+/// headroom and compacts automatically at 90% of the raw window.
+const CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS: u64 = 272_000;
+const CHATGPT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u8 = 95;
+
+const fn chatgpt_context_policy(context_window_tokens: Option<u64>) -> (Option<u8>, Option<u64>) {
+    match context_window_tokens {
+        Some(raw) => (
+            Some(CHATGPT_EFFECTIVE_CONTEXT_WINDOW_PERCENT),
+            Some(raw * 9 / 10),
+        ),
+        None => (None, None),
+    }
+}
+
 const CHATGPT_MODELS: &[BuiltInModelDescriptor] = &[
-    built_in_model(
-        "gpt-5.3-codex-spark",
-        "GPT-5.3 Codex Spark",
-        128_000,
-        128_000,
-        true,
+    chatgpt_model("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", 128_000),
+    chatgpt_model("gpt-5.4", "GPT-5.4", CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS),
+    chatgpt_model(
+        "gpt-5.4-mini",
+        "GPT-5.4 mini",
+        CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS,
     ),
-    built_in_model("gpt-5.4", "GPT-5.4", 272_000, 128_000, true),
-    built_in_model("gpt-5.4-mini", "GPT-5.4 mini", 272_000, 128_000, true),
-    built_in_model("gpt-5.5", "GPT-5.5", 272_000, 128_000, true),
-    built_in_model("gpt-5.6-luna", "GPT-5.6 Luna", 372_000, 128_000, true),
-    built_in_model("gpt-5.6-sol", "GPT-5.6 Sol", 372_000, 128_000, true),
-    built_in_model("gpt-5.6-terra", "GPT-5.6 Terra", 372_000, 128_000, true),
+    chatgpt_model("gpt-5.5", "GPT-5.5", CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS),
+    chatgpt_model(
+        "gpt-5.6-luna",
+        "GPT-5.6 Luna",
+        CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS,
+    ),
+    chatgpt_model(
+        "gpt-5.6-sol",
+        "GPT-5.6 Sol",
+        CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS,
+    ),
+    chatgpt_model(
+        "gpt-5.6-terra",
+        "GPT-5.6 Terra",
+        CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS,
+    ),
 ];
 
 const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
@@ -2167,6 +2210,27 @@ const fn built_in_model(
         max_output_tokens: Some(max_output_tokens),
         supports_tools: Some(true),
         supports_reasoning: Some(supports_reasoning),
+        effective_context_window_percent: None,
+        auto_compact_token_limit: None,
+    }
+}
+
+const fn chatgpt_model(
+    id: &'static str,
+    display_name: &'static str,
+    context_window_tokens: u64,
+) -> BuiltInModelDescriptor {
+    let (effective_context_window_percent, auto_compact_token_limit) =
+        chatgpt_context_policy(Some(context_window_tokens));
+    BuiltInModelDescriptor {
+        id,
+        display_name,
+        context_window_tokens: Some(context_window_tokens),
+        max_output_tokens: Some(128_000),
+        supports_tools: Some(true),
+        supports_reasoning: Some(true),
+        effective_context_window_percent,
+        auto_compact_token_limit,
     }
 }
 
@@ -2189,6 +2253,9 @@ impl MergedModelCatalog {
                                 max_output_tokens: model.max_output_tokens,
                                 supports_tools: model.supports_tools,
                                 supports_reasoning: model.supports_reasoning,
+                                effective_context_window_percent: model
+                                    .effective_context_window_percent,
+                                auto_compact_token_limit: model.auto_compact_token_limit,
                             },
                         )
                     })
@@ -2251,8 +2318,17 @@ impl MergedModelCatalog {
             );
             return (catalog, warnings);
         };
+        let generated_by_models_refresh = root.get("generated_by").and_then(Value::as_str)
+            == Some(EULER_MODELS_REFRESH_GENERATOR);
 
         for (provider_key, provider_value) in providers {
+            if generated_by_models_refresh && provider_key == CHATGPT_PROVIDER_ID {
+                warnings.push(
+                    "ignored stale ChatGPT metadata generated by `euler models refresh`; run refresh again to remove it"
+                        .to_owned(),
+                );
+                continue;
+            }
             catalog.merge_provider(provider_key, provider_value, &mut warnings);
         }
         (catalog, warnings)
@@ -2399,6 +2475,12 @@ fn merge_models(
             optional_positive_u64(object, "max_output_tokens", &scope, warnings);
         let supports_tools = optional_bool(object, "supports_tools", &scope, warnings);
         let supports_reasoning = optional_bool(object, "supports_reasoning", &scope, warnings);
+        let (effective_context_window_percent, auto_compact_token_limit) =
+            if provider_key == CHATGPT_PROVIDER_ID {
+                chatgpt_context_policy(context_window_tokens)
+            } else {
+                (None, None)
+            };
         if provider
             .models
             .get(&id)
@@ -2420,6 +2502,8 @@ fn merge_models(
                 max_output_tokens,
                 supports_tools,
                 supports_reasoning,
+                effective_context_window_percent,
+                auto_compact_token_limit,
             },
         );
     }
