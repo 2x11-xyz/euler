@@ -1686,29 +1686,28 @@ impl<D: PermissionDecider> Session<D> {
         let Some(writer) = self.provenance.clone() else {
             return Err(SessionError::ScrubRequiresProvenance);
         };
+        let secrets = crate::scrub::prepare_secrets(secrets);
+        // Scrub the IN-MEMORY bus first: it can't fail, so the running session
+        // stops carrying the value even if a later on-disk surface errors (no
+        // render, compaction, or persist can re-emit it). Ids and count are
+        // unchanged, so the persisted-events cursor stays valid.
+        self.bus.scrub_payloads(&secrets);
+        self.scrub_candidates
+            .retain(|candidate| !secrets.contains(candidate));
+        // Non-log surfaces before the audit, so the audit reflects them and a
+        // failure aborts before any audit claims success.
+        let non_log = match writer.log_path().parent() {
+            Some(session_dir) => crate::scrub::scrub_non_log_surfaces(session_dir, None, &secrets)?,
+            None => crate::provenance::NonLogScrub::default(),
+        };
         let stats = writer.scrub_and_audit(
-            secrets,
+            &secrets,
             Some(self.config.root.as_path()),
             &self.config.session_id,
             &self.config.agent_id,
+            non_log,
         )?;
-        let mut report = crate::scrub::report_from_log_stats(stats);
-        if let Some(session_dir) = writer.log_path().parent() {
-            crate::scrub::finish_non_log_surfaces(
-                session_dir,
-                crate::scrub::ScrubSurfaces::default(),
-                secrets,
-                &mut report,
-            )?;
-        }
-        // The running session must stop carrying the value: the durable log is
-        // already scrubbed, so align the in-memory bus so no later render,
-        // compaction, or persist re-emits it. Ids and count are unchanged, so
-        // the persisted-events cursor stays valid.
-        self.bus.scrub_payloads(secrets);
-        self.scrub_candidates
-            .retain(|candidate| !secrets.contains(candidate));
-        Ok(report)
+        Ok(crate::scrub::report_from(stats, non_log))
     }
 
     fn emit(&mut self, kind: &'static str, payload: JsonObject) -> Result<String, SessionError> {

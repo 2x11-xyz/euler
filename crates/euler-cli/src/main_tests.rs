@@ -1709,20 +1709,21 @@ fn provider_options_are_fresh_session_only_for_first_slice() {
 }
 
 #[test]
-fn scrub_command_parses_session_and_values() {
-    let args = parse_args_without_env(["scrub", "my-session", "sk-live-value-0123456789"]);
+fn scrub_command_parses_session_only() {
+    let args = parse_args_without_env(["scrub", "my-session"]);
     let Command::Scrub(scrub) = args.command else {
         panic!("expected scrub command");
     };
     assert_eq!(scrub.session, "my-session");
-    assert_eq!(scrub.values, vec!["sk-live-value-0123456789".to_owned()]);
 }
 
 #[test]
-fn scrub_command_requires_at_least_one_value() {
-    let error = parse_args_error(["scrub", "my-session"]);
+fn scrub_command_rejects_secret_values_in_argv() {
+    // A value on the command line would leak into shell history / `ps`; scrub
+    // reads secrets from stdin instead.
+    let error = parse_args_error(["scrub", "my-session", "sk-live-value-0123456789"]);
     assert!(
-        error.to_string().contains("requires at least one value"),
+        error.to_string().contains("reads secret values from stdin"),
         "{error}"
     );
 }

@@ -53,6 +53,8 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `canvas.swap`
 - `canvas.candidate.discarded`
 - `secret.redacted`
+- `secret.exposure.detected`
+- `secret.scrubbed`
 - `extension.artifact`
 - `agent.spawn`
 - `agent.message`
@@ -324,6 +326,17 @@ envelope `v` per `docs/contracts/persistence.md`.
   session's envelope `agent` and parents the matching `agent.spawn` event.
   `ok=true` permits `output` and forbids `error`; `ok=false` permits `error`
   and optional bounded `output`.
+- `secret.exposure.detected`: `event` (id of the exposing event), `field`,
+  `shapes` (array of non-secret shape labels, e.g. `sk-ant-` or `known-value`),
+  `count`. A read-only marker that a credential shape was detected in a faithful
+  tool-call argument (see `docs/contracts/secrets.md`). Never carries the value:
+  the exposing event stays verbatim; this only records that a scrub is offered.
+- `secret.scrubbed`: `values` (count of distinct values removed), `replacements`
+  (total occurrences), `surfaces` (`events`, `blobs`, `checkpoints` counts;
+  `sidecar`, `index` booleans), `note`. Audit-only record of a user-initiated
+  scrub across every persistent surface. Never carries the value. The count-only
+  audit is committed last, after all surfaces are scrubbed, so it is a truthful
+  all-surface record.
 
 ## Parentage Rules
 
@@ -360,6 +373,10 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `extension.artifact` parents the previous persisted event at append time.
   Source attribution belongs in `source_event_ids`; those ids do not choose the
   artifact event's parent.
+- `secret.exposure.detected` parents the exposing event it flags (the
+  `tool.call` whose argument held a credential shape).
+- `secret.scrubbed` parents the log tail at scrub time (a session-level audit
+  event). It is appended once all surfaces are scrubbed.
 - `agent.spawn` parents the current parent event in the spawning session,
   excluding runtime-only `model.delta` events.
 - `agent.message` parents the previous persisted event at parent drain time.

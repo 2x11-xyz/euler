@@ -169,7 +169,7 @@ fn scrubs_the_session_title_sidecar() {
 }
 
 #[test]
-fn rehashes_a_workspace_pre_image_checkpoint() {
+fn scrubs_a_workspace_pre_image_checkpoint_in_place() {
     let dir = tempdir().expect("temp");
     let workspace = tempdir().expect("workspace");
     // A value the checkpoint safety filter does not flag as secret-like, so it
@@ -206,22 +206,108 @@ fn rehashes_a_workspace_pre_image_checkpoint() {
     .expect("scrub");
     assert_eq!(report.checkpoints_rewritten, 1);
 
-    // The event now points at a new hash, and the restored pre-image is clean.
+    // Overwrite-in-place: the event still points at the ORIGINAL hash (no
+    // re-point, no delete — the content-addressed store is workspace-wide), but
+    // the file at that hash no longer holds the secret.
     let events = read_provenance(dir.path().join("events.jsonl")).unwrap();
-    let new_hash = events[0].payload["pre_image_blob"].as_str().unwrap();
-    assert_ne!(new_hash, hash);
-    let restored = crate::checkpoints::load_pre_image(workspace.path(), new_hash).unwrap();
-    assert!(!restored.contains(value));
-    assert!(restored.contains(crate::redaction::SCRUBBED));
+    assert_eq!(events[0].payload["pre_image_blob"].as_str().unwrap(), hash);
+    let raw = std::fs::read_to_string(
+        workspace
+            .path()
+            .join(".euler")
+            .join("checkpoints")
+            .join(&hash),
+    )
+    .expect("checkpoint blob");
+    assert!(!raw.contains(value));
+    assert!(raw.contains(crate::redaction::SCRUBBED));
+    // The hash no longer matches its (scrubbed) content, so a rollback of this
+    // pre-image degrades gracefully rather than restoring the secret.
+    assert!(crate::checkpoints::load_pre_image(workspace.path(), &hash).is_err());
+}
+
+#[test]
+fn scrubbing_a_value_with_json_metacharacters_keeps_the_sidecar_valid() {
+    let dir = tempdir().expect("temp");
+    write_events(dir.path(), &[tool_result("clean")]);
+    // A value containing a JSON quote: a raw substring replace would corrupt
+    // session.json (and would not even match the escaped form). The structured
+    // scrub parses, replaces the leaf, and re-serializes — always valid JSON.
+    let value = "abc\"def-secret-1234";
+    let sidecar = dir.path().join("session.json");
+    fs::write(
+        &sidecar,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "name": format!("dbg-{value}"),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = scrub_closed_session(
+        dir.path(),
+        "s",
+        ScrubSurfaces::default(),
+        &[value.to_owned()],
+    )
+    .expect("scrub");
+
+    assert!(report.sidecar_scrubbed);
+    let raw = fs::read_to_string(&sidecar).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).expect("sidecar stays valid JSON after scrub");
+    assert!(!raw.contains(value));
+    assert_eq!(
+        parsed["name"],
+        serde_json::Value::from(format!("dbg-{}", crate::redaction::SCRUBBED))
+    );
+}
+
+#[test]
+fn a_secret_only_in_the_index_is_scrubbed_and_audited() {
+    let dir = tempdir().expect("temp");
+    write_events(dir.path(), &[tool_result("clean output")]); // log has no secret
+    let index = dir.path().join("index.jsonl");
+    let value = "only-in-index-secret-9876";
+    fs::write(
+        &index,
+        format!(
+            "{}\n",
+            serde_json::json!({ "id": "s", "name": format!("x-{value}") })
+        ),
+    )
+    .unwrap();
+
+    let report = scrub_closed_session(
+        dir.path(),
+        "s",
+        ScrubSurfaces {
+            workspace_root: None,
+            index_path: Some(&index),
+        },
+        &[value.to_owned()],
+    )
+    .expect("scrub");
+
+    // Scrubbed and AUDITED, even though only the index (not the log) held it.
+    assert!(report.index_scrubbed);
+    let audit_id = report
+        .audit_event_id
+        .expect("audit emitted for an index-only secret");
+    let audit_line = raw_lines(dir.path())
+        .lines()
+        .find(|line| line.contains(&audit_id))
+        .expect("audit line")
+        .to_owned();
+    assert!(audit_line.contains("\"index\":true"));
+    assert!(!fs::read_to_string(&index).unwrap().contains(value));
 }
 
 #[test]
 fn preserves_event_ids_and_order_across_a_scrub() {
     let dir = tempdir().expect("temp");
-    let events = vec![
-        tool_result(&format!("has {SECRET}")),
-        tool_result("clean"),
-    ];
+    let events = vec![tool_result(&format!("has {SECRET}")), tool_result("clean")];
     write_events(dir.path(), &events);
     let ids_before: Vec<String> = read_provenance(dir.path().join("events.jsonl"))
         .unwrap()
@@ -242,5 +328,8 @@ fn preserves_event_ids_and_order_across_a_scrub() {
     let ids_after: Vec<String> = after.iter().map(|event| event.id.clone()).collect();
     assert_eq!(&ids_after[..ids_before.len()], &ids_before[..]);
     assert_eq!(ids_after.len(), ids_before.len() + 1);
-    assert_eq!(after.last().unwrap().kind.as_str(), EventKind::SECRET_SCRUBBED);
+    assert_eq!(
+        after.last().unwrap().kind.as_str(),
+        EventKind::SECRET_SCRUBBED
+    );
 }

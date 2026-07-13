@@ -16,7 +16,7 @@
 //! recalled; the audit note and the report both say so.
 
 use crate::home::{containing_dir, private_open_options, set_file_mode_0600, sync_dir};
-use crate::provenance::{LogScrubStats, ProvenanceWriter, ProvenanceWriterError};
+use crate::provenance::{LogScrubStats, NonLogScrub, ProvenanceWriter, ProvenanceWriterError};
 use std::fs::{self};
 use std::io::{self, Write};
 use std::path::Path;
@@ -26,6 +26,24 @@ use ulid::Ulid;
 /// Agent id recorded on the `secret.scrubbed` audit event for a post-close
 /// scrub — the live path records the session's own agent instead.
 pub const SCRUB_AGENT: &str = "euler-scrub";
+
+/// Explicit scrub values shorter than this are rejected: substring-replacing a
+/// 1-3 char value would mangle unrelated content far more than it protects.
+pub const MIN_SCRUB_VALUE_LEN: usize = 4;
+
+/// Prepare caller-supplied secrets for scrubbing: drop values too short to
+/// scrub safely, and sort longest-first so a longer secret is removed before
+/// any shorter secret it contains (overlap-safe, order-independent).
+pub fn prepare_secrets(secrets: &[String]) -> Vec<String> {
+    let mut prepared: Vec<String> = secrets
+        .iter()
+        .filter(|value| value.len() >= MIN_SCRUB_VALUE_LEN)
+        .cloned()
+        .collect();
+    prepared.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    prepared.dedup();
+    prepared
+}
 
 /// What a scrub removed, across every surface. `anything_scrubbed()` is false
 /// when the value was not present anywhere (a no-op scrub).
@@ -125,54 +143,88 @@ pub struct ScrubSurfaces<'a> {
     pub index_path: Option<&'a Path>,
 }
 
-/// Post-close scrub: acquire the session lock by opening a fresh writer, then
-/// remove `secrets` from every surface of `session_dir`.
+/// Post-close scrub: remove `secrets` from every surface of `session_dir`.
+///
+/// The non-log surfaces (sidecar, index) are scrubbed FIRST so their outcome is
+/// known before the audit commits — a failure there aborts before any audit
+/// claims success, and a secret found only there is still recorded. The log
+/// rewrite + `secret.scrubbed` audit then commit last, reflecting all surfaces.
 pub fn scrub_closed_session(
     session_dir: &Path,
     session_id: &str,
     surfaces: ScrubSurfaces<'_>,
     secrets: &[String],
 ) -> Result<ScrubReport, ScrubError> {
+    let secrets = prepare_secrets(secrets);
+    if secrets.is_empty() {
+        return Ok(ScrubReport::default());
+    }
+    let non_log = scrub_non_log_surfaces(session_dir, surfaces.index_path, &secrets)?;
     let writer = ProvenanceWriter::new(session_dir.join("events.jsonl"))?;
-    let stats = writer.scrub_and_audit(secrets, surfaces.workspace_root, session_id, SCRUB_AGENT)?;
+    let stats = writer.scrub_and_audit(
+        &secrets,
+        surfaces.workspace_root,
+        session_id,
+        SCRUB_AGENT,
+        non_log,
+    )?;
     drop(writer);
-    let mut report = ScrubReport::from_log(stats);
-    finish_non_log_surfaces(session_dir, surfaces, secrets, &mut report)?;
-    Ok(report)
+    Ok(report_from(stats, non_log))
 }
 
 /// Scrub the surfaces that live outside the append-only log — the session-title
-/// sidecar and the store index. Shared by the closed and live paths; the log
-/// itself is scrubbed by the caller (a fresh writer, or the live session's).
-pub fn finish_non_log_surfaces(
+/// sidecar and the store index — structurally (as JSON), returning what each
+/// held. Shared by the closed and live paths; the log itself is scrubbed by the
+/// caller (a fresh writer, or the live session's).
+pub fn scrub_non_log_surfaces(
     session_dir: &Path,
-    surfaces: ScrubSurfaces<'_>,
+    index_path: Option<&Path>,
     secrets: &[String],
-    report: &mut ScrubReport,
-) -> Result<(), ScrubError> {
-    report.sidecar_scrubbed = scrub_text_file(&session_dir.join("session.json"), secrets)?;
-    if let Some(index_path) = surfaces.index_path {
-        report.index_scrubbed = scrub_text_file(index_path, secrets)?;
-    }
-    Ok(())
+) -> Result<NonLogScrub, ScrubError> {
+    let sidecar = scrub_json_file(
+        &session_dir.join("session.json"),
+        secrets,
+        JsonShape::Object,
+    )?;
+    let index = match index_path {
+        Some(path) => scrub_json_file(path, secrets, JsonShape::Lines)?,
+        None => false,
+    };
+    Ok(NonLogScrub { sidecar, index })
 }
 
-/// Build a live-path report from the log stats produced by the session's own
-/// writer, so `Session::scrub_live` and the closed path share one report shape.
-pub fn report_from_log_stats(stats: LogScrubStats) -> ScrubReport {
-    ScrubReport::from_log(stats)
+/// Build a report from the log stats and the non-log outcome, so the live and
+/// closed paths share one report shape.
+pub fn report_from(stats: LogScrubStats, non_log: NonLogScrub) -> ScrubReport {
+    let mut report = ScrubReport::from_log(stats);
+    report.sidecar_scrubbed = non_log.sidecar;
+    report.index_scrubbed = non_log.index;
+    report
 }
 
-/// Atomically replace every secret occurrence in a private text file (session
-/// sidecar / index). Returns whether anything changed. Missing file is a no-op.
-/// Written 0600 via temp+rename+fsync, matching the store's other sidecars.
-fn scrub_text_file(path: &Path, secrets: &[String]) -> Result<bool, ScrubError> {
+/// Whether a JSON surface is a single object (`session.json`) or one JSON value
+/// per line (`index.jsonl`).
+#[derive(Clone, Copy)]
+enum JsonShape {
+    Object,
+    Lines,
+}
+
+/// Scrub secrets out of a private JSON surface STRUCTURALLY: parse, replace in
+/// string leaves, re-serialize. Unlike a raw substring replace, a secret
+/// containing JSON metacharacters (`"`, `\`) can never corrupt the file. Returns
+/// whether anything changed; a missing or unparseable file is a no-op. Written
+/// 0600 via temp+rename+fsync, matching the store's other sidecars.
+fn scrub_json_file(path: &Path, secrets: &[String], shape: JsonShape) -> Result<bool, ScrubError> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    let (scrubbed, replacements) = crate::redaction::scrub_secrets_in_text(&content, secrets);
+    let (scrubbed, replacements) = match shape {
+        JsonShape::Object => scrub_json_object(&content, secrets),
+        JsonShape::Lines => scrub_json_lines(&content, secrets),
+    };
     if replacements == 0 {
         return Ok(false);
     }
@@ -194,6 +246,59 @@ fn scrub_text_file(path: &Path, secrets: &[String]) -> Result<bool, ScrubError> 
     fs::rename(&temp_path, path)?;
     sync_dir(containing_dir(path))?;
     Ok(true)
+}
+
+/// Scrub a single JSON object (session.json), preserving pretty formatting.
+fn scrub_json_object(content: &str, secrets: &[String]) -> (String, usize) {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) else {
+        // Malformed (should not happen for euler-written sidecars): fall back to
+        // a raw substring scrub rather than leave a secret behind.
+        return crate::redaction::scrub_secrets_in_text(content, secrets);
+    };
+    let replacements = crate::redaction::scrub_secrets_in_value(&mut value, secrets);
+    if replacements == 0 {
+        return (content.to_owned(), 0);
+    }
+    match serde_json::to_string_pretty(&value) {
+        Ok(mut serialized) => {
+            serialized.push('\n');
+            (serialized, replacements)
+        }
+        Err(_) => crate::redaction::scrub_secrets_in_text(content, secrets),
+    }
+}
+
+/// Scrub JSONL (index.jsonl) line by line, each parsed as a JSON value.
+fn scrub_json_lines(content: &str, secrets: &[String]) -> (String, usize) {
+    let mut total = 0;
+    let mut out = String::with_capacity(content.len());
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(mut value) => {
+                total += crate::redaction::scrub_secrets_in_value(&mut value, secrets);
+                match serde_json::to_string(&value) {
+                    Ok(serialized) => out.push_str(&serialized),
+                    Err(_) => {
+                        let (serialized, count) =
+                            crate::redaction::scrub_secrets_in_text(line, secrets);
+                        total += count;
+                        out.push_str(&serialized);
+                    }
+                }
+            }
+            Err(_) => {
+                let (serialized, count) = crate::redaction::scrub_secrets_in_text(line, secrets);
+                total += count;
+                out.push_str(&serialized);
+            }
+        }
+        out.push('\n');
+    }
+    (out, total)
 }
 
 #[derive(Debug, Error)]

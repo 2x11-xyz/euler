@@ -144,9 +144,11 @@ impl ProvenanceWriter {
     /// replaced with the scrub marker, externalized blobs holding a secret are
     /// rewritten under a fresh content hash and re-pointed, and — when
     /// `workspace_root` is known — `file.change` pre-image checkpoints are
-    /// rewritten the same way. Event ids, timestamps, kinds, and ordering are
-    /// preserved, so the only tail movement is the appended `secret.scrubbed`
-    /// audit event (counts only, never the value).
+    /// overwritten in place (kept at their old hash, no re-point, no delete).
+    /// Event ids, timestamps, kinds, and ordering are preserved, so the only
+    /// tail movement is the appended `secret.scrubbed` audit event (counts only,
+    /// never the value); its `surfaces` also fold in the caller-scrubbed
+    /// sidecar/index via `non_log`.
     ///
     /// Held under the append lock so no concurrent append races. Atomic: the
     /// new log is fsynced and renamed over the old; new blobs are durable
@@ -158,6 +160,7 @@ impl ProvenanceWriter {
         workspace_root: Option<&Path>,
         session_id: &str,
         agent: &str,
+        non_log: NonLogScrub,
     ) -> io::Result<LogScrubStats> {
         let mut durable_tail = recover_mutex(&self.append_lock);
 
@@ -176,7 +179,11 @@ impl ProvenanceWriter {
         for event in &mut events {
             self.scrub_one_event(event, secrets, workspace_root, &mut pass)?;
         }
-        if !pass.stats.touched_anything() {
+        // The audit reflects EVERY surface — including the sidecar/index the
+        // caller already scrubbed — and is committed LAST, so it never claims a
+        // success that a later surface failure could contradict, and a secret
+        // found only in the sidecar/index is still recorded.
+        if !pass.stats.touched_anything() && !non_log.touched() {
             return Ok(pass.stats);
         }
 
@@ -185,7 +192,7 @@ impl ProvenanceWriter {
             agent,
             events.last().map(|event| event.id.clone()),
             EventKind::new(EventKind::SECRET_SCRUBBED),
-            scrub_audit_payload(secrets.len(), &pass.stats),
+            scrub_audit_payload(secrets.len(), &pass.stats, non_log),
         );
         pass.stats.audit_event_id = Some(audit.id.clone());
         events.push(audit);
@@ -248,12 +255,11 @@ impl ProvenanceWriter {
                     .filter(|hash| !hash.is_empty())
                     .map(str::to_owned)
                 {
-                    if let Some(new_hash) =
-                        crate::checkpoints::scrub_pre_image(root, &old_hash, secrets)?
-                    {
-                        event
-                            .payload
-                            .insert("pre_image_blob".to_owned(), new_hash.into());
+                    // Overwrite-in-place: the event keeps pointing at old_hash
+                    // (no re-point, so this is not coupled to the log commit;
+                    // no delete, so a shared content-addressed blob is safe).
+                    // Only the count changes.
+                    if crate::checkpoints::scrub_pre_image(root, &old_hash, secrets)? {
                         pass.stats.checkpoints_rewritten += 1;
                     }
                 }
@@ -266,7 +272,12 @@ impl ProvenanceWriter {
     /// content hash to re-point at. `None` when the blob is missing, non-UTF-8,
     /// or holds no secret. Same content hashes to the same value, so a blob
     /// shared by several events is read and rewritten once (cached in `pass`).
-    fn scrub_one_blob(&self, hash: &str, secrets: &[String], pass: &mut ScrubPass) -> Option<String> {
+    fn scrub_one_blob(
+        &self,
+        hash: &str,
+        secrets: &[String],
+        pass: &mut ScrubPass,
+    ) -> Option<String> {
         if let Some(new_hash) = pass.blob_rewrites.get(hash) {
             return Some(new_hash.clone());
         }
@@ -1158,6 +1169,21 @@ impl LogScrubStats {
     }
 }
 
+/// Whether the non-log surfaces (scrubbed by the caller before the audit
+/// commits) held a secret. Folded into the `secret.scrubbed` audit so it is a
+/// truthful, all-surface record.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NonLogScrub {
+    pub sidecar: bool,
+    pub index: bool,
+}
+
+impl NonLogScrub {
+    fn touched(&self) -> bool {
+        self.sidecar || self.index
+    }
+}
+
 /// Mutable accumulator threaded through a scrub over the log's events: running
 /// counts plus deferred blob side effects (written/removed around the atomic
 /// log commit) and a per-hash rewrite cache so a shared blob is handled once.
@@ -1169,11 +1195,17 @@ struct ScrubPass {
     blob_rewrites: std::collections::HashMap<String, String>,
 }
 
-fn scrub_audit_payload(values: usize, stats: &LogScrubStats) -> euler_event::JsonObject {
+fn scrub_audit_payload(
+    values: usize,
+    stats: &LogScrubStats,
+    non_log: NonLogScrub,
+) -> euler_event::JsonObject {
     let mut surfaces = serde_json::Map::new();
     surfaces.insert("events".to_owned(), stats.events_rewritten.into());
     surfaces.insert("blobs".to_owned(), stats.blobs_rewritten.into());
     surfaces.insert("checkpoints".to_owned(), stats.checkpoints_rewritten.into());
+    surfaces.insert("sidecar".to_owned(), non_log.sidecar.into());
+    surfaces.insert("index".to_owned(), non_log.index.into());
     let mut payload = serde_json::Map::new();
     payload.insert("values".to_owned(), values.into());
     payload.insert("replacements".to_owned(), stats.replacements.into());

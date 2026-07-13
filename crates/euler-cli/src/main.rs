@@ -3,8 +3,8 @@ use anyhow::{anyhow, Result};
 use euler_core::permissions::{DeciderVerdict, PermissionRequest};
 use euler_core::{
     fold_session, read_provenance, read_resume_prefix, resume_session_from_folded_prefix,
-    CompactionTier, EulerHome, ModelTarget, PermissionDecider, PermissionReviewer, ProvenanceWriter,
-    Session, SessionConfig, SessionKind, SessionStore,
+    CompactionTier, EulerHome, ModelTarget, PermissionDecider, PermissionReviewer,
+    ProvenanceWriter, Session, SessionConfig, SessionKind, SessionStore,
 };
 use euler_event::EventKind;
 use euler_provider::anthropic::AnthropicProvider;
@@ -837,21 +837,25 @@ enum Command {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScrubArgs {
     session: String,
-    values: Vec<String>,
 }
 
 impl ScrubArgs {
     fn parse(args: &mut impl Iterator<Item = String>) -> Result<Self> {
         let Some(session) = args.next() else {
-            return Err(anyhow!("usage: euler scrub <session> <value>..."));
-        };
-        let values: Vec<String> = args.collect();
-        if values.is_empty() {
             return Err(anyhow!(
-                "euler scrub requires at least one value to remove: euler scrub <session> <value>..."
+                "usage: euler scrub <session>  (secret values are read from stdin, one per line)"
+            ));
+        };
+        // Values are NEVER accepted as arguments: argv lands in shell history
+        // and the process command line (`ps`), which is exactly where a secret
+        // must not go. Read them from stdin instead.
+        if args.next().is_some() {
+            return Err(anyhow!(
+                "euler scrub reads secret values from stdin (one per line), not arguments — \
+                 passing a secret on the command line would leak it into shell history and `ps`"
             ));
         }
-        Ok(Self { session, values })
+        Ok(Self { session })
     }
 }
 
@@ -862,20 +866,56 @@ fn run_scrub(args: ScrubArgs) -> Result<()> {
     let home = EulerHome::resolve()?;
     let store = SessionStore::new(home)?;
     let Some(record) = store.resolve_session_reference(&args.session)? else {
-        return Err(anyhow!(
-            "no session found with id or name {}",
-            args.session
-        ));
+        return Err(anyhow!("no session found with id or name {}", args.session));
     };
+    let values = read_scrub_values_from_stdin()?;
     let index_path = store.home().sessions_dir().join("index.jsonl");
     let surfaces = euler_core::scrub::ScrubSurfaces {
         workspace_root: record.root(),
         index_path: Some(index_path.as_path()),
     };
-    let report =
-        euler_core::scrub::scrub_closed_session(record.session_dir(), record.id(), surfaces, &args.values)?;
+    let report = euler_core::scrub::scrub_closed_session(
+        record.session_dir(),
+        record.id(),
+        surfaces,
+        &values,
+    )?;
     println!("{}", report.summary_line());
     Ok(())
+}
+
+/// Read the secret values to scrub from stdin (one per line) — never argv, so
+/// they cannot leak into shell history or the process command line.
+fn read_scrub_values_from_stdin() -> Result<Vec<String>> {
+    if io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "euler scrub reads secret values from stdin; pipe them in, one per line \
+             (e.g. `printf '%s\\n' \"$SECRET\" | euler scrub <session>`)"
+        ));
+    }
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let values: Vec<String> = input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if values.is_empty() {
+        return Err(anyhow!("no secret values provided on stdin"));
+    }
+    if let Some(short) = values
+        .iter()
+        .find(|value| value.len() < euler_core::scrub::MIN_SCRUB_VALUE_LEN)
+    {
+        return Err(anyhow!(
+            "scrub value is too short ({} chars); the minimum is {} to avoid mangling \
+             unrelated content",
+            short.len(),
+            euler_core::scrub::MIN_SCRUB_VALUE_LEN
+        ));
+    }
+    Ok(values)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
