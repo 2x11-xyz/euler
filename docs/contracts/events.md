@@ -262,10 +262,10 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `session.resumed`: `provider`, `model`, `events_folded`, optional
   `resumed_from_event_id`. A durable audit marker recording that the session
   lifetime was continued, against which target and from which tail event.
-  Audit metadata only — never user or model content. Emitted at the first
-  continued turn of a resumed session (an open-and-inspect resume that never
-  continues emits none). It is a LOG-LEAF: appended to the log but not the
-  in-memory bus, so it never becomes the parent of the continued turn.
+  Audit metadata only — never user or model content. Emitted with the first
+  durable activity of a resumed session (an open-and-inspect resume that never
+  mutates or continues emits none). It is a LOG-LEAF: appended to the log but
+  not the in-memory bus, so it never becomes the parent of continued activity.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,

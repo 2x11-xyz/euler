@@ -441,7 +441,7 @@ fn model_call_tail_appends_nothing() {
 }
 
 #[test]
-fn resume_marker_is_a_log_leaf_emitted_at_the_first_continued_turn() {
+fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
     // Issue #6: the durable SESSION_RESUMED marker is emitted lazily at the
     // FIRST continued turn (not at resume-open), as a LOG-LEAF — it records the
     // tail it continued from, is absent from the session's in-memory event view,
@@ -511,6 +511,47 @@ fn resume_marker_is_a_log_leaf_emitted_at_the_first_continued_turn() {
             .count(),
         1
     );
+}
+
+#[test]
+fn resume_marker_precedes_non_turn_control_activity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let seed = model_call(None);
+    let seed_id = seed.id.clone();
+    write_events(&log, &[seed]);
+
+    let mut session = resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(Vec::new())),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    session.rename_session("continued work").expect("rename");
+
+    let logged = read_resume_prefix(&log).expect("read log");
+    let marker_index = logged
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::SESSION_RESUMED)
+        .expect("resume marker");
+    let rename_index = logged
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::SESSION_RENAMED)
+        .expect("rename event");
+    assert_eq!(marker_index + 1, rename_index);
+    assert_eq!(
+        logged[marker_index].parent.as_deref(),
+        Some(seed_id.as_str())
+    );
+    assert_eq!(
+        logged[rename_index].parent.as_deref(),
+        Some(seed_id.as_str())
+    );
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::SESSION_RESUMED));
 }
 
 #[test]

@@ -262,8 +262,8 @@ pub fn resume_session_from_folded_prefix<D>(
         recovery_closure_appended = true;
     }
     // Durable resume marker (issue #6): the marker is ARMED here but NOT
-    // appended — it is emitted lazily to the LOG only (never the bus) at the
-    // FIRST continued turn. Consequences:
+    // appended — the provenance writer emits it lazily to the LOG only (never
+    // the bus) with the FIRST durable activity after resume. Consequences:
     //   * an open-and-inspect resume that never continues appends nothing, so
     //     repeated inspection is byte-identical (idempotent);
     //   * a continuation records exactly one marker per resumed lifetime;
@@ -279,6 +279,9 @@ pub fn resume_session_from_folded_prefix<D>(
         folded.events.last().map(|event| event.id.clone()),
         events_folded,
     );
+    writer
+        .arm_resume_marker(resume_marker)
+        .map_err(ResumeError::Append)?;
     let events_len = folded.events.len();
     let mut config = config;
     config.reasoning_effort = reasoning_effort;
@@ -292,7 +295,6 @@ pub fn resume_session_from_folded_prefix<D>(
         folded.context_limit_emitted,
     )
     .with_provenance(writer);
-    session.arm_resume_marker(resume_marker);
     for capability in session_allowed {
         session.set_permission_mode(capability, ApprovalMode::SessionAllow);
     }

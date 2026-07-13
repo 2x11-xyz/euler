@@ -310,11 +310,6 @@ pub struct Session<D> {
     /// Wired code-swarm extension backing the `code_swarm_review` tool; the
     /// tool is advertised to the root session's model only when this is set.
     code_swarm_extension: Option<Arc<dyn Extension>>,
-    /// A durable `session.resumed` marker armed at resume, emitted lazily to
-    /// the LOG (not the bus) at the first continued turn (issue #6). Log-leaf,
-    /// so an open-and-inspect resume that never continues appends nothing and
-    /// the marker never enters the conversation's causal chain.
-    pending_resume_marker: Option<EventEnvelope>,
 }
 
 /// Session-side adapter driving the shared [`RoundLoop`]: bundles the
@@ -581,7 +576,6 @@ impl<D> Session<D> {
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
             code_swarm_extension: None,
-            pending_resume_marker: None,
         };
         session.install_provider_secret_sink();
         session
@@ -819,26 +813,6 @@ impl<D> Session<D> {
         self.permissions.set_mode(capability, mode);
     }
 
-    /// Arm the durable resume marker to be emitted at the first continued turn
-    /// (issue #6). Set by the resume funnel; a session that never continues
-    /// never emits it, keeping open-and-inspect resumes non-destructive.
-    pub(crate) fn arm_resume_marker(&mut self, marker: EventEnvelope) {
-        self.pending_resume_marker = Some(marker);
-    }
-
-    /// Emit an armed resume marker to the LOG only (not the in-memory bus), so
-    /// it is a leaf annotation off the resume boundary: it never becomes the
-    /// parent of the first continued turn (that turn still parents off the real
-    /// tail) and never re-materializes into the session's event view.
-    fn flush_pending_resume_marker(&mut self) -> Result<(), SessionError> {
-        if let Some(marker) = self.pending_resume_marker.take() {
-            if let Some(writer) = &self.provenance {
-                writer.append(std::slice::from_ref(&marker))?;
-            }
-        }
-        Ok(())
-    }
-
     /// Who resolves uncovered `ask` permission decisions (ADR 0011).
     pub fn permission_reviewer(&self) -> PermissionReviewer {
         self.config.permission_reviewer
@@ -957,7 +931,6 @@ impl<D> Session<D> {
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
             code_swarm_extension: None,
-            pending_resume_marker: None,
         };
         session.install_provider_secret_sink();
         session
@@ -1240,9 +1213,6 @@ impl<D: PermissionDecider> Session<D> {
         if self.context_limit_emitted.as_ref() == Some(&self.active_target) {
             return Ok(Vec::new());
         }
-        // A real continuation is starting: emit the armed resume marker (if any)
-        // as the first log-leaf of this turn, before anything else.
-        self.flush_pending_resume_marker()?;
         self.auto_compact_if_triggered()?;
 
         let start = self.bus.events().len();

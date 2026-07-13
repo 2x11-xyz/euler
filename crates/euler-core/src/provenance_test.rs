@@ -1,5 +1,5 @@
 use super::*;
-use euler_event::object;
+use euler_event::{object, JsonObject};
 use std::panic::{self, AssertUnwindSafe};
 
 #[test]
@@ -62,6 +62,90 @@ fn append_filters_model_delta_but_persists_unknown_kinds() {
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind.as_str(), "future.kind");
+}
+
+#[test]
+fn pending_resume_marker_survives_a_failed_append() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    fs::create_dir(&log).expect("failure-path directory");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let marker = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_RESUMED,
+        object([("events_folded", 1.into())]),
+    );
+    let continued = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_RENAMED,
+        object([("name", "continued work".into())]),
+    );
+    writer
+        .arm_resume_marker(marker.clone())
+        .expect("arm marker");
+
+    let error = writer
+        .append(std::slice::from_ref(&continued))
+        .expect_err("directory at log path must reject append");
+    assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+
+    fs::remove_dir(&log).expect("remove failure-path directory");
+    writer
+        .append(std::slice::from_ref(&continued))
+        .expect("retry append");
+    let events = read_provenance(&log).expect("read retried append");
+    assert_eq!(events, vec![marker, continued]);
+}
+
+#[test]
+fn pending_resume_marker_covers_parented_writer_clients() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let seed = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_START,
+        JsonObject::new(),
+    );
+    let seed_id = seed.id.clone();
+    writer
+        .append(std::slice::from_ref(&seed))
+        .expect("seed append");
+    let marker = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(seed_id.clone()),
+        EventKind::SESSION_RESUMED,
+        object([("events_folded", 1.into())]),
+    );
+    writer
+        .arm_resume_marker(marker.clone())
+        .expect("arm marker");
+
+    let continued = writer
+        .append_parented(|_| {
+            vec![EventEnvelope::new(
+                "session",
+                "child-agent",
+                None,
+                EventKind::AGENT_SPAWN,
+                JsonObject::new(),
+            )]
+        })
+        .expect("parented append");
+
+    assert_eq!(continued.len(), 1);
+    assert_eq!(continued[0].parent.as_deref(), Some(seed_id.as_str()));
+    let logged = read_provenance(&log).expect("read log");
+    assert_eq!(logged[0], seed);
+    assert_eq!(logged[1], marker);
+    assert_eq!(logged[2], continued[0]);
 }
 
 #[test]
