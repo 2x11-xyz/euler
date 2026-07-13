@@ -8,6 +8,7 @@ mod chat_completions;
 mod chat_completions_provider;
 pub mod chatgpt;
 mod chatgpt_device;
+mod chatgpt_websocket;
 pub mod custom_provider;
 pub mod openai;
 pub mod openrouter;

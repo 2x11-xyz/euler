@@ -6,9 +6,7 @@ use crate::{ModelStreamEvent, ProviderError, ReasoningChunk, StopReason, ToolCal
 pub struct SseParser {
     line_buffer: Vec<u8>,
     data_lines: Vec<String>,
-    saw_data: bool,
-    terminal_event_seen: bool,
-    saw_tool_call: bool,
+    response_events: ResponseEventParser,
 }
 
 impl SseParser {
@@ -48,10 +46,8 @@ impl SseParser {
         if !self.data_lines.is_empty() {
             self.flush_event(&mut events);
         }
-        if self.saw_data && !self.terminal_event_seen {
-            events.push(Err(ProviderError::stream_truncation(
-                "ChatGPT provider stream truncated before response.completed",
-            )));
+        if let Some(event) = self.response_events.finish() {
+            events.push(event);
         }
         events
     }
@@ -79,20 +75,54 @@ impl SseParser {
         if data == "[DONE]" {
             return;
         }
-        self.saw_data = true;
-        if let Some(mut event) = parse_payload(&data) {
-            if matches!(event, Ok(ModelStreamEvent::ToolCall(_))) {
-                self.saw_tool_call = true;
-            }
-            if let Ok(ModelStreamEvent::Finished { stop_reason, .. }) = &mut event {
-                if self.saw_tool_call && *stop_reason == StopReason::Completed {
-                    *stop_reason = StopReason::ToolUse;
-                }
-            }
-            if matches!(event, Ok(ModelStreamEvent::Finished { .. }) | Err(_)) {
-                self.terminal_event_seen = true;
-            }
+        if let Some(event) = self.response_events.push_json(&data) {
             events.push(event);
+        }
+    }
+}
+
+/// Parses individual Responses API events for both SSE and WebSocket
+/// transports. Keeping the terminal/tool-call bookkeeping here prevents the
+/// two transports from drifting in their canonical event behavior.
+#[derive(Debug, Default)]
+pub(crate) struct ResponseEventParser {
+    saw_data: bool,
+    terminal_event_seen: bool,
+    saw_tool_call: bool,
+}
+
+impl ResponseEventParser {
+    pub(crate) fn push_json(
+        &mut self,
+        data: &str,
+    ) -> Option<Result<ModelStreamEvent, ProviderError>> {
+        if data == "[DONE]" {
+            return None;
+        }
+        self.saw_data = true;
+        let mut event = parse_payload(data)?;
+        if matches!(event, Ok(ModelStreamEvent::ToolCall(_))) {
+            self.saw_tool_call = true;
+        }
+        if let Ok(ModelStreamEvent::Finished { stop_reason, .. }) = &mut event {
+            if self.saw_tool_call && *stop_reason == StopReason::Completed {
+                *stop_reason = StopReason::ToolUse;
+            }
+        }
+        if matches!(event, Ok(ModelStreamEvent::Finished { .. }) | Err(_)) {
+            self.terminal_event_seen = true;
+        }
+        Some(event)
+    }
+
+    pub(crate) fn finish(&mut self) -> Option<Result<ModelStreamEvent, ProviderError>> {
+        if self.saw_data && !self.terminal_event_seen {
+            self.terminal_event_seen = true;
+            Some(Err(ProviderError::stream_truncation(
+                "ChatGPT provider stream truncated before response.completed",
+            )))
+        } else {
+            None
         }
     }
 }
@@ -119,10 +149,12 @@ fn parse_payload(data: &str) -> Option<Result<ModelStreamEvent, ProviderError>> 
             )))
         }
         "response.output_item.done" => parse_tool_call(&value).map(Ok),
-        "response.completed" => Some(Ok(ModelStreamEvent::Finished {
-            stop_reason: stop_reason(&value),
-            usage: usage(&value),
-        })),
+        "response.completed" | "response.done" | "response.incomplete" => {
+            Some(Ok(ModelStreamEvent::Finished {
+                stop_reason: stop_reason(&value),
+                usage: usage(&value),
+            }))
+        }
         "response.failed" => Some(Err(response_failed_error(&value))),
         _ => None,
     }
@@ -250,6 +282,24 @@ data: {"type":"response.completed"}
                     usage: None,
                 }),
             ]
+        );
+    }
+
+    #[test]
+    fn parses_websocket_done_alias_for_completion() {
+        let mut parser = SseParser::new();
+        let events = parser.feed(
+            br#"data: {"type":"response.done","response":{"status":"completed"}}
+
+"#,
+        );
+
+        assert_eq!(
+            collect(events),
+            vec![Ok(ModelStreamEvent::Finished {
+                stop_reason: StopReason::Completed,
+                usage: None,
+            })]
         );
     }
 

@@ -434,6 +434,7 @@ const OPENAI_MODELS: &[BuiltInModelDescriptor] = &[
 /// the OpenAI API catalog. Codex reserves 5% of each raw window for runtime
 /// headroom and compacts automatically at 90% of the raw window.
 const CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS: u64 = 272_000;
+const CHATGPT_GPT56_CONTEXT_WINDOW_TOKENS: u64 = 372_000;
 const CHATGPT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u8 = 95;
 
 const fn chatgpt_context_policy(context_window_tokens: Option<u64>) -> (Option<u8>, Option<u64>) {
@@ -458,17 +459,17 @@ const CHATGPT_MODELS: &[BuiltInModelDescriptor] = &[
     chatgpt_model(
         "gpt-5.6-luna",
         "GPT-5.6 Luna",
-        CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS,
+        CHATGPT_GPT56_CONTEXT_WINDOW_TOKENS,
     ),
     chatgpt_model(
         "gpt-5.6-sol",
         "GPT-5.6 Sol",
-        CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS,
+        CHATGPT_GPT56_CONTEXT_WINDOW_TOKENS,
     ),
     chatgpt_model(
         "gpt-5.6-terra",
         "GPT-5.6 Terra",
-        CHATGPT_STANDARD_CONTEXT_WINDOW_TOKENS,
+        CHATGPT_GPT56_CONTEXT_WINDOW_TOKENS,
     ),
 ];
 
