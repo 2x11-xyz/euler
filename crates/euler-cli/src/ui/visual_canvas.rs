@@ -299,7 +299,7 @@ pub fn derive_frame(snapshot: &VisualCanvasSnapshot) -> VisualCanvasFrame {
 }
 
 fn is_committable_prefix_role(role: VisualBlockRole) -> bool {
-    matches!(role, VisualBlockRole::History | VisualBlockRole::Transcript)
+    role == VisualBlockRole::History
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -327,7 +327,6 @@ impl VisualBlock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VisualBlockRole {
     History,
-    Transcript,
     LiveTranscript,
     PermissionAsk,
     Activity,
@@ -634,10 +633,7 @@ mod tests {
     #[test]
     fn frame_stacks_blocks_in_stream_order() {
         let snapshot = snapshot_with_blocks(vec![
-            VisualBlock::new(
-                VisualBlockRole::Transcript,
-                vec![CanvasLine::plain("final")],
-            ),
+            VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("final")]),
             VisualBlock::new(VisualBlockRole::Activity, vec![CanvasLine::plain("active")]),
         ]);
 
@@ -652,10 +648,13 @@ mod tests {
     }
 
     #[test]
-    fn history_and_live_transcript_prefix_mark_rows_safe_for_native_scrollback_commit() {
+    fn live_transcript_rows_stay_after_native_scrollback_commit_boundary() {
         let snapshot = snapshot_with_blocks(vec![
             VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
-            VisualBlock::new(VisualBlockRole::Transcript, vec![CanvasLine::plain("live")]),
+            VisualBlock::new(
+                VisualBlockRole::LiveTranscript,
+                vec![CanvasLine::plain("live")],
+            ),
         ]);
 
         let frame = derive_frame(&snapshot);
@@ -664,7 +663,7 @@ mod tests {
             line_texts(&frame.active_frame_lines),
             vec!["history", "live"]
         );
-        assert_eq!(frame.committable_rows, 2);
+        assert_eq!(frame.committable_rows, 1);
         assert_eq!(frame.history_rows, 1);
     }
 
@@ -673,7 +672,10 @@ mod tests {
         let snapshot = snapshot_with_blocks(vec![
             VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(VisualBlockRole::Activity, vec![CanvasLine::plain("tool")]),
-            VisualBlock::new(VisualBlockRole::Transcript, vec![CanvasLine::plain("live")]),
+            VisualBlock::new(
+                VisualBlockRole::LiveTranscript,
+                vec![CanvasLine::plain("live")],
+            ),
         ]);
 
         let frame = derive_frame(&snapshot);
@@ -693,7 +695,7 @@ mod tests {
         let snapshot = snapshot_with_blocks(vec![
             VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(
-                VisualBlockRole::Transcript,
+                VisualBlockRole::LiveTranscript,
                 vec![CanvasLine::plain("stable")],
             ),
             VisualBlock::new(
@@ -708,7 +710,7 @@ mod tests {
             line_texts(&frame.active_frame_lines),
             vec!["history", "stable", "mutable"]
         );
-        assert_eq!(frame.committable_rows, 2);
+        assert_eq!(frame.committable_rows, 1);
         assert_eq!(frame.history_rows, 1);
     }
 
@@ -717,7 +719,7 @@ mod tests {
         let snapshot = snapshot_with_blocks(vec![
             VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(
-                VisualBlockRole::Transcript,
+                VisualBlockRole::LiveTranscript,
                 vec![CanvasLine::plain("stream")],
             ),
             VisualBlock::new(
@@ -746,7 +748,7 @@ mod tests {
         let snapshot = snapshot_with_blocks(vec![
             VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(
-                VisualBlockRole::Transcript,
+                VisualBlockRole::LiveTranscript,
                 vec![CanvasLine::plain("stream")],
             ),
             VisualBlock::new(VisualBlockRole::Notice, vec![CanvasLine::plain("notice")]),
@@ -774,7 +776,7 @@ mod tests {
                 vec![CanvasLine::plain("old tool")],
             ),
             VisualBlock::new(
-                VisualBlockRole::Transcript,
+                VisualBlockRole::LiveTranscript,
                 vec![CanvasLine::plain("stream")],
             ),
             VisualBlock::new(VisualBlockRole::Composer, vec![CanvasLine::plain("draft")]),

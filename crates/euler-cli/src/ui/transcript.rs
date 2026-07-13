@@ -395,9 +395,6 @@ impl TranscriptState {
     pub fn push_event(&mut self, event: EventEnvelope) {
         match event.kind.as_str() {
             EventKind::MODEL_DELTA => self.push_delta(&event),
-            EventKind::MODEL_RESULT if model_result_has_tool_calls(&event) => {
-                self.preserve_tool_call_live_tail(&event);
-            }
             EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::ERROR => {
                 self.clear_transient_live_tail();
             }
@@ -510,19 +507,6 @@ impl TranscriptState {
         self.reasoning_body.clear();
     }
 
-    fn preserve_tool_call_live_tail(&mut self, event: &EventEnvelope) {
-        self.reasoning_live = None;
-        self.reasoning_body.clear();
-        if let Some(content) =
-            payload_string(event, "content").filter(|content| !content.is_empty())
-        {
-            self.live_tail = content;
-            self.stream.clear();
-        } else if let Some(source) = self.stream.take_full_source() {
-            self.live_tail = source;
-        }
-    }
-
     fn push_delta(&mut self, event: &EventEnvelope) {
         match event
             .payload
@@ -574,8 +558,8 @@ impl TranscriptState {
     }
 
     /// True once answer text has started streaming in the current round
-    /// (cleared by `clear_transient_live_tail`/`preserve_tool_call_live_tail`
-    /// at the next turn boundary). Used to stop a late reasoning delta from
+    /// (cleared by `clear_transient_live_tail` at the next round boundary).
+    /// Used to stop a late reasoning delta from
     /// re-opening the transient thinking line over already-visible text.
     fn text_streamed_this_round(&self) -> bool {
         self.stream.mutable_source().is_some()
@@ -1124,20 +1108,12 @@ fn push_tui_entry(
 }
 
 fn model_result_fallback_item(event: &EventEnvelope) -> Option<TranscriptItem> {
-    if event.kind.as_str() != EventKind::MODEL_RESULT || model_result_has_tool_calls(event) {
+    if event.kind.as_str() != EventKind::MODEL_RESULT {
         return None;
     }
     payload_string(event, "content")
         .filter(|content| !content.is_empty())
         .map(TranscriptItem::AssistantMessage)
-}
-
-fn model_result_has_tool_calls(event: &EventEnvelope) -> bool {
-    event
-        .payload
-        .get("tool_calls")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|tool_calls| !tool_calls.is_empty())
 }
 
 fn model_result_has_matching_assistant_message(

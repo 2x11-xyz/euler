@@ -339,7 +339,7 @@ fn transcript_state_live_reasoning_body_is_bounded_but_finalize_keeps_full_text(
 }
 
 #[test]
-fn transcript_state_preserves_live_tail_across_tool_call_model_result() {
+fn transcript_state_commits_tool_round_narration_from_model_result() {
     let mut state = TranscriptState::default();
     state.push_event(event(
         EventKind::MODEL_DELTA,
@@ -366,12 +366,7 @@ fn transcript_state_preserves_live_tail_across_tool_call_model_result() {
         ]),
     ));
 
-    assert_eq!(
-        state.live_items(),
-        vec![TranscriptItem::AssistantMessage(
-            "I will inspect it.\n".to_owned()
-        )]
-    );
+    assert!(state.live_items().is_empty());
     assert_eq!(
         state.items(),
         vec![TranscriptItem::AssistantMessage(
@@ -381,7 +376,7 @@ fn transcript_state_preserves_live_tail_across_tool_call_model_result() {
 }
 
 #[test]
-fn transcript_state_preserves_uncommitted_live_tail_across_tool_call_model_result() {
+fn transcript_state_commits_unterminated_tool_round_narration_from_model_result() {
     let mut state = TranscriptState::default();
     state.push_event(event(
         EventKind::MODEL_DELTA,
@@ -408,18 +403,95 @@ fn transcript_state_preserves_uncommitted_live_tail_across_tool_call_model_resul
         ]),
     ));
 
-    assert_eq!(
-        state.live_items(),
-        vec![TranscriptItem::AssistantMessage(
-            "I will inspect it.".to_owned()
-        )]
-    );
+    assert!(state.live_items().is_empty());
     assert_eq!(
         state.items(),
         vec![TranscriptItem::AssistantMessage(
             "I will inspect it.".to_owned()
         )]
     );
+}
+
+#[test]
+fn transcript_state_commits_adversarial_tool_round_and_final_answer_once() {
+    let first =
+        "## Check αβ\n\n| API | Purpose |\n|---|---|\n| `invoke_http_error` | 😀 faithful |";
+    let mut state = TranscriptState::default();
+    for chunk in [
+        "## Ch",
+        "eck α",
+        "β\n\n| API | Pur",
+        "pose |\n|---|---|\n| `invoke_",
+        "http_error` | 😀 faithful |",
+    ] {
+        state.push_event(event(
+            EventKind::MODEL_DELTA,
+            object([("kind", "text".into()), ("delta", chunk.into())]),
+        ));
+    }
+    state.push_event(event(
+        EventKind::MODEL_RESULT,
+        object([
+            ("content", first.into()),
+            (
+                "tool_calls",
+                serde_json::json!([{
+                    "id": "call-read",
+                    "name": "read_file",
+                    "input": {"path": "Cargo.toml"}
+                }]),
+            ),
+        ]),
+    ));
+    assert!(state.live_items().is_empty());
+
+    state.push_event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("input", serde_json::json!({"path": "Cargo.toml"})),
+        ]),
+    ));
+    state.push_event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+            ("output", "workspace manifest".into()),
+        ]),
+    ));
+
+    let final_answer = "Done — `eetionsStream` stays unchanged.";
+    for chunk in ["Done — `eet", "ionsStream` stays ", "unchanged."] {
+        state.push_event(event(
+            EventKind::MODEL_DELTA,
+            object([("kind", "text".into()), ("delta", chunk.into())]),
+        ));
+    }
+    state.push_event(event(
+        EventKind::MODEL_RESULT,
+        object([
+            ("content", final_answer.into()),
+            ("tool_calls", serde_json::json!([])),
+        ]),
+    ));
+    state.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", final_answer.into())]),
+    ));
+
+    let messages = state
+        .items()
+        .into_iter()
+        .filter_map(|item| match item {
+            TranscriptItem::AssistantMessage(content) => Some(content),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(messages, vec![first.to_owned(), final_answer.to_owned()]);
+    assert!(state.live_items().is_empty());
 }
 
 #[test]

@@ -1267,7 +1267,7 @@ fn active_turn_frame_shows_working_state_and_next_draft() {
 }
 
 #[test]
-fn active_turn_live_transcript_prefix_is_committable() {
+fn active_turn_live_transcript_prefix_stays_after_commit_boundary() {
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -1293,7 +1293,12 @@ fn active_turn_live_transcript_prefix_is_committable() {
 
     assert!(text.contains("line one"), "frame: {text:?}");
     assert!(text.contains("⠋ working"), "frame: {text:?}");
-    assert!(frame.committable_rows > 0);
+    let first_live = frame
+        .active_frame_lines
+        .iter()
+        .position(|line| line.plain_text().contains("line one"))
+        .expect("live line");
+    assert!(first_live >= frame.committable_rows);
     assert!(frame.committable_rows < frame.active_frame_lines.len());
 }
 
@@ -1329,7 +1334,7 @@ fn active_turn_mutable_live_tail_is_not_committable() {
         .position(|line| line.contains("mutable tail"))
         .expect("mutable line should render");
 
-    assert!(stable < frame.committable_rows, "frame: {text:?}");
+    assert!(stable >= frame.committable_rows, "frame: {text:?}");
     assert!(
         mutable >= frame.committable_rows,
         "mutable row crossed commit boundary: {text:?}"
@@ -1368,7 +1373,7 @@ fn active_turn_open_code_fence_is_visible_but_not_committable() {
         .position(|line| line.contains("let x = 1;"))
         .expect("open fence code should render as live mutable text");
 
-    assert!(stable < frame.committable_rows, "frame: {text:?}");
+    assert!(stable >= frame.committable_rows, "frame: {text:?}");
     assert!(
         code >= frame.committable_rows,
         "open code fence crossed commit boundary: {text:?}"

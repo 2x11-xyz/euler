@@ -48,12 +48,6 @@ impl MarkdownStreamCollector {
         self.committed_len = 0;
     }
 
-    pub(crate) fn take_full_source(&mut self) -> Option<String> {
-        let source = (!self.buffer.is_empty()).then(|| self.buffer.clone());
-        self.clear();
-        source
-    }
-
     fn visible_end(&self) -> usize {
         let Some(completed_end) = self.buffer.rfind('\n').map(|idx| idx + 1) else {
             return if is_safe_partial_preview("", &self.buffer) {
