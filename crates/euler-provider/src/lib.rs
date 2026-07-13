@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod catalog;
 mod chat_completions;
+mod chat_completions_provider;
 pub mod chatgpt;
 mod chatgpt_device;
 pub mod custom_provider;
@@ -22,6 +23,8 @@ mod custom_provider_test;
 mod provider_config_test;
 #[cfg(test)]
 mod scripted_provider_test;
+#[cfg(test)]
+mod test_support;
 
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};

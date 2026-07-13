@@ -90,36 +90,29 @@ impl ModelProvider for CustomOpenAiProvider {
         let resolved = self.resolve_headers()?;
         let options = self.chat_completions_options(&request.model);
         let body = crate::chat_completions::request_body_with_options(&request, &options);
-        let agent = ureq::builder().redirects(0).build();
-        let mut call = agent
-            .post(&self.endpoint)
-            .set("Content-Type", "application/json")
-            .set("Accept", "text/event-stream");
-        for (name, value) in &resolved.headers {
-            call = call.set(name, value.expose());
-        }
-        let response = call.send_json(body);
-
-        let response = match response {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, _response)) => {
-                return Err(classify_http_error(&self.label, status));
-            }
-            Err(error) => {
-                return Err(ProviderError::transport(scrub_secrets(
+        // Shares the ureq request + error skeleton with the built-in providers
+        // via `send_chat_completions`; custom keeps its own resolved-header auth,
+        // multi-secret scrub, and label-based error classification.
+        let headers = resolved
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.expose()));
+        use crate::chat_completions_provider::SendFailure;
+        crate::chat_completions_provider::send_chat_completions(
+            &self.endpoint,
+            headers,
+            body,
+            self.label.clone(),
+            options,
+            |failure| match failure {
+                // custom does not read the body — the response is dropped unread.
+                SendFailure::Rejection { status, .. } => classify_http_error(&self.label, status),
+                SendFailure::Transport(error) => ProviderError::transport(scrub_secrets(
                     format!("{} request failed: {error}", self.label),
                     &resolved.secrets,
-                )));
-            }
-        };
-
-        Ok(Box::new(
-            crate::chat_completions::ChatCompletionsStream::new_with_options(
-                self.label.clone(),
-                response.into_reader(),
-                options,
-            ),
-        ))
+                )),
+            },
+        )
     }
 }
 

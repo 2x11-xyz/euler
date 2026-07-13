@@ -731,9 +731,8 @@ fn api_key_debug_redacts_value() {
         Some(std::ffi::OsString::from("or-secret")),
     )
     .expect("api key");
-    let key = OpenRouterApiKey::new(value);
 
-    let formatted = format!("{key:?}");
+    let formatted = format!("{value:?}");
 
     assert!(formatted.contains("[redacted]"));
     assert!(!formatted.contains("or-secret"));

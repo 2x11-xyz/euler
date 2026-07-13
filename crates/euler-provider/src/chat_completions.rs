@@ -6,10 +6,6 @@ use crate::{
     StopReason, ToolCall, ToolDefinition, Usage,
 };
 
-pub(crate) fn request_body(request: &ModelRequest) -> Value {
-    request_body_with_options(request, &ChatCompletionsOptions::default())
-}
-
 pub(crate) fn request_body_with_options(
     request: &ModelRequest,
     options: &ChatCompletionsOptions,
@@ -348,13 +344,6 @@ pub(crate) struct ChatCompletionsStream {
 }
 
 impl ChatCompletionsStream {
-    pub(crate) fn new(
-        provider_label: impl Into<String>,
-        reader: impl Read + Send + 'static,
-    ) -> Self {
-        Self::new_with_options(provider_label, reader, ChatCompletionsOptions::default())
-    }
-
     pub(crate) fn new_with_options(
         provider_label: impl Into<String>,
         reader: impl Read + Send + 'static,
