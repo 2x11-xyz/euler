@@ -343,13 +343,13 @@ fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
     }
     wire_code_swarm(&mut session);
     SubagentDecider::apply_tier(tier, &mut session);
-    run_turn_streaming(&mut session, &prompt)?;
+    let turn_result = run_turn_streaming(&mut session, &prompt);
     if let Some(refresh) = refresh.as_ref() {
         if let Err(error) = refresh.refresh() {
             eprintln!("warning: failed to refresh session metadata: {error}");
         }
     }
-    Ok(())
+    turn_result
 }
 
 fn run_exec_resume(
@@ -364,13 +364,13 @@ fn run_exec_resume(
             apply_exec_config(config, overrides);
         })?;
     SubagentDecider::apply_tier(auto_approve, &mut outcome.session);
-    run_turn_streaming(&mut outcome.session, &prompt)?;
+    let turn_result = run_turn_streaming(&mut outcome.session, &prompt);
     if let Some(refresh) = outcome.refresh.as_ref() {
         if let Err(error) = refresh.refresh() {
             eprintln!("warning: failed to refresh session metadata: {error}");
         }
     }
-    Ok(())
+    turn_result
 }
 
 #[derive(Clone, Copy)]
