@@ -29,6 +29,25 @@ impl BottomSurface {
         item.current = !item.current;
         Some(SurfaceEvent::None)
     }
+
+    /// Space toggles one of the two `/compaction` settings. `compact now` is
+    /// an action row and is intentionally not toggleable.
+    pub fn compaction_toggle(&mut self) -> Option<SurfaceEvent> {
+        let BottomOwner::Picker(picker) = &mut self.owner else {
+            return None;
+        };
+        if picker.kind != PickerKind::Compaction {
+            return None;
+        }
+        let index = picker.selected_item_index()?;
+        if index == 0 {
+            return Some(SurfaceEvent::Message(
+                "select automatic compaction or tool stubs to toggle it".to_owned(),
+            ));
+        }
+        picker.items[index].current = !picker.items[index].current;
+        Some(SurfaceEvent::None)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +76,7 @@ pub(super) enum PickerKind {
     CodeSwarmModels,
     CausalDagActions,
     CausalDagFormats,
+    Compaction,
 }
 
 impl PickerKind {
@@ -171,6 +191,9 @@ impl ReplacementPicker {
         }
         if self.kind == PickerKind::CodeSwarmModels {
             return self.render_code_swarm_lines(width);
+        }
+        if self.kind == PickerKind::Compaction {
+            return self.render_compaction_lines(width);
         }
         if matches!(
             self.kind,
@@ -297,6 +320,49 @@ impl ReplacementPicker {
         );
         lines.push(truncate_display(
             " space toggle  a add  x remove  Enter details  Esc close",
+            usize::from(width),
+        ));
+        lines
+    }
+
+    fn render_compaction_lines(&self, width: u16) -> Vec<String> {
+        let automatic = self.items.get(1).is_some_and(|item| item.current);
+        let stubs = self.items.get(2).is_some_and(|item| item.current);
+        let mut lines = vec![truncate_display(
+            &format!(
+                "COMPACTION · automatic {} · stubs {}  {}",
+                if automatic { "on" } else { "off" },
+                if stubs { "on" } else { "off" },
+                self.position_indicator()
+            ),
+            usize::from(width),
+        )];
+        for (offset, item_index) in self.visible_item_indices().iter().enumerate() {
+            let selected = self.scroll_offset + offset == self.selected;
+            let item = &self.items[*item_index];
+            let marker = if selected { "›" } else { " " };
+            let checkbox = if *item_index == 0 {
+                "   "
+            } else if item.current {
+                "[✓]"
+            } else {
+                "[ ]"
+            };
+            lines.push(truncate_display(
+                &format!("{marker} {checkbox} {}", item.label),
+                usize::from(width),
+            ));
+            if selected {
+                if let Some(detail) = &item.detail {
+                    lines.push(truncate_display(
+                        &format!("    {detail}"),
+                        usize::from(width),
+                    ));
+                }
+            }
+        }
+        lines.push(truncate_display(
+            " ↑↓ move · ⏎ select/apply · space toggle · esc close",
             usize::from(width),
         ));
         lines
@@ -505,6 +571,8 @@ impl ReplacementPicker {
             PickerKind::CausalDagActions | PickerKind::CausalDagFormats
         ) {
             4 + self.items.len()
+        } else if self.kind == PickerKind::Compaction {
+            2 + visible + usize::from(self.selected_detail().is_some())
         } else if self.kind == PickerKind::Model {
             5 + visible
                 + usize::from(filtered_count == 0)
@@ -671,7 +739,50 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             format!("CAUSAL DAG › EXPORT · {} nodes", stats.node_count),
             causal_dag_format_items(),
         ),
+        PickerSpec::Compaction(settings) => (
+            PickerKind::Compaction,
+            "COMPACTION".to_owned(),
+            compaction_items(settings),
+        ),
     }
+}
+
+fn compaction_items(settings: CompactionSettings) -> Vec<PickerItem> {
+    vec![
+        PickerItem {
+            label: "compact now".to_owned(),
+            detail: Some("run the configured pipeline before the next turn".to_owned()),
+            status: None,
+            group: None,
+            provider_tag: None,
+            current: false,
+            action: CommandAction::CompactSession,
+        },
+        PickerItem {
+            label: "automatic compaction".to_owned(),
+            detail: Some("compact as the active model approaches its context limit".to_owned()),
+            status: None,
+            group: None,
+            provider_tag: None,
+            current: settings.automatic,
+            action: CommandAction::SetCompactionPolicy {
+                automatic: settings.automatic,
+                stubs: settings.stubs,
+            },
+        },
+        PickerItem {
+            label: "tool stubs".to_owned(),
+            detail: Some("demote bulky outputs with exact recovery handles".to_owned()),
+            status: None,
+            group: None,
+            provider_tag: None,
+            current: settings.stubs,
+            action: CommandAction::SetCompactionPolicy {
+                automatic: settings.automatic,
+                stubs: settings.stubs,
+            },
+        },
+    ]
 }
 
 /// Checklist rows for the `/code-swarm` picker. `current` is the checked

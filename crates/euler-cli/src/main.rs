@@ -409,7 +409,9 @@ fn apply_exec_config(config: &mut SessionConfig, overrides: ExecConfigOverrides)
         config.max_tool_rounds = overrides.max_tool_rounds;
     }
     if let Some(tier) = overrides.auto_compaction {
-        config.auto_compaction.tier = tier;
+        config.auto_compaction = config
+            .auto_compaction
+            .with_settings(tier != CompactionTier::Off, tier == CompactionTier::Stubs);
     }
     if let Some(budget_bytes) = overrides.compaction_budget_bytes {
         config.auto_compaction.budget_bytes = budget_bytes;

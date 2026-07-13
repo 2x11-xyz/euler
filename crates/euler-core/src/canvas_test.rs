@@ -3,6 +3,7 @@ use euler_event::object;
 
 fn stubs_policy(budget_bytes: usize) -> AutoCompactionPolicy {
     AutoCompactionPolicy {
+        automatic: true,
         tier: CompactionTier::Stubs,
         budget_bytes,
     }
@@ -10,9 +11,19 @@ fn stubs_policy(budget_bytes: usize) -> AutoCompactionPolicy {
 
 fn off_policy(budget_bytes: usize) -> AutoCompactionPolicy {
     AutoCompactionPolicy {
+        automatic: false,
         tier: CompactionTier::Off,
         budget_bytes,
     }
+}
+
+#[test]
+fn default_policy_enables_automatic_compaction_and_tool_stubs() {
+    let policy = AutoCompactionPolicy::default();
+
+    assert!(policy.automatic);
+    assert!(policy.stubs_enabled());
+    assert!(policy.with_settings(false, true).stubs_enabled());
 }
 
 fn demoted_outputs(canvas: &[CanvasItem]) -> Vec<&str> {

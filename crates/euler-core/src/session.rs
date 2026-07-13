@@ -2,7 +2,7 @@
 //! Justification for >1000 lines: session.rs owns the main turn lifecycle while focused subsystems are extracted.
 use crate::canvas::{
     assemble_canvas, assemble_canvas_with_compaction, canvas_bytes, retention_stats,
-    AutoCompactionPolicy, CompactionTier,
+    AutoCompactionPolicy,
 };
 use crate::canvas::{render_context_slot, CanvasItem, CanvasRole};
 use crate::checkpoints::{self, list_from_events, WorkspaceCheckpointRef};
@@ -565,6 +565,8 @@ impl<D> Session<D> {
                 (
                     "auto_compaction",
                     json!({
+                        "automatic": config.auto_compaction.automatic,
+                        "stubs": config.auto_compaction.stubs_enabled(),
                         "tier": config.auto_compaction.tier.as_str(),
                         "budget_bytes": config.auto_compaction.budget_bytes,
                     }),
@@ -896,6 +898,31 @@ impl<D> Session<D> {
         self.config.auto_compaction
     }
 
+    /// Change the live compaction controls and record the change in the
+    /// session ledger. The budget remains a launch/configuration concern;
+    /// the picker owns only the two behavior switches.
+    pub fn set_auto_compaction_policy(
+        &mut self,
+        automatic: bool,
+        stubs: bool,
+    ) -> Result<bool, SessionError> {
+        let current = self.config.auto_compaction;
+        let next = current.with_settings(automatic, stubs);
+        if next == current {
+            return Ok(false);
+        }
+        self.emit_control_event_required(
+            EventKind::CANVAS_POLICY_CHANGED,
+            object([
+                ("automatic", next.automatic.into()),
+                ("stubs", next.stubs_enabled().into()),
+                ("budget_bytes", next.budget_bytes.into()),
+            ]),
+        )?;
+        self.config.auto_compaction = next;
+        Ok(true)
+    }
+
     pub fn context_limit_tokens(&self) -> Option<u64> {
         self.config.context_limit.map(|limit| limit.limit_tokens())
     }
@@ -971,6 +998,17 @@ impl<D> Session<D> {
 }
 
 impl<D: PermissionDecider> Session<D> {
+    /// Run the configured compaction pipeline immediately.
+    ///
+    /// Manual compaction is explicit user action, so it does not require a
+    /// provider usage snapshot or a configured context window. It still uses
+    /// the same recoverable-stubs-first path as automatic compaction and only
+    /// falls back to the structured projection when stubs cannot finish the
+    /// job.
+    pub fn compact_now(&mut self) -> bool {
+        self.compact_for_threshold(usize::MAX)
+    }
+
     pub fn spawn_agent(
         &mut self,
         task: AgentTask,
@@ -1462,6 +1500,9 @@ impl<D: PermissionDecider> Session<D> {
     }
 
     fn auto_compact_if_triggered(&mut self) -> Result<bool, SessionError> {
+        if !self.config.auto_compaction.automatic {
+            return Ok(false);
+        }
         // Re-entrancy guard: skip if last non-delta event is already a swap
         if self
             .bus
@@ -1504,10 +1545,24 @@ impl<D: PermissionDecider> Session<D> {
     fn compact_for_threshold(&mut self, threshold: usize) -> bool {
         let candidates =
             select_layer1_candidates(self.bus.events(), self.config.compaction_keep_recent, 4);
-        let policy = self.effective_stub_policy();
-        let compacted = assemble_canvas_with_compaction(self.bus.events(), &policy, &candidates);
-        if !candidates.is_empty() && estimated_tokens(&compacted) <= threshold {
-            return self.emit_layer1_swap(&candidates);
+        if self.config.auto_compaction.stubs_enabled() {
+            let policy = self.effective_stub_policy();
+            let compacted =
+                assemble_canvas_with_compaction(self.bus.events(), &policy, &candidates);
+            let compacted_ids = compacted
+                .iter()
+                .filter_map(|item| match item {
+                    CanvasItem::ToolOutput {
+                        event_id,
+                        compacted: true,
+                        ..
+                    } => Some(event_id.clone()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if !compacted_ids.is_empty() && estimated_tokens(&compacted) <= threshold {
+                return self.emit_layer1_swap(&compacted_ids);
+            }
         }
 
         let projection = heuristic_projection(self.bus.events());
@@ -1766,14 +1821,14 @@ impl<D: PermissionDecider> Session<D> {
     }
 }
 
-/// Off-tier honest stop (ADR D4): when auto-compaction is disabled and the
-/// assembled canvas exceeds the byte budget, the round boundary fails with
-/// a policy-naming error instead of silently truncating or demoting.
+/// Automatic-off honest stop (ADR D4): when automatic compaction is disabled
+/// and the assembled canvas exceeds the byte budget, the round boundary fails
+/// with a policy-naming error instead of silently truncating or demoting.
 fn context_budget_exhausted(
     policy: AutoCompactionPolicy,
     canvas: &[CanvasItem],
 ) -> Option<SessionError> {
-    if policy.tier != CompactionTier::Off {
+    if policy.automatic {
         return None;
     }
     let canvas_bytes = canvas_bytes(canvas);
@@ -1814,6 +1869,8 @@ fn canvas_snapshot_payload(
         ("retained_items", stats.retained_items.into()),
         ("retained_bytes", stats.retained_bytes.into()),
         ("demoted_items", stats.demoted_items.into()),
+        ("automatic", policy.automatic.into()),
+        ("stubs", policy.stubs_enabled().into()),
         ("tier", policy.tier.as_str().into()),
         ("budget_bytes", policy.budget_bytes.into()),
         // Stubs-tier demotion is best-effort: facts are indestructible, so a

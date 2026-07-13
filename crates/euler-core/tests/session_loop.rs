@@ -48,6 +48,8 @@ fn session_new_records_session_start_first() {
     assert_eq!(start.parent, None);
     assert_eq!(payload_str(start, "provider"), Some("fixture"));
     assert_eq!(payload_str(start, "model"), Some("echo"));
+    assert_eq!(start.payload["auto_compaction"]["automatic"], json!(true));
+    assert_eq!(start.payload["auto_compaction"]["stubs"], json!(true));
     let expected_root = temp
         .path()
         .canonicalize()
@@ -55,6 +57,34 @@ fn session_new_records_session_start_first() {
         .to_string_lossy()
         .to_string();
     assert_eq!(payload_str(start, "root"), Some(expected_root.as_str()));
+}
+
+#[test]
+fn compaction_policy_changes_are_ledgered_and_replayed_by_session_state() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![]),
+        ScriptedDecider::new(vec![]),
+    );
+    let mut session = session;
+
+    assert_eq!(
+        session.auto_compaction_policy(),
+        AutoCompactionPolicy::default()
+    );
+    assert!(session
+        .set_auto_compaction_policy(false, true)
+        .expect("policy change"));
+    assert!(!session.auto_compaction_policy().automatic);
+    assert!(session.auto_compaction_policy().stubs_enabled());
+
+    let change = find_kind(session.events(), EventKind::CANVAS_POLICY_CHANGED);
+    assert_eq!(change.payload["automatic"], json!(false));
+    assert_eq!(change.payload["stubs"], json!(true));
+    assert!(!session
+        .set_auto_compaction_policy(false, true)
+        .expect("unchanged policy"));
 }
 
 #[test]
@@ -556,6 +586,7 @@ fn off_tier_context_budget_exhaustion_fails_honestly_at_round_boundary() {
     ]);
     let mut config = SessionConfig::new(temp.path());
     config.auto_compaction = AutoCompactionPolicy {
+        automatic: false,
         tier: CompactionTier::Off,
         budget_bytes: 2000,
     };
@@ -591,6 +622,7 @@ fn stubs_tier_demotes_in_prompt_and_records_retention_telemetry() {
     );
     let mut config = SessionConfig::new(temp.path());
     config.auto_compaction = AutoCompactionPolicy {
+        automatic: true,
         tier: CompactionTier::Stubs,
         budget_bytes: 2000,
     };
@@ -653,6 +685,7 @@ fn stubs_tier_reports_over_budget_honestly_when_facts_exceed_budget() {
     );
     let mut config = SessionConfig::new(temp.path());
     config.auto_compaction = AutoCompactionPolicy {
+        automatic: true,
         tier: CompactionTier::Stubs,
         budget_bytes: 1,
     };

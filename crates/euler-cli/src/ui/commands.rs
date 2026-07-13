@@ -31,6 +31,23 @@ pub struct CommandContext {
     pub code_swarm_models: Vec<String>,
     /// Current causal-DAG counts for its extension-owned picker surface.
     pub causal_dag_stats: Option<CausalDagStats>,
+    /// Current session-local compaction controls for `/compaction`.
+    pub compaction: CompactionSettings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactionSettings {
+    pub automatic: bool,
+    pub stubs: bool,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            automatic: true,
+            stubs: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -379,7 +396,10 @@ pub enum CommandAction {
         name: String,
     },
     CompactSession,
-    ShowCompaction,
+    SetCompactionPolicy {
+        automatic: bool,
+        stubs: bool,
+    },
     ExportSession {
         path: Option<String>,
     },
@@ -502,6 +522,7 @@ pub enum PickerSpec {
     },
     CausalDagActions(CausalDagStats),
     CausalDagFormats(CausalDagStats),
+    Compaction(CompactionSettings),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -553,7 +574,7 @@ const COMMAND_TABLE: &[CommandSpec] = &[
     },
     CommandSpec {
         token: "/compaction",
-        summary: "show canvas retention status",
+        summary: "configure automatic compaction and stubs",
         args: "",
     },
     CommandSpec {
@@ -846,7 +867,7 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/effort" => effort_effect(parsed.arg, context),
         "/theme" => theme_effect(parsed.arg, context),
         "/compact" => CommandEffect::Action(CommandAction::CompactSession),
-        "/compaction" => CommandEffect::Action(CommandAction::ShowCompaction),
+        "/compaction" => CommandEffect::OpenPicker(PickerSpec::Compaction(context.compaction)),
         "/export" => CommandEffect::Action(CommandAction::ExportSession {
             path: parsed.arg.map(str::to_owned),
         }),
@@ -1341,6 +1362,20 @@ mod tests {
         assert_eq!(
             dispatch_command("/compact", &context),
             CommandEffect::Action(CommandAction::CompactSession)
+        );
+        let compaction_context = CommandContext {
+            compaction: CompactionSettings {
+                automatic: true,
+                stubs: true,
+            },
+            ..CommandContext::default()
+        };
+        assert_eq!(
+            dispatch_command("/compaction", &compaction_context),
+            CommandEffect::OpenPicker(PickerSpec::Compaction(CompactionSettings {
+                automatic: true,
+                stubs: true,
+            }))
         );
         assert_eq!(
             dispatch_command("/export /tmp/euler.json", &context),
