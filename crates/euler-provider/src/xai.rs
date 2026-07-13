@@ -41,7 +41,9 @@ impl XaiProvider {
         endpoint: impl Into<String>,
         api_key: impl ApiKeyAuth + 'static,
     ) -> Self {
-        Self(ChatCompletionsProvider::with_endpoint(&SPEC, endpoint, api_key))
+        Self(ChatCompletionsProvider::with_endpoint(
+            &SPEC, endpoint, api_key,
+        ))
     }
 }
 

@@ -103,7 +103,16 @@ impl ModelProvider for ChatCompletionsProvider {
             spec.display,
             options,
             |failure| match failure {
-                SendFailure::Rejection { status, body } => classify_rejection(spec, status, &body),
+                SendFailure::Rejection { status, response } => {
+                    // Only drain (a bounded slice of) the body when the spec
+                    // actually parses it for a detail; otherwise skip the read.
+                    let body = if spec.extract_rejection_detail {
+                        read_error_body(response)
+                    } else {
+                        String::new()
+                    };
+                    classify_rejection(spec, status, &body)
+                }
                 SendFailure::Transport(error) => ProviderError::transport(scrub_secret(
                     format!("{} provider request failed: {error}", spec.display),
                     &api_key,
@@ -116,7 +125,13 @@ impl ModelProvider for ChatCompletionsProvider {
 /// How a [`send_chat_completions`] call failed, handed to the caller's error
 /// mapper: an HTTP status with its response body, or a transport-level error.
 pub(crate) enum SendFailure {
-    Rejection { status: u16, body: String },
+    /// HTTP 4xx/5xx. The response is handed over UNREAD; a classifier that
+    /// needs a body detail calls [`read_error_body`], the rest drop it.
+    /// Boxed: `ureq::Response` is large.
+    Rejection {
+        status: u16,
+        response: Box<ureq::Response>,
+    },
     // Boxed: `ureq::Error` is large relative to the rejection variant.
     Transport(Box<ureq::Error>),
 }
@@ -153,13 +168,31 @@ where
             response.into_reader(),
             options,
         ))),
+        // Hand the raw response to the caller UNREAD: only providers whose
+        // classifier extracts a body detail should pay to drain it, and even
+        // then only a bounded prefix. A caller that ignores the response drops
+        // it here, so the connection closes without reading a slow/huge body.
         Err(ureq::Error::Status(status, response)) => Err(on_error(SendFailure::Rejection {
             status,
-            body: response.into_string().unwrap_or_default(),
+            response: Box::new(response),
         })),
         Err(error) => Err(on_error(SendFailure::Transport(Box::new(error)))),
     }
 }
+
+/// Read at most `MAX_ERROR_BODY_BYTES` of a rejection body — enough to surface
+/// the API's `error.type`/`code`, without buffering an unbounded error page.
+pub(crate) fn read_error_body(response: Box<ureq::Response>) -> String {
+    use std::io::Read;
+    let mut body = String::new();
+    let _ = response
+        .into_reader()
+        .take(MAX_ERROR_BODY_BYTES)
+        .read_to_string(&mut body);
+    body
+}
+
+const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
 /// Classify an HTTP rejection for a built-in chat-completions provider. The
 /// message wording matches the pre-collapse per-provider `classify_http_error`

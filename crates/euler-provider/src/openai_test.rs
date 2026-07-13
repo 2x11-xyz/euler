@@ -1,8 +1,8 @@
 use super::*;
+use crate::test_support::{StaticApiKey, TestServer};
 use crate::{
     ModelInputItem, ModelRole, ModelStreamEvent, StopReason, ToolCall, ToolDefinition, Usage,
 };
-use crate::test_support::{StaticApiKey, TestServer};
 use serde_json::json;
 
 #[test]

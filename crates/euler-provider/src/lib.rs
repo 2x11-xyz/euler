@@ -18,13 +18,13 @@ pub mod xai;
 #[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
-mod test_support;
-#[cfg(test)]
 mod custom_provider_test;
 #[cfg(test)]
 mod provider_config_test;
 #[cfg(test)]
 mod scripted_provider_test;
+#[cfg(test)]
+mod test_support;
 
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};

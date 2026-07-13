@@ -105,6 +105,7 @@ impl ModelProvider for CustomOpenAiProvider {
             self.label.clone(),
             options,
             |failure| match failure {
+                // custom does not read the body — the response is dropped unread.
                 SendFailure::Rejection { status, .. } => classify_http_error(&self.label, status),
                 SendFailure::Transport(error) => ProviderError::transport(scrub_secrets(
                     format!("{} request failed: {error}", self.label),
