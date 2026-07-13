@@ -5,7 +5,7 @@
 //!
 //! The observer companion's model turn is served by a provider that reads
 //! the brief task listing from the request (exactly as a live model would)
-//! and answers with `euler.causal_dag.hints.v1` JSON citing the listed
+//! and answers with `euler.causal_dag.hints.v2` JSON citing the listed
 //! event ids. Everything between the fixture provider seam and the slot in
 //! the canvas is the real production path.
 
@@ -36,7 +36,7 @@ use tracing_subscriber::{Layer, Registry};
 const EXTENSION_ID: &str = "causal-dag";
 const SESSION_ID: &str = "session-observer-loop";
 const OBSERVER_TASK_MARKER: &str = "Observe this bounded Euler event window";
-const NEW_EVENTS_MARKER: &str = "NEW EVENTS (new claims cite these event ids):";
+const NEW_EVENTS_MARKER: &str = "NEW EVENTS (use the source alias as source_ref.event_id):";
 const DEAD_END_TITLE: &str = "Raise the timeout";
 const DEAD_END_REASON: &str = "Raising the timeout did not fix the flaky failure.";
 const REFRESH_CAPABILITIES: [Capability; 6] = [
@@ -79,7 +79,7 @@ impl ObserverScriptProvider {
     }
 
     fn observer_response(&self, request: &ModelRequest, task: &str) -> String {
-        if request.instructions.contains("euler.causal_dag.hints.v1") {
+        if request.instructions.contains("euler.causal_dag.hints.v2") {
             self.observer_saw_hints_schema_prompt
                 .store(true, Ordering::SeqCst);
         }
@@ -146,7 +146,7 @@ fn stream(events: Vec<ModelStreamEvent>) -> ProviderStream {
 }
 
 /// Build valid semantic hints exactly the way a live observer would: cite
-/// only event ids from the task's NEW EVENTS listing.
+/// only source aliases from the task's NEW EVENTS listing.
 fn hints_from_listing(task: &str) -> String {
     let mut listed_ids = task
         .lines()
@@ -155,17 +155,17 @@ fn hints_from_listing(task: &str) -> String {
         .filter_map(|line| line.split_whitespace().next())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    for line in task.lines().filter(|line| line.starts_with("N ")) {
-        let Some(sources) = line
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix("sources="))
-        else {
-            continue;
-        };
-        for source in sources.split(',').filter(|source| !source.is_empty()) {
-            if !listed_ids.iter().any(|listed| listed == source) {
-                listed_ids.push(source.to_owned());
-            }
+    for source in task
+        .lines()
+        .take_while(|line| *line != NEW_EVENTS_MARKER)
+        .flat_map(str::split_whitespace)
+        .filter_map(|part| {
+            part.strip_prefix("src=")
+                .or_else(|| part.strip_prefix("es="))
+        })
+    {
+        if !listed_ids.iter().any(|listed| listed == source) {
+            listed_ids.push(source.to_owned());
         }
     }
     assert!(
@@ -175,7 +175,7 @@ fn hints_from_listing(task: &str) -> String {
     let first = &listed_ids[0];
     let last = listed_ids.last().expect("non-empty listing");
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [
             {
                 "id": "node-root",
@@ -185,7 +185,6 @@ fn hints_from_listing(task: &str) -> String {
                 "title": "Fix the flaky test",
                 "summary": "Root investigation thread for the flaky test.",
                 "source_refs": [{"id": "src-root", "event_id": first, "payload_pointer": null}],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "Stated by the listed user message."},
                 "metadata": {}
             },
@@ -197,7 +196,6 @@ fn hints_from_listing(task: &str) -> String {
                 "title": DEAD_END_TITLE,
                 "summary": DEAD_END_REASON,
                 "source_refs": [{"id": "src-timeout", "event_id": last, "payload_pointer": null}],
-                "confidence": {"level": "medium", "score": 0.7},
                 "basis": {"kind": "direct", "summary": "Failed attempt visible in the listed tool round."},
                 "metadata": {}
             },
@@ -209,7 +207,6 @@ fn hints_from_listing(task: &str) -> String {
                 "title": "Fix the underlying race",
                 "summary": "Pursue the race condition directly.",
                 "source_refs": [{"id": "src-race", "event_id": last, "payload_pointer": null}],
-                "confidence": {"level": "medium", "score": 0.6},
                 "basis": {"kind": "inferred", "summary": "Next open approach after the timeout dead end."},
                 "metadata": {}
             }
@@ -223,7 +220,6 @@ fn hints_from_listing(task: &str) -> String {
                 "kind": "continuation",
                 "canonical_backbone": true,
                 "source_refs": [{"id": "src-edge-timeout", "event_id": last, "payload_pointer": null}],
-                "confidence": {"level": "medium", "score": 0.7},
                 "basis": {"kind": "direct", "summary": "Attempt follows the root task."},
                 "metadata": {}
             },
@@ -235,7 +231,6 @@ fn hints_from_listing(task: &str) -> String {
                 "kind": "fork",
                 "canonical_backbone": true,
                 "source_refs": [{"id": "src-edge-race", "event_id": last, "payload_pointer": null}],
-                "confidence": {"level": "medium", "score": 0.6},
                 "basis": {"kind": "inferred", "summary": "Sibling approach forked from the root."},
                 "metadata": {}
             }
@@ -425,7 +420,7 @@ fn observer_loop_produces_semantic_graph_slot_end_to_end() {
     let artifact: Value =
         serde_json::from_slice(&fs::read(temp.path().join(artifact_path)).expect("artifact"))
             .expect("artifact json");
-    assert_eq!(artifact["schema"], json!("euler.causal_dag.v2"));
+    assert_eq!(artifact["schema"], json!("euler.causal_dag.v3"));
     assert_eq!(artifact["construction"]["operation"], json!("reframe"));
     assert_eq!(artifact["construction"]["trigger"], json!("round_cadence"));
     assert_eq!(

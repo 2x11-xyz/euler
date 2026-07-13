@@ -1662,7 +1662,7 @@ impl RawArgsParser {
             .next()
             .ok_or_else(|| anyhow!("--reasoning-effort requires a value"))?;
         let effort = ReasoningEffort::parse(&value).ok_or_else(|| {
-            anyhow!("--reasoning-effort must be one of xsmall|small|medium|large|xlarge")
+            anyhow!("--reasoning-effort must be one of xsmall|small|medium|large|xlarge|max")
         })?;
         self.parsed.reasoning_effort = Some(effort);
         Ok(ArgParseFlow::Continue)

@@ -154,6 +154,7 @@ struct ReasoningEffortMap {
     medium: String,
     high: String,
     xhigh: String,
+    max: String,
 }
 
 impl ReasoningEffortMap {
@@ -164,6 +165,7 @@ impl ReasoningEffortMap {
             "medium" => &self.medium,
             "high" => &self.high,
             "xhigh" => &self.xhigh,
+            "max" => &self.max,
             _ => &self.medium,
         }
     }
@@ -184,6 +186,7 @@ fn reasoning_effort_map(
         medium: reasoning_effort_for_level(map, "medium", boolean_format),
         high: reasoning_effort_for_level(map, "high", boolean_format),
         xhigh: reasoning_effort_for_level(map, "xhigh", boolean_format),
+        max: reasoning_effort_for_level(map, "max", boolean_format),
     }
 }
 

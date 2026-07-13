@@ -1023,7 +1023,12 @@ impl<D: PermissionDecider> Session<D> {
         self.persist_new_events()?;
 
         let previous = self.active_target.clone();
-        let event = EventEnvelope::new(
+        let next_effort = self.providers.clamp_reasoning_effort(
+            &next.provider,
+            &next.model,
+            self.config.reasoning_effort,
+        );
+        let switch = EventEnvelope::new(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
             self.previous_persisted_event_id(),
@@ -1036,12 +1041,34 @@ impl<D: PermissionDecider> Session<D> {
                 ("reason", reason.to_owned().into()),
             ]),
         );
-        self.append_before_accept(&event)?;
-        self.bus.push(event);
+        let switch_id = switch.id.clone();
+        let mut events = vec![switch];
+        if next_effort != self.config.reasoning_effort {
+            events.push(EventEnvelope::new(
+                self.config.session_id.clone(),
+                self.config.agent_id.clone(),
+                Some(switch_id),
+                EventKind::MODEL_EFFORT_CHANGED,
+                object([
+                    ("from_effort", self.config.reasoning_effort.as_str().into()),
+                    ("to_effort", next_effort.as_str().into()),
+                    ("reason", "model-switch".into()),
+                ]),
+            ));
+        }
+        // The target and any required effort downgrade are one control-plane
+        // transition: persist the complete batch before accepting either.
+        if let Some(writer) = &self.provenance {
+            writer.append(&events)?;
+        }
+        for event in events {
+            self.bus.push(event);
+        }
         if self.provenance.is_some() {
             self.persisted_events = self.bus.events().len();
         }
         self.active_target = next;
+        self.config.reasoning_effort = next_effort;
         // Compaction/hard-stop windows track the active model, not the launch
         // model. Unknown catalog windows clear the prior limit rather than
         // leaving a stale threshold.

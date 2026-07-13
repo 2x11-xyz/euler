@@ -1,6 +1,8 @@
 use super::*;
 use crate::active_state::ActiveGraphState;
 use crate::construction::Construction;
+use crate::observer_brief::{build_full_task, ObserverBriefMode};
+use euler_agents::{AgentTask, MAX_TASK_BYTES};
 use euler_core::extensions::{ExtensionHost, ExtensionHostError};
 use euler_core::{read_provenance, ProvenanceWriter};
 use euler_event::{object, EventEnvelope, EventKind};
@@ -43,7 +45,8 @@ fn manifest_and_command_registration_are_stable() {
     assert_eq!(
         registrar.names,
         vec![
-            COMMAND_NAME,
+            EXPORT_COMMAND_NAME,
+            VIEW_COMMAND_NAME,
             UPDATE_COMMAND_NAME,
             CATCH_UP_COMMAND_NAME,
             OBSERVE_COMMAND_NAME,
@@ -59,7 +62,12 @@ fn manifest_and_command_registration_are_stable() {
 fn command_required_capabilities_are_command_scoped() {
     assert_eq!(
         CausalDagExportCommand.descriptor().required_capabilities,
-        vec![Capability::ProvenanceRead, Capability::ArtifactWrite]
+        vec![
+            Capability::ProvenanceRead,
+            Capability::ArtifactWrite,
+            Capability::FsRead,
+            Capability::FsWrite
+        ]
     );
     assert_eq!(
         CausalDagUpdateCommand.descriptor().required_capabilities,
@@ -152,11 +160,15 @@ fn observer_brief_over_knuth_fixture_builds_bounded_agent_task() {
     assert_eq!(output["budget"]["max_turns"], json!(1));
     assert_eq!(output["budget"]["max_tool_calls"], json!(0));
     let task = output["task"].as_str().expect("task string");
-    assert!(task.len() <= 8192);
+    assert!(task.len() <= MAX_TASK_BYTES);
     assert!(!task.contains("agent-spawn"));
     assert!(!task.contains("self-artifact"));
     let system_prompt = output["system_prompt"].as_str().expect("system prompt");
-    assert!(system_prompt.contains("Use schema euler.causal_dag.hints.v1"));
+    assert!(system_prompt.contains("Use schema euler.causal_dag.hints.v2"));
+    assert!(system_prompt.contains("use payload_pointer /payload exactly"));
+    assert!(system_prompt.contains("Do not repeat CURRENT GRAPH source refs"));
+    assert!(system_prompt.contains("metadata.occurrence_source_ref_id"));
+    assert!(system_prompt.contains("add a successor checkpoint or synthesis"));
     assert!(system_prompt.contains(
         "Every non-root node must have exactly one incoming canonical_backbone structural edge"
     ));
@@ -169,6 +181,7 @@ fn observer_brief_over_knuth_fixture_builds_bounded_agent_task() {
         output["observe_window"]["watermark_event_id"]
     );
     assert_eq!(output["apply"]["session_id"], json!("session-knuth"));
+    assert!(output["apply"]["source_aliases"].is_object());
     assert!(output["apply"].get("causal_dag").is_none());
 }
 
@@ -388,6 +401,8 @@ fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
         recording_page(vec![first_event], DEFAULT_LIMIT, None, false),
         recording_page(vec![second_event], DEFAULT_LIMIT, None, false),
     ]);
+    let mut initial = single_root_hints("event-1");
+    initial["nodes"][0]["metadata"]["occurrence_source_ref_id"] = json!("src-root");
     CausalDagObserverApplyCommand
         .execute(
             CommandContext {
@@ -397,7 +412,7 @@ fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
                         "session_id": "session-1",
                         "expected_predecessor_artifact_event_id": null
                     }),
-                    single_root_hints("event-1"),
+                    initial,
                     "evt-result-1",
                 ),
             },
@@ -443,6 +458,24 @@ fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
             "event_id": "event-2",
             "payload_pointer": "/payload/content"
         }));
+    let mut moved_anchor = revision.clone();
+    moved_anchor["nodes"][0]["metadata"]["occurrence_source_ref_id"] = json!("src-root-new");
+    let error = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: observer_apply_input(apply.clone(), moved_anchor, "evt-result-moved-anchor"),
+            },
+            &host,
+        )
+        .expect_err("occurrence anchor is immutable");
+    assert_eq!(
+        error,
+        ExtensionError::Message(
+            "causal-dag node occurrence anchor changed during revision".to_owned()
+        )
+    );
+    assert_eq!(host.writes.lock().expect("writes").len(), 1);
+
     CausalDagObserverApplyCommand
         .execute(
             CommandContext {
@@ -465,6 +498,10 @@ fn incremental_revision_requires_new_evidence_and_deduplicates_prior_sources() {
     assert!(source_refs
         .iter()
         .all(|source| source["id"] != "src-root-renamed"));
+    assert_eq!(
+        artifact["forest"]["nodes"][0]["metadata"]["occurrence_source_ref_id"],
+        json!("src-root")
+    );
 }
 
 #[test]
@@ -696,9 +733,14 @@ fn reframe_can_replace_parentage_and_introduce_a_second_root() {
         "artifact-event"
     );
     let tasks = host.spawn_tasks.lock().expect("spawn tasks");
-    assert!(tasks[0].task.contains(
-        "E edge-child node-root->node-child class=structural kind=continuation backbone=true sources=event-2"
-    ));
+    let child_line = tasks[0]
+        .task
+        .lines()
+        .find(|line| line.starts_with("N ") && line.contains(" attempt/open "))
+        .expect("replacement task child line");
+    assert!(child_line.contains(" p=n"));
+    assert!(child_line.contains(" v=v"));
+    assert!(child_line.contains(" es=s"));
 }
 
 #[test]
@@ -766,6 +808,57 @@ fn incremental_refresh_bootstraps_a_truncated_session() {
     assert_eq!(output["feed"]["truncated"], true);
     assert_eq!(output["feed"]["next_after_event_id"], "event-1");
     assert_eq!(host.writes.lock().expect("writes").len(), 1);
+}
+
+#[test]
+fn incremental_refresh_fits_an_oversized_page_and_reports_remaining_feed() {
+    let events = (0..1000)
+        .map(|index| {
+            fixture_event(
+                "session-1",
+                &format!("refresh-events-{index:03}"),
+                EventKind::USER_MESSAGE,
+                "",
+            )
+        })
+        .collect::<Vec<_>>();
+    let host = RecordingHost::new(recording_page(events.clone(), events.len(), None, false))
+        .with_spawn_outcomes(vec![successful_agent_outcome(
+            single_root_hints("e0"),
+            "fitted",
+        )]);
+
+    let output = CausalDagRefreshCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-1",
+                    "operation": "incremental",
+                    "limit": events.len()
+                }),
+            },
+            &host,
+        )
+        .expect("refresh fits the observer task to a provenance prefix");
+    let tasks = host.spawn_tasks.lock().expect("spawn tasks");
+    let task = &tasks[0].task;
+    let active_cursor = output["active_cursor_event_id"]
+        .as_str()
+        .expect("active cursor");
+
+    assert!(task.len() <= MAX_TASK_BYTES);
+    assert_ne!(active_cursor, events.last().expect("last event").id);
+    assert!(task.contains("e0 user.message"));
+    assert_eq!(output["truncated"], false);
+    assert_eq!(output["feed"]["truncated"], true);
+    assert_eq!(output["feed"]["next_after_event_id"], active_cursor);
+    assert_eq!(output["feed"]["watermark_event_id"], active_cursor);
+    let writes = host.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0]
+        .source_event_ids
+        .iter()
+        .any(|event_id| event_id == "refresh-events-000"));
 }
 
 #[test]
@@ -957,7 +1050,12 @@ fn observer_brief_filter_policy_matrix_includes_only_work_events() {
     let output = CausalDagObserverBriefCommand
         .execute(CommandContext { input: json!({}) }, &host)
         .expect("observer brief");
-    let task = output["task"].as_str().expect("task string");
+    let aliased_event_ids = output["apply"]["source_aliases"]
+        .as_object()
+        .expect("source aliases")
+        .values()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
 
     for included in [
         "user",
@@ -967,7 +1065,10 @@ fn observer_brief_filter_policy_matrix_includes_only_work_events() {
         "file-change",
         "foreign-artifact",
     ] {
-        assert!(task.contains(included), "missing included id {included}");
+        assert!(
+            aliased_event_ids.contains(included),
+            "missing included id {included}"
+        );
     }
     for excluded in [
         "session-start",
@@ -981,7 +1082,7 @@ fn observer_brief_filter_policy_matrix_includes_only_work_events() {
         "self-artifact",
     ] {
         assert!(
-            !task.contains(excluded),
+            !aliased_event_ids.contains(excluded),
             "unexpected excluded id {excluded}"
         );
     }
@@ -1034,10 +1135,15 @@ fn observer_brief_excludes_its_companion_cognition() {
     let output = CausalDagObserverBriefCommand
         .execute(CommandContext { input: json!({}) }, &host)
         .expect("observer brief");
-    let task = output["task"].as_str().expect("task string");
+    let aliased_event_ids = output["apply"]["source_aliases"]
+        .as_object()
+        .expect("source aliases")
+        .values()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
 
-    assert!(!task.contains("observer-cognition"));
-    assert!(task.contains("driver-cognition"));
+    assert!(!aliased_event_ids.contains("observer-cognition"));
+    assert!(aliased_event_ids.contains("driver-cognition"));
     assert_eq!(output["listed_event_count"], 1);
 }
 
@@ -1139,7 +1245,8 @@ fn observer_brief_does_not_advance_into_an_incomplete_observer_span() {
         )
         .expect("complete observer span can be skipped");
     assert_eq!(brief["listed_event_count"], 1);
-    assert!(brief["task"].as_str().expect("task").contains("event-2"));
+    assert!(brief["task"].as_str().expect("task").contains("e0 "));
+    assert_eq!(brief["apply"]["source_aliases"]["e0"], "event-2");
     assert!(!brief["task"]
         .as_str()
         .expect("task")
@@ -1166,46 +1273,147 @@ fn observer_brief_rejects_unknown_input_fields() {
 }
 
 #[test]
-fn observer_brief_task_size_boundary_is_enforced() {
-    let exact = observer_brief_events_with_target_task_len(24 * 1024);
-    let host = RecordingHost::new(recording_page(exact.clone(), exact.len(), None, false));
+fn observer_brief_adapts_extracts_to_the_real_agent_task_boundary() {
+    let events = (0..64)
+        .map(|index| {
+            fixture_event(
+                "session-1",
+                &format!("event-budget-{index:02}"),
+                EventKind::USER_MESSAGE,
+                &"x".repeat(240),
+            )
+        })
+        .collect::<Vec<_>>();
+    let host = RecordingHost::new(recording_page(events.clone(), events.len(), None, false));
 
     let output = CausalDagObserverBriefCommand
         .execute(
             CommandContext {
-                input: json!({"limit": exact.len()}),
+                input: json!({"limit": events.len()}),
             },
             &host,
         )
-        .expect("exact boundary passes");
-    assert_eq!(output["task"].as_str().expect("task").len(), 24 * 1024);
-
-    let mut over = exact.clone();
-    let event = over
-        .iter_mut()
-        .find(|event| event.payload["content"].as_str().unwrap().len() < 240)
-        .expect("room for one more byte");
-    let content = event.payload["content"].as_str().unwrap();
-    event
-        .payload
-        .insert("content".to_owned(), format!("{content}x").into());
-    let host = RecordingHost::new(recording_page(over.clone(), over.len(), None, false));
-    let error = CausalDagObserverBriefCommand
-        .execute(
-            CommandContext {
-                input: json!({"limit": over.len()}),
-            },
-            &host,
-        )
-        .expect_err("over boundary fails");
-    let message = error.to_string();
-    assert!(message.contains("24577 bytes"));
-    assert!(message.contains(&format!("{} listed events", over.len())));
-    assert!(message.contains("reduce limit"));
+        .expect("adaptive brief");
+    let task = output["task"].as_str().expect("task");
+    assert!(task.len() <= MAX_TASK_BYTES);
+    assert_eq!(output["listed_event_count"], events.len());
+    for (index, event) in events.iter().enumerate() {
+        let alias = format!("e{index}");
+        assert_eq!(output["apply"]["source_aliases"][&alias], event.id);
+        assert!(task.contains(&format!("{alias} user.message")));
+    }
+    let extract_lengths = task
+        .lines()
+        .filter(|line| line.starts_with('e') && line.contains(" user.message "))
+        .map(|line| line.splitn(3, ' ').nth(2).unwrap_or("").chars().count())
+        .collect::<Vec<_>>();
+    assert_eq!(extract_lengths.len(), events.len());
+    assert!(extract_lengths.iter().all(|length| *length > 0));
+    assert!(extract_lengths.iter().all(|length| *length < 240));
+    AgentTask::new_inheriting_target(task, output["persona"].as_str().expect("persona"))
+        .expect("brief must satisfy the real companion task contract");
 }
 
 #[test]
-fn observer_brief_count_overflow_fails_without_dropping_events() {
+fn observer_brief_compacts_backbone_with_reversible_record_aliases() {
+    let host = RecordingHost::empty();
+    let (_, artifact) = load_knuth_fixture();
+    let record = ArtifactRecord {
+        persisted_event_id: "source-artifact-event".to_owned(),
+        relative_path: "extensions/causal-dag/artifacts/source.json".to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: 1,
+    };
+    let active = ActiveGraphState::commit(&host, &record, artifact.clone(), None)
+        .expect("active graph state");
+    let event = fixture_event(
+        "session-knuth",
+        "new-event",
+        EventKind::USER_MESSAGE,
+        "continue",
+    );
+
+    let fitted = build_full_task(&[event], Some(&active), ObserverBriefMode::Incremental)
+        .expect("compact observer task");
+    let task = &fitted.task;
+    assert!(task.len() <= MAX_TASK_BYTES);
+    for (index, node) in artifact["forest"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .enumerate()
+    {
+        let id = node["id"].as_str().expect("node id");
+        let alias = format!("n{index}");
+        assert_eq!(fitted.node_aliases[&alias], id);
+        assert!(
+            task.lines()
+                .any(|line| line.starts_with(&format!("N {alias} "))),
+            "missing node alias {alias}"
+        );
+    }
+    for (index, edge) in artifact["forest"]["edges"]
+        .as_array()
+        .expect("edges")
+        .iter()
+        .enumerate()
+    {
+        let id = edge["id"].as_str().expect("edge id");
+        let alias = format!("v{index}");
+        assert_eq!(fitted.edge_aliases[&alias], id);
+        if edge["canonical_backbone"] == true {
+            assert!(
+                task.contains(&format!("v={alias}:")),
+                "missing folded edge alias {alias}"
+            );
+        } else {
+            assert!(
+                task.lines()
+                    .any(|line| line.starts_with(&format!("E {alias} "))),
+                "missing non-backbone edge alias {alias}"
+            );
+        }
+    }
+}
+
+#[test]
+fn replacement_brief_fits_a_large_graph_without_dropping_provenance() {
+    let events = synthetic_summary_events(48);
+    let hints = synthetic_pressure_hints(&events, 44);
+    let projection = Projection::from_observer_revision(
+        &events,
+        &hints,
+        Some("session-1"),
+        None,
+        Construction::snapshot(),
+    )
+    .expect("large projection");
+    let artifact = projection.artifact_value();
+    let host = RecordingHost::empty();
+    let record = ArtifactRecord {
+        persisted_event_id: "source-artifact-event".to_owned(),
+        relative_path: "extensions/causal-dag/artifacts/source.json".to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: 1,
+    };
+    let active = ActiveGraphState::commit(&host, &record, artifact, None).expect("active graph");
+
+    let fitted = build_full_task(&[], Some(&active), ObserverBriefMode::Replacement)
+        .expect("replacement brief");
+
+    assert!(fitted.task.len() <= MAX_TASK_BYTES);
+    assert_eq!(fitted.listed_event_count, 0);
+    assert_eq!(fitted.node_aliases.len(), 48);
+    assert_eq!(fitted.edge_aliases.len(), 47);
+    assert_eq!(fitted.source_aliases.len(), 48);
+    assert!(fitted.task.contains("MODE REPLACEMENT"));
+    assert!(fitted.task.contains("src=s0"));
+    AgentTask::new_inheriting_target(fitted.task, OBSERVER_PERSONA)
+        .expect("replacement brief must satisfy the real companion task contract");
+}
+
+#[test]
+fn observer_brief_pages_count_overflow_without_dropping_events() {
     let events = (0..1000)
         .map(|index| {
             fixture_event(
@@ -1218,17 +1426,33 @@ fn observer_brief_count_overflow_fails_without_dropping_events() {
         .collect::<Vec<_>>();
     let host = RecordingHost::new(recording_page(events.clone(), events.len(), None, false));
 
-    let error = CausalDagObserverBriefCommand
+    let output = CausalDagObserverBriefCommand
         .execute(
             CommandContext {
                 input: json!({"limit": events.len()}),
             },
             &host,
         )
-        .expect_err("count overflow fails");
-    let message = error.to_string();
-    assert!(message.contains(&format!("{} listed events", events.len())));
-    assert!(message.contains("reduce limit"));
+        .expect("count overflow is fitted to a replayable prefix");
+    let listed = output["listed_event_count"].as_u64().expect("listed count") as usize;
+    let task = output["task"].as_str().expect("task");
+
+    assert!(listed > 0);
+    assert!(listed < events.len());
+    assert!(task.len() <= MAX_TASK_BYTES);
+    assert_eq!(output["watermark_event_id"], events[listed - 1].id);
+    assert_eq!(output["apply"]["watermark_event_id"], events[listed - 1].id);
+    assert_eq!(
+        output["apply"]["source_aliases"][format!("e{}", listed - 1)],
+        events[listed - 1].id
+    );
+    assert!(output["apply"]["source_aliases"]
+        .get(format!("e{listed}"))
+        .is_none());
+    assert!(task.contains(&format!("e{} user.message", listed - 1)));
+    assert!(!task.contains(&format!("e{listed} user.message")));
+    AgentTask::new_inheriting_target(task, output["persona"].as_str().expect("persona"))
+        .expect("fitted brief must satisfy the real companion task contract");
 }
 
 #[test]
@@ -1260,7 +1484,7 @@ fn observer_brief_normalizes_extracts_before_truncating() {
     let task = output["task"].as_str().expect("task");
     let line = task
         .lines()
-        .find(|line| line.starts_with("messy "))
+        .find(|line| line.starts_with("e0 "))
         .expect("event line");
     let extract = line.splitn(3, ' ').nth(2).expect("extract");
     assert_eq!(extract.chars().count(), 240);
@@ -1339,7 +1563,7 @@ fn export_writes_degraded_chronology_artifact_without_payload_content() {
     let second_bytes = &writes[1].bytes;
     let artifact: Value = serde_json::from_slice(first_bytes).expect("artifact json");
 
-    assert_eq!(first["event_count"], json!(3));
+    assert_eq!(first["node_count"], json!(3));
     assert_eq!(second["sha256"], json!(TEST_ARTIFACT_HASH));
     assert_eq!(first_bytes, second_bytes);
     assert!(!String::from_utf8_lossy(first_bytes).contains(secret));
@@ -1784,7 +2008,7 @@ fn slot_summary_empty_and_all_open_projections_render_deterministically() {
 fn slot_summary_strips_control_characters() {
     let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "hello");
     let hints = json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-root",
             "root_id": "node-root",
@@ -1797,7 +2021,6 @@ fn slot_summary_strips_control_characters() {
                 "event_id": "event-1",
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "operator", "summary": "Observer supplied the root."},
             "metadata": {}
         }],
@@ -1906,7 +2129,7 @@ fn observe_rejects_truncated_page_without_writing_artifact() {
 fn observe_dangling_source_ref_fails_without_fallback() {
     let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, "hello");
     let hints = json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-root",
             "root_id": "node-root",
@@ -1919,7 +2142,6 @@ fn observe_dangling_source_ref_fails_without_fallback() {
                 "event_id": "event-missing",
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "direct", "summary": "Observer supplied the root."},
             "metadata": {}
         }],
@@ -1960,15 +2182,15 @@ fn observe_rejects_invalid_and_oversized_hint_input_before_query() {
         (
             json!({
                 "session_id": "session-1",
-                "causal_dag": {"schema": "euler.causal_dag.hints.v2"}
+                "causal_dag": {"schema": "euler.causal_dag.hints.v1"}
             }),
-            "causal-dag hint schema must be euler.causal_dag.hints.v1".to_owned(),
+            "causal-dag hint schema must be euler.causal_dag.hints.v2".to_owned(),
         ),
         (
             json!({
                 "session_id": "session-1",
                 "kinds": [EventKind::USER_MESSAGE],
-                "causal_dag": {"schema": "euler.causal_dag.hints.v1"}
+                "causal_dag": {"schema": "euler.causal_dag.hints.v2"}
             }),
             "unknown input field `kinds`".to_owned(),
         ),
@@ -1976,7 +2198,7 @@ fn observe_rejects_invalid_and_oversized_hint_input_before_query() {
             json!({
                 "session_id": "session-1",
                 "causal_dag": {
-                    "schema": "euler.causal_dag.hints.v1",
+                    "schema": "euler.causal_dag.hints.v2",
                     "nodes": [{
                         "id": "node-root",
                         "root_id": "node-root",
@@ -1985,7 +2207,6 @@ fn observe_rejects_invalid_and_oversized_hint_input_before_query() {
                         "title": "Root",
                         "summary": oversized_summary,
                         "source_refs": [],
-                        "confidence": {"level": "high", "score": 0.9},
                         "basis": {"kind": "direct", "summary": "Oversized."},
                         "metadata": {}
                     }],
@@ -2302,7 +2523,7 @@ fn observe_rejects_empty_page_and_empty_hints_without_writing_artifact() {
                 input: json!({
                     "session_id": "session-1",
                     "causal_dag": {
-                        "schema": "euler.causal_dag.hints.v1",
+                        "schema": "euler.causal_dag.hints.v2",
                         "nodes": [],
                         "edges": []
                     }
@@ -2329,7 +2550,7 @@ fn observe_rejects_empty_page_and_empty_hints_without_writing_artifact() {
                 input: json!({
                     "session_id": "session-1",
                     "causal_dag": {
-                        "schema": "euler.causal_dag.hints.v1",
+                        "schema": "euler.causal_dag.hints.v2",
                         "nodes": [],
                         "edges": []
                     }
@@ -2516,7 +2737,7 @@ fn observe_does_not_copy_source_payload_secret_or_host_paths() {
     let secret = "OBSERVE_SOURCE_SECRET_DO_NOT_COPY";
     let event = fixture_event("session-1", "event-1", EventKind::USER_MESSAGE, secret);
     let hints = json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-root",
             "root_id": "node-root",
@@ -2529,7 +2750,6 @@ fn observe_does_not_copy_source_payload_secret_or_host_paths() {
                 "event_id": "event-1",
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "operator", "summary": "Observer supplied the root."},
             "metadata": {}
         }],
@@ -2588,7 +2808,7 @@ fn export_semantic_hint_wrong_schema_fails_without_generic_fallback() {
     );
     event.payload.insert(
         "causal_dag".to_owned(),
-        json!({"schema": "euler.causal_dag.hints.v2"}),
+        json!({"schema": "euler.causal_dag.hints.v1"}),
     );
     let host = RecordingHost::new(recording_page(
         vec![
@@ -2612,7 +2832,7 @@ fn export_semantic_hint_wrong_schema_fails_without_generic_fallback() {
     assert_eq!(
         error,
         ExtensionError::Message(
-            "causal-dag hint schema must be euler.causal_dag.hints.v1".to_owned()
+            "causal-dag hint schema must be euler.causal_dag.hints.v2".to_owned()
         )
     );
     assert!(host.writes.lock().expect("writes").is_empty());
@@ -2648,12 +2868,6 @@ fn observe_rejects_unknown_hint_fields_outside_metadata() {
         .expect("source ref object")
         .insert("path".to_owned(), json!("/payload/content"));
 
-    let mut confidence = hints.clone();
-    confidence["nodes"][0]["confidence"]
-        .as_object_mut()
-        .expect("confidence object")
-        .insert("reason".to_owned(), json!("looks right"));
-
     let mut basis = hints;
     basis["nodes"][0]["basis"]
         .as_object_mut()
@@ -2668,7 +2882,6 @@ fn observe_rejects_unknown_hint_fields_outside_metadata() {
             source_ref,
             "causal-dag source ref hint unknown field `path`",
         ),
-        (confidence, "causal-dag confidence unknown field `reason`"),
         (basis, "causal-dag basis unknown field `source_ref_ids`"),
     ] {
         let host = RecordingHost::new(recording_page(events.clone(), DEFAULT_LIMIT, None, false));
@@ -2694,10 +2907,20 @@ fn observe_allows_metadata_fields_inside_hint_records() {
     let (mut events, _) = load_knuth_fixture();
     let mut hints = extract_observer_hints(&mut events);
     assert_no_embedded_causal_dag_hints(&events);
+    let occurrence_source_ref_id = hints["nodes"][0]["source_refs"][0]["id"]
+        .as_str()
+        .expect("source ref id")
+        .to_owned();
     hints["nodes"][0]
         .as_object_mut()
         .expect("node object")
-        .insert("metadata".to_owned(), json!({"observer_note": "kept"}));
+        .insert(
+            "metadata".to_owned(),
+            json!({
+                "observer_note": "kept",
+                "occurrence_source_ref_id": occurrence_source_ref_id
+            }),
+        );
     hints["edges"][0]
         .as_object_mut()
         .expect("edge object")
@@ -2725,11 +2948,47 @@ fn observe_allows_metadata_fields_inside_hint_records() {
         .expect("nodes")
         .iter()
         .any(|node| node["metadata"]["observer_note"] == json!("kept")));
+    assert!(artifact["forest"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .any(
+            |node| node["metadata"]["occurrence_source_ref_id"] == json!(occurrence_source_ref_id)
+        ));
     assert!(artifact["forest"]["edges"]
         .as_array()
         .expect("edges")
         .iter()
         .any(|edge| edge["metadata"]["edge_note"] == json!("kept")));
+}
+
+#[test]
+fn observe_rejects_unresolved_occurrence_source_ref() {
+    let (mut events, _) = load_knuth_fixture();
+    let mut hints = extract_observer_hints(&mut events);
+    hints["nodes"][0]["metadata"]["occurrence_source_ref_id"] = json!("missing-source");
+    let host = RecordingHost::new(recording_page(events, DEFAULT_LIMIT, None, false));
+
+    let error = CausalDagObserveCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "session_id": "session-knuth",
+                    "causal_dag": hints
+                }),
+            },
+            &host,
+        )
+        .expect_err("unresolved occurrence source ref");
+
+    assert_eq!(
+        error,
+        ExtensionError::Message(
+            "causal-dag node metadata.occurrence_source_ref_id references missing source ref `missing-source`"
+                .to_owned()
+        )
+    );
+    assert!(host.writes.lock().expect("writes").is_empty());
 }
 
 #[test]
@@ -2743,7 +3002,7 @@ fn export_rejects_unknown_semantic_hint_field_without_generic_fallback() {
     event.payload.insert(
         "causal_dag".to_owned(),
         json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "label": "loose graph",
             "nodes": [],
             "edges": []
@@ -2887,7 +3146,7 @@ fn export_mixed_hint_page_uses_semantic_mode_without_generic_nodes() {
     hinted.payload.insert(
         "causal_dag".to_owned(),
         json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "nodes": [{
                 "id": "node-mixed-root",
                 "root_id": "node-mixed-root",
@@ -2900,7 +3159,6 @@ fn export_mixed_hint_page_uses_semantic_mode_without_generic_nodes() {
                     "event_id": "event-2",
                     "payload_pointer": "/payload/content"
                 }],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {
                     "kind": "direct",
                     "summary": "The hint explicitly opens the root."
@@ -2951,7 +3209,7 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
     root.payload.insert(
         "causal_dag".to_owned(),
         json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "nodes": [{
                 "id": "node-alpha-root",
                 "root_id": "node-alpha-root",
@@ -2964,7 +3222,6 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
                     "event_id": "event-alpha-root",
                     "payload_pointer": "/payload/content"
                 }],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "The root hint is explicit."},
                 "metadata": {}
             }],
@@ -2980,7 +3237,7 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
     branch.payload.insert(
         "causal_dag".to_owned(),
         json!({
-            "schema": "euler.causal_dag.hints.v1",
+            "schema": "euler.causal_dag.hints.v2",
             "nodes": [{
                 "id": "node-alpha-branch",
                 "root_id": "node-alpha-root",
@@ -2993,7 +3250,6 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
                     "event_id": "event-alpha-branch",
                     "payload_pointer": "/payload/content"
                 }],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "The branch hint is explicit."},
                 "metadata": {}
             }],
@@ -3009,7 +3265,6 @@ fn export_non_knuth_semantic_hints_project_same_rule() {
                     "event_id": "event-alpha-branch",
                     "payload_pointer": "/payload/content"
                 }],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "The fork hint is explicit."},
                 "metadata": {}
             }]
@@ -3432,8 +3687,8 @@ fn empty_bounded_page_writes_empty_forest_with_fixed_timestamp() {
     let writes = host.writes.lock().expect("writes");
     let artifact: Value = serde_json::from_slice(&writes[0].bytes).expect("artifact json");
 
-    assert_eq!(output["event_count"], json!(0));
-    assert_eq!(output["degraded"], json!(false));
+    assert_eq!(output["node_count"], json!(0));
+    assert_eq!(output["active_graph"], json!(false));
     assert!(writes[0].source_event_ids.is_empty());
     assert_eq!(artifact["generated_at"], json!(EMPTY_GENERATED_AT));
     assert_eq!(artifact["session"]["event_range"]["start"], Value::Null);
@@ -3492,8 +3747,7 @@ fn limit_cursor_and_kind_filters_pass_through_host_query() {
         ]
     );
     assert!(!queries[0].include_blob_fields);
-    assert_eq!(output["truncated"], json!(true));
-    assert_eq!(output["next_after_event_id"], json!("event-2"));
+    assert_eq!(output["node_count"], json!(1));
     let writes = host.writes.lock().expect("writes");
     let artifact: Value = serde_json::from_slice(&writes[0].bytes).expect("artifact json");
     assert_eq!(artifact["session"]["event_range"]["complete"], json!(false));
@@ -3573,7 +3827,7 @@ fn extension_host_integration_writes_artifact_event() {
         .expect("register extension");
 
     let output = host
-        .execute_command(COMMAND_NAME, json!({"session_id": session_id}))
+        .execute_command(EXPORT_COMMAND_NAME, json!({"session_id": session_id}))
         .expect("execute export");
     let relative_path = output["relative_path"]
         .as_str()
@@ -3604,6 +3858,7 @@ fn extension_host_integration_writes_artifact_event() {
             "schema": SCHEMA_NAME,
             "node_count": 2,
             "edge_count": 1,
+            "annotation_edge_count": 0,
             "degraded": true,
             "truncated": false,
             "applied_limit": DEFAULT_LIMIT,
@@ -3918,16 +4173,21 @@ fn export_can_be_registered_with_command_scoped_capabilities() {
         session_id,
         "agent-1",
         writer,
-        [Capability::ProvenanceRead, Capability::ArtifactWrite],
+        [
+            Capability::ProvenanceRead,
+            Capability::ArtifactWrite,
+            Capability::FsRead,
+            Capability::FsWrite,
+        ],
     );
 
-    host.register_extension_for_command(&CausalDagExtension, COMMAND_NAME)
+    host.register_extension_for_command(&CausalDagExtension, EXPORT_COMMAND_NAME)
         .expect("register export only");
     let output = host
-        .execute_command(COMMAND_NAME, json!({"session_id": session_id}))
+        .execute_command(EXPORT_COMMAND_NAME, json!({"session_id": session_id}))
         .expect("execute export");
 
-    assert_eq!(output["schema"], json!(SCHEMA_NAME));
+    assert_eq!(output["source_schema"], json!(SCHEMA_NAME));
     assert_eq!(
         host.execute_command(UPDATE_COMMAND_NAME, json!({"session_id": session_id}))
             .expect_err("update was not registered"),
@@ -4772,6 +5032,109 @@ fn corrupt_active_graph_state_self_heals_instead_of_bricking_the_loop() {
     );
 }
 
+#[test]
+fn active_view_and_exports_share_the_selected_graph_artifact() {
+    let host = RecordingHost::empty();
+    let (_, artifact) = load_knuth_fixture();
+    let source_record = ArtifactRecord {
+        persisted_event_id: "source-artifact-event".to_owned(),
+        relative_path: "sessions/session-knuth/extensions/causal-dag/artifacts/source-graph.json"
+            .to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: serde_json::to_vec(&artifact).expect("artifact bytes").len() + 1,
+    };
+    ActiveGraphState::commit(&host, &source_record, artifact, None).expect("active state");
+
+    let view = CausalDagViewCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-knuth"}),
+            },
+            &host,
+        )
+        .expect("view active graph");
+    assert_eq!(view["source_artifact_event_id"], "source-artifact-event");
+    assert_eq!(view["node_count"], 6);
+    assert!(view["summary"]
+        .as_str()
+        .is_some_and(|text| text.starts_with("GRAPH:")));
+
+    let json_export = CausalDagExportCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-knuth", "format": "json"}),
+            },
+            &host,
+        )
+        .expect("export active JSON");
+    assert_eq!(json_export["active_graph"], true);
+    assert_eq!(json_export["format"], "json");
+    assert_eq!(json_export["relative_path"], source_record.relative_path);
+    assert!(host.writes.lock().expect("writes").is_empty());
+
+    let html_export = CausalDagExportCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-knuth", "format": "html"}),
+            },
+            &host,
+        )
+        .expect("export active HTML");
+    assert_eq!(
+        html_export["source_artifact_event_id"],
+        "source-artifact-event"
+    );
+    assert_eq!(html_export["self_contained"], true);
+    let writes = host.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].source_event_ids, ["source-artifact-event"]);
+    assert_eq!(writes[0].metadata["format"], "html");
+    assert!(writes[0].bytes.starts_with(b"<!DOCTYPE html>"));
+}
+
+#[test]
+fn active_state_without_artifact_path_reexports_raw_json() {
+    let host = RecordingHost::empty();
+    let (_, artifact) = load_knuth_fixture();
+    let source_record = ArtifactRecord {
+        persisted_event_id: "source-artifact-event".to_owned(),
+        relative_path: "sessions/session-knuth/extensions/causal-dag/artifacts/source-graph.json"
+            .to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: serde_json::to_vec(&artifact).expect("artifact bytes").len() + 1,
+    };
+    ActiveGraphState::commit(&host, &source_record, artifact, None).expect("active state");
+    let path = host.state.path().join("active-graph.json");
+    let mut legacy: Value =
+        serde_json::from_slice(&fs::read(&path).expect("state bytes")).expect("state JSON");
+    legacy
+        .as_object_mut()
+        .expect("state object")
+        .remove("artifact_relative_path");
+    fs::write(&path, serde_json::to_vec(&legacy).expect("legacy bytes"))
+        .expect("write legacy state");
+
+    let loaded = ActiveGraphState::load(&host)
+        .expect("load legacy state")
+        .expect("active graph");
+    assert_eq!(loaded.artifact_relative_path(), None);
+    let output = CausalDagExportCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-knuth", "format": "json"}),
+            },
+            &host,
+        )
+        .expect("re-export legacy active graph");
+
+    assert_eq!(output["active_graph"], true);
+    assert_eq!(output["source_artifact_event_id"], "source-artifact-event");
+    let writes = host.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 1);
+    let exported: Value = serde_json::from_slice(&writes[0].bytes).expect("exported graph JSON");
+    assert_eq!(exported["schema"], SCHEMA_NAME);
+}
+
 fn recording_page(
     events: Vec<EventEnvelope>,
     applied_limit: usize,
@@ -4919,48 +5282,6 @@ fn parented_event(id: &str, kind: &'static str, content: &str, parent: &str) -> 
     event
 }
 
-fn observer_brief_events_with_target_task_len(target: usize) -> Vec<EventEnvelope> {
-    let mut events = (0..100)
-        .map(|index| {
-            fixture_event(
-                "session-1",
-                &format!("event-{index:02}"),
-                EventKind::USER_MESSAGE,
-                "",
-            )
-        })
-        .collect::<Vec<_>>();
-    let base_len = observer_brief_task_len(&events);
-    assert!(base_len <= target, "test fixture overshot target task size");
-    let mut remaining = target - base_len;
-    for event in &mut events {
-        let content_len = remaining.min(240);
-        event
-            .payload
-            .insert("content".to_owned(), "x".repeat(content_len).into());
-        remaining -= content_len;
-        if remaining == 0 {
-            break;
-        }
-    }
-    assert_eq!(remaining, 0, "test fixture cannot reach target task size");
-    assert_eq!(observer_brief_task_len(&events), target);
-    events
-}
-
-fn observer_brief_task_len(events: &[EventEnvelope]) -> usize {
-    let host = RecordingHost::new(recording_page(events.to_vec(), events.len(), None, false));
-    let output = CausalDagObserverBriefCommand
-        .execute(
-            CommandContext {
-                input: json!({"limit": events.len()}),
-            },
-            &host,
-        )
-        .expect("observer brief task length");
-    output["task"].as_str().expect("task").len()
-}
-
 fn causal_dag_graph_artifact_event(session_id: &str, id: &str) -> EventEnvelope {
     let mut event = EventEnvelope::new(
         session_id,
@@ -5049,7 +5370,7 @@ fn string_set<const N: usize>(values: [&str; N]) -> BTreeSet<String> {
 
 fn single_root_hints(event_id: &str) -> Value {
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-root",
             "root_id": "node-root",
@@ -5062,7 +5383,6 @@ fn single_root_hints(event_id: &str) -> Value {
                 "event_id": event_id,
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "operator", "summary": "Observer supplied the root."},
             "metadata": {}
         }],
@@ -5072,7 +5392,7 @@ fn single_root_hints(event_id: &str) -> Value {
 
 fn child_revision_hints(event_id: &str) -> Value {
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [{
             "id": "node-child",
             "root_id": "node-root",
@@ -5085,7 +5405,6 @@ fn child_revision_hints(event_id: &str) -> Value {
                 "event_id": event_id,
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "direct", "summary": "The new event states this attempt."},
             "metadata": {}
         }],
@@ -5101,7 +5420,6 @@ fn child_revision_hints(event_id: &str) -> Value {
                 "event_id": event_id,
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "direct", "summary": "The new attempt continues the root."},
             "metadata": {}
         }]
@@ -5145,7 +5463,6 @@ fn two_root_reframe_hints() -> Value {
                 "event_id": "event-2",
                 "payload_pointer": "/payload/content"
             }],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "direct", "summary": "The prior event supports a separate root."},
             "metadata": {}
         }));
@@ -5203,7 +5520,6 @@ fn synthetic_pressure_hints(events: &[EventEnvelope], open_count: usize) -> Valu
         "title": "Pressure root",
         "summary": "Root for pressure rendering.",
         "source_refs": [source_ref_hint("src-root", &events[0].id)],
-        "confidence": {"level": "high", "score": 0.9},
         "basis": {"kind": "operator", "summary": "Synthetic root."},
         "metadata": {}
     })];
@@ -5223,7 +5539,6 @@ fn synthetic_pressure_hints(events: &[EventEnvelope], open_count: usize) -> Valu
             "title": title,
             "summary": format!("Reason {index}: this approach was abandoned because it repeated a falsified search pattern with no new evidence."),
             "source_refs": [source_ref_hint(&format!("src-dead-{index}"), &events[index].id)],
-            "confidence": {"level": "high", "score": 0.9},
             "basis": {"kind": "operator", "summary": "Synthetic dead-end."},
             "metadata": {}
         }));
@@ -5247,7 +5562,6 @@ fn synthetic_pressure_hints(events: &[EventEnvelope], open_count: usize) -> Valu
             "title": format!("Open branch {index:03} with a deliberately long title to create slot byte pressure"),
             "summary": "Still open.",
             "source_refs": [source_ref_hint(&format!("src-open-{index:03}"), &events[event_index].id)],
-            "confidence": {"level": "medium", "score": 0.7},
             "basis": {"kind": "operator", "summary": "Synthetic open node."},
             "metadata": {}
         }));
@@ -5261,7 +5575,7 @@ fn synthetic_pressure_hints(events: &[EventEnvelope], open_count: usize) -> Valu
     }
 
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": nodes,
         "edges": edges
     })
@@ -5290,7 +5604,6 @@ fn backbone_edge_hint(
         "kind": "fork",
         "canonical_backbone": true,
         "source_refs": [source_ref_hint(source_ref_id, event_id)],
-        "confidence": {"level": "medium", "score": 0.7},
         "basis": {"kind": "operator", "summary": "Synthetic backbone edge."},
         "metadata": {}
     })
@@ -5404,7 +5717,7 @@ fn extract_observer_hints(events: &mut [EventEnvelope]) -> Value {
         );
     }
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": nodes,
         "edges": edges
     })

@@ -155,6 +155,7 @@ fn anthropic_effort(request: &ModelRequest) -> Option<&'static str> {
         ReasoningEffort::Medium => "high",
         ReasoningEffort::Large => "xhigh",
         ReasoningEffort::XLarge => "max",
+        ReasoningEffort::Max => "max",
     })
 }
 

@@ -94,6 +94,17 @@ impl ModelProvider for ChatGptProvider {
     }
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if !crate::catalog::model_supports_reasoning_effort(
+            crate::catalog::CHATGPT_PROVIDER_ID,
+            &request.model,
+            request.reasoning_effort,
+        ) {
+            return Err(ProviderError::rejected(format!(
+                "reasoning effort `{}` is not supported by chatgpt/{}",
+                request.reasoning_effort.as_str(),
+                request.model
+            )));
+        }
         let credentials = self.auth.load()?;
         let body = request_body(&request);
         let agent = ureq::builder().redirects(0).build();
@@ -204,15 +215,21 @@ fn request_body(request: &ModelRequest) -> Value {
         "model": request.model,
         "instructions": request.instructions,
         "input": request.input.iter().filter_map(input_item).collect::<Vec<_>>(),
-        "tools": request.tools.iter().map(tool_definition).collect::<Vec<_>>(),
-        "tool_choice": "auto",
         "stream": true,
         "store": false,
         "reasoning": { "effort": request.reasoning_effort.compat_level() },
     });
-    if let Some(max_output_tokens) = request.max_output_tokens {
-        body["max_output_tokens"] = json!(max_output_tokens);
+    if !request.tools.is_empty() {
+        body["tools"] = json!(request
+            .tools
+            .iter()
+            .map(tool_definition)
+            .collect::<Vec<_>>());
+        body["tool_choice"] = json!("auto");
     }
+    // The ChatGPT subscription endpoint rejects the Responses API
+    // `max_output_tokens` field with HTTP 400. Euler still accounts for the
+    // requested cap and enforces companion output budgets after the call.
     body
 }
 

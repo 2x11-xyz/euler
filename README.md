@@ -31,8 +31,8 @@ survived. Your agent's dead ends are data. Euler keeps them.
   every permission decision is logged, and failures are verbose rather than silent.
 
 The signature extension is the **causal DAG**: your session rendered as a
-branching tree of attempts (open, promising, verified, dead end,
-superseded) queryable by you *and by the agent itself*, so runs compound
+branching tree of attempts (open, blocked, inconclusive, successful, verified,
+dead end, superseded, or abandoned) queryable by you *and by the agent itself*, so runs compound
 instead of restarting.
 
 <p align="center"><img src="docs/assets/knuth-gpt55-xhigh.png" alt="Causal DAG of a GPT-5.5 session implementing Knuth's up-arrow, rendered as a 3D constellation against a time axis" width="760"></p>
@@ -101,7 +101,7 @@ euler exec --provider openrouter --model anthropic/claude-sonnet-5 \
   "Read BRIEF.md in this directory and carry it out fully."
 ```
 
-Useful exec flags: `--reasoning-effort xsmall..xlarge`,
+Useful exec flags: `--reasoning-effort xsmall|small|medium|large|xlarge|max`,
 `--auto-compaction off|stubs`, `--extensions <list|none>`,
 `--auto-approve read-only|trusted-local`, `--provenance <path>`.
 

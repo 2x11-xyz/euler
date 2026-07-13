@@ -1,5 +1,11 @@
 use super::*;
 
+mod causal_dag;
+use self::causal_dag::{
+    action_items as causal_dag_action_items, format_items as causal_dag_format_items,
+    short_session_id as short_causal_session_id,
+};
+
 impl BottomSurface {
     /// Space in the `/code-swarm` checklist toggles the selected row.
     /// Checking beyond the cap is refused (the row stays visible and dim in
@@ -39,6 +45,7 @@ pub struct ReplacementPicker {
     resume_preview: Option<Vec<String>>,
     /// `/code-swarm --user`: route the checklist save to the user tier.
     pub(super) code_swarm_user_tier: bool,
+    pub(super) causal_dag_stats: Option<CausalDagStats>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +55,8 @@ pub(super) enum PickerKind {
     Resume,
     Extensions,
     CodeSwarmModels,
+    CausalDagActions,
+    CausalDagFormats,
 }
 
 impl PickerKind {
@@ -82,6 +91,12 @@ impl ReplacementPicker {
                 ..
             }
         );
+        let causal_dag_stats = match &spec {
+            PickerSpec::CausalDagActions(stats) | PickerSpec::CausalDagFormats(stats) => {
+                Some(stats.clone())
+            }
+            _ => None,
+        };
         let (kind, title, items) = picker_parts(spec);
         let mut picker = Self {
             kind,
@@ -94,6 +109,7 @@ impl ReplacementPicker {
             saved_draft,
             resume_preview: None,
             code_swarm_user_tier,
+            causal_dag_stats,
         };
         picker.ensure_selected_visible();
         picker
@@ -155,6 +171,12 @@ impl ReplacementPicker {
         }
         if self.kind == PickerKind::CodeSwarmModels {
             return self.render_code_swarm_lines(width);
+        }
+        if matches!(
+            self.kind,
+            PickerKind::CausalDagActions | PickerKind::CausalDagFormats
+        ) {
+            return self.render_causal_dag_lines(width);
         }
         let mut lines = vec![truncate_display(
             &format!("{} {}", self.title, self.position_indicator()),
@@ -478,7 +500,12 @@ impl ReplacementPicker {
         let filtered_count = self.filtered_indices().len();
         let end = (self.scroll_offset + self.visible_rows).min(filtered_count);
         let visible = end.saturating_sub(self.scroll_offset);
-        let rows = if self.kind == PickerKind::Model {
+        let rows = if matches!(
+            self.kind,
+            PickerKind::CausalDagActions | PickerKind::CausalDagFormats
+        ) {
+            4 + self.items.len()
+        } else if self.kind == PickerKind::Model {
             5 + visible
                 + usize::from(filtered_count == 0)
                 + usize::from(self.selected_detail().is_some())
@@ -628,6 +655,21 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
                 "/code-swarm · reviewer models · project tier".to_owned()
             },
             code_swarm_model_items(choices, &selected),
+        ),
+        PickerSpec::CausalDagActions(stats) => (
+            PickerKind::CausalDagActions,
+            format!(
+                "CAUSAL DAG · session {} · {} nodes · {} cross-arcs",
+                short_causal_session_id(&stats.session_id),
+                stats.node_count,
+                stats.cross_arc_count
+            ),
+            causal_dag_action_items(stats),
+        ),
+        PickerSpec::CausalDagFormats(stats) => (
+            PickerKind::CausalDagFormats,
+            format!("CAUSAL DAG › EXPORT · {} nodes", stats.node_count),
+            causal_dag_format_items(),
         ),
     }
 }

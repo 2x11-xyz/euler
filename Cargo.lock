@@ -512,10 +512,12 @@ dependencies = [
 name = "euler-extension-causal-dag"
 version = "0.1.1"
 dependencies = [
+ "euler-agents",
  "euler-core",
  "euler-event",
  "euler-provider",
  "euler-sdk",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",

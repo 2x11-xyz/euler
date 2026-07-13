@@ -1,6 +1,6 @@
 {
-  "schema": "euler.causal_dag.v2",
-  "media_type": "application/vnd.euler.causal-dag.v2+json",
+  "schema": "euler.causal_dag.v3",
+  "media_type": "application/vnd.euler.causal-dag.v3+json",
   "generated_at": "2026-06-29T00:06:00.000Z",
   "session": {
     "id": "session-knuth",
@@ -49,10 +49,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.95
-        },
         "basis": {
           "kind": "direct",
           "summary": "The tool result explicitly records the failed assumption.",
@@ -80,10 +76,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.93
-        },
         "basis": {
           "kind": "direct",
           "summary": "The repair command states the new method and reused failure material.",
@@ -111,10 +103,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.98
-        },
         "basis": {
           "kind": "direct",
           "summary": "The user message defines the search objective.",
@@ -142,10 +130,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.9
-        },
         "basis": {
           "kind": "direct",
           "summary": "The user message opens a related second root.",
@@ -173,10 +157,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.88
-        },
         "basis": {
           "kind": "direct",
           "summary": "The check result verifies the sibling branch.",
@@ -204,10 +184,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.92
-        },
         "basis": {
           "kind": "direct",
           "summary": "The check result verifies the final path.",
@@ -241,10 +217,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.9
-        },
         "basis": {
           "kind": "direct",
           "summary": "The note artifact records the repaired path.",
@@ -272,10 +244,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.7
-        },
         "basis": {
           "kind": "direct",
           "summary": "The second root is explicitly related to the primary search.",
@@ -303,10 +271,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.9
-        },
         "basis": {
           "kind": "direct",
           "summary": "The failed tool result records the left fork.",
@@ -334,10 +298,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.88
-        },
         "basis": {
           "kind": "direct",
           "summary": "The sibling check records the right fork.",
@@ -365,10 +325,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "low",
-          "score": 0.4
-        },
         "basis": {
           "kind": "direct",
           "summary": "The sibling branch is inspired by the failure but is not a structural child of it.",
@@ -405,10 +361,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.9
-        },
         "basis": {
           "kind": "direct",
           "summary": "The edge cites the failed recurrence output and the repair command that reused it.",
@@ -437,10 +389,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.9
-        },
         "basis": {
           "kind": "direct",
           "summary": "The check result verifies the repaired path.",

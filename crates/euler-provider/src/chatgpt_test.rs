@@ -56,13 +56,24 @@ fn request_uses_responses_shape() {
 }
 
 #[test]
-fn request_applies_responses_max_output_tokens_cap() {
+fn request_omits_unsupported_max_output_tokens_cap() {
     let mut request = minimal_request();
     request.max_output_tokens = Some(11);
 
     let body = request_body(&request);
 
-    assert_eq!(body["max_output_tokens"], 11);
+    assert!(body.get("max_output_tokens").is_none());
+}
+
+#[test]
+fn request_without_tools_omits_tool_fields() {
+    let mut request = minimal_request();
+    request.tools.clear();
+
+    let body = request_body(&request);
+
+    assert!(body.get("tools").is_none());
+    assert!(body.get("tool_choice").is_none());
 }
 
 #[test]
@@ -344,4 +355,12 @@ fn request_forwards_reasoning_effort_compat_level() {
     xlarge.reasoning_effort = crate::ReasoningEffort::XLarge;
     let body = request_body(&xlarge);
     assert_eq!(body["reasoning"]["effort"], "xhigh");
+
+    for model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+        let mut max = xlarge.clone();
+        max.model = model.to_owned();
+        max.reasoning_effort = crate::ReasoningEffort::Max;
+        let body = request_body(&max);
+        assert_eq!(body["reasoning"]["effort"], "max", "model {model}");
+    }
 }

@@ -1,6 +1,6 @@
 {
-  "schema": "euler.causal_dag.v2",
-  "media_type": "application/vnd.euler.causal-dag.v2+json",
+  "schema": "euler.causal_dag.v3",
+  "media_type": "application/vnd.euler.causal-dag.v3+json",
   "generated_at": "2026-06-29T01:05:00.000Z",
   "session": {
     "id": "session-emdash",
@@ -38,10 +38,6 @@
         "title": "Narrow to style priors",
         "summary": "The projection records a narrowing decision after weak ordering evidence.",
         "source_refs": [],
-        "confidence": {
-          "level": "low",
-          "score": 0.35
-        },
         "basis": {
           "kind": "inferred",
           "summary": "The checkpoint is inferred from the bounded sequence and marked degraded.",
@@ -67,10 +63,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.86
-        },
         "basis": {
           "kind": "direct",
           "summary": "The evidence tool result states this claim directly.",
@@ -98,10 +90,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.74
-        },
         "basis": {
           "kind": "direct",
           "summary": "The counterexample probe blocks this mechanism.",
@@ -129,10 +117,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.96
-        },
         "basis": {
           "kind": "direct",
           "summary": "The user message defines the mechanism question.",
@@ -160,10 +144,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.68
-        },
         "basis": {
           "kind": "direct",
           "summary": "The assistant summary records the preferred explanation.",
@@ -193,10 +173,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.72
-        },
         "basis": {
           "kind": "direct",
           "summary": "The refutation probe refines the analysis toward a blocked competing claim.",
@@ -224,10 +200,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.7
-        },
         "basis": {
           "kind": "direct",
           "summary": "The evidence probe supports continuing through a narrowing checkpoint.",
@@ -255,10 +227,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.65
-        },
         "basis": {
           "kind": "direct",
           "summary": "The final summary integrates the competing mechanism evidence.",
@@ -286,10 +254,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "high",
-          "score": 0.82
-        },
         "basis": {
           "kind": "direct",
           "summary": "The corpus probe is evidence for the synthesis.",
@@ -307,10 +271,6 @@
         "kind": "related",
         "canonical_backbone": false,
         "source_refs": [],
-        "confidence": {
-          "level": "low",
-          "score": 0.2
-        },
         "basis": {
           "kind": "inferred",
           "summary": "The relation is inferred and therefore depends on the degraded projection.",
@@ -336,10 +296,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "medium",
-          "score": 0.7
-        },
         "basis": {
           "kind": "direct",
           "summary": "The counterexample probe refutes the tokenizer-only mechanism.",
@@ -367,10 +323,6 @@
             "blob": null
           }
         ],
-        "confidence": {
-          "level": "low",
-          "score": 0.3
-        },
         "basis": {
           "kind": "chronology",
           "summary": "Chronology preserves readable order when causal parentage is weak.",

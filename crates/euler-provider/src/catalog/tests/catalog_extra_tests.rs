@@ -27,7 +27,18 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
     // the platform API (pi reference: openai-codex.models.ts vs
     // openai.models.ts) — the two providers must not share one list.
     let chatgpt = catalog.provider("chatgpt").expect("chatgpt");
-    assert!(chatgpt.models().any(|model| model.id() == "gpt-5.6-luna"));
+    for model_id in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+        let chatgpt_model = chatgpt
+            .models()
+            .find(|model| model.id() == model_id)
+            .expect("ChatGPT GPT-5.6 model");
+        let openai_model = openai
+            .models()
+            .find(|model| model.id() == model_id)
+            .expect("OpenAI GPT-5.6 model");
+        assert_eq!(chatgpt_model.context_window_tokens(), Some(372_000));
+        assert_eq!(openai_model.context_window_tokens(), Some(272_000));
+    }
     assert!(chatgpt.models().all(|model| model.id() != "gpt-4.1"));
     assert!(openai.models().any(|model| model.id() == "gpt-4.1"));
 

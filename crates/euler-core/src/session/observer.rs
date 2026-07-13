@@ -104,11 +104,6 @@ fn observer_task(brief: &Value) -> Result<(AgentTask, Value), &'static str> {
     // incomplete-span fence key off this persona — hardcoding a different
     // one silently defeats them, feeding the previous observer's own hints
     // back into the next observation window as evidence (review #105 F1).
-    // The observer spawns under the persona the brief declares (falling back
-    // to the generic default). The extension's self-event exclusion and
-    // incomplete-span fence key off this persona — hardcoding a different
-    // one silently defeats them, feeding the previous observer's own hints
-    // back into the next observation window as evidence (review #105 F1).
     let persona = brief
         .get("persona")
         .and_then(Value::as_str)

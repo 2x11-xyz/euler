@@ -22,7 +22,7 @@ euler exec \
 Flags:
 
 - `--provider <id>` / `--model <id>` choose the route.
-- `--reasoning-effort xsmall|small|medium|large|xlarge` sets Euler's reasoning knob.
+- `--reasoning-effort xsmall|small|medium|large|xlarge|max` sets Euler's reasoning knob. `max` is available on GPT-5.6 Luna, Sol, and Terra. Codex's `ultra` mode is not a provider effort: it combines wire-level `max` with proactive multi-agent delegation, which Euler does not yet expose as a driver workflow.
 - `--auto-approve read-only|trusted-local` controls headless permissions.
   - `read-only` is the default: file reads are allowed; writes and shell are denied.
   - `trusted-local`: file reads, file writes, and shell are session-allowed.

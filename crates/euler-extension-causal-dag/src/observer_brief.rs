@@ -1,12 +1,13 @@
-use super::{input_error, is_causal_dag_self_event, OBSERVER_BRIEF_SCHEMA_NAME};
+use super::{input_error, is_causal_dag_self_event, HINTS_SCHEMA_NAME, OBSERVER_BRIEF_SCHEMA_NAME};
 use crate::active_state::ActiveGraphState;
+use euler_agents::{MAX_SYSTEM_PROMPT_BYTES, MAX_TASK_BYTES};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{
     ArgSpec, Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError,
     HostApi, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const OBSERVER_BRIEF_COMMAND_NAME: &str = "observer-brief";
 
@@ -17,8 +18,6 @@ const DEFAULT_LIMIT: usize = 64;
 // 2664 in + 6726 out, so the default leaves
 // headroom for both.
 pub(super) const DEFAULT_MAX_TOKENS: u64 = 24_576;
-const MAX_TASK_BYTES: usize = 24 * 1024;
-const MAX_SYSTEM_PROMPT_BYTES: usize = 8 * 1024;
 const EXTRACT_CHARS: usize = 240;
 pub(super) const OBSERVER_PERSONA: &str = "causal-dag-observer";
 
@@ -74,58 +73,91 @@ impl ExtensionCommand for CausalDagObserverBriefCommand {
             after_event_id.as_deref(),
         )?;
         let listed = listed_events(&page.events[..fence.listable_len])?;
-        // session_id is a validation input (family semantics: the host reads
-        // exactly one session log; this asserts the caller's expectation),
-        // never a query filter.
-        if let Some(session_id) = &input.session_id {
-            if let Some(mismatch) = listed
-                .iter()
-                .find(|event| event.session.as_str() != session_id)
-            {
-                return Err(input_error(format!(
-                    "causal-dag observer-brief session_id `{session_id}` does not match event `{}` session `{}`",
-                    mismatch.id, mismatch.session
-                )));
-            }
-        }
-        if listed.is_empty() {
-            if let (Some(active), Some(cursor)) =
-                (active.as_ref(), fence.watermark_event_id.as_deref())
-            {
-                if cursor != active.cursor_event_id() {
-                    active.advance_cursor(host, cursor)?;
-                }
-            }
-            if fence.stalled_on_incomplete_observer {
-                return Err(input_error(
-                    "causal-dag observer page ends inside a prior observer run; increase limit",
-                ));
-            }
-            return Err(input_error(
-                "causal-dag observer-brief found no observable events",
-            ));
-        }
-        let task = build_task(&listed, active.as_ref(), ObserverBriefMode::Incremental)?;
+        validate_listed_session(input.session_id.as_deref(), &listed)?;
+        reject_empty_listing(host, active.as_ref(), &fence, &listed)?;
+        let fitted = fit_task(&listed, active.as_ref(), ObserverBriefMode::Incremental)?;
         let system_prompt = observer_system_prompt()?;
-        let watermark_event_id = fence
-            .watermark_event_id
-            .or_else(|| {
-                active
-                    .as_ref()
-                    .map(ActiveGraphState::cursor_event_id)
-                    .map(str::to_owned)
-            })
-            .or(input.after_event_id.clone())
-            .ok_or_else(|| input_error("causal-dag observer-brief has no watermark event"))?;
+        let watermark_event_id =
+            fitted_watermark(&fitted, &listed, &fence, active.as_ref(), &input)?;
         Ok(output_value(
             &input,
             active.as_ref(),
-            task,
+            fitted,
             system_prompt,
             watermark_event_id,
-            listed.len(),
         ))
     }
+}
+
+fn validate_listed_session(
+    session_id: Option<&str>,
+    listed: &[EventEnvelope],
+) -> Result<(), ExtensionError> {
+    // The host reads one session log; this only asserts the caller's expectation.
+    let Some(session_id) = session_id else {
+        return Ok(());
+    };
+    let Some(mismatch) = listed
+        .iter()
+        .find(|event| event.session.as_str() != session_id)
+    else {
+        return Ok(());
+    };
+    Err(input_error(format!(
+        "causal-dag observer-brief session_id `{session_id}` does not match event `{}` session `{}`",
+        mismatch.id, mismatch.session
+    )))
+}
+
+fn reject_empty_listing(
+    host: &dyn HostApi,
+    active: Option<&ActiveGraphState>,
+    fence: &ObserverPageFence,
+    listed: &[EventEnvelope],
+) -> Result<(), ExtensionError> {
+    if !listed.is_empty() {
+        return Ok(());
+    }
+    if let (Some(active), Some(cursor)) = (active, fence.watermark_event_id.as_deref()) {
+        if cursor != active.cursor_event_id() {
+            active.advance_cursor(host, cursor)?;
+        }
+    }
+    let message = if fence.stalled_on_incomplete_observer {
+        "causal-dag observer page ends inside a prior observer run; increase limit"
+    } else {
+        "causal-dag observer-brief found no observable events"
+    };
+    Err(input_error(message))
+}
+
+fn fitted_watermark(
+    fitted: &FittedObserverTask,
+    listed: &[EventEnvelope],
+    fence: &ObserverPageFence,
+    active: Option<&ActiveGraphState>,
+    input: &ObserverBriefInput,
+) -> Result<String, ExtensionError> {
+    let fitted_prefix = if fitted.listed_event_count < listed.len() {
+        Some(
+            listed
+                .get(fitted.listed_event_count.saturating_sub(1))
+                .ok_or_else(|| input_error("causal-dag observer task fit no source events"))?
+                .id
+                .clone(),
+        )
+    } else {
+        None
+    };
+    fitted_prefix
+        .or_else(|| fence.watermark_event_id.clone())
+        .or_else(|| {
+            active
+                .map(ActiveGraphState::cursor_event_id)
+                .map(str::to_owned)
+        })
+        .or_else(|| input.after_event_id.clone())
+        .ok_or_else(|| input_error("causal-dag observer-brief has no watermark event"))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -213,11 +245,17 @@ fn brief_args() -> Vec<ArgSpec> {
 fn output_value(
     input: &ObserverBriefInput,
     active: Option<&ActiveGraphState>,
-    task: String,
+    fitted: FittedObserverTask,
     system_prompt: String,
     watermark_event_id: String,
-    listed_event_count: usize,
 ) -> Value {
+    let FittedObserverTask {
+        task,
+        listed_event_count,
+        source_aliases,
+        node_aliases,
+        edge_aliases,
+    } = fitted;
     let mut observe_window = Map::new();
     observe_window.insert("limit".to_owned(), input.limit.into());
     if let Some(scan_limit) = input.scan_limit {
@@ -241,8 +279,10 @@ fn output_value(
     // the observe window (plus the session assertion) so the apply step
     // folds the companion's hints over the same bounded page the brief
     // listed — replay fidelity between what the observer saw and what the
-    // projection covers.
     let mut apply = observe_window.clone();
+    apply.insert("source_aliases".to_owned(), json!(source_aliases));
+    apply.insert("node_aliases".to_owned(), json!(node_aliases));
+    apply.insert("edge_aliases".to_owned(), json!(edge_aliases));
     apply.insert(
         "expected_predecessor_artifact_event_id".to_owned(),
         active
@@ -412,13 +452,95 @@ pub(super) enum ObserverBriefMode {
     Replacement,
 }
 
-pub(super) fn build_task(
+pub(super) struct FittedObserverTask {
+    pub(super) task: String,
+    pub(super) listed_event_count: usize,
+    pub(super) source_aliases: BTreeMap<String, String>,
+    pub(super) node_aliases: BTreeMap<String, String>,
+    pub(super) edge_aliases: BTreeMap<String, String>,
+}
+
+pub(super) fn build_full_task(
     events: &[EventEnvelope],
     active: Option<&ActiveGraphState>,
     mode: ObserverBriefMode,
-) -> Result<String, ExtensionError> {
+) -> Result<FittedObserverTask, ExtensionError> {
+    let parts = task_parts(events, active, mode)?;
+    Ok(FittedObserverTask {
+        task: render_fitting_task(&parts.lines, &parts.event_lines)?,
+        listed_event_count: parts.event_lines.len(),
+        source_aliases: parts.source_aliases,
+        node_aliases: parts.node_aliases,
+        edge_aliases: parts.edge_aliases,
+    })
+}
+
+pub(super) fn fit_task(
+    events: &[EventEnvelope],
+    active: Option<&ActiveGraphState>,
+    mode: ObserverBriefMode,
+) -> Result<FittedObserverTask, ExtensionError> {
+    let parts = task_parts(events, active, mode)?;
+    if minimum_task_len(&parts.lines, &parts.event_lines) <= MAX_TASK_BYTES {
+        return Ok(FittedObserverTask {
+            task: render_fitting_task(&parts.lines, &parts.event_lines)?,
+            listed_event_count: parts.event_lines.len(),
+            source_aliases: parts.source_aliases,
+            node_aliases: parts.node_aliases,
+            edge_aliases: parts.edge_aliases,
+        });
+    }
+
+    let mut lower = 0usize;
+    let mut upper = parts.event_lines.len();
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        if minimum_task_len(&parts.lines, &parts.event_lines[..candidate]) <= MAX_TASK_BYTES {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    if lower == 0 {
+        return Err(task_too_large_error(
+            minimum_task_len(&parts.lines, &parts.event_lines),
+            parts.event_lines.len(),
+        ));
+    }
+    let mut source_aliases = parts.source_aliases;
+    source_aliases.retain(|alias, _| {
+        alias
+            .strip_prefix('e')
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+            .is_none_or(|index| index < lower)
+    });
+    Ok(FittedObserverTask {
+        task: render_fitting_task(&parts.lines, &parts.event_lines[..lower])?,
+        listed_event_count: lower,
+        source_aliases,
+        node_aliases: parts.node_aliases,
+        edge_aliases: parts.edge_aliases,
+    })
+}
+
+struct ObserverTaskParts {
+    lines: Vec<String>,
+    event_lines: Vec<EventTaskLine>,
+    source_aliases: BTreeMap<String, String>,
+    node_aliases: BTreeMap<String, String>,
+    edge_aliases: BTreeMap<String, String>,
+}
+
+fn task_parts(
+    events: &[EventEnvelope],
+    active: Option<&ActiveGraphState>,
+    mode: ObserverBriefMode,
+) -> Result<ObserverTaskParts, ExtensionError> {
     let mut lines =
         vec!["Observe this bounded Euler event window and revise the committed graph.".to_owned()];
+    let mut source_aliases = BTreeMap::new();
+    let mut node_aliases = BTreeMap::new();
+    let mut edge_aliases = BTreeMap::new();
     if let Some(active) = active {
         lines.push(match mode {
             ObserverBriefMode::Incremental =>
@@ -432,24 +554,241 @@ pub(super) fn build_task(
             active.watermark_event_id(),
             active.cursor_event_id()
         ));
-        lines.extend(compact_graph_lines(active.artifact())?);
+        let compact = compact_graph_lines(active.artifact(), mode)?;
+        lines.extend(compact.lines);
+        source_aliases.extend(compact.source_aliases);
+        node_aliases = compact.node_aliases;
+        edge_aliases = compact.edge_aliases;
     } else {
         lines.push("No graph exists yet; return the complete initial graph.".to_owned());
     }
-    lines.push("NEW EVENTS (new claims cite these event ids):".to_owned());
-    lines.extend(events.iter().map(event_line));
-    let task = lines.join("\n");
-    let actual = task.len();
-    if actual > MAX_TASK_BYTES {
-        return Err(input_error(format!(
-            "observer-brief task listing is {actual} bytes for {} listed events; reduce limit or replace the active graph with a smaller manual reframe",
-            events.len()
-        )));
-    }
-    Ok(task)
+    lines.push("Event extracts may be shortened to fit the agent-task contract; source aliases and kinds remain complete.".to_owned());
+    lines.push("NEW EVENTS (use the source alias as source_ref.event_id):".to_owned());
+    let event_lines = events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| EventTaskLine::new(format!("e{index}"), event))
+        .collect::<Vec<_>>();
+    source_aliases.extend(event_source_aliases(&event_lines));
+    Ok(ObserverTaskParts {
+        lines,
+        event_lines,
+        source_aliases,
+        node_aliases,
+        edge_aliases,
+    })
 }
 
-fn compact_graph_lines(artifact: &Value) -> Result<Vec<String>, ExtensionError> {
+fn render_fitting_task(
+    lines: &[String],
+    event_lines: &[EventTaskLine],
+) -> Result<String, ExtensionError> {
+    let minimum_len = minimum_task_len(lines, event_lines);
+    if minimum_len > MAX_TASK_BYTES {
+        return Err(task_too_large_error(minimum_len, event_lines.len()));
+    }
+    let complete = render_task(lines, event_lines, EXTRACT_CHARS);
+    if complete.len() <= MAX_TASK_BYTES {
+        return Ok(complete);
+    }
+    let mut lower = 0usize;
+    let mut upper = EXTRACT_CHARS;
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        if render_task(lines, event_lines, candidate).len() <= MAX_TASK_BYTES {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    Ok(render_task(lines, event_lines, lower))
+}
+
+fn minimum_task_len(lines: &[String], event_lines: &[EventTaskLine]) -> usize {
+    render_task(lines, event_lines, 0).len()
+}
+
+fn task_too_large_error(minimum_len: usize, event_count: usize) -> ExtensionError {
+    input_error(format!(
+        "observer-brief minimum task listing is {minimum_len} bytes for {event_count} listed events; reduce limit or replace the active graph with a smaller manual reframe"
+    ))
+}
+
+struct EventTaskLine {
+    alias: String,
+    event_id: String,
+    prefix: String,
+    extract: String,
+}
+
+impl EventTaskLine {
+    fn new(alias: String, event: &EventEnvelope) -> Self {
+        Self {
+            prefix: format!("{alias} {}", event.kind.as_str()),
+            alias,
+            event_id: event.id.clone(),
+            extract: payload_extract(event),
+        }
+    }
+}
+
+fn event_source_aliases(events: &[EventTaskLine]) -> BTreeMap<String, String> {
+    events
+        .iter()
+        .map(|event| (event.alias.clone(), event.event_id.clone()))
+        .collect()
+}
+
+pub(super) fn resolve_source_aliases(hints: &mut Value, aliases: &BTreeMap<String, String>) {
+    for collection in ["nodes", "edges"] {
+        let Some(records) = hints.get_mut(collection).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for record in records {
+            let Some(source_refs) = record.get_mut("source_refs").and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for source_ref in source_refs {
+                let canonical = source_ref
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .and_then(|event_id| aliases.get(event_id))
+                    .cloned();
+                if let (Some(object), Some(canonical)) = (source_ref.as_object_mut(), canonical) {
+                    object.insert("event_id".to_owned(), canonical.into());
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn resolve_record_aliases(
+    hints: &mut Value,
+    node_aliases: &BTreeMap<String, String>,
+    edge_aliases: &BTreeMap<String, String>,
+) {
+    if let Some(nodes) = hints.get_mut("nodes").and_then(Value::as_array_mut) {
+        for node in nodes {
+            resolve_field_alias(node, "id", node_aliases);
+            resolve_field_alias(node, "root_id", node_aliases);
+        }
+    }
+    if let Some(edges) = hints.get_mut("edges").and_then(Value::as_array_mut) {
+        for edge in edges {
+            resolve_field_alias(edge, "id", edge_aliases);
+            resolve_field_alias(edge, "from", node_aliases);
+            resolve_field_alias(edge, "to", node_aliases);
+        }
+    }
+}
+
+fn resolve_field_alias(record: &mut Value, field: &str, aliases: &BTreeMap<String, String>) {
+    let canonical = record
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|value| aliases.get(value))
+        .cloned();
+    if let (Some(object), Some(canonical)) = (record.as_object_mut(), canonical) {
+        object.insert(field.to_owned(), canonical.into());
+    }
+}
+
+fn render_task(prefix: &[String], events: &[EventTaskLine], extract_chars: usize) -> String {
+    let mut task = prefix.join("\n");
+    for event in events {
+        task.push('\n');
+        task.push_str(&event.prefix);
+        let extract = truncate_chars(&event.extract, extract_chars);
+        if !extract.is_empty() {
+            task.push(' ');
+            task.push_str(&extract);
+        }
+    }
+    task
+}
+
+struct CompactGraph {
+    lines: Vec<String>,
+    source_aliases: BTreeMap<String, String>,
+    node_aliases: BTreeMap<String, String>,
+    edge_aliases: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct AliasSet {
+    by_value: BTreeMap<String, String>,
+}
+
+impl AliasSet {
+    fn from_values<'a>(prefix: char, values: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut aliases = Self::default();
+        for value in values {
+            let next = aliases.by_value.len();
+            aliases
+                .by_value
+                .entry(value.to_owned())
+                .or_insert_with(|| format!("{prefix}{next}"));
+        }
+        aliases
+    }
+
+    fn get<'a>(&'a self, value: &str, kind: &str) -> Result<&'a str, ExtensionError> {
+        self.by_value
+            .get(value)
+            .map(String::as_str)
+            .ok_or_else(|| input_error(format!("active causal-dag {kind} alias is missing")))
+    }
+
+    fn mappings(&self) -> BTreeMap<String, String> {
+        self.by_value
+            .iter()
+            .map(|(value, alias)| (alias.clone(), value.clone()))
+            .collect()
+    }
+}
+
+struct GraphAliasSets {
+    sources: AliasSet,
+    nodes: AliasSet,
+    edges: AliasSet,
+}
+
+impl GraphAliasSets {
+    fn from_records(
+        nodes: &[Value],
+        edges: &[Value],
+        mode: ObserverBriefMode,
+    ) -> Result<Self, ExtensionError> {
+        let node_ids = nodes
+            .iter()
+            .map(|node| graph_string(node, "id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let edge_ids = edges
+            .iter()
+            .map(|edge| graph_string(edge, "id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let source_ids = if mode == ObserverBriefMode::Replacement {
+            nodes
+                .iter()
+                .chain(edges.iter())
+                .map(latest_graph_source_id)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            sources: AliasSet::from_values('s', source_ids),
+            nodes: AliasSet::from_values('n', node_ids),
+            edges: AliasSet::from_values('v', edge_ids),
+        })
+    }
+}
+
+fn compact_graph_lines(
+    artifact: &Value,
+    mode: ObserverBriefMode,
+) -> Result<CompactGraph, ExtensionError> {
     let nodes = artifact
         .pointer("/forest/nodes")
         .and_then(Value::as_array)
@@ -458,36 +797,121 @@ fn compact_graph_lines(artifact: &Value) -> Result<Vec<String>, ExtensionError> 
         .pointer("/forest/edges")
         .and_then(Value::as_array)
         .ok_or_else(|| input_error("active causal-dag graph has invalid edges"))?;
-    let mut lines = Vec::with_capacity(nodes.len() + edges.len());
+    let aliases = GraphAliasSets::from_records(nodes, edges, mode)?;
+    let mut parents = BTreeMap::new();
+    let mut non_backbone = Vec::new();
+    for edge in edges {
+        let backbone = edge
+            .get("canonical_backbone")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| input_error("active causal-dag edge has invalid backbone flag"))?;
+        if backbone {
+            let child = graph_string(edge, "to")?;
+            if parents.insert(child, edge).is_some() {
+                return Err(input_error(format!(
+                    "active causal-dag node `{child}` has multiple backbone parents"
+                )));
+            }
+        } else {
+            non_backbone.push(edge);
+        }
+    }
+    let mut represented_parents = BTreeSet::new();
+    let mut lines = Vec::with_capacity(nodes.len() + non_backbone.len());
     for node in nodes {
         let id = graph_string(node, "id")?;
-        let root_id = graph_string(node, "root_id")?;
-        let kind = graph_string(node, "kind")?;
-        let status = graph_string(node, "status")?;
-        let title = graph_string(node, "title")?;
-        let sources = graph_source_ids(node)?;
-        lines.push(format!(
-            "N {id} root={root_id} kind={kind} status={status} sources={} title={}",
-            sources.join(","),
-            truncate_chars(title, 96)
+        let parent = parents.get(id).copied();
+        if parent.is_some() {
+            represented_parents.insert(id);
+        }
+        lines.push(compact_node_line(
+            node,
+            parent,
+            mode,
+            &aliases.nodes,
+            &aliases.edges,
+            &aliases.sources,
+        )?);
+    }
+    if represented_parents.len() != parents.len() {
+        return Err(input_error(
+            "active causal-dag backbone references a missing child node",
         ));
     }
-    for edge in edges {
-        let sources = graph_source_ids(edge)?;
-        lines.push(format!(
-            "E {} {}->{} class={} kind={} backbone={} sources={}",
-            graph_string(edge, "id")?,
-            graph_string(edge, "from")?,
-            graph_string(edge, "to")?,
+    for edge in non_backbone {
+        let mut line = format!(
+            "E {} {}>{} {}/{}",
+            aliases.edges.get(graph_string(edge, "id")?, "edge")?,
+            aliases.nodes.get(graph_string(edge, "from")?, "node")?,
+            aliases.nodes.get(graph_string(edge, "to")?, "node")?,
             graph_string(edge, "class")?,
-            graph_string(edge, "kind")?,
-            edge.get("canonical_backbone")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| input_error("active causal-dag edge has invalid backbone flag"))?,
-            sources.join(",")
-        ));
+            graph_string(edge, "kind")?
+        );
+        if mode == ObserverBriefMode::Replacement {
+            line.push_str(&format!(
+                " src={}",
+                aliases
+                    .sources
+                    .get(latest_graph_source_id(edge)?, "source")?
+            ));
+        }
+        lines.push(line);
     }
-    Ok(lines)
+    Ok(CompactGraph {
+        lines,
+        source_aliases: aliases.sources.mappings(),
+        node_aliases: aliases.nodes.mappings(),
+        edge_aliases: aliases.edges.mappings(),
+    })
+}
+
+fn compact_node_line(
+    node: &Value,
+    parent: Option<&Value>,
+    mode: ObserverBriefMode,
+    node_ids: &AliasSet,
+    edge_ids: &AliasSet,
+    source_ids: &AliasSet,
+) -> Result<String, ExtensionError> {
+    let canonical_id = graph_string(node, "id")?;
+    let id = node_ids.get(canonical_id, "node")?;
+    let root_id = node_ids.get(graph_string(node, "root_id")?, "node")?;
+    let kind = graph_string(node, "kind")?;
+    let status = graph_string(node, "status")?;
+    let title = graph_string(node, "title")?;
+    if (kind == "root" && parent.is_some()) || (kind != "root" && parent.is_none()) {
+        return Err(input_error(format!(
+            "active causal-dag node `{id}` has invalid backbone parentage"
+        )));
+    }
+    let parent_fields = match parent {
+        Some(edge) if mode == ObserverBriefMode::Replacement => format!(
+            "p={} v={}:{} es={}",
+            node_ids.get(graph_string(edge, "from")?, "node")?,
+            edge_ids.get(graph_string(edge, "id")?, "edge")?,
+            graph_string(edge, "kind")?,
+            source_ids.get(latest_graph_source_id(edge)?, "source")?
+        ),
+        Some(edge) => format!(
+            "p={} v={}:{}",
+            node_ids.get(graph_string(edge, "from")?, "node")?,
+            edge_ids.get(graph_string(edge, "id")?, "edge")?,
+            graph_string(edge, "kind")?
+        ),
+        None => "p=- v=-".to_owned(),
+    };
+    let retained_source = if mode == ObserverBriefMode::Replacement {
+        format!(
+            " r={root_id} src={}",
+            source_ids.get(latest_graph_source_id(node)?, "source")?
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "N {id} {kind}/{status}{retained_source} {parent_fields} t={}",
+        truncate_chars(title, 56)
+    ))
 }
 
 fn graph_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, ExtensionError> {
@@ -497,28 +921,15 @@ fn graph_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, ExtensionErr
         .ok_or_else(|| input_error(format!("active causal-dag record has invalid `{key}`")))
 }
 
-fn graph_source_ids(value: &Value) -> Result<Vec<&str>, ExtensionError> {
+fn latest_graph_source_id(value: &Value) -> Result<&str, ExtensionError> {
     value
         .get("source_refs")
         .and_then(Value::as_array)
         .ok_or_else(|| input_error("active causal-dag record has invalid source_refs"))?
-        .iter()
-        .map(|source_ref| {
-            source_ref
-                .get("event_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| input_error("active causal-dag source ref has invalid event_id"))
-        })
-        .collect()
-}
-
-fn event_line(event: &EventEnvelope) -> String {
-    format!(
-        "{} {} {}",
-        event.id,
-        event.kind.as_str(),
-        payload_extract(event)
-    )
+        .last()
+        .and_then(|source_ref| source_ref.get("event_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| input_error("active causal-dag source ref has invalid event_id"))
 }
 
 fn payload_extract(event: &EventEnvelope) -> String {
@@ -617,27 +1028,37 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
+    let schema_instruction = format!("Use schema {HINTS_SCHEMA_NAME} and this shape:");
+    let schema_shape = format!(r#"{{"schema":"{HINTS_SCHEMA_NAME}","nodes":[],"edges":[]}}"#);
     let prompt = [
         "You are a generic Causal DAG observer for Euler.",
         "Return exactly one raw JSON object. Do not use markdown fences.",
-        "Use schema euler.causal_dag.hints.v1 and this shape:",
-        "{\"schema\":\"euler.causal_dag.hints.v1\",\"nodes\":[],\"edges\":[]}",
+        &schema_instruction,
+        &schema_shape,
         "The task may include a committed CURRENT GRAPH followed by NEW EVENTS.",
+        "CURRENT GRAPH uses N <node-alias> <kind>/<status> p=<parent-alias> v=<edge-alias>:<kind> t=<title>; E lines are non-backbone edges.",
+        "REPLACEMENT N lines also carry r=<root-alias>, src=<node-source-alias>, and es=<parent-edge-source-alias>; E lines carry src=<edge-source-alias>.",
+        "Existing node aliases are n0, n1, ...; existing edge aliases are v0, v1, ...; retained source aliases are s0, s1, ....",
+        "Copy existing aliases into revised output records; the host resolves them back to stable graph ids and canonical provenance ids before validation.",
+        "INCREMENTAL graph lines omit retained source refs because the host preserves all prior record evidence.",
         "The task declares MODE INCREMENTAL or MODE REPLACEMENT when CURRENT GRAPH is present.",
         "In INCREMENTAL mode, return only added or revised records; omitted records remain unchanged.",
         "In REPLACEMENT mode, return the complete replacement graph; omitted records are removed from the new interpretation but remain in prior artifacts.",
         "When no CURRENT GRAPH is present, return the complete initial graph.",
-        "Preserve stable node and edge ids unless the interpreted entity genuinely changed identity.",
+        "Preserve stable node and edge ids only while they describe the same material state.",
         "Revised records cite the NEW EVENTS that justify the revision; unchanged prior evidence is retained by the host.",
-        "A prior event id may be reused only when it is named in the CURRENT GRAPH record being revised.",
+        "Do not repeat CURRENT GRAPH source refs; the host preserves prior evidence on revised records.",
+        "For every NEW EVENT source ref, copy its e-prefixed alias into event_id and use payload_pointer /payload exactly; use null only for extension.artifact events.",
+        "The host resolves source aliases to canonical provenance event ids before committing the graph.",
         "Do not use old archive knowledge, fixture oracle labels, or target edge lists.",
         "Omit unsupported claims rather than inventing structure.",
-        "Node keys are exactly: id, root_id, kind, status, title, summary, source_refs, confidence, basis, metadata.",
-        "Edge keys are exactly: id, from, to, class, kind, canonical_backbone, source_refs, confidence, basis, metadata.",
+        "Node keys are exactly: id, root_id, kind, status, title, summary, source_refs, basis, metadata.",
+        "Edge keys are exactly: id, from, to, class, kind, canonical_backbone, source_refs, basis, metadata.",
         "Every source_ref uses exactly: id, event_id, payload_pointer.",
-        "Every confidence uses exactly {\"level\":\"high|medium|low\",\"score\":0.0..1.0}.",
         "Every basis uses exactly {\"kind\":\"direct|cluster|inferred|chronology|operator\",\"summary\":\"...\"}.",
-        "Use metadata: {} unless bounded derived annotation is necessary.",
+        "For each new node, set metadata.occurrence_source_ref_id to its local source_ref id for the event where that material state first occurred, not later documentation or verification.",
+        "For existing node revisions use metadata: {}; the host preserves the immutable occurrence anchor.",
+        "When later work creates a materially new integrated or verified state, add a successor checkpoint or synthesis; do not fold it into an earlier node and make a causal relation point backward.",
         "Allowed node kinds: root, attempt, claim, checkpoint, synthesis.",
         "Allowed statuses: open, blocked, dead_end, inconclusive, success, verified, superseded, abandoned.",
         "Allowed structural edge kinds: continuation, refinement, repair, fork, decomposition, integration, verification.",
@@ -652,12 +1073,14 @@ pub(super) fn observer_system_prompt() -> Result<String, ExtensionError> {
         "Use repair only when a later event explicitly reuses concrete failure material from a terminal branch.",
         "Use artifact_use only for source-session artifacts or outputs, not Causal DAG graph artifacts.",
         "Every returned node and edge must have at least one source_ref citing a NEW EVENT or a source named on its CURRENT GRAPH record.",
-        "JSON pointers are against the whole event object, usually /payload/content or /payload/output.",
-        "Stable ids should be short lowercase ids prefixed with node- or edge-.",
+        "Never guess a kind-specific payload field: /payload is the canonical pointer for listed events.",
+        "New stable ids should be short lowercase ids prefixed with node- or edge-; use the supplied aliases for existing records.",
     ]
     .join("\n");
     if prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
-        return Err(input_error("observer system_prompt exceeds 8192 bytes"));
+        return Err(input_error(format!(
+            "observer system_prompt exceeds {MAX_SYSTEM_PROMPT_BYTES} bytes"
+        )));
     }
     Ok(prompt)
 }

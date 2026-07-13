@@ -2,6 +2,8 @@ use super::theme::ThemeChoice;
 use euler_core::{ActiveGrant, ApprovalMode, GrantSource, ReasoningEffort};
 use euler_sdk::Capability;
 
+mod causal_dag;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
     pub token: &'static str,
@@ -27,6 +29,15 @@ pub struct CommandContext {
     pub extension_slash_commands: Vec<ExtensionSlashCommand>,
     /// Saved `/code-swarm` reviewer model set (provider::model strings).
     pub code_swarm_models: Vec<String>,
+    /// Current causal-DAG counts for its extension-owned picker surface.
+    pub causal_dag_stats: Option<CausalDagStats>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CausalDagStats {
+    pub session_id: String,
+    pub node_count: usize,
+    pub cross_arc_count: usize,
 }
 
 /// One extension row for the `/extension` manager picker.
@@ -230,7 +241,8 @@ impl EffortChoice {
             ReasoningEffort::Small => "small - light reasoning",
             ReasoningEffort::Medium => "medium - balanced default",
             ReasoningEffort::Large => "large - deeper reasoning",
-            ReasoningEffort::XLarge => "xlarge - maximum reasoning",
+            ReasoningEffort::XLarge => "xlarge - extra-high reasoning",
+            ReasoningEffort::Max => "max - maximum reasoning",
         };
         Self {
             effort,
@@ -405,8 +417,10 @@ pub enum CommandAction {
     ShowDiff,
     /// Token breakdown for the session (costs only when catalog prices exist).
     ShowUsage,
-    /// Dispatch to `causal-dag.export` (teach when extension disabled).
-    DagExport,
+    /// Drill from the causal-DAG action picker into its export formats.
+    OpenCausalDagExport {
+        stats: CausalDagStats,
+    },
     /// Open the extensions manager picker.
     OpenExtensionManager,
     /// Toggle extension enablement (registry + live session set).
@@ -454,6 +468,8 @@ pub enum PickerSpec {
         selected: Vec<String>,
         user_tier: bool,
     },
+    CausalDagActions(CausalDagStats),
+    CausalDagFormats(CausalDagStats),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -526,11 +542,6 @@ const COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec {
         token: "/usage",
         summary: "token usage for this session",
-        args: "",
-    },
-    CommandSpec {
-        token: "/dag",
-        summary: "export causal DAG for this session",
         args: "",
     },
     CommandSpec {
@@ -653,6 +664,17 @@ pub fn build_extension_slash_commands(
     let mut claimed = core_tokens;
     let mut out = Vec::new();
     for item in items {
+        if item.id == "causal-dag" {
+            claimed.insert("causal-dag".to_owned());
+            out.push(ExtensionSlashCommand {
+                token: "/causal-dag".to_owned(),
+                summary: "causal-dag · view, export, or refresh".to_owned(),
+                extension_id: item.id.clone(),
+                command: "surface".to_owned(),
+                enabled: item.enabled,
+            });
+            continue;
+        }
         if item.id == "code-swarm" {
             // TUI-side surface (picker + orchestration) keyed to this
             // extension; dispatched by the explicit "/code-swarm" arm, never
@@ -810,7 +832,7 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/timestamps" => CommandEffect::Action(CommandAction::ToggleTimestamps),
         "/diff" => CommandEffect::Action(CommandAction::ShowDiff),
         "/usage" => CommandEffect::Action(CommandAction::ShowUsage),
-        "/dag" => CommandEffect::Action(CommandAction::DagExport),
+        "/causal-dag" => causal_dag::effect(parsed.arg, context),
         "/code-swarm" => code_swarm_effect(parsed.arg, context),
         token => extension_slash_or_unknown(token, parsed.arg, context),
     }
@@ -917,23 +939,9 @@ fn extension_slash_or_unknown(
         // Arguments are never dropped: JSON parses here, `--flag` text is
         // parsed against the ArgSpec at resolve time, anything else is a
         // usage error.
-        let (input, raw_args) = match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
-            None => (serde_json::Value::Object(serde_json::Map::new()), None),
-            Some(json) if json.starts_with('{') => match serde_json::from_str(json) {
-                Ok(value) => (value, None),
-                Err(error) => {
-                    return CommandEffect::Message(format!("{token} input must be JSON: {error}"));
-                }
-            },
-            Some(flags) if flags.starts_with("--") => (
-                serde_json::Value::Object(serde_json::Map::new()),
-                Some(flags.to_owned()),
-            ),
-            Some(other) => {
-                return CommandEffect::Message(format!(
-                    "usage: {token} [--flag value…]  or  {token} {{json}}  — got `{other}`"
-                ));
-            }
+        let (input, raw_args) = match extension_argument_values(arg, token) {
+            Ok(values) => values,
+            Err(message) => return CommandEffect::Message(message),
         };
         return CommandEffect::Action(CommandAction::ExtensionRun {
             id: cmd.extension_id.clone(),
@@ -943,6 +951,25 @@ fn extension_slash_or_unknown(
         });
     }
     CommandEffect::Message(format!("unknown command: {token}"))
+}
+
+fn extension_argument_values(
+    arg: Option<&str>,
+    token: &str,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
+        None => Ok((serde_json::Value::Object(serde_json::Map::new()), None)),
+        Some(json) if json.starts_with('{') => serde_json::from_str(json)
+            .map(|value| (value, None))
+            .map_err(|error| format!("{token} input must be JSON: {error}")),
+        Some(flags) if flags.starts_with("--") => Ok((
+            serde_json::Value::Object(serde_json::Map::new()),
+            Some(flags.to_owned()),
+        )),
+        Some(other) => Err(format!(
+            "usage: {token} [--flag value…]  or  {token} {{json}}  — got `{other}`"
+        )),
+    }
 }
 
 /// Faint teach line when an extension-backed command is invoked while disabled.
@@ -1068,9 +1095,9 @@ fn effort_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
     };
     match ReasoningEffort::parse(level) {
         Some(effort) => CommandEffect::Action(CommandAction::SetReasoningEffort { effort }),
-        None => {
-            CommandEffect::Message("usage: /effort <xsmall|small|medium|large|xlarge>".to_owned())
-        }
+        None => CommandEffect::Message(
+            "usage: /effort <xsmall|small|medium|large|xlarge|max>".to_owned(),
+        ),
     }
 }
 
@@ -1227,6 +1254,12 @@ mod tests {
             dispatch_command("/effort xlarge", &context),
             CommandEffect::Action(CommandAction::SetReasoningEffort {
                 effort: ReasoningEffort::XLarge,
+            })
+        );
+        assert_eq!(
+            dispatch_command("/effort max", &context),
+            CommandEffect::Action(CommandAction::SetReasoningEffort {
+                effort: ReasoningEffort::Max,
             })
         );
         assert_eq!(
@@ -1416,30 +1449,11 @@ mod tests {
             .any(|spec| spec.token == "/theme" && spec.args.is_empty()));
         assert!(command_table().iter().any(|spec| spec.token == "/diff"));
         assert!(command_table().iter().any(|spec| spec.token == "/usage"));
-        assert!(command_table().iter().any(|spec| spec.token == "/dag"));
+        assert!(!command_table().iter().any(|spec| spec.token == "/dag"));
         assert!(command_table().iter().any(|spec| spec.token == "/rollback"));
         assert!(command_table()
             .iter()
             .any(|spec| spec.token == "/timestamps"));
-    }
-
-    #[test]
-    fn extension_slash_collisions_prefer_core_token_and_qualified_extension() {
-        let items = vec![ExtensionManagerItem {
-            id: "causal-dag".to_owned(),
-            display_name: "Causal DAG".to_owned(),
-            enabled: true,
-            bundled: true,
-            materialization: None,
-            version: "0.1.0".to_owned(),
-            commands: vec!["export".to_owned(), "catch-up".to_owned()],
-            capabilities: vec![],
-            audit_status: None,
-        }];
-        let cmds = build_extension_slash_commands(&items);
-        assert!(cmds.iter().any(|c| c.token == "/causal-dag.export"));
-        assert!(cmds.iter().any(|c| c.token == "/catch-up"));
-        assert!(!cmds.iter().any(|c| c.token == "/export"));
     }
 
     fn code_swarm_context(enabled: bool) -> CommandContext {
@@ -1693,7 +1707,9 @@ mod tests {
         );
         assert_eq!(
             dispatch_command("/effort extra-high", &context),
-            CommandEffect::Message("usage: /effort <xsmall|small|medium|large|xlarge>".to_owned())
+            CommandEffect::Message(
+                "usage: /effort <xsmall|small|medium|large|xlarge|max>".to_owned(),
+            )
         );
         assert_eq!(
             dispatch_command("/theme gruvbox", &context),
@@ -1722,7 +1738,7 @@ mod tests {
         );
         assert_eq!(
             dispatch_command("/dag", &context),
-            CommandEffect::Action(CommandAction::DagExport)
+            CommandEffect::Message("unknown command: /dag".to_owned())
         );
         assert!(matches!(
             dispatch_command("/extension run causal-dag.catch-up {", &context),

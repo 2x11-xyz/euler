@@ -12,7 +12,7 @@
 //!
 //! The `apply` value is the observe window the brief echoed (limit,
 //! scan_limit, after_event_id, watermark_event_id, session_id); the
-//! companion `output` is the observer's raw `euler.causal_dag.hints.v1`
+//! companion `output` is the observer's raw `euler.causal_dag.hints.v2`
 //! JSON. This command extracts the hints, folds them over the same bounded
 //! window via the shared observe path, writes the graph artifact, and
 //! publishes the `graph` context slot. The companion never writes: every
@@ -22,11 +22,13 @@ use super::{
     execute_observe_projection, input_error, ObservationCommit, ObserveInput,
     OBSERVER_HINT_MAX_BYTES,
 };
+use crate::observer_brief::{resolve_record_aliases, resolve_source_aliases};
 use crate::projection::Projection;
 use euler_sdk::{
     Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError, HostApi,
 };
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 pub(super) const OBSERVER_APPLY_COMMAND_NAME: &str = "observer-apply";
 
@@ -126,12 +128,21 @@ impl ObserverApplyInput {
             .ok_or_else(|| {
                 input_error("causal-dag observer-apply `companion` must be a JSON object")
             })?;
-        let hints = companion_hints(companion)?;
+        let mut hints = companion_hints(companion)?;
+        let source_aliases =
+            parse_aliases(apply.get("source_aliases"), "source_aliases", &['e', 's'])?;
+        let node_aliases = parse_aliases(apply.get("node_aliases"), "node_aliases", &['n'])?;
+        let edge_aliases = parse_aliases(apply.get("edge_aliases"), "edge_aliases", &['v'])?;
+        resolve_source_aliases(&mut hints, &source_aliases);
+        resolve_record_aliases(&mut hints, &node_aliases, &edge_aliases);
 
         let expected_predecessor_artifact_event_id =
             optional_apply_string(apply, "expected_predecessor_artifact_event_id")?;
         let mut observe_value = apply.clone();
         observe_value.remove("expected_predecessor_artifact_event_id");
+        observe_value.remove("source_aliases");
+        observe_value.remove("node_aliases");
+        observe_value.remove("edge_aliases");
         observe_value.insert("causal_dag".to_owned(), hints);
         Ok(Self {
             observe: ObserveInput::parse(&Value::Object(observe_value))?,
@@ -139,6 +150,48 @@ impl ObserverApplyInput {
             expected_predecessor_artifact_event_id,
         })
     }
+}
+
+fn parse_aliases(
+    value: Option<&Value>,
+    field: &str,
+    prefixes: &[char],
+) -> Result<BTreeMap<String, String>, ExtensionError> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let object = value.as_object().ok_or_else(|| {
+        input_error(format!(
+            "causal-dag observer-apply {field} must be an object"
+        ))
+    })?;
+    if object.len() > 4096 {
+        return Err(input_error(format!(
+            "causal-dag observer-apply {field} exceeds 4096 entries"
+        )));
+    }
+    object
+        .iter()
+        .map(|(alias, event_id)| {
+            let valid_alias = prefixes.iter().any(|prefix| {
+                alias.strip_prefix(*prefix).is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+                })
+            });
+            let event_id = event_id
+                .as_str()
+                .filter(|event_id| !event_id.is_empty() && event_id.len() <= 128);
+            if !valid_alias || alias.len() > 16 || event_id.is_none() {
+                return Err(input_error(format!(
+                    "causal-dag observer-apply {field} contains an invalid mapping"
+                )));
+            }
+            Ok((
+                alias.clone(),
+                event_id.expect("checked event id").to_owned(),
+            ))
+        })
+        .collect()
 }
 
 impl CompanionAttribution {
@@ -269,7 +322,7 @@ mod tests {
     use serde_json::json;
 
     const HEADER_ONLY_HINTS: &str =
-        r#"{"schema":"euler.causal_dag.hints.v1","nodes":[],"edges":[]}"#;
+        r#"{"schema":"euler.causal_dag.hints.v2","nodes":[],"edges":[]}"#;
 
     fn envelope(apply: Value, companion: Value) -> Value {
         json!({"apply": apply, "companion": companion})
@@ -312,7 +365,7 @@ mod tests {
         assert_eq!(parsed.observe.session_id.as_deref(), Some("session-1"));
         assert_eq!(
             parsed.observe.hints["schema"],
-            json!("euler.causal_dag.hints.v1")
+            json!("euler.causal_dag.hints.v2")
         );
         assert_eq!(
             parsed.companion.child_agent_id.as_deref(),
@@ -339,10 +392,42 @@ mod tests {
             let parsed = ObserverApplyInput::parse(&input).expect("parse fenced output");
             assert_eq!(
                 parsed.observe.hints["schema"],
-                json!("euler.causal_dag.hints.v1"),
+                json!("euler.causal_dag.hints.v2"),
                 "input: {fenced:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolves_brief_source_and_record_aliases_before_observe_validation() {
+        let hints = json!({
+            "schema": "euler.causal_dag.hints.v2",
+            "nodes": [{
+                "id": "n0",
+                "root_id": "n0",
+                "source_refs": [{"event_id": "s0", "payload_pointer": "/payload"}]
+            }],
+            "edges": [{"id": "v0", "from": "n0", "to": "n1"}]
+        });
+        let input = envelope(
+            json!({
+                "source_aliases": {"s0": "event-canonical"},
+                "node_aliases": {"n0": "node-root", "n1": "node-child"},
+                "edge_aliases": {"v0": "edge-child"}
+            }),
+            ok_companion(&hints.to_string()),
+        );
+
+        let parsed = ObserverApplyInput::parse(&input).expect("parse aliased output");
+        assert_eq!(parsed.observe.hints["nodes"][0]["id"], "node-root");
+        assert_eq!(parsed.observe.hints["nodes"][0]["root_id"], "node-root");
+        assert_eq!(
+            parsed.observe.hints["nodes"][0]["source_refs"][0]["event_id"],
+            "event-canonical"
+        );
+        assert_eq!(parsed.observe.hints["edges"][0]["id"], "edge-child");
+        assert_eq!(parsed.observe.hints["edges"][0]["from"], "node-root");
+        assert_eq!(parsed.observe.hints["edges"][0]["to"], "node-child");
     }
 
     #[test]
@@ -364,7 +449,7 @@ mod tests {
             ),
             (
                 envelope(
-                    json!({"causal_dag": {"schema": "euler.causal_dag.hints.v1"}}),
+                    json!({"causal_dag": {"schema": "euler.causal_dag.hints.v2"}}),
                     ok_companion(HEADER_ONLY_HINTS),
                 ),
                 "must not carry `causal_dag`",
@@ -435,7 +520,7 @@ mod tests {
     fn rejects_oversized_companion_output() {
         let padding = "n".repeat(OBSERVER_HINT_MAX_BYTES);
         let oversized =
-            format!(r#"{{"schema":"euler.causal_dag.hints.v1","nodes":["{padding}"],"edges":[]}}"#);
+            format!(r#"{{"schema":"euler.causal_dag.hints.v2","nodes":["{padding}"],"edges":[]}}"#);
         let input = envelope(json!({}), json!({"ok": true, "output": oversized}));
 
         let error = ObserverApplyInput::parse(&input)

@@ -490,7 +490,7 @@ fn lint_reasoning(value: &Value, scope: &str, warnings: &mut Vec<String>) {
     for (level, value) in effort_map {
         if !matches!(
             level.as_str(),
-            "minimal" | "low" | "medium" | "high" | "xhigh"
+            "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
         ) {
             warnings.push(format!("ignored {rscope} effort_map level `{level}` because it is not a known Euler reasoning level"));
         } else if !value.is_string() {

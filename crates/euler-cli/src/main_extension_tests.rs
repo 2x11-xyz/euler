@@ -179,7 +179,7 @@ fn extension_parse_accepts_management_commands() {
 #[test]
 fn headless_companion_run_happy_path_with_scripted_provider() {
     let (_temp, mut session) = companion_test_session(vec![FixtureResponse::Assistant(
-        "{\"schema\":\"euler.causal_dag.hints.v1\",\"nodes\":[],\"edges\":[]}".to_owned(),
+        "{\"schema\":\"euler.causal_dag.hints.v2\",\"nodes\":[],\"edges\":[]}".to_owned(),
     )]);
     let request = json!({
         "task": "observe listed events",
@@ -206,7 +206,7 @@ fn headless_companion_run_happy_path_with_scripted_provider() {
     assert!(output["result"]["output"]
         .as_str()
         .unwrap()
-        .contains("euler.causal_dag.hints.v1"));
+        .contains("euler.causal_dag.hints.v2"));
 }
 
 #[test]
@@ -249,7 +249,7 @@ fn headless_companion_run_capability_escalation_fails_cleanly() {
 }
 
 #[test]
-fn headless_observer_companion_observe_composition_persists_artifact() {
+fn headless_observer_companion_apply_composition_persists_artifact() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("workspace");
     std::fs::create_dir(&root).expect("workspace");
@@ -275,17 +275,21 @@ fn headless_observer_companion_observe_composition_persists_artifact() {
         .run_turn("unrelated event after brief")
         .expect("append after brief");
 
-    let hints: Value = serde_json::from_str(
-        companion_line["result"]["output"]
-            .as_str()
-            .expect("companion output"),
-    )
-    .expect("hints json");
-    let mut observe_input = brief["observe_window"].clone();
-    observe_input["causal_dag"] = hints;
+    let apply_input = json!({
+        "apply": brief["apply"].clone(),
+        "companion": {
+            "ok": companion_line["result"]["ok"].clone(),
+            "summary": companion_line["result"]["summary"].clone(),
+            "output": companion_line["result"]["output"].clone(),
+            "error": companion_line["result"]["error"].clone(),
+            "child_agent_id": companion_line["child_agent_id"].clone(),
+            "spawn_event_id": companion_line["spawn_event_id"].clone(),
+            "result_event_id": companion_line["result_event_id"].clone()
+        }
+    });
     let observe_line = execute_headless_extension_run(
         &mut session,
-        &format!("causal-dag.observe {}", observe_input),
+        &format!("causal-dag.observer-apply {apply_input}"),
     );
 
     assert_eq!(observe_line["type"], json!("extension_run_result"));
@@ -317,9 +321,33 @@ fn headless_observer_companion_observe_composition_persists_artifact() {
         })
         .map(|event| event.id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    assert!(source_ids
+    let result_event_id = companion_line["result_event_id"]
+        .as_str()
+        .expect("result event id");
+    let spawn_event_id = companion_line["spawn_event_id"]
+        .as_str()
+        .expect("spawn event id");
+    assert!(source_ids.contains(&result_event_id));
+    assert!(!source_ids.contains(&spawn_event_id));
+
+    // The observer result is construction lineage for the artifact, but it
+    // must never become evidence for a graph node or edge.
+    let relative_path = artifact.payload["path"].as_str().expect("artifact path");
+    let graph: Value = serde_json::from_slice(
+        &std::fs::read(temp.path().join(relative_path)).expect("artifact bytes"),
+    )
+    .expect("artifact json");
+    for record in graph["forest"]["nodes"]
+        .as_array()
+        .expect("graph nodes")
         .iter()
-        .all(|event_id| !companion_machinery.contains(event_id)));
+        .chain(graph["forest"]["edges"].as_array().expect("graph edges"))
+    {
+        for source_ref in record["source_refs"].as_array().expect("source refs") {
+            let event_id = source_ref["event_id"].as_str().expect("source event id");
+            assert!(!companion_machinery.contains(event_id));
+        }
+    }
 }
 
 #[test]
@@ -644,7 +672,7 @@ fn extension_parse_accepts_causal_dag_record_observation_run() {
 }
 
 #[test]
-fn causal_dag_catalog_lists_observe_command() {
+fn causal_dag_catalog_lists_registered_commands() {
     let descriptor = bundled_extensions::bundled_descriptor_by_id("causal-dag")
         .expect("descriptor load")
         .expect("causal-dag");
@@ -658,6 +686,7 @@ fn causal_dag_catalog_lists_observe_command() {
         commands,
         vec![
             "export",
+            "view",
             "update",
             "catch-up",
             "observe",
@@ -1215,7 +1244,7 @@ fn dynamic_observer_hints(prompt: &str) -> String {
         "observer task should list at least two source ids"
     );
     json!({
-        "schema": "euler.causal_dag.hints.v1",
+        "schema": "euler.causal_dag.hints.v2",
         "nodes": [
             {
                 "id": "node-root",
@@ -1225,7 +1254,6 @@ fn dynamic_observer_hints(prompt: &str) -> String {
                 "title": "Started attempt",
                 "summary": "The session started a task.",
                 "source_refs": [{"id": "src-root", "event_id": ids[0], "payload_pointer": "/payload/content"}],
-                "confidence": {"level": "high", "score": 0.9},
                 "basis": {"kind": "direct", "summary": "Listed event starts the attempt."},
                 "metadata": {}
             },
@@ -1237,7 +1265,6 @@ fn dynamic_observer_hints(prompt: &str) -> String {
                 "title": "Dead end",
                 "summary": "The attempted path was abandoned.",
                 "source_refs": [{"id": "src-dead", "event_id": ids[1], "payload_pointer": "/payload/content"}],
-                "confidence": {"level": "medium", "score": 0.7},
                 "basis": {"kind": "direct", "summary": "Listed event closes this branch."},
                 "metadata": {}
             }
@@ -1250,7 +1277,6 @@ fn dynamic_observer_hints(prompt: &str) -> String {
             "kind": "continuation",
             "canonical_backbone": true,
             "source_refs": [{"id": "src-edge", "event_id": ids[1], "payload_pointer": "/payload/content"}],
-            "confidence": {"level": "medium", "score": 0.7},
             "basis": {"kind": "direct", "summary": "The later listed event follows the first."},
             "metadata": {}
         }]

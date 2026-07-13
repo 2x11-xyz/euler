@@ -1,6 +1,7 @@
 use super::*;
 use crate::ui::commands::{
-    command_table, permission_choices, theme_choices, EffortChoice, ModelChoice, ResumeItem,
+    build_extension_slash_commands, command_table, permission_choices, theme_choices,
+    CausalDagStats, EffortChoice, ExtensionManagerItem, ModelChoice, ResumeItem,
 };
 use crate::ui::theme::ThemeChoice;
 use euler_core::{ApprovalMode, ReasoningEffort};
@@ -28,6 +29,84 @@ fn code_swarm_checked(surface: &BottomSurface) -> usize {
         panic!("picker should own surface");
     };
     picker.items.iter().filter(|item| item.current).count()
+}
+
+fn causal_dag_surface() -> BottomSurface {
+    let extension_items = vec![ExtensionManagerItem {
+        id: "causal-dag".to_owned(),
+        display_name: "Causal DAG".to_owned(),
+        enabled: true,
+        bundled: true,
+        materialization: None,
+        version: "0.2.0".to_owned(),
+        commands: vec!["view".to_owned(), "export".to_owned(), "refresh".to_owned()],
+        capabilities: vec![],
+        audit_status: None,
+    }];
+    let context = CommandContext {
+        extension_slash_commands: build_extension_slash_commands(&extension_items),
+        extension_items,
+        causal_dag_stats: Some(CausalDagStats {
+            session_id: "01KX8VEXAMPLE".to_owned(),
+            node_count: 35,
+            cross_arc_count: 7,
+        }),
+        ..CommandContext::default()
+    };
+    BottomSurface::new(context)
+}
+
+#[test]
+fn causal_dag_picker_drills_into_formats_and_steps_back() {
+    let mut surface = causal_dag_surface();
+    surface.open_palette();
+    surface.palette_insert("causal-dag");
+    assert_eq!(surface.confirm(), SurfaceEvent::None);
+    let actions = surface
+        .surface_lines(100)
+        .expect("action picker")
+        .join("\n");
+    assert!(actions.contains("CAUSAL DAG · session 01KX8V… · 35 nodes · 7 cross-arcs"));
+    assert!(actions.contains("view      Show current graph"));
+    assert!(actions.contains("refresh   Re-observe recent activity"));
+
+    surface.move_selection_down();
+    assert_eq!(surface.confirm(), SurfaceEvent::None);
+    let formats = surface
+        .surface_lines(100)
+        .expect("format picker")
+        .join("\n");
+    assert!(formats.contains("CAUSAL DAG › EXPORT · 35 nodes"));
+    assert!(formats.contains("html      Interactive viewer"));
+    assert!(formats.contains("summary   Compact GRAPH: slot text"));
+    assert!(formats.contains("⌫ back"));
+
+    assert!(surface.picker_backspace_steps_back());
+    assert!(matches!(
+        surface.owner(),
+        BottomOwner::Picker(picker) if picker.kind == PickerKind::CausalDagActions
+    ));
+    assert!(surface.picker_backspace_steps_back());
+    assert!(matches!(surface.owner(), BottomOwner::Palette(_)));
+}
+
+#[test]
+fn causal_dag_format_selection_runs_the_extension_with_selected_format() {
+    let mut surface = causal_dag_surface();
+    surface.open_picker(PickerSpec::CausalDagFormats(CausalDagStats {
+        session_id: "session".to_owned(),
+        node_count: 3,
+        cross_arc_count: 1,
+    }));
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::ExtensionRun {
+            id: "causal-dag".to_owned(),
+            command: "export".to_owned(),
+            input: serde_json::json!({"format": "html"}),
+            raw_args: None,
+        })
+    );
 }
 
 #[test]
@@ -942,7 +1021,7 @@ fn code_swarm_backspace_steps_back_to_palette_when_filter_is_empty() {
         user_tier: false,
     });
 
-    assert!(surface.code_swarm_backspace_steps_back_to_palette());
+    assert!(surface.picker_backspace_steps_back());
     assert!(matches!(surface.owner(), BottomOwner::Palette(_)));
     assert_eq!(surface.composer(), &saved);
 }
@@ -951,7 +1030,7 @@ fn code_swarm_backspace_steps_back_to_palette_when_filter_is_empty() {
 fn code_swarm_backspace_does_not_step_back_while_filter_has_text() {
     let mut surface = code_swarm_picker_surface(Vec::new());
     surface.palette_insert("gl");
-    assert!(!surface.code_swarm_backspace_steps_back_to_palette());
+    assert!(!surface.picker_backspace_steps_back());
     assert!(matches!(surface.owner(), BottomOwner::Picker(_)));
 }
 
