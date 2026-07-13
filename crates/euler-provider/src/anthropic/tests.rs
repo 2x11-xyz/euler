@@ -62,6 +62,98 @@ fn request_maps_system_text_tools_and_sonnet_thinking() {
 }
 
 #[test]
+fn large_launch_prompt_maps_to_one_wellformed_text_block() {
+    // Regression for #8: a long launch prompt must produce exactly one
+    // well-formed user text block carrying the whole prompt — request shaping
+    // does not degrade with size.
+    let prompt = "word ".repeat(1600); // ~8 KB, far past the ~1.5 KB report
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: "sys".to_owned(),
+        input: vec![ModelInputItem::Message {
+            role: ModelRole::User,
+            content: prompt.clone(),
+        }],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(body["messages"][0]["role"], "user");
+    let content = body["messages"][0]["content"].as_array().expect("content");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], prompt);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+}
+
+#[test]
+fn empty_message_is_dropped_rather_than_sent_as_empty_text_block() {
+    // Anthropic 400s on an empty text content block. An assistant turn recorded
+    // with no text (e.g. tool-call only) must not surface one (#8).
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![
+            ModelInputItem::Message {
+                role: ModelRole::User,
+                content: "real question".to_owned(),
+            },
+            ModelInputItem::Message {
+                role: ModelRole::Assistant,
+                content: "   ".to_owned(),
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "empty assistant message dropped");
+    assert_eq!(messages[0]["role"], "user");
+    // No block anywhere is an empty text block.
+    for message in messages {
+        for block in message["content"].as_array().expect("content") {
+            if block["type"] == "text" {
+                assert!(!block["text"].as_str().unwrap().trim().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_successful_tool_output_becomes_a_placeholder_block() {
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![ModelInputItem::ToolOutput {
+            call_id: "c1".to_owned(),
+            name: "run_shell".to_owned(),
+            ok: true,
+            output: Some(String::new()),
+            error: None,
+            exit_code: Some(0),
+        }],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    let text = &body["messages"][0]["content"][0]["content"][0]["text"];
+    assert_eq!(text, "[no output]", "empty tool_result must not be empty");
+}
+
+#[test]
 fn request_applies_max_tokens_cap() {
     let request = ModelRequest {
         model: DEFAULT_MODEL.to_owned(),
