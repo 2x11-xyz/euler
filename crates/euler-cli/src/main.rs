@@ -830,10 +830,9 @@ enum Command {
     Scrub(ScrubArgs),
 }
 
-/// `euler scrub <session> <value>...` — post-close credential removal (issue
-/// #100). Resolves a closed session by id or name and removes each value from
-/// every persistent surface. At least one explicit value is required: unlike
-/// the live `/scrub`, a closed session has no in-context detection candidate.
+/// `euler scrub <session>` — post-close credential removal (issue #100).
+/// Resolves a closed session by id or name and reads exact values from stdin,
+/// keeping them out of shell history and the process command line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScrubArgs {
     session: String,
@@ -869,10 +868,8 @@ fn run_scrub(args: ScrubArgs) -> Result<()> {
         return Err(anyhow!("no session found with id or name {}", args.session));
     };
     let values = read_scrub_values_from_stdin()?;
-    let index_path = store.home().sessions_dir().join("index.jsonl");
     let surfaces = euler_core::scrub::ScrubSurfaces {
         workspace_root: record.root(),
-        index_path: Some(index_path.as_path()),
     };
     let report = euler_core::scrub::scrub_closed_session(
         record.session_dir(),
@@ -895,10 +892,13 @@ fn read_scrub_values_from_stdin() -> Result<Vec<String>> {
     }
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
+    parse_scrub_values(&input)
+}
+
+fn parse_scrub_values(input: &str) -> Result<Vec<String>> {
     let values: Vec<String> = input
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.trim().is_empty())
         .map(str::to_owned)
         .collect();
     if values.is_empty() {

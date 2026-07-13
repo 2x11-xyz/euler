@@ -9,17 +9,18 @@
 //! - **live** `/scrub` runs against the session's own writer mid-turn;
 //! - **post-close** `euler scrub` runs against a closed session directory.
 //!
-//! Both remove the value from every persistent surface — the append-only log,
-//! externalized blobs, workspace pre-image checkpoints, the session-title
-//! sidecar, and the store index — and append a `secret.scrubbed` audit event
-//! (counts only, never the value). Already-exported or pushed copies cannot be
-//! recalled; the audit note and the report both say so.
+//! Both remove the value from every session-owned persistent surface — the
+//! append-only log, externalized blobs, workspace pre-image checkpoints,
+//! extension artifacts and private state, and the session-title sidecar — then
+//! append a `secret.scrubbed` audit event (counts only, never the value).
+//! Already-exported, copied, terminal-scrollback, or pushed data cannot be
+//! recalled.
 
 use crate::home::{containing_dir, private_open_options, set_file_mode_0600, sync_dir};
-use crate::provenance::{LogScrubStats, NonLogScrub, ProvenanceWriter, ProvenanceWriterError};
-use std::fs::{self};
+use crate::provenance::{ProvenanceWriter, ProvenanceWriterError};
+use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -52,31 +53,16 @@ pub struct ScrubReport {
     pub events_rewritten: usize,
     pub blobs_rewritten: usize,
     pub checkpoints_rewritten: usize,
+    pub extension_artifacts_rewritten: usize,
+    pub extension_state_files_rewritten: usize,
     pub replacements: usize,
     pub sidecar_scrubbed: bool,
-    pub index_scrubbed: bool,
     pub audit_event_id: Option<String>,
 }
 
 impl ScrubReport {
-    fn from_log(stats: LogScrubStats) -> Self {
-        Self {
-            events_rewritten: stats.events_rewritten,
-            blobs_rewritten: stats.blobs_rewritten,
-            checkpoints_rewritten: stats.checkpoints_rewritten,
-            replacements: stats.replacements,
-            sidecar_scrubbed: false,
-            index_scrubbed: false,
-            audit_event_id: stats.audit_event_id,
-        }
-    }
-
     pub fn anything_scrubbed(&self) -> bool {
         self.replacements > 0
-            || self.blobs_rewritten > 0
-            || self.checkpoints_rewritten > 0
-            || self.sidecar_scrubbed
-            || self.index_scrubbed
     }
 
     /// One-line human summary for the slash command / CLI. Never contains the
@@ -86,11 +72,14 @@ impl ScrubReport {
             return "scrub: nothing matched — no occurrences on any surface".to_owned();
         }
         let mut parts = Vec::new();
-        if self.replacements > 0 {
+        parts.push(format!(
+            "{} occurrence{}",
+            self.replacements,
+            plural(self.replacements),
+        ));
+        if self.events_rewritten > 0 {
             parts.push(format!(
-                "{} occurrence{} across {} event{}",
-                self.replacements,
-                plural(self.replacements),
+                "{} event{}",
                 self.events_rewritten,
                 plural(self.events_rewritten),
             ));
@@ -109,14 +98,25 @@ impl ScrubReport {
                 plural(self.checkpoints_rewritten)
             ));
         }
+        if self.extension_artifacts_rewritten > 0 {
+            parts.push(format!(
+                "{} extension artifact{}",
+                self.extension_artifacts_rewritten,
+                plural(self.extension_artifacts_rewritten)
+            ));
+        }
+        if self.extension_state_files_rewritten > 0 {
+            parts.push(format!(
+                "{} extension state file{}",
+                self.extension_state_files_rewritten,
+                plural(self.extension_state_files_rewritten)
+            ));
+        }
         if self.sidecar_scrubbed {
             parts.push("session title".to_owned());
         }
-        if self.index_scrubbed {
-            parts.push("store index".to_owned());
-        }
         format!(
-            "scrubbed {} — already-exported or pushed copies cannot be recalled",
+            "scrubbed {} — already-exported, copied, terminal-scrollback, or pushed data cannot be recalled",
             parts.join(", ")
         )
     }
@@ -138,17 +138,13 @@ pub struct ScrubSurfaces<'a> {
     /// Workspace root for `.euler/checkpoints` pre-images (from the session's
     /// recorded root). `None` skips checkpoint scrubbing.
     pub workspace_root: Option<&'a Path>,
-    /// The store's `index.jsonl`, whose entry carries the session name. `None`
-    /// skips index scrubbing (e.g. a detached session directory).
-    pub index_path: Option<&'a Path>,
 }
 
 /// Post-close scrub: remove `secrets` from every surface of `session_dir`.
 ///
-/// The non-log surfaces (sidecar, index) are scrubbed FIRST so their outcome is
-/// known before the audit commits — a failure there aborts before any audit
-/// claims success, and a secret found only there is still recorded. The log
-/// rewrite + `secret.scrubbed` audit then commit last, reflecting all surfaces.
+/// The writer lock is acquired before any surface changes, so this path cannot
+/// mutate an active session and then discover the ownership conflict. The
+/// success audit is appended only after every scrubbed surface is durable.
 pub fn scrub_closed_session(
     session_dir: &Path,
     session_id: &str,
@@ -159,146 +155,139 @@ pub fn scrub_closed_session(
     if secrets.is_empty() {
         return Ok(ScrubReport::default());
     }
-    let non_log = scrub_non_log_surfaces(session_dir, surfaces.index_path, &secrets)?;
     let writer = ProvenanceWriter::new(session_dir.join("events.jsonl"))?;
-    let stats = writer.scrub_and_audit(
-        &secrets,
-        surfaces.workspace_root,
-        session_id,
-        SCRUB_AGENT,
-        non_log,
-    )?;
+    let report =
+        writer.scrub_and_audit(&secrets, surfaces.workspace_root, session_id, SCRUB_AGENT)?;
     drop(writer);
-    Ok(report_from(stats, non_log))
+    Ok(report)
 }
 
-/// Scrub the surfaces that live outside the append-only log — the session-title
-/// sidecar and the store index — structurally (as JSON), returning what each
-/// held. Shared by the closed and live paths; the log itself is scrubbed by the
-/// caller (a fresh writer, or the live session's).
-pub fn scrub_non_log_surfaces(
-    session_dir: &Path,
-    index_path: Option<&Path>,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FileScrub {
+    pub changed: bool,
+    pub secret_replacements: usize,
+}
+
+/// Structurally scrub one JSON state file and update any content-addressed
+/// references changed by the same transaction. Malformed files are scrubbed as
+/// bytes: corruption must not become a reason to leave a credential behind.
+pub(crate) fn scrub_json_file(
+    path: &Path,
     secrets: &[String],
-) -> Result<NonLogScrub, ScrubError> {
-    let sidecar = scrub_json_file(
-        &session_dir.join("session.json"),
-        secrets,
-        JsonShape::Object,
-    )?;
-    let index = match index_path {
-        Some(path) => scrub_json_file(path, secrets, JsonShape::Lines)?,
-        None => false,
+    references: &[(String, String)],
+) -> io::Result<FileScrub> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(FileScrub::default()),
+        Err(error) => return Err(error),
     };
-    Ok(NonLogScrub { sidecar, index })
-}
-
-/// Build a report from the log stats and the non-log outcome, so the live and
-/// closed paths share one report shape.
-pub fn report_from(stats: LogScrubStats, non_log: NonLogScrub) -> ScrubReport {
-    let mut report = ScrubReport::from_log(stats);
-    report.sidecar_scrubbed = non_log.sidecar;
-    report.index_scrubbed = non_log.index;
-    report
-}
-
-/// Whether a JSON surface is a single object (`session.json`) or one JSON value
-/// per line (`index.jsonl`).
-#[derive(Clone, Copy)]
-enum JsonShape {
-    Object,
-    Lines,
-}
-
-/// Scrub secrets out of a private JSON surface STRUCTURALLY: parse, replace in
-/// string leaves, re-serialize. Unlike a raw substring replace, a secret
-/// containing JSON metacharacters (`"`, `\`) can never corrupt the file. Returns
-/// whether anything changed; a missing or unparseable file is a no-op. Written
-/// 0600 via temp+rename+fsync, matching the store's other sidecars.
-fn scrub_json_file(path: &Path, secrets: &[String], shape: JsonShape) -> Result<bool, ScrubError> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let (scrubbed, replacements) = match shape {
-        JsonShape::Object => scrub_json_object(&content, secrets),
-        JsonShape::Lines => scrub_json_lines(&content, secrets),
-    };
-    if replacements == 0 {
-        return Ok(false);
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("scrub surface is not a regular file: {}", path.display()),
+        ));
     }
+    let original = fs::read(path)?;
+    let (scrubbed, secret_replacements) =
+        match serde_json::from_slice::<serde_json::Value>(&original) {
+            Ok(mut value) => {
+                let replacements = crate::redaction::scrub_secrets_in_value(&mut value, secrets);
+                let references_changed = replace_references_in_value(&mut value, references);
+                if replacements == 0 && !references_changed {
+                    return Ok(FileScrub::default());
+                }
+                let mut bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
+                bytes.push(b'\n');
+                (bytes, replacements)
+            }
+            Err(_) => {
+                let (mut bytes, replacements) =
+                    crate::redaction::scrub_secrets_in_bytes(&original, secrets);
+                for (from, to) in references {
+                    bytes =
+                        crate::redaction::replace_bytes(&bytes, from.as_bytes(), to.as_bytes()).0;
+                }
+                (bytes, replacements)
+            }
+        };
+    if scrubbed == original {
+        return Ok(FileScrub {
+            changed: false,
+            secret_replacements,
+        });
+    }
+    write_private_atomic(path, &scrubbed)?;
+    Ok(FileScrub {
+        changed: true,
+        secret_replacements,
+    })
+}
+
+fn replace_references_in_value(
+    value: &mut serde_json::Value,
+    references: &[(String, String)],
+) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            let mut changed = false;
+            for (from, to) in references {
+                if text.contains(from) {
+                    *text = text.replace(from, to);
+                    changed = true;
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= replace_references_in_value(item, references);
+            }
+            changed
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            let entries = std::mem::take(map);
+            for (mut key, mut value) in entries {
+                for (from, to) in references {
+                    if key.contains(from) {
+                        key = key.replace(from, to);
+                        changed = true;
+                    }
+                }
+                changed |= replace_references_in_value(&mut value, references);
+                let key = crate::redaction::unique_json_key(map, key);
+                map.insert(key, value);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("scrub");
-    let temp_path = path.with_file_name(format!(".{file_name}.{}.scrub.tmp", Ulid::new()));
-    {
+    let temp_path: PathBuf = path.with_file_name(format!(".{file_name}.{}.scrub.tmp", Ulid::new()));
+    let result = (|| {
         let mut file = private_open_options()
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
         set_file_mode_0600(&file)?;
-        file.write_all(scrubbed.as_bytes())?;
+        file.write_all(bytes)?;
         file.flush()?;
         file.sync_data()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        sync_dir(containing_dir(path))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
     }
-    fs::rename(&temp_path, path)?;
-    sync_dir(containing_dir(path))?;
-    Ok(true)
-}
-
-/// Scrub a single JSON object (session.json), preserving pretty formatting.
-fn scrub_json_object(content: &str, secrets: &[String]) -> (String, usize) {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) else {
-        // Malformed (should not happen for euler-written sidecars): fall back to
-        // a raw substring scrub rather than leave a secret behind.
-        return crate::redaction::scrub_secrets_in_text(content, secrets);
-    };
-    let replacements = crate::redaction::scrub_secrets_in_value(&mut value, secrets);
-    if replacements == 0 {
-        return (content.to_owned(), 0);
-    }
-    match serde_json::to_string_pretty(&value) {
-        Ok(mut serialized) => {
-            serialized.push('\n');
-            (serialized, replacements)
-        }
-        Err(_) => crate::redaction::scrub_secrets_in_text(content, secrets),
-    }
-}
-
-/// Scrub JSONL (index.jsonl) line by line, each parsed as a JSON value.
-fn scrub_json_lines(content: &str, secrets: &[String]) -> (String, usize) {
-    let mut total = 0;
-    let mut out = String::with_capacity(content.len());
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            out.push('\n');
-            continue;
-        }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(mut value) => {
-                total += crate::redaction::scrub_secrets_in_value(&mut value, secrets);
-                match serde_json::to_string(&value) {
-                    Ok(serialized) => out.push_str(&serialized),
-                    Err(_) => {
-                        let (serialized, count) =
-                            crate::redaction::scrub_secrets_in_text(line, secrets);
-                        total += count;
-                        out.push_str(&serialized);
-                    }
-                }
-            }
-            Err(_) => {
-                let (serialized, count) = crate::redaction::scrub_secrets_in_text(line, secrets);
-                total += count;
-                out.push_str(&serialized);
-            }
-        }
-        out.push('\n');
-    }
-    (out, total)
+    result
 }
 
 #[derive(Debug, Error)]
@@ -307,6 +296,8 @@ pub enum ScrubError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Writer(#[from] ProvenanceWriterError),
+    #[error("failed to reconcile the live session after scrub: {0}")]
+    Reconcile(String),
 }
 
 #[cfg(test)]

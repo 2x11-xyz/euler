@@ -47,12 +47,12 @@ impl EventKind {
     pub const CANVAS_SWAP: &'static str = "canvas.swap";
     pub const CANVAS_CANDIDATE_DISCARDED: &'static str = "canvas.candidate.discarded";
     pub const SECRET_REDACTED: &'static str = "secret.redacted";
-    /// A credential shape was detected in a faithful payload (tool-call
-    /// argument / tool result). Read-only marker: the payload is NOT modified.
+    /// A credential shape was detected in a faithful tool-call argument.
+    /// Read-only marker: the payload is NOT modified.
     /// Carries shape labels + a pointer to the exposing event, never the value.
     pub const SECRET_EXPOSURE_DETECTED: &'static str = "secret.exposure.detected";
-    /// A user-initiated scrub removed a value from every persistent surface.
-    /// Audit only: carries per-surface counts, never the scrubbed value.
+    /// A user-initiated scrub removed a value from every session-owned
+    /// persistent surface. Audit only: carries counts, never the value.
     pub const SECRET_SCRUBBED: &'static str = "secret.scrubbed";
     pub const EXTENSION_ARTIFACT: &'static str = "extension.artifact";
     pub const AGENT_SPAWN: &'static str = "agent.spawn";

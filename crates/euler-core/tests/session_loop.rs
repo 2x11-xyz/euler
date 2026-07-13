@@ -4514,7 +4514,9 @@ fn credential_in_tool_call_argument_warns_stays_faithful_and_scrubs_on_demand() 
     assert_eq!(session.scrub_candidates(), std::slice::from_ref(&token));
 
     // 5. Scrub on demand removes it from the faithful argument too.
-    let report = session.scrub_live(std::slice::from_ref(&token)).expect("scrub");
+    let report = session
+        .scrub_live(std::slice::from_ref(&token))
+        .expect("scrub");
     assert!(report.anything_scrubbed());
     let after = logged_events(&log);
     assert!(
@@ -4522,6 +4524,11 @@ fn credential_in_tool_call_argument_warns_stays_faithful_and_scrubs_on_demand() 
         "no surface retains the value after scrub"
     );
     assert_eq!(count_kind(&after, EventKind::SECRET_SCRUBBED), 1);
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| !event.to_json_line().unwrap().contains(&token)));
+    assert_eq!(count_kind(session.events(), EventKind::SECRET_SCRUBBED), 1);
     assert!(session.scrub_candidates().is_empty());
 }
 

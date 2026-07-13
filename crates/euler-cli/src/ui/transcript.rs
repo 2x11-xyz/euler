@@ -748,8 +748,8 @@ fn scrub_notice_text(event: &EventEnvelope) -> String {
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     format!(
-        "{} scrubbed — {replacements} occurrence{} removed from provenance; \
-         already-exported or pushed copies cannot be recalled.",
+        "{} scrubbed — {replacements} occurrence{} removed from session data; \
+         already-exported, copied, terminal-scrollback, or pushed data cannot be recalled.",
         super::glyphs::check(),
         if replacements == 1 { "" } else { "s" },
     )

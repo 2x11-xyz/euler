@@ -1729,6 +1729,19 @@ fn scrub_command_rejects_secret_values_in_argv() {
 }
 
 #[test]
+fn scrub_stdin_preserves_exact_leading_and_trailing_whitespace() {
+    let values = parse_scrub_values("  secret-value  \nsecond-secret\r\n").expect("values");
+
+    assert_eq!(values, ["  secret-value  ", "second-secret"]);
+}
+
+#[test]
+fn scrub_stdin_rejects_empty_lines_and_short_values() {
+    assert!(parse_scrub_values("\n   \n\r\n").is_err());
+    assert!(parse_scrub_values("abc\n").is_err());
+}
+
+#[test]
 fn observe_flag_parses_valid_extension_and_default_cadence() {
     let args = parse_without_env(["--observe", "causal-dag"]);
 

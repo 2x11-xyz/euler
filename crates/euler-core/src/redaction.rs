@@ -44,13 +44,77 @@ pub fn scrub_secrets_in_text(text: &str, secrets: &[String]) -> (String, usize) 
     (out, replacements)
 }
 
-/// Recursively scrub secrets from every string leaf of a JSON value, returning
-/// the replacement count. Arrays and objects are walked; the inline
-/// `projection_blob` compaction state is a string leaf and so is covered. The
-/// single scrub walk shared by the ledger rewrite and the in-memory bus.
+/// Scrub literal and JSON-escaped forms from arbitrary bytes. Extension
+/// artifacts can be binary or can embed JSON inside HTML/JavaScript, where a
+/// value containing `"` or `\\` no longer appears as its literal UTF-8 bytes.
+pub fn scrub_secrets_in_bytes(bytes: &[u8], secrets: &[String]) -> (Vec<u8>, usize) {
+    let mut out = bytes.to_vec();
+    let mut replacements = 0;
+    for secret in secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        let (next, count) = replace_bytes(&out, secret.as_bytes(), SCRUBBED.as_bytes());
+        out = next;
+        replacements += count;
+
+        let encoded = serde_json::to_string(secret).unwrap_or_default();
+        let encoded = encoded
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or_default();
+        if !encoded.is_empty() && encoded.as_bytes() != secret.as_bytes() {
+            let (next, count) = replace_bytes(&out, encoded.as_bytes(), SCRUBBED.as_bytes());
+            out = next;
+            replacements += count;
+        }
+    }
+    (out, replacements)
+}
+
+pub(crate) fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, usize) {
+    if needle.is_empty() || needle.len() > input.len() {
+        return (input.to_vec(), 0);
+    }
+    let mut out = Vec::with_capacity(input.len());
+    let mut from = 0;
+    let mut replacements = 0;
+    while let Some(offset) = input[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let at = from + offset;
+        out.extend_from_slice(&input[from..at]);
+        out.extend_from_slice(replacement);
+        from = at + needle.len();
+        replacements += 1;
+    }
+    if replacements == 0 {
+        return (input.to_vec(), 0);
+    }
+    out.extend_from_slice(&input[from..]);
+    (out, replacements)
+}
+
+/// Recursively scrub secrets from every string leaf and object key of a JSON
+/// value, returning the replacement count. The inline `projection_blob`
+/// compaction state is a string leaf and so is covered. This is the single
+/// scrub walk shared by the ledger rewrite and the in-memory bus.
 pub fn scrub_secrets_in_value(value: &mut serde_json::Value, secrets: &[String]) -> usize {
     let mut count = 0;
     scrub_value_rec(value, secrets, &mut count);
+    count
+}
+
+/// Scrub a JSON object including its top-level keys. Event payloads use the
+/// object alias directly rather than a wrapping `Value`.
+pub fn scrub_secrets_in_object(object: &mut euler_event::JsonObject, secrets: &[String]) -> usize {
+    let mut value = serde_json::Value::Object(std::mem::take(object));
+    let count = scrub_secrets_in_value(&mut value, secrets);
+    let serde_json::Value::Object(scrubbed) = value else {
+        unreachable!("an object scrub preserves the JSON value kind")
+    };
+    *object = scrubbed;
     count
 }
 
@@ -69,13 +133,35 @@ fn scrub_value_rec(value: &mut serde_json::Value, secrets: &[String], count: &mu
             }
         }
         serde_json::Value::Object(map) => {
-            for value in map.values_mut() {
-                scrub_value_rec(value, secrets, count);
+            let entries = std::mem::take(map);
+            for (key, mut value) in entries {
+                let (scrubbed_key, replacements) = scrub_secrets_in_text(&key, secrets);
+                *count += replacements;
+                scrub_value_rec(&mut value, secrets, count);
+                let key = unique_json_key(map, scrubbed_key);
+                map.insert(key, value);
             }
         }
         _ => {}
     }
 }
+
+pub(crate) fn unique_json_key(
+    map: &serde_json::Map<String, serde_json::Value>,
+    key: String,
+) -> String {
+    if !map.contains_key(&key) {
+        return key;
+    }
+    for suffix in 2_u64.. {
+        let candidate = format!("{key}#{suffix}");
+        if !map.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u64 key suffix space exhausted")
+}
+
 /// Values shorter than this are ignored: exact-matching tiny strings would
 /// mangle ordinary output far more often than it would protect anything.
 const MIN_VALUE_LEN: usize = 8;
@@ -210,6 +296,35 @@ impl SecretRedactor {
         matches.sort_by(|a, b| a.value.cmp(&b.value).then_with(|| a.label.cmp(&b.label)));
         matches.dedup_by(|a, b| a.value == b.value);
         matches
+    }
+
+    /// Detect credentials in every JSON string leaf and object key without
+    /// serializing first. Serializing escapes quotes and backslashes, which can
+    /// hide an exact registered value from the known-value detector.
+    pub fn detect_value(&self, value: &serde_json::Value) -> Vec<SecretMatch> {
+        let mut matches = Vec::new();
+        self.detect_value_rec(value, &mut matches);
+        matches.sort_by(|a, b| a.value.cmp(&b.value).then_with(|| a.label.cmp(&b.label)));
+        matches.dedup_by(|a, b| a.value == b.value);
+        matches
+    }
+
+    fn detect_value_rec(&self, value: &serde_json::Value, matches: &mut Vec<SecretMatch>) {
+        match value {
+            serde_json::Value::String(text) => matches.extend(self.detect(text)),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.detect_value_rec(item, matches);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    matches.extend(self.detect(key));
+                    self.detect_value_rec(value, matches);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -369,7 +484,9 @@ mod tests {
         let hits = redactor.detect(&text);
         // Two distinct secrets: the known value and the token shape.
         assert_eq!(hits.len(), 2, "{hits:?}");
-        assert!(hits.iter().any(|h| h.label == "known-value" && h.value == "known-secret-value-1"));
+        assert!(hits
+            .iter()
+            .any(|h| h.label == "known-value" && h.value == "known-secret-value-1"));
         assert!(hits.iter().any(|h| h.label == "ghp_" && h.value == token));
     }
 
@@ -398,6 +515,63 @@ mod tests {
     #[test]
     fn detect_is_quiet_on_clean_text() {
         let redactor = SecretRedactor::new();
-        assert!(redactor.detect("plain prose, ghp_ alone, AKIA short").is_empty());
+        assert!(redactor
+            .detect("plain prose, ghp_ alone, AKIA short")
+            .is_empty());
+    }
+
+    #[test]
+    fn detect_value_finds_registered_secrets_with_json_metacharacters() {
+        let redactor = SecretRedactor::new();
+        let secret = "registered-\"secret\\value-123";
+        redactor.add_value(secret);
+        let input = serde_json::json!({"nested": [secret]});
+
+        let hits = redactor.detect_value(&input);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value, secret);
+    }
+
+    #[test]
+    fn structured_scrub_covers_object_keys_without_dropping_collisions() {
+        let secret = "credential-value-1234".to_owned();
+        let mut map = serde_json::Map::new();
+        map.insert(secret.clone(), "first".into());
+        map.insert(SCRUBBED.to_owned(), "second".into());
+        let mut value = serde_json::Value::Object(map);
+
+        let replacements = scrub_secrets_in_value(&mut value, &[secret]);
+
+        assert_eq!(replacements, 1);
+        assert_eq!(value.as_object().expect("object").len(), 2);
+        assert!(serde_json::to_string(&value)
+            .expect("serialize")
+            .contains(SCRUBBED));
+    }
+
+    #[test]
+    fn object_scrub_covers_top_level_keys() {
+        let secret = "credential-value-1234".to_owned();
+        let mut object = euler_event::JsonObject::new();
+        object.insert(secret.clone(), "value".into());
+
+        let replacements = scrub_secrets_in_object(&mut object, &[secret]);
+
+        assert_eq!(replacements, 1);
+        assert_eq!(object.get(SCRUBBED), Some(&serde_json::json!("value")));
+    }
+
+    #[test]
+    fn byte_scrub_covers_json_escaped_values() {
+        let secret = "credential-\"value\\1234".to_owned();
+        let encoded = serde_json::to_vec(&serde_json::json!({"value": secret})).expect("json");
+
+        let (scrubbed, replacements) =
+            scrub_secrets_in_bytes(&encoded, std::slice::from_ref(&secret));
+
+        assert_eq!(replacements, 1);
+        assert!(!String::from_utf8_lossy(&scrubbed).contains(&secret));
+        serde_json::from_slice::<serde_json::Value>(&scrubbed).expect("valid JSON");
     }
 }

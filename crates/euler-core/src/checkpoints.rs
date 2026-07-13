@@ -74,49 +74,6 @@ pub fn load_pre_image(root: &Path, sha256: &str) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// Scrub `secrets` out of a stored pre-image (issue #100).
-///
-/// If the checkpoint blob `sha256` exists and holds any secret, rewrite it
-/// scrubbed under a new content-addressed hash, remove the original file, and
-/// return the new hash so the caller can re-point the `file.change` event.
-/// Returns `Ok(None)` when there is nothing to do — the blob is missing, its
-/// hash is malformed, or it holds no secret. A checkpoint whose bytes changed
-/// out from under us (hash mismatch) is treated as not-ours and left alone.
-pub fn scrub_pre_image(root: &Path, sha256: &str, secrets: &[String]) -> io::Result<bool> {
-    if !is_sha256_hex(sha256) {
-        return Ok(false);
-    }
-    let path = checkpoint_blob_path(root, sha256);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if hash_bytes(&bytes) != sha256 {
-        // Not the content we recorded (already rewritten / not ours): leave it.
-        return Ok(false);
-    }
-    let Ok(content) = String::from_utf8(bytes) else {
-        return Ok(false);
-    };
-    let (scrubbed, replacements) = crate::redaction::scrub_secrets_in_text(&content, secrets);
-    if replacements == 0 {
-        return Ok(false);
-    }
-    // Overwrite the pre-image IN PLACE with the scrubbed bytes. The file keeps
-    // its old-hash name — so the `file.change.pre_image_blob` pointer still
-    // resolves — but no longer holds the secret. We deliberately do NOT
-    // re-hash + re-point + delete the old blob: the checkpoint store is
-    // workspace-wide and content-addressed, so deleting a blob could break
-    // another session that references the same hash, and re-pointing would
-    // couple this scrub to the append-only log commit. A later `load_pre_image`
-    // sees the hash mismatch and degrades that single rollback gracefully — a
-    // scrubbed pre-image cannot be cleanly restored anyway. Durable overwrite,
-    // independent of any log rewrite.
-    write_blob_durable(&path, scrubbed.as_bytes())?;
-    Ok(true)
-}
-
 /// Scan session events for `file.change` rows that carry a restorable pre-image.
 /// Newest first for the `/rollback` picker.
 pub fn list_from_events(events: &[EventEnvelope]) -> Vec<WorkspaceCheckpointRef> {

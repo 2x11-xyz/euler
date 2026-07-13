@@ -179,19 +179,25 @@ One surface-sweeping engine (`euler_core::scrub`), two entry points:
   form scrubs the buffered detection candidates; an explicit value scrubs that
   string. Also scrubs the in-memory event bus so the running session stops
   carrying the value.
-- **post-close** — `euler scrub <session> <value>…` (`scrub_closed_session`),
-  for exposure noticed after the session ended. A closed session has no live
-  candidate, so at least one explicit value is required.
+- **post-close** — `printf '%s\n' "$SECRET" | euler scrub <session>`
+  (`scrub_closed_session`), for exposure noticed after the session ended. A
+  closed session has no live candidate, so exact values are read one per line
+  from stdin; values are never accepted through argv.
 
 Both remove every occurrence from **every persistent surface**:
 
 - `events.jsonl` payloads, including the inline `projection_blob` compaction
-  state (recursive string-leaf walk);
+  state (recursive JSON string/key walk);
 - externalized `blobs/` — a blob holding a secret is rewritten under a fresh
   content hash, re-pointed, and the superseded file removed;
 - workspace `.euler/checkpoints` pre-images — rewritten and re-pointed the
   same way when the session's root is known;
-- the `session.json` title sidecar and the store `index.jsonl` entry.
+- extension content-addressed artifacts — rewritten under fresh hashes and
+  re-pointed in their `extension.artifact` events;
+- extension private state, including projections that duplicate artifact
+  content or retain an artifact hash/path;
+- the `session.json` title sidecar. The session index contains only ids and
+  timestamps, not user-authored content, so it is not a scrub surface.
 
 Event ids, timestamps, kinds, and ordering are preserved; the log rewrite is
 atomic (fsync + rename) under the session append lock, with new blobs durable
@@ -199,7 +205,8 @@ before the commit and superseded blobs removed after. Occurrences are replaced
 with the `[scrubbed]` marker — distinct from the emit-time `[redacted-secret]`
 marker so the record shows WHICH mechanism removed a value. A `secret.scrubbed`
 audit event records per-surface counts (never the value) and notes that
-**already-exported or pushed copies cannot be recalled**.
+**already-exported, copied, terminal-scrollback, or pushed data cannot be
+recalled**.
 
 ## Non-Goals
 

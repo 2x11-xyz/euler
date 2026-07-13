@@ -1644,7 +1644,7 @@ impl<D: PermissionDecider> Session<D> {
         tool_call_event_id: &str,
         input: &serde_json::Value,
     ) -> Result<(), SessionError> {
-        let hits = self.redactor.detect(&input.to_string());
+        let hits = self.redactor.detect_value(input);
         if hits.is_empty() {
             return Ok(());
         }
@@ -1676,9 +1676,10 @@ impl<D: PermissionDecider> Session<D> {
     }
 
     /// Live scrub (issue #100): remove `secrets` from the running session's
-    /// durable surfaces (ledger, blobs, workspace checkpoints, title sidecar)
-    /// AND its in-memory event bus, append a `secret.scrubbed` audit event, and
-    /// drop any matching detection candidates. Requires a provenance writer.
+    /// durable surfaces (ledger, blobs, workspace checkpoints, extension
+    /// artifacts/state, title sidecar) AND its in-memory event bus, append a
+    /// `secret.scrubbed` audit event, and drop matching detection candidates.
+    /// Requires a provenance writer.
     pub fn scrub_live(
         &mut self,
         secrets: &[String],
@@ -1687,27 +1688,26 @@ impl<D: PermissionDecider> Session<D> {
             return Err(SessionError::ScrubRequiresProvenance);
         };
         let secrets = crate::scrub::prepare_secrets(secrets);
-        // Scrub the IN-MEMORY bus first: it can't fail, so the running session
-        // stops carrying the value even if a later on-disk surface errors (no
-        // render, compaction, or persist can re-emit it). Ids and count are
-        // unchanged, so the persisted-events cursor stays valid.
-        self.bus.scrub_payloads(&secrets);
-        self.scrub_candidates
-            .retain(|candidate| !secrets.contains(candidate));
-        // Non-log surfaces before the audit, so the audit reflects them and a
-        // failure aborts before any audit claims success.
-        let non_log = match writer.log_path().parent() {
-            Some(session_dir) => crate::scrub::scrub_non_log_surfaces(session_dir, None, &secrets)?,
-            None => crate::provenance::NonLogScrub::default(),
-        };
-        let stats = writer.scrub_and_audit(
+        let report = writer.scrub_and_audit(
             &secrets,
             Some(self.config.root.as_path()),
             &self.config.session_id,
             &self.config.agent_id,
-            non_log,
         )?;
-        Ok(crate::scrub::report_from(stats, non_log))
+        let durable = match crate::resume::read_resume_prefix(writer.log_path()) {
+            Ok(events) => events,
+            Err(crate::resume::ResumeError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Vec::new()
+            }
+            Err(error) => return Err(crate::scrub::ScrubError::Reconcile(error.to_string()).into()),
+        };
+        self.bus.reconcile_scrubbed_log(&durable, &secrets);
+        self.persisted_events = self.bus.events().len();
+        self.scrub_candidates
+            .retain(|candidate| !secrets.contains(candidate));
+        Ok(report)
     }
 
     fn emit(&mut self, kind: &'static str, payload: JsonObject) -> Result<String, SessionError> {

@@ -1,7 +1,9 @@
 use super::*;
 use crate::provenance::{read_provenance, ProvenanceWriter};
 use euler_event::{object, EventEnvelope, EventKind};
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::path::Path;
 use tempfile::tempdir;
 
 const SECRET: &str = "sk-live-SUPERSECRETVALUE-abcdef123456";
@@ -169,7 +171,7 @@ fn scrubs_the_session_title_sidecar() {
 }
 
 #[test]
-fn scrubs_a_workspace_pre_image_checkpoint_in_place() {
+fn rehashes_and_repoints_a_workspace_pre_image_checkpoint() {
     let dir = tempdir().expect("temp");
     let workspace = tempdir().expect("workspace");
     // A value the checkpoint safety filter does not flag as secret-like, so it
@@ -199,31 +201,29 @@ fn scrubs_a_workspace_pre_image_checkpoint_in_place() {
         "session-1",
         ScrubSurfaces {
             workspace_root: Some(workspace.path()),
-            index_path: None,
         },
         &[value.to_owned()],
     )
     .expect("scrub");
     assert_eq!(report.checkpoints_rewritten, 1);
 
-    // Overwrite-in-place: the event still points at the ORIGINAL hash (no
-    // re-point, no delete — the content-addressed store is workspace-wide), but
-    // the file at that hash no longer holds the secret.
+    // The event moves to a hash-valid replacement and the old secret-bearing
+    // object is retired. Rollback remains functional after the scrub.
     let events = read_provenance(dir.path().join("events.jsonl")).unwrap();
-    assert_eq!(events[0].payload["pre_image_blob"].as_str().unwrap(), hash);
-    let raw = std::fs::read_to_string(
-        workspace
-            .path()
-            .join(".euler")
-            .join("checkpoints")
-            .join(&hash),
-    )
-    .expect("checkpoint blob");
-    assert!(!raw.contains(value));
-    assert!(raw.contains(crate::redaction::SCRUBBED));
-    // The hash no longer matches its (scrubbed) content, so a rollback of this
-    // pre-image degrades gracefully rather than restoring the secret.
-    assert!(crate::checkpoints::load_pre_image(workspace.path(), &hash).is_err());
+    let new_hash = events[0].payload["pre_image_blob"]
+        .as_str()
+        .expect("checkpoint hash");
+    assert_ne!(new_hash, hash);
+    let restored = crate::checkpoints::load_pre_image(workspace.path(), new_hash)
+        .expect("scrubbed checkpoint remains loadable");
+    assert!(!restored.contains(value));
+    assert!(restored.contains(crate::redaction::SCRUBBED));
+    assert!(!workspace
+        .path()
+        .join(".euler")
+        .join("checkpoints")
+        .join(hash)
+        .exists());
 }
 
 #[test]
@@ -265,43 +265,95 @@ fn scrubbing_a_value_with_json_metacharacters_keeps_the_sidecar_valid() {
 }
 
 #[test]
-fn a_secret_only_in_the_index_is_scrubbed_and_audited() {
+fn scrubs_and_repoints_extension_artifacts_and_private_state() {
     let dir = tempdir().expect("temp");
-    write_events(dir.path(), &[tool_result("clean output")]); // log has no secret
-    let index = dir.path().join("index.jsonl");
-    let value = "only-in-index-secret-9876";
+    let extension_dir = dir.path().join("extensions").join("causal-dag");
+    let artifact_dir = extension_dir.join("artifacts");
+    fs::create_dir_all(&artifact_dir).expect("artifact dir");
+    let artifact = serde_json::to_vec(&serde_json::json!({
+        "schema": "euler.causal_dag.v1",
+        "summary": format!("observed {SECRET}"),
+    }))
+    .expect("artifact json");
+    let old_hash = sha256(&artifact);
+    let old_relative_path =
+        format!("sessions/session-1/extensions/causal-dag/artifacts/{old_hash}");
+    fs::write(artifact_dir.join(&old_hash), &artifact).expect("artifact");
     fs::write(
-        &index,
-        format!(
-            "{}\n",
-            serde_json::json!({ "id": "s", "name": format!("x-{value}") })
-        ),
+        extension_dir.join("active-graph.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "artifact_sha256": old_hash,
+            "artifact_relative_path": old_relative_path,
+            "artifact": serde_json::from_slice::<serde_json::Value>(&artifact).unwrap(),
+        }))
+        .unwrap(),
     )
-    .unwrap();
+    .expect("active state");
+
+    write_events(
+        dir.path(),
+        &[EventEnvelope::new(
+            "session-1",
+            "agent",
+            None,
+            EventKind::new(EventKind::EXTENSION_ARTIFACT),
+            object([
+                ("extension_id", "causal-dag".into()),
+                ("display_name", "Causal DAG".into()),
+                ("media_type", "application/json".into()),
+                ("path", old_relative_path.clone().into()),
+                ("sha256", old_hash.clone().into()),
+                ("byte_len", artifact.len().into()),
+            ]),
+        )],
+    );
 
     let report = scrub_closed_session(
         dir.path(),
-        "s",
-        ScrubSurfaces {
-            workspace_root: None,
-            index_path: Some(&index),
-        },
-        &[value.to_owned()],
+        "session-1",
+        ScrubSurfaces::default(),
+        &[SECRET.to_owned()],
     )
     .expect("scrub");
 
-    // Scrubbed and AUDITED, even though only the index (not the log) held it.
-    assert!(report.index_scrubbed);
-    let audit_id = report
-        .audit_event_id
-        .expect("audit emitted for an index-only secret");
-    let audit_line = raw_lines(dir.path())
-        .lines()
-        .find(|line| line.contains(&audit_id))
-        .expect("audit line")
-        .to_owned();
-    assert!(audit_line.contains("\"index\":true"));
-    assert!(!fs::read_to_string(&index).unwrap().contains(value));
+    assert_eq!(report.extension_artifacts_rewritten, 1);
+    assert_eq!(report.extension_state_files_rewritten, 1);
+    let events = read_provenance(dir.path().join("events.jsonl")).expect("events");
+    let event = &events[0];
+    let new_hash = event.payload["sha256"].as_str().expect("new hash");
+    let new_path = event.payload["path"].as_str().expect("new path");
+    assert_ne!(new_hash, old_hash);
+    assert_ne!(new_path, old_relative_path);
+    assert!(new_path.ends_with(new_hash));
+    let new_artifact = fs::read(artifact_dir.join(new_hash)).expect("new artifact");
+    assert_eq!(sha256(&new_artifact), new_hash);
+    assert!(!String::from_utf8_lossy(&new_artifact).contains(SECRET));
+    assert!(!artifact_dir.join(old_hash).exists());
+
+    let state = fs::read_to_string(extension_dir.join("active-graph.json")).expect("state");
+    assert!(!state.contains(SECRET));
+    assert!(state.contains(new_hash));
+    assert!(state.contains(new_path));
+}
+
+#[test]
+fn surface_failure_does_not_append_a_success_audit() {
+    let dir = tempdir().expect("temp");
+    write_events(dir.path(), &[tool_result(&format!("leak {SECRET}"))]);
+    fs::create_dir(dir.path().join("session.json")).expect("invalid sidecar surface");
+
+    let error = scrub_closed_session(
+        dir.path(),
+        "session-1",
+        ScrubSurfaces::default(),
+        &[SECRET.to_owned()],
+    )
+    .expect_err("non-file sidecar must fail closed");
+
+    assert!(error.to_string().contains("not a regular file"));
+    let log = raw_lines(dir.path());
+    assert!(log.contains(SECRET));
+    assert!(!log.contains(EventKind::SECRET_SCRUBBED));
 }
 
 #[test]
@@ -332,4 +384,8 @@ fn preserves_event_ids_and_order_across_a_scrub() {
         after.last().unwrap().kind.as_str(),
         EventKind::SECRET_SCRUBBED
     );
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }

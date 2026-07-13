@@ -331,12 +331,13 @@ envelope `v` per `docs/contracts/persistence.md`.
   `count`. A read-only marker that a credential shape was detected in a faithful
   tool-call argument (see `docs/contracts/secrets.md`). Never carries the value:
   the exposing event stays verbatim; this only records that a scrub is offered.
-- `secret.scrubbed`: `values` (count of distinct values removed), `replacements`
-  (total occurrences), `surfaces` (`events`, `blobs`, `checkpoints` counts;
-  `sidecar`, `index` booleans), `note`. Audit-only record of a user-initiated
-  scrub across every persistent surface. Never carries the value. The count-only
-  audit is committed last, after all surfaces are scrubbed, so it is a truthful
-  all-surface record.
+- `secret.scrubbed`: `requested_values` (count of distinct values requested),
+  `replacements` (total occurrences), `surfaces` (`events`, `blobs`,
+  `checkpoints`, `extension_artifacts`, and `extension_state_files` counts;
+  `sidecar` boolean), `note`. Audit-only record of a user-initiated scrub
+  across every session-owned persistent surface. Never carries the value. The
+  count-only audit is committed last, after all surfaces are scrubbed, so it is
+  a truthful all-surface record.
 
 ## Parentage Rules
 
