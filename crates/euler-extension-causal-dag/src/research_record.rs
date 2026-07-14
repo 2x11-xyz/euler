@@ -188,6 +188,18 @@ pub(crate) enum InvestigationOutcome {
     Abandoned,
 }
 
+impl InvestigationOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::DeadEnd => "dead_end",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResearchOutcome {
@@ -536,6 +548,19 @@ impl AcceptedRecord {
             self.outcomes
                 .get(id)
                 .filter(|outcome| outcome.investigation_id == investigation_id)
+        })
+    }
+
+    pub(crate) fn is_productive_investigation(&self, investigation_id: &str) -> bool {
+        self.relations.values().any(|relation| {
+            relation.kind == RelationKind::Produces
+                && relation.from == investigation_id
+                && self.entities.get(&relation.to).is_some_and(|entity| {
+                    matches!(
+                        entity.kind,
+                        EntityKind::Observation | EntityKind::Artifact | EntityKind::Claim
+                    )
+                })
         })
     }
 

@@ -1,12 +1,12 @@
 use super::{compact, input_error};
 use crate::research_record::{
-    AcceptedRecord, EntityKind, LedgerEntry, ResearchRecord, SemanticRecord,
+    AcceptedRecord, DecisionOutcome, EntityKind, LedgerEntry, ResearchRecord, SemanticRecord,
     RESEARCH_PROPOSALS_SCHEMA,
 };
 use euler_agents::MAX_TASK_BYTES;
 use euler_event::EventEnvelope;
 use euler_sdk::ExtensionError;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const EVENT_EXTRACT_CHARS: usize = 240;
 const MAX_KNOWN_ENTITIES: usize = 96;
@@ -86,11 +86,12 @@ fn render_record_summary(record: &ResearchRecord, budget: usize) -> Vec<String> 
         return vec!["accepted record could not be read".to_owned()];
     };
     let mut candidates = recent_semantic_id_lines(record, &accepted);
-    candidates.extend(summary_candidates(&accepted));
+    candidates.extend(summary_candidates(record, &accepted));
     trim_to_budget(candidates, budget)
 }
 
 fn recent_semantic_id_lines(record: &ResearchRecord, accepted: &AcceptedRecord) -> Vec<String> {
+    let accepted_proposals = accepted_proposal_ids(record);
     let accepted_ids = accepted
         .entities
         .keys()
@@ -100,13 +101,21 @@ fn recent_semantic_id_lines(record: &ResearchRecord, accepted: &AcceptedRecord) 
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let mut ids = Vec::new();
+    let mut seen_ids = BTreeSet::new();
     let mut bytes = 0usize;
     for entry in record.ledger.iter().rev() {
-        let LedgerEntry::Proposal { semantic, .. } = entry else {
+        let LedgerEntry::Proposal {
+            id: proposal_id,
+            semantic,
+        } = entry
+        else {
             continue;
         };
         let id = semantic_id(semantic);
-        if !accepted_ids.contains(id) {
+        if !accepted_proposals.contains(proposal_id.as_str())
+            || !accepted_ids.contains(id)
+            || !seen_ids.insert(id)
+        {
             continue;
         }
         let separator = if ids.is_empty() { 0 } else { 1 };
@@ -136,9 +145,28 @@ fn semantic_id(semantic: &SemanticRecord) -> &str {
     }
 }
 
-fn summary_candidates(accepted: &AcceptedRecord) -> Vec<String> {
-    let mut lines = vec!["CURRENT INVESTIGATION LEDGER:".to_owned()];
-    lines.extend(current_investigation_lines(accepted));
+fn accepted_proposal_ids(record: &ResearchRecord) -> BTreeSet<&str> {
+    record
+        .ledger
+        .iter()
+        .filter_map(|entry| match entry {
+            LedgerEntry::Decision {
+                proposal_id,
+                outcome,
+                ..
+            } if *outcome == DecisionOutcome::Accepted => Some(proposal_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn summary_candidates(record: &ResearchRecord, accepted: &AcceptedRecord) -> Vec<String> {
+    let investigations = current_investigation_lines(record, accepted);
+    let mut lines = Vec::new();
+    if !investigations.is_empty() {
+        lines.push("CURRENT INVESTIGATION LEDGER:".to_owned());
+        lines.extend(investigations);
+    }
     lines.extend(entity_summary_lines(accepted, true));
     lines.extend(outcome_summary_lines(accepted));
     lines.extend(relation_summary_lines(accepted));
@@ -147,23 +175,33 @@ fn summary_candidates(accepted: &AcceptedRecord) -> Vec<String> {
     lines
 }
 
-fn current_investigation_lines(accepted: &AcceptedRecord) -> Vec<String> {
-    accepted
+fn current_investigation_lines(record: &ResearchRecord, accepted: &AcceptedRecord) -> Vec<String> {
+    let positions = latest_investigation_positions(record, accepted);
+    let mut investigations = accepted
         .entities
         .values()
         .filter(|entity| entity.kind == EntityKind::Investigation)
+        .collect::<Vec<_>>();
+    investigations.sort_by(|left, right| {
+        positions
+            .get(&right.id)
+            .cmp(&positions.get(&left.id))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    investigations
+        .into_iter()
         .take(MAX_CURRENT_INVESTIGATIONS)
         .map(|investigation| {
             let (current_outcome_id, current_outcome) = accepted
                 .latest_outcome_for(&investigation.id)
-                .map(|outcome| (outcome.id.as_str(), format!("{:?}", outcome.outcome)))
-                .unwrap_or(("-", "none".to_owned()));
+                .map(|outcome| (outcome.id.as_str(), outcome.outcome.as_str()))
+                .unwrap_or(("-", "none"));
             format!(
                 "CURRENT investigation={} current_outcome_id={} current_outcome={} productive={} lineage_anchor={}",
                 investigation.id,
                 current_outcome_id,
                 current_outcome,
-                investigation_is_productive(accepted, &investigation.id),
+                accepted.is_productive_investigation(&investigation.id),
                 investigation
                     .source_event_ids
                     .first()
@@ -173,17 +211,47 @@ fn current_investigation_lines(accepted: &AcceptedRecord) -> Vec<String> {
         .collect()
 }
 
-fn investigation_is_productive(accepted: &AcceptedRecord, investigation_id: &str) -> bool {
-    accepted.relations.values().any(|relation| {
-        relation.kind == crate::research_record::RelationKind::Produces
-            && relation.from == investigation_id
-            && accepted.entities.get(&relation.to).is_some_and(|entity| {
-                matches!(
-                    entity.kind,
-                    EntityKind::Observation | EntityKind::Artifact | EntityKind::Claim
-                )
-            })
-    })
+fn latest_investigation_positions(
+    record: &ResearchRecord,
+    accepted: &AcceptedRecord,
+) -> BTreeMap<String, usize> {
+    let accepted_proposals = accepted_proposal_ids(record);
+    let investigation_ids = accepted
+        .entities
+        .values()
+        .filter(|entity| entity.kind == EntityKind::Investigation)
+        .map(|entity| entity.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut positions = BTreeMap::new();
+    for (position, entry) in record.ledger.iter().enumerate() {
+        let LedgerEntry::Proposal {
+            id: proposal_id,
+            semantic,
+        } = entry
+        else {
+            continue;
+        };
+        if !accepted_proposals.contains(proposal_id.as_str()) {
+            continue;
+        }
+        for investigation_id in semantic_investigation_ids(semantic) {
+            if investigation_ids.contains(investigation_id) {
+                positions.insert(investigation_id.to_owned(), position);
+            }
+        }
+    }
+    positions
+}
+
+fn semantic_investigation_ids(semantic: &SemanticRecord) -> Vec<&str> {
+    match semantic {
+        SemanticRecord::Entity(entity) if entity.kind == EntityKind::Investigation => {
+            vec![entity.id.as_str()]
+        }
+        SemanticRecord::InvestigationOutcome(outcome) => vec![outcome.investigation_id.as_str()],
+        SemanticRecord::Relation(relation) => vec![relation.from.as_str(), relation.to.as_str()],
+        SemanticRecord::Entity(_) | SemanticRecord::Assessment(_) => Vec::new(),
+    }
 }
 
 fn entity_summary_lines(accepted: &AcceptedRecord, core: bool) -> Vec<String> {

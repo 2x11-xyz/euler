@@ -281,25 +281,14 @@ fn validate_lineage_relation(
         }
         _ => {}
     }
-    if relation.kind == RelationKind::ContinuesFrom && !is_productive(predecessor, accepted) {
+    if relation.kind == RelationKind::ContinuesFrom
+        && !accepted.is_productive_investigation(&predecessor.id)
+    {
         return Err(input_error(
             "continuation requires a productive predecessor with an accepted output",
         ));
     }
     require_lineage_source_overlap(relation, predecessor, successor, accepted)
-}
-
-fn is_productive(investigation: &ResearchEntity, accepted: &AcceptedRecord) -> bool {
-    accepted.relations.values().any(|relation| {
-        relation.kind == RelationKind::Produces
-            && relation.from == investigation.id
-            && accepted.entities.get(&relation.to).is_some_and(|entity| {
-                matches!(
-                    entity.kind,
-                    EntityKind::Observation | EntityKind::Artifact | EntityKind::Claim
-                )
-            })
-    })
 }
 
 fn require_lineage_source_overlap(
