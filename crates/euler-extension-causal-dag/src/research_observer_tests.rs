@@ -254,7 +254,7 @@ fn task_preserves_repair_and_pivot_direction_rules() {
     );
     let fence = task
         .lines()
-        .find(|line| line.starts_with("RECENT ACCEPTED SEMANTIC IDS"))
+        .find(|line| line.starts_with("RECENT ACCEPTED SEMANTIC IDS (do not re-emit):"))
         .expect("collision fence");
     let ids = fence
         .split_once(": ")
@@ -262,7 +262,7 @@ fn task_preserves_repair_and_pivot_direction_rules() {
         .1
         .split(',')
         .collect::<Vec<_>>();
-    assert_eq!(ids.iter().filter(|id| **id == "q").count(), 0);
+    assert_eq!(ids.iter().filter(|id| **id == "q").count(), 1);
 }
 
 #[test]
