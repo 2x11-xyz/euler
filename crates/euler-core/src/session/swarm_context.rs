@@ -1,17 +1,27 @@
+use euler_sdk::Capability;
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_FILE_BYTES: usize = 100_000;
 pub const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024;
 pub const MAX_TOTAL_BYTES: usize = 256 * 1024;
 pub const CONTEXT_OVERHEAD_BYTES: usize = 8_000;
+/// Largest review prompt that still fits [`CONTEXT_OVERHEAD_BYTES`] once the
+/// `\nReview prompt:\n` framing is added. Callers bound `focus` by this so a
+/// prompt is accepted or rejected exactly once, at one limit.
+pub const MAX_PROMPT_BYTES: usize = CONTEXT_OVERHEAD_BYTES - 64;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FILES: usize = 64;
 const MAX_SKIPPED: usize = 64;
+/// Wall-clock bound for one `git`/`gh` assembly call. Assembly runs inline on
+/// the session thread, so an unbounded child would hang the whole session.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ERROR_DETAIL_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReviewMode {
@@ -44,6 +54,49 @@ impl ReviewMode {
             Self::PullRequest => "review-pr",
         }
     }
+
+    /// Authority this mode actually exercises while assembling context.
+    ///
+    /// `code_swarm_review` itself is gated on `AgentSpawn`, but assembly reads
+    /// the workspace (`review-code`), runs `git` (`review-diff`), and runs
+    /// `gh` against the network (`review-pr`). Each mode declares what it uses
+    /// so the ordinary permission machinery can approve or deny it (ADR 0010:
+    /// the contract update lands with the authority, not after it).
+    pub(super) const fn required_capabilities(self) -> &'static [Capability] {
+        match self {
+            Self::Plan => &[],
+            Self::Code => &[Capability::FsRead],
+            Self::Diff => &[Capability::ShellExec],
+            Self::PullRequest => &[Capability::ShellExec, Capability::Network],
+        }
+    }
+}
+
+/// Parse a `code-swarm review` input object into a [`ContextRequest`].
+///
+/// Shared by the `code_swarm_review` tool and the extension-run bridge so a
+/// malformed selector is rejected identically on both seams.
+pub(super) fn request_from_object(object: &Map<String, Value>) -> Result<ContextRequest, String> {
+    let max_total_bytes = object_usize(object, "max_total_bytes", DEFAULT_MAX_TOTAL_BYTES)?;
+    Ok(ContextRequest {
+        mode: ReviewMode::parse(object.get("mode"))?,
+        prompt: object_string(object, "prompt")?.unwrap_or_default(),
+        context: object_string(object, "context")?,
+        files: object_string_list(object, "files")?,
+        base: object_string(object, "base")?,
+        staged: object_bool(object, "staged")?,
+        pr: object_string(object, "pr")?,
+        current: object_bool(object, "current")?,
+        include_full_files: object_bool(object, "include_full_files")?,
+        include_comments: object_bool(object, "include_comments")?,
+        max_file_bytes: object_usize(object, "max_file_bytes", DEFAULT_MAX_FILE_BYTES)?,
+        max_total_bytes,
+        max_diff_bytes: object_usize(
+            object,
+            "max_diff_bytes",
+            max_total_bytes.saturating_sub(CONTEXT_OVERHEAD_BYTES),
+        )?,
+    })
 }
 
 #[derive(Debug)]
@@ -88,9 +141,12 @@ impl AssembledContext {
 pub fn assemble(root: &Path, request: &ContextRequest) -> Result<AssembledContext, String> {
     validate_budget(request)?;
     let prompt_bytes = request.prompt.trim().len();
-    if prompt_bytes == 0 || prompt_bytes + 32 > CONTEXT_OVERHEAD_BYTES {
+    if prompt_bytes == 0 {
+        return Err("prompt must contain a review question or focus".to_owned());
+    }
+    if prompt_bytes > MAX_PROMPT_BYTES {
         return Err(format!(
-            "prompt must be non-empty and fit the {CONTEXT_OVERHEAD_BYTES}-byte instruction reserve"
+            "prompt is {prompt_bytes} bytes; the limit is {MAX_PROMPT_BYTES}"
         ));
     }
     let body_budget = request.max_total_bytes - CONTEXT_OVERHEAD_BYTES;
@@ -273,46 +329,63 @@ fn assemble_pr(
         );
     }
     if request.include_full_files {
-        let files = metadata
-            .get("files")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "gh pr view omitted the files array".to_owned())?;
-        for file in files {
-            let Some(path) = file.get("path").and_then(Value::as_str) else {
-                continue;
-            };
-            let resolved = match resolve_repo_file(root, path) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    assembler.skip(format!("{path} ({error})"));
-                    continue;
-                }
-            };
-            let data = match fs::read(&resolved) {
-                Ok(data) => data,
-                Err(_) => {
-                    assembler.skip(format!("{path} (missing from local checkout)"));
-                    continue;
-                }
-            };
-            if data.len() > request.max_file_bytes {
-                assembler.skip(format!(
-                    "{path} ({} bytes > {} per-file limit)",
-                    data.len(),
-                    request.max_file_bytes
-                ));
+        push_pr_local_files(root, request, assembler, &metadata)?;
+    }
+    Ok(())
+}
+
+/// Append the current local contents of each PR-touched file.
+///
+/// These bytes come from the local checkout, not the PR head, so the manifest
+/// says so: labelling working-tree content as PR content would make every
+/// finding about it unfalsifiable.
+fn push_pr_local_files(
+    root: &Path,
+    request: &ContextRequest,
+    assembler: &mut Assembler,
+    metadata: &Value,
+) -> Result<(), String> {
+    assembler.skip(
+        "full-file context was read from the local checkout, not the PR head; it may differ \
+         from the patch above"
+            .to_owned(),
+    );
+    let files = metadata
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "gh pr view omitted the files array".to_owned())?;
+    for file in files {
+        let Some(path) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let resolved = match resolve_repo_file(root, path) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                assembler.skip(format!("{path} ({error})"));
                 continue;
             }
-            if data.iter().take(512).any(|byte| *byte == 0) {
-                assembler.skip(format!("{path} (binary)"));
-                continue;
-            }
-            assembler.push_text(
-                &format!("Current local file: {path}"),
-                &String::from_utf8_lossy(&data),
-                request.max_file_bytes,
-            );
+        };
+        let Ok(data) = fs::read(&resolved) else {
+            assembler.skip(format!("{path} (missing from local checkout)"));
+            continue;
+        };
+        if data.len() > request.max_file_bytes {
+            assembler.skip(format!(
+                "{path} ({} bytes > {} per-file limit)",
+                data.len(),
+                request.max_file_bytes
+            ));
+            continue;
         }
+        if data.iter().take(512).any(|byte| *byte == 0) {
+            assembler.skip(format!("{path} (binary)"));
+            continue;
+        }
+        assembler.push_text(
+            &format!("Current local file: {path}"),
+            &String::from_utf8_lossy(&data),
+            request.max_file_bytes,
+        );
     }
     Ok(())
 }
@@ -511,35 +584,69 @@ fn run_command(root: &Path, program: &str, args: &[String]) -> Result<String, St
         }
         result
     });
-    let status = loop {
-        if overflow_rx.try_recv().is_ok() {
-            let _ = child.kill();
-            break child
-                .wait()
-                .map_err(|error| format!("could not stop {program}: {error}"))?;
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("could not poll {program}: {error}"))?
-        {
-            break status;
-        }
-        thread::sleep(std::time::Duration::from_millis(5));
-    };
+    let (status, timed_out) = wait_bounded(&mut child, program, &overflow_rx)?;
     let stdout = out_thread
         .join()
         .map_err(|_| format!("{program} stdout reader panicked"))??;
     let stderr = err_thread
         .join()
         .map_err(|_| format!("{program} stderr reader panicked"))??;
-    if !status.success() {
-        let _ = stderr;
+    if timed_out {
         return Err(format!(
-            "{program} {} failed with status {status}",
-            args.join(" ")
+            "{program} {} timed out after {}s",
+            args.join(" "),
+            COMMAND_TIMEOUT.as_secs()
         ));
     }
+    if !status.success() {
+        // Callers redact this before it reaches a model or an artifact.
+        let detail = String::from_utf8_lossy(&stderr);
+        let detail = detail.trim();
+        let (detail, _) = truncate_utf8(detail, MAX_ERROR_DETAIL_BYTES);
+        return Err(if detail.is_empty() {
+            format!("{program} {} failed with status {status}", args.join(" "))
+        } else {
+            format!(
+                "{program} {} failed with status {status}: {detail}",
+                args.join(" ")
+            )
+        });
+    }
     String::from_utf8(stdout).map_err(|_| format!("{program} output was not UTF-8"))
+}
+
+/// Wait for `child`, killing it if it outruns [`COMMAND_TIMEOUT`] or if a
+/// reader reports its output overflowed. Assembly runs inline on the session
+/// thread, so an unbounded wait here would hang the whole session.
+fn wait_bounded(
+    child: &mut std::process::Child,
+    program: &str,
+    overflow_rx: &std::sync::mpsc::Receiver<()>,
+) -> Result<(std::process::ExitStatus, bool), String> {
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    loop {
+        if overflow_rx.try_recv().is_ok() {
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .map_err(|error| format!("could not stop {program}: {error}"))?;
+            return Ok((status, false));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("could not poll {program}: {error}"))?
+        {
+            return Ok((status, false));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .map_err(|error| format!("could not stop {program}: {error}"))?;
+            return Ok((status, true));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn read_bounded(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -586,3 +693,38 @@ pub(super) fn object_bool(object: &Map<String, Value>, field: &str) -> Result<bo
             .ok_or_else(|| format!("{field} must be boolean")),
     }
 }
+
+pub(super) fn object_string(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| format!("{field} must be a string")),
+    }
+}
+
+pub(super) fn object_string_list(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| format!("{field} must contain only strings"))
+            })
+            .collect(),
+        Some(_) => Err(format!("{field} must be an array of strings")),
+    }
+}
+
+#[cfg(test)]
+#[path = "swarm_context_test.rs"]
+mod tests;

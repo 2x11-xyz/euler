@@ -883,3 +883,71 @@ fn malformed_tool_input_fails_honestly() {
         "unknown-field error must teach the schema: {error}"
     );
 }
+
+#[test]
+fn diff_mode_denied_shell_exec_fails_without_assembling() {
+    // Assembly runs `git`, which AgentSpawn does not cover. A denial must stop
+    // the review before the child process, not after.
+    let mut harness = harness_with_permission(
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "find regressions", "mode": "review-diff"}),
+            )]),
+            FixtureResponse::Assistant("relayed".to_owned()),
+        ],
+        reviewer_provider_set(&[("p1", vec![FixtureResponse::Assistant("finding".to_owned())])]),
+        vec![DeciderVerdict::Deny],
+        Some(ApprovalMode::SessionAllow),
+    );
+    write_project_config(&harness.root, &["p1::m1"]);
+    harness
+        .session
+        .set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+
+    harness.session.run_turn("review the diff").expect("turn");
+
+    let results = tool_results(&harness.session);
+    assert_eq!(results[0].payload["ok"], json!(false));
+    let error = results[0].payload["error"].as_str().expect("error");
+    assert!(
+        error.contains("shell-exec") || error.contains("capability"),
+        "denial must name the capability: {error}"
+    );
+    assert!(
+        !harness
+            .session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::AGENT_SPAWN),
+        "a denied assembly must not spawn reviewers"
+    );
+}
+
+#[test]
+fn plan_mode_needs_no_assembly_capability() {
+    // The cheapest mode reaches for nothing: plan context is caller-supplied
+    // text, so an always-deny ShellExec must not block it.
+    let mut harness = harness(
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "find design gaps", "context": "step one\nstep two"}),
+            )]),
+            FixtureResponse::Assistant("adjudicated".to_owned()),
+        ],
+        &[("p1", vec![FixtureResponse::Assistant("finding".to_owned())])],
+    );
+    write_project_config(&harness.root, &["p1::m1"]);
+    harness
+        .session
+        .set_permission_mode(Capability::ShellExec, ApprovalMode::AlwaysDeny);
+
+    harness.session.run_turn("review the plan").expect("turn");
+
+    let results = tool_results(&harness.session);
+    assert_eq!(
+        results[0].payload["ok"],
+        json!(true),
+        "{:?}",
+        results[0].payload
+    );
+}

@@ -124,12 +124,17 @@ runs a batch of single-round, tool-free, empty-capability child briefs
 quota. Determinism, event ordering, and failure honesty for both live in the
 multi-agent contract; hosts without live spawn support reject both calls.
 
-`SpawnAgentTask::include_parent_canvas` is an explicit context boundary.
+`SpawnAgentTask::include_parent_canvas` is an explicit context boundary,
+honoured on **both** spawn paths: `spawn_agent` and `spawn_agents`. A task
+that sets it to `false` receives no parent canvas and its `canvas.snapshot`
+records zero retained items, so provenance shows what the child actually got.
 Native extensions set it to `true` only when their child workflow requires
 the active parent canvas; self-contained workflows such as CodeSwarm set it
-to `false` and carry all bounded context in `task`. This field was added to
-the pre-1.0 SDK as a source-breaking struct-field change rather than hiding a
-privacy-sensitive default in the host bridge.
+to `false` and carry all bounded context in `task`/`explicit_context`. The
+default is `true`, so existing companion workflows keep the canvas they have
+always had. This field was added to the pre-1.0 SDK as a source-breaking
+struct-field change rather than hiding a privacy-sensitive default in the
+host bridge.
 
 `SpawnAgentTask::explicit_context` carries up to 256 KiB of caller-assembled
 context as a separate child input item for both single and parallel spawn.

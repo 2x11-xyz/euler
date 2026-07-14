@@ -280,6 +280,12 @@ drafts — the required focus prompt carries the complete bounded subject.
   execution it delegates to additionally carries `artifact-write` for the
   host-mediated consolidated report, mirroring the round-observer's
   manifest-grant precedent.
+- **Assembly authority**: reading files and running `git`/`gh` is not covered
+  by `AgentSpawn`, so each mode declares and requests its own capabilities
+  (`review-code` → FsRead, `review-diff` → ShellExec, `review-pr` →
+  ShellExec + Network; `plan` needs none) through that same machinery,
+  **before** any source is read. The per-mode table lives in the tools
+  contract. A denial fails the review and assembles nothing.
 - **Result (honest and complete, no adjudication)**: the tool result
   carries the K-of-N succeeded summary, the consolidated review artifact
   reference (relative path + persisted event id), and one block per

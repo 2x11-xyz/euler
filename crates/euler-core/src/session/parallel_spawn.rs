@@ -9,8 +9,8 @@
 use super::companion::{companion_failure, companion_success, usage_payload, ParentedAppender};
 use super::{
     canvas_snapshot_payload, context_budget_exhausted, model_input_item, AgentResultSummary,
-    ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session,
-    SessionError, SYSTEM_INSTRUCTIONS,
+    ContextLimitConfig, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo,
+    RoundOutcome, Session, SessionError, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::assemble_canvas;
 use crate::permissions::PermissionDecider;
@@ -32,6 +32,11 @@ struct PreparedReviewer {
     spawned: SpawnedAgent,
     model_call_id: String,
     request: ModelRequest,
+    /// Set when phase 1 rejected this reviewer before any provider call (its
+    /// `error` event is already recorded). Its worker is skipped and its
+    /// terminal `agent.result` carries this message, so one bad reviewer
+    /// fails alone instead of sinking the batch.
+    prepare_failure: Option<String>,
 }
 
 /// What a worker hands back: the drained round or the terminal error, plus
@@ -148,24 +153,8 @@ impl<D: PermissionDecider> Session<D> {
             (Some(session_cap), Some(task_cap)) => Some(session_cap.min(task_cap)),
             (session_cap, task_cap) => session_cap.or(task_cap),
         };
-        let mut model_call = object([
-            ("provider", target.provider.clone().into()),
-            ("model", target.model.clone().into()),
-            ("canvas_items", task_canvas.len().into()),
-            (
-                "requested_reasoning_effort",
-                self.config.reasoning_effort.as_str().into(),
-            ),
-        ]);
-        if let Some(reasoning_effort) = self
-            .providers
-            .reasoning_effort(&target.provider, &target.model)
-        {
-            model_call.insert("reasoning_effort".to_owned(), reasoning_effort.into());
-        }
-        if let Some(max_output_tokens) = max_output_tokens {
-            model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
-        }
+        let model_call =
+            self.reviewer_model_call_payload(&target, task_canvas.len(), max_output_tokens);
         let model_call_id = self
             .appender_as(writer, &child_agent_id)
             .append(EventKind::MODEL_CALL, model_call, None)?
@@ -181,16 +170,23 @@ impl<D: PermissionDecider> Session<D> {
             role: ModelRole::User,
             content: task.task().to_owned(),
         });
-        if let Some(limit) = self.config.context_limit.limit_tokens {
-            let input_bytes = input.iter().map(model_input_bytes).sum::<usize>();
-            let estimated_input = u64::try_from(input_bytes.div_ceil(4)).unwrap_or(u64::MAX);
-            let requested_output = task.budget().max_tokens.unwrap_or(0);
-            if estimated_input.saturating_add(requested_output) > limit {
-                return Err(SessionError::Other(format!(
-                    "reviewer request exceeds context limit: estimated {estimated_input} input + {requested_output} output tokens > {limit}"
-                )));
+        // One oversized reviewer must not sink the batch: the swarm's K-of-N
+        // summary exists to report exactly this kind of partial failure, so
+        // record an error event for this child and let its siblings run.
+        let prepare_failure = match self.reviewer_context_overflow(&input, &task) {
+            Some(message) => {
+                self.appender_as(writer, &child_agent_id).append(
+                    EventKind::ERROR,
+                    object([
+                        ("source", "companion".into()),
+                        ("message", message.clone().into()),
+                    ]),
+                    None,
+                )?;
+                Some(message)
             }
-        }
+            None => None,
+        };
         let request = ModelRequest {
             model: target.model.clone(),
             instructions: task
@@ -210,7 +206,63 @@ impl<D: PermissionDecider> Session<D> {
             spawned,
             model_call_id,
             request,
+            prepare_failure,
         })
+    }
+
+    /// The `model.call` payload for one reviewer. `canvas_items` reports what
+    /// this child actually receives, which is zero for canvas-disabled briefs.
+    fn reviewer_model_call_payload(
+        &self,
+        target: &ModelTarget,
+        canvas_items: usize,
+        max_output_tokens: Option<u64>,
+    ) -> JsonObject {
+        let mut model_call = object([
+            ("provider", target.provider.clone().into()),
+            ("model", target.model.clone().into()),
+            ("canvas_items", canvas_items.into()),
+            (
+                "requested_reasoning_effort",
+                self.config.reasoning_effort.as_str().into(),
+            ),
+        ]);
+        if let Some(reasoning_effort) = self
+            .providers
+            .reasoning_effort(&target.provider, &target.model)
+        {
+            model_call.insert("reasoning_effort".to_owned(), reasoning_effort.into());
+        }
+        if let Some(max_output_tokens) = max_output_tokens {
+            model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
+        }
+        model_call
+    }
+
+    /// Why this reviewer cannot be dispatched, if its estimated request would
+    /// not fit the configured context window. Estimation is deliberately crude
+    /// (4 bytes per token): it exists to catch briefs that are obviously too
+    /// large before spending a provider call, not to predict tokenizer output.
+    fn reviewer_context_overflow(
+        &self,
+        input: &[ModelInputItem],
+        task: &AgentTask,
+    ) -> Option<String> {
+        let limit = self
+            .config
+            .context_limit
+            .as_ref()
+            .map(ContextLimitConfig::limit_tokens)?;
+        let input_bytes = input.iter().map(model_input_bytes).sum::<usize>();
+        let estimated_input = u64::try_from(input_bytes.div_ceil(4)).unwrap_or(u64::MAX);
+        let requested_output = task.budget().max_tokens().unwrap_or(0);
+        if estimated_input.saturating_add(requested_output) <= limit {
+            return None;
+        }
+        Some(format!(
+            "reviewer request exceeds context limit: estimated {estimated_input} input \
+             + {requested_output} output tokens > {limit}"
+        ))
     }
 
     fn record_reviewer_outcome(
@@ -225,8 +277,23 @@ impl<D: PermissionDecider> Session<D> {
             mut spawned,
             model_call_id,
             request: _,
+            prepare_failure,
         } = reviewer;
         let child_agent_id = spawned.child_agent_id().to_owned();
+        // A phase-1 rejection is host-generated and already has its error
+        // event: report it as this reviewer's terminal result and stop.
+        if let Some(message) = prepare_failure {
+            let result = companion_failure(message);
+            let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
+            return Ok(AgentResultSummary {
+                child_agent_id,
+                spawn_event_id: spawned.spawn_event_id().to_owned(),
+                result_event_id,
+                provider: target.provider,
+                model: target.model,
+                result,
+            });
+        }
         if let Some((mut payload, parent)) = outcome.buffered_error {
             // Workers buffer the raw provider error (they carry no
             // redactor); this session-thread append is the emission
@@ -405,6 +472,17 @@ fn run_workers(
                     transport_retry_backoff_ms: config.transport_retry_backoff_ms.clone(),
                 };
                 scope.spawn(move || {
+                    // Phase 1 already rejected this reviewer and recorded its
+                    // error event; spending a provider call on it would be
+                    // spending tokens to confirm a decision already made.
+                    if reviewer.prepare_failure.is_some() {
+                        return WorkerOutcome {
+                            round: Err(SessionError::InvalidCompanionTask(
+                                "reviewer rejected before dispatch".to_owned(),
+                            )),
+                            buffered_error: None,
+                        };
+                    }
                     let mut io = WorkerIo {
                         session_id,
                         providers,
@@ -534,12 +612,23 @@ impl RoundLoopIo for WorkerIo<'_> {
 #[path = "parallel_spawn_test.rs"]
 mod tests;
 
+/// Rough byte size of one request item, for the pre-dispatch context estimate.
 fn model_input_bytes(item: &ModelInputItem) -> usize {
     match item {
         ModelInputItem::Message { content, .. } => content.len(),
         ModelInputItem::ToolCall {
             name, arguments, ..
         } => name.len() + arguments.to_string().len(),
-        ModelInputItem::ToolResult { output, .. } => output.len(),
+        ModelInputItem::ToolOutput {
+            name,
+            output,
+            error,
+            ..
+        } => {
+            name.len()
+                + output.as_deref().map_or(0, str::len)
+                + error.as_deref().map_or(0, str::len)
+        }
+        ModelInputItem::Reasoning { content, .. } => content.len(),
     }
 }
