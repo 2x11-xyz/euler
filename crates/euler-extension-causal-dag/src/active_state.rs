@@ -5,6 +5,7 @@
 //! replaying the whole session.
 
 use super::SCHEMA_NAME;
+use crate::research_state::ResearchState;
 use euler_sdk::{ArtifactRecord, ExtensionError, HostApi};
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
@@ -29,7 +30,26 @@ pub(super) struct ActiveGraphState {
 
 impl ActiveGraphState {
     pub(super) fn load(host: &dyn HostApi) -> Result<Option<Self>, ExtensionError> {
-        let path = host.state_dir()?.join(ACTIVE_STATE_FILE);
+        let dir = host.state_dir()?;
+        Self::ensure_legacy_mode_in_dir(&dir)?;
+        Self::load_from_dir(&dir)
+    }
+
+    pub(super) fn ensure_legacy_mode(host: &dyn HostApi) -> Result<(), ExtensionError> {
+        Self::ensure_legacy_mode_in_dir(&host.state_dir()?)
+    }
+
+    fn ensure_legacy_mode_in_dir(dir: &Path) -> Result<(), ExtensionError> {
+        if ResearchState::load_from_dir(dir)?.is_some() {
+            return Err(state_message(
+                "research-record pilot is enabled; legacy causal-DAG graph construction is unavailable in this session",
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_from_dir(dir: &Path) -> Result<Option<Self>, ExtensionError> {
+        let path = dir.join(ACTIVE_STATE_FILE);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -103,6 +123,7 @@ impl ActiveGraphState {
             cursor_event_id,
             artifact,
         };
+        Self::ensure_legacy_mode(host)?;
         state.write(host)?;
         Ok(state)
     }
@@ -117,6 +138,7 @@ impl ActiveGraphState {
         }
         let mut advanced = self.clone();
         advanced.cursor_event_id = cursor_event_id.to_owned();
+        Self::ensure_legacy_mode(host)?;
         advanced.write(host)?;
         Ok(advanced)
     }

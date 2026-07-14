@@ -1,5 +1,7 @@
 use crate::active_state::ActiveGraphState;
 use crate::export::graph::ViewerDag;
+use crate::research_record::RESEARCH_DAG_SCHEMA;
+use crate::research_state::ResearchState;
 use crate::slot_summary::render_artifact_summary;
 use crate::{input_error, SCHEMA_NAME};
 use euler_sdk::{
@@ -31,31 +33,55 @@ impl ExtensionCommand for CausalDagViewCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let session_id = parse_session_id(&context.input)?;
+        if let Some(research) = ResearchState::load(host)? {
+            let artifact = research.graph_value().ok_or_else(|| {
+                input_error(
+                    "research-record pilot has no accepted projection yet; run an observed pilot turn before viewing",
+                )
+            })?;
+            let artifact_event_id = research.graph_artifact_event_id().ok_or_else(|| {
+                input_error("research-record pilot selected graph is missing its artifact record")
+            })?;
+            return view_output(artifact, artifact_event_id, RESEARCH_DAG_SCHEMA, session_id);
+        }
         let active = ActiveGraphState::load(host)?.ok_or_else(|| {
             input_error("no active causal DAG; run causal-dag.refresh before viewing")
         })?;
-        let artifact_session = active
-            .artifact()
-            .pointer("/session/id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| input_error("active causal-dag graph has no session id"))?;
-        if session_id.is_some_and(|expected| expected != artifact_session) {
-            return Err(input_error(
-                "session_id does not match the active causal-dag graph",
-            ));
-        }
-        let dag = ViewerDag::from_artifact(active.artifact())?;
-        Ok(json!({
-            "schema": "euler.causal_dag.view.v1",
-            "source_schema": SCHEMA_NAME,
-            "source_artifact_event_id": active.artifact_event_id(),
-            "session_id": artifact_session,
-            "node_count": dag.node_count(),
-            "edge_count": dag.edge_count(),
-            "cross_arc_count": dag.cross_arc_count(),
-            "summary": render_artifact_summary(active.artifact())?,
-        }))
+        view_output(
+            active.artifact(),
+            active.artifact_event_id(),
+            SCHEMA_NAME,
+            session_id,
+        )
     }
+}
+
+fn view_output(
+    artifact: &Value,
+    artifact_event_id: &str,
+    source_schema: &str,
+    session_id: Option<&str>,
+) -> Result<Value, ExtensionError> {
+    let artifact_session = artifact
+        .pointer("/session/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| input_error("active causal-dag graph has no session id"))?;
+    if session_id.is_some_and(|expected| expected != artifact_session) {
+        return Err(input_error(
+            "session_id does not match the active causal-dag graph",
+        ));
+    }
+    let dag = ViewerDag::from_artifact(artifact)?;
+    Ok(json!({
+        "schema": "euler.causal_dag.view.v1",
+        "source_schema": source_schema,
+        "source_artifact_event_id": artifact_event_id,
+        "session_id": artifact_session,
+        "node_count": dag.node_count(),
+        "edge_count": dag.edge_count(),
+        "cross_arc_count": dag.cross_arc_count(),
+        "summary": render_artifact_summary(artifact)?,
+    }))
 }
 
 fn parse_session_id(input: &Value) -> Result<Option<&str>, ExtensionError> {

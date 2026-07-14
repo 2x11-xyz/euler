@@ -4,6 +4,8 @@ use self::graph::ViewerDag;
 use self::palette::Palette;
 use crate::active_state::ActiveGraphState;
 use crate::projection::Projection;
+use crate::research_record::{RESEARCH_DAG_MEDIA_TYPE, RESEARCH_DAG_SCHEMA};
+use crate::research_state::ResearchState;
 use crate::slot_summary::render_artifact_summary;
 use crate::{
     event_ids, input_error, optional_non_empty_string, optional_string, optional_string_array,
@@ -151,9 +153,10 @@ impl ExportFormat {
         }
     }
 
-    fn media_type(self) -> &'static str {
+    fn media_type(self, source_schema: &str) -> &'static str {
         match self {
             Self::Html => "text/html; charset=utf-8",
+            Self::Json if source_schema == RESEARCH_DAG_SCHEMA => RESEARCH_DAG_MEDIA_TYPE,
             Self::Json => MEDIA_TYPE_JSON,
             Self::Svg => "image/svg+xml",
             Self::Dot => "text/vnd.graphviz; charset=utf-8",
@@ -233,12 +236,31 @@ struct GraphSource {
     artifact_event_id: String,
     record: Option<ArtifactRecord>,
     active: bool,
+    source_schema: String,
 }
 
 impl GraphSource {
     fn load(host: &dyn HostApi, input: &ExportInput) -> Result<Self, ExtensionError> {
+        if let Some(research) = ResearchState::load(host)? {
+            let artifact = research.graph_value().ok_or_else(|| {
+                input_error(
+                    "research-record pilot has no accepted projection yet; run an observed pilot turn before exporting",
+                )
+            })?;
+            validate_artifact_session(artifact, input.session_id.as_deref())?;
+            let record = research.graph_record().ok_or_else(|| {
+                input_error("research-record pilot selected graph is missing its artifact record")
+            })?;
+            return Ok(Self {
+                artifact: artifact.clone(),
+                artifact_event_id: record.persisted_event_id.clone(),
+                record: Some(record),
+                active: true,
+                source_schema: RESEARCH_DAG_SCHEMA.to_owned(),
+            });
+        }
         if let Some(active) = ActiveGraphState::load(host)? {
-            validate_input_session(&active, input.session_id.as_deref())?;
+            validate_artifact_session(active.artifact(), input.session_id.as_deref())?;
             let byte_len = canonical_json_bytes(active.artifact())?.len();
             let record = active
                 .artifact_relative_path()
@@ -253,6 +275,7 @@ impl GraphSource {
                 artifact_event_id: active.artifact_event_id().to_owned(),
                 record,
                 active: true,
+                source_schema: SCHEMA_NAME.to_owned(),
             });
         }
         Self::snapshot(host, input)
@@ -274,6 +297,7 @@ impl GraphSource {
             artifact_event_id: record.persisted_event_id.clone(),
             record: Some(record),
             active: false,
+            source_schema: SCHEMA_NAME.to_owned(),
         })
     }
 }
@@ -288,12 +312,12 @@ fn write_view_artifact(
 ) -> Result<ArtifactRecord, ExtensionError> {
     host.write_artifact(ArtifactWrite {
         display_name: format!("{DISPLAY_NAME} {} export", format.as_str()),
-        media_type: format.media_type().to_owned(),
+        media_type: format.media_type(&source.source_schema).to_owned(),
         bytes,
         source_event_ids: vec![source.artifact_event_id.clone()],
         metadata: Map::from_iter([
             ("schema".to_owned(), json!(EXPORT_METADATA_SCHEMA)),
-            ("source_schema".to_owned(), json!(SCHEMA_NAME)),
+            ("source_schema".to_owned(), json!(source.source_schema)),
             ("format".to_owned(), json!(format.as_str())),
             (
                 "source_artifact_event_id".to_owned(),
@@ -321,7 +345,7 @@ fn export_output(
 ) -> Value {
     json!({
         "schema": EXPORT_METADATA_SCHEMA,
-        "source_schema": SCHEMA_NAME,
+        "source_schema": source.source_schema,
         "format": format.as_str(),
         "suggested_name": suggested_name,
         "persisted_event_id": record.persisted_event_id,
@@ -338,12 +362,11 @@ fn export_output(
     })
 }
 
-fn validate_input_session(
-    active: &ActiveGraphState,
+fn validate_artifact_session(
+    artifact: &Value,
     expected: Option<&str>,
 ) -> Result<(), ExtensionError> {
-    let actual = active
-        .artifact()
+    let actual = artifact
         .pointer("/session/id")
         .and_then(Value::as_str)
         .ok_or_else(|| input_error("active causal-dag graph has no session id"))?;

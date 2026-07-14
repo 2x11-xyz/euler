@@ -2,6 +2,8 @@ use super::*;
 use crate::active_state::ActiveGraphState;
 use crate::construction::Construction;
 use crate::observer_brief::{build_full_task, ObserverBriefMode};
+use crate::research_record::{RESEARCH_DAG_SCHEMA, RESEARCH_PROPOSALS_SCHEMA};
+use crate::research_state::ResearchState;
 use euler_agents::{AgentTask, MAX_TASK_BYTES};
 use euler_core::extensions::{ExtensionHost, ExtensionHostError};
 use euler_core::{read_provenance, ProvenanceWriter};
@@ -50,6 +52,7 @@ fn manifest_and_command_registration_are_stable() {
             UPDATE_COMMAND_NAME,
             CATCH_UP_COMMAND_NAME,
             OBSERVE_COMMAND_NAME,
+            RESEARCH_ENABLE_COMMAND_NAME,
             REFRESH_COMMAND_NAME,
             OBSERVER_BRIEF_COMMAND_NAME,
             OBSERVER_APPLY_COMMAND_NAME,
@@ -98,6 +101,12 @@ fn command_required_capabilities_are_command_scoped() {
             Capability::FsWrite,
             Capability::ContextSlot
         ]
+    );
+    assert_eq!(
+        CausalDagResearchEnableCommand
+            .descriptor()
+            .required_capabilities,
+        vec![Capability::FsRead, Capability::FsWrite]
     );
     assert_eq!(
         CausalDagObserverBriefCommand
@@ -5090,6 +5099,247 @@ fn active_view_and_exports_share_the_selected_graph_artifact() {
     assert_eq!(writes[0].source_event_ids, ["source-artifact-event"]);
     assert_eq!(writes[0].metadata["format"], "html");
     assert!(writes[0].bytes.starts_with(b"<!DOCTYPE html>"));
+}
+
+#[test]
+fn research_record_observer_round_projects_and_reframes_identically() {
+    let user = fixture_event(
+        "session-1",
+        "event-user",
+        EventKind::USER_MESSAGE,
+        "Solve the scoped Knuth problem.",
+    );
+    let hidden_reasoning = fixture_event(
+        "session-1",
+        "event-hidden",
+        EventKind::MODEL_REASONING,
+        "hidden observer bait must never enter the task",
+    );
+    let counterexample = fixture_event(
+        "session-1",
+        "event-counterexample",
+        EventKind::TOOL_RESULT,
+        "The recurrence disagrees with the generated table at n=4.",
+    );
+    let later_pilot_event = fixture_event(
+        "session-1",
+        "event-later-pilot-work",
+        EventKind::TOOL_RESULT,
+        "Later pilot evidence that requires a separate incremental reconciliation.",
+    );
+    let source_page = recording_page(
+        vec![user.clone(), hidden_reasoning, counterexample.clone()],
+        64,
+        None,
+        false,
+    );
+    let host = RecordingHost::new_pages(vec![
+        source_page.clone(),
+        source_page,
+        recording_page(vec![later_pilot_event], 64, None, false),
+    ]);
+
+    CausalDagResearchEnableCommand
+        .execute(CommandContext { input: json!({}) }, &host)
+        .expect("enable research record");
+
+    let brief = CausalDagObserverBriefCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1", "limit": 64}),
+            },
+            &host,
+        )
+        .expect("research observer brief");
+    let task = brief["task"].as_str().expect("task");
+    assert!(task.contains("event-counterexample"));
+    assert!(!task.contains("hidden observer bait"));
+
+    let proposals = json!({
+        "schema": RESEARCH_PROPOSALS_SCHEMA,
+        "entities": [
+            {
+                "id": "q-knuth",
+                "kind": "question",
+                "title": "Solve the scoped Knuth problem",
+                "summary": "The user's bounded mathematical task.",
+                "lifecycle": "active",
+                "source_event_ids": ["event-user"]
+            },
+            {
+                "id": "i-recurrence",
+                "kind": "investigation",
+                "title": "Test the recurrence",
+                "summary": "Try the proposed recurrence against a generated table.",
+                "lifecycle": "active",
+                "source_event_ids": ["event-counterexample"]
+            },
+            {
+                "id": "o-counterexample",
+                "kind": "observation",
+                "title": "Generated-table counterexample",
+                "summary": "The recurrence disagrees at the recorded bounded input.",
+                "lifecycle": null,
+                "source_event_ids": ["event-counterexample"]
+            },
+            {
+                "id": "c-recurrence",
+                "kind": "claim",
+                "title": "The recurrence solves the scoped task",
+                "summary": "The proposed recurrence is valid on the stated scope.",
+                "lifecycle": "active",
+                "source_event_ids": ["event-user"]
+            }
+        ],
+        "outcomes": [
+            {
+                "id": "outcome-recurrence-dead",
+                "investigation_id": "i-recurrence",
+                "outcome": "dead_end",
+                "summary": "The counterexample blocks this recurrence approach.",
+                "supersedes_outcome_id": null,
+                "source_event_ids": ["event-counterexample"]
+            }
+        ],
+        "relations": [
+            {
+                "id": "rel-recurrence-question",
+                "kind": "investigates",
+                "from": "i-recurrence",
+                "to": "q-knuth",
+                "summary": "The recurrence is directed at the scoped question.",
+                "source_event_ids": ["event-counterexample"]
+            },
+            {
+                "id": "rel-recurrence-observation",
+                "kind": "produces",
+                "from": "i-recurrence",
+                "to": "o-counterexample",
+                "summary": "The investigation produced the generated-table result.",
+                "source_event_ids": ["event-counterexample"]
+            },
+            {
+                "id": "rel-recurrence-claim",
+                "kind": "investigates",
+                "from": "i-recurrence",
+                "to": "c-recurrence",
+                "summary": "The attempt tests the recurrence claim.",
+                "source_event_ids": ["event-user"]
+            },
+            {
+                "id": "rel-observation-claim",
+                "kind": "evidence_against",
+                "from": "o-counterexample",
+                "to": "c-recurrence",
+                "summary": "The counterexample bears against the recurrence claim.",
+                "source_event_ids": ["event-counterexample"]
+            }
+        ],
+        "assessments": [
+            {
+                "id": "assessment-recurrence-refuted",
+                "claim_id": "c-recurrence",
+                "scope": "the recorded bounded input",
+                "verdict": "refuted",
+                "standard": "counterexample",
+                "summary": "The table supplies a counterexample in the stated scope.",
+                "supersedes_assessment_id": null,
+                "source_event_ids": ["event-counterexample"]
+            }
+        ]
+    });
+    let apply = CausalDagObserverApplyCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "apply": brief["apply"].clone(),
+                    "companion": {
+                        "ok": true,
+                        "output": proposals.to_string(),
+                        "child_agent_id": "observer-child",
+                        "spawn_event_id": "observer-spawn",
+                        "result_event_id": "observer-result"
+                    }
+                }),
+            },
+            &host,
+        )
+        .expect("apply research proposals");
+    assert_eq!(apply["mode"], "research_record_v1");
+    assert_eq!(apply["record"]["persisted_event_id"], "artifact-event");
+    assert_eq!(apply["graph"]["persisted_event_id"], "artifact-event-2");
+    assert!(apply["slot_published"].as_bool().expect("slot publication"));
+    assert!(ResearchState::load(&host)
+        .expect("load research state")
+        .is_some_and(|state| state.active()));
+
+    let view = CausalDagViewCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1"}),
+            },
+            &host,
+        )
+        .expect("view v4 graph");
+    assert_eq!(view["source_schema"], RESEARCH_DAG_SCHEMA);
+    assert_eq!(view["node_count"], 4);
+
+    let json_export = CausalDagExportCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1", "format": "json"}),
+            },
+            &host,
+        )
+        .expect("export v4 JSON");
+    assert_eq!(json_export["source_schema"], RESEARCH_DAG_SCHEMA);
+    assert_eq!(
+        json_export["relative_path"],
+        apply["graph"]["relative_path"]
+    );
+
+    let legacy_error = CausalDagUpdateCommand
+        .execute(
+            CommandContext {
+                input: json!({"session_id": "session-1"}),
+            },
+            &host,
+        )
+        .expect_err("legacy update must not create a second active semantic path");
+    assert!(legacy_error
+        .to_string()
+        .contains("research-record pilot is enabled"));
+
+    let reframe = CausalDagRefreshCommand
+        .execute(
+            CommandContext {
+                input: json!({"operation": "reframe", "session_id": "session-1"}),
+            },
+            &host,
+        )
+        .expect("reframe from the accepted research record");
+    assert_eq!(reframe["mode"], "research_record_v1");
+    assert_eq!(reframe["reframed"], true);
+    let writes = host.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 3);
+    assert_eq!(writes[1].bytes, writes[2].bytes);
+    assert_eq!(host.queries.lock().expect("queries").len(), 2);
+    assert!(host.spawn_tasks.lock().expect("spawn tasks").is_empty());
+
+    let state_path = host.state.path().join("active-research-record.json");
+    let mut state: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("state bytes")).expect("state JSON");
+    state["graph"]["artifact"]["projection"]["record_artifact_event_id"] =
+        json!("unrelated-record");
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&state).expect("state bytes"),
+    )
+    .expect("replace malformed state");
+    let error = ResearchState::load(&host).expect_err("mixed record and graph must be rejected");
+    assert!(error
+        .to_string()
+        .contains("does not match its selected record"));
 }
 
 #[test]

@@ -15,9 +15,15 @@ mod observer_brief;
 mod projection;
 mod record_observation;
 mod refresh;
+mod research_enable;
+mod research_observer;
+mod research_projection;
+mod research_record;
+mod research_state;
 mod revision;
 mod slot_summary;
 mod view;
+use active_state::ActiveGraphState;
 use export::{CausalDagExportCommand, EXPORT_COMMAND_NAME};
 use observer_apply::{CausalDagObserverApplyCommand, OBSERVER_APPLY_COMMAND_NAME};
 use observer_brief::{CausalDagObserverBriefCommand, OBSERVER_BRIEF_COMMAND_NAME};
@@ -30,6 +36,8 @@ use record_observation::{
 };
 use record_observation::{CausalDagRecordObservationCommand, RECORD_OBSERVATION_COMMAND_NAME};
 use refresh::{CausalDagRefreshCommand, REFRESH_COMMAND_NAME};
+use research_enable::{CausalDagResearchEnableCommand, RESEARCH_ENABLE_COMMAND_NAME};
+use research_record::{RESEARCH_DAG_MEDIA_TYPE, RESEARCH_RECORD_MEDIA_TYPE};
 use revision::{execute_observe_projection, ObservationCommit};
 use slot_summary::{publish_graph_slot, with_slot_publication, SlotPublication};
 #[cfg(test)]
@@ -90,6 +98,10 @@ impl Extension for CausalDagExtension {
         registrar.register_command(UPDATE_COMMAND_NAME, Box::new(CausalDagUpdateCommand));
         registrar.register_command(CATCH_UP_COMMAND_NAME, Box::new(CausalDagCatchUpCommand));
         registrar.register_command(OBSERVE_COMMAND_NAME, Box::new(CausalDagObserveCommand));
+        registrar.register_command(
+            RESEARCH_ENABLE_COMMAND_NAME,
+            Box::new(CausalDagResearchEnableCommand),
+        );
         registrar.register_command(REFRESH_COMMAND_NAME, Box::new(CausalDagRefreshCommand));
         registrar.register_command(
             OBSERVER_BRIEF_COMMAND_NAME,
@@ -128,6 +140,7 @@ impl ExtensionCommand for CausalDagUpdateCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let input = UpdateInput::parse(&context.input)?;
+        ActiveGraphState::ensure_legacy_mode(host)?;
         Ok(execute_update_tick(host, &input)?.output)
     }
 }
@@ -159,6 +172,7 @@ impl ExtensionCommand for CausalDagCatchUpCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         let input = CatchUpInput::parse(&context.input)?;
+        ActiveGraphState::ensure_legacy_mode(host)?;
         execute_catch_up(host, &input)
     }
 }
@@ -446,7 +460,11 @@ fn is_causal_dag_graph_artifact(event: &EventEnvelope) -> Result<bool, Extension
     Ok(extension_id == EXTENSION_ID
         && matches!(
             media_type,
-            MEDIA_TYPE_JSON | PRIOR_MEDIA_TYPE_JSON | LEGACY_MEDIA_TYPE_JSON
+            MEDIA_TYPE_JSON
+                | PRIOR_MEDIA_TYPE_JSON
+                | LEGACY_MEDIA_TYPE_JSON
+                | RESEARCH_RECORD_MEDIA_TYPE
+                | RESEARCH_DAG_MEDIA_TYPE
         ))
 }
 

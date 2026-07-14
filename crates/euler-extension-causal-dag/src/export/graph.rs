@@ -1,3 +1,4 @@
+use crate::research_record::RESEARCH_DAG_SCHEMA;
 use crate::{input_error, SCHEMA_NAME};
 use euler_sdk::ExtensionError;
 use serde::Serialize;
@@ -40,9 +41,10 @@ pub(super) struct ViewerArc {
 
 impl ViewerDag {
     pub(crate) fn from_artifact(artifact: &Value) -> Result<Self, ExtensionError> {
-        if artifact.get("schema").and_then(Value::as_str) != Some(SCHEMA_NAME) {
+        let schema = artifact.get("schema").and_then(Value::as_str);
+        if !matches!(schema, Some(SCHEMA_NAME | RESEARCH_DAG_SCHEMA)) {
             return Err(input_error(format!(
-                "causal-dag visualization requires `{SCHEMA_NAME}`"
+                "causal-dag visualization requires `{SCHEMA_NAME}` or `{RESEARCH_DAG_SCHEMA}`"
             )));
         }
         let forest = artifact

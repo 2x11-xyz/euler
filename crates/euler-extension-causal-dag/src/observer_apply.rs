@@ -24,6 +24,8 @@ use super::{
 };
 use crate::observer_brief::{resolve_record_aliases, resolve_source_aliases};
 use crate::projection::Projection;
+use crate::research_observer;
+use crate::research_state::ResearchState;
 use euler_sdk::{
     Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError, HostApi,
 };
@@ -64,6 +66,19 @@ impl ExtensionCommand for CausalDagObserverApplyCommand {
         context: CommandContext,
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
+        if ResearchState::load(host)?.is_some() {
+            if research_observer::is_research_apply(&context.input) {
+                return research_observer::execute_apply(context, host);
+            }
+            return Err(input_error(
+                "research-record pilot is enabled; observer-apply must receive its research-record apply envelope",
+            ));
+        }
+        if research_observer::is_research_apply(&context.input) {
+            return Err(input_error(
+                "research-record observer apply requires causal-dag.research-enable in this session",
+            ));
+        }
         let input = ObserverApplyInput::parse(&context.input)?;
         let observer_result_event_id =
             input.companion.result_event_id.clone().ok_or_else(|| {
