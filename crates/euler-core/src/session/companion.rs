@@ -673,17 +673,26 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         &mut self,
         target: &ModelTarget,
     ) -> Result<(String, ModelRequest), SessionError> {
-        let canvas = assemble_canvas(self.bus.events(), &self.auto_compaction);
-        if let Some(error) = context_budget_exhausted(self.auto_compaction, &canvas) {
-            self.append(
-                EventKind::ERROR,
-                object([
-                    ("source", "companion".into()),
-                    ("message", error.to_string().into()),
-                ]),
-                None,
-            )?;
-            return Err(error);
+        // A task that declares no parent-canvas inheritance gets none here
+        // either: the flag is a privacy boundary, and honouring it only on the
+        // batch path would make it a lie on this one.
+        let canvas = if self.task.includes_parent_canvas() {
+            assemble_canvas(self.bus.events(), &self.auto_compaction)
+        } else {
+            Vec::new()
+        };
+        if self.task.includes_parent_canvas() {
+            if let Some(error) = context_budget_exhausted(self.auto_compaction, &canvas) {
+                self.append(
+                    EventKind::ERROR,
+                    object([
+                        ("source", "companion".into()),
+                        ("message", error.to_string().into()),
+                    ]),
+                    None,
+                )?;
+                return Err(error);
+            }
         }
         self.append(
             EventKind::CANVAS_SNAPSHOT,
@@ -711,6 +720,12 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         }
         let model_call_id = self.append(EventKind::MODEL_CALL, model_call, None)?.id;
         let mut input = canvas.iter().map(model_input_item).collect::<Vec<_>>();
+        if let Some(context) = self.task.explicit_context() {
+            input.push(ModelInputItem::Message {
+                role: ModelRole::User,
+                content: context.to_owned(),
+            });
+        }
         input.push(ModelInputItem::Message {
             role: ModelRole::User,
             content: self.task.task().to_owned(),

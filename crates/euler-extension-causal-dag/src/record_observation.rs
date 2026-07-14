@@ -2,7 +2,7 @@ use euler_event::EventKind;
 use euler_sdk::{
     ArgSpec, ArgValueKind, Capability, CommandContext, CommandDescriptor, ExtensionCommand,
     ExtensionError, HostAgentBudget, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
-    ProvenancePage, ProvenanceQuery,
+    Invocation, ProvenancePage, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
 
@@ -29,6 +29,7 @@ pub(super) struct CausalDagRecordObservationCommand;
 impl ExtensionCommand for CausalDagRecordObservationCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: RECORD_OBSERVATION_COMMAND_NAME.to_owned(),
             display_name: "Record Causal DAG observation".to_owned(),
             summary: "Record post-hoc observer audit metadata for an existing Causal DAG artifact."

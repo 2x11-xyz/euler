@@ -371,6 +371,7 @@ fn linked_extension(
             runtime_kind: "native-rust".to_owned(),
             capabilities: vec!["provenance-read".to_owned()],
             commands: vec![StaticCommandDescriptor {
+                invocation: crate::Invocation::User,
                 name: "inspect".to_owned(),
                 display_name: "Inspect".to_owned(),
                 summary: "Inspect provenance.".to_owned(),

@@ -350,6 +350,7 @@ impl ExtensionCommand for PanicAnyCommand {
 
 fn empty_command_descriptor() -> CommandDescriptor {
     CommandDescriptor {
+        invocation: euler_sdk::Invocation::User,
         name: String::new(),
         display_name: String::new(),
         summary: String::new(),

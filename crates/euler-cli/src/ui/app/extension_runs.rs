@@ -294,7 +294,14 @@ fn bundled_manager_items(
             bundled: true,
             materialization: None,
             version: descriptor.version.clone(),
-            commands: descriptor.commands.iter().map(|c| c.name.clone()).collect(),
+            commands: descriptor
+                .commands
+                .iter()
+                .map(|c| crate::ui::commands::ExtensionCommandItem {
+                    name: c.name.clone(),
+                    invocation: c.invocation,
+                })
+                .collect(),
             capabilities: descriptor
                 .capabilities
                 .iter()
@@ -330,7 +337,10 @@ fn append_linked_manager_items(
                 .descriptor
                 .commands
                 .iter()
-                .map(|c| c.name.clone())
+                .map(|c| crate::ui::commands::ExtensionCommandItem {
+                    name: c.name.clone(),
+                    invocation: c.invocation,
+                })
                 .collect(),
             capabilities: link.descriptor.capabilities.clone(),
             audit_status: audit_by_id.get(&link.id).cloned(),

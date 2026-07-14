@@ -23,11 +23,15 @@ use thiserror::Error;
 pub const MAX_SWARM_REVIEWERS: usize = 5;
 
 /// Canonical remediation-bearing unconfigured error (multi-agent contract):
-/// every entry seam — TUI, headless `extension_run`, the `code_swarm_review`
-/// tool — emits this text instead of invoking the swarm, and it must name
-/// working invocations only. The invocations are pinned by tests; update
-/// them together with the surfaces they describe.
-pub const UNCONFIGURED_SWARM_ERROR: &str = "code-swarm is not configured: no reviewer models are set for this project or user, and none were passed. Pick reviewers in the TUI with /code-swarm (persists to this project; /code-swarm --user for a global default), or pass explicit one-off targets: TUI `/review --model provider::model`, or headless (`euler run`) control line `extension_run code-swarm.review {\"models\":[\"provider::model\"]}`.";
+/// every entry seam emits this text instead of invoking the swarm, and it
+/// must name working invocations only. The invocations are pinned by tests;
+/// update them together with the surfaces they describe.
+///
+/// CodeSwarm is agent-only, so the remediation is configuration — `/code-swarm`
+/// — not a run command. It deliberately names no `/review` or `extension_run`
+/// invocation: both refuse now, and telling a stuck user to type something that
+/// cannot work is worse than telling them nothing.
+pub const UNCONFIGURED_SWARM_ERROR: &str = "code-swarm is not configured: no reviewer models are set for this project or user, and none were passed. Pick reviewers in the TUI with /code-swarm (persists to this project; /code-swarm --user for a global default), then ask for the review again. Reviews are run by the agent — there is no /code-swarm run command.";
 /// Max bytes for the config file at either tier.
 const MAX_SWARM_CONFIG_BYTES: u64 = 16 * 1024;
 

@@ -114,7 +114,11 @@ mod tests {
             bundled: true,
             materialization: None,
             version: "0.2.0".to_owned(),
-            commands: vec!["view".to_owned(), "export".to_owned(), "refresh".to_owned()],
+            commands: vec![
+                ExtensionCommandItem::user("view"),
+                ExtensionCommandItem::user("export"),
+                ExtensionCommandItem::user("refresh"),
+            ],
             capabilities: vec![],
             audit_status: None,
         }];

@@ -2,7 +2,7 @@ use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{
     ArgSpec, ArgValueKind, ArtifactWrite, Capability, CommandContext, CommandDescriptor,
     CommandRegistrar, Extension, ExtensionCommand, ExtensionError, ExtensionManifest, HostApi,
-    ProvenanceQuery,
+    Invocation, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
@@ -57,6 +57,7 @@ struct ObjectiveBriefCommand;
 impl ExtensionCommand for ObjectiveBriefCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: OBJECTIVE_BRIEF_COMMAND.to_owned(),
             display_name: "Build autoresearch objective brief".to_owned(),
             summary: "Build a companion AgentTask brief for choosing the next objective."
@@ -108,6 +109,7 @@ struct ObjectiveReportCommand;
 impl ExtensionCommand for ObjectiveReportCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: OBJECTIVE_REPORT_COMMAND.to_owned(),
             display_name: "Write autoresearch objective report".to_owned(),
             summary: "Persist a companion-produced autoresearch objective artifact.".to_owned(),

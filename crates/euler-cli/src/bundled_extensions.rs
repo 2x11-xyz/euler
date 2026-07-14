@@ -110,6 +110,7 @@ impl BundledDescriptor {
                     display_name: &command.display_name,
                     summary: &command.summary,
                     required_capabilities: capability_strings(&command.required_capabilities),
+                    invocation: command.invocation.as_str(),
                 })
                 .collect(),
         }
@@ -133,6 +134,10 @@ struct CommandInfo<'a> {
     display_name: &'a str,
     summary: &'a str,
     required_capabilities: Vec<&'static str>,
+    /// Always emitted, including the `user` default: a reader must be able to
+    /// tell an agent-only command from an invocable one without inferring it
+    /// from the field's absence.
+    invocation: &'static str,
 }
 
 #[derive(Default)]

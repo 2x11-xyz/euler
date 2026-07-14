@@ -15,7 +15,7 @@ use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{
     ArgSpec, ArgValueKind, ArtifactWrite, Capability, CommandContext, CommandDescriptor,
     CommandRegistrar, Extension, ExtensionCommand, ExtensionError, ExtensionManifest, HostApi,
-    ProvenanceQuery,
+    Invocation, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -84,6 +84,7 @@ struct PopulationBriefCommand;
 impl ExtensionCommand for PopulationBriefCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: POPULATION_BRIEF_COMMAND.to_owned(),
             display_name: "Build MaxProof population briefs".to_owned(),
             summary: "Build bounded proof-generator AgentTask briefs.".to_owned(),
@@ -116,6 +117,7 @@ struct VerifyBriefCommand;
 impl ExtensionCommand for VerifyBriefCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: VERIFY_BRIEF_COMMAND.to_owned(),
             display_name: "Build MaxProof verifier briefs".to_owned(),
             summary: "Build independent verifier AgentTask briefs for candidate results."
@@ -163,6 +165,7 @@ struct TournamentCommand;
 impl ExtensionCommand for TournamentCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: TOURNAMENT_COMMAND.to_owned(),
             display_name: "Run MaxProof tournament".to_owned(),
             summary: "Select a proof by conservative deterministic fitness and persist archive."

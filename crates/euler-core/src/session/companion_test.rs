@@ -823,6 +823,95 @@ fn task_with_caps(caps: impl IntoIterator<Item = Capability>) -> AgentTask {
         .with_capabilities(caps)
 }
 
+/// Captures every request a provider is asked to invoke.
+struct RequestCapture {
+    requests: Arc<Mutex<Vec<euler_provider::ModelRequest>>>,
+}
+
+impl ModelProvider for RequestCapture {
+    fn name(&self) -> &'static str {
+        "capture"
+    }
+
+    fn invoke(
+        &self,
+        request: euler_provider::ModelRequest,
+    ) -> Result<ProviderStream, euler_provider::ProviderError> {
+        self.requests.lock().expect("requests").push(request);
+        Ok(Box::new(
+            vec![
+                Ok(euler_provider::ModelStreamEvent::TextDelta(
+                    "done".to_owned(),
+                )),
+                Ok(euler_provider::ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: None,
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+#[test]
+fn single_spawn_honours_the_parent_canvas_boundary() {
+    // The batch path gated on include_parent_canvas from the start; this path
+    // did not, so a task that declared no inheritance still received the whole
+    // canvas. A privacy flag that works on one of two paths is a lie on the
+    // other.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        RequestCapture {
+            requests: Arc::clone(&requests),
+        },
+        ScriptedDecider::new(vec![]),
+    );
+    session.run_turn("ambient baggage").expect("seed turn");
+
+    let task = AgentTask::new_inheriting_target("review the work", "default")
+        .expect("task")
+        .with_parent_canvas(false)
+        .with_explicit_context("explicit brief")
+        .expect("context");
+    session.spawn_companion(task).expect("companion");
+
+    let requests = requests.lock().expect("requests");
+    let companion = requests.last().expect("companion request");
+    let prompt = companion.prompt_text();
+    assert!(prompt.contains("explicit brief"));
+    assert!(prompt.contains("review the work"));
+    assert!(
+        !prompt.contains("ambient baggage"),
+        "canvas-disabled companion inherited parent history: {prompt}"
+    );
+    assert_eq!(companion.input.len(), 2, "explicit context and task only");
+}
+
+#[test]
+fn single_spawn_still_inherits_canvas_by_default() {
+    // The boundary is opt-out: generic companions keep the canvas they have
+    // always had, so the fix cannot silently starve unrelated workflows.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        RequestCapture {
+            requests: Arc::clone(&requests),
+        },
+        ScriptedDecider::new(vec![]),
+    );
+    session.run_turn("ambient baggage").expect("seed turn");
+
+    session
+        .spawn_companion(AgentTask::new_inheriting_target("summarise", "default").expect("task"))
+        .expect("companion");
+
+    let requests = requests.lock().expect("requests");
+    let companion = requests.last().expect("companion request");
+    assert!(
+        companion.prompt_text().contains("ambient baggage"),
+        "default companion lost its parent canvas"
+    );
+}
+
 fn read_note_call() -> ToolCall {
     ToolCall {
         id: "call-read".to_owned(),

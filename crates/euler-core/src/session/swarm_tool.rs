@@ -24,20 +24,27 @@ use std::time::Instant;
 
 pub(super) const CODE_SWARM_REVIEW_TOOL: &str = "code_swarm_review";
 pub(super) const EXTENSION_ID: &str = "code-swarm";
-const REVIEW_COMMAND: &str = "review";
-/// Matches the extension's `--prompt` ArgSpec bound.
-const MAX_FOCUS_BYTES: usize = 2000;
+pub(super) const REVIEW_COMMAND: &str = "review";
+/// The reviewer brief includes the focus alongside fixed instructions and
+/// must remain below `euler_agents::MAX_TASK_BYTES`.
+const MAX_FOCUS_BYTES: usize = 7 * 1024;
+/// Review material travels as a separate user message, never as parent canvas.
+const MAX_REVIEW_CONTEXT_BYTES: usize = 256 * 1024;
 
 pub(super) fn code_swarm_review_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: CODE_SWARM_REVIEW_TOOL.to_owned(),
-        description: "Run the user's configured CodeSwarm reviewer models over the current session and return every reviewer's findings for you to adjudicate. This is a stage-agnostic review gate: call it at checkpoints — after drafting a plan, after implementing a change, after preparing a diff, or before finalizing an analysis or draft — and call it again after revisions. Pass `focus` to name the subject under review. The result carries a K-of-N success summary, a consolidated artifact reference, and each reviewer's raw findings; judge validity yourself and report a triaged conclusion — the tool does not filter or vote. Reviewer models come from the user's persisted /code-swarm configuration; only pass `models` when the user explicitly named one-off targets, never guessed ones. If the tool reports that no reviewers are configured, relay its remediation options to the user.".to_owned(),
+        description: "Run configured CodeSwarm reviewers over explicit bounded review material. First use ordinary tools to retrieve the exact plan, files, or diff to review; then provide that material in context. Reviewers receive context and a concise focus, never ambient session canvas. Returns every reviewer finding plus a consolidated artifact. Use models only for user-named one-off targets.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "focus": {
                     "type": "string",
-                    "description": "What to review (a plan, a diff, an analysis, ...); carried into every reviewer brief."
+                    "description": "Required concise review question (maximum 7168 bytes)."
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Required exact review material assembled by the calling agent with ordinary tools (maximum 262144 bytes)."
                 },
                 "personas": {
                     "type": "array",
@@ -51,6 +58,7 @@ pub(super) fn code_swarm_review_tool_definition() -> ToolDefinition {
                 },
                 "max_tokens": {"type": "integer", "minimum": 1}
             },
+            "required": ["focus", "context"],
             "additionalProperties": false
         }),
     }
@@ -63,9 +71,10 @@ struct ResolvedReviewPlan {
     max_tokens: Option<u64>,
 }
 
-/// Parsed tool arguments. All optional (tools contract).
+/// Parsed tool arguments.
 struct ReviewToolArgs {
-    focus: Option<String>,
+    focus: String,
+    context: String,
     personas: Option<Vec<String>>,
     models: Option<Vec<String>>,
     max_tokens: Option<u64>,
@@ -134,15 +143,23 @@ impl<D: PermissionDecider> Session<D> {
         };
         let plan = self.resolve_review_targets(&args)?;
         self.ensure_target_providers_configured(&plan.targets)?;
+        // The caller obtains source material through ordinary tools first.
+        // Redact only the reviewer egress copy: model-authored tool arguments
+        // remain faithful in provenance under the secrets contract.
+        let context = self.redactor.redact(&args.context);
+        if context.len() > MAX_REVIEW_CONTEXT_BYTES {
+            return Err(ReviewToolFailure::Honest(format!(
+                "context exceeds {MAX_REVIEW_CONTEXT_BYTES} bytes after redaction; provide a smaller explicit excerpt"
+            )));
+        }
 
         let mut review_input = serde_json::Map::new();
         review_input.insert("models".to_owned(), json!(plan.targets));
         if let Some(personas) = plan.personas {
             review_input.insert("reviewers".to_owned(), json!(personas));
         }
-        if let Some(focus) = args.focus {
-            review_input.insert("prompt".to_owned(), json!(focus));
-        }
+        review_input.insert("prompt".to_owned(), json!(args.focus));
+        review_input.insert("context".to_owned(), json!(context));
         if let Some(max_tokens) = plan.max_tokens {
             review_input.insert("max_tokens".to_owned(), json!(max_tokens));
         }
@@ -242,6 +259,9 @@ fn map_execution_error(error: ExtensionExecutionError) -> ReviewToolFailure {
                 capability = capability.as_str()
             ))
         }
+        // Host-generated validation text: safe to relay verbatim, and it names
+        // the field the caller has to fix.
+        ExtensionExecutionError::InvalidInput(message) => ReviewToolFailure::Honest(message),
         ExtensionExecutionError::RegistrationFailed
         | ExtensionExecutionError::CommandFailed
         | ExtensionExecutionError::CommandPanicked => ReviewToolFailure::Honest(
@@ -259,26 +279,17 @@ fn parse_review_tool_args(input: &Value) -> Result<ReviewToolArgs, String> {
     let object = if input.is_null() {
         &empty
     } else {
-        input.as_object().ok_or_else(|| {
-            "code_swarm_review input must be a JSON object (all fields optional)".to_owned()
-        })?
+        input
+            .as_object()
+            .ok_or_else(|| "code_swarm_review input must be a JSON object".to_owned())?
     };
     for key in object.keys() {
-        if !["focus", "personas", "models", "max_tokens"].contains(&key.as_str()) {
-            return Err(format!(
-                "unknown code_swarm_review field `{key}`; supported: focus, personas, models, max_tokens"
-            ));
+        if !["focus", "context", "personas", "models", "max_tokens"].contains(&key.as_str()) {
+            return Err(format!("unknown code_swarm_review field `{key}`"));
         }
     }
-    let focus = optional_string(object, "focus")?;
-    if focus
-        .as_ref()
-        .is_some_and(|focus| focus.len() > MAX_FOCUS_BYTES)
-    {
-        return Err(format!(
-            "focus exceeds {MAX_FOCUS_BYTES} bytes; shorten it — reviewers see the session canvas already"
-        ));
-    }
+    let focus = parse_focus(object)?;
+    let context = parse_context(object)?;
     // An empty model-facing optional list names no one-off override, so let
     // the persisted resolution chain run. Explicit CLI/extension invocations
     // bypass this parser and continue to reject empty model lists.
@@ -291,8 +302,45 @@ fn parse_review_tool_args(input: &Value) -> Result<ReviewToolArgs, String> {
             "models must list 1-{MAX_SWARM_REVIEWERS} provider::model targets when provided"
         ));
     }
-    let max_tokens = match object.get("max_tokens") {
-        None | Some(Value::Null) => None,
+    Ok(ReviewToolArgs {
+        focus,
+        context,
+        personas: optional_string_list(object, "personas")?,
+        models,
+        max_tokens: parse_max_tokens(object)?,
+    })
+}
+
+fn parse_focus(object: &serde_json::Map<String, Value>) -> Result<String, String> {
+    let focus = optional_string(object, "focus")?
+        .filter(|focus| !focus.trim().is_empty())
+        .ok_or_else(|| "focus is required and must contain a review question".to_owned())?;
+    if focus.len() > MAX_FOCUS_BYTES {
+        return Err(format!(
+            "focus exceeds {MAX_FOCUS_BYTES} bytes; shorten the review question"
+        ));
+    }
+    Ok(focus)
+}
+
+fn parse_context(object: &serde_json::Map<String, Value>) -> Result<String, String> {
+    let context = optional_string(object, "context")?
+        .filter(|context| !context.trim().is_empty())
+        .ok_or_else(|| {
+            "context is required; use ordinary tools to gather the exact material to review, then provide it explicitly"
+                .to_owned()
+        })?;
+    if context.len() > MAX_REVIEW_CONTEXT_BYTES {
+        return Err(format!(
+            "context exceeds {MAX_REVIEW_CONTEXT_BYTES} bytes; provide a smaller explicit excerpt"
+        ));
+    }
+    Ok(context)
+}
+
+fn parse_max_tokens(object: &serde_json::Map<String, Value>) -> Result<Option<u64>, String> {
+    match object.get("max_tokens") {
+        None | Some(Value::Null) => Ok(None),
         Some(value) => {
             let value = value
                 .as_u64()
@@ -300,15 +348,9 @@ fn parse_review_tool_args(input: &Value) -> Result<ReviewToolArgs, String> {
             if value == 0 {
                 return Err("max_tokens must be greater than zero".to_owned());
             }
-            Some(value)
+            Ok(Some(value))
         }
-    };
-    Ok(ReviewToolArgs {
-        focus: focus.filter(|focus| !focus.trim().is_empty()),
-        personas: optional_string_list(object, "personas")?,
-        models,
-        max_tokens,
-    })
+    }
 }
 
 fn optional_string(

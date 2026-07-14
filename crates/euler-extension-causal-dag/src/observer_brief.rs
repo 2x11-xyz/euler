@@ -4,7 +4,7 @@ use euler_agents::{MAX_SYSTEM_PROMPT_BYTES, MAX_TASK_BYTES};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{
     ArgSpec, Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError,
-    HostApi, ProvenanceQuery,
+    HostApi, Invocation, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +27,7 @@ pub(crate) struct CausalDagObserverBriefCommand;
 impl ExtensionCommand for CausalDagObserverBriefCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: OBSERVER_BRIEF_COMMAND_NAME.to_owned(),
             display_name: "Build observer brief".to_owned(),
             summary: "Build a bounded companion AgentTask for observing a provenance window."

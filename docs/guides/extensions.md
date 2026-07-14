@@ -35,7 +35,7 @@ Minimal native extension crate:
 ```rust
 use euler_sdk::{
     CommandContext, CommandDescriptor, CommandRegistrar, Extension, ExtensionCommand,
-    ExtensionError, ExtensionManifest, HostApi,
+    ExtensionError, ExtensionManifest, HostApi, Invocation,
 };
 use serde_json::{json, Value};
 
@@ -62,6 +62,7 @@ struct HelloCommand;
 impl ExtensionCommand for HelloCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: "hello".to_owned(),
             display_name: "Say hello".to_owned(),
             summary: "Return a small JSON object.".to_owned(),

@@ -1,7 +1,7 @@
 use euler_sdk::{
     ArgSpec, ArgValueKind, ArtifactRecord, ArtifactWrite, Capability, CommandContext,
     CommandDescriptor, CommandRegistrar, DiagnosticsQuery, Extension, ExtensionCommand,
-    ExtensionError, ExtensionManifest, HostApi,
+    ExtensionError, ExtensionManifest, HostApi, Invocation,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -40,6 +40,7 @@ struct ReportCommand;
 impl ExtensionCommand for ReportCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: COMMAND_NAME.to_owned(),
             display_name: "Write diagnostics report".to_owned(),
             summary: "Aggregate the current session diagnostics log into a report artifact."

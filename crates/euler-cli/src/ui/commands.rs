@@ -49,9 +49,27 @@ pub struct ExtensionManagerItem {
     pub bundled: bool,
     pub materialization: Option<String>,
     pub version: String,
-    pub commands: Vec<String>,
+    pub commands: Vec<ExtensionCommandItem>,
     pub capabilities: Vec<String>,
     pub audit_status: Option<String>,
+}
+
+/// One command an extension registers, and whether a user may drive it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionCommandItem {
+    pub name: String,
+    pub invocation: euler_sdk::Invocation,
+}
+
+impl ExtensionCommandItem {
+    /// Fixture helper: production builds these from real descriptors.
+    #[cfg(test)]
+    pub fn user(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            invocation: euler_sdk::Invocation::User,
+        }
+    }
 }
 
 impl ExtensionManagerItem {
@@ -85,7 +103,20 @@ impl ExtensionManagerItem {
             ),
         ];
         if !self.commands.is_empty() {
-            lines.push(format!("commands: {}", self.commands.join(", ")));
+            // Agent-only commands are listed, not hidden: they exist, and the
+            // reader should know why no slash command matches them.
+            let commands = self
+                .commands
+                .iter()
+                .map(|command| {
+                    if command.invocation.is_agent_only() {
+                        format!("{} (agent-only)", command.name)
+                    } else {
+                        command.name.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            lines.push(format!("commands: {}", commands.join(", ")));
         }
         if !self.capabilities.is_empty() {
             lines.push(format!("capabilities: {}", self.capabilities.join(", ")));
@@ -373,11 +404,6 @@ pub enum CommandAction {
     /// Remove one tier's persisted `/code-swarm` reviewer config.
     CodeSwarmClear {
         user_tier: bool,
-    },
-    /// Run the reviewer swarm: brief -> spawn companions -> report.
-    CodeSwarmReview {
-        prompt: Option<String>,
-        personas: Option<Vec<String>>,
     },
     ShowStatus,
     /// Remove a credential from every provenance surface (issue #100). Bare
@@ -701,21 +727,27 @@ pub fn build_extension_slash_commands(
             });
         }
         for command in &item.commands {
-            let short = command.to_lowercase();
+            // Agent-only commands mint no slash token: they are the agent's
+            // to call, not the user's to drive.
+            if command.invocation.is_agent_only() {
+                continue;
+            }
+            let name = &command.name;
+            let short = name.to_lowercase();
             let (token, summary) = if claimed.contains(&short) {
                 (
-                    format!("/{}.{}", item.id, command),
-                    format!("{} · {}", item.id, command),
+                    format!("/{}.{}", item.id, name),
+                    format!("{} · {}", item.id, name),
                 )
             } else {
                 claimed.insert(short);
-                (format!("/{command}"), format!("{} · {}", item.id, command))
+                (format!("/{name}"), format!("{} · {}", item.id, name))
             };
             out.push(ExtensionSlashCommand {
                 token,
                 summary,
                 extension_id: item.id.clone(),
-                command: command.clone(),
+                command: name.clone(),
                 enabled: item.enabled,
             });
         }
@@ -853,13 +885,19 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
     }
 }
 
-/// `/code-swarm` — extension-provided surface (teaches when disabled).
+/// `/code-swarm` — set up the reviewer swarm; it does not run one.
+///
 /// No arg: open the reviewer-model checklist picker (selection IS the
 /// count); the save persists to the project tier, or the user tier with
 /// `--user`. `clear [--user]` removes one tier's config.
-/// `review [--personas a,b,c] [--prompt <text…>]`: run the swarm.
+///
+/// There is deliberately no run verb here. CodeSwarm is something the agent
+/// does when asked ("code swarm this"), through its `code_swarm_review` tool,
+/// so this surface configures the reviewers and the agent runs them.
 fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
-    const USAGE: &str = "usage: /code-swarm [--user]  ·  /code-swarm clear [--user]  ·  /code-swarm review [--personas correctness,safety,tests] [--prompt <focus…>]";
+    const USAGE: &str =
+        "usage: /code-swarm [--user]  ·  /code-swarm clear [--user]  —  configures reviewers; \
+         to run a review, ask the agent (e.g. \"code swarm this\")";
     let enabled = context
         .extension_items
         .iter()
@@ -886,57 +924,24 @@ fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffe
         Some("clear --user") => {
             CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: true })
         }
-        Some(arg) => {
-            let Some(rest) = arg.strip_prefix("review") else {
-                return CommandEffect::Message(USAGE.to_owned());
-            };
-            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-                return CommandEffect::Message(USAGE.to_owned());
-            }
-            match parse_code_swarm_review_args(rest.trim_start()) {
-                Ok((prompt, personas)) => {
-                    CommandEffect::Action(CommandAction::CodeSwarmReview { prompt, personas })
-                }
-                Err(message) => CommandEffect::Message(format!("{message}\n{USAGE}")),
-            }
+        // `review` was a run verb here until CodeSwarm became agent-only.
+        // Users still have the muscle memory, so name the replacement rather
+        // than emit a bare usage line.
+        Some(arg) if arg == "review" || arg.starts_with("review ") => {
+            CommandEffect::Message(CODE_SWARM_AGENT_ONLY_TEACH.to_owned())
         }
+        Some(_) => CommandEffect::Message(USAGE.to_owned()),
     }
 }
 
-/// `--personas a,b,c` and `--prompt <everything after it>`. Prompt must come
-/// last so it can contain spaces without quoting.
-#[allow(clippy::type_complexity)]
-fn parse_code_swarm_review_args(
-    rest: &str,
-) -> Result<(Option<String>, Option<Vec<String>>), String> {
-    let mut prompt = None;
-    let mut personas = None;
-    let mut remaining = rest.trim();
-    while !remaining.is_empty() {
-        if let Some(value) = remaining.strip_prefix("--prompt") {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err("--prompt requires text".to_owned());
-            }
-            prompt = Some(value.to_owned());
-            remaining = "";
-        } else if let Some(value) = remaining.strip_prefix("--personas") {
-            let value = value.trim_start();
-            let (list, rest) = match value.split_once(char::is_whitespace) {
-                Some((list, rest)) => (list, rest.trim_start()),
-                None => (value, ""),
-            };
-            if list.is_empty() {
-                return Err("--personas requires a comma-separated list".to_owned());
-            }
-            personas = Some(list.split(',').map(str::trim).map(str::to_owned).collect());
-            remaining = rest;
-        } else {
-            return Err(format!("unknown argument: {remaining}"));
-        }
-    }
-    Ok((prompt, personas))
-}
+/// Shown wherever a user reaches for a CodeSwarm run verb. It names the one
+/// way in rather than only refusing.
+pub(crate) const CODE_SWARM_AGENT_ONLY_TEACH: &str =
+    "code-swarm has no run command: reviews are something the agent runs for you. \
+     Ask it in plain language — for example \"code swarm this diff\" or \"code swarm \
+     PR 123\" — and it will gather the needed material with ordinary tools, then call \
+     its code_swarm_review tool with explicit context. \
+     Use /code-swarm to choose which reviewer models it uses.";
 
 fn extension_slash_or_unknown(
     token: &str,
@@ -965,7 +970,37 @@ fn extension_slash_or_unknown(
             raw_args,
         });
     }
+    // An agent-only command mints no token, so its name lands here. Saying
+    // "unknown command" would be a lie: the command exists, it just is not
+    // the user's to run.
+    if let Some(teach) = agent_only_teach(token, context) {
+        return CommandEffect::Message(teach);
+    }
     CommandEffect::Message(format!("unknown command: {token}"))
+}
+
+/// The teach for a token that names an enabled extension's agent-only command.
+fn agent_only_teach(token: &str, context: &CommandContext) -> Option<String> {
+    let name = token.trim_start_matches('/');
+    let (name, id_hint) = match name.split_once('.') {
+        Some((id, command)) => (command, Some(id)),
+        None => (name, None),
+    };
+    let item = context.extension_items.iter().find(|item| {
+        item.enabled
+            && id_hint.is_none_or(|id| id == item.id)
+            && item.commands.iter().any(|command| {
+                command.invocation.is_agent_only() && command.name.eq_ignore_ascii_case(name)
+            })
+    })?;
+    if item.id == "code-swarm" {
+        return Some(CODE_SWARM_AGENT_ONLY_TEACH.to_owned());
+    }
+    Some(format!(
+        "{token} is not a user command: {} · {name} is run by the agent on your behalf. \
+         Ask the agent for it in plain language.",
+        item.id
+    ))
 }
 
 fn extension_argument_values(
@@ -1491,7 +1526,13 @@ mod tests {
                 bundled: true,
                 materialization: None,
                 version: "0.1.0".to_owned(),
-                commands: vec!["review".to_owned()],
+                // Mirrors production: the real ReviewCommand descriptor is
+                // AgentOnly, so a fixture claiming otherwise would test a
+                // surface that does not exist.
+                commands: vec![ExtensionCommandItem {
+                    name: "review".to_owned(),
+                    invocation: euler_sdk::Invocation::AgentOnly,
+                }],
                 capabilities: vec![],
                 audit_status: None,
             }],
@@ -1556,33 +1597,71 @@ mod tests {
     }
 
     #[test]
-    fn code_swarm_review_parses_personas_and_trailing_prompt() {
+    fn code_swarm_has_no_run_verb_and_teaches_the_agent_path() {
+        // CodeSwarm is agent-only: /code-swarm configures reviewers, and the
+        // agent's code_swarm_review tool is the only way to run one. The old
+        // `review` verb has muscle memory behind it, so it must name the
+        // replacement rather than emit a bare usage line.
         let context = code_swarm_context(true);
-        assert_eq!(
-            dispatch_command(
-                "/code-swarm review --personas tests,safety --prompt focus on the retry logic",
-                &context
-            ),
-            CommandEffect::Action(CommandAction::CodeSwarmReview {
-                prompt: Some("focus on the retry logic".to_owned()),
-                personas: Some(vec!["tests".to_owned(), "safety".to_owned()]),
-            })
-        );
-        assert_eq!(
-            dispatch_command("/code-swarm review", &context),
-            CommandEffect::Action(CommandAction::CodeSwarmReview {
-                prompt: None,
-                personas: None,
-            })
-        );
-        assert!(matches!(
-            dispatch_command("/code-swarm review --bogus", &context),
-            CommandEffect::Message(message) if message.contains("usage:")
-        ));
+        for input in [
+            "/code-swarm review",
+            "/code-swarm review --personas tests,safety --prompt focus on the retry logic",
+        ] {
+            match dispatch_command(input, &context) {
+                CommandEffect::Message(message) => {
+                    assert!(
+                        message.contains("code swarm this") && message.contains("/code-swarm"),
+                        "must name the agent path and the config surface: {message}"
+                    );
+                    assert!(
+                        !message.contains("--prompt"),
+                        "must not teach a flag that no longer exists: {message}"
+                    );
+                }
+                other => panic!("{input} must not run a review, got {other:?}"),
+            }
+        }
         assert!(matches!(
             dispatch_command("/code-swarm bogus", &context),
             CommandEffect::Message(message) if message.contains("usage:")
         ));
+    }
+
+    #[test]
+    fn agent_only_command_mints_no_slash_token_but_is_still_listed() {
+        // The command exists; it is simply not the user's to run. Hiding it
+        // from the manager would be a different lie than offering to run it.
+        let context = code_swarm_context(true);
+        assert!(
+            !build_extension_slash_commands(&context.extension_items)
+                .iter()
+                .any(|cmd| cmd.token == "/review"),
+            "agent-only review must not mint /review"
+        );
+        let details = context.extension_items[0].details_text();
+        assert!(
+            details.contains("review (agent-only)"),
+            "manager must still list it, marked: {details}"
+        );
+    }
+
+    #[test]
+    fn agent_only_token_teaches_instead_of_unknown_command() {
+        // /review no longer resolves; "unknown command" would be a lie.
+        let context = code_swarm_context(true);
+        match dispatch_command("/review --prompt x", &context) {
+            CommandEffect::Message(message) => {
+                assert!(
+                    message.contains("code swarm this"),
+                    "must name the agent path: {message}"
+                );
+                assert!(
+                    !message.contains("unknown command"),
+                    "the command exists: {message}"
+                );
+            }
+            other => panic!("expected teach, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1601,18 +1680,22 @@ mod tests {
         assert_eq!(entry.extension_id, "code-swarm");
         assert!(entry.summary.contains("reviewer swarm"));
         assert!(!entry.enabled);
-        // The command token still registers alongside the surface token.
-        assert!(cmds.iter().any(|cmd| cmd.token == "/review"));
+        // /code-swarm is the whole surface: it configures reviewers. The
+        // agent-only `review` command mints no companion token.
+        assert!(!cmds.iter().any(|cmd| cmd.token == "/review"));
     }
 
     #[test]
     fn extension_slash_arguments_parse_or_reject_never_drop() {
+        // Generic slash-argument handling, exercised through a user-invocable
+        // command. (It used /review until CodeSwarm became agent-only; the
+        // behavior under test was never CodeSwarm-specific.)
         let context = CommandContext {
             extension_slash_commands: vec![ExtensionSlashCommand {
-                token: "/review".to_owned(),
-                summary: "code-swarm · review".to_owned(),
-                extension_id: "code-swarm".to_owned(),
-                command: "review".to_owned(),
+                token: "/catch-up".to_owned(),
+                summary: "causal-dag · catch-up".to_owned(),
+                extension_id: "causal-dag".to_owned(),
+                command: "catch-up".to_owned(),
                 enabled: true,
             }],
             ..CommandContext::default()
@@ -1620,40 +1703,40 @@ mod tests {
 
         // JSON argument parses into the input.
         assert_eq!(
-            dispatch_command("/review {\"reviewers\":[\"tests\"]}", &context),
+            dispatch_command("/catch-up {\"format\":\"json\"}", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
-                id: "code-swarm".to_owned(),
-                command: "review".to_owned(),
-                input: serde_json::json!({"reviewers": ["tests"]}),
+                id: "causal-dag".to_owned(),
+                command: "catch-up".to_owned(),
+                input: serde_json::json!({"format": "json"}),
                 raw_args: None,
             })
         );
         // Flag arguments travel to resolve-time ArgSpec parsing.
         assert_eq!(
-            dispatch_command("/review --reviewer tests --model a::b", &context),
+            dispatch_command("/catch-up --format json", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
-                id: "code-swarm".to_owned(),
-                command: "review".to_owned(),
+                id: "causal-dag".to_owned(),
+                command: "catch-up".to_owned(),
                 input: serde_json::json!({}),
-                raw_args: Some("--reviewer tests --model a::b".to_owned()),
+                raw_args: Some("--format json".to_owned()),
             })
         );
         // Invalid JSON is an error, not a silent default run.
         assert!(matches!(
-            dispatch_command("/review {broken", &context),
+            dispatch_command("/catch-up {broken", &context),
             CommandEffect::Message(message) if message.contains("must be JSON")
         ));
         // Free text is a usage error, not a silent default run.
         assert!(matches!(
-            dispatch_command("/review tests please", &context),
+            dispatch_command("/catch-up json please", &context),
             CommandEffect::Message(message) if message.contains("usage:")
         ));
         // No argument still dispatches with empty input.
         assert_eq!(
-            dispatch_command("/review", &context),
+            dispatch_command("/catch-up", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
-                id: "code-swarm".to_owned(),
-                command: "review".to_owned(),
+                id: "causal-dag".to_owned(),
+                command: "catch-up".to_owned(),
                 input: serde_json::json!({}),
                 raw_args: None,
             })
@@ -1689,7 +1772,7 @@ mod tests {
                 bundled: true,
                 materialization: None,
                 version: "0.1.0".to_owned(),
-                commands: vec!["catch-up".to_owned()],
+                commands: vec![ExtensionCommandItem::user("catch-up")],
                 capabilities: vec![],
                 audit_status: None,
             }],

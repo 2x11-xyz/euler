@@ -32,10 +32,12 @@ honest UX today.
 `HostApi::spawn_agents`) restricts batch children to single-round, tool-free,
 empty-capability briefs, then runs three phases:
 
-- **Phase 1 (session thread, batch order)**: assemble the parent canvas
-  once; for each task record `agent.spawn`, `canvas.snapshot`,
-  `model.call`, and build the `ModelRequest`. All reviewers see the same
-  canvas — later reviewers do not observe earlier reviewers' events.
+- **Phase 1 (session thread, batch order)**: assemble the parent canvas once
+  only when a task explicitly requests it; for each task record
+  `agent.spawn`, `canvas.snapshot`, `model.call`, and build the
+  `ModelRequest`. Canvas-enabled children share that snapshot and never see
+  earlier reviewers' events. Self-contained CodeSwarm briefs disable parent
+  canvas inheritance and receive only their explicit task context.
 - **Phase 2 (worker threads, concurrent)**: one scoped thread per task
   invokes the provider and drains its stream through the shared
   `RoundLoop` (keeping transport-retry semantics). Workers append **no**

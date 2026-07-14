@@ -78,43 +78,4 @@ impl AppCore {
             ))
         }
     }
-
-    /// `/code-swarm review` — one extension command; the extension
-    /// self-orchestrates its reviewers through `HostApi::spawn_agents`.
-    /// Reviewer targets ride the shared resolution chain inside
-    /// `extension_run`'s code-swarm seam; this path never guesses models.
-    pub(super) fn code_swarm_review(
-        &mut self,
-        prompt: Option<String>,
-        personas: Option<Vec<String>>,
-    ) -> CoreEffect {
-        self.extension_run(
-            "code-swarm".to_owned(),
-            "review".to_owned(),
-            code_swarm_review_input(prompt, personas),
-            None,
-        )
-    }
-}
-
-pub(super) fn code_swarm_review_input(
-    prompt: Option<String>,
-    personas: Option<Vec<String>>,
-) -> serde_json::Value {
-    let mut input = serde_json::Map::new();
-    if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
-        input.insert("prompt".to_owned(), serde_json::Value::String(prompt));
-    }
-    if let Some(personas) = personas.filter(|personas| !personas.is_empty()) {
-        input.insert(
-            "reviewers".to_owned(),
-            serde_json::Value::Array(
-                personas
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    serde_json::Value::Object(input)
 }
