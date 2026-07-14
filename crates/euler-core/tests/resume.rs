@@ -1,8 +1,8 @@
 use euler_core::permissions::{DeciderVerdict, PermissionDecider, PermissionRequest};
 use euler_core::{
     fold_session, read_resume_prefix, resume_session, resume_session_from_prefix,
-    resume_session_with_outcome, ContextLimitConfig, ModelTarget, ProvenanceWriter,
-    ReasoningEffort, ResumeError, Session, SessionConfig,
+    resume_session_with_outcome, AutoCompactionPolicy, CompactionTier, ContextLimitConfig,
+    ModelTarget, ProvenanceWriter, ReasoningEffort, ResumeError, Session, SessionConfig,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
@@ -104,6 +104,48 @@ fn fold_leaves_original_target_empty_for_legacy_logs() {
     .expect("fold");
 
     assert_eq!(folded.original_target, None);
+}
+
+#[test]
+fn fold_replays_compaction_policy_changes_and_legacy_tier_off() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = SessionConfig::new(temp.path());
+    let mut session = Session::new(
+        config.clone(),
+        ScriptedProvider::new(vec![]),
+        CountingDecider::default(),
+    );
+    session
+        .set_auto_compaction_policy(false, true)
+        .expect("policy change");
+
+    let folded = fold_session(&config, session.events().to_vec()).expect("fold");
+    assert!(!folded.auto_compaction.automatic);
+    assert_eq!(folded.auto_compaction.tier, CompactionTier::Stubs);
+
+    let legacy_start = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_START,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            (
+                "auto_compaction",
+                json!({"tier": "off", "budget_bytes": 1234}),
+            ),
+        ]),
+    );
+    let legacy = fold_session(&config, vec![legacy_start]).expect("legacy fold");
+    assert_eq!(
+        legacy.auto_compaction,
+        AutoCompactionPolicy {
+            automatic: false,
+            tier: CompactionTier::Off,
+            budget_bytes: 1234,
+        }
+    );
 }
 
 #[test]

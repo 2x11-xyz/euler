@@ -61,7 +61,7 @@ fn exec_help_lists_verified_flags_and_defaults() {
     let text = stdout(&output);
     assert!(text.contains("--auto-compaction"));
     assert!(text.contains("--max-tool-rounds"));
-    assert!(text.contains("default: stubs"));
+    assert!(text.contains("default: automatic stubs"));
     assert!(text.contains("default: 640000"));
     assert!(text.contains("default: unlimited"));
     assert!(text.contains("exec --resume"));

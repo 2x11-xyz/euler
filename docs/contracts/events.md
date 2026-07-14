@@ -50,6 +50,7 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `context.limit`
 - `context.slot.updated`
 - `canvas.snapshot`
+- `canvas.policy.changed`
 - `canvas.swap`
 - `canvas.candidate.discarded`
 - `secret.redacted`
@@ -261,6 +262,12 @@ envelope `v` per `docs/contracts/persistence.md`.
   hard-stop checks. It is telemetry and config projection only; resume
   authority remains the event stream and active model target. Omitted in older
   streams means unknown.
+  Optional `auto_compaction` is an object `{ "automatic": <bool>,
+  "stubs": <bool>, "tier": "off"|"stubs", "budget_bytes": <usize> }`.
+  `automatic` controls threshold-driven compaction and `stubs` controls
+  recoverable tool-result demotion. Both default to `true` in new sessions;
+  older streams without the object use the launching configuration. The
+  legacy `tier` field remains for compatibility and is normalized at resume.
 - `session.resumed`: `provider`, `model`, `events_folded`, optional
   `resumed_from_event_id`. A durable audit marker recording that the session
   lifetime was continued, against which target and from which tail event.
@@ -275,11 +282,15 @@ envelope `v` per `docs/contracts/persistence.md`.
   event stream is readable and contains no `session.renamed`; the next rename
   writes this canonical event and refreshes the sidecar projection.
 - `canvas.snapshot`: `selected_event_ids`, `counts`, retention telemetry
-  `retained_items`, `retained_bytes`, `demoted_items`, `tier`, `budget_bytes`,
+  `retained_items`, `retained_bytes`, `demoted_items`, `automatic`, `stubs`,
+  `tier`, `budget_bytes`,
   `over_budget`, and `pressure` (`none`|`byte`|`token`|`both`). Optional
   `used_tokens` and `limit_tokens` are included when provider usage and a
   configured context limit are known. Snapshot fields are assembly telemetry
   for the next model request; they do not rewrite provenance history.
+- `canvas.policy.changed`: `automatic`, `stubs`, and `budget_bytes`. It records
+  a user/configuration change to the two live retention switches. The event is
+  session-level control metadata; it does not change or delete provenance.
 - `canvas.swap`: `snapshot_start_id`, `snapshot_end_id`,
   `frontier_start_id`, `policy_version`, `projection_schema_version`,
   `projection_blob`, `validation_result`. It records a compacted canvas
@@ -360,7 +371,8 @@ envelope `v` per `docs/contracts/persistence.md`.
   `model.call`.
 - `assistant.message` parents its `model.result`.
 - `model.switched`, `model.effort.changed`, `context.limit`,
-  `context.slot.updated`, `canvas.swap`, and `canvas.candidate.discarded`
+  `context.slot.updated`, `canvas.policy.changed`, `canvas.swap`, and
+  `canvas.candidate.discarded`
   parent the previous persisted event (they are session-level control events).
   When a model switch requires an automatic effort downgrade, the
   `model.effort.changed` event parents that `model.switched` event and both are

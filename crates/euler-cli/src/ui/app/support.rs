@@ -1,7 +1,7 @@
 use super::super::{
     commands::{
-        theme_choices, CausalDagStats, CheckpointItem, CommandContext, EffortChoice, ModelChoice,
-        ResumeItem,
+        theme_choices, CausalDagStats, CheckpointItem, CommandContext, CompactionSettings,
+        EffortChoice, ModelChoice, ResumeItem,
     },
     event_loop::{InputEvent, UiEvent},
     status::TokenUsageSnapshot,
@@ -99,6 +99,7 @@ pub(super) struct CommandContextParts {
     pub extension_slash_commands: Vec<super::super::commands::ExtensionSlashCommand>,
     pub code_swarm_models: Vec<String>,
     pub causal_dag_stats: Option<CausalDagStats>,
+    pub compaction: CompactionSettings,
 }
 
 pub(super) fn command_context(
@@ -138,6 +139,7 @@ pub(super) fn command_context(
         extension_slash_commands: parts.extension_slash_commands,
         code_swarm_models: parts.code_swarm_models,
         causal_dag_stats: parts.causal_dag_stats,
+        compaction: parts.compaction,
     }
 }
 

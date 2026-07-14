@@ -60,31 +60,22 @@ impl AppCore {
         }
     }
 
-    pub(super) fn show_compaction_status(&mut self) -> CoreEffect {
-        let AppState::Idle { session } = &self.state else {
-            return self.notice_item("compaction status waits for the active turn".to_owned());
+    pub(super) fn set_compaction_policy(&mut self, automatic: bool, stubs: bool) -> CoreEffect {
+        let AppState::Idle { session } = &mut self.state else {
+            return self.notice_item("compaction settings wait for the active turn".to_owned());
         };
-        let policy = session.auto_compaction_policy();
-        let demoted = self.token_usage.demoted_items;
-        let retained = self
-            .token_usage
-            .canvas_retained_bytes
-            .map(|bytes| bytes.to_string())
-            .unwrap_or_else(|| "?".to_owned());
-        let limit = session
-            .context_limit_tokens()
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "unknown".to_owned());
-        let used = session
-            .latest_model_usage_used_tokens()
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "unknown".to_owned());
-        self.notice_item(format!(
-            "compaction tier={} budget_bytes={} retained_bytes={retained} demoted={demoted} limit_tokens={limit} used_tokens={used} reserve={}",
-            policy.tier.as_str(),
-            policy.budget_bytes,
-            session.compaction_reserve_tokens()
-        ))
+        match session.set_auto_compaction_policy(automatic, stubs) {
+            Ok(true) => {
+                self.rebuild_bottom_surface();
+                self.notice_item(format!(
+                    "compaction settings · automatic {} · tool stubs {}",
+                    if automatic { "on" } else { "off" },
+                    if stubs { "on" } else { "off" },
+                ))
+            }
+            Ok(false) => self.notice_item("compaction settings unchanged".to_owned()),
+            Err(error) => self.error_item(format!("compaction settings rejected: {error}")),
+        }
     }
 
     pub(super) fn compact_session(&mut self) -> CoreEffect {
@@ -92,8 +83,7 @@ impl AppCore {
             return self.notice_item("compaction waits for the active turn".to_owned());
         };
         let start = session.events().len();
-        let projection = heuristic_projection(session.events());
-        if session.try_compact(&projection) {
+        if session.compact_now() {
             let new_events = session.events()[start..].to_vec();
             for event in new_events {
                 self.transcript.push_event(event);

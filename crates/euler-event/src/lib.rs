@@ -44,6 +44,7 @@ impl EventKind {
     pub const CONTEXT_LIMIT: &'static str = "context.limit";
     pub const CONTEXT_SLOT_UPDATED: &'static str = "context.slot.updated";
     pub const CANVAS_SNAPSHOT: &'static str = "canvas.snapshot";
+    pub const CANVAS_POLICY_CHANGED: &'static str = "canvas.policy.changed";
     pub const CANVAS_SWAP: &'static str = "canvas.swap";
     pub const CANVAS_CANDIDATE_DISCARDED: &'static str = "canvas.candidate.discarded";
     pub const SECRET_REDACTED: &'static str = "secret.redacted";
@@ -91,6 +92,7 @@ impl EventKind {
         Self::CONTEXT_LIMIT,
         Self::CONTEXT_SLOT_UPDATED,
         Self::CANVAS_SNAPSHOT,
+        Self::CANVAS_POLICY_CHANGED,
         Self::CANVAS_SWAP,
         Self::CANVAS_CANDIDATE_DISCARDED,
         Self::SECRET_REDACTED,
@@ -327,6 +329,14 @@ mod tests {
             object([("summary", "selected".into())]),
         );
         assert_round_trip(
+            EventKind::CANVAS_POLICY_CHANGED,
+            object([
+                ("automatic", true.into()),
+                ("stubs", true.into()),
+                ("budget_bytes", 640_000.into()),
+            ]),
+        );
+        assert_round_trip(
             EventKind::CANVAS_SWAP,
             object([
                 ("snapshot_start_id", "01J00000000000000000000001".into()),
@@ -425,6 +435,7 @@ mod tests {
             EventKind::CONTEXT_LIMIT,
             EventKind::CONTEXT_SLOT_UPDATED,
             EventKind::CANVAS_SNAPSHOT,
+            EventKind::CANVAS_POLICY_CHANGED,
             EventKind::CANVAS_SWAP,
             EventKind::CANVAS_CANDIDATE_DISCARDED,
             EventKind::SECRET_REDACTED,
@@ -606,6 +617,10 @@ mod tests {
                 json!({"selected_event_ids": ["01J00000000000000000000000"], "counts": {"items": 1}}),
             ),
             base(
+                EventKind::CANVAS_POLICY_CHANGED,
+                json!({"automatic": true, "stubs": true, "budget_bytes": 640000}),
+            ),
+            base(
                 EventKind::CANVAS_SWAP,
                 json!({
                     "snapshot_start_id": "01J00000000000000000000001",
@@ -743,6 +758,7 @@ mod tests {
             }
             EventKind::CONTEXT_SLOT_UPDATED => vec!["extension_id", "slot", "content"],
             EventKind::CANVAS_SNAPSHOT => vec!["selected_event_ids", "counts"],
+            EventKind::CANVAS_POLICY_CHANGED => vec!["automatic", "stubs", "budget_bytes"],
             EventKind::CANVAS_SWAP => {
                 vec![
                     "snapshot_start_id",

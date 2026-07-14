@@ -144,7 +144,7 @@ Options:
   --reasoning-effort <e>     xsmall, small, medium, large, xlarge, or max
   --max-output-tokens <n>    Cap output tokens per model response
   --max-tool-rounds <n>      Cap tool rounds per turn (default: unlimited)
-  --auto-compaction <tier>   off or stubs (default: stubs)
+  --auto-compaction <tier>   off or stubs (default: automatic stubs)
   --compaction-budget-bytes <n>
                              Canvas byte budget for compaction (default: 640000)
 {HELP_LINE}"

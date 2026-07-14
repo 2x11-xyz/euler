@@ -2,7 +2,8 @@ use super::*;
 use crate::ui::commands::ExtensionCommandItem;
 use crate::ui::commands::{
     build_extension_slash_commands, command_table, permission_choices, theme_choices,
-    CausalDagStats, EffortChoice, ExtensionManagerItem, ModelChoice, ResumeItem,
+    CausalDagStats, CompactionSettings, EffortChoice, ExtensionManagerItem, ModelChoice,
+    ResumeItem,
 };
 use crate::ui::theme::ThemeChoice;
 use euler_core::{ApprovalMode, ReasoningEffort};
@@ -163,6 +164,41 @@ fn palette_confirm_on_code_swarm_opens_config_not_extension_run() {
         }
         other => panic!("expected extension run, got {other:?}"),
     }
+}
+
+#[test]
+fn compaction_picker_shows_defaults_and_applies_independent_toggles() {
+    let mut surface = BottomSurface::new(CommandContext {
+        compaction: CompactionSettings {
+            automatic: true,
+            stubs: true,
+        },
+        ..CommandContext::default()
+    });
+    surface.open_palette();
+    surface.palette_insert("compaction");
+    assert_eq!(surface.confirm(), SurfaceEvent::None);
+
+    let rendered = surface
+        .surface_lines(100)
+        .expect("compaction picker")
+        .join("\n");
+    assert!(rendered.contains("COMPACTION · automatic on · stubs on"));
+    assert!(rendered.contains("[✓] automatic compaction"));
+    assert!(rendered.contains("[✓] tool stubs"));
+    assert!(rendered.contains("space toggle"));
+
+    surface.move_selection_down();
+    assert_eq!(surface.compaction_toggle(), Some(SurfaceEvent::None));
+    surface.move_selection_down();
+    assert_eq!(surface.compaction_toggle(), Some(SurfaceEvent::None));
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::SetCompactionPolicy {
+            automatic: false,
+            stubs: false,
+        })
+    );
 }
 
 #[test]

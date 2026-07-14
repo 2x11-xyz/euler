@@ -35,7 +35,10 @@ Flags:
   appear in `/resume`. (Pre-v0.1.2 default was `./euler-provenance.jsonl` in
   the cwd; scripts that depended on that path should pass `--provenance`
   explicitly.)
-- `--auto-compaction off|stubs` chooses canvas retention. Default: `stubs`.
+- `--auto-compaction off|stubs` chooses the legacy headless policy bundle:
+  `off` disables automatic compaction and stubs; `stubs` enables both. When no
+  flag is supplied, both automatic compaction and recoverable tool stubs are
+  enabled by default.
 - `--compaction-budget-bytes <n>` sets the rendered-canvas byte budget. Default:
   `640000`.
 
