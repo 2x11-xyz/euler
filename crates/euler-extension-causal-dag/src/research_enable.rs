@@ -37,7 +37,7 @@ impl ExtensionCommand for CausalDagResearchEnableCommand {
         if let Some(state) = ResearchState::load(host)? {
             return Ok(enable_output(&state));
         }
-        if ActiveGraphState::load(host)?.is_some() {
+        if ActiveGraphState::blocks_research_enable(host)? {
             return Err(input_error(
                 "cannot enable the research-record pilot while a v3 causal DAG is active; start a fresh session",
             ));

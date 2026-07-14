@@ -39,6 +39,27 @@ impl ActiveGraphState {
         Self::ensure_legacy_mode_in_dir(&host.state_dir()?)
     }
 
+    /// Mode selection only needs to know whether a valid v3 state is active.
+    /// A non-regular or oversized legacy file cannot be active under the v3
+    /// loader, so it must not prevent a user from starting the separate
+    /// research-record mode in this session.
+    pub(super) fn blocks_research_enable(host: &dyn HostApi) -> Result<bool, ExtensionError> {
+        let dir = host.state_dir()?;
+        let path = dir.join(ACTIVE_STATE_FILE);
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(state_error(error)),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_ACTIVE_STATE_BYTES
+        {
+            return Ok(false);
+        }
+        Ok(Self::load_from_dir(&dir)?.is_some())
+    }
+
     fn ensure_legacy_mode_in_dir(dir: &Path) -> Result<(), ExtensionError> {
         if ResearchState::load_from_dir(dir)?.is_some() {
             return Err(state_message(

@@ -62,14 +62,19 @@ fn view_output(
     source_schema: &str,
     session_id: Option<&str>,
 ) -> Result<Value, ExtensionError> {
+    let source = if source_schema == RESEARCH_DAG_SCHEMA {
+        "selected research projection"
+    } else {
+        "active causal-dag graph"
+    };
     let artifact_session = artifact
         .pointer("/session/id")
         .and_then(Value::as_str)
-        .ok_or_else(|| input_error("active causal-dag graph has no session id"))?;
+        .ok_or_else(|| input_error(format!("{source} has no session id")))?;
     if session_id.is_some_and(|expected| expected != artifact_session) {
-        return Err(input_error(
-            "session_id does not match the active causal-dag graph",
-        ));
+        return Err(input_error(format!(
+            "session_id does not match the {source}"
+        )));
     }
     let dag = ViewerDag::from_artifact(artifact)?;
     Ok(json!({

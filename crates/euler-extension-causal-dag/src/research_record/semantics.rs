@@ -23,6 +23,7 @@ pub(super) fn validate_record_semantics(accepted: &AcceptedRecord) -> Result<(),
         validate_relation_endpoints(relation, &accepted.entities)?;
         validate_lineage_relation(relation, accepted)?;
     }
+    validate_structural_backbone_acyclic(accepted)?;
     validate_syntheses(accepted)?;
     for investigation in accepted
         .entities
@@ -57,6 +58,57 @@ pub(super) fn validate_record_semantics(accepted: &AcceptedRecord) -> Result<(),
         }
     }
     Ok(())
+}
+
+fn validate_structural_backbone_acyclic(accepted: &AcceptedRecord) -> Result<(), ExtensionError> {
+    let mut parents = BTreeMap::<String, BTreeSet<String>>::new();
+    for relation in accepted.relations.values() {
+        let parent_edge = match relation.kind {
+            RelationKind::Repairs | RelationKind::ContinuesFrom => {
+                Some((&relation.from, &relation.to))
+            }
+            RelationKind::Decomposes if accepted.viable_decomposition_parent(&relation.from) => {
+                Some((&relation.to, &relation.from))
+            }
+            _ => None,
+        };
+        if let Some((child, parent)) = parent_edge {
+            parents
+                .entry(child.clone())
+                .or_default()
+                .insert(parent.clone());
+        }
+    }
+    let mut visiting = BTreeSet::new();
+    let mut settled = BTreeSet::new();
+    for child in parents.keys() {
+        if structural_cycle(child, &parents, &mut visiting, &mut settled) {
+            return Err(input_error("research structural backbone contains a cycle"));
+        }
+    }
+    Ok(())
+}
+
+fn structural_cycle(
+    entity_id: &str,
+    parents: &BTreeMap<String, BTreeSet<String>>,
+    visiting: &mut BTreeSet<String>,
+    settled: &mut BTreeSet<String>,
+) -> bool {
+    if settled.contains(entity_id) {
+        return false;
+    }
+    if !visiting.insert(entity_id.to_owned()) {
+        return true;
+    }
+    let cyclic = parents.get(entity_id).is_some_and(|parent_ids| {
+        parent_ids
+            .iter()
+            .any(|parent| structural_cycle(parent, parents, visiting, settled))
+    });
+    visiting.remove(entity_id);
+    settled.insert(entity_id.to_owned());
+    cyclic
 }
 
 fn validate_syntheses(accepted: &AcceptedRecord) -> Result<(), ExtensionError> {

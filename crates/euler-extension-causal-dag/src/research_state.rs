@@ -5,10 +5,14 @@
 //! observer can reconcile the next bounded provenance window.
 
 use crate::input_error;
-use crate::research_record::{ResearchRecord, RESEARCH_DAG_SCHEMA, RESEARCH_RECORD_SCHEMA};
+use crate::research_record::{
+    canonical_artifact_bytes, ResearchRecord, MAX_RESEARCH_DAG_ARTIFACT_BYTES,
+    MAX_RESEARCH_RECORD_ARTIFACT_BYTES, RESEARCH_DAG_SCHEMA, RESEARCH_RECORD_SCHEMA,
+};
 use euler_sdk::{ArtifactRecord, ExtensionError, HostApi};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path};
@@ -194,13 +198,13 @@ impl ResearchState {
             ));
         }
         let record_value = if let Some(record) = &self.record {
-            record.validate(RESEARCH_RECORD_SCHEMA)?;
+            record.validate(RESEARCH_RECORD_SCHEMA, MAX_RESEARCH_RECORD_ARTIFACT_BYTES)?;
             Some(ResearchRecord::from_value(&record.artifact)?)
         } else {
             None
         };
         if let Some(graph) = &self.graph {
-            graph.validate(RESEARCH_DAG_SCHEMA)?;
+            graph.validate(RESEARCH_DAG_SCHEMA, MAX_RESEARCH_DAG_ARTIFACT_BYTES)?;
         }
         if let (Some(record), Some(record_value), Some(graph)) =
             (&self.record, record_value.as_ref(), &self.graph)
@@ -247,7 +251,7 @@ impl StoredArtifact {
         Ok(stored)
     }
 
-    fn validate(&self, schema: &str) -> Result<(), ExtensionError> {
+    fn validate(&self, schema: &str, max_bytes: usize) -> Result<(), ExtensionError> {
         if !valid_event_id(&self.persisted_event_id)
             || !valid_sha256(&self.sha256)
             || !valid_relative_path(&self.relative_path)
@@ -255,6 +259,18 @@ impl StoredArtifact {
             || self.artifact.get("schema").and_then(Value::as_str) != Some(schema)
         {
             return Err(input_error("research-record selected artifact is invalid"));
+        }
+        let bytes = canonical_artifact_bytes(&self.artifact, "research-record selected artifact")?;
+        if bytes.len() > max_bytes {
+            return Err(input_error(
+                "research-record selected artifact exceeds the size limit",
+            ));
+        }
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        if self.byte_len != bytes.len() || !sha256.eq_ignore_ascii_case(&self.sha256) {
+            return Err(input_error(
+                "research-record selected artifact cache does not match its metadata",
+            ));
         }
         Ok(())
     }

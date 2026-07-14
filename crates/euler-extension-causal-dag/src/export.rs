@@ -247,7 +247,7 @@ impl GraphSource {
                     "research-record pilot has no accepted projection yet; run an observed pilot turn before exporting",
                 )
             })?;
-            validate_artifact_session(artifact, input.session_id.as_deref())?;
+            validate_artifact_session(artifact, input.session_id.as_deref(), RESEARCH_DAG_SCHEMA)?;
             let record = research.graph_record().ok_or_else(|| {
                 input_error("research-record pilot selected graph is missing its artifact record")
             })?;
@@ -260,7 +260,7 @@ impl GraphSource {
             });
         }
         if let Some(active) = ActiveGraphState::load(host)? {
-            validate_artifact_session(active.artifact(), input.session_id.as_deref())?;
+            validate_artifact_session(active.artifact(), input.session_id.as_deref(), SCHEMA_NAME)?;
             let byte_len = canonical_json_bytes(active.artifact())?.len();
             let record = active
                 .artifact_relative_path()
@@ -365,15 +365,21 @@ fn export_output(
 fn validate_artifact_session(
     artifact: &Value,
     expected: Option<&str>,
+    source_schema: &str,
 ) -> Result<(), ExtensionError> {
+    let source = if source_schema == RESEARCH_DAG_SCHEMA {
+        "selected research projection"
+    } else {
+        "active causal-dag graph"
+    };
     let actual = artifact
         .pointer("/session/id")
         .and_then(Value::as_str)
-        .ok_or_else(|| input_error("active causal-dag graph has no session id"))?;
+        .ok_or_else(|| input_error(format!("{source} has no session id")))?;
     if expected.is_some_and(|expected| expected != actual) {
-        return Err(input_error(
-            "session_id does not match the active causal-dag graph",
-        ));
+        return Err(input_error(format!(
+            "session_id does not match the {source}"
+        )));
     }
     Ok(())
 }

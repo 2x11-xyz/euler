@@ -2,8 +2,9 @@
 
 use crate::input_error;
 use crate::research_record::{
-    AcceptedRecord, AssessmentVerdict, EntityKind, InvestigationOutcome, RelationKind,
-    ResearchRecord, ResearchRelation, RESEARCH_DAG_MEDIA_TYPE, RESEARCH_DAG_SCHEMA,
+    canonical_artifact_bytes, AcceptedRecord, AssessmentVerdict, EntityKind, InvestigationOutcome,
+    RelationKind, ResearchRecord, ResearchRelation, MAX_RESEARCH_DAG_ARTIFACT_BYTES,
+    RESEARCH_DAG_MEDIA_TYPE, RESEARCH_DAG_SCHEMA,
 };
 use euler_sdk::ExtensionError;
 use serde_json::{json, Value};
@@ -64,9 +65,12 @@ impl ResearchProjection {
     }
 
     pub(crate) fn artifact_bytes(&self) -> Result<Vec<u8>, ExtensionError> {
-        let mut bytes = serde_json::to_vec(&self.artifact)
-            .map_err(|error| input_error(format!("research projection encode failed: {error}")))?;
-        bytes.push(b'\n');
+        let bytes = canonical_artifact_bytes(&self.artifact, "research projection")?;
+        if bytes.len() > MAX_RESEARCH_DAG_ARTIFACT_BYTES {
+            return Err(input_error(
+                "research projection exceeds the artifact size limit",
+            ));
+        }
         Ok(bytes)
     }
 
@@ -197,7 +201,7 @@ fn investigation_parent_candidates(entity_id: &str, accepted: &AcceptedRecord) -
             .filter(|relation| {
                 relation.kind == RelationKind::Decomposes
                     && relation.to == entity_id
-                    && viable_decomposition_parent(&relation.from, accepted)
+                    && accepted.viable_decomposition_parent(&relation.from)
             })
             .map(|relation| ParentLink {
                 relation_id: relation.id.clone(),
@@ -224,19 +228,6 @@ fn investigation_parent_candidates(entity_id: &str, accepted: &AcceptedRecord) -
             }),
     );
     candidates
-}
-
-fn viable_decomposition_parent(entity_id: &str, accepted: &AcceptedRecord) -> bool {
-    !matches!(
-        accepted
-            .latest_outcome_for(entity_id)
-            .map(|outcome| outcome.outcome),
-        Some(
-            InvestigationOutcome::Blocked
-                | InvestigationOutcome::DeadEnd
-                | InvestigationOutcome::Abandoned
-        )
-    )
 }
 
 fn produced_parent_candidates(entity_id: &str, accepted: &AcceptedRecord) -> Vec<ParentLink> {

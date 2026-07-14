@@ -10,8 +10,8 @@ use crate::observer_brief::{
 };
 use crate::research_projection::ResearchProjection;
 use crate::research_record::{
-    append_observer_batch, AppendInput, ObserverProposalBatch, ResearchRecord,
-    RESEARCH_DAG_MEDIA_TYPE, RESEARCH_PROPOSALS_SCHEMA, RESEARCH_RECORD_MEDIA_TYPE,
+    append_observer_batch, canonical_artifact_bytes, AppendInput, ObserverProposalBatch,
+    ResearchRecord, RESEARCH_DAG_MEDIA_TYPE, RESEARCH_PROPOSALS_SCHEMA, RESEARCH_RECORD_MEDIA_TYPE,
     RESEARCH_RECORD_SCHEMA,
 };
 use crate::research_state::ResearchState;
@@ -454,7 +454,7 @@ fn write_record_artifact(
     value: &Value,
     companion: &CompanionOutput,
 ) -> Result<ArtifactRecord, ExtensionError> {
-    let bytes = canonical_bytes(value, "research record")?;
+    let bytes = canonical_artifact_bytes(value, "research record")?;
     let source_event_ids = record
         .artifact_source_event_ids()
         .into_iter()
@@ -485,13 +485,6 @@ fn write_record_artifact(
             ),
         ]),
     })
-}
-
-fn canonical_bytes(value: &Value, label: &str) -> Result<Vec<u8>, ExtensionError> {
-    let mut bytes = serde_json::to_vec(value)
-        .map_err(|error| input_error(format!("{label} encode failed: {error}")))?;
-    bytes.push(b'\n');
-    Ok(bytes)
 }
 
 fn write_graph_artifact(
@@ -552,13 +545,14 @@ fn strip_json_fence(value: &str) -> &str {
     let Some(stripped) = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
     else {
         return trimmed;
     };
     stripped
         .strip_suffix("```")
         .map(str::trim)
-        .unwrap_or(trimmed)
+        .unwrap_or(stripped.trim())
 }
 
 fn parse_apply_envelope(value: &Value) -> Result<(ApplyInput, CompanionOutput), ExtensionError> {
@@ -592,10 +586,6 @@ fn parse_apply_envelope(value: &Value) -> Result<(ApplyInput, CompanionOutput), 
         .get("companion")
         .and_then(Value::as_object)
         .ok_or_else(|| input_error("research observer-apply input is missing companion"))?;
-    let output = companion
-        .get("output")
-        .and_then(Value::as_str)
-        .ok_or_else(|| input_error("research observer companion has no output"))?;
     if companion.get("ok").and_then(Value::as_bool) != Some(true) {
         let error = companion
             .get("error")
@@ -607,6 +597,10 @@ fn parse_apply_envelope(value: &Value) -> Result<(ApplyInput, CompanionOutput), 
             truncate(error, 240)
         )));
     }
+    let output = companion
+        .get("output")
+        .and_then(Value::as_str)
+        .ok_or_else(|| input_error("research observer companion has no output"))?;
     Ok((
         ApplyInput {
             limit: positive_usize(apply.get("limit"), DEFAULT_LIMIT, "limit")?,

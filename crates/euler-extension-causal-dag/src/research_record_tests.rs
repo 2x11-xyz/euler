@@ -148,6 +148,44 @@ fn malformed_ledger_cannot_reuse_a_decision_or_entry_identity() {
     let error = ResearchRecord::from_value(&second_decision)
         .expect_err("a proposal cannot be decided twice");
     assert!(error.to_string().contains("undecided proposal"));
+
+    let mut missing_decision = record.value().expect("record value");
+    missing_decision["ledger"]
+        .as_array_mut()
+        .expect("ledger")
+        .pop();
+    let error =
+        ResearchRecord::from_value(&missing_decision).expect_err("every proposal needs a decision");
+    assert!(error
+        .to_string()
+        .contains("missing its acceptance decision"));
+}
+
+#[test]
+fn record_rejects_aggregate_artifact_growth_before_persistence() {
+    let events = vec![
+        event("event-user", EventKind::USER_MESSAGE),
+        event("event-tool", EventKind::TOOL_RESULT),
+    ];
+    let record = append_observer_batch(AppendInput {
+        prior: None,
+        predecessor_record_artifact_event_id: None,
+        events: &events,
+        batch: batch(),
+        watermark_event_id: "event-tool".to_owned(),
+        generated_at: events[1].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("record");
+    let mut oversized = record.value().expect("record value");
+    oversized["episodes"][0]["event_kind"] =
+        serde_json::Value::String("x".repeat(MAX_RESEARCH_RECORD_ARTIFACT_BYTES));
+    let error = ResearchRecord::from_value(&oversized)
+        .expect_err("aggregate record size must be bounded before artifact persistence");
+    assert!(error
+        .to_string()
+        .contains("exceeds the artifact size limit"));
 }
 
 #[test]
@@ -507,6 +545,71 @@ fn repair_requires_shared_predecessor_and_successor_evidence() {
     assert!(error
         .to_string()
         .contains("lineage relation must cite evidence from both"));
+}
+
+#[test]
+fn structural_parent_relations_cannot_cycle() {
+    let events = vec![
+        event("event-user", EventKind::USER_MESSAGE),
+        event("event-tool", EventKind::TOOL_RESULT),
+    ];
+    let mut cyclic = batch();
+    cyclic.entities.push(ResearchEntity {
+        id: "i-repair".to_owned(),
+        kind: EntityKind::Investigation,
+        title: "Repair the recurrence".to_owned(),
+        summary: "A successor line that reuses the counterexample.".to_owned(),
+        lifecycle: Some(EntityLifecycle::Active),
+        source_event_ids: vec!["event-tool".to_owned()],
+    });
+    cyclic.outcomes.push(ResearchOutcome {
+        id: "outcome-repair-dead".to_owned(),
+        investigation_id: "i-repair".to_owned(),
+        outcome: InvestigationOutcome::DeadEnd,
+        summary: "The repair also reached a documented dead end.".to_owned(),
+        supersedes_outcome_id: None,
+        source_event_ids: vec!["event-tool".to_owned()],
+    });
+    cyclic.relations.extend([
+        ResearchRelation {
+            id: "r-repair-question".to_owned(),
+            kind: RelationKind::Investigates,
+            from: "i-repair".to_owned(),
+            to: "q-knuth".to_owned(),
+            summary: "The repair still addresses the question.".to_owned(),
+            source_event_ids: vec!["event-tool".to_owned()],
+        },
+        ResearchRelation {
+            id: "r-repair-to-recurrence".to_owned(),
+            kind: RelationKind::Repairs,
+            from: "i-repair".to_owned(),
+            to: "i-recurrence".to_owned(),
+            summary: "The repair cites the failed recurrence.".to_owned(),
+            source_event_ids: vec!["event-tool".to_owned()],
+        },
+        ResearchRelation {
+            id: "r-recurrence-to-repair".to_owned(),
+            kind: RelationKind::Repairs,
+            from: "i-recurrence".to_owned(),
+            to: "i-repair".to_owned(),
+            summary: "The original line cannot repair its successor.".to_owned(),
+            source_event_ids: vec!["event-tool".to_owned()],
+        },
+    ]);
+    let error = append_observer_batch(AppendInput {
+        prior: None,
+        predecessor_record_artifact_event_id: None,
+        events: &events,
+        batch: cyclic,
+        watermark_event_id: "event-tool".to_owned(),
+        generated_at: events[1].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect_err("a durable causal backbone must be acyclic");
+    assert!(error
+        .to_string()
+        .contains("structural backbone contains a cycle"));
 }
 
 #[test]

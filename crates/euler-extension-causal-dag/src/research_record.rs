@@ -27,6 +27,8 @@ pub(crate) const RESEARCH_PROPOSALS_SCHEMA: &str = "euler.research_record.propos
 pub(crate) const RESEARCH_DAG_SCHEMA: &str = "euler.causal_dag.v4";
 pub(crate) const RESEARCH_DAG_MEDIA_TYPE: &str = "application/vnd.euler.causal-dag.v4+json";
 pub(crate) const AUTO_ACCEPT_POLICY: &str = "source-grounded-auto-accept-v1";
+pub(crate) const MAX_RESEARCH_RECORD_ARTIFACT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_RESEARCH_DAG_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
 
 const MAX_ID_BYTES: usize = 96;
 const MAX_TITLE_BYTES: usize = 280;
@@ -415,8 +417,25 @@ impl ResearchRecord {
                 }
             }
         }
+        if canonical_artifact_bytes(&self.value()?, "research record")?.len()
+            > MAX_RESEARCH_RECORD_ARTIFACT_BYTES
+        {
+            return Err(input_error(
+                "research-record exceeds the artifact size limit",
+            ));
+        }
         Ok(())
     }
+}
+
+pub(crate) fn canonical_artifact_bytes(
+    value: &Value,
+    label: &str,
+) -> Result<Vec<u8>, ExtensionError> {
+    let mut bytes = serde_json::to_vec(value)
+        .map_err(|error| input_error(format!("{label} encode failed: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn accepted_proposals(
@@ -464,6 +483,11 @@ fn accepted_proposals(
                 }
             }
         }
+    }
+    if proposals.len() != decided_proposal_ids.len() {
+        return Err(input_error(
+            "research-record proposal is missing its acceptance decision",
+        ));
     }
     Ok((proposals, accepted_order))
 }
@@ -513,6 +537,18 @@ impl AcceptedRecord {
                 .get(id)
                 .filter(|outcome| outcome.investigation_id == investigation_id)
         })
+    }
+
+    pub(crate) fn viable_decomposition_parent(&self, entity_id: &str) -> bool {
+        !matches!(
+            self.latest_outcome_for(entity_id)
+                .map(|outcome| outcome.outcome),
+            Some(
+                InvestigationOutcome::Blocked
+                    | InvestigationOutcome::DeadEnd
+                    | InvestigationOutcome::Abandoned
+            )
+        )
     }
 }
 

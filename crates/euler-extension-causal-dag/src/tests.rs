@@ -12,6 +12,7 @@ use euler_sdk::{
     AgentOutcome, ArtifactRecord, EventFeedCheckpoint, HostAgentRecord, HostAgentResult,
     HostAgentTask, HostApi, ProvenancePage, SpawnAgentTask,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
@@ -1573,7 +1574,7 @@ fn export_writes_degraded_chronology_artifact_without_payload_content() {
     let artifact: Value = serde_json::from_slice(first_bytes).expect("artifact json");
 
     assert_eq!(first["node_count"], json!(3));
-    assert_eq!(second["sha256"], json!(TEST_ARTIFACT_HASH));
+    assert_eq!(second["sha256"], json!(artifact_sha256(second_bytes)));
     assert_eq!(first_bytes, second_bytes);
     assert!(!String::from_utf8_lossy(first_bytes).contains(secret));
     assert_eq!(artifact["schema"], json!(SCHEMA_NAME));
@@ -5042,6 +5043,40 @@ fn corrupt_active_graph_state_self_heals_instead_of_bricking_the_loop() {
 }
 
 #[test]
+fn research_enable_only_blocks_a_valid_active_legacy_graph() {
+    let host = RecordingHost::empty();
+    fs::write(
+        host.state.path().join("active-graph.json"),
+        vec![b'x'; 1024 * 1024 + 1],
+    )
+    .expect("write unusable legacy state");
+    let first = CausalDagResearchEnableCommand
+        .execute(CommandContext { input: json!({}) }, &host)
+        .expect("unusable legacy state must not block research mode");
+    let second = CausalDagResearchEnableCommand
+        .execute(CommandContext { input: json!({}) }, &host)
+        .expect("research enable is idempotent");
+    assert_eq!(first, second);
+    assert_eq!(first["enabled"], true);
+
+    let host = RecordingHost::empty();
+    let (_, artifact) = load_knuth_fixture();
+    let active = ArtifactRecord {
+        persisted_event_id: "legacy-artifact-event".to_owned(),
+        relative_path: "sessions/session-knuth/extensions/causal-dag/artifacts/legacy".to_owned(),
+        sha256: TEST_ARTIFACT_HASH.to_owned(),
+        byte_len: serde_json::to_vec(&artifact).expect("artifact bytes").len() + 1,
+    };
+    ActiveGraphState::commit(&host, &active, artifact, None).expect("active legacy graph");
+    let error = CausalDagResearchEnableCommand
+        .execute(CommandContext { input: json!({}) }, &host)
+        .expect_err("active legacy graph must block research mode");
+    assert!(error
+        .to_string()
+        .contains("while a v3 causal DAG is active"));
+}
+
+#[test]
 fn active_view_and_exports_share_the_selected_graph_artifact() {
     let host = RecordingHost::empty();
     let (_, artifact) = load_knuth_fixture();
@@ -5327,15 +5362,30 @@ fn research_record_observer_round_projects_and_reframes_identically() {
     assert!(host.spawn_tasks.lock().expect("spawn tasks").is_empty());
 
     let state_path = host.state.path().join("active-research-record.json");
-    let mut state: Value =
+    let state: Value =
         serde_json::from_slice(&fs::read(&state_path).expect("state bytes")).expect("state JSON");
-    state["graph"]["artifact"]["projection"]["record_artifact_event_id"] =
+    let mut tampered_cache = state.clone();
+    tampered_cache["graph"]["artifact"]["projection"]["record_artifact_event_id"] =
         json!("unrelated-record");
     fs::write(
         &state_path,
-        serde_json::to_vec(&state).expect("state bytes"),
+        serde_json::to_vec(&tampered_cache).expect("state bytes"),
     )
     .expect("replace malformed state");
+    let error = ResearchState::load(&host).expect_err("cached artifact tampering must be rejected");
+    assert!(error
+        .to_string()
+        .contains("cache does not match its metadata"));
+
+    let mut mismatched_pair = state;
+    mismatched_pair["graph"]["artifact"]["projection"]["record_artifact_event_id"] =
+        json!("unrelated-record");
+    refresh_cached_artifact_metadata(&mut mismatched_pair["graph"]);
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&mismatched_pair).expect("state bytes"),
+    )
+    .expect("replace mixed record and graph state");
     let error = ResearchState::load(&host).expect_err("mixed record and graph must be rejected");
     assert!(error
         .to_string()
@@ -5383,6 +5433,17 @@ fn active_state_without_artifact_path_reexports_raw_json() {
     assert_eq!(writes.len(), 1);
     let exported: Value = serde_json::from_slice(&writes[0].bytes).expect("exported graph JSON");
     assert_eq!(exported["schema"], SCHEMA_NAME);
+}
+
+fn artifact_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn refresh_cached_artifact_metadata(stored: &mut Value) {
+    let mut bytes = serde_json::to_vec(&stored["artifact"]).expect("artifact bytes");
+    bytes.push(b'\n');
+    stored["byte_len"] = json!(bytes.len());
+    stored["sha256"] = json!(artifact_sha256(&bytes));
 }
 
 fn recording_page(
@@ -5433,6 +5494,7 @@ impl HostApi for RecordingHost {
             return Err(ExtensionError::ArtifactWriteFailed("forced".to_owned()));
         }
         let byte_len = artifact.bytes.len();
+        let sha256 = artifact_sha256(&artifact.bytes);
         let mut writes = self.writes.lock().expect("writes");
         let write_number = writes.len() + 1;
         writes.push(artifact);
@@ -5444,7 +5506,7 @@ impl HostApi for RecordingHost {
         Ok(ArtifactRecord {
             persisted_event_id,
             relative_path: "sessions/session-1/extensions/causal-dag/artifacts/hash".to_owned(),
-            sha256: TEST_ARTIFACT_HASH.to_owned(),
+            sha256,
             byte_len,
         })
     }

@@ -31,6 +31,34 @@ fn task_states_the_observer_authority_boundary() {
 }
 
 #[test]
+fn proposal_parser_accepts_plain_markdown_fences() {
+    let output = format!(
+        "```\n{}\n```",
+        serde_json::json!({
+            "schema": RESEARCH_PROPOSALS_SCHEMA,
+            "entities": [],
+            "outcomes": [],
+            "relations": [],
+            "assessments": []
+        })
+    );
+    let parsed = parse_proposals(&output).expect("plain fence should be stripped");
+    assert_eq!(parsed.schema, RESEARCH_PROPOSALS_SCHEMA);
+}
+
+#[test]
+fn failed_companion_is_reported_before_missing_output() {
+    let error = parse_apply_envelope(&serde_json::json!({
+        "apply": {"mode": RESEARCH_MODE},
+        "companion": {"ok": false, "error": "observer quota exhausted"}
+    }))
+    .expect_err("failed companion must not require an output payload");
+    assert!(error
+        .to_string()
+        .contains("companion failed: observer quota exhausted"));
+}
+
+#[test]
 fn task_preserves_repair_and_pivot_direction_rules() {
     let record = ResearchRecord {
         schema: crate::research_record::RESEARCH_RECORD_SCHEMA.to_owned(),
