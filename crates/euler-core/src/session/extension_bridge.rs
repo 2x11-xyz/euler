@@ -11,7 +11,7 @@ use crate::permissions::PermissionDecider;
 use crate::permissions::{ApprovalMode, PermissionRequest};
 use euler_agents::{AgentBudget, AgentError, AgentTask};
 use euler_event::{object, EventKind};
-use euler_sdk::{AgentOutcome, Capability, Extension, ExtensionError, SpawnAgentTask};
+use euler_sdk::{AgentOutcome, Capability, Extension, ExtensionError, Invocation, SpawnAgentTask};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -297,6 +297,20 @@ impl<D> Session<D> {
         let extension_id = extension.manifest().id;
         if !self.extension_enabled(&extension_id) {
             return Err(ExtensionExecutionError::Disabled { id: extension_id });
+        }
+        // Every user-driven extension run funnels through here, so this is
+        // where agent-only is enforced rather than only at the surfaces that
+        // happen to exist today. The surfaces still refuse with their own
+        // wording (they can name a better next step); this is the backstop
+        // that keeps a future caller from quietly reopening the door.
+        // The agent's own path is `execute_extension_command`, which is
+        // ungated by design and unaffected.
+        if crate::extensions::command_invocation(extension, command)
+            .is_some_and(Invocation::is_agent_only)
+        {
+            return Err(ExtensionExecutionError::InvalidInput(format!(
+                "{extension_id}.{command} is agent-only: it is run by the agent on your behalf.                  Ask for it in ordinary turn text."
+            )));
         }
         self.approve_extension_capabilities(&extension_id, command, required)?;
         // Context assembly reads files and runs git/gh, so it must sit behind

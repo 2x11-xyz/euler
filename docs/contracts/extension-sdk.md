@@ -246,6 +246,13 @@ Rules:
 - **Refusals name the way in.** A surface that refuses an agent-only command
   must say how to reach it (ask the agent), not merely that it cannot run.
   "Unknown command" is a lie: the command exists.
+- **Enforced at the chokepoint, not only at the surfaces.**
+  `execute_extension_command_gated` — the path every user-driven run takes —
+  refuses agent-only commands itself, before any approval is spent. Surfaces
+  still refuse in their own words (they can name a better next step), but the
+  boundary does not depend on the set of surfaces that happens to exist.
+  `execute_extension_command` is the agent's ungated path and is deliberately
+  exempt: guarding it too would make agent-only mean unreachable.
 - **Listed, not hidden.** `/extension` still shows agent-only commands, marked
   `(agent-only)`. Hiding them would trade one wrong answer for another.
 - **Absent means `user`.** The manifest field and the persisted link inventory

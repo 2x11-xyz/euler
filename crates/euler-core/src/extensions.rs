@@ -10,7 +10,7 @@ use crate::{query_provenance, ProvenanceQuery, ProvenanceWriter};
 use euler_agents::ExtensionAgentRecordContext;
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_sdk::{
-    valid_checkpoint_name, EventFeedCheckpoint, EventFeedCheckpointError,
+    valid_checkpoint_name, EventFeedCheckpoint, EventFeedCheckpointError, Invocation,
     MAX_EVENT_FEED_CHECKPOINT_BYTES,
 };
 use euler_sdk::{AgentOutcome, SpawnAgentTask};
@@ -1394,6 +1394,22 @@ fn command_capabilities(
         ));
     }
     Ok(capabilities)
+}
+
+/// The declared invocation of `command` on `extension`, if it registers one.
+///
+/// Registration is contractually side-effect-free (extension-SDK contract), so
+/// this is safe to call on the approval path. `None` means the extension
+/// registers no such command — the caller's own unknown-command error is the
+/// honest answer then, not a fabricated invocation.
+pub(crate) fn command_invocation(extension: &dyn Extension, command: &str) -> Option<Invocation> {
+    let mut registrar = PendingRegistrar::default();
+    extension.register(&mut registrar).ok()?;
+    registrar
+        .0
+        .iter()
+        .find(|(name, _)| name == command)
+        .map(|(name, runner)| command_descriptor(name, runner.as_ref()).invocation)
 }
 
 fn command_descriptor(name: &str, runner: &dyn ExtensionCommand) -> CommandDescriptor {
