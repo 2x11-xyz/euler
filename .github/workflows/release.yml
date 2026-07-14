@@ -10,14 +10,30 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        name: Validate release tag
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
+            echo "Release tag must match v<version> using only letters, numbers, ., _, and -." >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -34,9 +50,9 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
 
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
@@ -50,7 +66,7 @@ jobs:
 
       - name: Package
         run: |
-          version="${{ github.event.inputs.tag || github.ref_name }}"
+          version="$RELEASE_TAG"
           name="euler-${version}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/euler" "$name/"
@@ -58,10 +74,33 @@ jobs:
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
 
-      - name: Upload assets
+      - name: Upload release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            euler-*.tar.gz
+            euler-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${{ github.event.inputs.tag || github.ref_name }}"
-          gh release create "$version" --verify-tag --title "Euler $version" --generate-notes || true
-          gh release upload "$version" euler-*.tar.gz euler-*.tar.gz.sha256 --clobber
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "Euler $RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/*.tar.gz release-assets/*.tar.gz.sha256 --clobber
