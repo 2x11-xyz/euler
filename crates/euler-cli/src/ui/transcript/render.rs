@@ -2,10 +2,11 @@ use super::cells::{
     edit_failure_status, output_rows_without_trailing_blanks, push_bounded_children,
     push_bounded_failure_children, push_cell_parent, push_child_rows, render_companion_block,
     render_edit_cell, render_extension_result, render_file_change_cell, render_interrupted,
-    render_patch_cell, render_permission_ask, render_permission_decision, render_resume_boundary,
-    render_tool_run, render_turn_recap, render_worked_duration, tool_failure_status,
-    CompanionRender, EditRender, ExtensionResultRender, FileChangeRender, PatchRender,
-    PermissionAskView, PermissionDecisionView, ResumeBoundaryRender, ToolRunRender,
+    render_patch_cell, render_permission_ask, render_permission_batch_ask,
+    render_permission_decision, render_resume_boundary, render_tool_run, render_turn_recap,
+    render_worked_duration, tool_failure_status, CompanionRender, EditRender,
+    ExtensionResultRender, FileChangeRender, PatchRender, PermissionAskView,
+    PermissionBatchAskView, PermissionDecisionView, ResumeBoundaryRender, ToolRunRender,
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
@@ -328,11 +329,20 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 push_cell_parent(&mut lines, &header, theme.transcript.tool, theme, width);
                 push_child_rows(&mut lines, &rows, theme.transcript.muted, theme, width);
             }
-            TranscriptItem::PermissionPrompt { capability, reason } => {
-                let text = if reason.is_empty() {
-                    format!("* Permission required: {capability}")
+            TranscriptItem::PermissionPrompt {
+                capability,
+                capabilities,
+                reason,
+            } => {
+                let requested = if capabilities.len() > 1 {
+                    capabilities.join(" · ")
                 } else {
-                    format!("* Permission required: {capability} - {reason}")
+                    capability.clone()
+                };
+                let text = if reason.is_empty() {
+                    format!("* Permission required: {requested}")
+                } else {
+                    format!("* Permission required: {reason} — {requested}")
                 };
                 push_wrapped(
                     &mut lines,
@@ -364,6 +374,22 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                         prior_count: *prior_count,
                         selected_option: *selected_option,
                         companion_name: companion_name.as_deref(),
+                    },
+                    theme,
+                    width,
+                );
+            }
+            TranscriptItem::PermissionBatchAsk {
+                operation,
+                capabilities,
+                selected_option,
+            } => {
+                render_permission_batch_ask(
+                    &mut lines,
+                    PermissionBatchAskView {
+                        operation,
+                        capabilities,
+                        selected_option: *selected_option,
                     },
                     theme,
                     width,

@@ -325,6 +325,44 @@ impl AppCore {
         ))
     }
 
+    /// Apply a session-local posture as an explicit mapping over every
+    /// capability. The mapping lives at the UI boundary: core continues to
+    /// own individual capability grants and never treats a posture as an OS
+    /// sandbox claim.
+    pub(super) fn set_permission_posture(&mut self, posture: PermissionPosture) -> CoreEffect {
+        let AppState::Idle { session } = &mut self.state else {
+            return self.notice_item("permission posture waits for the active turn".to_owned());
+        };
+        // A posture is an intentional reset of transient consent. Otherwise
+        // "Ask every time" could silently inherit an earlier session grant,
+        // and switching away from Read only could revive access the user
+        // thought they had turned off. Durable project/user rules remain
+        // visible and explicit in the advanced controls.
+        let session_grants = session
+            .list_grants()
+            .into_iter()
+            .filter(|(source, _)| *source == GrantSource::Session)
+            .collect::<Vec<_>>();
+        let mut cleared = 0;
+        for (_, grant) in session_grants {
+            match session.revoke_grant(grant.capability, &grant.pattern, GrantSource::Session) {
+                Ok(revoked) => cleared += revoked,
+                Err(error) => {
+                    return self
+                        .error_item(format!("could not reset session permission grant: {error}"));
+                }
+            }
+        }
+        for &capability in Capability::ALL {
+            session.set_permission_mode(capability, posture.mode_for(capability));
+        }
+        let grants = if cleared == 1 { "grant" } else { "grants" };
+        self.notice_item(format!(
+            "permission posture set to {} · cleared {cleared} session {grants}",
+            posture.label()
+        ))
+    }
+
     pub(super) fn open_permissions_picker(&mut self) -> CoreEffect {
         let AppState::Idle { session } = &self.state else {
             return self.notice_item("permissions wait for the active turn".to_owned());

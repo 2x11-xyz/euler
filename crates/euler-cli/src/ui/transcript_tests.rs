@@ -64,6 +64,30 @@ fn projects_supported_events_and_skips_control_events() {
 }
 
 #[test]
+fn operation_permission_panel_names_the_operation_and_every_capability() {
+    let items = vec![TranscriptItem::PermissionBatchAsk {
+        operation: "extension causal-dag.refresh".to_owned(),
+        capabilities: vec![
+            "fs-read".to_owned(),
+            "fs-write".to_owned(),
+            "network".to_owned(),
+        ],
+        selected_option: super::patch_approval::ApprovalOption::AllowOnce,
+    }];
+
+    let rendered = line_texts(&render_items_for_history(&items, &Theme::default(), 96)).join("\n");
+
+    assert!(rendered.contains("Approve operation?"));
+    assert!(rendered.contains("extension causal-dag.refresh"));
+    assert!(rendered.contains("requests: fs-read · fs-write · network"));
+    assert!(rendered.contains("y  Allow once"));
+    assert!(rendered.contains("a  Allow all requested capabilities for this session"));
+    assert!(rendered.contains("n  Deny"));
+    assert!(!rendered.contains("Allow all requested capabilities in this project"));
+    assert!(!rendered.contains("always"));
+}
+
+#[test]
 fn transcript_state_streams_live_tail_then_finalizes_without_duplicate() {
     let mut state = TranscriptState::default();
     state.push_event(event(
@@ -1527,6 +1551,7 @@ fn projects_slice2_events_without_opaque_reasoning_artifacts() {
             },
             TranscriptItem::PermissionPrompt {
                 capability: "shell-exec".to_owned(),
+                capabilities: Vec::new(),
                 reason: "run checks".to_owned(),
             },
             TranscriptItem::PermissionDecision {

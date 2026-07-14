@@ -95,7 +95,13 @@ envelope `v` per `docs/contracts/persistence.md`.
   on the tool header, not fresh decisions.
   This payload is the canonical tool-result shape; provider adapters map
   exactly this shape onto their wire formats.
-- `permission.prompt`: `capability`, `reason`.
+- `permission.prompt`: `capability`, `reason`. An operation-level extension
+  prompt retains that primary capability for compatibility and adds
+  `capabilities` (the complete, ordered, distinct capability list),
+  `operation`, `batch: true`, `extension_id`, and `command`. A batch is
+  settled only when it has one child `permission.decision` for every member of
+  `capabilities`; readers must not treat its first decision as a complete
+  answer.
 - `permission.decision`: `capability`, `mode`, `allowed`, `decision`.
   `mode` is the approval mode label (`ask` | `session-allow` |
   `always-deny`), or `static-grant` for extension registration grants, or
@@ -113,6 +119,10 @@ envelope `v` per `docs/contracts/persistence.md`.
     until resume learns patterned fold.
   - `instruction`: non-empty deny-with-guidance text when the user denied with
     instructions; omitted on bare deny and on allows.
+
+  Operation-batch decisions add `batch: true`, `operation`, `extension_id`,
+  and `command`. Each remains a separate capability decision and parents the
+  shared `permission.prompt`.
 
   Additive optional fields for guardian-reviewed decisions (ADR 0011 /
   `docs/contracts/capabilities.md`):

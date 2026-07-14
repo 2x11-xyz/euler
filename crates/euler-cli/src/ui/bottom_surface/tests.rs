@@ -3,7 +3,7 @@ use crate::ui::commands::ExtensionCommandItem;
 use crate::ui::commands::{
     build_extension_slash_commands, command_table, permission_choices, theme_choices,
     CausalDagStats, CompactionSettings, EffortChoice, ExtensionManagerItem, ModelChoice,
-    ResumeItem,
+    PermissionPosture, ResumeItem,
 };
 use crate::ui::theme::ThemeChoice;
 use euler_core::{ApprovalMode, ReasoningEffort};
@@ -733,20 +733,40 @@ fn permissions_palette_opens_via_action() {
 }
 
 #[test]
-fn permissions_picker_selects_existing_capability_and_mode() {
+fn permissions_picker_leads_with_honest_session_postures() {
     let mut surface = BottomSurface::new(CommandContext::default());
     surface.open_picker(PickerSpec::Permissions(permission_choices()));
     let rendered = surface
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Permissions (1/12)"));
-    assert!(rendered.contains("Files: read - Ask before reading files"));
+    assert!(rendered.contains("Permissions (1/40)"));
+    assert!(rendered.contains("Quick settings - Read only"));
+    assert!(rendered.contains("Full access (unsandboxed)"));
+    assert!(rendered.contains("Auto in workspace sandbox (not available)"));
     assert!(!rendered.contains('%'));
-    for _ in 0..4 {
+
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::SetPermissionPosture {
+            posture: PermissionPosture::ReadOnly,
+        })
+    );
+}
+
+#[test]
+fn permissions_picker_keeps_per_capability_controls_under_advanced() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_picker(PickerSpec::Permissions(permission_choices()));
+    for _ in 0..8 {
         surface.move_selection_down();
     }
 
+    let rendered = surface
+        .surface_lines(80)
+        .expect("permissions picker")
+        .join("\n");
+    assert!(rendered.contains("Advanced · Files: write - Allow file writes this session"));
     assert_eq!(
         surface.confirm(),
         SurfaceEvent::Action(CommandAction::SetPermissionMode {
@@ -757,10 +777,24 @@ fn permissions_picker_selects_existing_capability_and_mode() {
 }
 
 #[test]
+fn permissions_picker_marks_sandbox_posture_unavailable_instead_of_faking_it() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_picker(PickerSpec::Permissions(permission_choices()));
+    for _ in 0..3 {
+        surface.move_selection_down();
+    }
+
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::PermissionSandboxUnavailable)
+    );
+}
+
+#[test]
 fn permissions_picker_exposes_agent_spawn_controls() {
     let mut surface = BottomSurface::new(CommandContext::default());
     surface.open_picker(PickerSpec::Permissions(permission_choices()));
-    for _ in 0..9 {
+    for _ in 0..22 {
         surface.move_selection_down();
     }
 
@@ -768,7 +802,7 @@ fn permissions_picker_exposes_agent_spawn_controls() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Agents - Ask before spawning agents"));
+    assert!(rendered.contains("Advanced · Agents - Ask before spawning agents"));
     assert_eq!(
         surface.confirm(),
         SurfaceEvent::Action(CommandAction::SetPermissionMode {

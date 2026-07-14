@@ -382,6 +382,56 @@ fn short_time(ts: &str) -> String {
     ts.to_owned()
 }
 
+/// A session-local operating posture. It only configures permission policy;
+/// it never claims to create an operating-system sandbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermissionPosture {
+    /// Allow the capabilities that only retrieve local/session information;
+    /// deny mutation, execution, network, and credential access.
+    ReadOnly,
+    /// Require an explicit decision for every capability.
+    AskEveryTime,
+    /// Allow every capability for this session without a sandbox boundary.
+    FullAccess,
+}
+
+impl PermissionPosture {
+    pub const ALL: [Self; 3] = [Self::ReadOnly, Self::AskEveryTime, Self::FullAccess];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read only",
+            Self::AskEveryTime => "Ask every time",
+            Self::FullAccess => "Full access (unsandboxed)",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::ReadOnly => {
+                "allow local/session reads; deny writes, commands, agents, network, and secrets"
+            }
+            Self::AskEveryTime => {
+                "clear session approvals; ask before each operation not covered by a durable rule"
+            }
+            Self::FullAccess => "allow every capability for this session; no OS sandbox is active",
+        }
+    }
+
+    pub fn mode_for(self, capability: Capability) -> ApprovalMode {
+        match self {
+            Self::ReadOnly => match capability {
+                Capability::FsRead | Capability::ProvenanceRead | Capability::DiagnosticsRead => {
+                    ApprovalMode::SessionAllow
+                }
+                _ => ApprovalMode::AlwaysDeny,
+            },
+            Self::AskEveryTime => ApprovalMode::Ask,
+            Self::FullAccess => ApprovalMode::SessionAllow,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandAction {
     NewSession,
@@ -445,6 +495,12 @@ pub enum CommandAction {
         capability: Capability,
         mode: ApprovalMode,
     },
+    SetPermissionPosture {
+        posture: PermissionPosture,
+    },
+    /// Kept as a visible picker row so users understand the intended future
+    /// posture without mistaking an approval policy for a sandbox.
+    PermissionSandboxUnavailable,
     /// Open the permissions picker with live session/project grants.
     OpenPermissions,
     RevokeGrant {
@@ -527,6 +583,15 @@ pub enum PickerSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PermissionChoice {
+    Posture {
+        posture: PermissionPosture,
+        label: String,
+        detail: String,
+    },
+    Unavailable {
+        label: String,
+        detail: String,
+    },
     SetMode {
         capability: Capability,
         mode: ApprovalMode,
@@ -634,7 +699,7 @@ const COMMAND_TABLE: &[CommandSpec] = &[
     },
     CommandSpec {
         token: "/permissions",
-        summary: "approval modes and active grants",
+        summary: "session permission postures, advanced modes, and active grants",
         args: "",
     },
     CommandSpec {
@@ -813,42 +878,43 @@ pub fn permission_choices() -> Vec<PermissionChoice> {
     permission_choices_with_grants(&[])
 }
 
-/// Mode choices plus revoke rows for active session/project grants.
+/// Quick session postures, active grants, then per-capability advanced modes.
 pub fn permission_choices_with_grants(
     grants: &[(GrantSource, ActiveGrant)],
 ) -> Vec<PermissionChoice> {
-    let mut choices = grants
-        .iter()
-        .map(|(source, grant)| {
-            let pattern = grant.pattern.as_str();
-            let pattern_label = if pattern.is_empty() {
-                "all".to_owned()
-            } else {
-                format!("{pattern}*")
-            };
-            PermissionChoice::Revoke {
-                capability: grant.capability,
-                pattern: pattern.to_owned(),
-                source: *source,
-                label: format!(
-                    "Revoke {} {} ({})",
-                    source.as_str(),
-                    grant.capability.as_str(),
-                    pattern_label
-                ),
-            }
+    let mut choices = PermissionPosture::ALL
+        .into_iter()
+        .map(|posture| PermissionChoice::Posture {
+            posture,
+            label: posture.label().to_owned(),
+            detail: posture.detail().to_owned(),
         })
         .collect::<Vec<_>>();
-    choices.extend(
-        [
-            Capability::FsRead,
-            Capability::FsWrite,
-            Capability::ShellExec,
-            Capability::AgentSpawn,
-        ]
-        .into_iter()
-        .flat_map(permission_modes),
-    );
+    choices.push(PermissionChoice::Unavailable {
+        label: "Auto in workspace sandbox (not available)".to_owned(),
+        detail: "requires the Linux workspace sandbox; selecting this does not change permissions"
+            .to_owned(),
+    });
+    choices.extend(grants.iter().map(|(source, grant)| {
+        let pattern = grant.pattern.as_str();
+        let pattern_label = if pattern.is_empty() {
+            "all".to_owned()
+        } else {
+            format!("{pattern}*")
+        };
+        PermissionChoice::Revoke {
+            capability: grant.capability,
+            pattern: pattern.to_owned(),
+            source: *source,
+            label: format!(
+                "Revoke {} {} ({})",
+                source.as_str(),
+                grant.capability.as_str(),
+                pattern_label
+            ),
+        }
+    }));
+    choices.extend(Capability::ALL.iter().copied().flat_map(permission_modes));
     choices
 }
 
@@ -1295,6 +1361,43 @@ fn mode_label(mode: ApprovalMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_postures_have_explicit_non_sandboxed_mappings() {
+        for capability in [
+            Capability::FsRead,
+            Capability::ProvenanceRead,
+            Capability::DiagnosticsRead,
+        ] {
+            assert_eq!(
+                PermissionPosture::ReadOnly.mode_for(capability),
+                ApprovalMode::SessionAllow
+            );
+        }
+        for capability in [
+            Capability::FsWrite,
+            Capability::ShellExec,
+            Capability::AgentSpawn,
+            Capability::Network,
+            Capability::SecretResolve,
+        ] {
+            assert_eq!(
+                PermissionPosture::ReadOnly.mode_for(capability),
+                ApprovalMode::AlwaysDeny
+            );
+            assert_eq!(
+                PermissionPosture::AskEveryTime.mode_for(capability),
+                ApprovalMode::Ask
+            );
+            assert_eq!(
+                PermissionPosture::FullAccess.mode_for(capability),
+                ApprovalMode::SessionAllow
+            );
+        }
+        assert!(PermissionPosture::FullAccess
+            .detail()
+            .contains("no OS sandbox"));
+    }
 
     #[test]
     fn slash_command_parsing_routes_baseline_actions() {

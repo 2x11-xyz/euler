@@ -38,15 +38,10 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::Exploration { summaries } => {
             format!("explored: {}\n", summaries.join(", "))
         }
-        super::TranscriptItem::PermissionPrompt { capability, .. } => {
-            format!("permission.prompt: {capability}\n")
-        }
-        super::TranscriptItem::PermissionAsk { capability, .. } => {
-            format!("permission.ask: {capability}\n")
-        }
-        super::TranscriptItem::PermissionDecision { decision, .. } => {
-            format!("permission.decision: {decision}\n")
-        }
+        super::TranscriptItem::PermissionPrompt { .. }
+        | super::TranscriptItem::PermissionAsk { .. }
+        | super::TranscriptItem::PermissionBatchAsk { .. }
+        | super::TranscriptItem::PermissionDecision { .. } => line_oriented_permission(item),
         super::TranscriptItem::PatchProposed { path, old, new } => {
             line_oriented_patch("patch.proposed", path, old.as_deref(), new.as_deref())
         }
@@ -78,6 +73,24 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::Companion { .. } => line_oriented_companion(item),
         super::TranscriptItem::Error { source, message } => format!("error: {source}: {message}\n"),
         super::TranscriptItem::Notice(message) => format!("notice: {message}\n"),
+    }
+}
+
+fn line_oriented_permission(item: &super::TranscriptItem) -> String {
+    match item {
+        super::TranscriptItem::PermissionPrompt { capability, .. } => {
+            format!("permission.prompt: {capability}\n")
+        }
+        super::TranscriptItem::PermissionAsk { capability, .. } => {
+            format!("permission.ask: {capability}\n")
+        }
+        super::TranscriptItem::PermissionBatchAsk { operation, .. } => {
+            format!("permission.ask: {operation}\n")
+        }
+        super::TranscriptItem::PermissionDecision { decision, .. } => {
+            format!("permission.decision: {decision}\n")
+        }
+        _ => String::new(),
     }
 }
 

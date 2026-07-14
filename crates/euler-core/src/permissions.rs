@@ -3,7 +3,8 @@ use crate::grants::{
     ProjectGrantStore, ScopePattern,
 };
 use euler_sdk::Capability;
-use std::collections::BTreeMap;
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +78,81 @@ impl PermissionRequest {
         self.path = Some(path.into());
         self
     }
+}
+
+/// One user-facing operation that needs several independent capability
+/// decisions. The operation is presentation metadata; every contained request
+/// remains the authority for matching, grants, and provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionRequestBatch {
+    operation: String,
+    requests: Vec<PermissionRequest>,
+}
+
+impl PermissionRequestBatch {
+    /// Construct one normalized operation batch. This is core-owned because
+    /// callers must not silently coalesce differently scoped requests.
+    pub(crate) fn new(operation: impl Into<String>, requests: Vec<PermissionRequest>) -> Self {
+        let operation = operation.into();
+        assert!(
+            !operation.trim().is_empty(),
+            "batch operation must be non-empty"
+        );
+        assert!(!requests.is_empty(), "permission batch must not be empty");
+        let capabilities = requests
+            .iter()
+            .map(|request| request.capability)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            capabilities.len(),
+            requests.len(),
+            "permission batch capabilities must be distinct"
+        );
+        Self {
+            operation,
+            requests,
+        }
+    }
+
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub fn requests(&self) -> &[PermissionRequest] {
+        &self.requests
+    }
+
+    pub fn capabilities(&self) -> impl Iterator<Item = Capability> + '_ {
+        self.requests.iter().map(|request| request.capability)
+    }
+}
+
+/// Expected individual decisions for one persisted `permission.prompt`.
+/// Legacy prompts carry a single `capability`; operation batches add a
+/// complete `capabilities` array. Readers intentionally fall back to the
+/// legacy field when an additive array is absent or malformed.
+pub(crate) fn permission_prompt_capabilities(payload: &Map<String, Value>) -> BTreeSet<String> {
+    let batched = payload
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|capability| !capability.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+        .filter(|capabilities| !capabilities.is_empty());
+    batched.unwrap_or_else(|| {
+        payload
+            .get("capability")
+            .and_then(Value::as_str)
+            .filter(|capability| !capability.is_empty())
+            .map(ToOwned::to_owned)
+            .into_iter()
+            .collect()
+    })
 }
 
 /// Decider outcome. Existing variants remain; scoped grants and deny-with-
@@ -196,6 +272,16 @@ impl GrantDecision {
 
 pub trait PermissionDecider {
     fn decide(&mut self, request: &PermissionRequest) -> DeciderVerdict;
+
+    /// One decision for one operation whose individual capability effects are
+    /// installed by [`PermissionGate`]. Existing deciders remain fail-closed
+    /// for multi-capability operations until they opt in to presenting a batch.
+    fn decide_batch(&mut self, batch: &PermissionRequestBatch) -> DeciderVerdict {
+        match batch.requests() {
+            [request] => self.decide(request),
+            _ => DeciderVerdict::Deny,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -534,6 +620,10 @@ impl<D: PermissionDecider + ?Sized> PermissionDecider for &mut D {
     fn decide(&mut self, request: &PermissionRequest) -> DeciderVerdict {
         (**self).decide(request)
     }
+
+    fn decide_batch(&mut self, batch: &PermissionRequestBatch) -> DeciderVerdict {
+        (**self).decide_batch(batch)
+    }
 }
 
 impl<D: PermissionDecider> PermissionGate<D> {
@@ -580,6 +670,59 @@ impl<D: PermissionDecider> PermissionGate<D> {
             }
         }
     }
+
+    /// Resolve a single user decision for several capability requests. The
+    /// batch surface intentionally supports only allow-once and unscoped
+    /// session grants: durable/project and narrowed scopes need a concrete
+    /// per-capability subject and are attenuated to once rather than widened.
+    ///
+    /// The caller must preflight configured denies and covered grants before
+    /// building this batch. This method therefore never partially decides an
+    /// operation: one verdict becomes one truthful decision per request.
+    ///
+    /// It intentionally does not install grants. The bridge first persists
+    /// every individual decision, then calls [`Self::commit_batch_decisions`]
+    /// so a failed event write cannot leave a live partial authorization.
+    pub(crate) fn decide_batch_detailed(
+        &mut self,
+        batch: &PermissionRequestBatch,
+    ) -> Vec<GrantDecision> {
+        let verdict = self.decider.decide_batch(batch);
+        let scope = match verdict.grant_scope() {
+            Some(GrantScope::Session(pattern)) if pattern.is_unscoped() => {
+                Some(GrantScope::Session(pattern))
+            }
+            Some(_) => Some(GrantScope::Once),
+            None => None,
+        };
+        let decisions = batch
+            .capabilities()
+            .map(|capability| match &scope {
+                Some(scope) => GrantDecision::allow(capability, scope.clone()),
+                None => GrantDecision::deny(capability, verdict.instruction().map(str::to_owned)),
+            })
+            .collect::<Vec<_>>();
+
+        decisions
+    }
+
+    /// Commit the session-wide portion of a fully persisted batch. Batch
+    /// construction only permits once or unscoped session scopes, and the
+    /// latter are purely in-memory, so this installs every listed grant or
+    /// none without a durable-store failure path.
+    pub(crate) fn commit_batch_decisions(&mut self, decisions: &[GrantDecision]) {
+        for decision in decisions {
+            let GrantScope::Session(pattern) = &decision.scope else {
+                continue;
+            };
+            if !decision.allowed() || !pattern.is_unscoped() {
+                continue;
+            }
+            self.set_mode(decision.capability, ApprovalMode::SessionAllow);
+            self.session_grants
+                .insert(ActiveGrant::new(decision.capability, pattern.clone()));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -599,6 +742,10 @@ impl PermissionDecider for ScriptedDecider {
     fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
         self.decisions.pop_front().unwrap_or(DeciderVerdict::Deny)
     }
+
+    fn decide_batch(&mut self, _batch: &PermissionRequestBatch) -> DeciderVerdict {
+        self.decisions.pop_front().unwrap_or(DeciderVerdict::Deny)
+    }
 }
 
 #[cfg(test)]
@@ -611,6 +758,111 @@ mod tests {
         fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
             panic!("decider must not be called for default-denied capability");
         }
+    }
+
+    struct BatchCountingDecider {
+        calls: usize,
+        verdict: DeciderVerdict,
+    }
+
+    impl PermissionDecider for BatchCountingDecider {
+        fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
+            panic!("a batch must not devolve into per-capability decisions");
+        }
+
+        fn decide_batch(&mut self, _batch: &PermissionRequestBatch) -> DeciderVerdict {
+            self.calls += 1;
+            self.verdict.clone()
+        }
+    }
+
+    #[test]
+    fn operation_batch_calls_the_decider_once_and_installs_every_session_grant() {
+        let batch = PermissionRequestBatch::new(
+            "extension example.run",
+            vec![
+                PermissionRequest::new(Capability::FsWrite, "extension example.run"),
+                PermissionRequest::new(Capability::Network, "extension example.run"),
+            ],
+        );
+        let mut gate = PermissionGate::new(BatchCountingDecider {
+            calls: 0,
+            verdict: DeciderVerdict::AllowSession,
+        });
+
+        let decisions = gate.decide_batch_detailed(&batch);
+
+        assert_eq!(gate.decider_mut().calls, 1);
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(GrantDecision::allowed));
+        assert!(decisions
+            .iter()
+            .all(|decision| { decision.scope == GrantScope::Session(ScopePattern::unscoped()) }));
+        assert!(
+            gate.session_grants().is_empty(),
+            "the bridge must persist every decision before it installs grants"
+        );
+        gate.commit_batch_decisions(&decisions);
+        for capability in [Capability::FsWrite, Capability::Network] {
+            assert_eq!(gate.mode(capability), ApprovalMode::SessionAllow);
+            assert!(gate
+                .session_grants()
+                .iter()
+                .any(|grant| { grant.capability == capability && grant.pattern.is_unscoped() }));
+        }
+    }
+
+    #[test]
+    fn operation_batch_attenuates_scoped_or_durable_verdicts_to_once() {
+        let batch = PermissionRequestBatch::new(
+            "extension example.run",
+            vec![
+                PermissionRequest::new(Capability::FsWrite, "extension example.run"),
+                PermissionRequest::new(Capability::Network, "extension example.run"),
+            ],
+        );
+        let mut gate = PermissionGate::new(BatchCountingDecider {
+            calls: 0,
+            verdict: DeciderVerdict::AllowScoped(GrantScope::Project(
+                ScopePattern::new("src").expect("pattern"),
+            )),
+        });
+
+        let decisions = gate.decide_batch_detailed(&batch);
+
+        assert_eq!(gate.decider_mut().calls, 1);
+        assert!(decisions
+            .iter()
+            .all(|decision| decision.scope == GrantScope::Once));
+        assert!(gate.session_grants().is_empty());
+        assert_eq!(gate.mode(Capability::FsWrite), ApprovalMode::Ask);
+        assert_eq!(gate.mode(Capability::Network), ApprovalMode::AlwaysDeny);
+    }
+
+    #[test]
+    fn batched_prompt_capabilities_fall_back_to_the_legacy_primary_field() {
+        let legacy = Map::from_iter([(
+            "capability".to_owned(),
+            Value::String("fs-write".to_owned()),
+        )]);
+        assert_eq!(
+            permission_prompt_capabilities(&legacy),
+            BTreeSet::from(["fs-write".to_owned()])
+        );
+        let batch = Map::from_iter([
+            (
+                "capability".to_owned(),
+                Value::String("fs-write".to_owned()),
+            ),
+            (
+                "capabilities".to_owned(),
+                serde_json::json!(["fs-write", "network", "network"]),
+            ),
+        ]);
+        assert_eq!(
+            permission_prompt_capabilities(&batch),
+            BTreeSet::from(["fs-write".to_owned(), "network".to_owned()])
+        );
     }
 
     #[test]

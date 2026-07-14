@@ -6,7 +6,7 @@ use self::resume::TuiResume;
 #[cfg(test)]
 use super::app_layout::{layout, string_lines};
 use super::bottom_surface::{BottomOwner, BottomSurface, SurfaceEvent};
-use super::commands::{CommandAction, CompactionSettings};
+use super::commands::{CommandAction, CompactionSettings, PermissionPosture};
 #[cfg(test)]
 use super::composer::composer_widget;
 use super::composer::{
@@ -30,7 +30,7 @@ use super::theme::{ColorLevel, Theme, ThemeChoice};
 #[cfg(test)]
 use super::transcript::transcript_items_widget;
 use super::transcript::{self, TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
-use super::tui_decider::{PermissionChannels, PermissionReply, TuiDecider};
+use super::tui_decider::{PermissionChannels, PermissionPrompt, PermissionReply, TuiDecider};
 use super::visual_canvas::{
     BlockCursor, CanvasComposerSnapshot, CanvasLine, CanvasSpan, CanvasStatusSnapshot, FocusOwner,
     TextRole, VisualBlock, VisualBlockRole, VisualCanvasFrame, VisualCanvasSnapshot,
@@ -44,7 +44,7 @@ use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection
 use crate::model_preference;
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use euler_core::permissions::PermissionRequest;
+use euler_core::permissions::{PermissionRequest, PermissionRequestBatch};
 use euler_core::{
     event_is_runtime_only, fold_session, load_extension_package, read_resume_prefix,
     resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, EulerHome,
@@ -175,7 +175,7 @@ pub struct AppOptions {
 
 pub struct AppCore {
     state: AppState,
-    permission_rx: Receiver<PermissionRequest>,
+    permission_rx: Receiver<PermissionPrompt>,
     reply_tx: Sender<PermissionReply>,
     bottom: BottomSurface,
     status: StatusSnapshot,
@@ -320,6 +320,7 @@ enum PendingRunRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Modal {
     Permission(PermissionRequest),
+    PermissionBatch(PermissionRequestBatch),
     PatchApproval(PatchApprovalModal),
     Help,
 }
@@ -1543,7 +1544,7 @@ impl AppCore {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
             }
-            KeyCode::Char('p') | KeyCode::Char('P') if draft_empty => {
+            KeyCode::Char('p') | KeyCode::Char('P') if draft_empty && !self.modal_is_batch() => {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
             }
@@ -1568,6 +1569,17 @@ impl AppCore {
     }
 
     fn move_approval_selection_up(&mut self) -> CoreEffect {
+        if self.modal_is_batch() {
+            self.approval_selection = match self.approval_selection {
+                ApprovalOption::AllowOnce => ApprovalOption::AllowOnce,
+                ApprovalOption::AllowSession => ApprovalOption::AllowOnce,
+                ApprovalOption::Deny => ApprovalOption::AllowSession,
+                ApprovalOption::AllowProject | ApprovalOption::AllowUser => {
+                    ApprovalOption::AllowOnce
+                }
+            };
+            return CoreEffect::Render;
+        }
         self.approval_selection = self
             .approval_selection
             .previous(self.modal_user_rule_prefix().is_some());
@@ -1575,6 +1587,15 @@ impl AppCore {
     }
 
     fn move_approval_selection_down(&mut self) -> CoreEffect {
+        if self.modal_is_batch() {
+            self.approval_selection = match self.approval_selection {
+                ApprovalOption::AllowOnce => ApprovalOption::AllowSession,
+                ApprovalOption::AllowSession => ApprovalOption::Deny,
+                ApprovalOption::Deny => ApprovalOption::Deny,
+                ApprovalOption::AllowProject | ApprovalOption::AllowUser => ApprovalOption::Deny,
+            };
+            return CoreEffect::Render;
+        }
         self.approval_selection = self
             .approval_selection
             .next(self.modal_user_rule_prefix().is_some());
@@ -1582,6 +1603,17 @@ impl AppCore {
     }
 
     fn reply_to_selected_approval(&mut self) -> CoreEffect {
+        if self.modal_is_batch() {
+            return match self.approval_selection {
+                ApprovalOption::AllowOnce => self.reply_to_modal(PermissionReply::AllowOnce),
+                ApprovalOption::AllowSession => {
+                    self.reply_to_modal(PermissionReply::AllowSessionScope(String::new()))
+                }
+                ApprovalOption::AllowProject | ApprovalOption::AllowUser | ApprovalOption::Deny => {
+                    self.reply_deny_from_modal()
+                }
+            };
+        }
         match self.approval_selection {
             ApprovalOption::AllowOnce => self.reply_to_modal(PermissionReply::AllowOnce),
             ApprovalOption::AllowSession => {
@@ -1604,6 +1636,9 @@ impl AppCore {
     }
 
     fn modal_scope_prefix(&self) -> Option<String> {
+        if self.modal_is_batch() {
+            return Some(String::new());
+        }
         let request = self.modal_permission_request()?;
         patch_approval::derive_scope_prefix(request)
     }
@@ -1612,6 +1647,9 @@ impl AppCore {
     /// the session has a loaded user grant store AND the ask is a simple
     /// shell command with a derivable first token.
     fn modal_user_rule_prefix(&self) -> Option<String> {
+        if self.modal_is_batch() {
+            return None;
+        }
         if !self.user_rules_enabled {
             return None;
         }
@@ -1623,8 +1661,12 @@ impl AppCore {
         match &self.modal {
             Some(Modal::Permission(request)) => Some(request),
             Some(Modal::PatchApproval(modal)) => Some(&modal.request),
-            None | Some(Modal::Help) => None,
+            None | Some(Modal::PermissionBatch(_)) | Some(Modal::Help) => None,
         }
+    }
+
+    fn modal_is_batch(&self) -> bool {
+        matches!(self.modal, Some(Modal::PermissionBatch(_)))
     }
 
     fn reply_deny_from_modal(&mut self) -> CoreEffect {
@@ -1807,6 +1849,11 @@ impl AppCore {
             CommandAction::SetPermissionMode { capability, mode } => {
                 self.set_permission_mode(capability, mode)
             }
+            CommandAction::SetPermissionPosture { posture } => self.set_permission_posture(posture),
+            CommandAction::PermissionSandboxUnavailable => self.notice_item(
+                "auto in workspace sandbox is not available yet; no permission policy changed"
+                    .to_owned(),
+            ),
             CommandAction::OpenPermissions => self.open_permissions_picker(),
             CommandAction::RevokeGrant {
                 capability,
@@ -2221,9 +2268,9 @@ impl AppCore {
         while self.modal.is_none() {
             changed |= self.drain_turn_events();
             match self.permission_rx.try_recv() {
-                Ok(request) => {
+                Ok(prompt) => {
                     self.drain_turn_events();
-                    self.open_permission_modal(request);
+                    self.open_permission_modal(prompt);
                     self.queue_notification(NotifyEvent::ApprovalNeeded);
                     changed = true;
                 }
@@ -2237,14 +2284,21 @@ impl AppCore {
     /// starts EMPTY: any in-progress composer draft is stashed (and restored
     /// after the decision) so the y/a/p/n hotkeys stay live and a stale
     /// draft can never be consumed as the deny instruction (issue #60).
-    fn open_permission_modal(&mut self, request: PermissionRequest) {
+    fn open_permission_modal(&mut self, prompt: impl Into<PermissionPrompt>) {
         self.approval_selection = ApprovalOption::default();
         let draft = self.bottom.composer().submit_text();
         if !draft.is_empty() {
             self.modal_stashed_draft = Some(draft);
             self.bottom.replace_composer_text("");
         }
-        self.modal = Some(self.modal_for_request(request));
+        self.modal = Some(self.modal_for_prompt(prompt.into()));
+    }
+
+    fn modal_for_prompt(&self, prompt: PermissionPrompt) -> Modal {
+        match prompt {
+            PermissionPrompt::Request(request) => self.modal_for_request(request),
+            PermissionPrompt::Batch(batch) => Modal::PermissionBatch(batch),
+        }
     }
 
     fn modal_for_request(&self, request: PermissionRequest) -> Modal {
@@ -2404,7 +2458,7 @@ impl AppCore {
     fn working_hud_line(&self) -> Option<HudLine> {
         if matches!(
             self.modal,
-            Some(Modal::Permission(_) | Modal::PatchApproval(_))
+            Some(Modal::Permission(_) | Modal::PermissionBatch(_) | Modal::PatchApproval(_))
         ) {
             return None;
         }
@@ -2476,22 +2530,32 @@ impl AppCore {
     }
 
     fn permission_ask_item(&self) -> Option<TranscriptItem> {
-        let Some(Modal::Permission(request)) = &self.modal else {
-            return None;
-        };
-        let scope_prefix = patch_approval::derive_scope_prefix(request);
-        Some(TranscriptItem::PermissionAsk {
-            capability: request.capability.as_str().to_owned(),
-            reason: request.reason.clone(),
-            command: self
-                .shell_command_for_permission(request)
-                .or_else(|| request.command.clone()),
-            prior_count: self.prior_permission_count(request, scope_prefix.as_deref()),
-            selected_option: self.approval_selection,
-            scope_prefix,
-            user_rule_prefix: self.modal_user_rule_prefix(),
-            companion_name: self.in_flight_companion_name.clone(),
-        })
+        match &self.modal {
+            Some(Modal::Permission(request)) => {
+                let scope_prefix = patch_approval::derive_scope_prefix(request);
+                Some(TranscriptItem::PermissionAsk {
+                    capability: request.capability.as_str().to_owned(),
+                    reason: request.reason.clone(),
+                    command: self
+                        .shell_command_for_permission(request)
+                        .or_else(|| request.command.clone()),
+                    prior_count: self.prior_permission_count(request, scope_prefix.as_deref()),
+                    selected_option: self.approval_selection,
+                    scope_prefix,
+                    user_rule_prefix: self.modal_user_rule_prefix(),
+                    companion_name: self.in_flight_companion_name.clone(),
+                })
+            }
+            Some(Modal::PermissionBatch(batch)) => Some(TranscriptItem::PermissionBatchAsk {
+                operation: batch.operation().to_owned(),
+                capabilities: batch
+                    .capabilities()
+                    .map(|capability| capability.as_str().to_owned())
+                    .collect(),
+                selected_option: self.approval_selection,
+            }),
+            None | Some(Modal::PatchApproval(_)) | Some(Modal::Help) => None,
+        }
     }
 
     fn prior_permission_count(
