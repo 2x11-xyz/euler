@@ -228,7 +228,7 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("model exceeded maximum tool rounds")]
     ToolRoundsExceeded,
-    #[error("context budget exhausted under auto-compaction=off: canvas {canvas_bytes} bytes exceeds budget {budget_bytes} bytes")]
+    #[error("context budget exhausted under current compaction settings: canvas {canvas_bytes} bytes exceeds budget {budget_bytes} bytes")]
     ContextBudgetExhausted {
         canvas_bytes: usize,
         budget_bytes: usize,
@@ -1006,7 +1006,8 @@ impl<D: PermissionDecider> Session<D> {
     /// falls back to the structured projection when stubs cannot finish the
     /// job.
     pub fn compact_now(&mut self) -> bool {
-        self.compact_for_threshold(usize::MAX)
+        let target_tokens = self.effective_stub_policy().budget_bytes.div_ceil(4);
+        self.compact_for_threshold(target_tokens)
     }
 
     pub fn spawn_agent(
@@ -1821,14 +1822,16 @@ impl<D: PermissionDecider> Session<D> {
     }
 }
 
-/// Automatic-off honest stop (ADR D4): when automatic compaction is disabled
-/// and the assembled canvas exceeds the byte budget, the round boundary fails
-/// with a policy-naming error instead of silently truncating or demoting.
+/// Canvas-budget guard: a stubs-enabled automatic policy preserves facts even
+/// when the resulting canvas remains over budget. Every other configuration
+/// must fail closed rather than send an oversized canvas: automatic projection
+/// may not have triggered or may not have found a valid candidate, and stubs
+/// may be disabled.
 fn context_budget_exhausted(
     policy: AutoCompactionPolicy,
     canvas: &[CanvasItem],
 ) -> Option<SessionError> {
-    if policy.automatic {
+    if policy.automatic && policy.stubs_enabled() {
         return None;
     }
     let canvas_bytes = canvas_bytes(canvas);

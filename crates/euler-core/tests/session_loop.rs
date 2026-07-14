@@ -599,7 +599,7 @@ fn off_tier_context_budget_exhaustion_fails_honestly_at_round_boundary() {
     assert!(matches!(error, SessionError::ContextBudgetExhausted { .. }));
     assert!(error
         .to_string()
-        .contains("context budget exhausted under auto-compaction=off"));
+        .contains("context budget exhausted under current compaction settings"));
     // The first round completed and its result stayed intact: the honest
     // stop happens at the next round boundary, before a second model call.
     assert_eq!(count_kind(session.events(), EventKind::TOOL_RESULT), 1);
@@ -607,7 +607,36 @@ fn off_tier_context_budget_exhaustion_fails_honestly_at_round_boundary() {
     let error_event = find_kind(session.events(), EventKind::ERROR);
     assert!(payload_str(error_event, "message")
         .expect("message")
-        .contains("auto-compaction=off"));
+        .contains("current compaction settings"));
+}
+
+#[test]
+fn automatic_without_stubs_rejects_an_over_budget_canvas_before_the_next_model_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "x".repeat(8000)).expect("write fixture");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-read".to_owned(),
+            name: "read_file".to_owned(),
+            input: json!({"path": "note.txt"}),
+        }]),
+        FixtureResponse::Assistant("must not be requested".to_owned()),
+    ]);
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction = AutoCompactionPolicy {
+        automatic: true,
+        tier: CompactionTier::Off,
+        budget_bytes: 2000,
+    };
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    let error = session
+        .run_turn("read note")
+        .expect_err("unbounded canvas must not reach the provider");
+
+    assert!(matches!(error, SessionError::ContextBudgetExhausted { .. }));
+    assert_eq!(count_kind(session.events(), EventKind::TOOL_RESULT), 1);
+    assert_eq!(count_kind(session.events(), EventKind::MODEL_CALL), 1);
 }
 
 #[test]
@@ -668,6 +697,39 @@ fn stubs_tier_demotes_in_prompt_and_records_retention_telemetry() {
     assert!(prompt.contains("content demoted,"));
     assert!(prompt.contains("handle event:"));
     assert!(prompt.contains("user: read note"));
+}
+
+#[test]
+fn manual_compaction_falls_back_to_projection_when_stubs_exceed_the_budget() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "x\n".repeat(8)).expect("write fixture");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-read".to_owned(),
+            name: "read_file".to_owned(),
+            input: json!({"path": "note.txt"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut config = SessionConfig::new(temp.path());
+    config.compaction_keep_recent = 0;
+    config.auto_compaction = AutoCompactionPolicy {
+        automatic: true,
+        tier: CompactionTier::Stubs,
+        budget_bytes: 1,
+    };
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session.run_turn("read note").expect("turn");
+    assert!(session.compact_now());
+
+    let swap = session
+        .events()
+        .iter()
+        .rfind(|event| event.kind.as_str() == EventKind::CANVAS_SWAP)
+        .expect("canvas swap");
+    assert_eq!(payload_str(swap, "validation_result"), Some("pass"));
+    assert!(payload_str(swap, "projection_blob").is_some_and(|blob| !blob.is_empty()));
 }
 
 #[test]
