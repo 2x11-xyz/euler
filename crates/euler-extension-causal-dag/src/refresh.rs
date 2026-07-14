@@ -15,7 +15,8 @@ use crate::observer_brief::{
 use euler_event::EventEnvelope;
 use euler_sdk::{
     AgentOutcome, ArgSpec, ArgValueKind, Capability, CommandContext, CommandDescriptor,
-    ExtensionCommand, ExtensionError, HostApi, ProvenancePage, ProvenanceQuery, SpawnAgentTask,
+    ExtensionCommand, ExtensionError, HostApi, Invocation, ProvenancePage, ProvenanceQuery,
+    SpawnAgentTask,
 };
 use serde_json::{json, Map, Value};
 
@@ -28,6 +29,7 @@ pub(super) struct CausalDagRefreshCommand;
 impl ExtensionCommand for CausalDagRefreshCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: REFRESH_COMMAND_NAME.to_owned(),
             display_name: "Refresh causal DAG".to_owned(),
             summary: "Increment, reframe, or finalize the active semantic Causal DAG.".to_owned(),

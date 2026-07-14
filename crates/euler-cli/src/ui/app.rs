@@ -1768,9 +1768,6 @@ impl AppCore {
                 self.code_swarm_save_models(models, user_tier)
             }
             CommandAction::CodeSwarmClear { user_tier } => self.code_swarm_clear(user_tier),
-            CommandAction::CodeSwarmReview { prompt, personas } => {
-                self.code_swarm_review(prompt, personas)
-            }
             CommandAction::ShowStatus => self.show_status(),
             CommandAction::Scrub { value } => self.scrub_current_session(value),
             CommandAction::Login { provider } => self.login_guidance(provider),

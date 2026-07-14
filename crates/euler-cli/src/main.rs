@@ -694,6 +694,21 @@ fn wire_code_swarm<D>(session: &mut Session<D>) {
     ));
 }
 
+/// Refusal text for an agent-only command reached through a control line.
+/// It names the way in rather than only saying no.
+fn agent_only_control_line_error(id: &str, command: &str) -> String {
+    if id == "code-swarm" {
+        return "code-swarm.review is agent-only: ask the agent for a review in ordinary turn \
+                text (e.g. \"code swarm this diff\") and it will call its code_swarm_review \
+                tool. Reviewer models come from the persisted /code-swarm config."
+            .to_owned();
+    }
+    format!(
+        "{id}.{command} is agent-only: it is run by the agent on your behalf, not by a control \
+         line. Ask for it in ordinary turn text."
+    )
+}
+
 fn run_live_extension_command(
     session: &mut Session<CliDecider>,
     id: &str,
@@ -708,6 +723,12 @@ fn run_live_extension_command(
     let Some(command_descriptor) = descriptor.command(command) else {
         return headless_extension_error(format!("unknown command for extension {id}: {command}"));
     };
+    // An agent-only command is the agent's to call, not a control line's. The
+    // agent is present in headless too, so this is not a lost capability: the
+    // turn text is the way in.
+    if command_descriptor.invocation.is_agent_only() {
+        return headless_extension_error(agent_only_control_line_error(id, command));
+    }
     let Some(bundled) = bundled_extension_by_id(id) else {
         return headless_extension_error(format!("unknown extension id: {id}"));
     };

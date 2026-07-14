@@ -364,13 +364,28 @@ fn headless_code_swarm_review_spawns_reviewer_and_persists_report_artifact() {
         .run_turn("implement a tiny change")
         .expect("seed turn");
 
-    let report_line = execute_headless_extension_run(
-        &mut session,
-        "code-swarm.review {\"models\":[\"fixture::echo\"],\"reviewers\":[\"tests\"],\"prompt\":\"Review the explicit tiny-change summary.\",\"max_tokens\":2048}",
-    );
-
-    assert_eq!(report_line["type"], json!("extension_run_result"));
-    let result = &report_line["result"];
+    // Driven the way the agent drives it. The control line refuses this
+    // command now (it is agent-only), but the extension's fan-out and its
+    // consolidated artifact are exactly what the agent's tool reaches, so the
+    // subject under test is unchanged.
+    let result = session
+        .execute_extension_command(
+            &euler_extension_code_swarm::CodeSwarmExtension,
+            "review",
+            json!({
+                "models": ["fixture::echo"],
+                "reviewers": ["tests"],
+                "prompt": "Review the explicit tiny-change summary.",
+                "context": "the tiny change adds a boundary check",
+                "max_tokens": 2048,
+            }),
+            [
+                euler_sdk::Capability::AgentSpawn,
+                euler_sdk::Capability::ArtifactWrite,
+            ],
+        )
+        .expect("code-swarm review");
+    let result = &result;
     assert_eq!(result["reviewer_count"], json!(1));
     assert_eq!(result["succeeded"], json!(1));
     assert_eq!(result["reviewers"][0]["provider"], json!("fixture"));

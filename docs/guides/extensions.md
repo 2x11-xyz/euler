@@ -61,7 +61,10 @@ struct HelloCommand;
 
 impl ExtensionCommand for HelloCommand {
     fn descriptor(&self) -> CommandDescriptor {
+        invocation: Invocation::User,
         CommandDescriptor {
+            invocation: Invocation::User,
+            invocation: Invocation::User,
             name: "hello".to_owned(),
             display_name: "Say hello".to_owned(),
             summary: "Return a small JSON object.".to_owned(),

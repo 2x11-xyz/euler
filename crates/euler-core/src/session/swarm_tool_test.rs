@@ -41,6 +41,7 @@ struct FakeReviewCommand;
 impl ExtensionCommand for FakeReviewCommand {
     fn descriptor(&self) -> euler_sdk::CommandDescriptor {
         euler_sdk::CommandDescriptor {
+            invocation: euler_sdk::Invocation::User,
             name: "review".to_owned(),
             display_name: "review".to_owned(),
             summary: "test review".to_owned(),
@@ -548,7 +549,7 @@ fn failed_reviewer_error_is_redacted_but_findings_stay_faithful() {
 }
 
 #[test]
-fn unconfigured_tool_call_fails_honestly_with_both_remediation_paths() {
+fn unconfigured_tool_call_fails_honestly_naming_only_working_remediation() {
     let mut harness = harness(
         vec![
             FixtureResponse::ToolCalls(vec![review_tool_call(
@@ -565,16 +566,19 @@ fn unconfigured_tool_call_fails_honestly_with_both_remediation_paths() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].payload["ok"], json!(false));
     let error = results[0].payload["error"].as_str().expect("error text");
-    // Pinned remediation paths (multi-agent contract): the TUI picker and
-    // the literal explicit-model invocations for TUI and headless use.
-    assert!(error.contains("/code-swarm"), "TUI picker path: {error}");
+    // Pinned remediation (multi-agent contract): the error must name only
+    // invocations that work. CodeSwarm is agent-only, so that is the
+    // /code-swarm picker — and explicitly NOT the /review or extension_run
+    // paths this text used to advertise, which now refuse. Sending a stuck
+    // user to a command that cannot work is worse than sending them nowhere.
+    assert!(error.contains("/code-swarm"), "config path: {error}");
     assert!(
-        error.contains("/review --model provider::model"),
-        "TUI one-off override path: {error}"
+        !error.contains("/review"),
+        "must not name the removed /review surface: {error}"
     );
     assert!(
-        error.contains("extension_run code-swarm.review {\"models\":[\"provider::model\"],\"prompt\":\"explicit review context\"}"),
-        "headless one-off override path: {error}"
+        !error.contains("extension_run"),
+        "must not name the refusing control line: {error}"
     );
     assert!(
         error.contains("do not guess providers or models"),

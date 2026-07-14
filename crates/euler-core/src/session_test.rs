@@ -2065,6 +2065,7 @@ impl ExtensionCommand for TestCommand {
             TestCommandBehavior::Noop(_) => Vec::new(),
         };
         CommandDescriptor {
+            invocation: euler_sdk::Invocation::User,
             name: "write".to_owned(),
             display_name: String::new(),
             summary: String::new(),

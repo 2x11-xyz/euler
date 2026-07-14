@@ -1,7 +1,7 @@
 use euler_sdk::{
     AgentOutcome, ArgSpec, ArgValueKind, ArtifactWrite, Capability, CommandContext,
     CommandDescriptor, CommandRegistrar, Extension, ExtensionCommand, ExtensionError,
-    ExtensionManifest, HostApi, SpawnAgentTask,
+    ExtensionManifest, HostApi, Invocation, SpawnAgentTask,
 };
 use serde_json::{json, Map, Value};
 
@@ -16,8 +16,8 @@ const DEFAULT_MAX_TOKENS: u64 = 8192;
 const PERSONA_PREFIX: &str = "code-swarm-";
 /// Hard cap on reviewer agents per swarm (matches the prototype's limit).
 const MAX_SWARM_AGENTS: usize = 5;
-/// Backstop for a direct invocation that dodged every config-resolving entry
-/// seam (the TUI, headless `extension_run`, and tool seams pre-empt this with
+/// Backstop for a direct invocation that dodged the config-resolving entry
+/// seam (the `code_swarm_review` tool pre-empts this with
 /// `euler_core::UNCONFIGURED_SWARM_ERROR`). The swarm never guesses targets.
 const UNCONFIGURED_MESSAGE: &str = "code-swarm review needs explicit reviewer models: pass --model provider::model (repeatable, 1-5), or configure a persistent set with /code-swarm in the TUI";
 
@@ -43,8 +43,9 @@ impl Extension for CodeSwarmExtension {
 /// The whole swarm in one command: build reviewer tasks, run them as one
 /// concurrent `HostApi::spawn_agents` batch, and consolidate the outcomes
 /// into the review artifact. Orchestration lives here, not in a host-side
-/// state machine; entry seams (TUI, headless, the `code_swarm_review` tool)
-/// only resolve config into this command's input.
+/// state machine; the `code_swarm_review` tool — this command's only entry
+/// seam, since the command is agent-only — resolves config and assembles
+/// context into its input.
 #[derive(Clone, Copy, Debug)]
 struct ReviewCommand;
 
@@ -52,6 +53,11 @@ impl ExtensionCommand for ReviewCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
             name: REVIEW_COMMAND.to_owned(),
+            // CodeSwarm is a step the agent takes when the user asks it to
+            // "code swarm this", never a verb the user drives directly:
+            // /code-swarm configures the reviewer set, and the agent's
+            // code_swarm_review tool is the only way to run one.
+            invocation: Invocation::AgentOnly,
             display_name: "Run CodeSwarm review".to_owned(),
             summary: "Run 1-5 review-only agents over explicit bounded context and write a consolidated review artifact.".to_owned(),
             required_capabilities: vec![Capability::AgentSpawn, Capability::ArtifactWrite],

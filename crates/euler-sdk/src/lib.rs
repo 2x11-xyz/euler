@@ -115,6 +115,47 @@ pub struct CommandContext {
     pub input: serde_json::Value,
 }
 
+/// Who may invoke a command directly.
+///
+/// This is a product boundary, not a security one: `AgentOnly` says a command
+/// is a step the agent takes on the user's behalf, not a verb the user drives.
+/// Nothing here grants or withholds capability — an `AgentOnly` command runs
+/// with exactly the authority it declares, whoever reaches it.
+/// The serde spelling matches [`Invocation::as_str`]/[`Invocation::parse`], so
+/// the manifest wire form and the hand-written parser cannot drift apart.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Invocation {
+    /// Users may invoke it: it earns a slash command, a headless control
+    /// line, and a CLI subcommand.
+    #[default]
+    User,
+    /// Only an in-session agent may invoke it, through a tool. Direct
+    /// user-facing surfaces refuse it and say what to do instead.
+    AgentOnly,
+}
+
+impl Invocation {
+    pub const fn is_agent_only(self) -> bool {
+        matches!(self, Self::AgentOnly)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::AgentOnly => "agent-only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(Self::User),
+            "agent-only" => Some(Self::AgentOnly),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandDescriptor {
     pub name: String,
@@ -123,6 +164,10 @@ pub struct CommandDescriptor {
     pub required_capabilities: Vec<Capability>,
     pub args: Vec<ArgSpec>,
     pub accepts_session_id: bool,
+    /// Whether users may drive this command directly. Defaults to `User`;
+    /// commands that exist only as an agent's tool set `AgentOnly` and every
+    /// user-facing surface then refuses them.
+    pub invocation: Invocation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -402,6 +447,7 @@ pub trait CommandRegistrar {
 pub trait ExtensionCommand: Send + Sync {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: String::new(),
             display_name: String::new(),
             summary: String::new(),

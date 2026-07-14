@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::commands::ExtensionCommandItem;
 use crate::ui::commands::{
     build_extension_slash_commands, command_table, permission_choices, theme_choices,
     CausalDagStats, EffortChoice, ExtensionManagerItem, ModelChoice, ResumeItem,
@@ -39,7 +40,11 @@ fn causal_dag_surface() -> BottomSurface {
         bundled: true,
         materialization: None,
         version: "0.2.0".to_owned(),
-        commands: vec!["view".to_owned(), "export".to_owned(), "refresh".to_owned()],
+        commands: vec![
+            ExtensionCommandItem::user("view"),
+            ExtensionCommandItem::user("export"),
+            ExtensionCommandItem::user("refresh"),
+        ],
         capabilities: vec![],
         audit_status: None,
     }];
@@ -125,7 +130,10 @@ fn palette_confirm_on_code_swarm_opens_config_not_extension_run() {
             bundled: true,
             materialization: None,
             version: "0.1.0".to_owned(),
-            commands: vec!["review-brief".to_owned(), "review-report".to_owned()],
+            commands: vec![
+                ExtensionCommandItem::user("review-brief"),
+                ExtensionCommandItem::user("review-report"),
+            ],
             capabilities: vec![],
             audit_status: None,
         }],
@@ -170,7 +178,10 @@ fn palette_confirm_on_extension_entry_keeps_typed_arguments() {
             bundled: true,
             materialization: None,
             version: "0.1.0".to_owned(),
-            commands: vec!["review-brief".to_owned(), "review-report".to_owned()],
+            commands: vec![
+                ExtensionCommandItem::user("review-brief"),
+                ExtensionCommandItem::user("review-report"),
+            ],
             capabilities: vec![],
             audit_status: None,
         }],
@@ -207,7 +218,10 @@ fn palette_confirm_on_disabled_extension_returns_muted_notice_every_time() {
             bundled: true,
             materialization: None,
             version: "0.1.0".to_owned(),
-            commands: vec!["review-brief".to_owned(), "review-report".to_owned()],
+            commands: vec![
+                ExtensionCommandItem::user("review-brief"),
+                ExtensionCommandItem::user("review-report"),
+            ],
             capabilities: vec![],
             audit_status: None,
         }],

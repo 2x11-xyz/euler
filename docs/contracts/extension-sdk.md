@@ -226,6 +226,35 @@ Native command capability rules:
   `register()` method to discover commands, and validates the command names it
   reports. Extension registration must remain side-effect-free.
 
+## Command Invocation v0
+
+`CommandDescriptor.invocation` declares who may drive a command:
+
+- `Invocation::User` (the default): the command earns a slash token, a
+  headless `extension_run` control line, and `euler extension run`.
+- `Invocation::AgentOnly`: the command is a step an agent takes on the user's
+  behalf, reachable only through a session tool. `build_extension_slash_commands`
+  mints no token for it; the headless control line and the CLI refuse it by
+  name. The bundled `code-swarm` `review` command is the first of these.
+
+Rules:
+
+- **It is a product boundary, not a security one.** `AgentOnly` says a command
+  is not a verb the user drives; it grants and withholds nothing. Authority is
+  `required_capabilities` and only that, whoever reaches the command. Do not
+  use `invocation` to contain a dangerous command — declare fewer capabilities.
+- **Refusals name the way in.** A surface that refuses an agent-only command
+  must say how to reach it (ask the agent), not merely that it cannot run.
+  "Unknown command" is a lie: the command exists.
+- **Listed, not hidden.** `/extension` still shows agent-only commands, marked
+  `(agent-only)`. Hiding them would trade one wrong answer for another.
+- **Absent means `user`.** The manifest field and the persisted link inventory
+  both default to `user`, which is what every manifest written before this
+  field existed meant. A missing `invocation` must decode, never fail the
+  extension.
+- Remediation text anywhere in the system must name only invocations that
+  work; an agent-only command must not be advertised as a user command.
+
 ## Local Event Wake v0
 
 Core provides a process-local wake primitive on `ProvenanceWriter` /
