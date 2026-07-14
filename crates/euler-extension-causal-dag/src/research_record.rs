@@ -566,7 +566,7 @@ pub(crate) struct AppendInput<'a> {
 pub(crate) fn append_observer_batch(
     input: AppendInput<'_>,
 ) -> Result<ResearchRecord, ExtensionError> {
-    validate_batch_header(&input.batch)?;
+    validate_batch_header(&input.batch, input.prior.is_some())?;
     let mut record = record_for_append(&input)?;
     let accepted = record.accepted()?;
     let source_context = SourceContext::new(&record, &accepted, input.events);
@@ -672,19 +672,23 @@ fn capture_record(
     ))
 }
 
-fn validate_batch_header(batch: &ObserverProposalBatch) -> Result<(), ExtensionError> {
+fn validate_batch_header(
+    batch: &ObserverProposalBatch,
+    allows_no_semantic_change: bool,
+) -> Result<(), ExtensionError> {
     if batch.schema != RESEARCH_PROPOSALS_SCHEMA {
         return Err(input_error(format!(
             "research observer output must use `{RESEARCH_PROPOSALS_SCHEMA}`"
         )));
     }
-    if batch.entities.is_empty()
+    if !allows_no_semantic_change
+        && batch.entities.is_empty()
         && batch.outcomes.is_empty()
         && batch.relations.is_empty()
         && batch.assessments.is_empty()
     {
         return Err(input_error(
-            "research observer output contains no proposals",
+            "initial research-record capture requires at least one proposal",
         ));
     }
     Ok(())

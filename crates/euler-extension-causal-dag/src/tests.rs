@@ -5137,6 +5137,33 @@ fn active_view_and_exports_share_the_selected_graph_artifact() {
 }
 
 #[test]
+fn research_observer_brief_reports_caught_up_as_a_normal_result() {
+    let host = RecordingHost::empty();
+
+    CausalDagResearchEnableCommand
+        .execute(CommandContext { input: json!({}) }, &host)
+        .expect("enable research record");
+
+    let output = CausalDagObserverBriefCommand
+        .execute(CommandContext { input: json!({}) }, &host)
+        .expect("caught-up research observer brief");
+
+    assert_eq!(
+        output["schema"],
+        json!(crate::research_observer::RESEARCH_BRIEF_SCHEMA)
+    );
+    assert_eq!(
+        output["mode"],
+        json!(crate::research_observer::RESEARCH_MODE)
+    );
+    assert_eq!(output["status"], json!("caught_up"));
+    assert_eq!(output["listed_event_count"], json!(0));
+    assert!(output["watermark_event_id"].is_null());
+    assert!(output.get("task").is_none());
+    assert!(output.get("apply").is_none());
+}
+
+#[test]
 fn research_record_observer_round_projects_and_reframes_identically() {
     let user = fixture_event(
         "session-1",

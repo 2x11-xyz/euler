@@ -258,6 +258,78 @@ fn reconcile_snapshot_carries_explicit_artifact_lineage() {
 }
 
 #[test]
+fn reconciliation_can_advance_without_a_new_semantic_proposal() {
+    let initial_events = vec![
+        event("event-user", EventKind::USER_MESSAGE),
+        event("event-tool", EventKind::TOOL_RESULT),
+    ];
+    let prior = append_observer_batch(AppendInput {
+        prior: None,
+        predecessor_record_artifact_event_id: None,
+        events: &initial_events,
+        batch: batch(),
+        watermark_event_id: "event-tool".to_owned(),
+        generated_at: initial_events[1].ts.clone(),
+        session_id: None,
+        observer_result_event_id: Some("observer-first"),
+    })
+    .expect("prior record");
+    let recap_events = vec![event("event-recap", EventKind::ASSISTANT_MESSAGE)];
+    let record = append_observer_batch(AppendInput {
+        prior: Some(&prior),
+        predecessor_record_artifact_event_id: Some("record-first"),
+        events: &recap_events,
+        batch: ObserverProposalBatch {
+            schema: RESEARCH_PROPOSALS_SCHEMA.to_owned(),
+            entities: Vec::new(),
+            outcomes: Vec::new(),
+            relations: Vec::new(),
+            assessments: Vec::new(),
+        },
+        watermark_event_id: "event-recap".to_owned(),
+        generated_at: recap_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: Some("observer-recap"),
+    })
+    .expect("recap reconciliation");
+
+    assert_eq!(record.ledger, prior.ledger);
+    assert_eq!(record.episodes.len(), prior.episodes.len() + 1);
+    assert_eq!(record.session.observed_through_event_id, "event-recap");
+    assert_eq!(record.construction.operation, RecordOperation::Reconcile);
+    assert_eq!(
+        record.construction.observer_result_event_id.as_deref(),
+        Some("observer-recap")
+    );
+}
+
+#[test]
+fn initial_capture_rejects_an_empty_semantic_proposal() {
+    let events = vec![event("event-user", EventKind::USER_MESSAGE)];
+    let error = append_observer_batch(AppendInput {
+        prior: None,
+        predecessor_record_artifact_event_id: None,
+        events: &events,
+        batch: ObserverProposalBatch {
+            schema: RESEARCH_PROPOSALS_SCHEMA.to_owned(),
+            entities: Vec::new(),
+            outcomes: Vec::new(),
+            relations: Vec::new(),
+            assessments: Vec::new(),
+        },
+        watermark_event_id: "event-user".to_owned(),
+        generated_at: events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect_err("initial capture needs a semantic root");
+
+    assert!(error
+        .to_string()
+        .contains("initial research-record capture requires at least one proposal"));
+}
+
+#[test]
 fn decomposition_is_whole_to_component_and_stops_at_a_dead_end() {
     let initial_events = vec![event("event-structure", EventKind::TOOL_RESULT)];
     let initial = append_observer_batch(AppendInput {

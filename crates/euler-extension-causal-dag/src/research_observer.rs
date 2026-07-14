@@ -97,12 +97,10 @@ pub(crate) fn execute_brief(
     host: &dyn HostApi,
 ) -> Result<Value, ExtensionError> {
     let input = BriefInput::parse(&context.input)?;
-    let Some(prepared) = prepare_brief(host, input.clone())? else {
-        return Err(input_error(
-            "research-record observer-brief found no observable pilot events",
-        ));
-    };
-    Ok(brief_output(&input, prepared))
+    match prepare_brief(host, input.clone())? {
+        Some(prepared) => Ok(brief_output(&input, prepared)),
+        None => caught_up_output(host),
+    }
 }
 
 pub(crate) fn execute_apply(
@@ -289,6 +287,19 @@ fn brief_output(input: &BriefInput, prepared: PreparedBrief) -> Value {
         "after_event_id_echo": prepared.apply.after_event_id,
         "listed_event_count": prepared.apply.observed_event_ids.len()
     })
+}
+
+fn caught_up_output(host: &dyn HostApi) -> Result<Value, ExtensionError> {
+    let state = ResearchState::load(host)?.ok_or_else(|| {
+        input_error("research-record pilot is not enabled; run causal-dag.research-enable first")
+    })?;
+    Ok(json!({
+        "schema": RESEARCH_BRIEF_SCHEMA,
+        "mode": RESEARCH_MODE,
+        "status": "caught_up",
+        "watermark_event_id": state.observed_through_event_id(),
+        "listed_event_count": 0
+    }))
 }
 
 fn apply_proposals(
