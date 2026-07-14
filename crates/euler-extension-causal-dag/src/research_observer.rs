@@ -139,6 +139,10 @@ pub(crate) fn execute_refresh(
         provider: input.provider,
         model: input.model,
         system_prompt: observer_system_prompt(),
+        // The durable observer task carries its complete, bounded evidence
+        // window. Parent canvas context could introduce unrecorded material.
+        explicit_context: None,
+        include_parent_canvas: false,
         capabilities: Vec::new(),
         max_turns: Some(1),
         max_tool_calls: Some(0),

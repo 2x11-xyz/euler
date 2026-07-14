@@ -6,6 +6,7 @@ use crate::research_observer::RESEARCH_MODE;
 use crate::research_state::ResearchState;
 use euler_sdk::{
     Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError, HostApi,
+    Invocation,
 };
 use serde_json::{json, Value};
 
@@ -18,6 +19,7 @@ pub(super) struct CausalDagResearchEnableCommand;
 impl ExtensionCommand for CausalDagResearchEnableCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: RESEARCH_ENABLE_COMMAND_NAME.to_owned(),
             display_name: "Enable durable research record".to_owned(),
             summary: "Use the durable research record and deterministic v4 Causal DAG projection for this session."
@@ -73,7 +75,7 @@ fn reject_input(input: &Value) -> Result<(), ExtensionError> {
 #[cfg(test)]
 mod tests {
     use super::{reject_input, CausalDagResearchEnableCommand};
-    use euler_sdk::ExtensionCommand;
+    use euler_sdk::{ExtensionCommand, Invocation};
     use serde_json::json;
 
     #[test]
@@ -85,10 +87,8 @@ mod tests {
 
     #[test]
     fn enable_does_not_advertise_an_unused_session_id() {
-        assert!(
-            !CausalDagResearchEnableCommand
-                .descriptor()
-                .accepts_session_id
-        );
+        let descriptor = CausalDagResearchEnableCommand.descriptor();
+        assert!(!descriptor.accepts_session_id);
+        assert_eq!(descriptor.invocation, Invocation::User);
     }
 }

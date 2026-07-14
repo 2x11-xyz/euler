@@ -5393,6 +5393,62 @@ fn research_record_observer_round_projects_and_reframes_identically() {
 }
 
 #[test]
+fn research_refresh_spawns_a_self_contained_observer() {
+    let source = fixture_event(
+        "session-1",
+        "event-context",
+        EventKind::USER_MESSAGE,
+        "Frame the bounded research question.",
+    );
+    let proposals = json!({
+        "schema": RESEARCH_PROPOSALS_SCHEMA,
+        "entities": [{
+            "id": "q-context",
+            "kind": "question",
+            "title": "Bounded research question",
+            "summary": "The recorded question for this observer round.",
+            "lifecycle": "active",
+            "source_event_ids": ["event-context"]
+        }],
+        "outcomes": [],
+        "relations": [],
+        "assessments": []
+    });
+    let host = RecordingHost::new_pages(vec![
+        recording_page(vec![source.clone()], DEFAULT_LIMIT, None, false),
+        recording_page(vec![source], DEFAULT_LIMIT, None, false),
+    ])
+    .with_spawn_outcomes(vec![successful_agent_outcome(
+        proposals,
+        "research-context",
+    )]);
+
+    CausalDagResearchEnableCommand
+        .execute(CommandContext { input: json!({}) }, &host)
+        .expect("enable research record");
+    let output = CausalDagRefreshCommand
+        .execute(
+            CommandContext {
+                input: json!({
+                    "operation": "incremental",
+                    "session_id": "session-1",
+                    "provider": "fixture",
+                    "model": "observer"
+                }),
+            },
+            &host,
+        )
+        .expect("refresh research record");
+
+    assert_eq!(output["mode"], "research_record_v1");
+    let tasks = host.spawn_tasks.lock().expect("spawn tasks");
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].task.contains("event-context"));
+    assert_eq!(tasks[0].explicit_context, None);
+    assert!(!tasks[0].include_parent_canvas);
+}
+
+#[test]
 fn active_state_without_artifact_path_reexports_raw_json() {
     let host = RecordingHost::empty();
     let (_, artifact) = load_knuth_fixture();
