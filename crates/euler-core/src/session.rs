@@ -47,7 +47,6 @@ mod observer;
 mod parallel_spawn;
 mod permissions_gate;
 mod round_loop;
-pub mod swarm_context;
 mod swarm_tool;
 mod tool_dispatch;
 pub use background::{

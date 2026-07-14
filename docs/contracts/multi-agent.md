@@ -269,36 +269,32 @@ user names targets explicitly.
 A session-level tool advertised **only** to the root session when the
 `code-swarm` extension is wired and enabled — companions never see it
 (depth one). It is a stage-agnostic review gate: plans, diffs, analyses,
-drafts — the required focus prompt carries the complete bounded subject.
+drafts — the calling agent selects the subject with ordinary tools before it
+calls the gate.
 
-- **Required focus, explicit source mode.** `focus` is the bounded review
-  question. `mode` selects `plan`, `review-code`, `review-diff`, or
-  `review-pr`. Mode-specific fields select plan context, repository-relative
-  files, working/staged/base diffs, or a numbered/current PR. The host
-  assembles at most 256 KiB, reserves 8 KiB for instructions, applies
-  per-file/diff limits, and records included/skipped/truncated context in the
-  report manifest. Optional: `personas`, `models`
-  (`provider::model` one-shot override — only when the user explicitly
-  named targets; the tool must not guess providers), `max_tokens`. On this
-  model-facing surface, an empty `models` array names no explicit target and
-  is treated as omission so persisted config can resolve. Direct extension
-  inputs remain strict 1–5 target lists and reject empty input.
-- **No ambient canvas**: reviewers receive only host-assembled explicit
-  context. They do not inherit parent session history, tool output, or
-  compacted-result stubs. Context sources are selected explicitly, and the
-  report says exactly what was omitted or truncated.
+- **Required focus and context.** `focus` is the concise review question
+  (at most 7 KiB); `context` is the exact review material (at most 256 KiB).
+  The calling agent uses normal `read_file`, `git_diff`, and other tools to
+  retrieve material under their ordinary permissions and then supplies the
+  selected excerpt here. Optional: `personas`, `models` (`provider::model`
+  one-shot override — only when the user explicitly named targets; the tool
+  must not guess providers), and `max_tokens`. On this model-facing surface,
+  an empty `models` array names no explicit target and is treated as omission
+  so persisted config can resolve. Direct extension inputs remain strict 1–5
+  target lists and reject empty input.
+- **No ambient canvas**: reviewers receive only the supplied `context` and
+  their small reviewer brief. They do not inherit parent session history,
+  unrelated tool output, or compacted-result stubs. The report records only
+  the explicit context's source (`agent-supplied`) and byte count, not a
+  second full copy of its contents.
 - **Gate**: `Capability::AgentSpawn` through the ordinary tool permission
   machinery (prompt/grant/deny; covered grants do not re-prompt, so
   repeated checkpoint-loop calls pay no repeat approval). The extension
   execution it delegates to additionally carries `artifact-write` for the
   host-mediated consolidated report, mirroring the round-observer's
-  manifest-grant precedent.
-- **Assembly authority**: reading files and running `git`/`gh` is not covered
-  by `AgentSpawn`, so each mode declares and requests its own capabilities
-  (`review-code` → FsRead, `review-diff` → ShellExec, `review-pr` →
-  ShellExec + Network; `plan` needs none) through that same machinery,
-  **before** any source is read. The per-mode table lives in the tools
-  contract. A denial fails the review and assembles nothing.
+  manifest-grant precedent. It has no hidden source-acquisition authority:
+  retrieving material remains a prior, separately permissioned core-tool
+  action by the calling agent.
 - **Result (honest and complete, no adjudication)**: the tool result
   carries the K-of-N succeeded summary, the consolidated review artifact
   reference (relative path + persisted event id), and one block per

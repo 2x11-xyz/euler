@@ -939,7 +939,8 @@ fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffe
 pub(crate) const CODE_SWARM_AGENT_ONLY_TEACH: &str =
     "code-swarm has no run command: reviews are something the agent runs for you. \
      Ask it in plain language — for example \"code swarm this diff\" or \"code swarm \
-     PR 123\" — and it will pick the context and call its code_swarm_review tool. \
+     PR 123\" — and it will gather the needed material with ordinary tools, then call \
+     its code_swarm_review tool with explicit context. \
      Use /code-swarm to choose which reviewer models it uses.";
 
 fn extension_slash_or_unknown(

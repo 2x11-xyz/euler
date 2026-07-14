@@ -3433,7 +3433,10 @@ fn headless_exec_code_swarm_review_tool_runs_reviewers_from_project_config() {
           "tool_call": {
             "id": "call-review",
             "name": "code_swarm_review",
-            "input": { "focus": "the migration plan" }
+            "input": {
+              "focus": "the migration plan",
+              "context": "plan: deploy in two stages with no rollback step"
+            }
           }
         },
         { "finished": { "stop_reason": "tool_use" } }
