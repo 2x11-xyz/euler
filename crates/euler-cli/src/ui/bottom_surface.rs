@@ -1,7 +1,8 @@
 use super::commands::{
     dispatch_command, filter_palette_entries, CausalDagStats, CheckpointItem, CommandAction,
-    CommandContext, CommandEffect, EffortChoice, ExtensionManagerItem, ModelChoice, PaletteEntry,
-    PaletteEntryKind, PermissionChoice, PickerSpec, ResumeItem, ThemeChoiceItem,
+    CommandContext, CommandEffect, CompactionSettings, EffortChoice, ExtensionManagerItem,
+    ModelChoice, PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec, ResumeItem,
+    ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
 use super::search::TranscriptSearch;
@@ -250,6 +251,13 @@ impl BottomSurface {
         matches!(
             &self.owner,
             BottomOwner::Picker(picker) if picker.kind == PickerKind::CodeSwarmModels
+        )
+    }
+
+    pub fn is_compaction_picker(&self) -> bool {
+        matches!(
+            &self.owner,
+            BottomOwner::Picker(picker) if picker.kind == PickerKind::Compaction
         )
     }
 
@@ -609,6 +617,22 @@ impl BottomSurface {
             }
             let user_tier = picker.code_swarm_user_tier;
             return self.apply_action(CommandAction::CodeSwarmSaveModels { models, user_tier });
+        }
+        if picker.kind == PickerKind::Compaction {
+            if matches!(
+                picker.selected_action(),
+                Some(CommandAction::CompactSession)
+            ) {
+                return self.apply_action(CommandAction::CompactSession);
+            }
+            let settings = CompactionSettings {
+                automatic: picker.items.get(1).is_some_and(|item| item.current),
+                stubs: picker.items.get(2).is_some_and(|item| item.current),
+            };
+            return self.apply_action(CommandAction::SetCompactionPolicy {
+                automatic: settings.automatic,
+                stubs: settings.stubs,
+            });
         }
         // Extension manager: Enter shows details.
         if picker.kind == PickerKind::Extensions {

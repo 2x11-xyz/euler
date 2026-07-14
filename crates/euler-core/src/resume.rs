@@ -1,3 +1,4 @@
+use crate::canvas::{AutoCompactionPolicy, CompactionTier};
 use crate::permissions::ApprovalMode;
 use crate::provenance::{accepted_prefix_lines, ProvenanceWriter};
 use crate::session::{
@@ -6,6 +7,7 @@ use crate::session::{
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::ProviderSet;
 use euler_sdk::Capability;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
@@ -23,6 +25,7 @@ pub struct FoldedSession {
     pub reasoning_effort: euler_provider::ReasoningEffort,
     pub latest_model_usage_used_tokens: Option<u64>,
     pub context_limit_emitted: Option<ModelTarget>,
+    pub auto_compaction: AutoCompactionPolicy,
     /// Capabilities granted for the session scope in the historical prefix
     /// (PERMISSION_DECISION with scope == "session", root agent only). Old
     /// logs without the scope field are never folded (ADR D7/A13).
@@ -84,6 +87,7 @@ pub fn fold_session(
     let mut original_target = None;
     let mut latest_model_usage_used_tokens = None;
     let mut context_limit_emitted = None;
+    let mut auto_compaction = config.auto_compaction;
     let mut session_allowed_capabilities = Vec::new();
     let mut warnings = Vec::new();
 
@@ -97,6 +101,10 @@ pub fn fold_session(
                     original_target = Some(target.clone());
                     target_at_event = target;
                 }
+                auto_compaction = policy_from_session_start(event, auto_compaction);
+            }
+            EventKind::CANVAS_POLICY_CHANGED => {
+                auto_compaction = policy_from_change(event, auto_compaction);
             }
             EventKind::MODEL_SWITCHED => {
                 target_at_event = fold_model_target(target_at_event, std::slice::from_ref(event))?;
@@ -108,9 +116,7 @@ pub fn fold_session(
             EventKind::MODEL_RESULT => {
                 latest_model_usage_used_tokens = event.payload.get("usage").and_then(used_tokens);
             }
-            EventKind::CONTEXT_LIMIT => {
-                context_limit_emitted = Some(target_at_event.clone());
-            }
+            EventKind::CONTEXT_LIMIT => context_limit_emitted = Some(target_at_event.clone()),
             EventKind::PERMISSION_DECISION => {
                 // Fold only explicit session-scoped grants made by the root
                 // agent; companion decisions are per-spawn and never folded.
@@ -155,6 +161,7 @@ pub fn fold_session(
         reasoning_effort,
         latest_model_usage_used_tokens,
         context_limit_emitted,
+        auto_compaction,
         session_allowed_capabilities,
         warnings,
     })
@@ -285,6 +292,7 @@ pub fn resume_session_from_folded_prefix<D>(
     let events_len = folded.events.len();
     let mut config = config;
     config.reasoning_effort = reasoning_effort;
+    config.auto_compaction = folded.auto_compaction;
     let mut session = Session::from_resumed_events(
         config,
         providers,
@@ -306,6 +314,58 @@ pub fn resume_session_from_folded_prefix<D>(
         active_target,
         warnings,
     })
+}
+
+fn policy_from_session_start(
+    event: &EventEnvelope,
+    fallback: AutoCompactionPolicy,
+) -> AutoCompactionPolicy {
+    event
+        .payload
+        .get("auto_compaction")
+        .and_then(Value::as_object)
+        .map_or(fallback, |value| policy_from_object(value, fallback))
+}
+
+fn policy_from_change(
+    event: &EventEnvelope,
+    fallback: AutoCompactionPolicy,
+) -> AutoCompactionPolicy {
+    policy_from_object(&event.payload, fallback)
+}
+
+fn policy_from_object(
+    value: &serde_json::Map<String, Value>,
+    fallback: AutoCompactionPolicy,
+) -> AutoCompactionPolicy {
+    let legacy_tier = value
+        .get("tier")
+        .and_then(Value::as_str)
+        .and_then(CompactionTier::parse);
+    let automatic = value
+        .get("automatic")
+        .and_then(Value::as_bool)
+        .or_else(|| legacy_tier.map(|tier| tier != CompactionTier::Off))
+        .unwrap_or(fallback.automatic);
+    let stubs = value
+        .get("stubs")
+        .and_then(Value::as_bool)
+        .or_else(|| legacy_tier.map(|tier| tier == CompactionTier::Stubs))
+        .unwrap_or_else(|| fallback.stubs_enabled());
+    let budget_bytes = value
+        .get("budget_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .unwrap_or(fallback.budget_bytes);
+    AutoCompactionPolicy {
+        automatic,
+        tier: if stubs {
+            CompactionTier::Stubs
+        } else {
+            CompactionTier::Off
+        },
+        budget_bytes,
+    }
 }
 
 fn preflight_events(events: &[EventEnvelope]) -> Result<(), ResumeError> {

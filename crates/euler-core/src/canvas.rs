@@ -17,10 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 160_000 × 4 = 640_000 bytes of rendered canvas text.
 pub const DEFAULT_CANVAS_BUDGET_BYTES: usize = 640_000;
 
-/// Auto-compaction tier (ADR D4). The two base tiers are implemented;
-/// `structured` and `assisted` are planned and are intentionally not
-/// named here — every variant must be a live assembly path, and naming them
-/// now would create dead code.
+/// First-stage content retention for automatic compaction.
+///
+/// The trigger and the first-stage mechanism are separate controls. This
+/// enum answers only whether bulky tool output may be demoted to a
+/// recoverable stub; [`AutoCompactionPolicy::automatic`] controls whether
+/// the threshold-driven pipeline runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactionTier {
     /// Full history, no demotion. At budget exhaustion the session stops
@@ -54,6 +56,10 @@ impl CompactionTier {
 /// result content may degrade.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AutoCompactionPolicy {
+    /// Run the threshold-driven compaction pipeline before the context limit.
+    pub automatic: bool,
+    /// First-stage content demotion. `Off` means the structured projection
+    /// fallback is used directly when compaction is requested.
     pub tier: CompactionTier,
     pub budget_bytes: usize,
 }
@@ -61,9 +67,26 @@ pub struct AutoCompactionPolicy {
 impl Default for AutoCompactionPolicy {
     fn default() -> Self {
         Self {
+            automatic: true,
             tier: CompactionTier::Stubs,
             budget_bytes: DEFAULT_CANVAS_BUDGET_BYTES,
         }
+    }
+}
+
+impl AutoCompactionPolicy {
+    pub fn stubs_enabled(self) -> bool {
+        self.tier == CompactionTier::Stubs
+    }
+
+    pub fn with_settings(mut self, automatic: bool, stubs: bool) -> Self {
+        self.automatic = automatic;
+        self.tier = if stubs {
+            CompactionTier::Stubs
+        } else {
+            CompactionTier::Off
+        };
+        self
     }
 }
 
@@ -183,7 +206,7 @@ pub fn assemble_canvas_with_compaction(
     compacted_result_ids: &BTreeSet<String>,
 ) -> Vec<CanvasItem> {
     let mut items = collect_canvas_items(events, compacted_result_ids);
-    if policy.tier == CompactionTier::Stubs {
+    if policy.stubs_enabled() {
         demote_to_budget(
             &mut items,
             policy.budget_bytes,

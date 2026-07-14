@@ -30,9 +30,13 @@ window, sessions wire that limit so token-threshold compaction can fire:
 layer-1 first (eligible `read_file` previews), then full projection swap.
 Stub demotion remains the assembly-time byte backstop. Demoted/compacted
 results should be recovered with `tool_result_get` (event/blob handle) rather
-than re-running the original tool when possible. The policy ladder is
-`off`/`stubs` today, with `structured` and an extension-owned `assisted` tier
-designed to follow.
+than re-running the original tool when possible. The live policy has two
+independent controls: automatic threshold compaction and recoverable tool
+stubs. Both default to on. Turning automatic compaction off stops the
+threshold-driven projection pipeline; it does not silently override the
+separately selected stub setting. The structured projection fallback remains
+deterministic in core; model-assisted projection is a later extension of this
+contract.
 
 Write-shaped facts (edits, patches, artifact creations) demote last, and
 their stubs always carry the artifact path.

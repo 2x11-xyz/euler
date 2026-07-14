@@ -6,7 +6,7 @@ use self::resume::TuiResume;
 #[cfg(test)]
 use super::app_layout::{layout, string_lines};
 use super::bottom_surface::{BottomOwner, BottomSurface, SurfaceEvent};
-use super::commands::CommandAction;
+use super::commands::{CommandAction, CompactionSettings};
 #[cfg(test)]
 use super::composer::composer_widget;
 use super::composer::{
@@ -46,10 +46,10 @@ use anyhow::{anyhow, Result};
 use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use euler_core::permissions::PermissionRequest;
 use euler_core::{
-    event_is_runtime_only, fold_session, heuristic_projection, load_extension_package,
-    read_resume_prefix, resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode,
-    EulerHome, ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource,
-    ModelTarget, ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
+    event_is_runtime_only, fold_session, load_extension_package, read_resume_prefix,
+    resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, EulerHome,
+    ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
+    ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -721,7 +721,15 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         &target.provider,
         &target.model,
         &authenticated_providers,
-        empty_command_context_parts(reasoning_effort, theme_choice, Some(session_id.clone())),
+        empty_command_context_parts(
+            reasoning_effort,
+            theme_choice,
+            Some(session_id.clone()),
+            CompactionSettings {
+                automatic: session.auto_compaction_policy().automatic,
+                stubs: session.auto_compaction_policy().stubs_enabled(),
+            },
+        ),
     );
     AppCoreBootstrap {
         session_id,
@@ -829,6 +837,7 @@ impl AppCore {
             extension_slash_commands,
             code_swarm_models: self.code_swarm_models.clone(),
             causal_dag_stats: self.current_causal_dag_stats(),
+            compaction: self.current_compaction_settings(),
         };
         self.bottom.reset_context(command_context(
             &self.model_catalog,
@@ -851,6 +860,7 @@ impl AppCore {
             extension_slash_commands,
             code_swarm_models: self.code_swarm_models.clone(),
             causal_dag_stats: self.current_causal_dag_stats(),
+            compaction: self.current_compaction_settings(),
         };
         self.bottom = BottomSurface::new(command_context(
             &self.model_catalog,
@@ -868,6 +878,19 @@ impl AppCore {
     fn refresh_authenticated_providers(&mut self) {
         if let AppState::Idle { session } = &self.state {
             self.authenticated_providers = session.providers().authenticated_provider_ids();
+        }
+    }
+
+    fn current_compaction_settings(&self) -> CompactionSettings {
+        match &self.state {
+            AppState::Idle { session } => {
+                let policy = session.auto_compaction_policy();
+                CompactionSettings {
+                    automatic: policy.automatic,
+                    stubs: policy.stubs_enabled(),
+                }
+            }
+            AppState::Empty | AppState::TurnInFlight { .. } => self.bottom.context().compaction,
         }
     }
 
@@ -1204,6 +1227,12 @@ impl AppCore {
             }
             KeyCode::Char(' ') if self.bottom.is_code_swarm_picker() => {
                 if let Some(event) = self.bottom.code_swarm_toggle() {
+                    return self.surface_event(event);
+                }
+                CoreEffect::None
+            }
+            KeyCode::Char(' ') if self.bottom.is_compaction_picker() => {
+                if let Some(event) = self.bottom.compaction_toggle() {
                     return self.surface_event(event);
                 }
                 CoreEffect::None
@@ -1755,7 +1784,9 @@ impl AppCore {
             CommandAction::SwitchModel { provider, model } => self.switch_model(provider, model),
             CommandAction::SetReasoningEffort { effort } => self.set_reasoning_effort(effort),
             CommandAction::CompactSession => self.compact_session(),
-            CommandAction::ShowCompaction => self.show_compaction_status(),
+            CommandAction::SetCompactionPolicy { automatic, stubs } => {
+                self.set_compaction_policy(automatic, stubs)
+            }
             CommandAction::ExportSession { path } => self.export_session(path),
             CommandAction::ExtensionRun {
                 id,
@@ -2525,6 +2556,7 @@ fn empty_command_context_parts(
     current_effort: ReasoningEffort,
     current_theme: ThemeChoice,
     current_session_id: Option<String>,
+    compaction: CompactionSettings,
 ) -> CommandContextParts {
     CommandContextParts {
         current_effort,
@@ -2534,6 +2566,7 @@ fn empty_command_context_parts(
         extension_items: Vec::new(),
         extension_slash_commands: Vec::new(),
         code_swarm_models: Vec::new(),
+        compaction,
         causal_dag_stats: current_session_id.map(|session_id| {
             crate::ui::commands::CausalDagStats {
                 session_id,

@@ -590,6 +590,7 @@ fn companion_inherits_off_tier_and_fails_honestly_on_budget_exhaustion() {
     );
     session.run_turn("hello").expect("parent turn");
     session.config.auto_compaction = AutoCompactionPolicy {
+        automatic: false,
         tier: CompactionTier::Off,
         budget_bytes: 1,
     };
@@ -603,7 +604,7 @@ fn companion_inherits_off_tier_and_fails_honestly_on_budget_exhaustion() {
         .result
         .error()
         .expect("error")
-        .contains("context budget exhausted under auto-compaction=off"));
+        .contains("context budget exhausted under current compaction settings"));
 }
 
 #[test]
