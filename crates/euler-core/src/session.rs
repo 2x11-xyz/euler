@@ -15,6 +15,7 @@ use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
 use crate::provenance::ProvenanceWriter;
 use crate::redaction::SecretRedactor;
+use crate::sandbox::SubprocessSandbox;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
@@ -123,6 +124,10 @@ pub struct SessionConfig {
     pub model: String,
     pub reasoning_effort: ReasoningEffort,
     pub root: PathBuf,
+    /// Whether agent-controlled subprocesses must use a core sandbox profile.
+    /// Disabled is the default until a user-facing mode can promise real
+    /// enforcement on the current host.
+    pub subprocess_sandbox: SubprocessSandbox,
     /// `None` (default) = unlimited rounds per turn; a turn ends when the
     /// model finishes, fails, or the user cancels. Set only when a hard
     /// ceiling is explicitly wanted (e.g. exec --max-tool-rounds).
@@ -179,6 +184,7 @@ impl SessionConfig {
             model: "fixture".to_owned(),
             reasoning_effort: ReasoningEffort::Medium,
             root: root.into(),
+            subprocess_sandbox: SubprocessSandbox::Disabled,
             max_tool_rounds: None,
             provider_transport_retries: 2,
             provider_transport_retry_backoff_ms: vec![1000, 3000],
@@ -533,7 +539,8 @@ impl<D> Session<D> {
     }
 
     pub fn new_with_providers(config: SessionConfig, providers: ProviderSet, decider: D) -> Self {
-        let tools = ToolRegistry::new(config.root.clone());
+        let tools =
+            ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
         let active_target = ModelTarget::new(config.provider.clone(), config.model.clone());
         let mut bus = EventBus::new();
         bus.push(EventEnvelope::new(
@@ -966,7 +973,8 @@ impl<D> Session<D> {
         latest_model_usage_used_tokens: Option<u64>,
         context_limit_emitted: Option<ModelTarget>,
     ) -> Self {
-        let tools = ToolRegistry::new(config.root.clone());
+        let tools =
+            ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
         let persisted_events = events.len();
         let mut permissions = PermissionGate::new(decider);
         let _ = permissions
