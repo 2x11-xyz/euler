@@ -479,6 +479,17 @@ fn parse_extension_run(args: &mut impl Iterator<Item = String>) -> Result<Extens
     let target = PathBuf::from(target);
     let descriptor =
         bundled_descriptor_by_id(&id)?.and_then(|descriptor| descriptor.command(&command).cloned());
+    // Refuse before parsing the rest: an agent-only command is not something
+    // this CLI runs, so validating its flags would only teach a dead surface.
+    if descriptor
+        .as_ref()
+        .is_some_and(|descriptor| descriptor.invocation.is_agent_only())
+    {
+        return Err(anyhow!(
+            "{reference} is agent-only: it is run by an agent in a live session, not by `euler \
+             extension run`. Start a session and ask for it in ordinary turn text."
+        ));
+    }
     let input = parse_extension_run_input(&reference, descriptor.as_ref(), args)?;
     Ok(ExtensionRunArgs {
         id,

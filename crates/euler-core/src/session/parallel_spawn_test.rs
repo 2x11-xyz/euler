@@ -8,7 +8,7 @@ use euler_provider::{
     ProviderStream, ScriptedProvider, StopReason, Usage,
 };
 use serde_json::json;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 fn reviewer_task(provider: &str, model: &str, persona: &str) -> AgentTask {
@@ -17,6 +17,10 @@ fn reviewer_task(provider: &str, model: &str, persona: &str) -> AgentTask {
         .with_system_prompt("You are a reviewer. Return findings.")
         .expect("system prompt")
         .with_budget(AgentBudget::new(Some(1), Some(0), Some(1_000_000)).expect("budget"))
+}
+
+fn explicit_reviewer_task(provider: &str, model: &str, persona: &str) -> AgentTask {
+    reviewer_task(provider, model, persona).with_parent_canvas(false)
 }
 
 fn session_with_providers(
@@ -157,6 +161,67 @@ fn batch_returns_outcomes_in_task_order_with_ordered_events() {
             spawn.payload["child_agent_id"]
         );
     }
+}
+
+struct CapturingProvider {
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+impl ModelProvider for CapturingProvider {
+    fn name(&self) -> &'static str {
+        "capture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests.lock().expect("requests").push(request);
+        Ok(Box::new(
+            vec![
+                Ok(ModelStreamEvent::TextDelta("finding".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: None,
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+#[test]
+fn explicit_review_brief_does_not_receive_parent_canvas() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        CapturingProvider {
+            requests: Arc::clone(&requests),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.run_turn("ambient baggage").expect("seed turn");
+
+    session
+        .spawn_reviewers_parallel(
+            vec![explicit_reviewer_task("p1", "m1", "code-swarm-correctness")
+                .with_explicit_context("explicit diff context")
+                .expect("explicit context")],
+            &AtomicBool::new(false),
+        )
+        .expect("review batch");
+
+    let requests = requests.lock().expect("requests");
+    let review = requests.last().expect("review request");
+    assert_eq!(review.input.len(), 2, "context and task only are sent");
+    assert!(review.prompt_text().contains("explicit diff context"));
+    assert!(review.prompt_text().contains("review the work"));
+    assert!(!review.prompt_text().contains("ambient baggage"));
+    let snapshot = session
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .expect("review snapshot");
+    assert_eq!(snapshot.payload["retained_items"], json!(0));
+    assert_eq!(snapshot.payload["selected_event_ids"], json!([]));
 }
 
 #[test]

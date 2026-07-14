@@ -291,6 +291,11 @@ pub enum ExtensionExecutionError {
     /// The selected command attempted a capability not granted for this call.
     #[error("extension capability denied")]
     CapabilityDenied { capability: Capability },
+    /// Host-side validation rejected the command input before execution. The
+    /// message is host-generated (never raw extension error text), so unlike
+    /// the sibling variants it is safe to surface verbatim.
+    #[error("{0}")]
+    InvalidInput(String),
     /// The command returned an extension error. Raw extension error text is
     /// persisted only as a sanitized host-generated extension error event.
     #[error("extension command failed")]

@@ -124,6 +124,23 @@ runs a batch of single-round, tool-free, empty-capability child briefs
 quota. Determinism, event ordering, and failure honesty for both live in the
 multi-agent contract; hosts without live spawn support reject both calls.
 
+`SpawnAgentTask::include_parent_canvas` is an explicit context boundary,
+honoured on **both** spawn paths: `spawn_agent` and `spawn_agents`. A task
+that sets it to `false` receives no parent canvas and its `canvas.snapshot`
+records zero retained items, so provenance shows what the child actually got.
+Native extensions set it to `true` only when their child workflow requires
+the active parent canvas; self-contained workflows such as CodeSwarm set it
+to `false` and carry all bounded context in `task`/`explicit_context`. The
+default is `true`, so existing companion workflows keep the canvas they have
+always had. This field was added to the pre-1.0 SDK as a source-breaking
+struct-field change rather than hiding a privacy-sensitive default in the
+host bridge.
+
+`SpawnAgentTask::explicit_context` carries up to 256 KiB of caller-assembled
+context as a separate child input item for both single and parallel spawn.
+Spawn provenance records its byte count, not its contents, so a multi-reviewer
+batch does not duplicate the review subject in every `agent.spawn` event.
+
 ## Context Slot Update v0
 
 `HostApi::update_context_slot(slot, content)` appends a canonical
@@ -208,6 +225,42 @@ Native command capability rules:
 - V0 command-scoped registration still calls the extension's normal
   `register()` method to discover commands, and validates the command names it
   reports. Extension registration must remain side-effect-free.
+
+## Command Invocation v0
+
+`CommandDescriptor.invocation` declares who may drive a command:
+
+- `Invocation::User` (the default): the command earns a slash token, a
+  headless `extension_run` control line, and `euler extension run`.
+- `Invocation::AgentOnly`: the command is a step an agent takes on the user's
+  behalf, reachable only through a session tool. `build_extension_slash_commands`
+  mints no token for it; the headless control line and the CLI refuse it by
+  name. The bundled `code-swarm` `review` command is the first of these.
+
+Rules:
+
+- **It is a product boundary, not a security one.** `AgentOnly` says a command
+  is not a verb the user drives; it grants and withholds nothing. Authority is
+  `required_capabilities` and only that, whoever reaches the command. Do not
+  use `invocation` to contain a dangerous command — declare fewer capabilities.
+- **Refusals name the way in.** A surface that refuses an agent-only command
+  must say how to reach it (ask the agent), not merely that it cannot run.
+  "Unknown command" is a lie: the command exists.
+- **Enforced at the chokepoint, not only at the surfaces.**
+  `execute_extension_command_gated` — the path every user-driven run takes —
+  refuses agent-only commands itself, before any approval is spent. Surfaces
+  still refuse in their own words (they can name a better next step), but the
+  boundary does not depend on the set of surfaces that happens to exist.
+  `execute_extension_command` is the agent's ungated path and is deliberately
+  exempt: guarding it too would make agent-only mean unreachable.
+- **Listed, not hidden.** `/extension` still shows agent-only commands, marked
+  `(agent-only)`. Hiding them would trade one wrong answer for another.
+- **Absent means `user`.** The manifest field and the persisted link inventory
+  both default to `user`, which is what every manifest written before this
+  field existed meant. A missing `invocation` must decode, never fail the
+  extension.
+- Remediation text anywhere in the system must name only invocations that
+  work; an agent-only command must not be advertised as a user command.
 
 ## Local Event Wake v0
 

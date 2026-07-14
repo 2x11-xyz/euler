@@ -2780,6 +2780,7 @@ impl ExtensionCommand for UndeclaredWriteCommand {
 
 fn test_descriptor(capabilities: impl IntoIterator<Item = Capability>) -> CommandDescriptor {
     CommandDescriptor {
+        invocation: euler_sdk::Invocation::User,
         name: String::new(),
         display_name: String::new(),
         summary: String::new(),

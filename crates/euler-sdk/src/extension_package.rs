@@ -49,6 +49,12 @@ pub struct StaticCommandDescriptor {
     pub display_name: String,
     pub summary: String,
     pub required_capabilities: Vec<String>,
+    /// Absent means `user`, which is what every manifest and every persisted
+    /// link inventory written before this field existed meant. `serde(default)`
+    /// is load-bearing: inventories are on-disk user state, so a missing field
+    /// must decode, not fail the extension.
+    #[serde(default)]
+    pub invocation: crate::Invocation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -432,7 +438,13 @@ fn parse_commands(
             .ok_or_else(|| invalid(format!("{scope} must be an object")))?;
         validate_fields(
             object,
-            &["name", "display_name", "summary", "required_capabilities"],
+            &[
+                "name",
+                "display_name",
+                "summary",
+                "required_capabilities",
+                "invocation",
+            ],
             &scope,
         )?;
         let name = required_identifier(object, "name", &format!("{scope} name"))?;
@@ -460,14 +472,33 @@ fn parse_commands(
             &required_capabilities,
             &format!("{scope} required_capabilities"),
         )?;
+        let invocation = parse_invocation(object, &scope)?;
         parsed.push(StaticCommandDescriptor {
             name,
             display_name,
             summary,
             required_capabilities,
+            invocation,
         });
     }
     Ok(parsed)
+}
+
+/// `invocation` is absent in manifests written before the field existed, and
+/// those commands were all user-invocable, so absence means `user`.
+fn parse_invocation(
+    object: &Map<String, Value>,
+    scope: &str,
+) -> Result<crate::Invocation, ExtensionPackageError> {
+    match object.get("invocation") {
+        None | Some(Value::Null) => Ok(crate::Invocation::User),
+        Some(Value::String(value)) => crate::Invocation::parse(value).ok_or_else(|| {
+            invalid(format!(
+                "{scope} invocation must be \"user\" or \"agent-only\""
+            ))
+        }),
+        Some(_) => Err(invalid(format!("{scope} invocation must be a string"))),
+    }
 }
 
 fn validate_fields(

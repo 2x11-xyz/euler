@@ -14,7 +14,7 @@ use crate::{
 };
 use euler_sdk::{
     ArgSpec, ArgValueKind, ArtifactRecord, ArtifactWrite, Capability, CommandContext,
-    CommandDescriptor, ExtensionCommand, ExtensionError, HostApi, ProvenanceQuery,
+    CommandDescriptor, ExtensionCommand, ExtensionError, HostApi, Invocation, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
 use std::fs::{self, File, OpenOptions};
@@ -58,6 +58,7 @@ impl ExtensionCommand for CausalDagExportCommand {
             },
         ]);
         CommandDescriptor {
+            invocation: Invocation::User,
             name: EXPORT_COMMAND_NAME.to_owned(),
             display_name: "Export causal DAG".to_owned(),
             summary: "Export the active Causal DAG as HTML, JSON, SVG, DOT, Markdown, or summary."

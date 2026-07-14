@@ -3,7 +3,7 @@ use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{
     ArgSpec, ArgValueKind, ArtifactRecord, ArtifactWrite, Capability, CommandContext,
     CommandDescriptor, CommandRegistrar, EventFeedCheckpoint, Extension, ExtensionCommand,
-    ExtensionError, ExtensionManifest, HostApi, ProvenancePage, ProvenanceQuery,
+    ExtensionError, ExtensionManifest, HostApi, Invocation, ProvenancePage, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
 
@@ -125,6 +125,7 @@ struct CausalDagUpdateCommand;
 impl ExtensionCommand for CausalDagUpdateCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: UPDATE_COMMAND_NAME.to_owned(),
             display_name: "Update causal DAG".to_owned(),
             summary: "Run one durable checkpointed Causal DAG projection tick.".to_owned(),
@@ -157,6 +158,7 @@ impl ExtensionCommand for CausalDagCatchUpCommand {
             Some(MAX_CATCH_UP_TICKS),
         ));
         CommandDescriptor {
+            invocation: Invocation::User,
             name: CATCH_UP_COMMAND_NAME.to_owned(),
             display_name: "Catch up causal DAG".to_owned(),
             summary: "Run bounded Causal DAG update ticks until caught up or budgeted.".to_owned(),
@@ -195,6 +197,7 @@ impl ExtensionCommand for CausalDagObserveCommand {
             repeatable: false,
         });
         CommandDescriptor {
+            invocation: Invocation::User,
             name: OBSERVE_COMMAND_NAME.to_owned(),
             display_name: "Observe causal DAG".to_owned(),
             summary: "Project observer-produced Causal DAG hints over bounded provenance."

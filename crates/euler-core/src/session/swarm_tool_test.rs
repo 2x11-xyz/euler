@@ -41,6 +41,7 @@ struct FakeReviewCommand;
 impl ExtensionCommand for FakeReviewCommand {
     fn descriptor(&self) -> euler_sdk::CommandDescriptor {
         euler_sdk::CommandDescriptor {
+            invocation: euler_sdk::Invocation::AgentOnly,
             name: "review".to_owned(),
             display_name: "review".to_owned(),
             summary: "test review".to_owned(),
@@ -60,8 +61,10 @@ impl ExtensionCommand for FakeReviewCommand {
             .ok_or_else(|| ExtensionError::Message("review needs explicit models".to_owned()))?;
         let focus = context.input["prompt"]
             .as_str()
-            .unwrap_or_default()
-            .to_owned();
+            .ok_or_else(|| ExtensionError::Message("review needs a focus prompt".to_owned()))?;
+        let explicit_context = context.input["context"]
+            .as_str()
+            .ok_or_else(|| ExtensionError::Message("review needs explicit context".to_owned()))?;
         let tasks = models
             .iter()
             .map(|model| {
@@ -69,12 +72,14 @@ impl ExtensionCommand for FakeReviewCommand {
                 let (provider, model) = target.split_once("::").expect("provider::model");
                 SpawnAgentTask {
                     task: format!(
-                        "Review the subject visible in this session. Review focus: {focus}"
+                        "Review only the separate explicit context. Review focus: {focus}"
                     ),
                     persona: "code-swarm-correctness".to_owned(),
                     provider: provider.to_owned(),
                     model: model.to_owned(),
                     system_prompt: String::new(),
+                    explicit_context: Some(explicit_context.to_owned()),
+                    include_parent_canvas: false,
                     capabilities: Vec::new(),
                     max_turns: Some(1),
                     max_tool_calls: Some(0),
@@ -123,6 +128,16 @@ fn outcome_json(outcome: &AgentOutcome) -> Value {
 }
 
 fn review_tool_call(input: Value) -> euler_provider::ToolCall {
+    let mut input = input;
+    input
+        .as_object_mut()
+        .expect("review tool fixture must be an object")
+        .entry("context")
+        .or_insert_with(|| json!("explicit test review material"));
+    raw_review_tool_call(input)
+}
+
+fn raw_review_tool_call(input: Value) -> euler_provider::ToolCall {
     euler_provider::ToolCall {
         id: "call-swarm".to_owned(),
         name: "code_swarm_review".to_owned(),
@@ -277,6 +292,69 @@ fn tool_call_with_project_config_spawns_reviewers_and_returns_honest_summary() {
 }
 
 #[test]
+fn code_swarm_forwards_only_explicit_context_to_reviewer_canvas() {
+    struct CapturingReviewer {
+        requests: Arc<Mutex<Vec<ProviderModelRequest>>>,
+    }
+
+    impl euler_provider::ModelProvider for CapturingReviewer {
+        fn name(&self) -> &'static str {
+            "capture-reviewer"
+        }
+
+        fn invoke(
+            &self,
+            request: ProviderModelRequest,
+        ) -> Result<euler_provider::ProviderStream, euler_provider::ProviderError> {
+            self.requests.lock().expect("capture").push(request);
+            Ok(Box::new(
+                vec![
+                    Ok(euler_provider::ModelStreamEvent::TextDelta(
+                        "finding".to_owned(),
+                    )),
+                    Ok(euler_provider::ModelStreamEvent::Finished {
+                        stop_reason: euler_provider::StopReason::Completed,
+                        usage: None,
+                    }),
+                ]
+                .into_iter(),
+            ))
+        }
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut providers = ProviderSet::new();
+    providers.insert_named(
+        "reviewer".to_owned(),
+        CapturingReviewer {
+            requests: Arc::clone(&requests),
+        },
+    );
+    let mut harness = harness_with_providers(
+        vec![
+            FixtureResponse::Assistant("ambient baggage".to_owned()),
+            FixtureResponse::ToolCalls(vec![review_tool_call(json!({
+                "focus": "look for regressions",
+                "context": "selected patch excerpt",
+            }))]),
+            FixtureResponse::Assistant("adjudicated".to_owned()),
+        ],
+        providers,
+    );
+    write_project_config(&harness.root, &["reviewer::capture"]);
+
+    harness.session.run_turn("seed").expect("seed turn");
+    harness.session.run_turn("review").expect("review turn");
+
+    let requests = requests.lock().expect("capture");
+    let request = requests.last().expect("reviewer request");
+    assert_eq!(request.input.len(), 2, "context and reviewer brief only");
+    assert!(request.prompt_text().contains("selected patch excerpt"));
+    assert!(request.prompt_text().contains("look for regressions"));
+    assert!(!request.prompt_text().contains("ambient baggage"));
+}
+
+#[test]
 fn interactive_tool_call_prompts_for_agent_spawn_and_runs_after_approval() {
     let mut harness = interactive_harness(
         vec![
@@ -420,7 +498,8 @@ fn malformed_nonempty_model_override_does_not_fall_back_to_config() {
     let mut harness = harness(
         vec![
             FixtureResponse::ToolCalls(vec![review_tool_call(json!({
-                "models": ["missing-separator"]
+                "models": ["missing-separator"],
+                "focus": "explicit review subject"
             }))]),
             FixtureResponse::Assistant("relayed".to_owned()),
         ],
@@ -545,10 +624,12 @@ fn failed_reviewer_error_is_redacted_but_findings_stay_faithful() {
 }
 
 #[test]
-fn unconfigured_tool_call_fails_honestly_with_both_remediation_paths() {
+fn unconfigured_tool_call_fails_honestly_naming_only_working_remediation() {
     let mut harness = harness(
         vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("relayed".to_owned()),
         ],
         &[],
@@ -560,16 +641,19 @@ fn unconfigured_tool_call_fails_honestly_with_both_remediation_paths() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].payload["ok"], json!(false));
     let error = results[0].payload["error"].as_str().expect("error text");
-    // Pinned remediation paths (multi-agent contract): the TUI picker and
-    // the literal explicit-model invocations for TUI and headless use.
-    assert!(error.contains("/code-swarm"), "TUI picker path: {error}");
+    // Pinned remediation (multi-agent contract): the error must name only
+    // invocations that work. CodeSwarm is agent-only, so that is the
+    // /code-swarm picker — and explicitly NOT the /review or extension_run
+    // paths this text used to advertise, which now refuse. Sending a stuck
+    // user to a command that cannot work is worse than sending them nowhere.
+    assert!(error.contains("/code-swarm"), "config path: {error}");
     assert!(
-        error.contains("/review --model provider::model"),
-        "TUI one-off override path: {error}"
+        !error.contains("/review"),
+        "must not name the removed /review surface: {error}"
     );
     assert!(
-        error.contains("extension_run code-swarm.review {\"models\":[\"provider::model\"]}"),
-        "headless one-off override path: {error}"
+        !error.contains("extension_run"),
+        "must not name the refusing control line: {error}"
     );
     assert!(
         error.contains("do not guess providers or models"),
@@ -590,7 +674,7 @@ fn explicit_models_override_wins_over_persisted_config() {
     let mut harness = harness(
         vec![
             FixtureResponse::ToolCalls(vec![review_tool_call(
-                json!({"models": ["p2::override-model"]}),
+                json!({"models": ["p2::override-model"], "focus": "explicit review subject"}),
             )]),
             FixtureResponse::Assistant("done".to_owned()),
         ],
@@ -623,7 +707,9 @@ fn explicit_models_override_wins_over_persisted_config() {
 fn user_tier_config_is_the_fallback_when_project_tier_is_absent() {
     let mut harness = harness(
         vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("done".to_owned()),
         ],
         &[(
@@ -704,7 +790,9 @@ fn repeat_invocations_succeed_with_fresh_quota_and_no_reprompt() {
 fn unconfigured_provider_target_fails_honestly_naming_login() {
     let mut harness = harness(
         vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("relayed".to_owned()),
         ],
         &[],
@@ -726,7 +814,9 @@ fn unconfigured_provider_target_fails_honestly_naming_login() {
 fn denied_agent_spawn_is_a_failed_tool_result() {
     let mut harness = harness(
         vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("adapted".to_owned()),
         ],
         &[],
@@ -826,7 +916,9 @@ fn unwired_tool_call_fails_honestly() {
     let providers = ProviderSet::single_named(
         "fixture",
         ScriptedProvider::new(vec![
-            FixtureResponse::ToolCalls(vec![review_tool_call(json!({}))]),
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "explicit review subject"}),
+            )]),
             FixtureResponse::Assistant("relayed".to_owned()),
         ]),
     );
@@ -866,8 +958,106 @@ fn malformed_tool_input_fails_honestly() {
     assert_eq!(results[0].payload["ok"], json!(false));
     let error = results[0].payload["error"].as_str().expect("error");
     assert!(
-        error.contains("unknown code_swarm_review field `bogus`")
-            && error.contains("focus, personas, models, max_tokens"),
+        error.contains("unknown code_swarm_review field `bogus`"),
         "unknown-field error must teach the schema: {error}"
     );
+}
+
+#[test]
+fn source_selector_fields_are_rejected_before_reviewers_spawn() {
+    // Source retrieval stays with ordinary core tools. The review gate accepts
+    // only the resulting explicit material, so it cannot silently acquire
+    // filesystem, git, or network authority.
+    let mut harness = harness_with_permission(
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(json!({
+                "focus": "find regressions",
+                "context": "the selected diff",
+                "mode": "review-diff",
+            }))]),
+            FixtureResponse::Assistant("relayed".to_owned()),
+        ],
+        reviewer_provider_set(&[("p1", vec![FixtureResponse::Assistant("finding".to_owned())])]),
+        Vec::new(),
+        Some(ApprovalMode::SessionAllow),
+    );
+    write_project_config(&harness.root, &["p1::m1"]);
+
+    harness
+        .session
+        .run_turn("review selected diff")
+        .expect("turn");
+
+    let results = tool_results(&harness.session);
+    assert_eq!(results[0].payload["ok"], json!(false));
+    let error = results[0].payload["error"].as_str().expect("error");
+    assert!(
+        error.contains("unknown code_swarm_review field `mode`"),
+        "removed selector must fail explicitly: {error}"
+    );
+    assert!(
+        !harness
+            .session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::AGENT_SPAWN),
+        "invalid source selector must not spawn reviewers"
+    );
+}
+
+#[test]
+fn supplied_context_needs_no_source_acquisition_capability() {
+    // A review receives already-selected material. Denying ShellExec cannot
+    // block it because no hidden git/gh acquisition path remains.
+    let mut harness = harness(
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(
+                json!({"focus": "find design gaps", "context": "step one\nstep two"}),
+            )]),
+            FixtureResponse::Assistant("adjudicated".to_owned()),
+        ],
+        &[("p1", vec![FixtureResponse::Assistant("finding".to_owned())])],
+    );
+    write_project_config(&harness.root, &["p1::m1"]);
+    harness
+        .session
+        .set_permission_mode(Capability::ShellExec, ApprovalMode::AlwaysDeny);
+
+    harness.session.run_turn("review the plan").expect("turn");
+
+    let results = tool_results(&harness.session);
+    assert_eq!(
+        results[0].payload["ok"],
+        json!(true),
+        "{:?}",
+        results[0].payload
+    );
+}
+
+#[test]
+fn missing_explicit_context_fails_honestly_before_any_spawn() {
+    let mut harness = harness(
+        vec![
+            FixtureResponse::ToolCalls(vec![raw_review_tool_call(json!({
+                "focus": "find design gaps",
+            }))]),
+            FixtureResponse::Assistant("relayed".to_owned()),
+        ],
+        &[],
+    );
+    write_project_config(&harness.root, &["p1::m1"]);
+
+    harness.session.run_turn("review").expect("turn");
+
+    let results = tool_results(&harness.session);
+    assert_eq!(results[0].payload["ok"], json!(false));
+    assert!(results[0].payload["error"]
+        .as_str()
+        .expect("error")
+        .contains("context is required"));
+    assert!(harness
+        .session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::AGENT_SPAWN));
 }

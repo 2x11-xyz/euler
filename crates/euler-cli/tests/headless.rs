@@ -2680,31 +2680,31 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#""artifact-write","fs-read","fs-write","agent-record","agent-spawn","context-slot"],"commands":[{{"name":"export","#,
                 r#""display_name":"Export causal DAG","#,
                 r#""summary":"Export the active Causal DAG as HTML, JSON, SVG, DOT, Markdown, or summary.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write"]}},{{"name":"view","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write"],"invocation":"user"}},{{"name":"view","#,
                 r#""display_name":"View causal DAG","#,
                 r#""summary":"Show the active path, open frontier, and dead ends without writing a file.","#,
-                r#""required_capabilities":["fs-read","fs-write"]}},{{"name":"update","#,
+                r#""required_capabilities":["fs-read","fs-write"],"invocation":"user"}},{{"name":"update","#,
                 r#""display_name":"Update causal DAG","#,
                 r#""summary":"Run one durable checkpointed Causal DAG projection tick.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"]}},{{"name":"catch-up","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"],"invocation":"user"}},{{"name":"catch-up","#,
                 r#""display_name":"Catch up causal DAG","#,
                 r#""summary":"Run bounded Causal DAG update ticks until caught up or budgeted.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"]}},{{"name":"observe","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"],"invocation":"user"}},{{"name":"observe","#,
                 r#""display_name":"Observe causal DAG","#,
                 r#""summary":"Project observer-produced Causal DAG hints over bounded provenance.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"]}},{{"name":"refresh","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"],"invocation":"user"}},{{"name":"refresh","#,
                 r#""display_name":"Refresh causal DAG","#,
                 r#""summary":"Increment, reframe, or finalize the active semantic Causal DAG.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","agent-spawn","context-slot"]}},{{"name":"observer-brief","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","agent-spawn","context-slot"],"invocation":"user"}},{{"name":"observer-brief","#,
                 r#""display_name":"Build observer brief","#,
                 r#""summary":"Build a bounded companion AgentTask for observing a provenance window.","#,
-                r#""required_capabilities":["provenance-read","fs-read","fs-write"]}},{{"name":"observer-apply","#,
+                r#""required_capabilities":["provenance-read","fs-read","fs-write"],"invocation":"user"}},{{"name":"observer-apply","#,
                 r#""display_name":"Apply observer output","#,
                 r#""summary":"Fold a round-observer companion's hints output into a Causal DAG projection.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"]}},{{"name":"record-observation","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"],"invocation":"user"}},{{"name":"record-observation","#,
                 r#""display_name":"Record Causal DAG observation","#,
                 r#""summary":"Record post-hoc observer audit metadata for an existing Causal DAG artifact.","#,
-                r#""required_capabilities":["provenance-read","agent-record"]}}]}}"#,
+                r#""required_capabilities":["provenance-read","agent-record"],"invocation":"user"}}]}}"#,
                 "\n"
             ),
             version
@@ -2742,7 +2742,7 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#""artifact-write"],"commands":[{{"name":"session-export","#,
                 r#""display_name":"Session export","#,
                 r#""summary":"Export bounded session events as a JSON artifact.","#,
-                r#""required_capabilities":["provenance-read","artifact-write"]}}]}}"#,
+                r#""required_capabilities":["provenance-read","artifact-write"],"invocation":"user"}}]}}"#,
                 "\n"
             ),
             version
@@ -2782,8 +2782,11 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#""runtime_kind":"native-rust","capabilities":["agent-spawn","#,
                 r#""artifact-write"],"commands":[{{"name":"review","#,
                 r#""display_name":"Run CodeSwarm review","#,
-                r#""summary":"Run 1-5 review-only agents over the current session and write a consolidated review artifact.","#,
-                r#""required_capabilities":["agent-spawn","artifact-write"]}}]}}"#,
+                r#""summary":"Run 1-5 review-only agents over explicit bounded context and write a consolidated review artifact.","#,
+                r#""required_capabilities":["agent-spawn","artifact-write"],"#,
+                // Pinned: review is agent-only, and the descriptor says so.
+                // A reader must not have to infer it from an absent field.
+                r#""invocation":"agent-only"}}]}}"#,
                 "\n"
             ),
             version
@@ -2818,7 +2821,7 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
     let diagnostics_stdout =
         String::from_utf8(diagnostics_info.stdout).expect("diagnostics-report info stdout utf8");
     let diagnostics_expected = format!(
-        "{{\"id\":\"diagnostics-report\",\"display_name\":\"Diagnostics Report\",\"version\":\"{}\",\"source_kind\":\"bundled\",\"runtime_kind\":\"native-rust\",\"capabilities\":[\"diagnostics-read\",\"artifact-write\"],\"commands\":[{{\"name\":\"report\",\"display_name\":\"Write diagnostics report\",\"summary\":\"Aggregate the current session diagnostics log into a report artifact.\",\"required_capabilities\":[\"diagnostics-read\",\"artifact-write\"]}}]}}\n",
+        "{{\"id\":\"diagnostics-report\",\"display_name\":\"Diagnostics Report\",\"version\":\"{}\",\"source_kind\":\"bundled\",\"runtime_kind\":\"native-rust\",\"capabilities\":[\"diagnostics-read\",\"artifact-write\"],\"commands\":[{{\"name\":\"report\",\"display_name\":\"Write diagnostics report\",\"summary\":\"Aggregate the current session diagnostics log into a report artifact.\",\"required_capabilities\":[\"diagnostics-read\",\"artifact-write\"],\"invocation\":\"user\"}}]}}\n",
         version
     );
     assert_eq!(diagnostics_stdout, diagnostics_expected);
@@ -2851,7 +2854,7 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
     let autoresearch_stdout =
         String::from_utf8(autoresearch_info.stdout).expect("autoresearch info stdout utf8");
     let autoresearch_expected = format!(
-        "{{\"id\":\"autoresearch\",\"display_name\":\"Autoresearch\",\"version\":\"{}\",\"source_kind\":\"bundled\",\"runtime_kind\":\"native-rust\",\"capabilities\":[\"provenance-read\",\"artifact-write\",\"context-slot\"],\"commands\":[{{\"name\":\"objective-brief\",\"display_name\":\"Build autoresearch objective brief\",\"summary\":\"Build a companion AgentTask brief for choosing the next objective.\",\"required_capabilities\":[\"provenance-read\"]}},{{\"name\":\"objective-report\",\"display_name\":\"Write autoresearch objective report\",\"summary\":\"Persist a companion-produced autoresearch objective artifact.\",\"required_capabilities\":[\"provenance-read\",\"artifact-write\",\"context-slot\"]}}]}}\n",
+        "{{\"id\":\"autoresearch\",\"display_name\":\"Autoresearch\",\"version\":\"{}\",\"source_kind\":\"bundled\",\"runtime_kind\":\"native-rust\",\"capabilities\":[\"provenance-read\",\"artifact-write\",\"context-slot\"],\"commands\":[{{\"name\":\"objective-brief\",\"display_name\":\"Build autoresearch objective brief\",\"summary\":\"Build a companion AgentTask brief for choosing the next objective.\",\"required_capabilities\":[\"provenance-read\"],\"invocation\":\"user\"}},{{\"name\":\"objective-report\",\"display_name\":\"Write autoresearch objective report\",\"summary\":\"Persist a companion-produced autoresearch objective artifact.\",\"required_capabilities\":[\"provenance-read\",\"artifact-write\",\"context-slot\"],\"invocation\":\"user\"}}]}}\n",
         version
     );
     assert_eq!(autoresearch_stdout, autoresearch_expected);
@@ -2882,7 +2885,7 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
     );
     let maxproof_stdout = String::from_utf8(maxproof_info.stdout).expect("maxproof info stdout");
     let maxproof_expected = format!(
-        "{{\"id\":\"maxproof\",\"display_name\":\"MaxProof\",\"version\":\"{}\",\"source_kind\":\"bundled\",\"runtime_kind\":\"native-rust\",\"capabilities\":[\"provenance-read\",\"artifact-write\"],\"commands\":[{{\"name\":\"population-brief\",\"display_name\":\"Build MaxProof population briefs\",\"summary\":\"Build bounded proof-generator AgentTask briefs.\",\"required_capabilities\":[]}},{{\"name\":\"verify-brief\",\"display_name\":\"Build MaxProof verifier briefs\",\"summary\":\"Build independent verifier AgentTask briefs for candidate results.\",\"required_capabilities\":[\"provenance-read\"]}},{{\"name\":\"tournament\",\"display_name\":\"Run MaxProof tournament\",\"summary\":\"Select a proof by conservative deterministic fitness and persist archive.\",\"required_capabilities\":[\"provenance-read\",\"artifact-write\"]}}]}}\n",
+        "{{\"id\":\"maxproof\",\"display_name\":\"MaxProof\",\"version\":\"{}\",\"source_kind\":\"bundled\",\"runtime_kind\":\"native-rust\",\"capabilities\":[\"provenance-read\",\"artifact-write\"],\"commands\":[{{\"name\":\"population-brief\",\"display_name\":\"Build MaxProof population briefs\",\"summary\":\"Build bounded proof-generator AgentTask briefs.\",\"required_capabilities\":[],\"invocation\":\"user\"}},{{\"name\":\"verify-brief\",\"display_name\":\"Build MaxProof verifier briefs\",\"summary\":\"Build independent verifier AgentTask briefs for candidate results.\",\"required_capabilities\":[\"provenance-read\"],\"invocation\":\"user\"}},{{\"name\":\"tournament\",\"display_name\":\"Run MaxProof tournament\",\"summary\":\"Select a proof by conservative deterministic fitness and persist archive.\",\"required_capabilities\":[\"provenance-read\",\"artifact-write\"],\"invocation\":\"user\"}}]}}\n",
         version
     );
     assert_eq!(maxproof_stdout, maxproof_expected);
@@ -3378,62 +3381,32 @@ fn extension_cli_code_swarm_review_validates_input_and_stays_live_only() {
         .expect("extension enable code-swarm");
     assert!(enabled.status.success());
 
-    let bad_model = command_with_home(exe, &home)
-        .args([
-            "extension",
-            "run",
-            "code-swarm.review",
-            &session_id,
-            "--model",
-            "no-separator",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("code swarm review run with bad model");
-    assert!(!bad_model.status.success());
-    let stderr = String::from_utf8_lossy(&bad_model.stderr);
-    assert!(
-        stderr.contains("provider::model"),
-        "expected model target guidance, got: {stderr}"
-    );
-
-    // No models and no persisted config: the honest unconfigured error with
-    // remediation, never a guessed reviewer set.
-    let unconfigured = command_with_home(exe, &home)
-        .args(["extension", "run", "code-swarm.review", &session_id])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("code swarm review offline run");
-    assert!(!unconfigured.status.success());
-    let stderr = String::from_utf8_lossy(&unconfigured.stderr);
-    assert!(
-        stderr.contains("--model provider::model") && stderr.contains("/code-swarm"),
-        "expected unconfigured remediation, got: {stderr}"
-    );
-
-    // Explicit models get past input validation; the offline runner then has
-    // no live session to spawn against and must say so honestly.
-    let offline = command_with_home(exe, &home)
-        .args([
-            "extension",
-            "run",
-            "code-swarm.review",
-            &session_id,
-            "--model",
-            "fixture::fixture-model",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("code swarm review offline run with models");
-    assert!(!offline.status.success());
-    let stderr = String::from_utf8_lossy(&offline.stderr);
-    assert!(
-        stderr.contains("agent spawn unavailable"),
-        "expected spawn-unavailable error from the offline host, got: {stderr}"
-    );
+    // CodeSwarm is agent-only: `euler extension run` refuses it outright, so
+    // none of the old input-validation paths are reachable from this surface.
+    // The refusal must name the way in, not just say no.
+    for extra in [
+        vec![],
+        vec!["--model", "no-separator"],
+        vec!["--model", "fixture::fixture-model", "--prompt", "subject"],
+    ] {
+        let mut args = vec!["extension", "run", "code-swarm.review", &session_id];
+        args.extend(extra.iter().copied());
+        let refused = command_with_home(exe, &home)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("code swarm review run");
+        assert!(
+            !refused.status.success(),
+            "extension run must not run an agent-only command: {args:?}"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("agent-only") && stderr.contains("turn text"),
+            "refusal must name the agent path, got: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -3460,7 +3433,10 @@ fn headless_exec_code_swarm_review_tool_runs_reviewers_from_project_config() {
           "tool_call": {
             "id": "call-review",
             "name": "code_swarm_review",
-            "input": { "focus": "the migration plan" }
+            "input": {
+              "focus": "the migration plan",
+              "context": "plan: deploy in two stages with no rollback step"
+            }
           }
         },
         { "finished": { "stop_reason": "tool_use" } }
@@ -3548,95 +3524,21 @@ fn headless_exec_code_swarm_review_tool_runs_reviewers_from_project_config() {
 }
 
 #[test]
-fn headless_run_code_swarm_review_uses_persisted_project_config() {
-    // A headless run with NO explicit models uses the TUI-persisted project
-    // store for this cwd (resolution chain, step 2).
-    let exe = env!("CARGO_BIN_EXE_euler");
-    let home = isolated_home();
-    let root = tempfile::tempdir().expect("root dir");
-    let log = root.path().join("events.jsonl");
-    write_code_swarm_project_config(root.path(), &["fixture::config-model"]);
-    let script = write_fixture_script(
-        root.path(),
-        "swarm-config.json",
-        r#"{
-  "version": 1,
-  "responses": [
-    {
-      "events": [
-        { "text_delta": "finding from the configured reviewer" },
-        { "finished": { "stop_reason": "completed" } }
-      ]
-    }
-  ]
-}
-"#,
-    );
-
-    let result = run_headless_code_swarm_review(exe, &home, root.path(), &script, &log, "{}");
-    assert_eq!(result["type"], serde_json::json!("extension_run_result"));
-    let reviewers = &result["result"]["reviewers"];
-    assert_eq!(reviewers[0]["model"], serde_json::json!("config-model"));
-    assert_eq!(reviewers[0]["ok"], serde_json::json!(true));
-    assert_eq!(
-        reviewers[0]["findings"],
-        serde_json::json!("finding from the configured reviewer")
-    );
-    assert_eq!(result["result"]["succeeded"], serde_json::json!(1));
-}
-
-#[test]
-fn headless_run_code_swarm_review_explicit_models_override_persisted_config() {
-    // Explicit models on the invocation win outright (resolution chain,
-    // step 1) and never mutate the stores.
-    let exe = env!("CARGO_BIN_EXE_euler");
-    let home = isolated_home();
-    let root = tempfile::tempdir().expect("root dir");
-    let log = root.path().join("events.jsonl");
-    write_code_swarm_project_config(root.path(), &["fixture::config-model"]);
-    let script = write_fixture_script(
-        root.path(),
-        "swarm-override.json",
-        r#"{
-  "version": 1,
-  "responses": [
-    {
-      "events": [
-        { "text_delta": "finding from the override reviewer" },
-        { "finished": { "stop_reason": "completed" } }
-      ]
-    }
-  ]
-}
-"#,
-    );
-
-    let result = run_headless_code_swarm_review(
-        exe,
-        &home,
-        root.path(),
-        &script,
-        &log,
-        "{\"models\":[\"fixture::override-model\"]}",
-    );
-    let reviewers = &result["result"]["reviewers"];
-    assert_eq!(reviewers[0]["model"], serde_json::json!("override-model"));
-    // One-shot: the persisted store is untouched.
-    let stored = std::fs::read_to_string(root.path().join(".euler").join("code-swarm.json"))
-        .expect("config still present");
-    assert!(stored.contains("config-model"));
-    assert!(!stored.contains("override-model"));
-}
-
-#[test]
-fn headless_run_code_swarm_review_unconfigured_is_the_honest_remediation_error() {
+fn headless_control_line_refuses_agent_only_code_swarm_review() {
+    // CodeSwarm is agent-only on every non-agent surface, headless included.
+    // The agent is present in `euler run` too, so the way in is ordinary turn
+    // text; the refusal has to say that rather than just fail.
+    //
+    // Reviewer-config resolution (project tier / user tier / explicit override
+    // / unconfigured) used to be covered through this control line. It is now
+    // covered where it actually runs: euler-core's swarm_tool tests.
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
     let root = tempfile::tempdir().expect("root dir");
     let log = root.path().join("events.jsonl");
     let script = write_fixture_script(
         root.path(),
-        "swarm-unconfigured.json",
+        "swarm-agent-only.json",
         r#"{
   "version": 1,
   "responses": [
@@ -3650,15 +3552,29 @@ fn headless_run_code_swarm_review_unconfigured_is_the_honest_remediation_error()
 }
 "#,
     );
+    write_code_swarm_project_config(root.path(), &["fixture::config-model"]);
 
-    let result = run_headless_code_swarm_review(exe, &home, root.path(), &script, &log, "{}");
-    assert_eq!(result["type"], serde_json::json!("error"));
-    let message = result["message"].as_str().expect("message");
-    assert!(message.contains("/code-swarm"), "TUI path: {message}");
-    assert!(
-        message.contains("extension_run code-swarm.review"),
-        "headless override path: {message}"
-    );
+    for input in [
+        "{}",
+        r#"{"prompt":"subject"}"#,
+        r#"{"models":["fixture::m"],"prompt":"subject"}"#,
+    ] {
+        let result = run_headless_code_swarm_review(exe, &home, root.path(), &script, &log, input);
+        assert_eq!(result["type"], serde_json::json!("error"), "input {input}");
+        let message = result["message"].as_str().expect("message");
+        assert!(
+            message.contains("agent-only") && message.contains("code_swarm_review"),
+            "refusal must name the agent path, got: {message}"
+        );
+        // A configured reviewer set must not tempt it into running anyway.
+        assert!(
+            !log.exists()
+                || !fs::read_to_string(&log)
+                    .expect("log")
+                    .contains("agent.spawn"),
+            "an agent-only control line must not spawn reviewers"
+        );
+    }
 }
 
 /// Drive one `extension_run code-swarm.review <input>` control line through

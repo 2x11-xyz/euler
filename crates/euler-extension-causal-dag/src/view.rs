@@ -6,6 +6,7 @@ use crate::slot_summary::render_artifact_summary;
 use crate::{input_error, SCHEMA_NAME};
 use euler_sdk::{
     Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError, HostApi,
+    Invocation,
 };
 use serde_json::{json, Value};
 
@@ -17,6 +18,7 @@ pub(super) struct CausalDagViewCommand;
 impl ExtensionCommand for CausalDagViewCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: VIEW_COMMAND_NAME.to_owned(),
             display_name: "View causal DAG".to_owned(),
             summary: "Show the active path, open frontier, and dead ends without writing a file."

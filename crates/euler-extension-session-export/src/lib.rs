@@ -8,7 +8,7 @@
 use euler_sdk::{
     ArgSpec, ArgValueKind, ArtifactWrite, Capability, CommandContext, CommandDescriptor,
     CommandRegistrar, Extension, ExtensionCommand, ExtensionError, ExtensionManifest, HostApi,
-    ProvenancePage, ProvenanceQuery,
+    Invocation, ProvenancePage, ProvenanceQuery,
 };
 use serde_json::{json, Map, Value};
 
@@ -45,6 +45,7 @@ struct SessionExportCommand;
 impl ExtensionCommand for SessionExportCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: COMMAND_NAME.to_owned(),
             display_name: "Session export".to_owned(),
             summary: "Export bounded session events as a JSON artifact.".to_owned(),

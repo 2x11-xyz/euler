@@ -2002,6 +2002,7 @@ struct TestExtension {
     id: &'static str,
     capabilities: Vec<Capability>,
     behavior: TestCommandBehavior,
+    invocation: euler_sdk::Invocation,
 }
 
 fn test_extension(
@@ -2013,6 +2014,115 @@ fn test_extension(
         id,
         capabilities,
         behavior,
+        invocation: euler_sdk::Invocation::User,
+    }
+}
+
+#[test]
+fn gated_extension_run_refuses_an_agent_only_command() {
+    // Every user-driven extension run funnels through the gated bridge, so
+    // agent-only is enforced here and not only at whichever surfaces happen
+    // to exist. A refusal must also cost nothing: no prompt, no execution.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join(".euler").join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-agent-only".to_owned();
+    enable_test_extensions(&mut config, &["artifact-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    )
+    .with_provenance(writer);
+    let extension = agent_only_test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"must not be written".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    let error = session
+        .execute_extension_command_gated(
+            &extension,
+            "write",
+            json!(null),
+            &[Capability::ArtifactWrite],
+        )
+        .expect_err("agent-only command must be refused");
+
+    assert!(
+        matches!(&error, ExtensionExecutionError::InvalidInput(message)
+            if message.contains("agent-only") && message.contains("turn text")),
+        "refusal must name the agent path: {error:?}"
+    );
+    assert!(
+        !session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT),
+        "a refused command must not spend an approval"
+    );
+    assert!(
+        !session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::EXTENSION_ARTIFACT),
+        "a refused command must not execute"
+    );
+}
+
+#[test]
+fn ungated_extension_run_still_serves_the_agent_path() {
+    // The agent reaches an agent-only command through execute_extension_command
+    // (what the code_swarm_review tool uses). That path is ungated by design:
+    // if this guard leaked into it, agent-only would mean unreachable.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join(".euler").join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-agent-only-ok".to_owned();
+    enable_test_extensions(&mut config, &["artifact-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    let extension = agent_only_test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"agent path output".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    let output = session
+        .execute_extension_command(
+            &extension,
+            "write",
+            json!(null),
+            [Capability::ArtifactWrite],
+        )
+        .expect("the agent path must still reach an agent-only command");
+    assert!(output["records"][0]["persisted_event_id"].is_string());
+}
+
+fn agent_only_test_extension(
+    id: &'static str,
+    capabilities: Vec<Capability>,
+    behavior: TestCommandBehavior,
+) -> TestExtension {
+    TestExtension {
+        invocation: euler_sdk::Invocation::AgentOnly,
+        ..test_extension(id, capabilities, behavior)
     }
 }
 
@@ -2031,6 +2141,7 @@ impl Extension for TestExtension {
             "write",
             Box::new(TestCommand {
                 behavior: self.behavior.clone(),
+                invocation: self.invocation,
             }),
         );
         Ok(())
@@ -2039,6 +2150,7 @@ impl Extension for TestExtension {
 
 struct TestCommand {
     behavior: TestCommandBehavior,
+    invocation: euler_sdk::Invocation,
 }
 
 impl ExtensionCommand for TestCommand {
@@ -2065,6 +2177,7 @@ impl ExtensionCommand for TestCommand {
             TestCommandBehavior::Noop(_) => Vec::new(),
         };
         CommandDescriptor {
+            invocation: self.invocation,
             name: "write".to_owned(),
             display_name: String::new(),
             summary: String::new(),
@@ -2108,6 +2221,8 @@ impl ExtensionCommand for TestCommand {
                         provider: String::new(),
                         model: String::new(),
                         system_prompt: String::new(),
+                        explicit_context: None,
+                        include_parent_canvas: true,
                         capabilities: child_capabilities.clone(),
                         max_turns: Some(4),
                         max_tool_calls: Some(4),
@@ -2134,6 +2249,8 @@ impl ExtensionCommand for TestCommand {
                             provider: String::new(),
                             model: String::new(),
                             system_prompt: String::new(),
+                            explicit_context: None,
+                            include_parent_canvas: true,
                             capabilities: Vec::new(),
                             max_turns: Some(1),
                             max_tool_calls: Some(0),

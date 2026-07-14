@@ -28,6 +28,7 @@ use crate::research_observer;
 use crate::research_state::ResearchState;
 use euler_sdk::{
     Capability, CommandContext, CommandDescriptor, ExtensionCommand, ExtensionError, HostApi,
+    Invocation,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -43,6 +44,7 @@ pub(super) struct CausalDagObserverApplyCommand;
 impl ExtensionCommand for CausalDagObserverApplyCommand {
     fn descriptor(&self) -> CommandDescriptor {
         CommandDescriptor {
+            invocation: Invocation::User,
             name: OBSERVER_APPLY_COMMAND_NAME.to_owned(),
             display_name: "Apply observer output".to_owned(),
             summary: "Fold a round-observer companion's hints output into a Causal DAG projection."
