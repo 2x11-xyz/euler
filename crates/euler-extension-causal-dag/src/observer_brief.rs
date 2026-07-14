@@ -1,5 +1,7 @@
 use super::{input_error, is_causal_dag_self_event, HINTS_SCHEMA_NAME, OBSERVER_BRIEF_SCHEMA_NAME};
 use crate::active_state::ActiveGraphState;
+use crate::research_observer;
+use crate::research_state::ResearchState;
 use euler_agents::{MAX_SYSTEM_PROMPT_BYTES, MAX_TASK_BYTES};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{
@@ -47,6 +49,9 @@ impl ExtensionCommand for CausalDagObserverBriefCommand {
         context: CommandContext,
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
+        if ResearchState::load(host)?.is_some() {
+            return research_observer::execute_brief(context, host);
+        }
         let input = ObserverBriefInput::parse(&context.input)?;
         let active = ActiveGraphState::load(host)?;
         let mut query = input.query();

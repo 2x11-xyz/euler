@@ -2692,7 +2692,10 @@ fn extension_info_reports_stable_bundled_descriptor_only_json() {
                 r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"],"invocation":"user"}},{{"name":"observe","#,
                 r#""display_name":"Observe causal DAG","#,
                 r#""summary":"Project observer-produced Causal DAG hints over bounded provenance.","#,
-                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"],"invocation":"user"}},{{"name":"refresh","#,
+                r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","context-slot"],"invocation":"user"}},{{"name":"research-enable","#,
+                r#""display_name":"Enable durable research record","#,
+                r#""summary":"Use the durable research record and deterministic v4 Causal DAG projection for this session.","#,
+                r#""required_capabilities":["fs-read","fs-write"],"invocation":"user"}},{{"name":"refresh","#,
                 r#""display_name":"Refresh causal DAG","#,
                 r#""summary":"Increment, reframe, or finalize the active semantic Causal DAG.","#,
                 r#""required_capabilities":["provenance-read","artifact-write","fs-read","fs-write","agent-spawn","context-slot"],"invocation":"user"}},{{"name":"observer-brief","#,
@@ -2998,15 +3001,18 @@ fn extension_search_reports_deterministic_bundled_metadata_json() {
             "context-slot"
         ])
     );
-    assert_eq!(result["commands"][0]["name"], "export");
-    assert_eq!(result["commands"][1]["name"], "view");
-    assert_eq!(result["commands"][2]["name"], "update");
-    assert_eq!(result["commands"][3]["name"], "catch-up");
-    assert_eq!(result["commands"][4]["name"], "observe");
-    assert_eq!(result["commands"][5]["name"], "refresh");
-    assert_eq!(result["commands"][6]["name"], "observer-brief");
-    assert_eq!(result["commands"][7]["name"], "observer-apply");
-    assert_eq!(result["commands"][8]["name"], "record-observation");
+    let commands = result["commands"].as_array().expect("commands");
+    assert_eq!(commands.len(), 10);
+    assert_eq!(commands[0]["name"], "export");
+    assert_eq!(commands[1]["name"], "view");
+    assert_eq!(commands[2]["name"], "update");
+    assert_eq!(commands[3]["name"], "catch-up");
+    assert_eq!(commands[4]["name"], "observe");
+    assert_eq!(commands[5]["name"], "research-enable");
+    assert_eq!(commands[6]["name"], "refresh");
+    assert_eq!(commands[7]["name"], "observer-brief");
+    assert_eq!(commands[8]["name"], "observer-apply");
+    assert_eq!(commands[9]["name"], "record-observation");
     assert!(!stdout.contains(home.path().to_string_lossy().as_ref()));
 
     let summary_search = command_with_home(exe, &home)

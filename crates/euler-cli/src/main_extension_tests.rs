@@ -705,6 +705,7 @@ fn causal_dag_catalog_lists_registered_commands() {
             "update",
             "catch-up",
             "observe",
+            "research-enable",
             "refresh",
             "observer-brief",
             "observer-apply",

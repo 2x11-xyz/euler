@@ -12,6 +12,8 @@ use crate::observer_brief::{
     resolve_record_aliases, resolve_source_aliases, FittedObserverTask, ObserverBriefMode,
     DEFAULT_MAX_TOKENS, OBSERVER_PERSONA,
 };
+use crate::research_observer;
+use crate::research_state::ResearchState;
 use euler_event::EventEnvelope;
 use euler_sdk::{
     AgentOutcome, ArgSpec, ArgValueKind, Capability, CommandContext, CommandDescriptor,
@@ -51,6 +53,9 @@ impl ExtensionCommand for CausalDagRefreshCommand {
         context: CommandContext,
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
+        if ResearchState::load(host)?.is_some() {
+            return research_observer::execute_refresh(context, host);
+        }
         let input = RefreshInput::parse(&context.input)?;
         let active = ActiveGraphState::load(host)?;
         let operation = input.effective_operation(active.as_ref());
