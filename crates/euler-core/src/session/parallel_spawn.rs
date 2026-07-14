@@ -181,6 +181,16 @@ impl<D: PermissionDecider> Session<D> {
             role: ModelRole::User,
             content: task.task().to_owned(),
         });
+        if let Some(limit) = self.config.context_limit.limit_tokens {
+            let input_bytes = input.iter().map(model_input_bytes).sum::<usize>();
+            let estimated_input = u64::try_from(input_bytes.div_ceil(4)).unwrap_or(u64::MAX);
+            let requested_output = task.budget().max_tokens.unwrap_or(0);
+            if estimated_input.saturating_add(requested_output) > limit {
+                return Err(SessionError::Other(format!(
+                    "reviewer request exceeds context limit: estimated {estimated_input} input + {requested_output} output tokens > {limit}"
+                )));
+            }
+        }
         let request = ModelRequest {
             model: target.model.clone(),
             instructions: task
@@ -523,3 +533,13 @@ impl RoundLoopIo for WorkerIo<'_> {
 #[cfg(test)]
 #[path = "parallel_spawn_test.rs"]
 mod tests;
+
+fn model_input_bytes(item: &ModelInputItem) -> usize {
+    match item {
+        ModelInputItem::Message { content, .. } => content.len(),
+        ModelInputItem::ToolCall {
+            name, arguments, ..
+        } => name.len() + arguments.to_string().len(),
+        ModelInputItem::ToolResult { output, .. } => output.len(),
+    }
+}

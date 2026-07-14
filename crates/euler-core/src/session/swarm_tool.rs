@@ -12,6 +12,7 @@
 //! concrete next action in euler's real vocabulary. The tool never guesses
 //! providers or models.
 
+use super::swarm_context::{self, ContextRequest, ReviewMode};
 use super::{elapsed_ms, ExtensionExecutionError, Session, SessionError};
 use crate::permissions::PermissionDecider;
 use crate::swarm::{resolve_swarm_config, SwarmReviewer, MAX_SWARM_REVIEWERS};
@@ -25,20 +26,31 @@ use std::time::Instant;
 pub(super) const CODE_SWARM_REVIEW_TOOL: &str = "code_swarm_review";
 pub(super) const EXTENSION_ID: &str = "code-swarm";
 const REVIEW_COMMAND: &str = "review";
-/// Matches the extension's `--prompt` ArgSpec bound.
-const MAX_FOCUS_BYTES: usize = 256 * 1024;
+const MAX_FOCUS_BYTES: usize = 8 * 1024;
 
 pub(super) fn code_swarm_review_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: CODE_SWARM_REVIEW_TOOL.to_owned(),
-        description: "Run the user's configured CodeSwarm reviewer models over explicit context and return every reviewer's findings for you to adjudicate. This is a stage-agnostic review gate: call it at checkpoints after assembling the plan, diff, files, PR material, analysis, or draft that reviewers need. Ambient session canvas is never included. Put the complete bounded review subject in `focus`; reviewers cannot inspect omitted session history or use tools. The result carries a K-of-N success summary, a consolidated artifact reference, and each reviewer's raw findings; judge validity yourself and report a triaged conclusion — the tool does not filter or vote. Reviewer models come from the user's persisted /code-swarm configuration; only pass `models` when the user explicitly named one-off targets, never guessed ones. If the tool reports that no reviewers are configured, relay its remediation options to the user.".to_owned(),
+        description: "Run configured CodeSwarm reviewers over explicitly selected bounded context. Modes: plan, review-code (files), review-diff (working tree, staged, or base), and review-pr (number/URL or current branch). Euler assembles context without ambient canvas, reports skipped/truncated material, and returns every reviewer finding plus a consolidated artifact. Use models only for user-named one-off targets.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "focus": {
                     "type": "string",
-                    "description": "Complete bounded context to review, at most 262144 UTF-8 bytes (plan, diff, file excerpts, PR material, analysis, or draft). Ambient session canvas is not included."
+                    "description": "Review question or focus. In plan mode it may also be the plan when context is omitted."
                 },
+                "mode": {"type": "string", "enum": ["plan", "review-code", "review-diff", "review-pr"]},
+                "context": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "base": {"type": "string"},
+                "staged": {"type": "boolean"},
+                "pr": {"type": "string"},
+                "current": {"type": "boolean"},
+                "include_full_files": {"type": "boolean"},
+                "include_comments": {"type": "boolean"},
+                "max_file_bytes": {"type": "integer", "minimum": 1},
+                "max_total_bytes": {"type": "integer", "minimum": 8001, "maximum": 262144},
+                "max_diff_bytes": {"type": "integer", "minimum": 1},
                 "personas": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -66,6 +78,18 @@ struct ResolvedReviewPlan {
 /// Parsed tool arguments. All optional (tools contract).
 struct ReviewToolArgs {
     focus: Option<String>,
+    mode: ReviewMode,
+    context: Option<String>,
+    files: Vec<String>,
+    base: Option<String>,
+    staged: bool,
+    pr: Option<String>,
+    current: bool,
+    include_full_files: bool,
+    include_comments: bool,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    max_diff_bytes: usize,
     personas: Option<Vec<String>>,
     models: Option<Vec<String>>,
     max_tokens: Option<u64>,
@@ -126,8 +150,7 @@ impl<D: PermissionDecider> Session<D> {
         let args = parse_review_tool_args(input).map_err(ReviewToolFailure::Honest)?;
         if args.focus.is_none() {
             return Err(ReviewToolFailure::Honest(
-                "code-swarm review requires explicit focus context; provide the bounded plan, \
-                 diff, file excerpts, PR material, analysis, or draft to review"
+                "code-swarm review requires a focus prompt naming what reviewers should check"
                     .to_owned(),
             ));
         }
@@ -141,15 +164,45 @@ impl<D: PermissionDecider> Session<D> {
         };
         let plan = self.resolve_review_targets(&args)?;
         self.ensure_target_providers_configured(&plan.targets)?;
+        let prompt = args.focus.as_deref().unwrap_or_default();
+        let mut assembled = swarm_context::assemble(
+            &self.config.root,
+            &ContextRequest {
+                mode: args.mode,
+                prompt: prompt.to_owned(),
+                context: args.context.clone(),
+                files: args.files.clone(),
+                base: args.base.clone(),
+                staged: args.staged,
+                pr: args.pr.clone(),
+                current: args.current,
+                include_full_files: args.include_full_files,
+                include_comments: args.include_comments,
+                max_file_bytes: args.max_file_bytes,
+                max_total_bytes: args.max_total_bytes,
+                max_diff_bytes: args.max_diff_bytes,
+            },
+        )
+        .map_err(ReviewToolFailure::Honest)?;
+        let redacted = crate::redaction::redact_external_context(
+            &assembled.body,
+            &crate::redaction::RedactionConfig {
+                extra_sensitive_values: self.config.extra_sensitive_values.clone(),
+            },
+        );
+        assembled
+            .replace_body(redacted)
+            .map_err(|error| ReviewToolFailure::Honest(error))?;
 
         let mut review_input = serde_json::Map::new();
         review_input.insert("models".to_owned(), json!(plan.targets));
+        review_input.insert("mode".to_owned(), json!(args.mode.as_str()));
+        review_input.insert("context_manifest".to_owned(), assembled.manifest);
         if let Some(personas) = plan.personas {
             review_input.insert("reviewers".to_owned(), json!(personas));
         }
-        if let Some(focus) = args.focus {
-            review_input.insert("prompt".to_owned(), json!(focus));
-        }
+        review_input.insert("prompt".to_owned(), json!(prompt));
+        review_input.insert("context".to_owned(), json!(assembled.body));
         if let Some(max_tokens) = plan.max_tokens {
             review_input.insert("max_tokens".to_owned(), json!(max_tokens));
         }
@@ -271,10 +324,27 @@ fn parse_review_tool_args(input: &Value) -> Result<ReviewToolArgs, String> {
         })?
     };
     for key in object.keys() {
-        if !["focus", "personas", "models", "max_tokens"].contains(&key.as_str()) {
-            return Err(format!(
-                "unknown code_swarm_review field `{key}`; supported: focus, personas, models, max_tokens"
-            ));
+        if ![
+            "focus",
+            "mode",
+            "context",
+            "files",
+            "base",
+            "staged",
+            "pr",
+            "current",
+            "include_full_files",
+            "include_comments",
+            "max_file_bytes",
+            "max_total_bytes",
+            "max_diff_bytes",
+            "personas",
+            "models",
+            "max_tokens",
+        ]
+        .contains(&key.as_str())
+        {
+            return Err(format!("unknown code_swarm_review field `{key}`"));
         }
     }
     let focus = optional_string(object, "focus")?;
@@ -289,6 +359,30 @@ fn parse_review_tool_args(input: &Value) -> Result<ReviewToolArgs, String> {
             "focus exceeds {MAX_FOCUS_BYTES} bytes; shorten or select the most relevant explicit excerpts"
         ));
     }
+    let mode = ReviewMode::parse(object.get("mode"))?;
+    let context = optional_string(object, "context")?;
+    let files = optional_string_list(object, "files")?.unwrap_or_default();
+    let base = optional_string(object, "base")?;
+    let staged = swarm_context::object_bool(object, "staged")?;
+    let pr = optional_string(object, "pr")?;
+    let current = swarm_context::object_bool(object, "current")?;
+    let include_full_files = swarm_context::object_bool(object, "include_full_files")?;
+    let include_comments = swarm_context::object_bool(object, "include_comments")?;
+    let max_file_bytes = swarm_context::object_usize(
+        object,
+        "max_file_bytes",
+        swarm_context::DEFAULT_MAX_FILE_BYTES,
+    )?;
+    let max_total_bytes = swarm_context::object_usize(
+        object,
+        "max_total_bytes",
+        swarm_context::DEFAULT_MAX_TOTAL_BYTES,
+    )?;
+    let max_diff_bytes = swarm_context::object_usize(
+        object,
+        "max_diff_bytes",
+        max_total_bytes.saturating_sub(swarm_context::CONTEXT_OVERHEAD_BYTES),
+    )?;
     // An empty model-facing optional list names no one-off override, so let
     // the persisted resolution chain run. Explicit CLI/extension invocations
     // bypass this parser and continue to reject empty model lists.
@@ -315,6 +409,18 @@ fn parse_review_tool_args(input: &Value) -> Result<ReviewToolArgs, String> {
     };
     Ok(ReviewToolArgs {
         focus: focus.filter(|focus| !focus.trim().is_empty()),
+        mode,
+        context,
+        files,
+        base,
+        staged,
+        pr,
+        current,
+        include_full_files,
+        include_comments,
+        max_file_bytes,
+        max_total_bytes,
+        max_diff_bytes,
         personas: optional_string_list(object, "personas")?,
         models,
         max_tokens,

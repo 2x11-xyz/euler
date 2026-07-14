@@ -257,19 +257,23 @@ A session-level tool advertised **only** to the root session when the
 (depth one). It is a stage-agnostic review gate: plans, diffs, analyses,
 drafts — the required focus prompt carries the complete bounded subject.
 
-- **Required context.** `focus` is the complete bounded explicit review
-  context carried into every reviewer brief (up to 256 KiB). Optional:
-  `personas` (reviewer charter names), `models`
+- **Required focus, explicit source mode.** `focus` is the bounded review
+  question. `mode` selects `plan`, `review-code`, `review-diff`, or
+  `review-pr`. Mode-specific fields select plan context, repository-relative
+  files, working/staged/base diffs, or a numbered/current PR. The host
+  assembles at most 256 KiB, reserves 8 KiB for instructions, applies
+  per-file/diff limits, and records included/skipped/truncated context in the
+  report manifest. Optional: `personas`, `models`
   (`provider::model` one-shot override — only when the user explicitly
   named targets; the tool must not guess providers), `max_tokens`. On this
   model-facing surface, an empty `models` array names no explicit target and
   is treated as omission so persisted config can resolve. Explicit CLI/TUI
   one-off lists and direct extension inputs remain strict 1–5 target lists and
   reject empty input.
-- **No ambient canvas**: reviewers receive the explicit `focus`/command
-  context only. They do not inherit parent session history, tool output, or
-  compacted-result stubs. Callers assemble the plan, diff, file excerpts, PR
-  material, analysis, or draft before invoking the gate.
+- **No ambient canvas**: reviewers receive only host-assembled explicit
+  context. They do not inherit parent session history, tool output, or
+  compacted-result stubs. Context sources are selected explicitly, and the
+  report says exactly what was omitted or truncated.
 - **Gate**: `Capability::AgentSpawn` through the ordinary tool permission
   machinery (prompt/grant/deny; covered grants do not re-prompt, so
   repeated checkpoint-loop calls pay no repeat approval). The extension

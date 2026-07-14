@@ -85,6 +85,9 @@ impl ExtensionCommand for ReviewCommand {
             .collect::<Vec<_>>();
         let artifact = json!({
             "schema": REVIEW_REPORT_SCHEMA,
+            "mode": input.mode,
+            "prompt": input.prompt,
+            "context_manifest": input.context_manifest,
             "reviewers": reviewers.iter().map(ReviewerResult::to_json).collect::<Vec<_>>(),
             "generated_from": generated_from,
         });
@@ -203,6 +206,9 @@ struct ReviewInput {
     charters: Vec<Charter>,
     models: Vec<ModelTarget>,
     prompt: Option<String>,
+    context: String,
+    mode: String,
+    context_manifest: Value,
     max_tokens: u64,
 }
 
@@ -214,7 +220,18 @@ impl ReviewInput {
         let object = value
             .as_object()
             .ok_or_else(|| input_error("code-swarm review input must be a JSON object"))?;
-        reject_unknown_fields(object, &["reviewers", "models", "prompt", "max_tokens"])?;
+        reject_unknown_fields(
+            object,
+            &[
+                "reviewers",
+                "models",
+                "prompt",
+                "context",
+                "mode",
+                "context_manifest",
+                "max_tokens",
+            ],
+        )?;
         let models = parse_models(object.get("models"))?;
         if models.is_empty() {
             return Err(input_error(UNCONFIGURED_MESSAGE));
@@ -227,10 +244,24 @@ impl ReviewInput {
                 "prompt exceeds the {MAX_REVIEW_CONTEXT_BYTES}-byte review context limit"
             )));
         }
+        let context = optional_string(object, "context")?
+            .filter(|context| !context.trim().is_empty())
+            .unwrap_or_else(|| prompt.clone());
+        if context.len() > MAX_REVIEW_CONTEXT_BYTES {
+            return Err(input_error(format!(
+                "context exceeds the {MAX_REVIEW_CONTEXT_BYTES}-byte review context limit"
+            )));
+        }
         Ok(Self {
             charters: parse_charters(object.get("reviewers"))?,
             models,
             prompt: Some(prompt),
+            context,
+            mode: optional_string(object, "mode")?.unwrap_or_else(|| "plan".to_owned()),
+            context_manifest: object
+                .get("context_manifest")
+                .cloned()
+                .unwrap_or_else(|| json!({"mode": "plan"})),
             max_tokens: parse_positive_u64(object, "max_tokens", DEFAULT_MAX_TOKENS)?,
         })
     }
@@ -240,13 +271,13 @@ impl ReviewInput {
     /// explicit — they come from persisted config or one-off flags, never
     /// from guessing (resolution chain, multi-agent contract).
     fn tasks(&self) -> Vec<SpawnAgentTask> {
-        let prompt = self.prompt.as_deref();
+        let context = Some(self.context.as_str());
         self.models
             .iter()
             .enumerate()
             .map(|(index, target)| {
                 let charter = &self.charters[index % self.charters.len()];
-                charter_task(charter, target, prompt, self.max_tokens)
+                charter_task(charter, target, context, self.max_tokens)
             })
             .collect()
     }

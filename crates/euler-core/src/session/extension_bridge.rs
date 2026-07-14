@@ -292,6 +292,11 @@ impl<D> Session<D> {
     where
         D: crate::permissions::PermissionDecider,
     {
+        let input = if extension.manifest().id == "code-swarm" && command == "review" {
+            self.assemble_code_swarm_input(input)?
+        } else {
+            input
+        };
         let extension_id = extension.manifest().id;
         if !self.extension_enabled(&extension_id) {
             return Err(ExtensionExecutionError::Disabled { id: extension_id });
@@ -347,5 +352,106 @@ impl<D> Session<D> {
         );
         publish?;
         result
+    }
+
+    fn assemble_code_swarm_input(&self, input: Value) -> Result<Value, ExtensionExecutionError> {
+        let object = input.as_object().ok_or_else(|| {
+            ExtensionExecutionError::Extension(ExtensionError::InvalidInput(
+                "code-swarm review input must be an object".to_owned(),
+            ))
+        })?;
+        if object.contains_key("context_manifest") {
+            return Err(ExtensionExecutionError::Extension(
+                ExtensionError::InvalidInput(
+                    "context_manifest is host-generated and cannot be supplied by callers"
+                        .to_owned(),
+                ),
+            ));
+        }
+        let string = |field: &str| {
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        };
+        let boolean = |field: &str| object.get(field).and_then(Value::as_bool).unwrap_or(false);
+        let positive = |field: &str, default: usize| {
+            object
+                .get(field)
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(default)
+        };
+        let mode = crate::session::swarm_context::ReviewMode::parse(object.get("mode")).map_err(
+            |error| ExtensionExecutionError::Extension(ExtensionError::InvalidInput(error)),
+        )?;
+        let files = object
+            .get("files")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let max_total = positive(
+            "max_total_bytes",
+            crate::session::swarm_context::DEFAULT_MAX_TOTAL_BYTES,
+        );
+        let mut assembled = crate::session::swarm_context::assemble(
+            &self.config.root,
+            &crate::session::swarm_context::ContextRequest {
+                mode,
+                prompt: string("prompt").unwrap_or_default(),
+                context: string("context"),
+                files,
+                base: string("base"),
+                staged: boolean("staged"),
+                pr: string("pr"),
+                current: boolean("current"),
+                include_full_files: boolean("include_full_files"),
+                include_comments: boolean("include_comments"),
+                max_file_bytes: positive(
+                    "max_file_bytes",
+                    crate::session::swarm_context::DEFAULT_MAX_FILE_BYTES,
+                ),
+                max_total_bytes: max_total,
+                max_diff_bytes: positive(
+                    "max_diff_bytes",
+                    max_total.saturating_sub(crate::session::swarm_context::CONTEXT_OVERHEAD_BYTES),
+                ),
+            },
+        )
+        .map_err(|error| ExtensionExecutionError::Extension(ExtensionError::InvalidInput(error)))?;
+        let redacted = crate::redaction::redact_external_context(
+            &assembled.body,
+            &crate::redaction::RedactionConfig {
+                extra_sensitive_values: self.config.extra_sensitive_values.clone(),
+            },
+        );
+        assembled.replace_body(redacted).map_err(|error| {
+            ExtensionExecutionError::Extension(ExtensionError::InvalidInput(error))
+        })?;
+        let mut output = object.clone();
+        for field in [
+            "files",
+            "base",
+            "staged",
+            "pr",
+            "current",
+            "include_full_files",
+            "include_comments",
+            "max_file_bytes",
+            "max_total_bytes",
+            "max_diff_bytes",
+        ] {
+            output.remove(field);
+        }
+        output.insert("context".to_owned(), assembled.body.into());
+        output.insert("context_manifest".to_owned(), assembled.manifest);
+        output.insert("mode".to_owned(), mode.as_str().into());
+        Ok(Value::Object(output))
     }
 }

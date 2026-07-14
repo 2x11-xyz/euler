@@ -879,8 +879,7 @@ fn malformed_tool_input_fails_honestly() {
     assert_eq!(results[0].payload["ok"], json!(false));
     let error = results[0].payload["error"].as_str().expect("error");
     assert!(
-        error.contains("unknown code_swarm_review field `bogus`")
-            && error.contains("focus, personas, models, max_tokens"),
+        error.contains("unknown code_swarm_review field `bogus`"),
         "unknown-field error must teach the schema: {error}"
     );
 }

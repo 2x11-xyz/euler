@@ -47,6 +47,10 @@ mod observer;
 mod parallel_spawn;
 mod permissions_gate;
 mod round_loop;
+pub mod swarm_context;
+#[cfg(test)]
+#[path = "session/swarm_context_test.rs"]
+mod swarm_context_test;
 mod swarm_tool;
 mod tool_dispatch;
 pub use background::{
