@@ -430,6 +430,37 @@ impl PermissionPosture {
             Self::FullAccess => ApprovalMode::SessionAllow,
         }
     }
+
+    /// The posture and its envelope, in one line (§5.1). It states the
+    /// envelope and never just the name, so the boundary in force is legible
+    /// without cross-referencing what the posture means. Sandbox diagnostics
+    /// and mount paths never appear here (ADR 0014).
+    pub fn envelope(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read only · no writes · no commands · network denied",
+            Self::AskEveryTime => "Ask every time · every capability asks",
+            Self::FullAccess => "Full access · unsandboxed",
+        }
+    }
+
+    /// The posture currently in effect, if the session's per-capability modes
+    /// match one exactly. `None` means the modes were tuned individually under
+    /// Advanced and no posture describes them — the radio then shows nothing
+    /// current, which is honest: claiming a posture the gate isn't actually
+    /// enforcing is worse than showing none.
+    pub fn active(
+        mode_for_capability: impl Fn(Capability) -> Option<ApprovalMode>,
+    ) -> Option<Self> {
+        let modes = Capability::ALL
+            .iter()
+            .map(|capability| mode_for_capability(*capability).map(|mode| (*capability, mode)))
+            .collect::<Option<Vec<_>>>()?;
+        Self::ALL.into_iter().find(|posture| {
+            modes
+                .iter()
+                .all(|(capability, mode)| posture.mode_for(*capability) == *mode)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -587,6 +618,9 @@ pub enum PermissionChoice {
         posture: PermissionPosture,
         label: String,
         detail: String,
+        /// Whether this posture is the one currently in effect — drives the
+        /// `●`/`○` radio (§5.1).
+        current: bool,
     },
     Unavailable {
         label: String,
@@ -875,12 +909,16 @@ pub fn dispatch_command(input: &str, context: &CommandContext) -> CommandEffect 
 
 #[cfg(test)]
 pub fn permission_choices() -> Vec<PermissionChoice> {
-    permission_choices_with_grants(&[])
+    permission_choices_with_state(&[], None)
 }
 
 /// Quick session postures, active grants, then per-capability advanced modes.
-pub fn permission_choices_with_grants(
+/// `active` is the posture currently in effect (see
+/// [`PermissionPosture::active`]); `None` renders no filled radio, which is
+/// what a hand-tuned Advanced configuration honestly is.
+pub fn permission_choices_with_state(
     grants: &[(GrantSource, ActiveGrant)],
+    active: Option<PermissionPosture>,
 ) -> Vec<PermissionChoice> {
     let mut choices = PermissionPosture::ALL
         .into_iter()
@@ -888,6 +926,7 @@ pub fn permission_choices_with_grants(
             posture,
             label: posture.label().to_owned(),
             detail: posture.detail().to_owned(),
+            current: active == Some(posture),
         })
         .collect::<Vec<_>>();
     choices.push(PermissionChoice::Unavailable {

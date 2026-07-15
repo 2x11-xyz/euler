@@ -730,6 +730,53 @@ fn permissions_palette_opens_via_action() {
     );
 }
 
+/// §5.1: the radio fills for the posture actually in effect, and the title
+/// says which. A posture is "in effect" only when every capability's mode
+/// matches it exactly — otherwise the modes were tuned under Advanced and no
+/// posture honestly describes them, so nothing is filled.
+#[test]
+fn permissions_picker_marks_the_posture_actually_in_effect() {
+    for posture in PermissionPosture::ALL {
+        let active = PermissionPosture::active(|capability| Some(posture.mode_for(capability)));
+        assert_eq!(
+            active,
+            Some(posture),
+            "posture {posture:?} should round-trip"
+        );
+
+        let choices = crate::ui::commands::permission_choices_with_state(&[], active);
+        let mut surface = BottomSurface::new(CommandContext::default());
+        surface.open_picker(PickerSpec::Permissions(choices));
+        let rendered = surface
+            .surface_lines(80)
+            .expect("permissions picker")
+            .join("\n");
+        assert!(
+            rendered.contains(&format!("Current: {}", posture.label())),
+            "posture {posture:?}, rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("● {}", posture.label())),
+            "posture {posture:?} should be the filled radio, rendered:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches('●').count(),
+            1,
+            "exactly one posture is in effect, rendered:\n{rendered}"
+        );
+    }
+
+    // A hand-tuned mix matches no posture: deny everything except one allow.
+    let tuned = PermissionPosture::active(|capability| {
+        Some(if capability == Capability::Network {
+            ApprovalMode::SessionAllow
+        } else {
+            ApprovalMode::AlwaysDeny
+        })
+    });
+    assert_eq!(tuned, None, "a hand-tuned mix is not a posture");
+}
+
 #[test]
 fn permissions_picker_leads_with_honest_session_postures() {
     let mut surface = BottomSurface::new(CommandContext::default());
@@ -738,10 +785,14 @@ fn permissions_picker_leads_with_honest_session_postures() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Permissions · (1/40)"));
+    // §5.1: the title carries the posture in force. `permission_choices()`
+    // builds the list with no session behind it, so nothing is current — and
+    // "custom" is the honest reading of modes no posture describes.
+    assert!(rendered.contains("Permissions · Current: custom · (1/40)"));
     assert!(rendered.contains("QUICK SETTINGS"));
-    assert!(rendered.contains("Read only"));
-    assert!(rendered.contains("Full access (unsandboxed)"));
+    // §5.1 radio variant: postures render ●/○, never a caret-only list.
+    assert!(rendered.contains("○ Read only"));
+    assert!(rendered.contains("○ Full access (unsandboxed)"));
     assert!(rendered.contains("Auto in workspace sandbox (not available)"));
     assert!(!rendered.contains('%'));
 

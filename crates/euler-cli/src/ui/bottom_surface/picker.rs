@@ -127,12 +127,34 @@ impl ReplacementPicker {
             PickerKind::Model => Some(dot),
             // Generic is a catch-all: effort/theme/permission postures are
             // state pickers and carry a current value; a checkpoint or action
-            // list does not, and gets no state column.
+            // list does not, and gets no state column. A posture list with no
+            // current value (hand-tuned under Advanced) still renders the
+            // radio — every option unfilled is the honest reading.
+            PickerKind::Generic if self.is_posture_list() => Some(dot),
             PickerKind::Generic => self.items.iter().any(|item| item.current).then_some(dot),
             PickerKind::Resume | PickerKind::CausalDagActions | PickerKind::CausalDagFormats => {
                 None
             }
         }
+    }
+
+    /// Whether this generic picker is the `/permissions` posture list, which
+    /// §5.1 specifies as a radio regardless of whether any posture currently
+    /// matches the session's modes.
+    fn is_posture_list(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item.action, CommandAction::SetPermissionPosture { .. }))
+    }
+
+    /// The posture currently in effect, for the title line.
+    fn active_posture_label(&self) -> Option<&str> {
+        self.items
+            .iter()
+            .find(|item| {
+                item.current && matches!(item.action, CommandAction::SetPermissionPosture { .. })
+            })
+            .map(|item| item.label.as_str())
     }
 
     /// Width of the state-marker column, or 0 when this picker has no state
@@ -199,6 +221,19 @@ impl ReplacementPicker {
                 title: self.title.clone(),
                 params: Vec::new(),
                 footer: "↑↓ move · ⏎ export · ⌫ back · esc cancel".to_owned(),
+                empty: "no matches",
+            },
+            // §5.1: the posture picker's title carries the current state, so
+            // the boundary in force is legible without reading every row.
+            // "Current: custom" is the honest label for modes tuned under
+            // Advanced that no posture describes.
+            PickerKind::Generic if self.is_posture_list() => PickerChrome {
+                title: self.title.clone(),
+                params: vec![format!(
+                    "Current: {}",
+                    self.active_posture_label().unwrap_or("custom")
+                )],
+                footer: "↑↓ move · ⏎ select · esc cancel".to_owned(),
                 empty: "no matches",
             },
             PickerKind::CausalDagActions | PickerKind::Generic => PickerChrome {
@@ -864,13 +899,14 @@ fn permission_items(choices: Vec<PermissionChoice>) -> Vec<PickerItem> {
                 posture,
                 label,
                 detail,
+                current,
             } => PickerItem {
                 label,
                 detail: Some(detail),
                 status: None,
                 group: Some("Quick settings".to_owned()),
                 provider_tag: None,
-                current: false,
+                current,
                 action: CommandAction::SetPermissionPosture { posture },
             },
             PermissionChoice::Unavailable { label, detail } => PickerItem {

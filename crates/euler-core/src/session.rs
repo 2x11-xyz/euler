@@ -864,6 +864,13 @@ impl<D> Session<D> {
         self.permissions.list_grants()
     }
 
+    /// Explicitly configured approval mode for `capability`, if any. Lets
+    /// `/permissions` show which posture is currently in effect rather than
+    /// offering four choices with no indication of where the session stands.
+    pub fn configured_mode(&self, capability: Capability) -> Option<ApprovalMode> {
+        self.permissions.configured_mode(capability)
+    }
+
     /// Whether durable user-level rules are enabled for this session (a user
     /// grant dir was configured and loadable). Gates the "always" approval
     /// option in the UI.
