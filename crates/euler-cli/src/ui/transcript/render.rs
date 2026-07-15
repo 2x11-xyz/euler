@@ -333,6 +333,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 capability,
                 capabilities,
                 reason,
+                ..
             } => {
                 let requested = if capabilities.len() > 1 {
                     capabilities.join(" · ")

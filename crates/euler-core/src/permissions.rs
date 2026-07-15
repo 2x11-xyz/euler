@@ -863,6 +863,36 @@ mod tests {
             permission_prompt_capabilities(&batch),
             BTreeSet::from(["fs-write".to_owned(), "network".to_owned()])
         );
+
+        let malformed = Map::from_iter([
+            (
+                "capability".to_owned(),
+                Value::String("fs-write".to_owned()),
+            ),
+            (
+                "capabilities".to_owned(),
+                Value::String("network".to_owned()),
+            ),
+        ]);
+        assert_eq!(
+            permission_prompt_capabilities(&malformed),
+            BTreeSet::from(["fs-write".to_owned()])
+        );
+
+        let mixed = Map::from_iter([
+            (
+                "capability".to_owned(),
+                Value::String("fs-write".to_owned()),
+            ),
+            (
+                "capabilities".to_owned(),
+                serde_json::json!(["network", null, "", 7]),
+            ),
+        ]);
+        assert_eq!(
+            permission_prompt_capabilities(&mixed),
+            BTreeSet::from(["network".to_owned()])
+        );
     }
 
     #[test]

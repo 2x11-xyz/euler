@@ -89,6 +89,9 @@ pub enum TranscriptItem {
         /// Complete set for an operation-level prompt. Legacy/single prompts
         /// leave this empty and use `capability` directly.
         capabilities: Vec<String>,
+        /// Operation name for an operation-level prompt. Legacy/single
+        /// prompts leave this absent and use `capability` directly.
+        operation: Option<String>,
         reason: String,
     },
     PermissionAsk {
@@ -682,6 +685,7 @@ fn project_event_with_checkpoints(
                         .collect()
                 })
                 .unwrap_or_default(),
+            operation: payload_string(event, "operation"),
             reason: payload_string(event, "reason").unwrap_or_default(),
         }),
         EventKind::PERMISSION_DECISION => Some(TranscriptItem::PermissionDecision {

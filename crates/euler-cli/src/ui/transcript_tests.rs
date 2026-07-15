@@ -1415,6 +1415,27 @@ patch.applied: delete: src/lib.rs\n"
 }
 
 #[test]
+fn line_oriented_batch_permission_prompt_names_operation_and_capabilities() {
+    let events = vec![event(
+        EventKind::PERMISSION_PROMPT,
+        object([
+            ("capability", "fs-read".into()),
+            (
+                "capabilities",
+                serde_json::json!(["fs-read", "fs-write", "network"]),
+            ),
+            ("operation", "extension causal-dag.refresh".into()),
+            ("reason", "extension causal-dag.refresh".into()),
+        ]),
+    )];
+
+    assert_eq!(
+        render_line_oriented(&events),
+        "permission.prompt: extension causal-dag.refresh; capabilities: fs-read, fs-write, network\n"
+    );
+}
+
+#[test]
 fn line_oriented_renderer_ignores_event_timestamps() {
     let events = vec![event_at(
         EventKind::USER_MESSAGE,
@@ -1552,6 +1573,7 @@ fn projects_slice2_events_without_opaque_reasoning_artifacts() {
             TranscriptItem::PermissionPrompt {
                 capability: "shell-exec".to_owned(),
                 capabilities: Vec::new(),
+                operation: None,
                 reason: "run checks".to_owned(),
             },
             TranscriptItem::PermissionDecision {

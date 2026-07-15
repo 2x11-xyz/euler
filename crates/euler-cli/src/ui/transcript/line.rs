@@ -78,14 +78,37 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
 
 fn line_oriented_permission(item: &super::TranscriptItem) -> String {
     match item {
-        super::TranscriptItem::PermissionPrompt { capability, .. } => {
-            format!("permission.prompt: {capability}\n")
+        super::TranscriptItem::PermissionPrompt {
+            capability,
+            capabilities,
+            operation,
+            ..
+        } => {
+            let operation = operation.as_deref().filter(|value| !value.is_empty());
+            let subject = operation.unwrap_or(capability.as_str());
+            if operation.is_some() || !capabilities.is_empty() {
+                let requested = if capabilities.is_empty() {
+                    capability.clone()
+                } else {
+                    capabilities.join(", ")
+                };
+                format!("permission.prompt: {subject}; capabilities: {requested}\n")
+            } else {
+                format!("permission.prompt: {capability}\n")
+            }
         }
         super::TranscriptItem::PermissionAsk { capability, .. } => {
             format!("permission.ask: {capability}\n")
         }
-        super::TranscriptItem::PermissionBatchAsk { operation, .. } => {
-            format!("permission.ask: {operation}\n")
+        super::TranscriptItem::PermissionBatchAsk {
+            operation,
+            capabilities,
+            ..
+        } => {
+            format!(
+                "permission.ask: {operation}; capabilities: {}\n",
+                capabilities.join(", ")
+            )
         }
         super::TranscriptItem::PermissionDecision { decision, .. } => {
             format!("permission.decision: {decision}\n")
@@ -203,4 +226,28 @@ fn line_oriented_extension_result(item: &super::TranscriptItem) -> String {
         "extension.result: {reference} {}\n",
         if *ok { "ok" } else { "failed" }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_line_oriented_item;
+    use crate::ui::{patch_approval::ApprovalOption, transcript::TranscriptItem};
+
+    #[test]
+    fn batched_permission_ask_lists_the_requested_capabilities() {
+        let item = TranscriptItem::PermissionBatchAsk {
+            operation: "extension causal-dag.refresh".to_owned(),
+            capabilities: vec![
+                "fs-read".to_owned(),
+                "fs-write".to_owned(),
+                "network".to_owned(),
+            ],
+            selected_option: ApprovalOption::AllowOnce,
+        };
+
+        assert_eq!(
+            render_line_oriented_item(&item),
+            "permission.ask: extension causal-dag.refresh; capabilities: fs-read, fs-write, network\n"
+        );
+    }
 }
