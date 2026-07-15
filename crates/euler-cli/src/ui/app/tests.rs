@@ -2390,10 +2390,25 @@ fn status_reports_session_id_while_turn_is_in_flight() {
     assert!(text.contains(&format!("session: {session_id}")));
     assert!(text.contains("theme: Gruvbox Dark (gruvbox-dark)"));
     assert!(!text.contains("session: none"));
-    // §5.1: the posture envelope must survive mid-turn. `TurnInFlight` holds
-    // no session, so reading it from there would drop the boundary during
-    // exactly the long-running work where it matters most.
-    assert!(text.contains("permissions: "), "text: {text:?}");
+    // No permissions line is asserted here: this test enters TurnInFlight by
+    // hand, so no handoff ever snapshotted an envelope. Production can only
+    // reach that state through `spawn_*`, which does. The envelope's mid-turn
+    // behavior is covered by the `permission_envelope_*` tests, which hand a
+    // real session off.
+}
+
+/// The most recent `permissions:` line from the rendered transcript. The
+/// transcript accumulates, so asserting `!contains(...)` over the whole thing
+/// matches earlier notices ("permission posture set to Full access") rather
+/// than the status line under test.
+fn last_permissions_line(core: &mut AppCore) -> String {
+    assert_eq!(core.show_status(), CoreEffect::Render);
+    let text = drain_finalized_visual_text(core, 80);
+    text.lines()
+        .rev()
+        .find(|line| line.contains("permissions:"))
+        .unwrap_or_else(|| panic!("no permissions line in:\n{text}"))
+        .to_owned()
 }
 
 /// §5.1: approving an uncovered capability for the session flips its mode to
@@ -2414,17 +2429,10 @@ fn permission_envelope_follows_a_session_approval_across_the_turn_boundary() {
         core.set_permission_posture(PermissionPosture::AskEveryTime),
         CoreEffect::Render
     );
-    let before = core
-        .status
-        .permission_envelope
-        .clone()
-        .expect("posture in force");
-    assert!(before.starts_with("Ask every time"), "before: {before:?}");
+    let before = last_permissions_line(&mut core);
+    assert!(before.contains("Ask every time"), "before: {before:?}");
 
-    let AppState::Idle { mut session } = std::mem::replace(&mut core.state, AppState::Empty) else {
-        panic!("core should be idle");
-    };
-
+    let mut session = core.take_idle_session();
     // What the worker's session looks like after the user answers `a`.
     session.set_permission_mode(Capability::ShellExec, ApprovalMode::SessionAllow);
 
@@ -2439,29 +2447,32 @@ fn permission_envelope_follows_a_session_approval_across_the_turn_boundary() {
         session,
     });
 
-    let after = core
-        .status
-        .permission_envelope
-        .clone()
-        .expect("refreshed on the way home");
-    assert_ne!(
-        after, before,
-        "the approval changed the boundary; the envelope must say so"
+    // Home again: derived live, so the approval is reflected without anything
+    // having had to remember to refresh.
+    let home = last_permissions_line(&mut core);
+    assert!(
+        home.contains("custom") && !home.contains("Ask every time"),
+        "the approval changed the boundary; before was {before:?}, now {home:?}"
     );
-    assert_eq!(after, crate::ui::commands::CUSTOM_PERMISSION_ENVELOPE);
 
-    assert_eq!(core.show_status(), CoreEffect::Render);
-    let text = drain_finalized_visual_text(&mut core, 80);
-    assert!(text.contains("permissions: custom"), "text: {text:?}");
+    // And into the next turn, via the handoff snapshot.
+    let session = core.take_idle_session();
+    core.spawn_turn("next".to_owned(), session);
+    let in_flight = last_permissions_line(&mut core);
+    assert!(
+        in_flight.contains("custom") && !in_flight.contains("Ask every time"),
+        "stale mid-turn: {in_flight:?}"
+    );
 }
 
-/// The cache is only read while a turn is in flight, so a mode change made
-/// while idle must reach it before the next turn starts — otherwise /status
-/// spends that whole turn reporting the pre-change boundary. Revoking an
-/// unscoped session grant restores Ask through the same door, and shares this
-/// refresh.
+/// The cache answers /status for exactly one window — a turn in flight — and
+/// the only way into that window is handing the session to a worker. So the
+/// envelope is snapshotted at that boundary, which is what makes every idle
+/// change reach it: a posture, a mode, a revoked grant, or a wholly different
+/// session from `/new` or `/resume`. Refreshing at the sites that *change*
+/// modes only ever covers the ones someone remembered.
 #[test]
-fn permission_envelope_is_fresh_for_the_turn_after_an_idle_mode_change() {
+fn permission_envelope_is_snapshotted_when_the_session_is_handed_off() {
     let mut core = core();
     assert_eq!(
         core.set_permission_posture(PermissionPosture::AskEveryTime),
@@ -2471,23 +2482,60 @@ fn permission_envelope_is_fresh_for_the_turn_after_an_idle_mode_change() {
         core.set_permission_mode(Capability::ShellExec, ApprovalMode::SessionAllow),
         CoreEffect::Render
     );
+    // Nothing refreshed a cache on the way through: idle derives live.
+    assert_eq!(core.status.permission_envelope, None);
 
-    // Hand the session to a worker: /status can still be asked, and now only
-    // the cache can answer.
-    let AppState::Idle { session: _session } = std::mem::replace(&mut core.state, AppState::Empty)
-    else {
-        panic!("core should be idle");
-    };
-    let (_tx, worker_rx) = mpsc::channel();
-    core.state = AppState::TurnInFlight {
-        worker_rx,
-        interrupt_flag: Arc::new(AtomicBool::new(false)),
-        started_at: Instant::now(),
-    };
+    let session = core.take_idle_session();
+    core.spawn_turn("first".to_owned(), session);
 
-    assert_eq!(core.show_status(), CoreEffect::Render);
-    let text = drain_finalized_visual_text(&mut core, 80);
-    assert!(text.contains("permissions: custom"), "text: {text:?}");
+    let in_flight = last_permissions_line(&mut core);
+    assert!(in_flight.contains("custom"), "line: {in_flight:?}");
+}
+
+/// The case no mutation-site refresh can cover: the session is *replaced*
+/// (`/new`, `/resume`) rather than mutated, so nothing that changes modes ever
+/// runs. The handoff still snapshots, because it snapshots whatever session it
+/// is actually given.
+#[test]
+fn permission_envelope_follows_a_replaced_session_into_the_next_turn() {
+    // Built first: `core` shadows the constructor below.
+    let mut replacement = core();
+    assert_eq!(
+        replacement.set_permission_posture(PermissionPosture::ReadOnly),
+        CoreEffect::Render
+    );
+
+    let mut core = core();
+    assert_eq!(
+        core.set_permission_posture(PermissionPosture::FullAccess),
+        CoreEffect::Render
+    );
+    let first = core.take_idle_session();
+    core.spawn_turn("first".to_owned(), first);
+    assert!(
+        core.status
+            .permission_envelope
+            .as_deref()
+            .expect("snapshot")
+            .starts_with("Full access"),
+        "envelope: {:?}",
+        core.status.permission_envelope
+    );
+
+    // A different session takes its place, with a different boundary — as
+    // `/new` or `/resume` installs one. Nothing that mutates modes runs on
+    // this path at all.
+    let session = replacement.take_idle_session();
+    core.state = AppState::Idle { session };
+
+    let session = core.take_idle_session();
+    core.spawn_turn("second".to_owned(), session);
+
+    let in_flight = last_permissions_line(&mut core);
+    assert!(
+        in_flight.contains("Read only") && !in_flight.contains("Full access"),
+        "stale envelope from the replaced session: {in_flight:?}"
+    );
 }
 
 /// §5.1: the envelope states what the gate *effectively* does. Under Ask, a

@@ -720,9 +720,6 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
     if session.permission_reviewer() != euler_core::PermissionReviewer::User {
         status.permission_reviewer = Some(session.permission_reviewer().as_str().to_owned());
     }
-    // §5.1 posture envelope, seeded before the first turn so /status is
-    // correct without waiting for a posture change to populate it.
-    status.permission_envelope = Some(permission_envelope_for(session));
     let initial_token_usage = TokenUsageSnapshot {
         context_window_tokens: context_window_tokens_for(
             &model_catalog,
@@ -1792,7 +1789,23 @@ impl AppCore {
         }
     }
 
+    /// §5.1: snapshot the session's permission envelope at the moment we give
+    /// it away.
+    ///
+    /// This is the whole invariant. `/status` derives the envelope live while
+    /// the session is here, so the cache is read in exactly one window — a
+    /// turn in flight — and that window can only be entered through a handoff.
+    /// Snapshotting here therefore covers every way the modes can differ from
+    /// the last cached value: a posture change, a mode change, a revoked
+    /// grant, a grant the previous turn's approval installed, and a wholly
+    /// different session from `/new` or `/resume`. Refreshing at the sites
+    /// that *change* modes instead only covers the ones anyone remembered.
+    fn snapshot_permission_envelope(&mut self, session: &Session<TuiDecider>) {
+        self.status.permission_envelope = Some(permission_envelope_for(session));
+    }
+
     fn spawn_turn(&mut self, prompt: String, mut session: Box<Session<TuiDecider>>) {
+        self.snapshot_permission_envelope(&session);
         let (worker_tx, worker_rx) = mpsc::channel();
         let interrupt_flag = Arc::new(AtomicBool::new(false));
         let worker_interrupt = Arc::clone(&interrupt_flag);
@@ -2040,6 +2053,7 @@ impl AppCore {
         request: CompanionRunRequest,
         mut session: Box<Session<TuiDecider>>,
     ) {
+        self.snapshot_permission_envelope(&session);
         let (worker_tx, worker_rx) = mpsc::channel();
         let worker_request = request.clone();
         std::thread::spawn(move || {

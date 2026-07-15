@@ -337,7 +337,6 @@ impl AppCore {
             return self.notice_item("permission mode waits for the active turn".to_owned());
         };
         session.set_permission_mode(capability, mode);
-        self.refresh_permission_envelope();
         self.notice_item(format!(
             "permission {} set to {:?}",
             capability.as_str(),
@@ -376,23 +375,11 @@ impl AppCore {
         for &capability in Capability::ALL {
             session.set_permission_mode(capability, posture.mode_for(capability));
         }
-        self.refresh_permission_envelope();
         let grants = if cleared == 1 { "grant" } else { "grants" };
         self.notice_item(format!(
             "permission posture set to {} · cleared {cleared} session {grants}",
             posture.label()
         ))
-    }
-
-    /// Re-derive the cached §5.1 posture envelope from the live session. Must
-    /// be called after anything that changes a capability's mode; the cache
-    /// exists only because `/status` is answerable while a turn is in flight
-    /// and that state carries no session.
-    pub(super) fn refresh_permission_envelope(&mut self) {
-        let AppState::Idle { session } = &self.state else {
-            return;
-        };
-        self.status.permission_envelope = Some(super::permission_envelope_for(session));
     }
 
     pub(super) fn open_permissions_picker(&mut self) -> CoreEffect {
@@ -451,23 +438,16 @@ impl AppCore {
                     pattern.as_str()
                 }
             )),
-            Ok(_) => {
-                // Revoking an unscoped session grant restores the capability
-                // to Ask (`PermissionGate::revoke`), which can change the
-                // posture — so the cached envelope has to follow it here, or
-                // the next turn reports the pre-revoke boundary.
-                self.refresh_permission_envelope();
-                self.notice_item(format!(
-                    "revoked {} {} ({})",
-                    source.as_str(),
-                    capability.as_str(),
-                    if pattern.is_unscoped() {
-                        "all"
-                    } else {
-                        pattern.as_str()
-                    }
-                ))
-            }
+            Ok(_) => self.notice_item(format!(
+                "revoked {} {} ({})",
+                source.as_str(),
+                capability.as_str(),
+                if pattern.is_unscoped() {
+                    "all"
+                } else {
+                    pattern.as_str()
+                }
+            )),
             Err(error) => self.error_item(format!("revoke failed: {error}")),
         }
     }
