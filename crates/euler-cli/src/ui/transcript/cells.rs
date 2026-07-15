@@ -320,18 +320,27 @@ pub(super) fn push_child_rows(
         } else {
             tree_gutter_mid()
         };
-        push_wrapped_with_prefix(
+        push_wrapped_inner(
             lines,
             CellPrefixes {
                 first: prefix,
                 next: blank_gutter(),
             },
-            row,
-            style,
+            RowText::with_bold_lead(row, style),
             theme,
             width,
         );
     }
+}
+
+/// Codex vocabulary (§4): every tool-group child opens with a capitalized
+/// sub-verb — `Read`, `Search`, `List` — which is the only bold token on the
+/// row. Capitalization is the marker, so a row that doesn't open with a verb
+/// (a bare path, a continuation) simply gets no bold lead.
+fn leading_verb(row: &str) -> Option<&str> {
+    let verb = row.split(' ').next()?;
+    let initial = verb.chars().next()?;
+    (initial.is_uppercase() && verb.len() > 1).then_some(verb)
 }
 
 pub(super) fn push_bounded_children(
@@ -473,6 +482,51 @@ fn push_wrapped_with_prefix(
     theme: &Theme,
     width: u16,
 ) {
+    push_wrapped_inner(lines, prefixes, RowText::plain(text, style), theme, width);
+}
+
+/// One row's text and how to weight it.
+#[derive(Clone, Copy)]
+struct RowText<'a> {
+    text: &'a str,
+    style: ratatui::style::Style,
+    /// A leading verb rendered bold ahead of the text (Codex vocabulary, §4):
+    /// the verb carries the weight, the target stays at `style`. It applies
+    /// only to the first wrapped segment, which is where the verb lives.
+    bold_lead: Option<&'a str>,
+}
+
+impl<'a> RowText<'a> {
+    fn plain(text: &'a str, style: ratatui::style::Style) -> Self {
+        Self {
+            text,
+            style,
+            bold_lead: None,
+        }
+    }
+
+    fn with_bold_lead(text: &'a str, style: ratatui::style::Style) -> Self {
+        Self {
+            text,
+            style,
+            bold_lead: leading_verb(text),
+        }
+    }
+}
+
+/// Shared body of [`push_wrapped_with_prefix`].
+fn push_wrapped_inner(
+    lines: &mut Vec<Line<'static>>,
+    prefixes: CellPrefixes,
+    row: RowText<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    let RowText {
+        text,
+        style,
+        bold_lead,
+    } = row;
     let first_is_ledger = is_ledger_gutter(prefixes.first);
     let next_is_ledger = is_ledger_gutter(prefixes.next);
     let first_content = if first_is_ledger {
@@ -507,8 +561,34 @@ fn push_wrapped_with_prefix(
             ));
         }
         spans.push(Span::styled(prefix.to_owned(), theme.transcript.gutter));
-        spans.push(Span::styled(segment, style));
+        let lead = if index == 0 { bold_lead } else { None };
+        push_body_spans(&mut spans, segment, style, lead);
         lines.push(Line::from(spans));
+    }
+}
+
+/// Split a row into `bold verb` + `plain rest` when a lead verb is named and
+/// actually opens the row; otherwise emit the row as one span.
+fn push_body_spans(
+    spans: &mut Vec<Span<'static>>,
+    segment: String,
+    style: ratatui::style::Style,
+    bold_lead: Option<&str>,
+) {
+    let split = bold_lead.and_then(|verb| {
+        segment
+            .strip_prefix(verb)
+            .map(|rest| (verb.to_owned(), rest.to_owned()))
+    });
+    match split {
+        Some((verb, rest)) => {
+            spans.push(Span::styled(
+                verb,
+                style.add_modifier(ratatui::style::Modifier::BOLD),
+            ));
+            spans.push(Span::styled(rest, style));
+        }
+        None => spans.push(Span::styled(segment, style)),
     }
 }
 

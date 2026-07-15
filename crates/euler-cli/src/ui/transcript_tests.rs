@@ -973,8 +973,8 @@ fn tui_read_tool_flow_uses_compact_result_without_raw_lifecycle_rows() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    assert!(contents.contains("explore"));
-    assert!(contents.contains("read README.md"));
+    assert!(contents.contains("Explored"));
+    assert!(contents.contains("Read README.md"));
     assert!(!contents.contains("raw file contents"));
     assert!(!contents.contains("* Tool read_file"));
     assert!(!contents.contains("read_file call"));
@@ -982,8 +982,12 @@ fn tui_read_tool_flow_uses_compact_result_without_raw_lifecycle_rows() {
     assert!(!contents.contains("Permission allowed"));
 }
 
+/// §4 drops per-step result counts ("212 lines / 0 matches — that was
+/// data-slop"), reversing design review v3 §R3, which kept the count on a
+/// single non-coalesced read. The count stays in the event log; it just
+/// stops occupying a row that the reader never acts on.
 #[test]
-fn tui_read_tool_result_carries_line_count_result_data() {
+fn tui_read_tool_result_drops_line_count_result_data() {
     let output = (1..=84)
         .map(|index| format!("line {index}"))
         .collect::<Vec<_>>()
@@ -1000,13 +1004,23 @@ fn tui_read_tool_result_carries_line_count_result_data() {
 
     let contents = rendered_screen(&events, &theme, 80, 6);
 
-    // Lowercase verb, single space, per-step result data (design review v3
-    // §R3) — a single (non-coalesced) read keeps its line count.
-    assert!(contents.contains("read README.md · 84 lines"));
+    assert!(
+        contents.contains("Read README.md"),
+        "contents: {contents:?}"
+    );
+    assert!(!contents.contains("84 lines"), "contents: {contents:?}");
+    // The child row carries the path and nothing else — no ` · ` result data.
+    let child = contents
+        .lines()
+        .find(|line| line.contains("Read README.md"))
+        .expect("child row");
+    assert!(!child.contains(" · "), "contents: {contents:?}");
 }
 
 #[test]
-fn tui_explore_sub_verbs_render_lowercase_and_single_spaced() {
+/// §4 Codex vocabulary: capitalized sub-verbs, single-spaced, and no per-step
+/// result counts. Supersedes the lowercase phrasing from design review v3 §R3.
+fn tui_explore_sub_verbs_render_capitalized_and_single_spaced() {
     let events = vec![
         tool_call("call-status", "git_status", serde_json::json!({})),
         tool_result("call-status", "git_status", "nothing to commit"),
@@ -1021,12 +1035,12 @@ fn tui_explore_sub_verbs_render_lowercase_and_single_spaced() {
 
     let contents = rendered_screen(&events, &theme, 80, 8);
 
-    // `git status`, not the old capitalized double-space alignment bug
-    // (`Git  status`).
-    assert!(contents.contains("git status"));
-    assert!(!contents.contains("Git"));
-    assert!(!contents.contains("git  status"));
-    assert!(contents.contains("read README.md · 1 line"));
+    assert!(contents.contains("Git status"));
+    assert!(contents.contains("Read README.md"));
+    // The earlier capitalized layout double-spaced the verb; single space.
+    assert!(!contents.contains("Git  status"));
+    // Per-step result counts are data-slop and stay dropped (§4).
+    assert!(!contents.contains("1 line"), "contents: {contents:?}");
 }
 
 #[test]
@@ -1185,8 +1199,8 @@ fn tui_exploration_coalesces_and_dedupes_read_labels() {
 
     let contents = rendered_screen(&events, &theme, 96, 10);
 
-    assert_eq!(contents.matches("explore").count(), 1);
-    assert!(contents.contains("└ read README.md, Cargo.toml"));
+    assert_eq!(contents.matches("Explored").count(), 1);
+    assert!(contents.contains("└ Read README.md, Cargo.toml"));
     assert!(contents.contains("bash $ rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("Search rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("README raw content"));
@@ -1216,8 +1230,8 @@ fn tui_assistant_finalization_does_not_leave_stale_exploration_fragments() {
 
     let contents = rendered_screen(&events, &theme, 80, 8);
 
-    assert!(contents.contains("explore"));
-    assert!(contents.contains("read AGENTS.md"));
+    assert!(contents.contains("Explored"));
+    assert!(contents.contains("Read AGENTS.md"));
     assert_eq!(contents.matches("final answer").count(), 1);
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("# raw agent instructions"));

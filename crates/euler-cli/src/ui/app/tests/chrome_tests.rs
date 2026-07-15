@@ -432,8 +432,8 @@ fn scrollback_preserves_banner_user_tool_and_final_after_many_insertions() {
         &[
             "e^(iπ) + 1 = 0",
             "▌ inspect",
-            "explore",
-            "read AGENTS.md",
+            "Explored",
+            "Read AGENTS.md",
             "final prose",
             "filler 11",
         ],
@@ -892,7 +892,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let before_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &before_final,
-        &["explore", "read Cargo.toml", "bash $ cargo test"],
+        &["Explored", "Read Cargo.toml", "bash $ cargo test"],
     );
     assert!(!before_final.iter().any(|row| row.contains("final answer")));
 
@@ -907,7 +907,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let after_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &after_final,
-        &["explore", "bash $ cargo test", "final answer"],
+        &["Explored", "bash $ cargo test", "final answer"],
     );
 }
 
@@ -1633,7 +1633,7 @@ fn idle_frame_does_not_render_stale_tool_activity_after_final_answer() {
     let contents = terminal.backend().screen_contents();
     assert!(!contents.contains("read_file call"));
     assert!(!contents.contains("read_file completed"));
-    assert!(!contents.contains("explore"));
+    assert!(!contents.contains("Explored"));
     assert!(!contents.contains("# raw instructions"));
 }
 

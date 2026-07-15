@@ -11,6 +11,13 @@ use std::collections::HashMap;
 
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 10;
 
+/// Codex tool vocabulary (§4). The verbs are capitalized and bold-on-render,
+/// so they live in one place: the summary producer and the read-coalescer
+/// must agree on the exact token or folding silently stops matching.
+pub(crate) const EXPLORED_GROUP_VERB: &str = "Explored";
+const READ_VERB: &str = "Read";
+const READ_PREFIX: &str = "Read ";
+
 mod cells;
 mod file_diff;
 mod line;
@@ -1812,62 +1819,54 @@ fn exploration_summary_from_result(
     } else {
         exploration_summary_without_args(&name)?
     };
-    if name == "read_file" {
-        if let Some(lines) = payload_string(event, "output").map(|output| output.lines().count()) {
-            let label = if lines == 1 {
-                "1 line".to_owned()
-            } else {
-                format!("{lines} lines")
-            };
-            return Some(format!("{summary} · {label}"));
-        }
-    }
+    // §4 deliberately drops per-step result counts (`· 84 lines`, `· 0
+    // matches`): the group already says what was explored, and the count is
+    // data-slop that never changes what the reader does next. The event log
+    // keeps the full output either way.
     Some(summary)
 }
 
+/// Codex vocabulary (§4): a capitalized sub-verb + target, one line per step.
+/// The verb is what the renderer bolds, so it is always the first token.
 fn exploration_summary_from_call(name: &str, input: Option<&serde_json::Value>) -> Option<String> {
     match name {
         "read_file" => input
             .and_then(|input| input.get("path"))
             .and_then(serde_json::Value::as_str)
-            .map(|path| format!("read {path}"))
+            .map(|path| format!("{READ_VERB} {path}"))
             .or_else(|| exploration_summary_without_args(name)),
         "git_status" | "git_diff" => exploration_summary_without_args(name),
         "list_files" => input
             .and_then(|input| input.get("path"))
             .and_then(serde_json::Value::as_str)
-            .map(|path| format!("list {path}"))
-            .or_else(|| Some("list files".to_owned())),
+            .map(|path| format!("List {path}"))
+            .or_else(|| Some("List files".to_owned())),
         "search" => input
             .and_then(|input| input.get("query"))
             .and_then(serde_json::Value::as_str)
-            .map(|query| format!("search {query}"))
-            .or_else(|| Some("search".to_owned())),
+            .map(|query| format!("Search {query}"))
+            .or_else(|| Some("Search".to_owned())),
         _ => None,
     }
 }
 
 fn exploration_summary_without_args(name: &str) -> Option<String> {
     match name {
-        "read_file" => Some("read file".to_owned()),
-        "git_status" => Some("git status".to_owned()),
-        "git_diff" => Some("git diff".to_owned()),
+        "read_file" => Some("Read file".to_owned()),
+        "git_status" => Some("Git status".to_owned()),
+        "git_diff" => Some("Git diff".to_owned()),
         _ => None,
     }
 }
 
-/// Coalesce consecutive `read` summaries into one row (`read a, b`),
-/// dropping each individual `· N lines` suffix once more than one path is
-/// joined — the joined list can't attribute a line count to a single path.
-/// A single, non-coalesced read keeps its per-step line count.
+/// Fold repeated reads onto one row (§4): `Read a.rs, b.rs, c.rs`.
 fn coalesced_exploration_summaries(summaries: &[String]) -> Vec<String> {
     let mut coalesced = Vec::new();
-    let mut reads: Vec<(String, Option<String>)> = Vec::new();
+    let mut reads: Vec<String> = Vec::new();
     for summary in summaries {
-        if let Some(rest) = summary.strip_prefix("read ") {
-            let (path, suffix) = split_read_result_suffix(rest);
-            if !reads.iter().any(|(existing, _)| existing == path) {
-                reads.push((path.to_owned(), suffix.map(str::to_owned)));
+        if let Some(path) = summary.strip_prefix(READ_PREFIX) {
+            if !reads.iter().any(|existing| existing == path) {
+                reads.push(path.to_owned());
             }
             continue;
         }
@@ -1880,31 +1879,10 @@ fn coalesced_exploration_summaries(summaries: &[String]) -> Vec<String> {
     coalesced
 }
 
-/// Split `path · N lines` into (`path`, `Some("N lines")`); returns
-/// (`path`, `None`) when there is no result-data suffix.
-fn split_read_result_suffix(rest: &str) -> (&str, Option<&str>) {
-    match rest.split_once(" · ") {
-        Some((path, suffix)) => (path, Some(suffix)),
-        None => (rest, None),
-    }
-}
-
-fn flush_read_summaries(coalesced: &mut Vec<String>, reads: &mut Vec<(String, Option<String>)>) {
+fn flush_read_summaries(coalesced: &mut Vec<String>, reads: &mut Vec<String>) {
     if reads.is_empty() {
         return;
     }
-    if let [(path, suffix)] = reads.as_slice() {
-        coalesced.push(match suffix {
-            Some(suffix) => format!("read {path} · {suffix}"),
-            None => format!("read {path}"),
-        });
-    } else {
-        let joined = reads
-            .iter()
-            .map(|(path, _)| path.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        coalesced.push(format!("read {joined}"));
-    }
+    coalesced.push(format!("{READ_VERB} {}", reads.join(", ")));
     reads.clear();
 }
