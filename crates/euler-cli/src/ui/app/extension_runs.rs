@@ -290,7 +290,7 @@ pub(super) fn list_extension_manager_items(
     let enablement = registry.enablement_states().unwrap_or_default();
     let audit_by_id = audit_status_by_id(&registry);
     let mut items = bundled_manager_items(session_enabled, &enablement, &audit_by_id);
-    append_linked_manager_items(&mut items, &registry, session_enabled, &audit_by_id);
+    append_linked_manager_items(&mut items, &registry, &audit_by_id);
     items
 }
 
@@ -361,7 +361,6 @@ fn bundled_manager_items(
 fn append_linked_manager_items(
     items: &mut Vec<crate::ui::commands::ExtensionManagerItem>,
     registry: &ExtensionRegistry,
-    session_enabled: Option<&std::collections::BTreeSet<String>>,
     audit_by_id: &std::collections::BTreeMap<String, String>,
 ) {
     let Ok(linked) = registry.linked_extensions() else {
@@ -377,9 +376,11 @@ fn append_linked_manager_items(
         items.push(crate::ui::commands::ExtensionManagerItem {
             id: link.id.clone(),
             display_name: link.descriptor.display_name.clone(),
-            enabled: session_enabled
-                .map(|set| set.contains(&link.id) && linked_enabled)
-                .unwrap_or(linked_enabled),
+            // Linked launch consent is persisted separately from the bundled
+            // session selection set. A fresh session intentionally has no
+            // linked IDs in that set; the worker inserts the ID only after it
+            // revalidates current consent and fingerprint at execution time.
+            enabled: linked_enabled,
             bundled: false,
             materialization: Some(link.materialization.as_str().to_owned()),
             version: link.descriptor.version.clone(),

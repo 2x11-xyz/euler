@@ -8951,6 +8951,108 @@ fn tui_pty_submit_fixture_turn_and_quit() {
     tui.quit();
 }
 
+#[cfg(unix)]
+#[test]
+fn fresh_tui_runs_a_persistently_enabled_linked_process() {
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let sdk_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-fresh-tui",
+        "0.1.1",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let manifest_path = extension_dir
+        .path()
+        .join(euler_core::EXTENSION_MANIFEST_FILE);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest["capabilities"] = serde_json::json!([]);
+    manifest["commands"][0]["required_capabilities"] = serde_json::json!([]);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write capability-free manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        format!(
+            "import sys\nsys.path.insert(0, {sdk_source:?})\nfrom euler_managed_process_sdk import serve\nserve({{'inspect': lambda context: {{'fresh_tui': True}}}})\n",
+            sdk_source = sdk_source.to_string_lossy()
+        ),
+    )
+    .expect("write Python extension");
+    configure_linked_extension(
+        env!("CARGO_BIN_EXE_euler"),
+        &home,
+        extension_dir.path(),
+        "python-fresh-tui",
+    );
+
+    let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
+    assert!(tui.wait_for_screen("echo · ctx"));
+    tui.write("/extension run python-fresh-tui.inspect {}\r");
+    assert!(
+        tui.wait_for_screen("fresh_tui"),
+        "persistently enabled linked command did not run:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+}
+
+#[cfg(unix)]
+#[test]
+fn tty_line_mode_denies_linked_capabilities_before_process_launch() {
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-tty-permission",
+        "0.1.1",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        "from pathlib import Path\nPath('invoked').write_text('yes')\n",
+    )
+    .expect("write marker process");
+    configure_linked_extension(
+        env!("CARGO_BIN_EXE_euler"),
+        &home,
+        extension_dir.path(),
+        "python-tty-permission",
+    );
+
+    let mut line = PtyHarness::spawn_with_args(home.path(), &["--no-tty", "--provider", "fixture"]);
+    line.write("extension_run python-tty-permission.inspect {}\r");
+    assert!(
+        line.wait_for_screen("permission: allow provenance-read, artifact-write"),
+        "TTY line mode did not ask for capability approval:\n{}",
+        line.screen_text()
+    );
+    line.write("n\r");
+    assert!(line.wait_for_screen("capability denied"));
+    line.write("exit\r");
+    assert!(line.wait_success());
+    assert!(
+        !extension_dir.path().join("invoked").exists(),
+        "managed process launched before capability approval"
+    );
+}
+
 #[test]
 fn tui_pty_without_provenance_writes_home_session_store() {
     let home = isolated_home();
@@ -9835,6 +9937,23 @@ fn command_with_home(exe: &str, home: &tempfile::TempDir) -> Command {
     let mut command = Command::new(exe);
     command.env("HOME", home.path());
     command
+}
+
+fn configure_linked_extension(exe: &str, home: &tempfile::TempDir, path: &Path, id: &str) {
+    for args in [
+        vec!["extension", "link", path_str(path)],
+        vec!["extension", "enable", id],
+    ] {
+        let output = command_with_home(exe, home)
+            .args(args)
+            .output()
+            .expect("configure linked extension");
+        assert!(
+            output.status.success(),
+            "configuration stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn command_with_secret_env(
