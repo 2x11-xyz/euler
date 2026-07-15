@@ -39,8 +39,8 @@ The first profile, **sandboxed workspace**, has these invariants:
   parent;
 - before Bubblewrap launches, every inherited descriptor except
   stdin/stdout/stderr is marked close-on-exec (atomically where the kernel
-  supports it, with a syscall-only compatibility fallback), so open host files
-  or sockets cannot bypass the mount and network boundary through
+  supports it, otherwise by a post-fork procfs descriptor scan), so open host
+  files or sockets cannot bypass the mount and network boundary through
   `/proc/self/fd`;
 - the default profile creates a separate network namespace with no network.
 

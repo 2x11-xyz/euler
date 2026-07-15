@@ -496,7 +496,12 @@ impl ToolRegistry {
         let sandboxed = child.sandboxed;
         let outcome = run_with_timeout(child.command, timeout_ms)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
-        let text = collected_agent_output(outcome.stdout, outcome.stderr, sandboxed)?;
+        let text = collected_agent_output(
+            outcome.stdout,
+            outcome.stderr,
+            sandboxed,
+            outcome.status.is_none(),
+        )?;
         let after = capture_workspace_snapshot(&self.root).ok();
         let file_changes = before
             .zip(after)
@@ -533,6 +538,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
             sandboxed,
+            false,
         )?;
         let status = output.status.code().unwrap_or(-1);
         Ok(ToolExecution {
@@ -644,10 +650,17 @@ fn collected_agent_output(
     stdout: String,
     stderr: String,
     sandboxed: bool,
+    timed_out: bool,
 ) -> Result<String, ToolError> {
     let stdout = if sandboxed {
-        crate::sandbox::strip_sandbox_ready_marker(&stdout)
-            .map_err(ToolError::SandboxUnavailable)?
+        match crate::sandbox::strip_sandbox_ready_marker(&stdout) {
+            Ok(stdout) => stdout,
+            // A requested timeout can kill the launcher before it is ready.
+            // It is still a timeout, but its raw stdout/stderr must remain
+            // hidden because neither came from the agent command.
+            Err(_) if timed_out => return Ok(String::new()),
+            Err(reason) => return Err(ToolError::SandboxUnavailable(reason)),
+        }
     } else {
         &stdout
     };

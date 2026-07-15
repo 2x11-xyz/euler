@@ -190,6 +190,14 @@ const SANDBOX_READY_WRAPPER: &str = "printf '__EULER_SANDBOX_READY__\\n'; exec \
 const FIRST_INHERITED_FD: libc::c_uint = 3;
 #[cfg(target_os = "linux")]
 const CLOSE_RANGE_CLOEXEC: libc::c_ulong = 1 << 2;
+#[cfg(target_os = "linux")]
+const PROC_FD_DIRECTORY: &[u8] = b"/proc/self/fd\0";
+#[cfg(target_os = "linux")]
+const PROC_DIRENT64_RECLEN_OFFSET: usize = 16;
+#[cfg(target_os = "linux")]
+const PROC_DIRENT64_NAME_OFFSET: usize = 19;
+#[cfg(target_os = "linux")]
+const PROC_FD_BUFFER_LEN: usize = 4096;
 
 /// Probe whether the default profile is actually enforceable for `workspace`.
 ///
@@ -359,7 +367,7 @@ where
 /// `CLOEXEC` preserves Rust's private spawn-error pipe until `exec`, while
 /// ensuring Bubblewrap and its inner command receive only standard I/O. Linux
 /// 5.11+ can set the bit atomically with `close_range`; older kernels use a
-/// post-fork, syscall-only `fcntl` fallback and therefore remain supported.
+/// post-fork `/proc/self/fd` syscall scan and therefore remain supported.
 #[cfg(target_os = "linux")]
 fn mark_inherited_fds_close_on_exec(command: &mut Command) {
     use std::os::unix::process::CommandExt as _;
@@ -398,39 +406,140 @@ fn mark_all_inherited_fds_close_on_exec() -> std::io::Result<()> {
 }
 
 /// Compatibility path for kernels that predate `CLOSE_RANGE_CLOEXEC`.
-/// This runs after fork, so no other thread can create a descriptor between
-/// the scan and the `exec` boundary.
+/// This scans the live descriptor table after fork, so it covers descriptors
+/// above a subsequently lowered `RLIMIT_NOFILE` and has no concurrent opener.
 #[cfg(target_os = "linux")]
 fn mark_inherited_fds_close_on_exec_compat() -> std::io::Result<()> {
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    // SAFETY: `limit` is valid writable storage for this direct syscall.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+    // SAFETY: the constant is a NUL-terminated path and these flags do not
+    // create or modify a filesystem entry.
+    let directory = unsafe {
+        libc::open(
+            PROC_FD_DIRECTORY.as_ptr().cast(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if directory < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: `getrlimit` succeeded and initialized `limit`.
-    let limit = unsafe { limit.assume_init().rlim_cur };
-    let limit = libc::c_int::try_from(limit)
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
 
-    let mut fd = FIRST_INHERITED_FD as libc::c_int;
-    while fd < limit {
-        // SAFETY: `fcntl` only reads descriptor flags for the candidate fd.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EBADF) {
-                fd += 1;
-                continue;
-            }
-            return Err(error);
-        }
-        // SAFETY: `fcntl` updates only the close-on-exec bit on this fd.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        fd += 1;
+    let result = mark_proc_descriptors_close_on_exec(directory);
+    // SAFETY: `directory` came from `open` above and is still owned here.
+    let close_result = unsafe { libc::close(directory) };
+    result?;
+    if close_result != 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mark_proc_descriptors_close_on_exec(directory: libc::c_int) -> std::io::Result<()> {
+    let mut buffer = [0_u8; PROC_FD_BUFFER_LEN];
+    loop {
+        // SAFETY: `buffer` is writable for its full length and `directory` is
+        // the live `/proc/self/fd` descriptor opened by the caller.
+        let count = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                directory,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let count = usize::try_from(count).map_err(|_| invalid_proc_fd_directory())?;
+        if count == 0 {
+            return Ok(());
+        }
+        if count > buffer.len() {
+            return Err(invalid_proc_fd_directory());
+        }
+
+        let mut offset = 0;
+        while offset < count {
+            let (record_len, descriptor) = proc_fd_directory_entry(&buffer[..count], offset)?;
+            if let Some(descriptor) = descriptor {
+                mark_descriptor_close_on_exec(descriptor)?;
+            }
+            offset = offset
+                .checked_add(record_len)
+                .ok_or_else(invalid_proc_fd_directory)?;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_fd_directory_entry(
+    buffer: &[u8],
+    offset: usize,
+) -> std::io::Result<(usize, Option<libc::c_int>)> {
+    let header_end = offset
+        .checked_add(PROC_DIRENT64_NAME_OFFSET)
+        .ok_or_else(invalid_proc_fd_directory)?;
+    if header_end > buffer.len() {
+        return Err(invalid_proc_fd_directory());
+    }
+    let record_len = usize::from(u16::from_ne_bytes([
+        buffer[offset + PROC_DIRENT64_RECLEN_OFFSET],
+        buffer[offset + PROC_DIRENT64_RECLEN_OFFSET + 1],
+    ]));
+    let record_end = offset
+        .checked_add(record_len)
+        .ok_or_else(invalid_proc_fd_directory)?;
+    if record_len < PROC_DIRENT64_NAME_OFFSET || record_end > buffer.len() {
+        return Err(invalid_proc_fd_directory());
+    }
+    let name_with_padding = &buffer[header_end..record_end];
+    let Some(name_end) = name_with_padding.iter().position(|byte| *byte == 0) else {
+        return Err(invalid_proc_fd_directory());
+    };
+    let name = &name_with_padding[..name_end];
+    if name == b"." || name == b".." {
+        return Ok((record_len, None));
+    }
+    let mut descriptor = 0 as libc::c_int;
+    if name.is_empty() {
+        return Err(invalid_proc_fd_directory());
+    }
+    for byte in name {
+        if !byte.is_ascii_digit() {
+            return Err(invalid_proc_fd_directory());
+        }
+        descriptor = descriptor
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(libc::c_int::from(*byte - b'0')))
+            .ok_or_else(invalid_proc_fd_directory)?;
+    }
+    Ok((
+        record_len,
+        (descriptor >= FIRST_INHERITED_FD as libc::c_int).then_some(descriptor),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `fcntl` only reads descriptor flags for the candidate fd.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EBADF) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: `fcntl` updates only the close-on-exec bit on this fd.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn invalid_proc_fd_directory() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::EIO)
 }
 
 #[cfg(test)]
@@ -439,6 +548,8 @@ mod tests {
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::net::TcpListener;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::{AsRawFd, FromRawFd};
     #[cfg(target_os = "linux")]
     use std::time::Duration;
 
@@ -531,6 +642,82 @@ mod tests {
             !SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
                 .is_enforced()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compat_sanitizer_covers_descriptor_above_reduced_soft_limit() {
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `limits` is valid writable storage for this direct syscall.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) },
+            0,
+            "read descriptor limit"
+        );
+        // SAFETY: `getrlimit` initialized `limits` above.
+        let limits = unsafe { limits.assume_init() };
+        if limits.rlim_cur <= 128 || limits.rlim_max < 64 {
+            return;
+        }
+
+        let source = fs::File::open("/dev/null").expect("open source descriptor");
+        // SAFETY: `source` is live, and `F_DUPFD` returns a fresh descriptor
+        // at or above 128 on success.
+        let duplicated = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, 128) };
+        assert!(duplicated >= 128, "duplicate high descriptor");
+        // SAFETY: `F_DUPFD` returned a fresh owned descriptor.
+        let high_descriptor = unsafe { fs::File::from_raw_fd(duplicated) };
+        let descriptor = high_descriptor.as_raw_fd();
+        // SAFETY: `descriptor` is live and this clears only its CLOEXEC bit.
+        unsafe {
+            let flags = libc::fcntl(descriptor, libc::F_GETFD);
+            assert!(flags >= 0, "read high descriptor flags");
+            assert_eq!(
+                libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+                0,
+                "clear high descriptor CLOEXEC"
+            );
+        }
+
+        // Run the post-fork compatibility path in a child so its all-FD
+        // mutation cannot affect the concurrently executing test harness.
+        // SAFETY: the child only uses the same syscall-only sanitizer that
+        // production invokes from `pre_exec`, then exits immediately.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork compatibility probe");
+        if child == 0 {
+            let reduced = libc::rlimit {
+                rlim_cur: 64,
+                rlim_max: limits.rlim_max,
+            };
+            // SAFETY: these calls affect only the child, which exits below.
+            let status = unsafe {
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &reduced) != 0 {
+                    1
+                } else if mark_inherited_fds_close_on_exec_compat().is_err() {
+                    2
+                } else {
+                    let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                    if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
+                        0
+                    } else {
+                        3
+                    }
+                }
+            };
+            // SAFETY: the child must not run Rust destructors after fork.
+            unsafe { libc::_exit(status) };
+        }
+
+        let mut status = 0;
+        // SAFETY: `child` is the live child created above and `status` is
+        // writable storage for its wait status.
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut status, 0) },
+            child,
+            "wait for compatibility probe"
+        );
+        assert_eq!(status, 0, "compatibility sanitizer child exit status");
     }
 
     #[test]
