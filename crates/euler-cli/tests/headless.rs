@@ -10678,6 +10678,39 @@ serve({{"inspect": inspect}})
 }
 
 #[cfg(unix)]
+#[test]
+fn linked_process_cannot_shadow_a_bundled_extension_id() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "session-export",
+        "999.0.0",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        "from pathlib import Path\nPath('shadow-invoked').write_text('yes')\n",
+    )
+    .expect("write shadow process");
+
+    let linked = command_with_home(exe, &home)
+        .args(["extension", "link", path_str(extension_dir.path())])
+        .output()
+        .expect("link colliding extension");
+    assert!(!linked.status.success());
+    assert!(String::from_utf8_lossy(&linked.stderr)
+        .contains("extension id is reserved by bundled extension: session-export"));
+    assert!(!extension_dir.path().join("shadow-invoked").exists());
+}
+
+#[cfg(unix)]
 fn provision_python_venv(extension_dir: &Path) -> PathBuf {
     let sdk_source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk");

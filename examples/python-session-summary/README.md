@@ -3,6 +3,9 @@
 This is a standalone Euler managed-process extension using `uv` for its Python
 environment and dependency installation.
 
+Euler managed-process execution, and this `.venv/bin/python` entrypoint, are
+currently supported on macOS and Linux.
+
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/) if needed, then run from this

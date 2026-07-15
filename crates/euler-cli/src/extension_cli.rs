@@ -510,6 +510,7 @@ fn non_runnable_extension_error(linked: &LinkedExtension, action: &str) -> anyho
 fn validate_linked_process_for_activation(
     linked: &LinkedExtension,
 ) -> Result<euler_sdk::ManagedProcessEntrypoint> {
+    reject_bundled_link_collision(&linked.id)?;
     let package = load_linked_process_for_action(linked, "enable")?;
     managed_process_entrypoint_from_manifest_bytes(&package.manifest_bytes).map_err(Into::into)
 }
@@ -594,6 +595,7 @@ pub(crate) fn resolve_live_linked_process_command(
     let Some(linked) = linked_extension(&registry, id)? else {
         return Ok(None);
     };
+    reject_bundled_link_collision(id)?;
     validate_linked_command(&linked, command)?;
     let package = load_enabled_linked_process(&registry, &linked)?;
     let extension = ManagedProcessExtension::from_package(&package)
@@ -603,6 +605,15 @@ pub(crate) fn resolve_live_linked_process_command(
         .ok_or_else(|| anyhow!("unknown command for extension {id}: {command}"))?
         .clone();
     Ok(Some((extension, descriptor)))
+}
+
+fn reject_bundled_link_collision(id: &str) -> Result<()> {
+    if bundled_extension_by_id(id).is_some() {
+        return Err(anyhow!(
+            "extension id `{id}` is ambiguous: a linked package conflicts with a bundled extension; unlink or rename the linked package"
+        ));
+    }
+    Ok(())
 }
 
 /// Change linked-process launch consent through the same validation boundary
