@@ -114,8 +114,10 @@ in-session loop from ever closing.
   (`max_turns`/`max_tool_calls`/`max_tokens`), and an opaque `apply` value.
   An idle object may carry extension-owned informational fields, but none of
   the recognized task fields; core records a successful tick and runs neither
-  companion nor apply. Unknown fields on a task object are ignored; an unknown
-  status or mixed idle/task envelope fails the tick fail-open
+  companion nor apply. The extension owns the meaning of no work and may
+  advance private acquisition state before returning idle; core does not infer
+  that the extension is globally caught up. Unknown fields on a task object are
+  ignored; an unknown status or mixed idle/task envelope fails the tick fail-open
   (`failed_stage="envelope"` semantics under the brief stage).
 - **Apply envelope**: core calls the apply command with exactly
   `{ "apply": <brief apply value untouched>, "companion": { ok, summary,
