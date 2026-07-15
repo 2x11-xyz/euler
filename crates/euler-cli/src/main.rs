@@ -717,6 +717,9 @@ fn run_live_extension_command(
     command: &str,
     input: serde_json::Value,
 ) -> serde_json::Value {
+    if let Some(result) = run_live_linked_extension_command(session, id, command, input.clone()) {
+        return result;
+    }
     let descriptor = match bundled_descriptor_by_id(id) {
         Ok(Some(descriptor)) => descriptor,
         Ok(None) => return headless_extension_error(format!("unknown extension id: {id}")),
@@ -776,6 +779,53 @@ fn run_live_extension_command(
         }),
         Err(error) => headless_extension_error(error.to_string()),
     }
+}
+
+fn run_live_linked_extension_command(
+    session: &mut Session<CliDecider>,
+    id: &str,
+    command: &str,
+    input: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let (extension, descriptor) =
+        match extension_cli::resolve_live_linked_process_command(id, command) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => return None,
+            Err(error) => return Some(headless_extension_error(error.to_string())),
+        };
+    if descriptor.invocation.is_agent_only() {
+        return Some(headless_extension_error(agent_only_control_line_error(
+            id, command,
+        )));
+    }
+    if !descriptor.required_capabilities.is_empty() {
+        let granted = descriptor
+            .required_capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "extension {id}.{command}: granting declared capabilities for this run: {granted}"
+        );
+    }
+    session.set_extension_enabled(id.to_owned(), true);
+    Some(
+        match session.execute_extension_command(
+            &extension,
+            command,
+            input,
+            descriptor.required_capabilities.iter().copied(),
+        ) {
+            Ok(result) => serde_json::json!({
+                "type": "extension_run_result",
+                "extension": id,
+                "command": command,
+                "result": result,
+            }),
+            Err(error) => headless_extension_error(error.to_string()),
+        },
+    )
 }
 
 fn headless_extension_error(message: String) -> serde_json::Value {

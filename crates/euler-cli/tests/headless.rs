@@ -10588,6 +10588,96 @@ fn write_managed_process_extension_manifest(
 }
 
 #[cfg(unix)]
+#[test]
+fn headless_extension_run_executes_enabled_linked_python_process_live() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let python = PathBuf::from("python3");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-live-proof",
+        "0.1.1",
+        &[
+            python.to_string_lossy().into_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let sdk_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        format!(
+            r#"import sys
+sys.path.insert(0, {sdk_source:?})
+from euler_managed_process_sdk import serve
+
+def inspect(context):
+    page = context.host.query_provenance(limit=16, scan_limit=32)
+    return {{"tag": context.input["tag"], "seen_events": len(page["events"])}}
+
+serve({{"inspect": inspect}})
+"#,
+            sdk_source = sdk_source.to_string_lossy()
+        ),
+    )
+    .expect("write Python extension");
+
+    for args in [
+        vec!["extension", "link", path_str(extension_dir.path())],
+        vec!["extension", "enable", "python-live-proof"],
+    ] {
+        let output = command_with_home(exe, &home)
+            .args(args)
+            .output()
+            .expect("configure linked extension");
+        assert!(
+            output.status.success(),
+            "configuration stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    let mut child = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("--provenance")
+        .arg(path_str(&log))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(
+            b"seed live process\nextension_run python-live-proof.inspect {\"tag\":\"live\"}\n",
+        )
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = String::from_utf8(output.stdout)
+        .expect("stdout utf8")
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("result json"))
+        .expect("extension result");
+    assert_eq!(result["type"], serde_json::json!("extension_run_result"));
+    assert_eq!(result["extension"], serde_json::json!("python-live-proof"));
+    assert_eq!(result["result"]["tag"], serde_json::json!("live"));
+    assert!(result["result"]["seen_events"].as_u64().unwrap() >= 1);
+}
+
+#[cfg(unix)]
 fn provision_python_venv(extension_dir: &Path) -> PathBuf {
     let sdk_source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk");

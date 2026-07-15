@@ -583,6 +583,28 @@ fn load_enabled_linked_process(
     Ok(package)
 }
 
+/// Resolve an explicitly enabled linked managed-process command for a live
+/// session. The package is reloaded and fingerprint-checked on every run, so a
+/// manifest change revokes launch consent just as it does for offline runs.
+pub(crate) fn resolve_live_linked_process_command(
+    id: &str,
+    command: &str,
+) -> Result<Option<(ManagedProcessExtension, CommandDescriptor)>> {
+    let registry = extension_registry()?;
+    let Some(linked) = linked_extension(&registry, id)? else {
+        return Ok(None);
+    };
+    validate_linked_command(&linked, command)?;
+    let package = load_enabled_linked_process(&registry, &linked)?;
+    let extension = ManagedProcessExtension::from_package(&package)
+        .map_err(|error| anyhow!(error.to_string()))?;
+    let descriptor = extension
+        .command_descriptor(command)
+        .ok_or_else(|| anyhow!("unknown command for extension {id}: {command}"))?
+        .clone();
+    Ok(Some((extension, descriptor)))
+}
+
 fn current_linked_execution_enabled(
     registry: &ExtensionRegistry,
     linked: &LinkedExtension,
