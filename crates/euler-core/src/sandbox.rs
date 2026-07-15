@@ -185,9 +185,23 @@ const RUNTIME_MOUNTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
 const SANDBOX_PATH: &str = "/usr/bin:/bin";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const SANDBOX_READY_MARKER: &str = "__EULER_SANDBOX_READY__\n";
-const SANDBOX_READY_WRAPPER: &str = "printf '__EULER_SANDBOX_READY__\\n'; exec \"$@\"";
-#[cfg(target_os = "linux")]
-const CLOSE_RANGE_CLOEXEC: libc::c_ulong = 1 << 2;
+/// Trusted shell prelude that removes any inherited host descriptors before
+/// starting the agent-controlled program. Bubblewrap deliberately preserves
+/// descriptors, so environment clearing and mount isolation are insufficient
+/// on their own: a live file or socket is reachable through `/proc/self/fd`.
+/// This runs only after Bubblewrap established its private mount namespace;
+/// `set -e` makes descriptor-closure failure fail before the ready marker or
+/// the agent command can run.
+const SANDBOX_READY_WRAPPER: &str = r#"set -e
+for fd_path in /proc/self/fd/*; do
+    fd=${fd_path##*/}
+    case "$fd" in
+        0|1|2) ;;
+        *) eval "exec ${fd}>&-" ;;
+    esac
+done
+printf '__EULER_SANDBOX_READY__\n'
+exec "$@""#;
 
 /// Probe whether the default profile is actually enforceable for `workspace`.
 ///
@@ -283,7 +297,6 @@ where
     // this prevents an inherited loader/configuration variable from changing
     // Bubblewrap before it establishes the namespace.
     command.env_clear();
-    mark_inherited_fds_close_on_exec(&mut command);
     command.args([
         "--unshare-user",
         "--unshare-pid",
@@ -349,43 +362,6 @@ where
         .args(args);
     command
 }
-
-/// Bubblewrap preserves inherited descriptors unless its launcher closes or
-/// marks them close-on-exec. A readable file or connected socket inherited
-/// from Euler would bypass the mount and network boundary through
-/// `/proc/self/fd`, so descriptor isolation is part of enforcing this
-/// profile, not a best-effort hygiene step.
-///
-/// `close_range(CLOSE_RANGE_CLOEXEC)` preserves Rust's private spawn-error
-/// pipe until `exec`, while ensuring `bwrap` and its inner command receive
-/// only stdio. A kernel that cannot provide that guarantee makes the probe
-/// fail closed via this pre-exec error.
-#[cfg(target_os = "linux")]
-fn mark_inherited_fds_close_on_exec(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-
-    // SAFETY: the closure performs only the direct Linux syscall between fork
-    // and exec; it does not allocate, lock, or inspect process state.
-    unsafe {
-        command.pre_exec(|| {
-            // SAFETY: `close_range` accepts these integer syscall arguments.
-            let result = libc::syscall(
-                libc::SYS_close_range,
-                3 as libc::c_ulong,
-                u32::MAX as libc::c_ulong,
-                CLOSE_RANGE_CLOEXEC,
-            );
-            if result == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn mark_inherited_fds_close_on_exec(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

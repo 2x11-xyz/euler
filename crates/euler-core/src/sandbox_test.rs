@@ -4,8 +4,14 @@ use serde_json::json;
 use std::env;
 use std::fs;
 #[cfg(target_os = "linux")]
+use std::io::{self, Read};
+#[cfg(target_os = "linux")]
+use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -207,6 +213,65 @@ fn sandboxed_shell_cannot_read_an_inherited_host_descriptor() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sandboxed_shell_cannot_use_an_inherited_host_socket() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let registry = ToolRegistry::with_subprocess_sandbox(
+        &workspace,
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork),
+    );
+    let availability = registry
+        .sandbox_availability()
+        .expect("sandbox was requested");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("host listener");
+    let client =
+        TcpStream::connect(listener.local_addr().expect("listener address")).expect("host client");
+    let (mut peer, _) = listener.accept().expect("accept host client");
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("read timeout");
+    clear_close_on_exec(&client);
+
+    let fd = client.as_raw_fd();
+    let result = registry.execute(
+        "run_shell",
+        &json!({
+            "command": format!(
+                "if test -e /proc/self/fd/{fd}; then printf inherited-host-socket >&{fd} 2>/dev/null || true; fi"
+            )
+        }),
+    );
+
+    match availability {
+        SandboxAvailability::Enforced(_) => {
+            let execution = result.expect("sandboxed shell");
+            assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
+            let mut received = [0_u8; 64];
+            match peer.read(&mut received) {
+                Ok(0) => {}
+                Ok(size) => panic!(
+                    "sandbox wrote through an inherited host socket: {:?}",
+                    String::from_utf8_lossy(&received[..size])
+                ),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => panic!("read host socket: {error}"),
+            }
+        }
+        SandboxAvailability::Unavailable(reason) => {
+            assert!(matches!(
+                result,
+                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn sandboxed_shell_timeout_kills_the_bubblewrap_process_group() {
     let temp = tempfile::tempdir().expect("temp dir");
     let registry = ToolRegistry::with_subprocess_sandbox(
@@ -246,9 +311,9 @@ fn shell_quote(path: &std::path::Path) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn clear_close_on_exec(file: &fs::File) {
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is borrowed from a live `File`; these calls only inspect
+fn clear_close_on_exec(descriptor: &impl AsRawFd) {
+    let fd = descriptor.as_raw_fd();
+    // SAFETY: `fd` is borrowed from a live descriptor; these calls only inspect
     // and clear its close-on-exec bit for this regression probe.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFD);
