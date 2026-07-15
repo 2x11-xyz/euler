@@ -180,6 +180,17 @@ impl AppCore {
         session: Box<Session<TuiDecider>>,
         auto_flush: bool,
     ) {
+        // §5.1: re-cache the posture envelope while the session is in hand,
+        // before any of the branches below can hand it straight to another
+        // worker (a pending run, or queued input flushing into a new turn) —
+        // on those paths the session never passes through `Idle`, so a
+        // refresh placed there would be skipped for the whole next turn.
+        //
+        // The turn that just ended may have moved the modes without anyone
+        // here choosing to: approving an uncovered capability for the session
+        // flips it to SessionAllow (`PermissionGate::install_grant`), so a
+        // posture of "Ask every time" can stop being true mid-turn.
+        self.status.permission_envelope = Some(super::permission_envelope_for(&session));
         self.bottom
             .set_causal_dag_stats(Some(causal_dag_stats_from_events(
                 session.events(),

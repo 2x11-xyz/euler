@@ -2396,6 +2396,100 @@ fn status_reports_session_id_while_turn_is_in_flight() {
     assert!(text.contains("permissions: "), "text: {text:?}");
 }
 
+/// §5.1: approving an uncovered capability for the session flips its mode to
+/// SessionAllow (`PermissionGate::install_grant`), so a posture of "Ask every
+/// time" stops being true *during* the turn — nobody in the UI chose it. The
+/// cached envelope has to follow the session home, or /status keeps reporting
+/// the pre-turn boundary.
+///
+/// The mode move is what an unscoped session approval does; core proves that
+/// in `unscoped_session_grant_moves_the_mode_and_revoking_restores_it`. Here
+/// the concern is only that the reported envelope tracks it.
+#[test]
+fn permission_envelope_follows_a_session_approval_across_the_turn_boundary() {
+    let mut core = core();
+    // Start from a posture that is actually in force — a fresh session's
+    // capabilities are unset and match none, so it reads `custom` already.
+    assert_eq!(
+        core.set_permission_posture(PermissionPosture::AskEveryTime),
+        CoreEffect::Render
+    );
+    let before = core
+        .status
+        .permission_envelope
+        .clone()
+        .expect("posture in force");
+    assert!(before.starts_with("Ask every time"), "before: {before:?}");
+
+    let AppState::Idle { mut session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should be idle");
+    };
+
+    // What the worker's session looks like after the user answers `a`.
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::SessionAllow);
+
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+
+    let after = core
+        .status
+        .permission_envelope
+        .clone()
+        .expect("refreshed on the way home");
+    assert_ne!(
+        after, before,
+        "the approval changed the boundary; the envelope must say so"
+    );
+    assert_eq!(after, crate::ui::commands::CUSTOM_PERMISSION_ENVELOPE);
+
+    assert_eq!(core.show_status(), CoreEffect::Render);
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("permissions: custom"), "text: {text:?}");
+}
+
+/// The cache is only read while a turn is in flight, so a mode change made
+/// while idle must reach it before the next turn starts — otherwise /status
+/// spends that whole turn reporting the pre-change boundary. Revoking an
+/// unscoped session grant restores Ask through the same door, and shares this
+/// refresh.
+#[test]
+fn permission_envelope_is_fresh_for_the_turn_after_an_idle_mode_change() {
+    let mut core = core();
+    assert_eq!(
+        core.set_permission_posture(PermissionPosture::AskEveryTime),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        core.set_permission_mode(Capability::ShellExec, ApprovalMode::SessionAllow),
+        CoreEffect::Render
+    );
+
+    // Hand the session to a worker: /status can still be asked, and now only
+    // the cache can answer.
+    let AppState::Idle { session: _session } = std::mem::replace(&mut core.state, AppState::Empty)
+    else {
+        panic!("core should be idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    assert_eq!(core.show_status(), CoreEffect::Render);
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("permissions: custom"), "text: {text:?}");
+}
+
 /// §5.1: the envelope states what the gate *effectively* does. Under Ask, a
 /// statically-safe shell command (#78) and an operation already covered by a
 /// durable grant both run with no prompt — so "every capability asks" is a

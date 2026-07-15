@@ -142,11 +142,21 @@ impl AppCore {
         );
         // §5.1 status indicator: the active posture *and its envelope*, never
         // just the name — the boundary in force has to be legible without
-        // knowing what each posture means. Read from the snapshot, not the
-        // session: /status is answerable mid-turn, and `TurnInFlight` holds no
-        // session, so gating on `Idle` would drop this line during exactly the
-        // long-running work where the boundary matters most.
-        if let Some(envelope) = self.status.permission_envelope.as_deref() {
+        // knowing what each posture means.
+        //
+        // Derive it live whenever the session is in hand. The modes behind it
+        // move for reasons no single caller owns — an unscoped session
+        // approval flips a capability to SessionAllow, revoking one restores
+        // Ask (`PermissionGate::install_grant` / `revoke`) — so a cache that
+        // every mutation site has to remember to refresh is a stale line
+        // waiting to happen. The cache is the fallback for the one window
+        // where the session is unreachable: a turn in flight, where /status is
+        // still answerable but the worker owns the session.
+        let envelope = match &self.state {
+            AppState::Idle { session } => Some(super::permission_envelope_for(session)),
+            _ => self.status.permission_envelope.clone(),
+        };
+        if let Some(envelope) = envelope {
             status.push_str(&format!("\npermissions: {envelope}"));
         }
         // ADR 0011 visibility: say so whenever a non-default reviewer
@@ -441,16 +451,23 @@ impl AppCore {
                     pattern.as_str()
                 }
             )),
-            Ok(_) => self.notice_item(format!(
-                "revoked {} {} ({})",
-                source.as_str(),
-                capability.as_str(),
-                if pattern.is_unscoped() {
-                    "all"
-                } else {
-                    pattern.as_str()
-                }
-            )),
+            Ok(_) => {
+                // Revoking an unscoped session grant restores the capability
+                // to Ask (`PermissionGate::revoke`), which can change the
+                // posture — so the cached envelope has to follow it here, or
+                // the next turn reports the pre-revoke boundary.
+                self.refresh_permission_envelope();
+                self.notice_item(format!(
+                    "revoked {} {} ({})",
+                    source.as_str(),
+                    capability.as_str(),
+                    if pattern.is_unscoped() {
+                        "all"
+                    } else {
+                        pattern.as_str()
+                    }
+                ))
+            }
             Err(error) => self.error_item(format!("revoke failed: {error}")),
         }
     }
