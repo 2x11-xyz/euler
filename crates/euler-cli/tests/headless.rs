@@ -8951,6 +8951,108 @@ fn tui_pty_submit_fixture_turn_and_quit() {
     tui.quit();
 }
 
+#[cfg(unix)]
+#[test]
+fn fresh_tui_runs_a_persistently_enabled_linked_process() {
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let sdk_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-fresh-tui",
+        "0.1.1",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let manifest_path = extension_dir
+        .path()
+        .join(euler_core::EXTENSION_MANIFEST_FILE);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest["capabilities"] = serde_json::json!([]);
+    manifest["commands"][0]["required_capabilities"] = serde_json::json!([]);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write capability-free manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        format!(
+            "import sys\nsys.path.insert(0, {sdk_source:?})\nfrom euler_managed_process_sdk import serve\nserve({{'inspect': lambda context: {{'fresh_tui': True}}}})\n",
+            sdk_source = sdk_source.to_string_lossy()
+        ),
+    )
+    .expect("write Python extension");
+    configure_linked_extension(
+        env!("CARGO_BIN_EXE_euler"),
+        &home,
+        extension_dir.path(),
+        "python-fresh-tui",
+    );
+
+    let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
+    assert!(tui.wait_for_screen("echo · ctx"));
+    tui.write("/extension run python-fresh-tui.inspect {}\r");
+    assert!(
+        tui.wait_for_screen("fresh_tui"),
+        "persistently enabled linked command did not run:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+}
+
+#[cfg(unix)]
+#[test]
+fn tty_line_mode_denies_linked_capabilities_before_process_launch() {
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-tty-permission",
+        "0.1.1",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        "from pathlib import Path\nPath('invoked').write_text('yes')\n",
+    )
+    .expect("write marker process");
+    configure_linked_extension(
+        env!("CARGO_BIN_EXE_euler"),
+        &home,
+        extension_dir.path(),
+        "python-tty-permission",
+    );
+
+    let mut line = PtyHarness::spawn_with_args(home.path(), &["--no-tty", "--provider", "fixture"]);
+    line.write("extension_run python-tty-permission.inspect {}\r");
+    assert!(
+        line.wait_for_screen("permission: allow provenance-read, artifact-write"),
+        "TTY line mode did not ask for capability approval:\n{}",
+        line.screen_text()
+    );
+    line.write("n\r");
+    assert!(line.wait_for_screen("capability denied"));
+    line.write("exit\r");
+    assert!(line.wait_success());
+    assert!(
+        !extension_dir.path().join("invoked").exists(),
+        "managed process launched before capability approval"
+    );
+}
+
 #[test]
 fn tui_pty_without_provenance_writes_home_session_store() {
     let home = isolated_home();
@@ -9837,6 +9939,23 @@ fn command_with_home(exe: &str, home: &tempfile::TempDir) -> Command {
     command
 }
 
+fn configure_linked_extension(exe: &str, home: &tempfile::TempDir, path: &Path, id: &str) {
+    for args in [
+        vec!["extension", "link", path_str(path)],
+        vec!["extension", "enable", id],
+    ] {
+        let output = command_with_home(exe, home)
+            .args(args)
+            .output()
+            .expect("configure linked extension");
+        assert!(
+            output.status.success(),
+            "configuration stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn command_with_secret_env(
     exe: &str,
     home: &tempfile::TempDir,
@@ -10585,6 +10704,202 @@ fn write_managed_process_extension_manifest(
         serde_json::to_vec_pretty(&manifest).expect("serialize managed-process manifest"),
     )
     .expect("write managed-process extension manifest");
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_extension_run_executes_enabled_linked_python_process_live() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let python = PathBuf::from("python3");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-live-proof",
+        "0.1.1",
+        &[
+            python.to_string_lossy().into_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let sdk_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        format!(
+            r#"import sys
+sys.path.insert(0, {sdk_source:?})
+from euler_managed_process_sdk import serve
+
+def inspect(context):
+    page = context.host.query_provenance(limit=16, scan_limit=32)
+    return {{"tag": context.input["tag"], "seen_events": len(page["events"])}}
+
+serve({{"inspect": inspect}})
+"#,
+            sdk_source = sdk_source.to_string_lossy()
+        ),
+    )
+    .expect("write Python extension");
+
+    for args in [
+        vec!["extension", "link", path_str(extension_dir.path())],
+        vec!["extension", "enable", "python-live-proof"],
+    ] {
+        let output = command_with_home(exe, &home)
+            .args(args)
+            .output()
+            .expect("configure linked extension");
+        assert!(
+            output.status.success(),
+            "configuration stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+    let mut child = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("--provenance")
+        .arg(path_str(&log))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(
+            b"seed live process\nextension_run python-live-proof.inspect {\"tag\":\"live\"}\n",
+        )
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = String::from_utf8(output.stdout)
+        .expect("stdout utf8")
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("result json"))
+        .expect("extension result");
+    assert_eq!(result["type"], serde_json::json!("extension_run_result"));
+    assert_eq!(result["extension"], serde_json::json!("python-live-proof"));
+    assert_eq!(result["result"]["tag"], serde_json::json!("live"));
+    assert!(result["result"]["seen_events"].as_u64().unwrap() >= 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_process_cannot_shadow_a_bundled_extension_id() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "session-export",
+        "999.0.0",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        "from pathlib import Path\nPath('shadow-invoked').write_text('yes')\n",
+    )
+    .expect("write shadow process");
+
+    let linked = command_with_home(exe, &home)
+        .args(["extension", "link", path_str(extension_dir.path())])
+        .output()
+        .expect("link colliding extension");
+    assert!(!linked.status.success());
+    assert!(String::from_utf8_lossy(&linked.stderr)
+        .contains("extension id is reserved by bundled extension: session-export"));
+    assert!(!extension_dir.path().join("shadow-invoked").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn live_resolver_rejects_a_legacy_link_collision_before_launch() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "legacy-shadow",
+        "0.1.1",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        "from pathlib import Path\nPath('shadow-invoked').write_text('yes')\n",
+    )
+    .expect("write shadow process");
+    let linked = command_with_home(exe, &home)
+        .args(["extension", "link", path_str(extension_dir.path())])
+        .output()
+        .expect("link non-colliding extension");
+    assert!(linked.status.success());
+
+    // Simulate a legacy inventory created before bundled IDs were reserved.
+    // The live resolver must reject it before reading or launching the source.
+    let inventory_path = home.path().join(".euler/extensions/links.json");
+    let mut inventory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&inventory_path).expect("read inventory"))
+            .expect("inventory json");
+    let mut record = inventory["links"]
+        .as_object_mut()
+        .expect("links object")
+        .remove("legacy-shadow")
+        .expect("linked record");
+    record["descriptor"]["id"] = serde_json::json!("session-export");
+    inventory["links"]
+        .as_object_mut()
+        .expect("links object")
+        .insert("session-export".to_owned(), record);
+    fs::write(
+        &inventory_path,
+        serde_json::to_vec_pretty(&inventory).expect("serialize legacy inventory"),
+    )
+    .expect("write legacy inventory");
+
+    let root = tempfile::tempdir().expect("root dir");
+    let mut child = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"extension_run session-export.session-export {}\n")
+        .expect("write control line");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.contains(
+        "extension id `session-export` is ambiguous: a linked package conflicts with a bundled extension"
+    ));
+    assert!(!extension_dir.path().join("shadow-invoked").exists());
 }
 
 #[cfg(unix)]

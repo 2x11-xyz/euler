@@ -1,0 +1,10 @@
+[project]
+name = "euler-python-session-summary"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+  "euler-managed-process-sdk @ git+https://github.com/2x11-xyz/euler.git#subdirectory=python/euler_managed_process_sdk"
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,19 @@
+version = 1
+revision = 2
+requires-python = ">=3.9"
+
+[[package]]
+name = "euler-managed-process-sdk"
+version = "0.1.1"
+source = { git = "https://github.com/2x11-xyz/euler.git?subdirectory=python%2Feuler_managed_process_sdk#d8c679d40249df6cb7a0be038d7fab6827e2829e" }
+
+[[package]]
+name = "euler-python-session-summary"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "euler-managed-process-sdk" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "euler-managed-process-sdk", git = "https://github.com/2x11-xyz/euler.git?subdirectory=python%2Feuler_managed_process_sdk" }]

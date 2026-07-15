@@ -3,8 +3,10 @@
 This describes the extension surface that is in this tree today. Euler ships
 native Rust extensions compiled into the `euler` binary, and can run explicitly
 enabled, locally linked `managed-process` packages over a versioned JSON-RPC
-stdio contract. Python is the first client SDK for that contract; it is not a
-Python-only runtime mode.
+stdio contract. Linked commands work through standalone `extension run`, the
+line-oriented live-session `extension_run` control line, and the TUI
+`/extension run` form. Python is the first client SDK for that contract; it is
+not a Python-only runtime mode.
 
 Linking inventories a local package without starting it. `validate`, `link`,
 and `info` show a managed package's exact argv; `enable` echoes that argv as it
@@ -148,7 +150,7 @@ The protocol is documented in
 `docs/contracts/extension-sdk.md`; another language can implement it directly
 without a core change or this Python SDK.
 
-The first runnable surface is Unix-only (macOS and Linux). Euler clears the
+Managed-process execution is Unix-only (macOS and Linux). Euler clears the
 child environment and supplies only the package directory as working directory,
 the inherited `PATH`, and `EULER_MANAGED_PROCESS_PROTOCOL`; package code must
 not depend on ambient `HOME`, locale, certificate, or Python-path variables.
