@@ -571,6 +571,7 @@ fn run_stdin_loop(
 ) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let interactive_permissions = stdin.is_terminal();
     // The banner is output UX, so it is gated on stdout being a TTY (not
     // stdin) and sized from stdout's terminal. This avoids writing a banner
     // into a redirected file and avoids sizing it from a mismatched stdin.
@@ -594,7 +595,7 @@ fn run_stdin_loop(
             break;
         }
         if let Some(request) = strip_extension_run_prefix(input) {
-            let output = execute_headless_extension_run(session, request);
+            let output = execute_live_extension_run(session, request, interactive_permissions);
             if let Some(refresh) = refresh {
                 if let Err(error) = refresh.refresh() {
                     eprintln!("warning: failed to refresh session metadata: {error}");
@@ -647,12 +648,23 @@ fn strip_control_prefix<'a>(input: &'a str, token: &str) -> Option<&'a str> {
         .then(|| rest.trim_start())
 }
 
+#[cfg(test)]
 fn execute_headless_extension_run(
     session: &mut Session<CliDecider>,
     request: &str,
 ) -> serde_json::Value {
+    execute_live_extension_run(session, request, false)
+}
+
+fn execute_live_extension_run(
+    session: &mut Session<CliDecider>,
+    request: &str,
+    gated: bool,
+) -> serde_json::Value {
     match parse_live_extension_request(request) {
-        Ok((id, command, input)) => run_live_extension_command(session, &id, &command, input),
+        Ok((id, command, input)) => {
+            run_live_extension_command(session, &id, &command, input, gated)
+        }
         Err(error) => headless_extension_error(error.to_string()),
     }
 }
@@ -716,7 +728,13 @@ fn run_live_extension_command(
     id: &str,
     command: &str,
     input: serde_json::Value,
+    gated: bool,
 ) -> serde_json::Value {
+    if let Some(result) =
+        run_live_linked_extension_command(session, id, command, input.clone(), gated)
+    {
+        return result;
+    }
     let descriptor = match bundled_descriptor_by_id(id) {
         Ok(Some(descriptor)) => descriptor,
         Ok(None) => return headless_extension_error(format!("unknown extension id: {id}")),
@@ -748,10 +766,10 @@ fn run_live_extension_command(
     } else {
         input
     };
-    // Piped headless runs cannot prompt (stdin is the command protocol):
+    // Piped runs cannot prompt (stdin is the command protocol):
     // invoking `extension_run` names the command explicitly, so its declared
     // capabilities are granted for this run — with visibility, never silently.
-    if !command_descriptor.required_capabilities.is_empty() {
+    if !gated && !command_descriptor.required_capabilities.is_empty() {
         let granted = command_descriptor
             .required_capabilities
             .iter()
@@ -762,12 +780,22 @@ fn run_live_extension_command(
             "extension {id}.{command}: granting declared capabilities for this run: {granted}"
         );
     }
-    match session.execute_extension_command(
-        bundled.extension,
-        command,
-        input,
-        command_descriptor.required_capabilities.iter().copied(),
-    ) {
+    let result = if gated {
+        session.execute_extension_command_gated(
+            bundled.extension,
+            command,
+            input,
+            &command_descriptor.required_capabilities,
+        )
+    } else {
+        session.execute_extension_command(
+            bundled.extension,
+            command,
+            input,
+            command_descriptor.required_capabilities.iter().copied(),
+        )
+    };
+    match result {
         Ok(result) => serde_json::json!({
             "type": "extension_run_result",
             "extension": id,
@@ -776,6 +804,62 @@ fn run_live_extension_command(
         }),
         Err(error) => headless_extension_error(error.to_string()),
     }
+}
+
+fn run_live_linked_extension_command(
+    session: &mut Session<CliDecider>,
+    id: &str,
+    command: &str,
+    input: serde_json::Value,
+    gated: bool,
+) -> Option<serde_json::Value> {
+    let (extension, descriptor) =
+        match extension_cli::resolve_live_linked_process_command(id, command) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => return None,
+            Err(error) => return Some(headless_extension_error(error.to_string())),
+        };
+    if descriptor.invocation.is_agent_only() {
+        return Some(headless_extension_error(agent_only_control_line_error(
+            id, command,
+        )));
+    }
+    if !gated && !descriptor.required_capabilities.is_empty() {
+        let granted = descriptor
+            .required_capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "extension {id}.{command}: granting declared capabilities for this run: {granted}"
+        );
+    }
+    session.set_extension_enabled(id.to_owned(), true);
+    let result = if gated {
+        session.execute_extension_command_gated(
+            &extension,
+            command,
+            input,
+            &descriptor.required_capabilities,
+        )
+    } else {
+        session.execute_extension_command(
+            &extension,
+            command,
+            input,
+            descriptor.required_capabilities.iter().copied(),
+        )
+    };
+    Some(match result {
+        Ok(result) => serde_json::json!({
+            "type": "extension_run_result",
+            "extension": id,
+            "command": command,
+            "result": result,
+        }),
+        Err(error) => headless_extension_error(error.to_string()),
+    })
 }
 
 fn headless_extension_error(message: String) -> serde_json::Value {

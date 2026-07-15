@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "python-session-summary",
+  "display_name": "Python session summary",
+  "extension_version": "0.1.1",
+  "runtime_kind": "managed-process",
+  "entrypoint": {
+    "command": [".venv/bin/python", "-B", "-u", "extension.py"]
+  },
+  "capabilities": ["provenance-read", "artifact-write"],
+  "commands": [
+    {
+      "name": "summarize",
+      "display_name": "Summarize session",
+      "summary": "Count provenance events and write a JSON summary artifact.",
+      "required_capabilities": ["provenance-read", "artifact-write"]
+    }
+  ]
+}

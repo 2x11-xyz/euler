@@ -510,6 +510,7 @@ fn non_runnable_extension_error(linked: &LinkedExtension, action: &str) -> anyho
 fn validate_linked_process_for_activation(
     linked: &LinkedExtension,
 ) -> Result<euler_sdk::ManagedProcessEntrypoint> {
+    reject_bundled_link_collision(&linked.id)?;
     let package = load_linked_process_for_action(linked, "enable")?;
     managed_process_entrypoint_from_manifest_bytes(&package.manifest_bytes).map_err(Into::into)
 }
@@ -583,7 +584,57 @@ fn load_enabled_linked_process(
     Ok(package)
 }
 
-fn current_linked_execution_enabled(
+/// Resolve an explicitly enabled linked managed-process command for a live
+/// session. The package is reloaded and fingerprint-checked on every run, so a
+/// manifest change revokes launch consent just as it does for offline runs.
+pub(crate) fn resolve_live_linked_process_command(
+    id: &str,
+    command: &str,
+) -> Result<Option<(ManagedProcessExtension, CommandDescriptor)>> {
+    let registry = extension_registry()?;
+    let Some(linked) = linked_extension(&registry, id)? else {
+        return Ok(None);
+    };
+    reject_bundled_link_collision(id)?;
+    validate_linked_command(&linked, command)?;
+    let package = load_enabled_linked_process(&registry, &linked)?;
+    let extension = ManagedProcessExtension::from_package(&package)
+        .map_err(|error| anyhow!(error.to_string()))?;
+    let descriptor = extension
+        .command_descriptor(command)
+        .ok_or_else(|| anyhow!("unknown command for extension {id}: {command}"))?
+        .clone();
+    Ok(Some((extension, descriptor)))
+}
+
+fn reject_bundled_link_collision(id: &str) -> Result<()> {
+    if bundled_extension_by_id(id).is_some() {
+        return Err(anyhow!(
+            "extension id `{id}` is ambiguous: a linked package conflicts with a bundled extension; unlink or rename the linked package"
+        ));
+    }
+    Ok(())
+}
+
+/// Change linked-process launch consent through the same validation boundary
+/// as the CLI enable/disable actions. Returns `false` when `id` is not linked.
+pub(crate) fn set_live_linked_process_enabled(id: &str, enabled: bool) -> Result<bool> {
+    let registry = extension_registry()?;
+    let Some(linked) = linked_extension(&registry, id)? else {
+        return Ok(false);
+    };
+    if enabled {
+        validate_linked_process_for_activation(&linked)?;
+    } else if linked.materialization != ExtensionMaterialization::Linked
+        || linked.descriptor.runtime_kind != "managed-process"
+    {
+        return Err(non_runnable_extension_error(&linked, "disable"));
+    }
+    registry.set_linked_execution_enabled(id, enabled)?;
+    Ok(true)
+}
+
+pub(crate) fn current_linked_execution_enabled(
     registry: &ExtensionRegistry,
     linked: &LinkedExtension,
 ) -> Result<bool> {

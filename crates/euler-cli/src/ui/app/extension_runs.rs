@@ -11,8 +11,23 @@ pub(super) struct ExtensionRunRequest {
     pub(super) id: String,
     pub(super) command: String,
     input: serde_json::Value,
-    extension: &'static dyn Extension,
+    extension: LiveExtension,
     capabilities: Vec<Capability>,
+}
+
+#[derive(Clone)]
+enum LiveExtension {
+    Bundled(&'static dyn Extension),
+    Managed(Box<euler_managed_process::ManagedProcessExtension>),
+}
+
+impl LiveExtension {
+    fn as_extension(&self) -> &dyn Extension {
+        match self {
+            Self::Bundled(extension) => *extension,
+            Self::Managed(extension) => extension.as_ref(),
+        }
+    }
 }
 
 impl ExtensionRunRequest {
@@ -135,25 +150,27 @@ impl AppCore {
         input: serde_json::Value,
         raw_args: Option<String>,
     ) -> Result<ExtensionRunRequest> {
-        let descriptor = bundled_descriptor_by_id(&id)?.ok_or_else(|| {
-            // Linked/installed extensions are manageable but not yet runnable
-            // in-session: teach the CLI path instead of "unknown id"
-            // (calibration finding E3).
-            if self
-                .bottom
-                .context()
-                .extension_items
-                .iter()
-                .any(|item| item.id == id && !item.bundled)
-            {
-                anyhow!(
-                    "{id} is a linked extension — in-session runs are not supported yet; \
-                     use `euler extension run {id}.{command} <session>` from the CLI"
-                )
-            } else {
-                anyhow!("unknown extension id: {id}")
+        if let Some((extension, descriptor)) =
+            crate::extension_cli::resolve_live_linked_process_command(&id, &command)?
+        {
+            if descriptor.invocation.is_agent_only() {
+                return Err(anyhow!(crate::agent_only_control_line_error(&id, &command)));
             }
-        })?;
+            if raw_args.is_some() {
+                return Err(anyhow!(
+                    "linked managed-process commands accept JSON input in-session"
+                ));
+            }
+            return Ok(ExtensionRunRequest {
+                id,
+                command,
+                input,
+                extension: LiveExtension::Managed(Box::new(extension)),
+                capabilities: descriptor.required_capabilities,
+            });
+        }
+        let descriptor =
+            bundled_descriptor_by_id(&id)?.ok_or_else(|| anyhow!("unknown extension id: {id}"))?;
         let command_descriptor = descriptor
             .command(&command)
             .ok_or_else(|| anyhow!("unknown command for extension {id}: {command}"))?;
@@ -178,7 +195,7 @@ impl AppCore {
             id,
             command,
             input,
-            extension: bundled.extension,
+            extension: LiveExtension::Bundled(bundled.extension),
             capabilities: command_descriptor.required_capabilities.clone(),
         })
     }
@@ -189,15 +206,50 @@ impl AppCore {
         mut session: Box<Session<TuiDecider>>,
     ) {
         let (worker_tx, worker_rx) = mpsc::channel();
-        let worker_request = request.clone();
+        let mut worker_request = request.clone();
         let label = request.label();
         std::thread::spawn(move || {
             let start = session.events().len();
+            // A request can wait behind an in-flight turn. Re-resolve at actual
+            // execution time so disable, reload, or a manifest change revokes
+            // launch consent even after the command was queued.
+            if matches!(worker_request.extension, LiveExtension::Managed(_)) {
+                match crate::extension_cli::resolve_live_linked_process_command(
+                    &worker_request.id,
+                    &worker_request.command,
+                ) {
+                    Ok(Some((extension, descriptor))) => {
+                        worker_request.extension = LiveExtension::Managed(Box::new(extension));
+                        worker_request.capabilities = descriptor.required_capabilities;
+                    }
+                    Ok(None) => {
+                        let _ = worker_tx.send(TurnEvent::ExtensionDone {
+                            request: worker_request,
+                            outcome: ExtensionOutcome::Failed(
+                                "linked extension is no longer available".to_owned(),
+                            ),
+                            events: Vec::new(),
+                            session,
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = worker_tx.send(TurnEvent::ExtensionDone {
+                            request: worker_request,
+                            outcome: ExtensionOutcome::Failed(error.to_string()),
+                            events: Vec::new(),
+                            session,
+                        });
+                        return;
+                    }
+                }
+                session.set_extension_enabled(worker_request.id.clone(), true);
+            }
             // Gated: declared capabilities become grants only through the
             // permission gate (the approval panel asks; session grants
             // cover later runs). Never pass a descriptor list as authority.
             let result = session.execute_extension_command_gated(
-                worker_request.extension,
+                worker_request.extension.as_extension(),
                 &worker_request.command,
                 worker_request.input.clone(),
                 &worker_request.capabilities,
@@ -238,13 +290,7 @@ pub(super) fn list_extension_manager_items(
     let enablement = registry.enablement_states().unwrap_or_default();
     let audit_by_id = audit_status_by_id(&registry);
     let mut items = bundled_manager_items(session_enabled, &enablement, &audit_by_id);
-    append_linked_manager_items(
-        &mut items,
-        &registry,
-        session_enabled,
-        &enablement,
-        &audit_by_id,
-    );
+    append_linked_manager_items(&mut items, &registry, &audit_by_id);
     items
 }
 
@@ -315,8 +361,6 @@ fn bundled_manager_items(
 fn append_linked_manager_items(
     items: &mut Vec<crate::ui::commands::ExtensionManagerItem>,
     registry: &ExtensionRegistry,
-    session_enabled: Option<&std::collections::BTreeSet<String>>,
-    enablement: &std::collections::BTreeMap<String, ExtensionEnablement>,
     audit_by_id: &std::collections::BTreeMap<String, String>,
 ) {
     let Ok(linked) = registry.linked_extensions() else {
@@ -326,10 +370,17 @@ fn append_linked_manager_items(
         if items.iter().any(|item| item.id == link.id) {
             continue;
         }
+        let linked_enabled =
+            crate::extension_cli::current_linked_execution_enabled(registry, &link)
+                .unwrap_or(false);
         items.push(crate::ui::commands::ExtensionManagerItem {
             id: link.id.clone(),
             display_name: link.descriptor.display_name.clone(),
-            enabled: extension_is_enabled(&link.id, session_enabled, enablement),
+            // Linked launch consent is persisted separately from the bundled
+            // session selection set. A fresh session intentionally has no
+            // linked IDs in that set; the worker inserts the ID only after it
+            // revalidates current consent and fingerprint at execution time.
+            enabled: linked_enabled,
             bundled: false,
             materialization: Some(link.materialization.as_str().to_owned()),
             version: link.descriptor.version.clone(),
@@ -349,6 +400,9 @@ fn append_linked_manager_items(
 }
 
 fn set_extension_enabled(id: &str, enable: bool) -> Result<()> {
+    if crate::extension_cli::set_live_linked_process_enabled(id, enable)? {
+        return Ok(());
+    }
     let registry = ExtensionRegistry::new(EulerHome::resolve()?)?;
     if enable {
         registry.enable(id)?;
