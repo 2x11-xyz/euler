@@ -494,7 +494,8 @@ impl ToolRegistry {
         let before = capture_workspace_snapshot(&self.root).ok();
         let child = self.agent_subprocess("sh", &["-c", command])?;
         let sandboxed = child.sandboxed;
-        let outcome = run_with_timeout(child.command, timeout_ms)?;
+        let outcome = run_with_timeout(child.command, timeout_ms)
+            .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let text = collected_agent_output(outcome.stdout, outcome.stderr, sandboxed)?;
         let after = capture_workspace_snapshot(&self.root).ok();
         let file_changes = before
@@ -523,7 +524,11 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
     fn git(&self, args: &[&str], name: &str) -> Result<ToolExecution, ToolError> {
         let mut child = self.agent_subprocess("git", args)?;
         let sandboxed = child.sandboxed;
-        let output = child.command.output()?;
+        let output = child
+            .command
+            .output()
+            .map_err(ToolError::Io)
+            .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let text = collected_agent_output(
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -647,6 +652,18 @@ fn collected_agent_output(
         &stdout
     };
     Ok(format!("{stdout}{stderr}"))
+}
+
+/// A selected profile must never fall back to host execution or disclose raw
+/// launcher details. An I/O failure while launching or supervising it is
+/// therefore reported as the same concise enforcement failure as a missing
+/// readiness marker.
+fn normalize_sandbox_subprocess_error(sandboxed: bool, error: ToolError) -> ToolError {
+    if sandboxed && matches!(&error, ToolError::Io(_)) {
+        ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
+    } else {
+        error
+    }
 }
 
 const DISPLAY_PATH_MAX_CHARS: usize = 256;

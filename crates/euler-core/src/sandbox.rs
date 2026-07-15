@@ -185,23 +185,11 @@ const RUNTIME_MOUNTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
 const SANDBOX_PATH: &str = "/usr/bin:/bin";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const SANDBOX_READY_MARKER: &str = "__EULER_SANDBOX_READY__\n";
-/// Trusted shell prelude that removes any inherited host descriptors before
-/// starting the agent-controlled program. Bubblewrap deliberately preserves
-/// descriptors, so environment clearing and mount isolation are insufficient
-/// on their own: a live file or socket is reachable through `/proc/self/fd`.
-/// This runs only after Bubblewrap established its private mount namespace;
-/// `set -e` makes descriptor-closure failure fail before the ready marker or
-/// the agent command can run.
-const SANDBOX_READY_WRAPPER: &str = r#"set -e
-for fd_path in /proc/self/fd/*; do
-    fd=${fd_path##*/}
-    case "$fd" in
-        0|1|2) ;;
-        *) eval "exec ${fd}>&-" ;;
-    esac
-done
-printf '__EULER_SANDBOX_READY__\n'
-exec "$@""#;
+const SANDBOX_READY_WRAPPER: &str = "printf '__EULER_SANDBOX_READY__\\n'; exec \"$@\"";
+#[cfg(target_os = "linux")]
+const FIRST_INHERITED_FD: libc::c_uint = 3;
+#[cfg(target_os = "linux")]
+const CLOSE_RANGE_CLOEXEC: libc::c_ulong = 1 << 2;
 
 /// Probe whether the default profile is actually enforceable for `workspace`.
 ///
@@ -297,6 +285,7 @@ where
     // this prevents an inherited loader/configuration variable from changing
     // Bubblewrap before it establishes the namespace.
     command.env_clear();
+    mark_inherited_fds_close_on_exec(&mut command);
     command.args([
         "--unshare-user",
         "--unshare-pid",
@@ -361,6 +350,87 @@ where
         .arg(program)
         .args(args);
     command
+}
+
+/// Keep non-stdio host descriptors out of Bubblewrap and the agent command.
+/// A readable file or connected socket inherited from Euler would otherwise
+/// bypass the mount and network boundary through `/proc/self/fd`.
+///
+/// `CLOEXEC` preserves Rust's private spawn-error pipe until `exec`, while
+/// ensuring Bubblewrap and its inner command receive only standard I/O. Linux
+/// 5.11+ can set the bit atomically with `close_range`; older kernels use a
+/// post-fork, syscall-only `fcntl` fallback and therefore remain supported.
+#[cfg(target_os = "linux")]
+fn mark_inherited_fds_close_on_exec(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: this hook performs only direct descriptor syscalls between fork
+    // and exec. It neither allocates nor inspects shared process state.
+    unsafe {
+        command.pre_exec(mark_all_inherited_fds_close_on_exec);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mark_inherited_fds_close_on_exec(_command: &mut Command) {}
+
+#[cfg(target_os = "linux")]
+fn mark_all_inherited_fds_close_on_exec() -> std::io::Result<()> {
+    // SAFETY: `close_range` accepts these integer syscall arguments.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            FIRST_INHERITED_FD as libc::c_ulong,
+            u32::MAX as libc::c_ulong,
+            CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    let errno = error.raw_os_error();
+    if errno != Some(libc::EINVAL) && errno != Some(libc::ENOSYS) {
+        return Err(error);
+    }
+    mark_inherited_fds_close_on_exec_compat()
+}
+
+/// Compatibility path for kernels that predate `CLOSE_RANGE_CLOEXEC`.
+/// This runs after fork, so no other thread can create a descriptor between
+/// the scan and the `exec` boundary.
+#[cfg(target_os = "linux")]
+fn mark_inherited_fds_close_on_exec_compat() -> std::io::Result<()> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `limit` is valid writable storage for this direct syscall.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `getrlimit` succeeded and initialized `limit`.
+    let limit = unsafe { limit.assume_init().rlim_cur };
+    let limit = libc::c_int::try_from(limit)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
+    let mut fd = FIRST_INHERITED_FD as libc::c_int;
+    while fd < limit {
+        // SAFETY: `fcntl` only reads descriptor flags for the candidate fd.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EBADF) {
+                fd += 1;
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: `fcntl` updates only the close-on-exec bit on this fd.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        fd += 1;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

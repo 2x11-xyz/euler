@@ -1414,3 +1414,27 @@ fn intercepted_run_shell_heredoc_counts_against_apply_patch() {
         "a failed apply_patch heredoc through run_shell continues the apply_patch streak"
     );
 }
+
+#[test]
+fn selected_sandbox_normalizes_subprocess_io_failures() {
+    let sandboxed = normalize_sandbox_subprocess_error(
+        true,
+        ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "raw launcher detail",
+        )),
+    );
+    assert!(matches!(
+        sandboxed,
+        ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
+    ));
+
+    let host = normalize_sandbox_subprocess_error(
+        false,
+        ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "ordinary host error",
+        )),
+    );
+    assert!(matches!(host, ToolError::Io(_)));
+}

@@ -8,7 +8,9 @@ use std::io::{self, Read};
 #[cfg(target_os = "linux")]
 use std::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -172,7 +174,8 @@ fn sandboxed_shell_cannot_read_an_inherited_host_descriptor() {
     fs::create_dir_all(&outside).expect("outside");
     let host_file = outside.join("host-fd");
     fs::write(&host_file, "inherited-host-descriptor").expect("host file");
-    let host_fd = fs::File::open(&host_file).expect("open host descriptor");
+    let opened_host_fd = fs::File::open(&host_file).expect("open host descriptor");
+    let host_fd = duplicate_at_or_above(&opened_host_fd, 100);
     clear_close_on_exec(&host_fd);
 
     let registry = ToolRegistry::with_subprocess_sandbox(
@@ -213,6 +216,82 @@ fn sandboxed_shell_cannot_read_an_inherited_host_descriptor() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sandboxed_git_cannot_read_an_inherited_host_descriptor() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::create_dir_all(&outside).expect("outside");
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&workspace)
+        .status()
+        .expect("git available for git_status tool");
+    assert!(initialized.success(), "initialize workspace repository");
+
+    let host_file = outside.join("host-fd");
+    fs::write(&host_file, "inherited-host-descriptor").expect("host file");
+    let opened_host_fd = fs::File::open(&host_file).expect("open host descriptor");
+    let host_fd = duplicate_at_or_above(&opened_host_fd, 100);
+    clear_close_on_exec(&host_fd);
+    let fd = host_fd.as_raw_fd();
+
+    let fsmonitor = workspace.join("fsmonitor");
+    fs::write(
+        &fsmonitor,
+        format!(
+            "#!/bin/sh\nprintf invoked > /workspace/fsmonitor-invoked\n\
+             if test -r /proc/self/fd/{fd}; then cat /proc/self/fd/{fd} > /workspace/git-fd-leak; fi\n\
+             printf 'version 2\\n'\nprintf 'token\\n'\n"
+        ),
+    )
+    .expect("write fsmonitor hook");
+    let mut permissions = fs::metadata(&fsmonitor)
+        .expect("fsmonitor metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fsmonitor, permissions).expect("make fsmonitor executable");
+    let configured = std::process::Command::new("git")
+        .args(["config", "core.fsmonitor", "/workspace/fsmonitor"])
+        .current_dir(&workspace)
+        .status()
+        .expect("configure fsmonitor hook");
+    assert!(configured.success(), "configure fsmonitor hook");
+
+    let registry = ToolRegistry::with_subprocess_sandbox(
+        &workspace,
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork),
+    );
+    let availability = registry
+        .sandbox_availability()
+        .expect("sandbox was requested");
+    let result = registry.execute("git_status", &json!({}));
+
+    match availability {
+        SandboxAvailability::Enforced(_) => {
+            let execution = result.expect("sandboxed direct git");
+            assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
+            assert_eq!(
+                fs::read_to_string(workspace.join("fsmonitor-invoked"))
+                    .expect("direct git invoked fsmonitor"),
+                "invoked"
+            );
+            assert!(
+                !workspace.join("git-fd-leak").exists(),
+                "direct git read an inherited host descriptor"
+            );
+        }
+        SandboxAvailability::Unavailable(reason) => {
+            assert!(matches!(
+                result,
+                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn sandboxed_shell_cannot_use_an_inherited_host_socket() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
@@ -224,9 +303,28 @@ fn sandboxed_shell_cannot_use_an_inherited_host_socket() {
     let availability = registry
         .sandbox_availability()
         .expect("sandbox was requested");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("host listener");
-    let client =
-        TcpStream::connect(listener.local_addr().expect("listener address")).expect("host client");
+    if let SandboxAvailability::Unavailable(reason) = availability {
+        let result = registry.execute("run_shell", &json!({"command": "printf should-not-run"}));
+        assert!(matches!(
+            result,
+            Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+        ));
+        return;
+    }
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        // Some hermetic test runners prohibit host network sockets entirely.
+        // The enforced profile is still valid there, but this regression needs
+        // a host socket to establish its canary and cannot run.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("host listener: {error}"),
+    };
+    let client = match TcpStream::connect(listener.local_addr().expect("listener address")) {
+        Ok(client) => client,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("host client: {error}"),
+    };
     let (mut peer, _) = listener.accept().expect("accept host client");
     peer.set_read_timeout(Some(Duration::from_millis(100)))
         .expect("read timeout");
@@ -242,31 +340,21 @@ fn sandboxed_shell_cannot_use_an_inherited_host_socket() {
         }),
     );
 
-    match availability {
-        SandboxAvailability::Enforced(_) => {
-            let execution = result.expect("sandboxed shell");
-            assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
-            let mut received = [0_u8; 64];
-            match peer.read(&mut received) {
-                Ok(0) => {}
-                Ok(size) => panic!(
-                    "sandbox wrote through an inherited host socket: {:?}",
-                    String::from_utf8_lossy(&received[..size])
-                ),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) => {}
-                Err(error) => panic!("read host socket: {error}"),
-            }
-        }
-        SandboxAvailability::Unavailable(reason) => {
-            assert!(matches!(
-                result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
-            ));
-        }
+    let execution = result.expect("sandboxed shell");
+    assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
+    let mut received = [0_u8; 64];
+    match peer.read(&mut received) {
+        Ok(0) => {}
+        Ok(size) => panic!(
+            "sandbox wrote through an inherited host socket: {:?}",
+            String::from_utf8_lossy(&received[..size])
+        ),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) => {}
+        Err(error) => panic!("read host socket: {error}"),
     }
 }
 
@@ -324,4 +412,14 @@ fn clear_close_on_exec(descriptor: &impl AsRawFd) {
             "clear close-on-exec"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+fn duplicate_at_or_above(descriptor: &impl AsRawFd, minimum_fd: libc::c_int) -> OwnedFd {
+    // SAFETY: `descriptor` is live, and `F_DUPFD` returns a new owned file
+    // descriptor at or above `minimum_fd` on success.
+    let duplicated = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD, minimum_fd) };
+    assert!(duplicated >= minimum_fd, "duplicate descriptor at high fd");
+    // SAFETY: `F_DUPFD` returned a fresh owned descriptor.
+    unsafe { OwnedFd::from_raw_fd(duplicated) }
 }

@@ -37,9 +37,10 @@ The first profile, **sandboxed workspace**, has these invariants:
 - `/tmp`, `/proc`, and `/dev` are private sandbox mounts;
 - the child has a cleared, minimal environment and is killed with its Euler
   parent;
-- a trusted in-sandbox wrapper closes every inherited descriptor except
-  stdin/stdout/stderr before it executes the agent-controlled program, so open
-  host files or sockets cannot bypass the mount and network boundary through
+- before Bubblewrap launches, every inherited descriptor except
+  stdin/stdout/stderr is marked close-on-exec (atomically where the kernel
+  supports it, with a syscall-only compatibility fallback), so open host files
+  or sockets cannot bypass the mount and network boundary through
   `/proc/self/fd`;
 - the default profile creates a separate network namespace with no network.
 
@@ -90,5 +91,6 @@ On supported Linux hosts, automated tests must prove that a sandboxed child
 can write inside a temporary workspace, cannot see a planted secret outside
 the allowed mounts, cannot connect to a host listener, and can run both shell
 and direct Git tool paths. They must also prove that intentionally inherited
-non-`CLOEXEC` host file and socket descriptors cannot be used inside the
-sandbox. Profile creation failure must fail closed.
+non-`CLOEXEC` host file descriptors cannot be read by shell or direct Git
+paths and that an inherited socket cannot be used inside the sandbox. Profile
+creation or later launch failure must fail closed.
