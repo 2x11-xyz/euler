@@ -548,7 +548,7 @@ fn manifest_parses_observer_declaration_and_rejects_unknown_commands() {
         })
     );
 
-    let mut invalid = manifest;
+    let mut invalid = manifest.clone();
     invalid["observer"]["brief_command"] = serde_json::json!("missing");
     let error = parse_extension_manifest_bytes(
         &serde_json::to_vec(&invalid).expect("invalid manifest json"),
@@ -557,4 +557,14 @@ fn manifest_parses_observer_declaration_and_rejects_unknown_commands() {
     assert!(error
         .to_string()
         .contains("manifest observer command `missing` is not registered"));
+
+    let mut zero = manifest;
+    zero["observer"]["default_cadence_rounds"] = serde_json::json!(0);
+    let error = parse_extension_manifest_bytes(
+        &serde_json::to_vec(&zero).expect("zero cadence manifest json"),
+    )
+    .expect_err("zero observer cadence");
+    assert!(error
+        .to_string()
+        .contains("manifest observer default_cadence_rounds must be greater than zero"));
 }

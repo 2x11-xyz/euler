@@ -25,6 +25,9 @@ overrides the manifest default. Euler revalidates linked activation and the
 reviewed manifest fingerprint before each automatic observer command. An
 observer is pinned to the fingerprint selected at session startup; after a
 reload, restart or resume the session to use the newly reviewed package.
+The fingerprint covers `Euler.extension.json`, not every source file in a
+linked development directory. Linked source remains mutable by design; use a
+future immutable installed-package runtime when source-byte pinning is needed.
 
 Linking inventories a local package without starting it. `validate`, `link`,
 and `info` show a managed package's exact argv; `enable` echoes that argv as it

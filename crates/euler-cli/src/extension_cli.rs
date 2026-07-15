@@ -13,8 +13,8 @@ use euler_core::{
 use euler_managed_process::ManagedProcessExtension;
 use euler_sdk::{
     load_extension_package, managed_process_entrypoint_from_manifest_bytes,
-    valid_extension_identifier, ArgSpec, ArgValueKind, CommandDescriptor, CommandRegistrar,
-    Extension, ExtensionError, ExtensionManifest,
+    valid_extension_identifier, ArgSpec, ArgValueKind, CommandContext, CommandDescriptor,
+    CommandRegistrar, Extension, ExtensionCommand, ExtensionError, ExtensionManifest, HostApi,
 };
 use output::{
     installed_info_summary, linked_info, linked_link_info, linked_status, package_validation_info,
@@ -660,6 +660,25 @@ impl Extension for RevalidatedLinkedExtension {
     }
 
     fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        let extension = self.current_extension()?;
+        let mut descriptors = ObserverDescriptorRegistrar::default();
+        extension.register(&mut descriptors)?;
+        for descriptor in descriptors.0 {
+            let name = descriptor.name.clone();
+            registrar.register_command(
+                &name,
+                Box::new(RevalidatedLinkedCommand {
+                    extension: self.clone(),
+                    descriptor,
+                }),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl RevalidatedLinkedExtension {
+    fn current_extension(&self) -> Result<ManagedProcessExtension, ExtensionError> {
         let registry =
             extension_registry().map_err(|error| ExtensionError::Message(error.to_string()))?;
         let linked = linked_extension(&registry, &self.id)
@@ -677,9 +696,61 @@ impl Extension for RevalidatedLinkedExtension {
             .map_err(|error| ExtensionError::Message(error.to_string()))?;
         let package = load_enabled_linked_process(&registry, &linked)
             .map_err(|error| ExtensionError::Message(error.to_string()))?;
-        let extension = ManagedProcessExtension::from_package(&package)
-            .map_err(|error| ExtensionError::Message(error.to_string()))?;
-        extension.register(registrar)
+        ManagedProcessExtension::from_package(&package)
+            .map_err(|error| ExtensionError::Message(error.to_string()))
+    }
+}
+
+impl Clone for RevalidatedLinkedExtension {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            manifest_sha256: self.manifest_sha256.clone(),
+            manifest: self.manifest.clone(),
+        }
+    }
+}
+
+struct RevalidatedLinkedCommand {
+    extension: RevalidatedLinkedExtension,
+    descriptor: CommandDescriptor,
+}
+
+impl ExtensionCommand for RevalidatedLinkedCommand {
+    fn descriptor(&self) -> CommandDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn execute(
+        &self,
+        context: CommandContext,
+        host: &dyn HostApi,
+    ) -> Result<serde_json::Value, ExtensionError> {
+        let extension = self.extension.current_extension()?;
+        let mut commands = CommandCollector::default();
+        extension.register(&mut commands)?;
+        let command = commands.0.remove(&self.descriptor.name).ok_or_else(|| {
+            ExtensionError::Message("observer command is no longer registered".to_owned())
+        })?;
+        command.execute(context, host)
+    }
+}
+
+#[derive(Default)]
+struct ObserverDescriptorRegistrar(Vec<CommandDescriptor>);
+
+impl CommandRegistrar for ObserverDescriptorRegistrar {
+    fn register_command(&mut self, _name: &str, command: Box<dyn ExtensionCommand>) {
+        self.0.push(command.descriptor());
+    }
+}
+
+#[derive(Default)]
+struct CommandCollector(std::collections::BTreeMap<String, Box<dyn ExtensionCommand>>);
+
+impl CommandRegistrar for CommandCollector {
+    fn register_command(&mut self, name: &str, command: Box<dyn ExtensionCommand>) {
+        self.0.insert(name.to_owned(), command);
     }
 }
 
