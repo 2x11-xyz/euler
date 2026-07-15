@@ -1,6 +1,8 @@
+use crate::sandbox::WorkspaceSandbox;
 use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
-    ApplyPatchDocument, ApplyPatchError, ObservedFileChange,
+    ApplyPatchDocument, ApplyPatchError, ObservedFileChange, SandboxAvailability,
+    SandboxUnavailableReason, SubprocessSandbox,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::ToolDefinition;
@@ -73,6 +75,8 @@ pub enum ToolError {
     UpdateHunkMatchCount { hunk: usize, count: usize },
     #[error("update hunk {hunk} overlaps earlier update hunk {previous_hunk}")]
     UpdateHunkOverlap { hunk: usize, previous_hunk: usize },
+    #[error("{0}")]
+    SandboxUnavailable(SandboxUnavailableReason),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -135,11 +139,31 @@ impl ReteachTracker {
 #[derive(Debug)]
 pub struct ToolRegistry {
     root: PathBuf,
+    workspace_sandbox: Option<WorkspaceSandbox>,
 }
 
 impl ToolRegistry {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self::with_subprocess_sandbox(root, SubprocessSandbox::Disabled)
+    }
+
+    /// Build a registry whose agent-controlled subprocesses either execute
+    /// normally or must use the supplied workspace profile. An unavailable
+    /// selected profile is retained so execution can fail closed with a
+    /// concise diagnostic rather than silently falling back to the host.
+    pub fn with_subprocess_sandbox(
+        root: impl Into<PathBuf>,
+        subprocess_sandbox: SubprocessSandbox,
+    ) -> Self {
+        let root = root.into();
+        let workspace_sandbox = match subprocess_sandbox {
+            SubprocessSandbox::Disabled => None,
+            SubprocessSandbox::Enforce(profile) => Some(WorkspaceSandbox::new(&root, profile)),
+        };
+        Self {
+            root,
+            workspace_sandbox,
+        }
     }
 
     /// The workspace root every tool executes in (`run_shell` is
@@ -147,6 +171,15 @@ impl ToolRegistry {
     /// so path-confinement checks reason about the real execution cwd.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The enforcement result for the selected profile, if subprocess
+    /// sandboxing was requested. `None` means ordinary host execution is the
+    /// configured posture.
+    pub fn sandbox_availability(&self) -> Option<SandboxAvailability> {
+        self.workspace_sandbox
+            .as_ref()
+            .map(WorkspaceSandbox::availability)
     }
 
     pub fn required_capability(&self, name: &str) -> Option<Capability> {
@@ -459,15 +492,21 @@ impl ToolRegistry {
             }
         };
         let before = capture_workspace_snapshot(&self.root).ok();
-        let mut child = Command::new("sh");
-        child.arg("-c").arg(command).current_dir(&self.root);
-        scrub_secret_env(&mut child);
-        let outcome = run_with_timeout(child, timeout_ms)?;
+        let child = self.agent_subprocess("sh", &["-c", command])?;
+        let sandboxed = child.sandboxed;
+        let outcome = run_with_timeout(child.command, timeout_ms)
+            .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
+        let text = collected_agent_output(
+            outcome.stdout,
+            outcome.stderr,
+            sandboxed,
+            outcome.status.is_none(),
+        )?;
         let after = capture_workspace_snapshot(&self.root).ok();
         let file_changes = before
             .zip(after)
             .map_or_else(Vec::new, |(before, after)| before.changes_to(&after));
-        let bounded = bound_text(&outcome.text, max_bytes, DEFAULT_MAX_LINES);
+        let bounded = bound_text(&text, max_bytes, DEFAULT_MAX_LINES);
         let (status, header) = match outcome.status {
             Some(status) => (status, format!("exit {status}")),
             None => (
@@ -488,13 +527,19 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
     }
 
     fn git(&self, args: &[&str], name: &str) -> Result<ToolExecution, ToolError> {
-        let mut child = Command::new("git");
-        child.args(args).current_dir(&self.root);
-        scrub_secret_env(&mut child);
-        let output = child.output()?;
-        let mut text = String::new();
-        text.push_str(&String::from_utf8_lossy(&output.stdout));
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let mut child = self.agent_subprocess("git", args)?;
+        let sandboxed = child.sandboxed;
+        let output = child
+            .command
+            .output()
+            .map_err(ToolError::Io)
+            .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
+        let text = collected_agent_output(
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            sandboxed,
+            false,
+        )?;
         let status = output.status.code().unwrap_or(-1);
         Ok(ToolExecution {
             name: name.to_owned(),
@@ -502,6 +547,29 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             exit_code: Some(status),
             patch: None,
             file_changes: Vec::new(),
+        })
+    }
+
+    /// Construct the child process for an agent-controlled command. The
+    /// sandbox branch deliberately receives no host `current_dir`: Bubblewrap
+    /// establishes `/workspace` inside its private mount namespace.
+    fn agent_subprocess(&self, program: &str, args: &[&str]) -> Result<AgentSubprocess, ToolError> {
+        let mut child = match &self.workspace_sandbox {
+            Some(sandbox) => sandbox
+                .command(program, args)
+                .map_err(ToolError::SandboxUnavailable)?,
+            None => {
+                let mut command = Command::new(program);
+                command.args(args).current_dir(&self.root);
+                command
+            }
+        };
+        // Defense in depth: Bubblewrap clears this environment too, while
+        // ordinary host execution keeps the existing secret-name scrub.
+        scrub_secret_env(&mut child);
+        Ok(AgentSubprocess {
+            command: child,
+            sandboxed: self.workspace_sandbox.is_some(),
         })
     }
 
@@ -565,6 +633,49 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             });
         }
         Ok(canonical)
+    }
+}
+
+/// One prepared agent-controlled process, with enough provenance to remove
+/// the sandbox launch prelude from captured output.
+struct AgentSubprocess {
+    command: Command,
+    sandboxed: bool,
+}
+
+/// Preserve program output, but do not expose Bubblewrap diagnostics when the
+/// launcher did not reach the inner command. The readiness marker is emitted
+/// by the private sandbox wrapper only after its mount namespace exists.
+fn collected_agent_output(
+    stdout: String,
+    stderr: String,
+    sandboxed: bool,
+    timed_out: bool,
+) -> Result<String, ToolError> {
+    let stdout = if sandboxed {
+        match crate::sandbox::strip_sandbox_ready_marker(&stdout) {
+            Ok(stdout) => stdout,
+            // A requested timeout can kill the launcher before it is ready.
+            // It is still a timeout, but its raw stdout/stderr must remain
+            // hidden because neither came from the agent command.
+            Err(_) if timed_out => return Ok(String::new()),
+            Err(reason) => return Err(ToolError::SandboxUnavailable(reason)),
+        }
+    } else {
+        &stdout
+    };
+    Ok(format!("{stdout}{stderr}"))
+}
+
+/// A selected profile must never fall back to host execution or disclose raw
+/// launcher details. An I/O failure while launching or supervising it is
+/// therefore reported as the same concise enforcement failure as a missing
+/// readiness marker.
+fn normalize_sandbox_subprocess_error(sandboxed: bool, error: ToolError) -> ToolError {
+    if sandboxed && matches!(&error, ToolError::Io(_)) {
+        ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
+    } else {
+        error
     }
 }
 
@@ -644,7 +755,8 @@ fn optional_usize(input: &Value, key: &'static str) -> Result<Option<usize>, Too
 struct ShellOutcome {
     /// `None` means the command was killed at the timeout deadline.
     status: Option<i32>,
-    text: String,
+    stdout: String,
+    stderr: String,
 }
 
 /// Runs the child in its own process group, polling for completion and
@@ -701,10 +813,11 @@ fn run_with_timeout(mut child: Command, timeout_ms: u64) -> Result<ShellOutcome,
             None => std::thread::sleep(Duration::from_millis(25)),
         }
     };
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&stdout.join().unwrap_or_default()));
-    text.push_str(&String::from_utf8_lossy(&stderr.join().unwrap_or_default()));
-    Ok(ShellOutcome { status, text })
+    Ok(ShellOutcome {
+        status,
+        stdout: String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned(),
+    })
 }
 
 fn optional_positive_usize(input: &Value, key: &'static str) -> Result<Option<usize>, ToolError> {

@@ -3,6 +3,7 @@ use crate::extensions::ExtensionHostError;
 use crate::permissions::ScriptedDecider;
 use crate::provenance::ProvenanceWriterError;
 use crate::read_provenance;
+use crate::{probe_workspace_sandbox, SandboxProfile, SubprocessSandbox};
 use euler_provider::{
     FixtureResponse, ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent,
     ProviderError, ProviderStream, ScriptedProvider, StopReason, Usage,
@@ -39,6 +40,22 @@ fn max_output_tokens_propagates_to_model_request_and_model_call() {
         .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
         .expect("model.call");
     assert_eq!(model_call.payload["max_output_tokens"], json!(42));
+}
+
+#[test]
+fn session_config_forwards_requested_subprocess_sandbox_to_tool_registry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = SessionConfig::new(temp.path());
+    config.subprocess_sandbox = SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork);
+    let expected = probe_workspace_sandbox(temp.path());
+
+    let session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    assert_eq!(session.tools.sandbox_availability(), Some(expected));
 }
 
 /// Provider whose invoke fails with an error message echoing request

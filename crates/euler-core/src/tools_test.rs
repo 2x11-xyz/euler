@@ -1414,3 +1414,34 @@ fn intercepted_run_shell_heredoc_counts_against_apply_patch() {
         "a failed apply_patch heredoc through run_shell continues the apply_patch streak"
     );
 }
+
+#[test]
+fn selected_sandbox_normalizes_subprocess_io_failures() {
+    let sandboxed = normalize_sandbox_subprocess_error(
+        true,
+        ToolError::Io(std::io::Error::other("raw launcher detail")),
+    );
+    assert!(matches!(
+        sandboxed,
+        ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
+    ));
+
+    let host = normalize_sandbox_subprocess_error(
+        false,
+        ToolError::Io(std::io::Error::other("ordinary host error")),
+    );
+    assert!(matches!(host, ToolError::Io(_)));
+}
+
+#[test]
+fn sandbox_timeout_before_readiness_hides_launcher_output() {
+    let output = collected_agent_output(
+        "bwrap: host mount detail".to_owned(),
+        "more host detail".to_owned(),
+        true,
+        true,
+    )
+    .expect("timeout is not a sandbox availability failure");
+
+    assert!(output.is_empty());
+}
