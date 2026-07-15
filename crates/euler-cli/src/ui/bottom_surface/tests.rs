@@ -72,9 +72,9 @@ fn causal_dag_picker_drills_into_formats_and_steps_back() {
         .surface_lines(100)
         .expect("action picker")
         .join("\n");
-    assert!(actions.contains("CAUSAL DAG · session 01KX8V… · 35 nodes · 7 cross-arcs"));
-    assert!(actions.contains("view      Show current graph"));
-    assert!(actions.contains("refresh   Re-observe recent activity"));
+    assert!(actions.contains("CAUSAL DAG · session 01KX8V… · 35 nodes · 7 cross-arcs · (1/3)"));
+    assert!(actions.contains("› view     Show current graph"));
+    assert!(actions.contains("refresh  Re-observe recent activity"));
 
     surface.move_selection_down();
     assert_eq!(surface.confirm(), SurfaceEvent::None);
@@ -183,9 +183,9 @@ fn compaction_picker_shows_defaults_and_applies_independent_toggles() {
         .surface_lines(100)
         .expect("compaction picker")
         .join("\n");
-    assert!(rendered.contains("COMPACTION · automatic on · stubs on"));
-    assert!(rendered.contains("[✓] automatic compaction"));
-    assert!(rendered.contains("[✓] tool stubs"));
+    assert!(rendered.contains("Compaction · automatic on · stubs on"));
+    assert!(rendered.contains("[x] automatic compaction"));
+    assert!(rendered.contains("[x] tool stubs"));
     assert!(rendered.contains("space toggle"));
 
     surface.move_selection_down();
@@ -485,13 +485,12 @@ fn model_picker_selects_switch_model_action() {
     surface.palette_insert("model");
     assert_eq!(surface.confirm(), SurfaceEvent::None);
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Select Model"));
-    assert!(rendered.contains("→ fixture::echo ✓"));
-    assert!(rendered.contains("  openrouter::glm-5.2"));
-    assert!(rendered.contains("Filter: "));
+    assert!(rendered.contains("Model · configured providers only"));
+    assert!(rendered.contains("› ● fixture::echo"));
+    assert!(rendered.contains("openrouter::glm-5.2"));
     assert!(rendered.contains("(1/2)"));
-    assert!(rendered.contains("Provider: fixture  Model: echo"));
-    assert!(rendered.contains("Press enter to confirm or esc to go back"));
+    assert!(rendered.contains("fixture · echo"));
+    assert!(rendered.contains("↑↓ move · ⏎ select · esc cancel"));
 
     surface.move_selection_down();
 
@@ -524,9 +523,9 @@ fn model_picker_filters_by_provider_model_and_label() {
 
     surface.palette_insert("openrouter gpt");
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Filter: openrouter gpt"));
-    assert!(rendered.contains("→ openrouter::openai/gpt-4.1-mini"));
-    assert!(rendered.contains("Provider: openrouter  Model: openai/gpt-4.1-mini"));
+    assert!(rendered.contains("/openrouter gpt"));
+    assert!(rendered.contains("› ○ openrouter::openai/gpt-4.1-mini"));
+    assert!(rendered.contains("openrouter · openai/gpt-4.1-mini"));
     assert!(rendered.contains("(1/1)"));
     assert!(!rendered.contains("fixture::echo"));
 
@@ -558,9 +557,9 @@ fn model_picker_filters_by_provider_model_and_label() {
         .surface_lines(80)
         .expect("model picker")
         .join("\n");
-    assert!(rendered.contains("Filter: friendly"));
-    assert!(rendered.contains("→ Friendly Alias"));
-    assert!(rendered.contains("Provider: custom-provider  Model: model-a"));
+    assert!(rendered.contains("/friendly"));
+    assert!(rendered.contains("› ○ Friendly Alias"));
+    assert!(rendered.contains("custom-provider · model-a"));
     assert!(!rendered.contains("fixture::echo"));
 
     let mut value_surface = BottomSurface::new(CommandContext {
@@ -580,7 +579,7 @@ fn model_picker_filters_by_provider_model_and_label() {
         .surface_lines(80)
         .expect("model picker")
         .join("\n");
-    assert!(rendered.contains("→ anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
+    assert!(rendered.contains("› ○ anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
 
     let mut metadata_surface = BottomSurface::new(CommandContext {
         model_choices: vec![ModelChoice::with_metadata(
@@ -599,7 +598,7 @@ fn model_picker_filters_by_provider_model_and_label() {
         .surface_lines(80)
         .expect("model picker")
         .join("\n");
-    assert!(rendered.contains("No matching models"));
+    assert!(rendered.contains("no matches"));
 }
 
 #[test]
@@ -614,8 +613,8 @@ fn model_picker_no_match_stays_open() {
 
     surface.palette_insert("missing");
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Filter: missing"));
-    assert!(rendered.contains("No matching models"));
+    assert!(rendered.contains("/missing"));
+    assert!(rendered.contains("no matches"));
     assert!(rendered.contains("(0/0)"));
     assert_eq!(surface.confirm(), SurfaceEvent::None);
     assert!(matches!(surface.owner(), BottomOwner::Picker(_)));
@@ -642,16 +641,15 @@ fn model_picker_query_backspace_delete_and_navigation_are_bounded() {
         panic!("model picker should own surface");
     };
     assert_eq!(picker.position_indicator(), "(2/2)");
-    assert_eq!(picker.visible_rows(80).len(), 1);
+    assert_eq!(picker.visible_row_count(), 1);
 
     surface.palette_backspace();
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Filter: openroute"));
+    assert!(rendered.contains("/openroute"));
     assert!(rendered.contains("(1/2)"));
 
     surface.palette_delete();
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Filter: "));
     assert!(rendered.contains("(1/3)"));
 }
 
@@ -740,8 +738,9 @@ fn permissions_picker_leads_with_honest_session_postures() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Permissions (1/40)"));
-    assert!(rendered.contains("Quick settings - Read only"));
+    assert!(rendered.contains("Permissions · (1/40)"));
+    assert!(rendered.contains("QUICK SETTINGS"));
+    assert!(rendered.contains("Read only"));
     assert!(rendered.contains("Full access (unsandboxed)"));
     assert!(rendered.contains("Auto in workspace sandbox (not available)"));
     assert!(!rendered.contains('%'));
@@ -766,7 +765,8 @@ fn permissions_picker_keeps_per_capability_controls_under_advanced() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Advanced · Files: write - Allow file writes this session"));
+    assert!(rendered.contains("ADVANCED · FILES: WRITE"));
+    assert!(rendered.contains("Allow file writes this session"));
     assert_eq!(
         surface.confirm(),
         SurfaceEvent::Action(CommandAction::SetPermissionMode {
@@ -802,7 +802,8 @@ fn permissions_picker_exposes_agent_spawn_controls() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Advanced · Agents - Ask before spawning agents"));
+    assert!(rendered.contains("ADVANCED · AGENTS"));
+    assert!(rendered.contains("Ask before spawning agents"));
     assert_eq!(
         surface.confirm(),
         SurfaceEvent::Action(CommandAction::SetPermissionMode {
@@ -832,13 +833,12 @@ fn resume_picker_is_list_mode_with_indicator_and_action() {
         panic!("picker should own surface");
     };
     assert_eq!(picker.position_indicator(), "(1/2)");
-    assert_eq!(picker.visible_rows(80).len(), 1);
+    assert_eq!(picker.visible_row_count(), 1);
     let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
-    assert!(rendered.contains("Resume a previous session"));
-    assert!(rendered.contains("Type to search"));
+    assert!(rendered.contains("Resume · newest first"));
     assert!(rendered.contains("4m ago"));
     assert!(rendered.contains("2026-06-19 research"));
-    assert!(rendered.contains("tui"));
+    assert!(rendered.contains("TUI"));
     // Selected-row preview (id + root), not a footer "Session:" detail.
     assert!(rendered.contains("s1  /repo"));
     assert!(!rendered.contains("Session:"));
@@ -880,7 +880,7 @@ fn resume_picker_searches_label_id_and_root_path() {
     surface.palette_insert("token /repo");
     let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
 
-    assert!(rendered.contains("Search: token /repo"));
+    assert!(rendered.contains("/token /repo"));
     assert!(rendered.contains("token budget review"));
     assert!(!rendered.contains("backend cleanup"));
     assert_eq!(
@@ -1103,7 +1103,17 @@ fn code_swarm_picker_selected_row_uses_same_select_bar_styling() {
     let lines = surface
         .surface_canvas_lines(&theme, width)
         .expect("picker lines");
-    let selected_line = &lines[1]; // title row, then first checklist row (selected).
+    // Find the bar rather than indexing chrome: the row's position shifts
+    // whenever the §4.2 anatomy above it changes, and this test is about the
+    // styling, not the offset.
+    let selected_line = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.bg == Some(theme.palette.selection))
+        })
+        .expect("selected row carries the select bar");
     assert_eq!(selected_line.spans.len(), 1);
     let span = &selected_line.spans[0];
     assert_eq!(span.style.fg, Some(theme.palette.warning));

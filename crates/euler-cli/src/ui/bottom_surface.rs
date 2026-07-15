@@ -154,25 +154,18 @@ impl BottomSurface {
     }
 
     /// Themed variant of `surface_lines` used by the real render path: the
-    /// slash palette (issue #23) and the `/code-swarm` picker (issue #24)
-    /// carry an explicit selected-row style (full-width select-token
-    /// background, warning-token/gold text) that plain strings cannot
-    /// express. Every other surface keeps its plain rendering, wrapped
-    /// without added style.
+    /// selected row carries a full-width select-token background with
+    /// warning-token (gold) text, which plain strings cannot express.
+    ///
+    /// §4.2: *every* picker gets the bar — "there is no un-highlighted
+    /// picker; selection is never conveyed by the caret alone". This used to
+    /// reach only the palette, `/code-swarm`, and `/dag`, leaving the model,
+    /// resume, extensions, compaction, and generic pickers with a caret and
+    /// no bar.
     pub fn surface_canvas_lines(&self, theme: &Theme, width: u16) -> Option<Vec<CanvasLine>> {
         match &self.owner {
             BottomOwner::Palette(palette) => Some(palette.render_canvas_lines(theme, width)),
-            BottomOwner::Picker(picker) if picker.kind == PickerKind::CodeSwarmModels => {
-                Some(picker.render_code_swarm_canvas_lines(theme, width))
-            }
-            BottomOwner::Picker(picker)
-                if matches!(
-                    picker.kind,
-                    PickerKind::CausalDagActions | PickerKind::CausalDagFormats
-                ) =>
-            {
-                Some(picker.render_causal_dag_canvas_lines(theme, width))
-            }
+            BottomOwner::Picker(picker) => Some(picker.render_canvas_lines(theme, width)),
             _ => self
                 .surface_lines(width)
                 .map(|lines| lines.into_iter().map(CanvasLine::plain_lossy).collect()),
