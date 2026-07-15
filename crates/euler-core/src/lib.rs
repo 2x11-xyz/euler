@@ -20,6 +20,7 @@ pub mod permissions;
 pub mod provenance;
 pub mod redaction;
 pub mod resume;
+pub mod sandbox;
 pub mod scrub;
 pub mod session;
 pub mod session_kind;
@@ -90,6 +91,10 @@ pub use resume::{
     fold_session, read_resume_prefix, resume_session, resume_session_from_folded_prefix,
     resume_session_from_prefix, resume_session_from_prefix_with_outcome,
     resume_session_with_outcome, FoldedSession, ResumeError, ResumeOutcome, ResumeWarning,
+};
+pub use sandbox::{
+    probe_workspace_sandbox, SandboxAvailability, SandboxProfile, SandboxUnavailableReason,
+    SubprocessSandbox,
 };
 pub use session::{
     fold_model_target, fold_reasoning_effort, AgentReporter, AgentResultSummary, BackgroundAgent,
