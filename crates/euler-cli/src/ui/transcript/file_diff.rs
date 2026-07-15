@@ -495,17 +495,21 @@ fn file_diff_line_style(kind: FileDiffLineKind, theme: &Theme) -> Style {
     }
 }
 
+/// Codex vocabulary (§4): every arm opens with a bold capitalized verb, so
+/// the file-diff cell reads the same as the edit cell it sits beside. (The
+/// `add`/`modify` arms were the last lowercase holdouts here — `Deleted` and
+/// `Changed` were already capitalized.)
 fn file_diff_title(path: &str, action: &str, stats: Option<(usize, usize)>) -> String {
     match (action, stats) {
-        ("add", Some((added, _))) => format!("write {path} · new · {added} lines"),
+        ("add", Some((added, _))) => format!("Wrote {path} · new · {added} lines"),
         ("delete", Some((_, removed))) => format!("Deleted {path} (-{removed})"),
         ("modify" | "update", Some((added, removed))) => {
-            format!("edit {path} · +{added} −{removed}")
+            format!("Edited {path} · +{added} −{removed}")
         }
         (_, Some((added, removed))) => format!("Changed {path} (+{added} -{removed})"),
-        ("add", None) => format!("write {path} · new"),
+        ("add", None) => format!("Wrote {path} · new"),
         ("delete", None) => format!("Deleted {path}"),
-        ("modify" | "update", None) => format!("edit {path}"),
+        ("modify" | "update", None) => format!("Edited {path}"),
         _ => format!("Changed {path}"),
     }
 }

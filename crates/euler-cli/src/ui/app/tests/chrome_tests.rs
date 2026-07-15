@@ -363,7 +363,7 @@ fn permission_approval_and_tool_history_stay_compact_after_inline_ask() {
     assert!(!rows.iter().any(|row| row.contains("Approval required")));
     assert!(!rows.iter().any(|row| row.contains("y  Allow once")));
     let decision = row_containing(&rows, "✓ allowed once · shell-exec");
-    let tool = row_containing(&rows, "bash $ cargo check");
+    let tool = row_containing(&rows, "Ran cargo check");
     let blank_rows_between = rows[decision + 1..tool]
         .iter()
         .filter(|row| row.trim().is_empty())
@@ -766,7 +766,7 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
     .map(crate::ui::visual_canvas::CanvasLine::plain_text)
     .collect::<Vec<_>>();
 
-    assert!(lines.iter().any(|line| line.contains("bash $ ls -la")));
+    assert!(lines.iter().any(|line| line.contains("Ran ls -la")));
     // v2 (§1): hairlines are gone; every event — including the last one — is
     // followed by exactly one blank line instead. A trailing blank row is
     // expected now, not a leftover "prompt/answer rhythm" hairline.
@@ -892,7 +892,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let before_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &before_final,
-        &["Explored", "Read Cargo.toml", "bash $ cargo test"],
+        &["Explored", "Read Cargo.toml", "Ran cargo test"],
     );
     assert!(!before_final.iter().any(|row| row.contains("final answer")));
 
@@ -907,7 +907,7 @@ fn activity_cells_accumulate_before_final_answer() {
     let after_final = terminal.backend().scrollback_rows();
     assert_ordered(
         &after_final,
-        &["Explored", "bash $ cargo test", "final answer"],
+        &["Explored", "Ran cargo test", "final answer"],
     );
 }
 

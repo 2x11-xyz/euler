@@ -859,7 +859,7 @@ fn tui_static_safe_run_tags_header_and_suppresses_decision_record() {
     let contents = rendered_screen(&events, &theme, 80, 8);
 
     assert!(
-        contents.contains("bash $ ls | wc -l · safe"),
+        contents.contains("Ran ls | wc -l · safe"),
         "contents: {contents:?}"
     );
     assert!(
@@ -1057,7 +1057,7 @@ fn tui_shell_run_uses_raw_command_label_without_semantic_prefix() {
 
     let contents = rendered_screen(&events, &theme, 96, 8);
 
-    assert!(contents.contains("bash $ rg transcript crates/euler-cli/src/ui"));
+    assert!(contents.contains("Ran rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("• Ran Search"));
     assert!(!contents.contains("Search rg transcript"));
     // Collapsed cells surface the sole output row as the `└ ` result line
@@ -1201,7 +1201,7 @@ fn tui_exploration_coalesces_and_dedupes_read_labels() {
 
     assert_eq!(contents.matches("Explored").count(), 1);
     assert!(contents.contains("└ Read README.md, Cargo.toml"));
-    assert!(contents.contains("bash $ rg transcript crates/euler-cli/src/ui"));
+    assert!(contents.contains("Ran rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("Search rg transcript crates/euler-cli/src/ui"));
     assert!(!contents.contains("README raw content"));
     assert!(!contents.contains("Cargo raw content"));
@@ -1312,7 +1312,7 @@ fn tui_edit_flow_keeps_compact_patch_result_without_allow_spam() {
 
     let contents = rendered_screen(&events, &theme, 80, 14);
 
-    assert!(contents.contains("edit src/lib.rs · +1 −0"));
+    assert!(contents.contains("Edited src/lib.rs · +1 −0"));
     assert!(contents.contains("two"));
     assert!(!contents.contains("Permission required"));
     assert!(!contents.contains("Permission allowed"));
@@ -1677,7 +1677,7 @@ fn vt100_render_wraps_with_stable_gutter_and_bounded_output() {
             line.starts_with("  ")
                 || line.starts_with("• ")
                 || line.contains("▌ ")
-                || trimmed.starts_with("bash")
+                || trimmed.starts_with("Ran")
                 || line.contains("─")
                 || line.chars().next().is_some_and(|ch| ch.is_ascii_digit()),
             "unstable gutter: {line:?}"
@@ -1786,7 +1786,7 @@ fn vt100_long_tool_output_uses_head_tail_affordance() {
     let theme = Theme::default();
     let contents = rendered_screen(&events, &theme, 80, 16);
 
-    assert!(contents.contains("bash $ printf lines"));
+    assert!(contents.contains("Ran printf lines"));
     // Head+tail preview (v4 spec amendment): the literal first two and last
     // three buffer rows in buffer order, elbow on the first, fold marker
     // carrying the hidden count in between.
@@ -1817,7 +1817,7 @@ fn tui_tool_output_trims_trailing_blank_rows_before_rendering() {
 
     // title + body + hairline under the meaningful tool block
     assert_eq!(texts.len(), 3, "texts: {texts:?}");
-    assert!(texts[0].contains("bash $ printf blank"), "texts: {texts:?}");
+    assert!(texts[0].contains("Ran printf blank"), "texts: {texts:?}");
     assert!(texts[0].contains("done · 1 line"), "texts: {texts:?}");
     assert!(display_width(&texts[0]) <= 80, "texts: {texts:?}");
     assert!(display_width(&texts[1]) <= 80, "texts: {texts:?}");
@@ -1864,12 +1864,12 @@ fn tool_run_header_tags_covering_grant_source() {
     let joined = texts.join("\n");
 
     assert!(
-        joined.contains("bash $ cargo test · user rule"),
+        joined.contains("Ran cargo test · user rule"),
         "texts: {texts:?}"
     );
     assert!(!joined.contains("user grant"), "texts: {texts:?}");
     assert!(
-        joined.contains("bash $ cargo build · session grant"),
+        joined.contains("Ran cargo build · session grant"),
         "texts: {texts:?}"
     );
 }
@@ -1890,7 +1890,7 @@ fn tool_artifact_cell_handles_empty_output_without_fold_affordance() {
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("bash $ true"), "texts: {texts:?}");
+    assert!(joined.contains("Ran true"), "texts: {texts:?}");
     assert!(joined.contains("done · 0 lines"), "texts: {texts:?}");
     assert!(!joined.contains("ctrl+o"), "texts: {texts:?}");
     assert!(texts.len() >= 2, "empty output keeps body row: {texts:?}");
@@ -2871,7 +2871,7 @@ fn path_only_patch_artifact_uses_fallback_title_and_body() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("edit src/lib.rs"));
+    assert!(joined.contains("Edited src/lib.rs"));
     assert!(joined.contains("no line changes"));
     assert!(joined.contains("unknown · 1 visible rows"));
     assert!(!joined.contains("* Edited"));
@@ -2893,7 +2893,7 @@ fn patch_applied_artifact_keeps_exact_render_shape() {
     assert_eq!(
         texts,
         vec![
-            "• edit src/lib.rs · +1 −1 · update · 3 visible r",
+            "• Edited src/lib.rs · +1 −1 · update · 3 visible",
             "           @@ -1 +1 @@                          ",
             "       1 - a                                    ",
             "       1 + b                                    ",
@@ -3137,7 +3137,7 @@ fn file_diff_renders_unified_diff_as_source_first_artifact() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("edit src/lib.rs · +1 −1"));
+    assert!(joined.contains("Edited src/lib.rs · +1 −1"));
     assert!(joined.contains("     1 - old"));
     assert!(joined.contains("     1 + new"));
     assert_no_box_chars(&texts);
@@ -3162,7 +3162,7 @@ fn file_diff_omission_renders_reason_without_metadata_inference() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("edit src/lib.rs"));
+    assert!(joined.contains("Edited src/lib.rs"));
     assert!(joined.contains("  diff: omitted: secret-like"));
     assert!(!joined.contains("@@"));
     assert!(!joined.contains("File modified"));
@@ -3336,7 +3336,7 @@ fn file_change_and_file_diff_artifacts_are_distinct_and_ordered() {
         .find("File modified src/lib.rs · metadata only")
         .expect("file change cell");
     let diff_index = contents
-        .find("edit src/lib.rs · +1 −1")
+        .find("Edited src/lib.rs · +1 −1")
         .expect("file diff cell");
 
     assert!(change_index < diff_index, "contents: {contents:?}");
@@ -3389,12 +3389,12 @@ fn patch_file_change_and_file_diff_render_independently_in_event_order() {
     let theme = Theme::default();
 
     let contents = rendered_screen(&events, &theme, 96, 24);
-    let patch_index = contents.find("edit src/lib.rs").expect("patch cell");
+    let patch_index = contents.find("Edited src/lib.rs").expect("patch cell");
     let change_index = contents
         .find("File modified src/lib.rs · metadata only")
         .expect("file change cell");
     let diff_index = contents
-        .rfind("edit src/lib.rs · +1 −1")
+        .rfind("Edited src/lib.rs · +1 −1")
         .expect("file diff cell");
 
     assert!(patch_index < change_index, "contents: {contents:?}");
@@ -3575,7 +3575,7 @@ fn patch_and_file_change_artifacts_are_distinct_and_ordered() {
     let theme = Theme::default();
 
     let contents = rendered_screen(&events, &theme, 80, 18);
-    let patch_index = contents.find("edit src/lib.rs").expect("patch cell");
+    let patch_index = contents.find("Edited src/lib.rs").expect("patch cell");
     let change_index = contents
         .find("File modified src/lib.rs · metadata only")
         .expect("file change cell");
@@ -3605,15 +3605,11 @@ fn consecutive_patch_artifact_cells_do_not_merge_or_use_old_child_rows() {
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
     let joined = texts.join("\n");
 
-    assert_eq!(joined.matches("edit src/").count(), 2, "texts: {texts:?}");
+    assert_eq!(joined.matches("Edited src/").count(), 2, "texts: {texts:?}");
     assert_no_box_chars(&texts);
     assert!(
         !joined.contains("  └ @@"),
         "old child row leaked: {texts:?}"
-    );
-    assert!(
-        !joined.contains("• Edited"),
-        "old parent row leaked: {texts:?}"
     );
 }
 
@@ -3869,7 +3865,7 @@ fn vt100_failed_tool_with_exit_code_and_empty_error_has_no_dangling_colon() {
 
     let contents = rendered_screen(&events, &theme, 48, 4);
 
-    assert!(contents.contains("bash"));
+    assert!(contents.contains("Ran"));
     assert!(contents.contains("✗ exit 2 · 0 lines"));
     assert!(!contents.contains("exit 2:"));
 }
@@ -3957,12 +3953,12 @@ fn edit_failure_renders_path_and_cause_inline() {
 
     assert!(
         contents
-            .contains("edit retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"),
+            .contains("Edited retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"),
         "contents: {contents:?}"
     );
     assert!(!contents.contains("edit failed"), "contents: {contents:?}");
     assert!(
-        !contents.contains("edit retry.rs failed"),
+        !contents.contains("Edited retry.rs failed"),
         "contents: {contents:?}"
     );
 }

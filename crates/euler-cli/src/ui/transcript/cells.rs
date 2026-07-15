@@ -83,13 +83,17 @@ pub(super) fn render_edit_cell(
     width: u16,
     limit: usize,
 ) {
+    // Codex vocabulary (§4): a bold capitalized verb + target. `Wrote` keeps
+    // file creation distinguishable from modification — the spec folds new
+    // files into the `Edited` group when several files change at once, but a
+    // lone created file is not an edit and reads wrong as one.
     let heading = match (
         patch_diff::action(edit.old, edit.new),
         diffstat(edit.old, edit.new),
     ) {
-        ("add", Some((added, _))) => format!("write {} · new · {added} lines", edit.path),
-        (_, Some((added, removed))) => format!("edit {} · +{added} −{removed}", edit.path),
-        _ => format!("edit {}", edit.path),
+        ("add", Some((added, _))) => format!("Wrote {} · new · {added} lines", edit.path),
+        (_, Some((added, removed))) => format!("Edited {} · +{added} −{removed}", edit.path),
+        _ => format!("Edited {}", edit.path),
     };
     render_patch_cell(
         lines,
@@ -696,15 +700,15 @@ mod tests {
                 "retry.rs",
                 "hunk 2/3 did not apply — file changed on disk since read"
             ),
-            "edit retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"
+            "Edited retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"
         );
-        assert_eq!(edit_failure_status("", ""), "edit ✗ no cause recorded");
+        assert_eq!(edit_failure_status("", ""), "Edited ✗ no cause recorded");
         assert_eq!(
             edit_failure_status(
                 "lib.rs",
                 "replacement text matched 0 times; expected exactly one"
             ),
-            "edit lib.rs ✗ replacement text matched 0 times; expected exactly one"
+            "Edited lib.rs ✗ replacement text matched 0 times; expected exactly one"
         );
     }
 
