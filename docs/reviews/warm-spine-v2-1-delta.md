@@ -174,6 +174,13 @@ Worth fixing in the source doc.
    `[x]`/`[ ]` with space to toggle. §5.11: extensions use `●`/`○` — and space
    toggles them. Followed §5.11 (more specific; enabled/disabled is a state,
    not a selection), but the rule in §4.2 should say so.
+3a. **§2 vs §4 conflict on bold.** §2: "Bold is reserved for user messages,
+   markdown headings, and picker/approval titles." §4: "a **bold** capitalized
+   verb", three times over. §2's list predates the Codex vocabulary adoption
+   and should name the verb set as a fourth use — ui.md now does.
+3b. **§4 never names a verb for the git tools.** Children are specified as
+   `Read`/`Search`; `git_status`/`git_diff` have no verb, so Euler uses `Git`.
+   Worth adopting or replacing in the source doc.
 4. **§4's "exactly one `└` result line" and §6's "most informative line" are
    superseded** by ui.md's head+tail amendment (2026-07-11), which postdates the
    spec by a day and says so explicitly. A blanket "spec wins" reconciliation
@@ -206,6 +213,42 @@ Worth fixing in the source doc.
    has a formatter kept alive solely by `const _: fn(usize) -> Option<String> =
    new_events_pill_text;` to suppress dead-code, with a comment saying the wiring
    is a follow-up. CLAUDE.md: "a helper lands with its consumer or not at all."
+
+---
+
+## 6 · Review findings (PR #132), all fixed
+
+Every one reproduced. Recorded because the pattern matters more than the
+individual bugs: **all five code findings were in paths with no test at all.**
+Each fix landed with the test that was missing, and each test was verified to
+fail against the unfixed code.
+
+1. **Extension rows repeated every fact** — `› ● ● causal-dag  (bundled)
+   causal-dag`. `ExtensionManagerItem::label()` bakes marker + id + kind into
+   one string; the unified picker then added its own marker, its own group
+   header, and the id again as the description. Contradicted this branch's own
+   "rows stop repeating their own value".
+2. **Action rows wore posture radios.** The marker came from whether the picker
+   held *any* posture, so `Advanced ›` and the unavailable sandbox row got `○`
+   — claiming to be unselected postures. The row's action now decides.
+3. **`/status` dropped the posture mid-turn.** Guarded by `AppState::Idle`,
+   but `/status` answers during `TurnInFlight`, which carries no session —
+   which is why the guard existed. Now cached on `StatusSnapshot`.
+4. **The Ask envelope overstated the boundary.** "every capability asks" is
+   false: statically-safe shell commands (#78) and covered durable grants run
+   without a prompt. In the one line whose job is to state the boundary
+   exactly, an approximation is the worst possible content.
+5. **Bold followed capitalization, not vocabulary** — `File`, `Patch`,
+   uppercase filenames. Now the closed `CODEX_VERBS` set.
+6. **Docs contradicted themselves**: ui.md required bold verbs while
+   Typography allowed bold for only three things (inherited from the spec's own
+   §2/§4 conflict); the sign-column contract said `−` while the renderers emit
+   ASCII `-` (the renderers are right — a copied row must paste back as a valid
+   diff); and ADR 0010 still normatively specified the v1 gutter, hairlines and
+   nearest-block `ctrl+o`, now carrying a partial-supersession note.
+
+Also reverted two `expect()` messages a rename regex mangled: the alternation
+included bare `a`/`b`, so `"write auth file"` and `"write blob event"` matched.
 
 ---
 
