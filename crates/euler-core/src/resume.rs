@@ -1,5 +1,5 @@
 use crate::canvas::{AutoCompactionPolicy, CompactionTier};
-use crate::permissions::ApprovalMode;
+use crate::permissions::{permission_prompt_capabilities, ApprovalMode};
 use crate::provenance::{accepted_prefix_lines, ProvenanceWriter};
 use crate::session::{
     fold_model_target, fold_reasoning_effort, ModelTarget, Session, SessionConfig,
@@ -90,6 +90,19 @@ pub fn fold_session(
     let mut auto_compaction = config.auto_compaction;
     let mut session_allowed_capabilities = Vec::new();
     let mut warnings = Vec::new();
+    // A batch is one authorization operation even though its decisions remain
+    // per-capability. Never revive the first recorded session grant from an
+    // interrupted batch: doing so would turn a partial durable tail into a
+    // live authorization on resume.
+    let unsettled_permission_batches = events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::PERMISSION_PROMPT
+                && permission_prompt_is_batch(event)
+                && !permission_prompt_is_resolved(&events, event)
+        })
+        .map(|event| event.id.as_str())
+        .collect::<BTreeSet<_>>();
 
     for event in &events {
         match event.kind.as_str() {
@@ -117,38 +130,15 @@ pub fn fold_session(
                 latest_model_usage_used_tokens = event.payload.get("usage").and_then(used_tokens);
             }
             EventKind::CONTEXT_LIMIT => context_limit_emitted = Some(target_at_event.clone()),
-            EventKind::PERMISSION_DECISION => {
-                // Fold only explicit session-scoped grants made by the root
-                // agent; companion decisions are per-spawn and never folded.
-                // Resume trusts local session provenance as authoritative
-                // local state (ADR A13).
-                if event.agent == config.agent_id
-                    && payload_str(event, "scope") == Some("session")
-                    && payload_str(event, "decision") == Some("allowed")
-                {
-                    if let Some(capability) =
-                        payload_str(event, "capability").and_then(Capability::parse)
-                    {
-                        if !session_allowed_capabilities.contains(&capability) {
-                            session_allowed_capabilities.push(capability);
-                        }
-                    } else {
-                        warnings.push(ResumeWarning {
-                            message: format!(
-                                "session-scoped grant for unknown capability ignored at {}",
-                                event.id
-                            ),
-                        });
-                    }
-                }
-            }
-            EventKind::PERMISSION_PROMPT if !has_permission_decision(&events, &event.id) => {
-                warnings.push(ResumeWarning {
-                    message: format!(
-                        "permission prompt {} has no decision in historical prefix",
-                        event.id
-                    ),
-                });
+            EventKind::PERMISSION_DECISION => fold_session_permission_decision(
+                event,
+                &config.agent_id,
+                &unsettled_permission_batches,
+                &mut session_allowed_capabilities,
+                &mut warnings,
+            ),
+            EventKind::PERMISSION_PROMPT => {
+                warn_if_permission_prompt_unresolved(event, &events, &mut warnings)
             }
             _ => {}
         }
@@ -165,6 +155,58 @@ pub fn fold_session(
         session_allowed_capabilities,
         warnings,
     })
+}
+
+fn fold_session_permission_decision(
+    event: &EventEnvelope,
+    agent_id: &str,
+    unsettled_permission_batches: &BTreeSet<&str>,
+    session_allowed_capabilities: &mut Vec<Capability>,
+    warnings: &mut Vec<ResumeWarning>,
+) {
+    // Fold only explicit session-scoped grants made by the root agent;
+    // companion decisions are per-spawn and never folded. An interrupted
+    // operation batch must not revive its first persisted session grant.
+    if event.agent != agent_id
+        || event
+            .parent
+            .as_deref()
+            .is_some_and(|parent| unsettled_permission_batches.contains(parent))
+        || payload_str(event, "scope") != Some("session")
+        || payload_str(event, "decision") != Some("allowed")
+    {
+        return;
+    }
+    if let Some(capability) = payload_str(event, "capability").and_then(Capability::parse) {
+        if !session_allowed_capabilities.contains(&capability) {
+            session_allowed_capabilities.push(capability);
+        }
+    } else {
+        warnings.push(ResumeWarning {
+            message: format!(
+                "session-scoped grant for unknown capability ignored at {}",
+                event.id
+            ),
+        });
+    }
+}
+
+fn warn_if_permission_prompt_unresolved(
+    prompt: &EventEnvelope,
+    events: &[EventEnvelope],
+    warnings: &mut Vec<ResumeWarning>,
+) {
+    if permission_prompt_is_resolved(events, prompt) {
+        return;
+    }
+    let state = if permission_prompt_is_batch(prompt) {
+        "has an incomplete decision set in historical prefix"
+    } else {
+        "has no decision in historical prefix"
+    };
+    warnings.push(ResumeWarning {
+        message: format!("permission prompt {} {state}", prompt.id),
+    });
 }
 
 pub fn read_resume_prefix(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>, ResumeError> {
@@ -565,28 +607,38 @@ fn permission_suffix_belongs_to_call(call: &EventEnvelope, suffix: &[EventEnvelo
 }
 
 fn permission_prompt_without_decision(suffix: &[EventEnvelope]) -> bool {
-    let prompts = suffix
+    suffix
         .iter()
         .filter(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
-        .map(|event| event.id.as_str())
-        .collect::<BTreeSet<_>>();
-    !prompts.is_empty()
-        && !suffix.iter().any(|event| {
-            event.kind.as_str() == EventKind::PERMISSION_DECISION
-                && !extension_permission_decision(event)
-                && event
-                    .parent
-                    .as_deref()
-                    .is_some_and(|parent| prompts.contains(parent))
-        })
+        .any(|prompt| !permission_prompt_is_resolved(suffix, prompt))
 }
 
-fn has_permission_decision(events: &[EventEnvelope], prompt_id: &str) -> bool {
-    events.iter().any(|event| {
-        event.kind.as_str() == EventKind::PERMISSION_DECISION
-            && !extension_permission_decision(event)
-            && event.parent.as_deref() == Some(prompt_id)
-    })
+fn permission_prompt_is_resolved(events: &[EventEnvelope], prompt: &EventEnvelope) -> bool {
+    let expected = permission_prompt_capabilities(&prompt.payload);
+    if expected.is_empty() {
+        return false;
+    }
+    let decided = events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::PERMISSION_DECISION
+                && !extension_permission_decision(event)
+                && event.parent.as_deref() == Some(prompt.id.as_str())
+        })
+        .filter_map(|event| payload_str(event, "capability"))
+        .collect::<BTreeSet<_>>();
+    expected
+        .iter()
+        .all(|capability| decided.contains(capability.as_str()))
+}
+
+fn permission_prompt_is_batch(prompt: &EventEnvelope) -> bool {
+    prompt
+        .payload
+        .get("batch")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || prompt.payload.get("capabilities").is_some()
 }
 
 fn extension_permission_decision(event: &EventEnvelope) -> bool {

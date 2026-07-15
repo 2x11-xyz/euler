@@ -286,6 +286,24 @@ ledger. Scoped grants and project persistence are defined in
 `docs/contracts/capabilities.md` (when extended); the UI must not claim a
 scope the gate did not grant.
 
+An extension command with several uncovered static capabilities renders one
+operation panel that names the command and lists every requested capability.
+Its choices are allow once, allow every listed capability for this session, or
+deny. The corresponding ledger entries remain separate per-capability
+decisions. Project and durable-user choices are absent from this panel because
+the grouped operation has no single narrow subject for those scopes.
+
+`/permissions` offers session-local postures before its advanced
+per-capability controls: **Read only** permits `fs-read`, `provenance-read`,
+and `diagnostics-read`; **Ask every time** puts every capability in `ask`; and
+**Full access (unsandboxed)** permits every capability for the current
+session. **Auto in workspace sandbox** stays visibly unavailable until an
+enforced Linux workspace-sandbox backend exists. A permission posture is not
+a sandbox claim and does not override secret/config guardrails. Applying a
+posture clears transient session grants, so a prior session approval cannot
+silently survive a switch to **Ask every time**; explicit project/user rules
+remain separately visible in the advanced controls.
+
 Runs that did not prompt render their provenance as a dim tag on the tool
 header instead of a standalone decision record: `· session grant` /
 `· project grant` for covered grants, `· safe` for static-safety

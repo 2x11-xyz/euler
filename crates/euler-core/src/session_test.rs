@@ -1072,6 +1072,162 @@ fn gated_extension_run_session_grant_covers_later_runs() {
 }
 
 #[test]
+fn gated_extension_run_batches_capabilities_but_keeps_individual_decisions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-gated-batch");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let writer = ProvenanceWriter::new(session_dir.join("events.jsonl")).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-gated-batch".to_owned();
+    enable_test_extensions(&mut config, &["batch-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::AllowSession]),
+    )
+    .with_provenance(writer);
+    let required = [Capability::ArtifactWrite, Capability::Network];
+    let extension = test_extension(
+        "batch-ext",
+        required.to_vec(),
+        TestCommandBehavior::Write {
+            chunks: vec![b"first".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    session
+        .execute_extension_command_gated(&extension, "write", json!(null), &required)
+        .expect("first run approved as one operation");
+    session
+        .execute_extension_command_gated(&extension, "write", json!(null), &required)
+        .expect("session approval covers both capabilities on the second run");
+
+    let prompts = session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::PERMISSION_PROMPT
+                && event.payload["extension_id"] == json!("batch-ext")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 1, "one operation gets one prompt");
+    let prompt = prompts[0];
+    assert_eq!(prompt.payload["batch"], json!(true));
+    assert_eq!(
+        prompt.payload["capabilities"],
+        json!(["artifact-write", "network"])
+    );
+
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::PERMISSION_DECISION
+                && event.parent.as_deref() == Some(prompt.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 2, "ledger remains per capability");
+    assert!(decisions
+        .iter()
+        .all(|event| event.payload["allowed"] == json!(true)));
+    assert!(decisions
+        .iter()
+        .all(|event| event.payload["scope"] == json!("session")));
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|event| event.payload["capability"].as_str().expect("capability"))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["artifact-write", "network"])
+    );
+}
+
+#[test]
+fn gated_extension_batch_denial_records_every_capability_and_executes_nothing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp
+        .path()
+        .join("sessions")
+        .join("session-gated-batch-deny");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let writer = ProvenanceWriter::new(session_dir.join("events.jsonl")).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-gated-batch-deny".to_owned();
+    enable_test_extensions(&mut config, &["batch-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Deny]),
+    )
+    .with_provenance(writer);
+    let required = [Capability::ArtifactWrite, Capability::Network];
+    let extension = test_extension(
+        "batch-ext",
+        required.to_vec(),
+        TestCommandBehavior::Write {
+            chunks: vec![b"must not be written".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    let error = session
+        .execute_extension_command_gated(&extension, "write", json!(null), &required)
+        .expect_err("denying the operation blocks it as a whole");
+    assert!(matches!(
+        error,
+        ExtensionExecutionError::CapabilityDenied {
+            capability: Capability::ArtifactWrite
+        }
+    ));
+    assert!(extension_artifacts(session.events()).is_empty());
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 2);
+    assert!(decisions
+        .iter()
+        .all(|event| event.payload["allowed"] == json!(false)));
+}
+
+#[test]
+fn extension_batch_preflights_always_deny_without_a_partial_prompt() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-gated-preflight");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let writer = ProvenanceWriter::new(session_dir.join("events.jsonl")).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-gated-preflight".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    )
+    .with_provenance(writer);
+    session.set_permission_mode(Capability::Network, ApprovalMode::AlwaysDeny);
+
+    let error = session
+        .approve_extension_capabilities(
+            "batch-ext",
+            "write",
+            &[Capability::ArtifactWrite, Capability::Network],
+        )
+        .expect_err("static deny wins before any user-facing partial approval");
+    assert!(matches!(
+        error,
+        ExtensionExecutionError::CapabilityDenied {
+            capability: Capability::Network
+        }
+    ));
+    assert!(session.events().iter().all(|event| {
+        event.kind.as_str() != EventKind::PERMISSION_PROMPT
+            && event.kind.as_str() != EventKind::PERMISSION_DECISION
+    }));
+}
+
+#[test]
 fn live_extension_spawn_agent_enforces_per_command_quota() {
     // Host-side fan-out ceiling: even an extension whose own input
     // validation fails must not spawn unbounded agents from one command.

@@ -375,6 +375,67 @@ fn extension_permission_decisions_do_not_satisfy_tool_prompts_or_tail_matching()
 }
 
 #[test]
+fn partially_decided_permission_batch_stays_interrupted_on_resume() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let call = tool_call(None, "call-extension", "extension_run");
+    let prompt = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::PERMISSION_PROMPT,
+        object([
+            ("capability", "fs-write".into()),
+            ("capabilities", json!(["fs-write", "network"])),
+            ("batch", true.into()),
+            ("operation", "extension example.run".into()),
+        ]),
+    );
+    let first_decision = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(prompt.id.clone()),
+        EventKind::PERMISSION_DECISION,
+        object([
+            ("capability", "fs-write".into()),
+            ("mode", "ask".into()),
+            ("allowed", true.into()),
+            ("decision", "allowed".into()),
+        ]),
+    );
+    write_events(&log, &[call, prompt, first_decision]);
+
+    let decider = CountingDecider::default();
+    let decider_calls = Rc::clone(&decider.calls);
+    let mut outcome = resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        decider,
+        &log,
+    )
+    .expect("resume");
+
+    assert!(outcome.warnings.iter().any(|warning| warning
+        .message
+        .contains("has an incomplete decision set in historical prefix")));
+    let closures = recovery_closures(outcome.session.events());
+    assert_eq!(closures.len(), 1);
+    assert!(payload_str(closures[0], "error")
+        .expect("closure message")
+        .contains("permission undecided"));
+    let retry = outcome.session.approve_extension_capabilities(
+        "example",
+        "run",
+        &[euler_sdk::Capability::FsWrite],
+    );
+    assert!(
+        retry.is_err(),
+        "partial batch must not revive fs-write access"
+    );
+    assert_eq!(decider_calls.get(), 1, "retry must reach the decider");
+}
+
+#[test]
 fn extension_permission_decisions_alone_leave_resume_state_unaffected() {
     let temp = tempfile::tempdir().expect("temp dir");
     let events = vec![

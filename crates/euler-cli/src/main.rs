@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(clippy::too_many_lines))] // unit-test exemption for inline test modules
 use anyhow::{anyhow, Result};
-use euler_core::permissions::{DeciderVerdict, PermissionRequest};
+use euler_core::permissions::{DeciderVerdict, PermissionRequest, PermissionRequestBatch};
 use euler_core::{
     fold_session, read_provenance, read_resume_prefix, resume_session_from_folded_prefix,
     CompactionTier, EulerHome, ModelTarget, PermissionDecider, PermissionReviewer,
@@ -2387,6 +2387,27 @@ impl PermissionDecider for CliDecider {
             "permission: allow {} for {}? [y/N] ",
             request.capability.as_str(),
             request.reason
+        );
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer).is_ok()
+            && matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+        {
+            DeciderVerdict::Allow
+        } else {
+            DeciderVerdict::Deny
+        }
+    }
+
+    fn decide_batch(&mut self, batch: &PermissionRequestBatch) -> DeciderVerdict {
+        let capabilities = batch
+            .capabilities()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprint!(
+            "permission: allow {capabilities} for {}? [y/N] ",
+            batch.operation()
         );
         let _ = io::stderr().flush();
         let mut answer = String::new();

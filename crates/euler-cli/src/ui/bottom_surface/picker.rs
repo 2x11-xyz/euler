@@ -902,6 +902,28 @@ fn permission_items(choices: Vec<PermissionChoice>) -> Vec<PickerItem> {
     choices
         .into_iter()
         .map(|choice| match choice {
+            PermissionChoice::Posture {
+                posture,
+                label,
+                detail,
+            } => PickerItem {
+                label,
+                detail: Some(detail),
+                status: None,
+                group: Some("Quick settings".to_owned()),
+                provider_tag: None,
+                current: false,
+                action: CommandAction::SetPermissionPosture { posture },
+            },
+            PermissionChoice::Unavailable { label, detail } => PickerItem {
+                label,
+                detail: Some(detail),
+                status: Some("unavailable".to_owned()),
+                group: Some("Quick settings".to_owned()),
+                provider_tag: None,
+                current: false,
+                action: CommandAction::PermissionSandboxUnavailable,
+            },
             PermissionChoice::SetMode {
                 capability,
                 mode,
@@ -910,7 +932,7 @@ fn permission_items(choices: Vec<PermissionChoice>) -> Vec<PickerItem> {
                 label: human_permission_label(capability, mode).to_owned(),
                 detail: None,
                 status: None,
-                group: Some(capability_group_label(capability).to_owned()),
+                group: Some(format!("Advanced · {}", capability_group_label(capability))),
                 provider_tag: None,
                 current: false,
                 action: CommandAction::SetPermissionMode { capability, mode },
