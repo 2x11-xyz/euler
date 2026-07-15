@@ -1137,6 +1137,51 @@ mod tests {
         assert!(!text.contains("Git  diff"), "text: {text:?}");
     }
 
+    /// §1: exactly one anchor per event, in both gutter modes. The cell
+    /// prefix is only a placeholder for the spliced-in spine glyph, so a
+    /// second bullet means the placeholder survived. This regressed unseen
+    /// with `/timestamps` on because every other anchor test runs in the
+    /// default gutter-off mode, where the bug cannot appear.
+    #[test]
+    fn one_anchor_per_event_in_both_gutter_modes() {
+        let entries = vec![ProjectedEntry {
+            item: TranscriptItem::Exploration {
+                summaries: vec!["Read Cargo.toml".to_owned()],
+            },
+            timing: Some(EventTiming {
+                absolute: "12:00:06".to_owned(),
+                since_previous: Some("6s".to_owned()),
+                since_start: Some("6s".to_owned()),
+            }),
+        }];
+
+        for show_gutter in [false, true] {
+            let lines = crate::ui::text::with_timestamp_gutter(show_gutter, || {
+                render_projected_entries(
+                    &entries,
+                    &Theme::default(),
+                    80,
+                    TranscriptRenderLimits::default(),
+                )
+            });
+            let text = plain_text(&lines);
+            let header = text.lines().next().expect("header row");
+            assert_eq!(
+                header.matches('•').count(),
+                1,
+                "show_gutter={show_gutter}, header: {header:?}"
+            );
+            if show_gutter {
+                assert!(
+                    header.starts_with("12:00:06 • Explored"),
+                    "header: {header:?}"
+                );
+            } else {
+                assert!(header.starts_with("• Explored"), "header: {header:?}");
+            }
+        }
+    }
+
     /// §4: the verb is the only bold token on a group row — the target keeps
     /// the row's own weight, so the eye lands on what was done, not the path.
     #[test]

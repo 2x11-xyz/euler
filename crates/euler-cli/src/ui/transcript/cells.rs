@@ -298,11 +298,19 @@ pub(super) fn push_cell_parent(
     theme: &Theme,
     width: u16,
 ) {
+    // Reserve the gutter and let the spine own the anchor: the renderer
+    // splices the real `•` glyph over this first span (`stamp_first_line`),
+    // so a literal bullet here is a placeholder that gets thrown away. It has
+    // to be `blank_gutter()` rather than a hardcoded 2-cell `"• "`, because
+    // with `/timestamps` on the gutter is 11 cells wide — a 2-cell prefix is
+    // not recognized as the ledger gutter there, so a blank gutter got
+    // prepended and the splice replaced *that*, leaving the placeholder
+    // behind as a second bullet (`12:00:06 • • Explored`).
     push_wrapped_with_prefix(
         lines,
         CellPrefixes {
-            first: "• ",
-            next: "  ",
+            first: blank_gutter(),
+            next: blank_gutter(),
         },
         text,
         style,
