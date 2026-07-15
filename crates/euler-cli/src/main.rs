@@ -54,8 +54,7 @@ mod ui;
 use auth_commands::{logout_args_for_provider, logout_chatgpt, print_auth_status, LogoutArgs};
 use auth_validation::{validate_provider_auth, StoredApiKeyAuth, StoredChatGptAuth};
 use bundled_extensions::{
-    bundled_descriptor_by_id, bundled_extension_by_id, bundled_round_observer,
-    validate_observe_options, ObserveOptions,
+    bundled_descriptor_by_id, bundled_extension_by_id, resolve_round_observer, ObserveOptions,
 };
 use companion_run::execute_headless_companion_run;
 use extension_cli::{run_extension_command, ExtensionArgs};
@@ -181,9 +180,12 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
-    let observer = bundled_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
+    let observer = resolve_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
     if let Some((observer_config, _)) = &observer {
         live_session.config.round_observer = Some(observer_config.clone());
+        if let Some(id) = run.observe.extension_id.as_ref() {
+            live_session.config.extensions_enabled.insert(id.clone());
+        }
     }
     bind_diagnostics_for_log(&live_session.log_path);
     let providers = ProviderSet::single_named(run.provider_id.clone(), run.provider);
@@ -210,9 +212,12 @@ fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
-    let observer = bundled_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
+    let observer = resolve_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
     if let Some((observer_config, _)) = &observer {
         live_session.config.round_observer = Some(observer_config.clone());
+        if let Some(id) = run.observe.extension_id.as_ref() {
+            live_session.config.extensions_enabled.insert(id.clone());
+        }
     }
     bind_diagnostics_for_log(&live_session.log_path);
     let (decider, channels) = TuiDecider::new();
@@ -323,9 +328,12 @@ fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &exec.run.extensions)?;
     let observer =
-        bundled_round_observer(&exec.run.observe, &live_session.config.extensions_enabled)?;
+        resolve_round_observer(&exec.run.observe, &live_session.config.extensions_enabled)?;
     if let Some((observer_config, _)) = &observer {
         live_session.config.round_observer = Some(observer_config.clone());
+        if let Some(id) = exec.run.observe.extension_id.as_ref() {
+            live_session.config.extensions_enabled.insert(id.clone());
+        }
     }
     let tier = exec.auto_approve;
     let providers = ProviderSet::single_named(exec.run.provider_id.clone(), exec.run.provider);
@@ -499,9 +507,12 @@ where
     apply_permission_reviewer(&mut config, &run);
     config.extensions_enabled = resolve_session_extensions(&config.root, &run.extensions)?;
     configure(&mut config);
-    let observer = bundled_round_observer(&run.observe, &config.extensions_enabled)?;
+    let observer = resolve_round_observer(&run.observe, &config.extensions_enabled)?;
     if let Some((observer_config, _)) = &observer {
         config.round_observer = Some(observer_config.clone());
+        if let Some(id) = run.observe.extension_id.as_ref() {
+            config.extensions_enabled.insert(id.clone());
+        }
     }
     let folded = fold_session(&config, prefix)?;
     let providers = if let Some(original) = &folded.original_target {
@@ -2093,7 +2104,6 @@ fn build_run_args(
         None => default_model_for_provider(&live.provider_id, catalog, custom_providers)?,
     };
     let observe = parsed.observe.clone().normalized()?;
-    validate_observe_options(&observe)?;
 
     Ok(RunArgs {
         provider_id: live.provider_id,

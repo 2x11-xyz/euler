@@ -8,6 +8,24 @@ line-oriented live-session `extension_run` control line, and the TUI
 `/extension run` form. Python is the first client SDK for that contract; it is
 not a Python-only runtime mode.
 
+Managed-process packages may also declare a round observer:
+
+```json
+"observer": {
+  "brief_command": "observer-brief",
+  "apply_command": "observer-apply",
+  "default_cadence_rounds": 8
+}
+```
+
+Both commands must be present in `commands`. After linking and enabling the
+package, `euler --observe <extension-id>` runs the same generic
+brief/companion/apply chain used by native observers. `--observe-cadence N`
+overrides the manifest default. Euler revalidates linked activation and the
+reviewed manifest fingerprint before each automatic observer command. An
+observer is pinned to the fingerprint selected at session startup; after a
+reload, restart or resume the session to use the newly reviewed package.
+
 Linking inventories a local package without starting it. `validate`, `link`,
 and `info` show a managed package's exact argv; `enable` echoes that argv as it
 records the explicit local decision to launch it. Reloading or disabling

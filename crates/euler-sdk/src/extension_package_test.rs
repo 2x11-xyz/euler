@@ -488,6 +488,7 @@ fn linked_extension(
                 summary: "Inspect provenance.".to_owned(),
                 required_capabilities: vec!["provenance-read".to_owned()],
             }],
+            observer: None,
         },
         broken_reason,
     }
@@ -514,4 +515,46 @@ fn inventory_record(id: &str, source_path: &str) -> serde_json::Value {
             }]
         }
     })
+}
+
+#[test]
+fn manifest_parses_observer_declaration_and_rejects_unknown_commands() {
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "observer-example",
+        "display_name": "Observer example",
+        "extension_version": "0.1.0",
+        "runtime_kind": "native-rust",
+        "capabilities": [],
+        "commands": [
+            {"name":"brief","display_name":"Brief","summary":"Brief.","required_capabilities":[]},
+            {"name":"apply","display_name":"Apply","summary":"Apply.","required_capabilities":[]}
+        ],
+        "observer": {
+            "brief_command": "brief",
+            "apply_command": "apply",
+            "default_cadence_rounds": 3
+        }
+    });
+    let descriptor =
+        parse_extension_manifest_bytes(&serde_json::to_vec(&manifest).expect("manifest json"))
+            .expect("valid observer manifest");
+    assert_eq!(
+        descriptor.observer,
+        Some(StaticObserverDescriptor {
+            brief_command: "brief".to_owned(),
+            apply_command: "apply".to_owned(),
+            default_cadence_rounds: 3,
+        })
+    );
+
+    let mut invalid = manifest;
+    invalid["observer"]["brief_command"] = serde_json::json!("missing");
+    let error = parse_extension_manifest_bytes(
+        &serde_json::to_vec(&invalid).expect("invalid manifest json"),
+    )
+    .expect_err("unknown observer command");
+    assert!(error
+        .to_string()
+        .contains("manifest observer command `missing` is not registered"));
 }

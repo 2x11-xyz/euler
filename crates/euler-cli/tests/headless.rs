@@ -532,6 +532,175 @@ fn exec_observe_causal_dag_spawns_observer_companion_and_stays_fail_open() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn exec_observe_runs_enabled_linked_python_observer_automatically() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let sdk_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "python-round-observer",
+        "display_name": "Python round observer",
+        "extension_version": "0.1.0",
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": ["python3", "-B", "-u", "extension.py"]},
+        "capabilities": [],
+        "commands": [
+            {
+                "name": "observer-brief",
+                "display_name": "Observer brief",
+                "summary": "Observe a round boundary.",
+                "required_capabilities": []
+            },
+            {
+                "name": "observer-apply",
+                "display_name": "Observer apply",
+                "summary": "Apply an observation.",
+                "required_capabilities": []
+            }
+        ],
+        "observer": {
+            "brief_command": "observer-brief",
+            "apply_command": "observer-apply",
+            "default_cadence_rounds": 1
+        }
+    });
+    fs::write(
+        extension_dir
+            .path()
+            .join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write observer manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        format!(
+            r#"import sys
++from pathlib import Path
++sys.path.insert(0, {sdk_source:?})
++from euler_managed_process_sdk import serve
++
++def brief(context):
++    Path("observer-ran").write_text("yes")
++    return {{"status": "idle"}}
++
++serve({{"observer-brief": brief, "observer-apply": lambda context: {{"ok": True}}}})
++"#,
+            sdk_source = sdk_source.to_string_lossy()
+        )
+        .replace("\n+", "\n"),
+    )
+    .expect("write observer process");
+    configure_linked_extension(exe, &home, extension_dir.path(), "python-round-observer");
+    fs::write(root.path().join("input.txt"), "observer input\n").expect("write input");
+    let script = write_fixture_script(
+        root.path(),
+        "python-observer-loop.json",
+        &r#"{
++  "version": 1,
++  "responses": [
++    {"events": [
++      {"tool_call": {"id": "call-read", "name": "read_file", "input": {"path": "input.txt"}}},
++      {"finished": {"stop_reason": "tool_use"}}
++    ]},
++    {"events": [
++      {"text_delta": "driver done"},
++      {"finished": {"stop_reason": "completed"}}
++    ]}
++  ]
++}"#
+        .replace("\n+", "\n"),
+    );
+
+    let output = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &format!("event-script={}", path_str(&script)),
+            "--observe",
+            "python-round-observer",
+            "read input.txt",
+        ])
+        .output()
+        .expect("run exec with Python observer");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        extension_dir.path().join("observer-ran").is_file(),
+        "managed observer brief did not run automatically"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_observe_rejects_linked_python_observer_without_launch_consent() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "python-disabled-observer",
+        "display_name": "Python disabled observer",
+        "extension_version": "0.1.0",
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": ["python3", "-B", "-u", "extension.py"]},
+        "capabilities": [],
+        "commands": [
+            {"name":"brief","display_name":"Brief","summary":"Brief.","required_capabilities":[]},
+            {"name":"apply","display_name":"Apply","summary":"Apply.","required_capabilities":[]}
+        ],
+        "observer": {
+            "brief_command": "brief",
+            "apply_command": "apply",
+            "default_cadence_rounds": 1
+        }
+    });
+    fs::write(
+        extension_dir
+            .path()
+            .join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write observer manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        "from pathlib import Path\nPath('observer-ran').write_text('yes')\n",
+    )
+    .expect("write observer process");
+    let linked = command_with_home(exe, &home)
+        .args(["extension", "link", path_str(extension_dir.path())])
+        .output()
+        .expect("link observer");
+    assert!(linked.status.success());
+
+    let output = command_with_home(exe, &home)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--observe",
+            "python-disabled-observer",
+            "do work",
+        ])
+        .output()
+        .expect("reject disabled observer");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "linked extension is not enabled; run `euler extension enable python-disabled-observer` first"
+    ));
+    assert!(!extension_dir.path().join("observer-ran").exists());
+}
+
 #[test]
 fn exec_renders_each_turn_event_to_stdout_in_order() {
     // Regression for #7: exec stdout is produced per event (streamed +

@@ -37,7 +37,7 @@ use super::visual_canvas::{
     VisualCanvasState,
 };
 use crate::bundled_extensions::{
-    bundled_descriptor_by_id, bundled_descriptors, bundled_extension_by_id, bundled_round_observer,
+    bundled_descriptor_by_id, bundled_descriptors, bundled_extension_by_id, resolve_round_observer,
     ObserveOptions,
 };
 use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection};
