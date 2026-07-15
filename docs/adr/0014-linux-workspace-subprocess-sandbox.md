@@ -37,6 +37,9 @@ The first profile, **sandboxed workspace**, has these invariants:
 - `/tmp`, `/proc`, and `/dev` are private sandbox mounts;
 - the child has a cleared, minimal environment and is killed with its Euler
   parent;
+- every inherited descriptor except stdin/stdout/stderr is close-on-exec
+  before Bubblewrap launches, so open host files or sockets cannot bypass the
+  mount and network boundary through `/proc/self/fd`;
 - the default profile creates a separate network namespace with no network.
 
 The backend probes the complete requested profile, rather than merely checking
@@ -85,4 +88,6 @@ bind mount.
 On supported Linux hosts, automated tests must prove that a sandboxed child
 can write inside a temporary workspace, cannot see a planted secret outside
 the allowed mounts, cannot connect to a host listener, and can run both shell
-and direct Git tool paths. Profile creation failure must fail closed.
+and direct Git tool paths. They must also prove that an intentionally inherited
+non-`CLOEXEC` host descriptor cannot be read inside the sandbox. Profile
+creation failure must fail closed.

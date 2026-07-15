@@ -3,6 +3,8 @@ use crate::{ToolError, ToolRegistry};
 use serde_json::json;
 use std::env;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -156,6 +158,55 @@ fn sandboxed_shell_uses_only_the_profile_environment() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sandboxed_shell_cannot_read_an_inherited_host_descriptor() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::create_dir_all(&outside).expect("outside");
+    let host_file = outside.join("host-fd");
+    fs::write(&host_file, "inherited-host-descriptor").expect("host file");
+    let host_fd = fs::File::open(&host_file).expect("open host descriptor");
+    clear_close_on_exec(&host_fd);
+
+    let registry = ToolRegistry::with_subprocess_sandbox(
+        &workspace,
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork),
+    );
+    let availability = registry
+        .sandbox_availability()
+        .expect("sandbox was requested");
+    let fd = host_fd.as_raw_fd();
+    let result = registry.execute(
+        "run_shell",
+        &json!({
+            "command": format!(
+                "if test -r /proc/self/fd/{fd} && grep -qx inherited-host-descriptor /proc/self/fd/{fd}; then exit 1; fi"
+            )
+        }),
+    );
+
+    match availability {
+        SandboxAvailability::Enforced(_) => {
+            let execution = result.expect("sandboxed shell");
+            assert_eq!(
+                execution.exit_code,
+                Some(0),
+                "sandbox read an inherited host descriptor: {}",
+                execution.output
+            );
+        }
+        SandboxAvailability::Unavailable(reason) => {
+            assert!(matches!(
+                result,
+                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn sandboxed_shell_timeout_kills_the_bubblewrap_process_group() {
     let temp = tempfile::tempdir().expect("temp dir");
     let registry = ToolRegistry::with_subprocess_sandbox(
@@ -192,4 +243,20 @@ fn sandboxed_shell_timeout_kills_the_bubblewrap_process_group() {
 #[cfg(target_os = "linux")]
 fn shell_quote(path: &std::path::Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "linux")]
+fn clear_close_on_exec(file: &fs::File) {
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is borrowed from a live `File`; these calls only inspect
+    // and clear its close-on-exec bit for this regression probe.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        assert!(flags >= 0, "read descriptor flags");
+        assert_eq!(
+            libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+            0,
+            "clear close-on-exec"
+        );
+    }
 }
