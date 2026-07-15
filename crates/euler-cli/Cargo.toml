@@ -17,6 +17,7 @@ euler-extension-code-swarm = { path = "../euler-extension-code-swarm" }
 euler-extension-diagnostics-report = { path = "../euler-extension-diagnostics-report" }
 euler-extension-maxproof = { path = "../euler-extension-maxproof" }
 euler-extension-session-export = { path = "../euler-extension-session-export" }
+euler-managed-process = { path = "../euler-managed-process" }
 euler-provider = { path = "../euler-provider" }
 euler-sdk = { path = "../euler-sdk" }
 anyhow.workspace = true

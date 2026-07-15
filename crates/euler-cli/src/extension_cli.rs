@@ -8,15 +8,17 @@ use crate::offline_extension_runner::{execute_offline_extension_run, OfflineExte
 use anyhow::{anyhow, Result};
 use euler_core::{
     EulerHome, ExtensionAuditErrorReport, ExtensionEnablement, ExtensionMaterialization,
-    ExtensionRegistry, ExtensionRegistryError, LinkedExtension,
+    ExtensionRegistry, ExtensionRegistryError, LinkedExtension, LinkedExtensionStatus,
 };
+use euler_managed_process::ManagedProcessExtension;
 use euler_sdk::{
-    load_extension_package, valid_extension_identifier, ArgSpec, ArgValueKind, CommandDescriptor,
+    load_extension_package, managed_process_entrypoint_from_manifest_bytes,
+    valid_extension_identifier, ArgSpec, ArgValueKind, CommandDescriptor,
 };
 use output::{
-    installed_info_summary, linked_info, linked_link_info, package_validation_info, search_matches,
-    search_result_for_bundled, search_result_for_linked, sort_search_results, SearchOutput,
-    UninstallInfo, UnlinkInfo,
+    installed_info_summary, linked_info, linked_link_info, linked_status, package_validation_info,
+    search_matches, search_result_for_bundled, search_result_for_linked, sort_search_results,
+    SearchOutput, UninstallInfo, UnlinkInfo,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -182,11 +184,12 @@ fn run_list(stdout: &mut dyn Write) -> Result<()> {
         writeln!(stdout, "{} {status}", descriptor.id)?;
     }
     for linked in registry.linked_extensions()? {
+        let execution_enabled = current_linked_execution_enabled(&registry, &linked)?;
         writeln!(
             stdout,
             "{} {} {}",
             linked.id,
-            linked.status.as_str(),
+            linked_status(&linked, execution_enabled),
             linked.materialization.as_str()
         )?;
     }
@@ -198,11 +201,12 @@ fn run_status(id: &str, stdout: &mut dyn Write) -> Result<()> {
     if validate_known_extension_id(id).is_ok() {
         writeln!(stdout, "{} {}", id, status_label(registry.state(id)))?;
     } else if let Some(linked) = linked_extension(&registry, id)? {
+        let execution_enabled = current_linked_execution_enabled(&registry, &linked)?;
         writeln!(
             stdout,
             "{} {} {}",
             linked.id,
-            linked.status.as_str(),
+            linked_status(&linked, execution_enabled),
             linked.materialization.as_str()
         )?;
     } else {
@@ -214,7 +218,18 @@ fn run_status(id: &str, stdout: &mut dyn Write) -> Result<()> {
 fn run_info(id: &str, stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry()?;
     if let Some(linked) = linked_extension(&registry, id)? {
-        writeln!(stdout, "{}", serde_json::to_string(&linked_info(&linked))?)?;
+        let entrypoint = linked_process_entrypoint(&linked)?;
+        let execution_enabled =
+            entrypoint.is_some() && registry.linked_execution_enabled(&linked.id)?.is_enabled();
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string(&linked_info(
+                &linked,
+                entrypoint.as_ref(),
+                execution_enabled,
+            ))?
+        )?;
     } else {
         let descriptor = validate_known_extension_id(id)?;
         writeln!(stdout, "{}", serde_json::to_string(&descriptor.to_info())?)?;
@@ -234,7 +249,8 @@ fn run_search(search: &ExtensionSearchArgs, stdout: &mut dyn Write) -> Result<()
     if let Some(registry) = &registry {
         for linked in linked_extensions_for_search(registry) {
             if bundled_extension_by_id(&linked.id).is_none() {
-                results.push(search_result_for_linked(&linked));
+                let execution_enabled = current_linked_execution_enabled(registry, &linked)?;
+                results.push(search_result_for_linked(&linked, execution_enabled));
             }
         }
     }
@@ -268,10 +284,15 @@ fn run_audit(stdout: &mut dyn Write) -> Result<()> {
 fn run_validate(path: &Path, stdout: &mut dyn Write) -> Result<()> {
     let package = load_extension_package(path)?;
     reject_bundled_id(&package.descriptor.id)?;
+    let entrypoint = package_process_entrypoint(&package)?;
     writeln!(
         stdout,
         "{}",
-        serde_json::to_string(&package_validation_info(&package, "valid"))?
+        serde_json::to_string(&package_validation_info(
+            &package,
+            entrypoint.as_ref(),
+            "valid"
+        ))?
     )?;
     Ok(())
 }
@@ -279,12 +300,13 @@ fn run_validate(path: &Path, stdout: &mut dyn Write) -> Result<()> {
 fn run_link(path: &Path, stdout: &mut dyn Write) -> Result<()> {
     let package = load_extension_package(path)?;
     reject_bundled_id(&package.descriptor.id)?;
+    let entrypoint = package_process_entrypoint(&package)?;
     let registry = extension_registry()?;
     let linked = registry.link_package(package)?;
     writeln!(
         stdout,
         "{}",
-        serde_json::to_string(&linked_link_info(&linked))?
+        serde_json::to_string(&linked_link_info(&linked, entrypoint.as_ref(), false))?
     )?;
     Ok(())
 }
@@ -306,10 +328,11 @@ fn run_reload(id: &str, stdout: &mut dyn Write) -> Result<()> {
     validate_extension_id_shape(id)?;
     let registry = extension_registry()?;
     let linked = registry.reload_link(id)?;
+    let entrypoint = linked_process_entrypoint(&linked)?;
     writeln!(
         stdout,
         "{}",
-        serde_json::to_string(&linked_link_info(&linked))?
+        serde_json::to_string(&linked_link_info(&linked, entrypoint.as_ref(), false))?
     )?;
     Ok(())
 }
@@ -351,7 +374,14 @@ fn run_uninstall(id: &str, stdout: &mut dyn Write) -> Result<()> {
 fn run_enable(id: &str, stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry()?;
     if let Some(linked) = linked_extension(&registry, id)? {
-        return Err(non_runnable_extension_error(&linked, "enable"));
+        let entrypoint = validate_linked_process_for_activation(&linked)?;
+        registry.set_linked_execution_enabled(id, true)?;
+        writeln!(
+            stdout,
+            "{id} enabled: {}",
+            serde_json::to_string(&entrypoint.command)?
+        )?;
+        return Ok(());
     }
     validate_known_extension_id(id)?;
     registry.enable(id)?;
@@ -362,7 +392,15 @@ fn run_enable(id: &str, stdout: &mut dyn Write) -> Result<()> {
 fn run_disable(id: &str, stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry()?;
     if let Some(linked) = linked_extension(&registry, id)? {
-        return Err(non_runnable_extension_error(&linked, "disable"));
+        if linked.materialization != ExtensionMaterialization::Linked {
+            return Err(non_runnable_extension_error(&linked, "disable"));
+        }
+        if linked.descriptor.runtime_kind != "managed-process" {
+            return Err(non_runnable_extension_error(&linked, "disable"));
+        }
+        registry.set_linked_execution_enabled(id, false)?;
+        writeln!(stdout, "{id} disabled")?;
+        return Ok(());
     }
     validate_known_extension_id(id)?;
     registry.disable(id)?;
@@ -374,7 +412,31 @@ fn run_extension(run: ExtensionRunArgs, stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry()?;
     if let Some(linked) = linked_extension(&registry, &run.id)? {
         validate_linked_command(&linked, &run.command)?;
-        return Err(non_runnable_extension_error(&linked, "run"));
+        let package = load_enabled_linked_process(&registry, &linked)?;
+        let extension = ManagedProcessExtension::from_package(&package)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let command = extension
+            .command_descriptor(&run.command)
+            .ok_or_else(|| anyhow!("unknown command for extension {}: {}", run.id, run.command))?
+            .clone();
+        if command.invocation.is_agent_only() {
+            return Err(anyhow!(
+                "{}.{} is agent-only: it is run by an agent in a live session, not by `euler \
+                 extension run`. Start a session and ask for it in ordinary turn text.",
+                run.id,
+                run.command
+            ));
+        }
+        announce_managed_process_capability_grant(&run.id, &command);
+        let output = execute_offline_extension_run(OfflineExtensionRun {
+            extension_id: &run.id,
+            command: &command,
+            extension: &extension,
+            target: run.target,
+            input: run.input,
+        })?;
+        writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
+        return Ok(());
     }
     validate_known_extension_id(&run.id)?;
     // Registry corruption must fail closed before target-dependent work; the
@@ -408,6 +470,22 @@ fn run_extension(run: ExtensionRunArgs, stdout: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+fn announce_managed_process_capability_grant(id: &str, command: &CommandDescriptor) {
+    if command.required_capabilities.is_empty() {
+        return;
+    }
+    let granted = command
+        .required_capabilities
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "extension {id}.{}: granting declared capabilities for this run: {granted}",
+        command.name
+    );
+}
+
 fn non_runnable_extension_error(linked: &LinkedExtension, action: &str) -> anyhow::Error {
     match linked.materialization {
         ExtensionMaterialization::Linked if action == "run" => {
@@ -427,6 +505,90 @@ fn non_runnable_extension_error(linked: &LinkedExtension, action: &str) -> anyho
             linked.id
         ),
     }
+}
+
+fn validate_linked_process_for_activation(
+    linked: &LinkedExtension,
+) -> Result<euler_sdk::ManagedProcessEntrypoint> {
+    let package = load_linked_process_for_action(linked, "enable")?;
+    managed_process_entrypoint_from_manifest_bytes(&package.manifest_bytes).map_err(Into::into)
+}
+
+fn package_process_entrypoint(
+    package: &euler_sdk::LoadedExtensionPackage,
+) -> Result<Option<euler_sdk::ManagedProcessEntrypoint>> {
+    if package.descriptor.runtime_kind == "managed-process" {
+        return managed_process_entrypoint_from_manifest_bytes(&package.manifest_bytes)
+            .map(Some)
+            .map_err(Into::into);
+    }
+    Ok(None)
+}
+
+fn linked_process_entrypoint(
+    linked: &LinkedExtension,
+) -> Result<Option<euler_sdk::ManagedProcessEntrypoint>> {
+    if linked.status == LinkedExtensionStatus::Broken
+        || linked.descriptor.runtime_kind != "managed-process"
+    {
+        return Ok(None);
+    }
+    let package = match load_extension_package(&linked.source_path) {
+        Ok(package) if package.manifest_sha256 == linked.manifest_sha256 => package,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    package_process_entrypoint(&package)
+}
+
+fn load_linked_process_for_action(
+    linked: &LinkedExtension,
+    action: &str,
+) -> Result<euler_sdk::LoadedExtensionPackage> {
+    if linked.materialization != ExtensionMaterialization::Linked {
+        return Err(non_runnable_extension_error(linked, action));
+    }
+    if linked.status == LinkedExtensionStatus::Broken {
+        return Err(anyhow!(
+            "linked extension is broken; reload it before enabling: {}",
+            linked.id
+        ));
+    }
+    if linked.descriptor.runtime_kind != "managed-process" {
+        return Err(anyhow!(
+            "linked extension runtime is not runnable yet: {}",
+            linked.descriptor.runtime_kind
+        ));
+    }
+    let package = load_extension_package(&linked.source_path)?;
+    if package.manifest_sha256 != linked.manifest_sha256 {
+        return Err(anyhow!(
+            "linked extension manifest changed; run `euler extension reload {}`, inspect it, then enable it",
+            linked.id
+        ));
+    }
+    Ok(package)
+}
+
+fn load_enabled_linked_process(
+    registry: &ExtensionRegistry,
+    linked: &LinkedExtension,
+) -> Result<euler_sdk::LoadedExtensionPackage> {
+    let package = load_linked_process_for_action(linked, "run")?;
+    if !registry.linked_execution_enabled(&linked.id)?.is_enabled() {
+        return Err(anyhow!(
+            "linked extension is not enabled; run `euler extension enable {}` first",
+            linked.id
+        ));
+    }
+    Ok(package)
+}
+
+fn current_linked_execution_enabled(
+    registry: &ExtensionRegistry,
+    linked: &LinkedExtension,
+) -> Result<bool> {
+    Ok(registry.linked_execution_enabled(&linked.id)?.is_enabled()
+        && linked_process_entrypoint(linked)?.is_some())
 }
 
 fn linked_extension(registry: &ExtensionRegistry, id: &str) -> Result<Option<LinkedExtension>> {
@@ -490,13 +652,33 @@ fn parse_extension_run(args: &mut impl Iterator<Item = String>) -> Result<Extens
              extension run`. Start a session and ask for it in ordinary turn text."
         ));
     }
-    let input = parse_extension_run_input(&reference, descriptor.as_ref(), args)?;
+    let input = match descriptor.as_ref() {
+        Some(descriptor) => parse_extension_run_input(&reference, Some(descriptor), args)?,
+        None => parse_managed_process_input(&reference, args)?,
+    };
     Ok(ExtensionRunArgs {
         id,
         command,
         target,
         input,
     })
+}
+
+fn parse_managed_process_input(
+    reference: &str,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<serde_json::Value> {
+    let Some(flag) = args.next() else {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    };
+    if flag != "--input-file" {
+        return Err(anyhow!(
+            "{reference} accepts only --input-file <json-object-file> until it is loaded as a managed-process package"
+        ));
+    }
+    let input = parse_json_object_file(args, "input-file", 64 * 1024, None)?;
+    ensure_no_extra_args("managed-process extension run", args)?;
+    Ok(input)
 }
 
 fn parse_extension_search(args: &mut impl Iterator<Item = String>) -> Result<ExtensionSearchArgs> {

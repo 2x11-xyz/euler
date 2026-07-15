@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub(super) struct OfflineExtensionRun<'a> {
     pub(super) extension_id: &'a str,
     pub(super) command: &'a CommandDescriptor,
-    pub(super) extension: &'static dyn Extension,
+    pub(super) extension: &'a dyn Extension,
     pub(super) target: PathBuf,
     pub(super) input: serde_json::Value,
 }

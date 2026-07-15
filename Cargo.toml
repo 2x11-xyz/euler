@@ -2,6 +2,7 @@
 members = [
     "crates/euler-event",
     "crates/euler-sdk",
+    "crates/euler-managed-process",
     "crates/euler-agents",
     "crates/euler-extension-session-export",
     "crates/euler-extension-causal-dag",
@@ -32,6 +33,7 @@ thiserror = "2"
 anyhow = "1"
 tempfile = "3"
 sha2 = "0.10"
+base64 = "0.22"
 fs4 = "1"
 libc = "0.2"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }

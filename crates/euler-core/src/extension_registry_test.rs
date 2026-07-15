@@ -470,6 +470,96 @@ fn registry_links_reloads_and_unlinks_local_package() {
 }
 
 #[test]
+fn linked_package_activation_is_explicit_and_reload_revokes_it() {
+    let (_temp, registry) = registry();
+    let package_dir = managed_process_extension_dir("example-extension");
+    registry
+        .link_package(load_extension_package(package_dir.path()).expect("package"))
+        .expect("link");
+    assert_eq!(
+        registry
+            .linked_execution_enabled("example-extension")
+            .expect("initial linked activation"),
+        ExtensionEnablement::Disabled
+    );
+
+    let enabled = registry
+        .set_linked_execution_enabled("example-extension", true)
+        .expect("enable linked package");
+    assert_eq!(enabled, ExtensionEnablement::Enabled);
+    assert_eq!(
+        registry
+            .linked_execution_enabled("example-extension")
+            .expect("linked activation"),
+        ExtensionEnablement::Enabled
+    );
+    assert_eq!(
+        registry.state("example-extension").expect("bundled state"),
+        ExtensionEnablement::Disabled,
+        "linked launch consent must not enter bundled extension selection"
+    );
+    assert!(
+        !registry
+            .enablement_states()
+            .expect("bundled states")
+            .contains_key("example-extension"),
+        "linked launch consent has its own persistence owner"
+    );
+
+    let disabled = registry
+        .set_linked_execution_enabled("example-extension", false)
+        .expect("disable linked package");
+    assert_eq!(disabled, ExtensionEnablement::Disabled);
+
+    registry
+        .set_linked_execution_enabled("example-extension", true)
+        .expect("re-enable linked package");
+    write_managed_process_manifest(package_dir.path(), "example-extension", "0.2.0");
+    let reloaded = registry.reload_link("example-extension").expect("reload");
+    assert_eq!(reloaded.status, LinkedExtensionStatus::NeedsReview);
+    assert_eq!(
+        registry
+            .linked_execution_enabled("example-extension")
+            .expect("revoked activation"),
+        ExtensionEnablement::Disabled
+    );
+}
+
+#[test]
+fn linked_package_activation_refuses_native_and_broken_packages() {
+    let (_temp, registry) = registry();
+    let native_dir = extension_dir("native-extension");
+    registry
+        .link_package(load_extension_package(native_dir.path()).expect("native package"))
+        .expect("link native package");
+    assert!(matches!(
+        registry
+            .set_linked_execution_enabled("native-extension", true)
+            .expect_err("native runtime cannot activate"),
+        ExtensionRegistryError::NotManagedProcess { .. }
+    ));
+
+    let broken_dir = managed_process_extension_dir("broken-extension");
+    registry
+        .link_package(load_extension_package(broken_dir.path()).expect("process package"))
+        .expect("link process package");
+    fs::remove_file(broken_dir.path().join(EXTENSION_MANIFEST_FILE)).expect("remove manifest");
+    assert_eq!(
+        registry
+            .reload_link("broken-extension")
+            .expect("reload broken package")
+            .status,
+        LinkedExtensionStatus::Broken
+    );
+    assert_eq!(
+        registry
+            .set_linked_execution_enabled("broken-extension", false)
+            .expect("broken package can always lose launch consent"),
+        ExtensionEnablement::Disabled
+    );
+}
+
+#[test]
 fn registry_link_rejects_conflicting_id_or_path() {
     let (_temp, registry) = registry();
     let first_dir = extension_dir("example-extension");
@@ -1064,6 +1154,12 @@ fn extension_dir(id: &str) -> tempfile::TempDir {
     dir
 }
 
+fn managed_process_extension_dir(id: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("managed-process extension dir");
+    write_managed_process_manifest(dir.path(), id, "0.1.0");
+    dir
+}
+
 fn write_manifest(dir: &std::path::Path, id: &str, version: &str) {
     fs::write(
         dir.join(EXTENSION_MANIFEST_FILE),
@@ -1087,6 +1183,32 @@ fn write_manifest(dir: &std::path::Path, id: &str, version: &str) {
         ),
     )
     .expect("write manifest");
+}
+
+fn write_managed_process_manifest(dir: &std::path::Path, id: &str, version: &str) {
+    fs::write(
+        dir.join(EXTENSION_MANIFEST_FILE),
+        format!(
+            r#"{{
+  "version": 1,
+  "id": "{id}",
+  "display_name": "Managed Process Extension",
+  "extension_version": "{version}",
+  "runtime_kind": "managed-process",
+  "entrypoint": {{"command": ["python3", "-u", "extension.py"]}},
+  "capabilities": ["provenance-read"],
+  "commands": [
+    {{
+      "name": "inspect",
+      "display_name": "Inspect",
+      "summary": "Inspect provenance.",
+      "required_capabilities": ["provenance-read"]
+    }}
+  ]
+}}"#
+        ),
+    )
+    .expect("write managed-process manifest");
 }
 
 #[cfg(unix)]

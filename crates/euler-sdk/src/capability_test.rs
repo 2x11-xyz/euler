@@ -1,4 +1,5 @@
 use super::Capability;
+use serde_json::json;
 
 #[test]
 fn capability_registry_round_trips_every_known_capability() {
@@ -23,4 +24,16 @@ fn capability_registry_round_trips_every_known_capability() {
         assert_eq!(Capability::parse(expected_name), Some(capability));
     }
     assert_eq!(Capability::parse("context_slot"), None);
+}
+
+#[test]
+fn capability_serde_spelling_matches_the_manifest_registry() {
+    for &capability in Capability::ALL {
+        let value = serde_json::to_value(capability).expect("serialize capability");
+        assert_eq!(value, json!(capability.as_str()));
+        assert_eq!(
+            serde_json::from_value::<Capability>(value).expect("deserialize capability"),
+            capability
+        );
+    }
 }

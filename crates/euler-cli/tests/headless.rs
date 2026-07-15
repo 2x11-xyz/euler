@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -6189,7 +6189,7 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
     assert!(!enable.status.success());
     assert!(enable.stdout.is_empty());
     assert!(String::from_utf8_lossy(&enable.stderr)
-        .contains("linked extension needs review before enable: example-extension"));
+        .contains("linked extension runtime is not runnable yet: native-rust"));
 
     let run = command_with_home(exe, &home)
         .args(["extension", "run", "example-extension.inspect", "session"])
@@ -6200,7 +6200,7 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
     assert!(!run.status.success());
     assert!(run.stdout.is_empty());
     assert!(String::from_utf8_lossy(&run.stderr)
-        .contains("linked extension is not runnable yet: example-extension"));
+        .contains("linked extension runtime is not runnable yet: native-rust"));
     assert!(!sentinel.exists(), "run rejection must not execute scripts");
 
     write_extension_manifest(extension_dir.path(), "example-extension", "0.2.0");
@@ -6260,6 +6260,349 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
     assert!(
         extension_dir.path().exists(),
         "unlink must not delete source"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn extension_cli_runs_enabled_linked_python_process_and_reload_revokes_it() {
+    let python = Command::new("python3")
+        .arg("--version")
+        .output()
+        .expect("Python 3 is required for the managed-process CLI test");
+    assert!(python.status.success(), "python3 --version failed");
+
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let python = provision_python_venv(extension_dir.path());
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-cli-proof",
+        "0.1.1",
+        &[
+            python.to_string_lossy().into_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let script = r#"import sys
+from pathlib import Path
+
+from euler_managed_process_sdk import serve
+
+def inspect(context):
+    Path("invoked").write_text("yes", encoding="utf-8")
+    sys.stderr.write("PYTHON_STDERR_SENTINEL\n")
+    sys.stderr.flush()
+    page = context.host.query_provenance(limit=8, scan_limit=32)
+    artifact = context.host.write_artifact(
+        display_name="python-cli-proof.txt",
+        media_type="text/plain",
+        data=b"cli artifact",
+        source_event_ids=[event["id"] for event in page["events"]],
+        metadata={"producer": "python-cli-proof"},
+    )
+    return {"input": context.input, "artifact": artifact, "seen_events": len(page["events"])}
+
+serve({"inspect": inspect})
+"#;
+    fs::write(extension_dir.path().join("extension.py"), script).expect("write Python extension");
+
+    let session_dir = tempfile::tempdir().expect("session dir");
+    let log = session_dir.path().join("events.jsonl");
+    write_events(&log, &[session_start("fixture", "echo")]);
+    let input = session_dir.path().join("input.json");
+    fs::write(&input, r#"{"tag":"cli-proof"}"#).expect("write extension input");
+    let expected_entrypoint =
+        serde_json::json!([python.to_string_lossy(), "-B", "-u", "extension.py"]);
+
+    let validated = command_with_home(exe, &home)
+        .args(["extension", "validate", path_str(extension_dir.path())])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("validate Python extension");
+    assert!(validated.status.success());
+    assert!(validated.stderr.is_empty());
+    let validated_json: serde_json::Value =
+        serde_json::from_slice(&validated.stdout).expect("validate json");
+    assert_eq!(validated_json["entrypoint"]["command"], expected_entrypoint);
+
+    let linked = command_with_home(exe, &home)
+        .args(["extension", "link", path_str(extension_dir.path())])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("link Python extension");
+    assert!(linked.status.success());
+    let linked_json: serde_json::Value = serde_json::from_slice(&linked.stdout).expect("link json");
+    assert_eq!(
+        linked_json["runtime_kind"],
+        serde_json::json!("managed-process")
+    );
+    assert_eq!(linked_json["status"], serde_json::json!("needs-review"));
+    assert_eq!(linked_json["entrypoint"]["command"], expected_entrypoint);
+
+    let review_info = command_with_home(exe, &home)
+        .args(["extension", "info", "python-cli-proof"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("linked Python extension info");
+    assert!(review_info.status.success());
+    assert!(review_info.stderr.is_empty());
+    let review_info_json: serde_json::Value =
+        serde_json::from_slice(&review_info.stdout).expect("review info json");
+    assert_eq!(
+        review_info_json["status"],
+        serde_json::json!("needs-review")
+    );
+    assert_eq!(
+        review_info_json["entrypoint"]["command"],
+        expected_entrypoint
+    );
+
+    let before_enable = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "python-cli-proof.inspect",
+            path_str(&log),
+            "--input-file",
+            path_str(&input),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run before enable");
+    assert!(!before_enable.status.success());
+    assert!(before_enable.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&before_enable.stderr).contains(
+        "linked extension is not enabled; run `euler extension enable python-cli-proof` first"
+    ));
+    assert!(
+        !extension_dir.path().join("invoked").exists(),
+        "a linked package must not launch before explicit enable"
+    );
+
+    let enabled = command_with_home(exe, &home)
+        .args(["extension", "enable", "python-cli-proof"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("enable Python extension");
+    assert!(enabled.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&enabled.stdout),
+        format!(
+            "python-cli-proof enabled: [\"{}\",\"-B\",\"-u\",\"extension.py\"]\n",
+            python.to_string_lossy()
+        )
+    );
+    assert!(enabled.stderr.is_empty());
+
+    // Linked-package launch consent must not enter the bundled registry. If it
+    // did, RegistryResolution would reject the linked id as an unknown bundled
+    // extension and this ordinary bundled run would fail after the link enable.
+    let bundled_enabled = command_with_home(exe, &home)
+        .args(["extension", "enable", "session-export"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("enable bundled session export");
+    assert!(
+        bundled_enabled.status.success(),
+        "bundled enable stderr: {}",
+        String::from_utf8_lossy(&bundled_enabled.stderr)
+    );
+    let bundled_run = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "session-export.session-export",
+            path_str(&log),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run bundled session export after linked enable");
+    assert!(
+        bundled_run.status.success(),
+        "bundled run stderr: {}",
+        String::from_utf8_lossy(&bundled_run.stderr)
+    );
+
+    let info = command_with_home(exe, &home)
+        .args(["extension", "info", "python-cli-proof"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("enabled Python extension info");
+    assert!(info.status.success());
+    let info_json: serde_json::Value = serde_json::from_slice(&info.stdout).expect("info json");
+    assert_eq!(info_json["status"], serde_json::json!("enabled"));
+    assert_eq!(info_json["execution_granted"], serde_json::json!(true));
+    assert_eq!(info_json["requires_review"], serde_json::json!(false));
+    assert_eq!(info_json["entrypoint"]["command"], expected_entrypoint);
+
+    let run = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "python-cli-proof.inspect",
+            path_str(&log),
+            "--input-file",
+            path_str(&input),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run Python extension");
+    assert!(
+        run.status.success(),
+        "managed-process stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let run_stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run_stderr.contains(
+            "extension python-cli-proof.inspect: granting declared capabilities for this run: provenance-read, artifact-write"
+        ),
+        "the explicit headless grant must be visible: {run_stderr}"
+    );
+    assert!(
+        !run_stderr.contains("PYTHON_STDERR_SENTINEL"),
+        "child stderr must not escape the protocol"
+    );
+    let run_json: serde_json::Value = serde_json::from_slice(&run.stdout).expect("run json");
+    assert_eq!(run_json["input"], serde_json::json!({"tag": "cli-proof"}));
+    assert!(run_json["seen_events"].as_u64().expect("seen events") >= 1);
+    assert!(extension_dir.path().join("invoked").is_file());
+
+    let events = read_jsonl(&log);
+    let artifact_event = events
+        .iter()
+        .rev()
+        .find(|event| event.kind.as_str() == EventKind::EXTENSION_ARTIFACT)
+        .expect("managed-process artifact event");
+    assert_eq!(
+        artifact_event.payload.get("extension_id"),
+        Some(&serde_json::json!("python-cli-proof"))
+    );
+    assert_eq!(
+        artifact_event.payload.get("display_name"),
+        Some(&serde_json::json!("python-cli-proof.txt"))
+    );
+    let relative_path = artifact_event
+        .payload
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .expect("artifact path");
+    assert_eq!(
+        fs::read(session_dir.path().join(relative_path)).expect("managed-process artifact bytes"),
+        b"cli artifact"
+    );
+    let raw_log = fs::read(&log).expect("read session log");
+    assert!(
+        !contains_bytes(&raw_log, b"PYTHON_STDERR_SENTINEL"),
+        "raw child stderr must not enter provenance"
+    );
+    assert!(
+        !contains_bytes(&raw_log, b"cli artifact"),
+        "artifact bytes must not enter provenance"
+    );
+
+    // The stored manifest fingerprint, not a best-effort source read, is the
+    // review boundary. A stale source must stop presenting as enabled and must
+    // not launch until `reload` records a new review decision.
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-cli-proof",
+        "0.1.2",
+        &[
+            python.to_string_lossy().into_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let stale_info = command_with_home(exe, &home)
+        .args(["extension", "info", "python-cli-proof"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("stale linked Python extension info");
+    assert!(stale_info.status.success());
+    let stale_info_json: serde_json::Value =
+        serde_json::from_slice(&stale_info.stdout).expect("stale info json");
+    assert_eq!(stale_info_json["status"], serde_json::json!("needs-review"));
+    assert_eq!(
+        stale_info_json["execution_granted"],
+        serde_json::json!(false)
+    );
+    assert_eq!(stale_info_json["requires_review"], serde_json::json!(true));
+
+    fs::remove_file(extension_dir.path().join("invoked")).expect("clear invocation marker");
+    let stale_run = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "python-cli-proof.inspect",
+            path_str(&log),
+            "--input-file",
+            path_str(&input),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run stale Python extension");
+    assert!(!stale_run.status.success());
+    assert!(String::from_utf8_lossy(&stale_run.stderr).contains(
+        "linked extension manifest changed; run `euler extension reload python-cli-proof`"
+    ));
+    assert!(
+        !extension_dir.path().join("invoked").exists(),
+        "a stale manifest must not launch"
+    );
+
+    let reloaded = command_with_home(exe, &home)
+        .args(["extension", "reload", "python-cli-proof"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("reload Python extension");
+    assert!(reloaded.status.success());
+    let reloaded_json: serde_json::Value =
+        serde_json::from_slice(&reloaded.stdout).expect("reload json");
+    assert_eq!(reloaded_json["status"], serde_json::json!("needs-review"));
+
+    let log_before_rejected_run = fs::read(&log).expect("log before rejected run");
+    let after_reload = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "python-cli-proof.inspect",
+            path_str(&log),
+            "--input-file",
+            path_str(&input),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run after reload");
+    assert!(!after_reload.status.success());
+    assert!(String::from_utf8_lossy(&after_reload.stderr).contains(
+        "linked extension is not enabled; run `euler extension enable python-cli-proof` first"
+    ));
+    assert!(
+        !extension_dir.path().join("invoked").exists(),
+        "reload must revoke the prior launch decision"
+    );
+    assert_eq!(
+        fs::read(&log).expect("log after rejected run"),
+        log_before_rejected_run
     );
 }
 
@@ -10214,4 +10557,85 @@ fn write_extension_manifest(dir: &Path, id: &str, version: &str) {
         ),
     )
     .expect("write extension manifest");
+}
+
+fn write_managed_process_extension_manifest(
+    dir: &Path,
+    id: &str,
+    version: &str,
+    command: &[String],
+) {
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": id,
+        "display_name": "Python CLI proof",
+        "extension_version": version,
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": command},
+        "capabilities": ["provenance-read", "artifact-write"],
+        "commands": [{
+            "name": "inspect",
+            "display_name": "Inspect",
+            "summary": "Read provenance and write an artifact.",
+            "required_capabilities": ["provenance-read", "artifact-write"]
+        }]
+    });
+    fs::write(
+        dir.join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("serialize managed-process manifest"),
+    )
+    .expect("write managed-process extension manifest");
+}
+
+#[cfg(unix)]
+fn provision_python_venv(extension_dir: &Path) -> PathBuf {
+    let sdk_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk");
+    let sdk_copy = extension_dir.join("sdk-package");
+    copy_directory(&sdk_source, &sdk_copy);
+    let venv = extension_dir.join(".venv");
+    let created = Command::new("python3")
+        // CI must stay offline. This gives the temporary venv access to the
+        // runner's setuptools while still proving that the installed SDK and
+        // `.venv/bin/python` entrypoint work end to end. A user-facing
+        // `pip install -e` can bootstrap its build dependency normally.
+        .args(["-m", "venv", "--system-site-packages"])
+        .arg(&venv)
+        .status()
+        .expect("create Python virtual environment");
+    assert!(created.success(), "python3 -m venv failed: {created}");
+    let python = venv.join("bin/python");
+    let installed = Command::new(&python)
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--no-build-isolation",
+            "--disable-pip-version-check",
+            "-e",
+        ])
+        .arg(&sdk_copy)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("install Python SDK into virtual environment");
+    assert!(
+        installed.status.success(),
+        "editable Python SDK install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    python
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create copied SDK directory");
+    for entry in fs::read_dir(source).expect("read SDK directory") {
+        let entry = entry.expect("SDK entry");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("SDK entry type").is_dir() {
+            copy_directory(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).expect("copy SDK file");
+        }
+    }
 }

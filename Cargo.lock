@@ -472,6 +472,7 @@ dependencies = [
  "euler-extension-diagnostics-report",
  "euler-extension-maxproof",
  "euler-extension-session-export",
+ "euler-managed-process",
  "euler-provider",
  "euler-sdk",
  "insta",
@@ -584,6 +585,19 @@ dependencies = [
  "euler-sdk",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "euler-managed-process"
+version = "0.1.1"
+dependencies = [
+ "base64",
+ "euler-sdk",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
