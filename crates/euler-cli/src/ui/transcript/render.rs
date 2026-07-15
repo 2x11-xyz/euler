@@ -1182,6 +1182,42 @@ mod tests {
         }
     }
 
+    /// Bold marks membership in the Codex vocabulary, not capitalization. A
+    /// row can open with a capital for reasons that have nothing to do with a
+    /// verb — a title like `File added …`, or an uppercase filename — and
+    /// bolding those spends the weight on a word carrying no verb meaning.
+    #[test]
+    fn only_codex_verbs_earn_the_bold_lead() {
+        let theme = Theme::default();
+        let bolded = |summary: &str| {
+            let entries = vec![ProjectedEntry {
+                item: TranscriptItem::Exploration {
+                    summaries: vec![summary.to_owned()],
+                },
+                timing: None,
+            }];
+            let lines =
+                render_projected_entries(&entries, &theme, 80, TranscriptRenderLimits::default());
+            lines.iter().any(|line| {
+                line.spans.iter().any(|span| {
+                    span.style.add_modifier.contains(Modifier::BOLD)
+                        && !span.content.trim().is_empty()
+                        && span
+                            .content
+                            .contains(summary.split(' ').next().unwrap_or(""))
+                })
+            })
+        };
+
+        for verb in super::super::cells::CODEX_VERBS {
+            assert!(bolded(&format!("{verb} target.rs")), "verb: {verb}");
+        }
+        // Capitalized, but not verbs.
+        for row in ["File added foo.rs", "Patch proposed", "README.md"] {
+            assert!(!bolded(row), "must not bold a non-verb lead: {row:?}");
+        }
+    }
+
     /// §4: the verb is the only bold token on a group row — the target keeps
     /// the row's own weight, so the eye lands on what was done, not the path.
     #[test]

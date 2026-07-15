@@ -90,16 +90,6 @@ impl ExtensionCommandItem {
 }
 
 impl ExtensionManagerItem {
-    pub fn label(&self) -> String {
-        let mark = if self.enabled { "●" } else { "○" };
-        let kind = if self.bundled {
-            "bundled"
-        } else {
-            self.materialization.as_deref().unwrap_or("linked")
-        };
-        format!("{mark} {}  ({kind})", self.id)
-    }
-
     pub fn details_text(&self) -> String {
         let mut lines = vec![
             format!("{}  v{}", self.display_name, self.version),
@@ -395,6 +385,11 @@ pub enum PermissionPosture {
     FullAccess,
 }
 
+/// §5.1 envelope for per-capability modes that match no posture. Named rather
+/// than inlined so `/status` and the picker title cannot drift apart on what
+/// "no posture describes this" is called.
+pub const CUSTOM_PERMISSION_ENVELOPE: &str = "custom · per-capability modes";
+
 impl PermissionPosture {
     pub const ALL: [Self; 3] = [Self::ReadOnly, Self::AskEveryTime, Self::FullAccess];
 
@@ -435,11 +430,23 @@ impl PermissionPosture {
     /// envelope and never just the name, so the boundary in force is legible
     /// without cross-referencing what the posture means. Sandbox diagnostics
     /// and mount paths never appear here (ADR 0014).
+    ///
+    /// The envelope describes what the gate *effectively* does, not the mode
+    /// it was configured with. Under `Ask` an operation runs without a prompt
+    /// when a durable grant already covers it, or when it is a statically-safe
+    /// shell command (`tool_dispatch.rs`, issue #78) — so "every capability
+    /// asks" would be a comfortable lie in the one line whose whole job is to
+    /// be exact about the boundary.
     pub fn envelope(self) -> &'static str {
         match self {
-            Self::ReadOnly => "Read only · no writes · no commands · network denied",
-            Self::AskEveryTime => "Ask every time · every capability asks",
-            Self::FullAccess => "Full access · unsandboxed",
+            // Reads are session-allowed; everything else is AlwaysDeny, which
+            // is never softened by a grant — grants are consulted under Ask.
+            Self::ReadOnly => "Read only · reads allowed · writes, commands, and network denied",
+            Self::AskEveryTime => {
+                "Ask every time · uncovered operations ask · durable grants and \
+                 statically-safe commands run without one"
+            }
+            Self::FullAccess => "Full access · unsandboxed · every capability allowed this session",
         }
     }
 

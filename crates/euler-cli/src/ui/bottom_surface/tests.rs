@@ -62,6 +62,69 @@ fn causal_dag_surface() -> BottomSurface {
     BottomSurface::new(context)
 }
 
+/// §4.2: a row is caret + one state marker + label + description column, and
+/// it never repeats its own value. `ExtensionManagerItem::label()` used to bake
+/// the marker, id and kind into one string, so the unified picker rendered
+/// `› ● ● causal-dag  (bundled)  causal-dag` — marker twice, kind twice (it is
+/// also the group header), id twice. Nothing covered this path.
+#[test]
+fn extension_picker_row_states_each_fact_once() {
+    let items = vec![
+        ExtensionManagerItem {
+            id: "causal-dag".to_owned(),
+            display_name: "Causal DAG".to_owned(),
+            enabled: true,
+            bundled: true,
+            materialization: None,
+            version: "0.2.0".to_owned(),
+            commands: vec![],
+            capabilities: vec![],
+            audit_status: None,
+        },
+        ExtensionManagerItem {
+            id: "local-thing".to_owned(),
+            display_name: "Local Thing".to_owned(),
+            enabled: false,
+            bundled: false,
+            materialization: Some("copied".to_owned()),
+            version: "0.1.0".to_owned(),
+            commands: vec![],
+            capabilities: vec![],
+            audit_status: None,
+        },
+    ];
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_picker(PickerSpec::Extensions(items));
+    let rendered = surface
+        .surface_lines(80)
+        .expect("extension picker")
+        .join("\n");
+
+    let enabled = rendered
+        .lines()
+        .find(|line| line.contains("causal-dag"))
+        .expect("enabled row");
+    assert_eq!(enabled.matches('●').count(), 1, "row: {enabled:?}");
+    assert_eq!(
+        enabled.matches("causal-dag").count(),
+        1,
+        "id must not repeat: {enabled:?}"
+    );
+    assert!(
+        !enabled.contains("bundled"),
+        "kind belongs to the group header, not the row: {enabled:?}"
+    );
+    assert!(rendered.contains("BUNDLED"), "rendered:\n{rendered}");
+
+    // Disabled + linked: hollow marker, materialization as the group.
+    let disabled = rendered
+        .lines()
+        .find(|line| line.contains("local-thing"))
+        .expect("disabled row");
+    assert_eq!(disabled.matches('○').count(), 1, "row: {disabled:?}");
+    assert!(rendered.contains("COPIED"), "rendered:\n{rendered}");
+}
+
 #[test]
 fn causal_dag_picker_drills_into_formats_and_steps_back() {
     let mut surface = causal_dag_surface();
@@ -775,6 +838,56 @@ fn permissions_picker_marks_the_posture_actually_in_effect() {
         })
     });
     assert_eq!(tuned, None, "a hand-tuned mix is not a posture");
+}
+
+/// A state marker is a claim about the row: that it has a state you can be in.
+/// `Advanced capability settings ›` and the unavailable sandbox row are
+/// actions, so marking them `○` says they are postures you have not selected —
+/// a lie about what ⏎ does. The marker follows the row's action, not merely
+/// whether the picker contains any posture.
+#[test]
+fn permissions_picker_gives_no_radio_to_action_rows() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_picker(PickerSpec::Permissions(permission_choices()));
+    let rendered = surface
+        .surface_lines(80)
+        .expect("permissions picker")
+        .join("\n");
+
+    for row in rendered.lines() {
+        if row.contains("Advanced capability settings") || row.contains("Auto in workspace sandbox")
+        {
+            assert!(
+                !row.contains('○') && !row.contains('●'),
+                "action row must not wear a posture marker: {row:?}"
+            );
+        }
+    }
+    // The postures themselves still do.
+    assert!(rendered.contains("○ Read only"), "rendered:\n{rendered}");
+}
+
+/// `compact now` is an action beside two toggles; it must not render a
+/// checkbox implying `space` does something to it.
+#[test]
+fn compaction_picker_gives_no_checkbox_to_the_action_row() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_palette();
+    surface.palette_insert("compaction");
+    assert_eq!(surface.confirm(), SurfaceEvent::None);
+    let rendered = surface
+        .surface_lines(100)
+        .expect("compaction picker")
+        .join("\n");
+
+    let action = rendered
+        .lines()
+        .find(|line| line.contains("compact now"))
+        .expect("action row");
+    assert!(
+        !action.contains('[') && !action.contains(']'),
+        "action row must not wear a checkbox: {action:?}"
+    );
 }
 
 #[test]

@@ -4,6 +4,20 @@
 
 Accepted for implementation on branch `feat/warm-ledger-tui` (2026-07-09).
 
+**Partially superseded (2026-07-15).** The decision below — Warm Ledger as the
+layout and interaction system, with `docs/contracts/ui.md` normative over it —
+stands. Three items in "Ledger rules (normative summary)" do not: they were
+written against the v1 layout and were reversed by the Warm Spine v2.1 design
+spec (2026-07-10) and by later amendments. The ADR is kept as the record of the
+decision that was made; **`docs/contracts/ui.md` is the current normative
+statement** wherever the two disagree.
+
+| Rule below | Superseded by |
+|---|---|
+| 9-character timestamp gutter by default | Timestamps **off** by default; the 2-cell anchor spine carries the ledger. `/timestamps` opts the gutter in (spec §0/§5.5). |
+| Hairline under each meaningful event | **No hairline per event** — separation is the spine plus one blank line (spec §0/§1). |
+| Nearest-block `ctrl+o` | `ctrl+o` is a **global** toggle, not per-cell targeting (issue #49; see "Fold" in `ui.md`). |
+
 ## Decision
 
 The core CLI transcript adopts **Warm Ledger** as its **layout and interaction

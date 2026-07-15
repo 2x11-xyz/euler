@@ -142,15 +142,11 @@ impl AppCore {
         );
         // §5.1 status indicator: the active posture *and its envelope*, never
         // just the name — the boundary in force has to be legible without
-        // knowing what each posture means. `custom` is the honest reading of
-        // per-capability modes that no posture describes.
-        if let AppState::Idle { session } = &self.state {
-            let envelope = crate::ui::commands::PermissionPosture::active(|capability| {
-                session.configured_mode(capability)
-            })
-            .map_or("custom · per-capability modes", |posture| {
-                posture.envelope()
-            });
+        // knowing what each posture means. Read from the snapshot, not the
+        // session: /status is answerable mid-turn, and `TurnInFlight` holds no
+        // session, so gating on `Idle` would drop this line during exactly the
+        // long-running work where the boundary matters most.
+        if let Some(envelope) = self.status.permission_envelope.as_deref() {
             status.push_str(&format!("\npermissions: {envelope}"));
         }
         // ADR 0011 visibility: say so whenever a non-default reviewer
@@ -331,6 +327,7 @@ impl AppCore {
             return self.notice_item("permission mode waits for the active turn".to_owned());
         };
         session.set_permission_mode(capability, mode);
+        self.refresh_permission_envelope();
         self.notice_item(format!(
             "permission {} set to {:?}",
             capability.as_str(),
@@ -369,11 +366,23 @@ impl AppCore {
         for &capability in Capability::ALL {
             session.set_permission_mode(capability, posture.mode_for(capability));
         }
+        self.refresh_permission_envelope();
         let grants = if cleared == 1 { "grant" } else { "grants" };
         self.notice_item(format!(
             "permission posture set to {} · cleared {cleared} session {grants}",
             posture.label()
         ))
+    }
+
+    /// Re-derive the cached §5.1 posture envelope from the live session. Must
+    /// be called after anything that changes a capability's mode; the cache
+    /// exists only because `/status` is answerable while a turn is in flight
+    /// and that state carries no session.
+    pub(super) fn refresh_permission_envelope(&mut self) {
+        let AppState::Idle { session } = &self.state else {
+            return;
+        };
+        self.status.permission_envelope = Some(super::permission_envelope_for(session));
     }
 
     pub(super) fn open_permissions_picker(&mut self) -> CoreEffect {

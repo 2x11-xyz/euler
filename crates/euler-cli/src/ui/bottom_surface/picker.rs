@@ -114,13 +114,23 @@ impl ReplacementPicker {
     /// independently selected". Extensions therefore keep `●`/`○` per §5.11
     /// even though `space` toggles them — enabled/disabled is a state, not a
     /// selection.
-    fn state_marker(&self, item_index: usize, item: &PickerItem) -> Option<&'static str> {
+    fn state_marker(&self, item: &PickerItem) -> Option<&'static str> {
         let checkbox = if item.current { "[x]" } else { "[ ]" };
         let dot = if item.current { "●" } else { "○" };
+        // A marker is a claim about the *row*: that it has a state you can be
+        // in. An action row has none, and marking it `○` says it is a posture
+        // you have not chosen — a lie about what ⏎ will do. So the row's own
+        // action decides; only then does the picker's kind pick the glyph.
+        if matches!(
+            item.action,
+            CommandAction::OpenPermissionsAdvanced
+                | CommandAction::PermissionSandboxUnavailable
+                | CommandAction::CompactSession
+        ) {
+            return None;
+        }
         match self.kind {
             PickerKind::CodeSwarmModels => Some(checkbox),
-            // Row 0 is "compact now" — an action, not a toggle.
-            PickerKind::Compaction if item_index == 0 => None,
             PickerKind::Compaction => Some(checkbox),
             PickerKind::Extensions => Some(dot),
             // §4.2 names the model picker a radio outright — it stays one even
@@ -132,7 +142,9 @@ impl ReplacementPicker {
             // list does not, and gets no state column. A posture list with no
             // current value (hand-tuned under Advanced) still renders the
             // radio — every option unfilled is the honest reading.
-            PickerKind::Generic if self.is_posture_list() => Some(dot),
+            PickerKind::Generic if self.is_posture_list() => {
+                matches!(item.action, CommandAction::SetPermissionPosture { .. }).then_some(dot)
+            }
             PickerKind::Generic => self.items.iter().any(|item| item.current).then_some(dot),
             PickerKind::Resume
             | PickerKind::CausalDagActions
@@ -166,8 +178,7 @@ impl ReplacementPicker {
     fn marker_width(&self) -> usize {
         self.items
             .iter()
-            .enumerate()
-            .filter_map(|(index, item)| self.state_marker(index, item))
+            .filter_map(|item| self.state_marker(item))
             .map(display_width)
             .max()
             .unwrap_or(0)
@@ -342,7 +353,7 @@ impl ReplacementPicker {
         let caret = if layout.selected { "›" } else { " " };
         let mut text = format!("{caret} ");
         if layout.marker_width > 0 {
-            let marker = self.state_marker(item_index, item).unwrap_or("");
+            let marker = self.state_marker(item).unwrap_or("");
             let pad = layout.marker_width.saturating_sub(display_width(marker));
             text.push_str(&format!("{marker}{} ", " ".repeat(pad)));
         }
@@ -517,12 +528,15 @@ impl ReplacementPicker {
         let CommandAction::ExtensionDetails { id } = &item.action else {
             return None;
         };
+        // The row's group column is the extension's kind: "bundled", or the
+        // materialization for a linked package.
+        let bundled = item.group.as_deref() == Some("bundled");
         Some(ExtensionManagerItem {
             id: id.clone(),
             display_name: item.label.clone(),
             enabled: item.current,
-            bundled: item.group.as_deref() == Some("bundled"),
-            materialization: item.status.clone(),
+            bundled,
+            materialization: (!bundled).then(|| item.group.clone()).flatten(),
             version: String::new(),
             commands: Vec::new(),
             capabilities: Vec::new(),
@@ -827,26 +841,32 @@ fn code_swarm_model_items(choices: Vec<ModelChoice>, selected: &[String]) -> Vec
 /// Swarm cap (mirrors the extension's MAX_SWARM_AGENTS).
 const CODE_SWARM_MAX_MODELS: usize = 5;
 
+/// §4.2: the row is caret + state marker + label + description column, and it
+/// never repeats its own value. `ExtensionManagerItem::label()` predates the
+/// unified picker and bakes all three into one string — `● causal-dag
+/// (bundled)` — so using it here rendered the marker twice (the picker adds
+/// its own), the kind twice (it is also the group header), and the id twice
+/// (it was also the description). The id alone is the label; every other fact
+/// gets exactly one home.
 fn extension_manager_items(items: Vec<ExtensionManagerItem>) -> Vec<PickerItem> {
     items
         .into_iter()
         .map(|item| {
-            let label = item.label();
-            let group = if item.bundled {
-                Some("bundled".to_owned())
+            let kind = if item.bundled {
+                "bundled".to_owned()
             } else {
-                None
+                item.materialization
+                    .clone()
+                    .unwrap_or_else(|| "linked".to_owned())
             };
-            let status = item.materialization.clone();
             let id = item.id.clone();
-            let enabled = item.enabled;
             PickerItem {
-                label,
-                detail: Some(id.clone()),
-                status,
-                group,
+                label: id.clone(),
+                detail: None,
+                status: None,
+                group: Some(kind),
                 provider_tag: None,
-                current: enabled,
+                current: item.enabled,
                 action: CommandAction::ExtensionDetails { id },
             }
         })

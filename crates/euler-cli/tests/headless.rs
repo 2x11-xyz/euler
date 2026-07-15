@@ -9184,7 +9184,7 @@ impl SecretFixture {
         fs::create_dir_all(auth_file.parent().expect("auth file parent"))
             .expect("create auth file parent");
         let auth_file_content = format!("{EULER_AUTH_FILE_CONTENT_SENTINEL}\n");
-        fs::write(&auth_file, &auth_file_content).expect("Wrote auth file");
+        fs::write(&auth_file, &auth_file_content).expect("write auth file");
         let auth_contents = fs::read_to_string(&auth_file).expect("read auth file");
         assert!(auth_contents.contains(EULER_AUTH_FILE_CONTENT_SENTINEL));
 
@@ -9775,7 +9775,7 @@ fn append_missing_blob_event(log: &Path, session_id: &str) {
             .expect("serialize blob event")
             .as_bytes(),
     )
-    .expect("Wrote blob event");
+    .expect("write blob event");
     file.write_all(b"\n").expect("finish blob event");
 }
 

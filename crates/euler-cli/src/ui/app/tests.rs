@@ -2390,6 +2390,48 @@ fn status_reports_session_id_while_turn_is_in_flight() {
     assert!(text.contains(&format!("session: {session_id}")));
     assert!(text.contains("theme: Gruvbox Dark (gruvbox-dark)"));
     assert!(!text.contains("session: none"));
+    // §5.1: the posture envelope must survive mid-turn. `TurnInFlight` holds
+    // no session, so reading it from there would drop the boundary during
+    // exactly the long-running work where it matters most.
+    assert!(text.contains("permissions: "), "text: {text:?}");
+}
+
+/// §5.1: the envelope states what the gate *effectively* does. Under Ask, a
+/// statically-safe shell command (#78) and an operation already covered by a
+/// durable grant both run with no prompt — so "every capability asks" is a
+/// comfortable lie in the one line whose whole job is to be exact.
+#[test]
+fn permission_envelope_does_not_overstate_the_ask_boundary() {
+    use crate::ui::commands::PermissionPosture;
+
+    let ask = PermissionPosture::AskEveryTime.envelope();
+    assert!(
+        !ask.contains("every capability asks"),
+        "envelope overstates the boundary: {ask:?}"
+    );
+    assert!(ask.contains("uncovered"), "envelope: {ask:?}");
+    assert!(
+        ask.contains("grants") && ask.contains("statically-safe"),
+        "envelope must name what runs without a prompt: {ask:?}"
+    );
+
+    // Read only denies outright, so nothing is carved out of it: grants are
+    // consulted under Ask, never under AlwaysDeny.
+    let read_only = PermissionPosture::ReadOnly.envelope();
+    assert!(read_only.contains("denied"), "envelope: {read_only:?}");
+    assert!(
+        !read_only.contains("ask"),
+        "Read only never prompts: {read_only:?}"
+    );
+
+    // Every envelope states the boundary, not just the posture's name.
+    for posture in PermissionPosture::ALL {
+        let envelope = posture.envelope();
+        assert!(
+            envelope.contains(" · "),
+            "envelope must state its boundary, not just a name: {envelope:?}"
+        );
+    }
 }
 
 #[test]

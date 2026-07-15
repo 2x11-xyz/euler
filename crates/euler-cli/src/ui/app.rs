@@ -666,6 +666,18 @@ struct AppCoreBootstrap {
     authenticated_providers: BTreeSet<String>,
 }
 
+/// §5.1: the session's active posture and its envelope, or the custom
+/// envelope when the per-capability modes match no posture. One definition,
+/// because `/status` and the picker title must never disagree about which
+/// boundary is in force.
+pub(super) fn permission_envelope_for(session: &Session<TuiDecider>) -> String {
+    crate::ui::commands::PermissionPosture::active(|capability| session.configured_mode(capability))
+        .map_or_else(
+            || crate::ui::commands::CUSTOM_PERMISSION_ENVELOPE.to_owned(),
+            |posture| posture.envelope().to_owned(),
+        )
+}
+
 fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> AppCoreBootstrap {
     let target = session.active_target().clone();
     let reasoning_effort = session.reasoning_effort();
@@ -708,6 +720,9 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
     if session.permission_reviewer() != euler_core::PermissionReviewer::User {
         status.permission_reviewer = Some(session.permission_reviewer().as_str().to_owned());
     }
+    // §5.1 posture envelope, seeded before the first turn so /status is
+    // correct without waiting for a posture change to populate it.
+    status.permission_envelope = Some(permission_envelope_for(session));
     let initial_token_usage = TokenUsageSnapshot {
         context_window_tokens: context_window_tokens_for(
             &model_catalog,

@@ -80,8 +80,11 @@ legible and fights user palettes.)
 
 - Columns: a **4-char right-aligned faint line-number** column (added/context
   use new-file numbering, removed use old-file numbering), a **1-char sign**
-  column (`+` green / `−` dim red / blank for context), then code with
-  indentation preserved verbatim.
+  column (`+` green / `-` dim red / blank for context), then code with
+  indentation preserved verbatim. The sign column is **ASCII** (`+` / `-`):
+  it is diff syntax, not typography — a row copied out of the transcript has
+  to paste back as a valid diff, which a Unicode minus (`−`, U+2212) breaks.
+  The diffstat below is prose and does use `−`.
 - **Added** rows: normal luminance with full syntax highlighting — they read
   like a normal code block. Added code is the star.
 - **Removed** rows: the whole row dims to **faint**, with syntax accents
@@ -138,7 +141,12 @@ promotes, or reorders lines.
 ### Typography
 
 - One mono family (the terminal’s). Hierarchy from color and **weight**, never size.
-- **Bold** only for: user messages, markdown headings, picker/approval titles.
+- **Bold** only for: user messages, markdown headings, picker/approval titles,
+  and the Codex tool verb that opens a ledger row (`Explored`, `Read`,
+  `Search`, `List`, `Git`, `Ran`, `Edited`, `Wrote`, `Deleted`, `Changed`).
+  The verb is a **closed set** (`CODEX_VERBS`) — capitalization alone does not
+  earn bold, or titles like `File added …` and uppercase filenames would take
+  it. Only the verb is bold; the target keeps the row’s own weight.
 - **No bold inside code.**
 - Italic only where specified (e.g. reasoning, hunk headers, comments).
 

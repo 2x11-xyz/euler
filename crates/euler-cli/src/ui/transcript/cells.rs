@@ -345,14 +345,28 @@ pub(super) fn push_child_rows(
     }
 }
 
-/// Codex vocabulary (§4): every tool-group child opens with a capitalized
-/// sub-verb — `Read`, `Search`, `List` — which is the only bold token on the
-/// row. Capitalization is the marker, so a row that doesn't open with a verb
-/// (a bare path, a continuation) simply gets no bold lead.
+/// The Codex tool vocabulary (§4) — the closed set of verbs that may open a
+/// ledger row. Bold is otherwise reserved (user messages, headings, picker and
+/// approval titles), so this list is exactly what earns it.
+///
+/// `Git` is ours, not the spec's: §4 names `Read`/`Search` for group children
+/// and never covers the `git_status`/`git_diff` tools. Leaving it out would
+/// bold one child of an `Explored` group and not its sibling, which reads as a
+/// rendering bug rather than a vocabulary boundary.
+pub(super) const CODEX_VERBS: [&str; 10] = [
+    "Explored", "Read", "Search", "List", "Git", "Ran", "Edited", "Wrote", "Deleted", "Changed",
+];
+
+/// The bold lead for a row, or `None` when it doesn't open with a Codex verb.
+///
+/// Membership, not capitalization: a row can begin with a capital for reasons
+/// that have nothing to do with the vocabulary — an uppercase filename, or a
+/// title like `File added …` / `Patch proposed`. Bolding those spends the
+/// weight on a word that carries no verb meaning and makes the canvas
+/// semantics drift every time a new title is added.
 fn leading_verb(row: &str) -> Option<&str> {
     let verb = row.split(' ').next()?;
-    let initial = verb.chars().next()?;
-    (initial.is_uppercase() && verb.len() > 1).then_some(verb)
+    CODEX_VERBS.contains(&verb).then_some(verb)
 }
 
 pub(super) fn push_bounded_children(
