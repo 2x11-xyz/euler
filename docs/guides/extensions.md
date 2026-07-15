@@ -140,10 +140,20 @@ def inspect(context: CommandContext) -> dict[str, object]:
 serve({"inspect": inspect})
 ```
 
-See `examples/python-managed-process-extension` for a complete package that
-writes an artifact. The protocol is documented in
+See `examples/python-managed-process-extension` for a complete **repo-local
+development** package that writes an artifact. Its source injection is
+deliberate so contributors can run it from this checkout; a standalone package
+must use the virtual-environment install above rather than copy that injection.
+The protocol is documented in
 `docs/contracts/extension-sdk.md`; another language can implement it directly
 without a core change or this Python SDK.
+
+The first runnable surface is Unix-only (macOS and Linux). Euler clears the
+child environment and supplies only the package directory as working directory,
+the inherited `PATH`, and `EULER_MANAGED_PROCESS_PROTOCOL`; package code must
+not depend on ambient `HOME`, locale, certificate, or Python-path variables.
+The manifest should name a package-local interpreter directly, such as
+`.venv/bin/python`, rather than relying on inherited virtual-environment state.
 
 ## Command args
 
@@ -264,6 +274,13 @@ the command explicitly grants that command's declared capabilities for that one
 invocation. Euler announces the exact capability list on stderr before launch;
 declarations are never silent grants. Child-process stdout/stderr are not
 forwarded there.
+
+Linked-package enablement is explicit user-scope launch consent, separate from
+the bundled-extension registry and its project/session selection overlay. It
+reviews the current manifest and exact argv—not a content hash of every source
+file—so trusted local package code can iterate without re-enabling after every
+edit. A manifest or argv change is the review boundary: it must be reloaded and
+enabled again before launch.
 
 ## Bundled examples
 

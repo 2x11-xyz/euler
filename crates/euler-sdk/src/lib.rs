@@ -203,6 +203,7 @@ pub enum ArgValueKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvenanceQuery {
     pub after_event_id: Option<String>,
     pub kinds: Vec<String>,
@@ -237,6 +238,7 @@ pub struct ProvenancePage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticsQuery {
     pub tail_lines: usize,
     pub max_bytes: usize,
@@ -251,6 +253,7 @@ pub struct DiagnosticsPage {
 /// Task description for `HostApi::spawn_agent` (mirrors the fields the
 /// session companion path validates; free-form fields are bounded by core).
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpawnAgentTask {
     pub task: String,
     pub persona: String,
@@ -307,6 +310,7 @@ pub struct ArtifactRecord {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostAgentBudget {
     pub max_turns: Option<u32>,
     pub max_tool_calls: Option<u32>,
@@ -314,6 +318,7 @@ pub struct HostAgentBudget {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostAgentTask {
     pub task: String,
     pub persona: String,
@@ -325,6 +330,7 @@ pub struct HostAgentTask {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostAgentResult {
     pub ok: bool,
     pub summary: String,

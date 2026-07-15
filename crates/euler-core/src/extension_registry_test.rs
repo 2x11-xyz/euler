@@ -476,11 +476,35 @@ fn linked_package_activation_is_explicit_and_reload_revokes_it() {
     registry
         .link_package(load_extension_package(package_dir.path()).expect("package"))
         .expect("link");
+    assert_eq!(
+        registry
+            .linked_execution_enabled("example-extension")
+            .expect("initial linked activation"),
+        ExtensionEnablement::Disabled
+    );
 
     let enabled = registry
         .set_linked_execution_enabled("example-extension", true)
         .expect("enable linked package");
     assert_eq!(enabled, ExtensionEnablement::Enabled);
+    assert_eq!(
+        registry
+            .linked_execution_enabled("example-extension")
+            .expect("linked activation"),
+        ExtensionEnablement::Enabled
+    );
+    assert_eq!(
+        registry.state("example-extension").expect("bundled state"),
+        ExtensionEnablement::Disabled,
+        "linked launch consent must not enter bundled extension selection"
+    );
+    assert!(
+        !registry
+            .enablement_states()
+            .expect("bundled states")
+            .contains_key("example-extension"),
+        "linked launch consent has its own persistence owner"
+    );
 
     let disabled = registry
         .set_linked_execution_enabled("example-extension", false)
@@ -493,6 +517,12 @@ fn linked_package_activation_is_explicit_and_reload_revokes_it() {
     write_managed_process_manifest(package_dir.path(), "example-extension", "0.2.0");
     let reloaded = registry.reload_link("example-extension").expect("reload");
     assert_eq!(reloaded.status, LinkedExtensionStatus::NeedsReview);
+    assert_eq!(
+        registry
+            .linked_execution_enabled("example-extension")
+            .expect("revoked activation"),
+        ExtensionEnablement::Disabled
+    );
 }
 
 #[test]
@@ -521,12 +551,12 @@ fn linked_package_activation_refuses_native_and_broken_packages() {
             .status,
         LinkedExtensionStatus::Broken
     );
-    assert!(matches!(
+    assert_eq!(
         registry
             .set_linked_execution_enabled("broken-extension", false)
-            .expect_err("broken runtime cannot activate"),
-        ExtensionRegistryError::BrokenLinkedExtension { .. }
-    ));
+            .expect("broken package can always lose launch consent"),
+        ExtensionEnablement::Disabled
+    );
 }
 
 #[test]

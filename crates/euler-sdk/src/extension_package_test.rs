@@ -129,6 +129,43 @@ fn parses_managed_process_entrypoint_and_rejects_ambiguous_runtime_shapes() {
         .expect_err("control character")
         .to_string()
         .contains("must not contain control characters"));
+
+    let mut empty_command: serde_json::Value =
+        serde_json::from_str(&manifest).expect("managed manifest json");
+    empty_command["entrypoint"]["command"] = json!([]);
+    assert!(parse_extension_manifest_bytes(
+        &serde_json::to_vec(&empty_command).expect("empty command manifest")
+    )
+    .expect_err("empty argv")
+    .to_string()
+    .contains("must not be empty"));
+
+    let mut too_many_args: serde_json::Value =
+        serde_json::from_str(&manifest).expect("managed manifest json");
+    too_many_args["entrypoint"]["command"] = serde_json::Value::Array(
+        (0..=MAX_MANAGED_PROCESS_ENTRYPOINT_ARGS)
+            .map(|_| json!("python3"))
+            .collect(),
+    );
+    assert!(parse_extension_manifest_bytes(
+        &serde_json::to_vec(&too_many_args).expect("too many args manifest")
+    )
+    .expect_err("argv count limit")
+    .to_string()
+    .contains("maximum is"));
+
+    let mut oversized_arg: serde_json::Value =
+        serde_json::from_str(&manifest).expect("managed manifest json");
+    oversized_arg["entrypoint"]["command"] = json!([
+        "python3",
+        "x".repeat(MAX_MANAGED_PROCESS_ENTRYPOINT_ARG_BYTES + 1),
+    ]);
+    assert!(parse_extension_manifest_bytes(
+        &serde_json::to_vec(&oversized_arg).expect("oversized arg manifest")
+    )
+    .expect_err("argv item limit")
+    .to_string()
+    .contains("is too long"));
 }
 
 #[test]

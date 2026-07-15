@@ -20,6 +20,8 @@ use thiserror::Error;
 
 const STATE_LOG_FILE: &str = "state.jsonl";
 const STATE_LOG_LOCK_FILE: &str = "state.jsonl.lock";
+const LINKED_ACTIVATION_LOG_FILE: &str = "linked-activation.jsonl";
+const LINKED_ACTIVATION_LOG_LOCK_FILE: &str = "linked-activation.jsonl.lock";
 const LINK_INVENTORY_FILE: &str = "links.json";
 const LINK_INVENTORY_LOCK_FILE: &str = "links.json.lock";
 const INSTALLED_DIR: &str = "installed";
@@ -189,7 +191,25 @@ impl ExtensionRegistry {
         } else {
             ExtensionEnablement::Disabled
         };
-        self.append_entry_locked(StateEntry::new(id, state))?;
+        self.append_enablement_entry_locked(&self.state_log_path(), StateEntry::new(id, state))?;
+        Ok(state)
+    }
+
+    fn set_linked_execution_enabled_locked(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<ExtensionEnablement, ExtensionRegistryError> {
+        let _states = self.fold_linked_execution_states()?;
+        let state = if enabled {
+            ExtensionEnablement::Enabled
+        } else {
+            ExtensionEnablement::Disabled
+        };
+        self.append_enablement_entry_locked(
+            &self.linked_activation_log_path(),
+            StateEntry::new(id, state),
+        )?;
         Ok(state)
     }
     pub fn enable(&self, id: &str) -> Result<ExtensionEnablement, ExtensionRegistryError> {
@@ -208,6 +228,20 @@ impl ExtensionRegistry {
     pub fn linked_extensions(&self) -> Result<Vec<LinkedExtension>, ExtensionRegistryError> {
         Ok(self.read_link_inventory()?.into_values().collect())
     }
+    /// Return the explicit launch consent for a linked package. This is kept
+    /// separate from bundled-extension enablement because local package
+    /// activation must never affect project/session bundled selection.
+    pub fn linked_execution_enabled(
+        &self,
+        id: &str,
+    ) -> Result<ExtensionEnablement, ExtensionRegistryError> {
+        validate_extension_id(id)?;
+        let states = self.fold_linked_execution_states()?;
+        Ok(states
+            .get(id)
+            .copied()
+            .unwrap_or(ExtensionEnablement::Disabled))
+    }
     /// Record an explicit local decision to launch (or stop launching) a
     /// linked package. This is package activation, not a capability grant:
     /// command capabilities remain mediated by the extension host at run time.
@@ -225,6 +259,12 @@ impl ExtensionRegistry {
             ExtensionMaterialization::Linked,
             MissingExtensionRecord::Linked,
         )?;
+        // Revocation is always safe. In particular, a package whose source
+        // has become broken must still be able to lose any prior consent.
+        if !enabled {
+            let _activation_lock = self.acquire_linked_activation_lock()?;
+            return self.set_linked_execution_enabled_locked(id, false);
+        }
         if existing.descriptor.runtime_kind != "managed-process" {
             return Err(ExtensionRegistryError::NotManagedProcess {
                 id: id.to_owned(),
@@ -234,8 +274,8 @@ impl ExtensionRegistry {
         if existing.status == LinkedExtensionStatus::Broken {
             return Err(ExtensionRegistryError::BrokenLinkedExtension { id: id.to_owned() });
         }
-        let _state_lock = self.acquire_lock()?;
-        self.set_enabled_locked(id, enabled)
+        let _activation_lock = self.acquire_linked_activation_lock()?;
+        self.set_linked_execution_enabled_locked(id, true)
     }
     pub fn audit(&self) -> Result<ExtensionAuditReport, ExtensionRegistryError> {
         let entries = self
@@ -256,8 +296,8 @@ impl ExtensionRegistry {
         let _lock = self.acquire_link_lock()?;
         let mut links = self.read_link_inventory()?;
         let linked = apply_link_package(&mut links, package)?;
-        let _state_lock = self.acquire_lock()?;
-        self.set_enabled_locked(&linked.id, false)?;
+        let _activation_lock = self.acquire_linked_activation_lock()?;
+        self.set_linked_execution_enabled_locked(&linked.id, false)?;
         self.write_link_inventory_locked(&links)?;
         Ok(linked)
     }
@@ -307,8 +347,8 @@ impl ExtensionRegistry {
             Err(error) => existing.with_broken(error.to_string()),
         };
         links.insert(id.to_owned(), linked.clone());
-        let _state_lock = self.acquire_lock()?;
-        self.set_enabled_locked(id, false)?;
+        let _activation_lock = self.acquire_linked_activation_lock()?;
+        self.set_linked_execution_enabled_locked(id, false)?;
         self.write_link_inventory_locked(&links)?;
         Ok(linked)
     }
@@ -322,8 +362,8 @@ impl ExtensionRegistry {
             ExtensionMaterialization::Linked,
             MissingExtensionRecord::Linked,
         )?;
-        let _state_lock = self.acquire_lock()?;
-        self.set_enabled_locked(id, false)?;
+        let _activation_lock = self.acquire_linked_activation_lock()?;
+        self.set_linked_execution_enabled_locked(id, false)?;
         links.remove(id);
         self.write_link_inventory_locked(&links)?;
         Ok(())
@@ -345,18 +385,34 @@ impl ExtensionRegistry {
         Ok(existing)
     }
     fn fold_states(&self) -> Result<BTreeMap<String, ExtensionEnablement>, ExtensionRegistryError> {
+        self.fold_enablement_log(&self.state_log_path())
+    }
+
+    fn fold_linked_execution_states(
+        &self,
+    ) -> Result<BTreeMap<String, ExtensionEnablement>, ExtensionRegistryError> {
+        self.fold_enablement_log(&self.linked_activation_log_path())
+    }
+
+    fn fold_enablement_log(
+        &self,
+        path: &Path,
+    ) -> Result<BTreeMap<String, ExtensionEnablement>, ExtensionRegistryError> {
         let mut states = BTreeMap::new();
-        for entry in self.read_entries()? {
+        for entry in self.read_enablement_entries(path)? {
             states.insert(entry.id, entry.op.enablement());
         }
         Ok(states)
     }
-    fn read_entries(&self) -> Result<Vec<StateEntry>, ExtensionRegistryError> {
+
+    fn read_enablement_entries(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<StateEntry>, ExtensionRegistryError> {
         // Readers intentionally do not take the advisory lock. Writers append
         // one newline-terminated JSON value while holding the lock, and readers
         // fold only the accepted newline-complete prefix.
-        let path = self.state_log_path();
-        let Some(content) = read_private_string(&path)? else {
+        let Some(content) = read_private_string(path)? else {
             return Ok(Vec::new());
         };
         accepted_prefix_lines(&content)
@@ -370,22 +426,25 @@ impl ExtensionRegistry {
             .collect()
     }
 
-    fn append_entry_locked(&self, entry: StateEntry) -> Result<(), ExtensionRegistryError> {
+    fn append_enablement_entry_locked(
+        &self,
+        path: &Path,
+        entry: StateEntry,
+    ) -> Result<(), ExtensionRegistryError> {
         let line = serde_json::to_string(&entry).map_err(ExtensionRegistryError::Serialize)?;
         let mut entry_line = line.into_bytes();
         entry_line.push(b'\n');
-        let path = self.state_log_path();
-        reject_symlink(&path, REGISTRY_LEAF_SYMLINK_MESSAGE)?;
+        reject_symlink(path, REGISTRY_LEAF_SYMLINK_MESSAGE)?;
         let mut file = private_no_follow_open_options()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .map_err(ExtensionRegistryError::Io)?;
         set_file_mode_0600(&file)?;
         file.write_all(&entry_line)?;
         file.flush()?;
         file.sync_data()?;
-        sync_dir(containing_dir(&path))?;
+        sync_dir(containing_dir(path))?;
         Ok(())
     }
 
@@ -471,12 +530,27 @@ impl ExtensionRegistry {
         acquire_file_lock(self.link_inventory_lock_path())
     }
 
+    fn acquire_linked_activation_lock(&self) -> Result<File, ExtensionRegistryError> {
+        ensure_registry_dir(&self.home)?;
+        acquire_file_lock(self.linked_activation_log_lock_path())
+    }
+
     fn state_log_path(&self) -> PathBuf {
         self.home.extensions_dir().join(STATE_LOG_FILE)
     }
 
     fn state_log_lock_path(&self) -> PathBuf {
         self.home.extensions_dir().join(STATE_LOG_LOCK_FILE)
+    }
+
+    fn linked_activation_log_path(&self) -> PathBuf {
+        self.home.extensions_dir().join(LINKED_ACTIVATION_LOG_FILE)
+    }
+
+    fn linked_activation_log_lock_path(&self) -> PathBuf {
+        self.home
+            .extensions_dir()
+            .join(LINKED_ACTIVATION_LOG_LOCK_FILE)
     }
 
     fn link_inventory_path(&self) -> PathBuf {

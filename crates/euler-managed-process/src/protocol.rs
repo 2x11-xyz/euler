@@ -99,7 +99,7 @@ pub(crate) fn object(value: Value) -> Result<Map<String, Value>, ProtocolError> 
 }
 
 fn valid_id(value: &Value) -> bool {
-    value.is_string() || value.is_number()
+    value.is_string() || value.as_i64().is_some() || value.as_u64().is_some()
 }
 
 #[cfg(test)]
@@ -127,6 +127,7 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": {}, "method": "x"}),
             json!({"jsonrpc": "2.0", "id": "x", "result": {}, "error": {}}),
             json!({"jsonrpc": "1.0", "id": "x", "result": {}}),
+            json!({"jsonrpc": "2.0", "id": 1.5, "result": {}}),
         ] {
             assert!(decode_message(value.to_string().as_bytes()).is_err());
         }

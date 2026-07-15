@@ -114,7 +114,8 @@ Euler is designed as a platform, not a fixed agent. Bundled native extensions ru
 today and can be enabled, disabled, or selected per session. Local packages can
 be validated, linked, installed, searched, and audited. Explicitly enabled,
 linked `managed-process` packages can also run through the language-neutral
-JSON-RPC stdio runtime; Python is the first SDK, not a special runtime kind.
+JSON-RPC stdio runtime via explicit headless `extension run` on macOS and
+Linux; Python is the first SDK, not a special runtime kind.
 
 ```sh
 euler extension list

@@ -1,5 +1,5 @@
 use super::{decode_message, IncomingMessage, ProtocolError};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -59,7 +59,7 @@ pub(super) fn spawn_stdout_reader(
     max_protocol_bytes: usize,
 ) -> IoThread {
     spawn_io_thread(move || {
-        let mut stdout = stdout;
+        let mut stdout = BufReader::new(stdout);
         let mut line = Vec::with_capacity(1024);
         let mut byte = [0_u8; 1];
         let mut messages_seen = 0_usize;

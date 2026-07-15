@@ -6263,6 +6263,7 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn extension_cli_runs_enabled_linked_python_process_and_reload_revokes_it() {
     let python = Command::new("python3")
@@ -6402,6 +6403,37 @@ serve({"inspect": inspect})
     );
     assert!(enabled.stderr.is_empty());
 
+    // Linked-package launch consent must not enter the bundled registry. If it
+    // did, RegistryResolution would reject the linked id as an unknown bundled
+    // extension and this ordinary bundled run would fail after the link enable.
+    let bundled_enabled = command_with_home(exe, &home)
+        .args(["extension", "enable", "session-export"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("enable bundled session export");
+    assert!(
+        bundled_enabled.status.success(),
+        "bundled enable stderr: {}",
+        String::from_utf8_lossy(&bundled_enabled.stderr)
+    );
+    let bundled_run = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "session-export.session-export",
+            path_str(&log),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run bundled session export after linked enable");
+    assert!(
+        bundled_run.status.success(),
+        "bundled run stderr: {}",
+        String::from_utf8_lossy(&bundled_run.stderr)
+    );
+
     let info = command_with_home(exe, &home)
         .args(["extension", "info", "python-cli-proof"])
         .stdout(Stdio::piped())
@@ -6482,6 +6514,59 @@ serve({"inspect": inspect})
         "artifact bytes must not enter provenance"
     );
 
+    // The stored manifest fingerprint, not a best-effort source read, is the
+    // review boundary. A stale source must stop presenting as enabled and must
+    // not launch until `reload` records a new review decision.
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-cli-proof",
+        "0.1.2",
+        &[
+            python.to_string_lossy().into_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let stale_info = command_with_home(exe, &home)
+        .args(["extension", "info", "python-cli-proof"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("stale linked Python extension info");
+    assert!(stale_info.status.success());
+    let stale_info_json: serde_json::Value =
+        serde_json::from_slice(&stale_info.stdout).expect("stale info json");
+    assert_eq!(stale_info_json["status"], serde_json::json!("needs-review"));
+    assert_eq!(
+        stale_info_json["execution_granted"],
+        serde_json::json!(false)
+    );
+    assert_eq!(stale_info_json["requires_review"], serde_json::json!(true));
+
+    fs::remove_file(extension_dir.path().join("invoked")).expect("clear invocation marker");
+    let stale_run = command_with_home(exe, &home)
+        .args([
+            "extension",
+            "run",
+            "python-cli-proof.inspect",
+            path_str(&log),
+            "--input-file",
+            path_str(&input),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run stale Python extension");
+    assert!(!stale_run.status.success());
+    assert!(String::from_utf8_lossy(&stale_run.stderr).contains(
+        "linked extension manifest changed; run `euler extension reload python-cli-proof`"
+    ));
+    assert!(
+        !extension_dir.path().join("invoked").exists(),
+        "a stale manifest must not launch"
+    );
+
     let reloaded = command_with_home(exe, &home)
         .args(["extension", "reload", "python-cli-proof"])
         .stdout(Stdio::piped())
@@ -6493,7 +6578,6 @@ serve({"inspect": inspect})
         serde_json::from_slice(&reloaded.stdout).expect("reload json");
     assert_eq!(reloaded_json["status"], serde_json::json!("needs-review"));
 
-    fs::remove_file(extension_dir.path().join("invoked")).expect("clear invocation marker");
     let log_before_rejected_run = fs::read(&log).expect("log before rejected run");
     let after_reload = command_with_home(exe, &home)
         .args([
@@ -10503,6 +10587,7 @@ fn write_managed_process_extension_manifest(
     .expect("write managed-process extension manifest");
 }
 
+#[cfg(unix)]
 fn provision_python_venv(extension_dir: &Path) -> PathBuf {
     let sdk_source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk");

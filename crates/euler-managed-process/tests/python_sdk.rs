@@ -1,3 +1,4 @@
+#![cfg(unix)]
 #![allow(clippy::too_many_lines)]
 
 use euler_managed_process::{
@@ -212,8 +213,11 @@ write({"jsonrpc": "2.0", "id": initialize["id"], "result": {"protocol_version": 
 read()
 command = read()
 write({"jsonrpc": "2.0", "id": command["id"], "error": {"code": -32000, "message": "PROCESS_SECRET_DO_NOT_RECORD"}})
-while sys.stdin.buffer.readline():
-    pass
+shutdown = read()
+assert shutdown["method"] == "shutdown"
+write({"jsonrpc": "2.0", "id": shutdown["id"], "result": {}})
+exit_message = read()
+assert exit_message["method"] == "exit"
 "#,
     );
     let error = execute(
@@ -229,6 +233,140 @@ while sys.stdin.buffer.readline():
         ManagedProcessRuntimeError::CommandFailed.to_string()
     );
     assert!(!message.contains("PROCESS_SECRET_DO_NOT_RECORD"));
+}
+
+#[test]
+fn peer_messages_queue_while_a_host_call_is_running() {
+    require_python();
+    let temp = TempDir::new().expect("temp package");
+    write_script(
+        temp.path(),
+        "extension.py",
+        r#"import json
+import sys
+
+def read():
+    return json.loads(sys.stdin.buffer.readline())
+
+def write(message):
+    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+initialize = read()
+write({"jsonrpc": "2.0", "id": initialize["id"], "result": {"protocol_version": "euler-managed-process/1"}})
+read()
+command = read()
+write({"jsonrpc": "2.0", "id": "slow-host-call", "method": "euler/host/query-provenance", "params": {"after_event_id": None, "kinds": [], "limit": 2, "scan_limit": 4, "include_blob_fields": False, "blob_byte_limit": 1024}})
+for index in range(33):
+    write({"jsonrpc": "2.0", "method": "euler/progress", "params": {"message": f"queued-{index}", "fraction": 0.5}})
+write({"jsonrpc": "2.0", "id": command["id"], "result": {"queued": 33}})
+host_response = read()
+assert host_response["id"] == "slow-host-call"
+shutdown = read()
+assert shutdown["method"] == "shutdown"
+write({"jsonrpc": "2.0", "id": shutdown["id"], "result": {}})
+exit_message = read()
+assert exit_message["method"] == "exit"
+"#,
+    );
+    let host = FakeHost {
+        query_delay: Some(Duration::from_millis(75)),
+        ..FakeHost::default()
+    };
+    let output = execute(
+        &extension(
+            temp.path(),
+            "exercise",
+            vec![Capability::ProvenanceRead.as_str().to_owned()],
+        ),
+        "exercise",
+        &host,
+    )
+    .expect("queued peer messages must remain within the declared budget");
+
+    assert_eq!(output, json!({"queued": 33}));
+}
+
+#[test]
+fn shutdown_requires_an_object_result() {
+    require_python();
+    let temp = TempDir::new().expect("temp package");
+    write_script(
+        temp.path(),
+        "extension.py",
+        r#"import json
+import sys
+
+def read():
+    return json.loads(sys.stdin.buffer.readline())
+
+def write(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+initialize = read()
+write({"jsonrpc": "2.0", "id": initialize["id"], "result": {"protocol_version": "euler-managed-process/1"}})
+read()
+command = read()
+write({"jsonrpc": "2.0", "id": command["id"], "result": {"ok": True}})
+shutdown = read()
+assert shutdown["method"] == "shutdown"
+write({"jsonrpc": "2.0", "id": shutdown["id"], "result": None})
+"#,
+    );
+    let error = execute(
+        &extension(temp.path(), "exercise", Vec::new()),
+        "exercise",
+        &FakeHost::default(),
+    )
+    .expect_err("non-object shutdown response");
+
+    assert_eq!(
+        error.to_string(),
+        ManagedProcessRuntimeError::ProtocolViolation.to_string()
+    );
+}
+
+#[test]
+fn nonzero_final_child_status_is_a_generic_extension_failure() {
+    require_python();
+    let temp = TempDir::new().expect("temp package");
+    write_script(
+        temp.path(),
+        "extension.py",
+        r#"import json
+import sys
+
+def read():
+    return json.loads(sys.stdin.buffer.readline())
+
+def write(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+initialize = read()
+write({"jsonrpc": "2.0", "id": initialize["id"], "result": {"protocol_version": "euler-managed-process/1"}})
+read()
+command = read()
+write({"jsonrpc": "2.0", "id": command["id"], "result": {"ok": True}})
+shutdown = read()
+write({"jsonrpc": "2.0", "id": shutdown["id"], "result": {}})
+exit_message = read()
+assert exit_message["method"] == "exit"
+raise SystemExit(7)
+"#,
+    );
+    let error = execute(
+        &extension(temp.path(), "exercise", Vec::new()),
+        "exercise",
+        &FakeHost::default(),
+    )
+    .expect_err("nonzero peer exit");
+
+    assert_eq!(
+        error.to_string(),
+        ManagedProcessRuntimeError::CommandFailed.to_string()
+    );
 }
 
 #[test]
@@ -703,6 +841,10 @@ write({"jsonrpc": "2.0", "id": "peer-query", "method": "euler/host/query-provena
 query_response = read()
 assert query_response["id"] == "peer-query"
 assert query_response["result"]["applied_limit"] == 2
+write({"jsonrpc": "2.0", "id": "peer-invalid", "method": "euler/host/query-provenance", "params": {"after_event_id": None, "kinds": [], "limit": 2, "scan_limit": 4, "include_blob_fields": False, "blob_byte_limit": 1024, "unexpected": True}})
+invalid_response = read()
+assert invalid_response["id"] == "peer-invalid"
+assert invalid_response["error"]["code"] == -32602
 write({"jsonrpc": "2.0", "id": "peer-unknown", "method": "euler/host/not-real", "params": {}})
 unknown_response = read()
 assert unknown_response["id"] == "peer-unknown"
@@ -837,10 +979,14 @@ struct FakeHost {
     spawned_batches: RefCell<usize>,
     deny_artifact: bool,
     diagnostics_line: String,
+    query_delay: Option<Duration>,
 }
 
 impl HostApi for FakeHost {
     fn query_provenance(&self, _query: ProvenanceQuery) -> Result<ProvenancePage, ExtensionError> {
+        if let Some(delay) = self.query_delay {
+            std::thread::sleep(delay);
+        }
         Ok(ProvenancePage {
             events: Vec::new(),
             applied_limit: 2,

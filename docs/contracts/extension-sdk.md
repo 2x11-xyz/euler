@@ -249,10 +249,12 @@ variant. Version `euler-managed-process/1` has this lifecycle:
 3. While that command is active, the peer may send bounded
    `euler/progress` notifications and JSON-RPC requests for the host methods
    below. The command's terminal response must be a JSON object.
-4. On successful completion Euler sends `shutdown`, waits for its response,
-   then sends `exit` and reaps the child. On timeout or protocol failure Euler
-   sends `$/cancelRequest` for the command, allows a short grace period, then
-   terminates and reaps the child and its normal descendants.
+4. On either a successful terminal result or a terminal JSON-RPC command error,
+   Euler sends `shutdown`, requires an object result, then sends `exit` and
+   reaps a zero-exit-status child. A non-object shutdown result or non-zero
+   final process status is a generic extension failure. On timeout or protocol
+   failure Euler sends `$/cancelRequest` for the command, allows a short grace
+   period, then terminates and reaps the child and its normal descendants.
 
 The current host request methods map one-for-one to `HostApi`:
 
@@ -300,6 +302,12 @@ forcibly preempted by the managed-process transport. A cancellable host-call
 SDK boundary is a separate core design change, not a hidden process-runtime
 exception.
 
+The child environment is deliberately minimal: package directory as current
+directory, inherited `PATH`, and `EULER_MANAGED_PROCESS_PROTOCOL`. No ambient
+home, locale, certificate, Python-path, or secret environment is inherited.
+Packages that need dependencies must invoke a package-local interpreter or
+otherwise carry their own explicit runtime configuration.
+
 `link` alone never launches a package. A linked managed-process package begins
 in `needs-review`; `validate`, `link`, and `info` expose its exact argv, and
 `enable` echoes that argv while recording explicit local launch consent.
@@ -308,12 +316,15 @@ inert in this slice. This consent is separate from capabilities: each
 invocation is still checked against its command's declared capability subset.
 
 This runtime is a process-management boundary, not OS-level containment. It is
-for trusted local packages. On Unix (including macOS), Euler launches the peer
-in its own process group and terminates ordinary descendants on cleanup so they
-cannot retain protocol pipes. Other platforms still bound Euler's own cleanup
-and detach a stuck I/O helper rather than blocking the caller; full descendant
-control is separate work. Sandboxing untrusted third-party code, including
-filesystem/network isolation, remains a separate security milestone.
+for trusted local packages and currently runs only on Unix hosts (including
+macOS); non-Unix hosts reject launch before starting a child. On Unix, Euler
+launches the peer in its own process group and, on cancellation or failure,
+terminates that group before reaping its leader so ordinary descendants cannot
+retain protocol pipes. After a clean peer exit Euler reaps only the direct
+child—it never signals a process group after reaping its leader, because that
+numeric id could be reused. A successful package must therefore clean up its
+own children. Sandboxing untrusted third-party code, including filesystem or
+network isolation, remains a separate security milestone.
 
 ## Command Invocation v0
 

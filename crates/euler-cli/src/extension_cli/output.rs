@@ -1,6 +1,6 @@
 use super::ExtensionSearchArgs;
 use crate::bundled_extensions::BundledDescriptor;
-use euler_core::{ExtensionMaterialization, LinkedExtension};
+use euler_core::{ExtensionMaterialization, LinkedExtension, LinkedExtensionStatus};
 use euler_sdk::{LoadedExtensionPackage, ManagedProcessEntrypoint, StaticCommandDescriptor};
 use serde::Serialize;
 use std::path::Path;
@@ -286,8 +286,11 @@ pub(super) fn search_result_for_linked(
 }
 
 pub(super) fn linked_status(linked: &LinkedExtension, execution_enabled: bool) -> &'static str {
-    if linked.status.as_str() == "broken" || linked.status.as_str() == "installed-inert" {
-        return linked.status.as_str();
+    match linked.status {
+        LinkedExtensionStatus::Broken | LinkedExtensionStatus::InstalledInert => {
+            return linked.status.as_str();
+        }
+        LinkedExtensionStatus::NeedsReview => {}
     }
     if linked.materialization == ExtensionMaterialization::Linked
         && linked.descriptor.runtime_kind == "managed-process"

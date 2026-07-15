@@ -16,21 +16,24 @@ use euler_sdk::{
 use io::{finish_io_thread, spawn_stderr_drain, spawn_stdin_writer, spawn_stdout_reader, IoThread};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::env;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::{
+    env,
+    process::{Command, Stdio},
+};
 use thiserror::Error;
 
 pub const MANAGED_PROCESS_PROTOCOL_VERSION: &str = "euler-managed-process/1";
 
-const MAX_PENDING_MESSAGES: usize = 32;
 const MAX_PENDING_OUTBOUND_MESSAGES: usize = 8;
 const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -77,6 +80,8 @@ pub enum ManagedProcessRuntimeError {
     InvalidDescriptor,
     #[error("managed-process extension could not start")]
     LaunchFailed,
+    #[error("managed-process extensions currently require a Unix host")]
+    UnsupportedPlatform,
     #[error("managed-process extension violated the protocol")]
     ProtocolViolation,
     #[error("managed-process extension exceeded the protocol output limit")]
@@ -321,31 +326,47 @@ fn run_protocol(
         "euler/command",
         json!({"command": command_name, "input": input}),
     ))?;
-    let result = process.await_response(
+    let command_response = process.await_response_body(
         &command_id,
         Instant::now() + process.limits.invocation_timeout,
         CallPhase::Invocation,
         host,
     )?;
-    if !result.is_object() {
-        return Err(ManagedProcessRuntimeError::ProtocolViolation);
-    }
+    let result = match command_response {
+        ResponseBody::Result(result) if result.is_object() => Some(result),
+        ResponseBody::Result(_) => return Err(ManagedProcessRuntimeError::ProtocolViolation),
+        // A JSON-RPC error is a valid terminal command response. Finish the
+        // protocol cleanly so SDKs do not receive a cancel/EOF traceback for
+        // an error they deliberately reported.
+        ResponseBody::Error => None,
+    };
 
+    shutdown_process(process, host)?;
+    result.ok_or(ManagedProcessRuntimeError::CommandFailed)
+}
+
+fn shutdown_process(
+    process: &mut RunningProcess,
+    host: &dyn HostApi,
+) -> Result<(), ManagedProcessRuntimeError> {
     let shutdown_id = Value::String("euler-shutdown-1".to_owned());
     process.send(request(
         shutdown_id.clone(),
         "shutdown",
         Value::Object(Map::new()),
     ))?;
-    let _shutdown = process.await_response(
+    let shutdown = process.await_response(
         &shutdown_id,
         Instant::now() + process.limits.shutdown_timeout,
         CallPhase::Shutdown,
         host,
     )?;
+    if !shutdown.is_object() {
+        return Err(ManagedProcessRuntimeError::ProtocolViolation);
+    }
     process.send(notification("exit", Value::Object(Map::new())))?;
     process.close_cleanly()?;
-    Ok(result)
+    Ok(())
 }
 
 fn validate_initialize_result(value: &Value) -> Result<(), ManagedProcessRuntimeError> {
@@ -375,6 +396,7 @@ struct RunningProcess {
     progress: ProgressBudget,
     host_requests: usize,
     invocation_started: bool,
+    child_reaped: bool,
     finished: bool,
 }
 
@@ -384,69 +406,83 @@ impl RunningProcess {
         entrypoint: &ManagedProcessEntrypoint,
         limits: &ManagedProcessLimits,
     ) -> Result<Self, ManagedProcessRuntimeError> {
-        let Some(executable) = entrypoint.command.first() else {
-            return Err(ManagedProcessRuntimeError::InvalidDescriptor);
-        };
-        let mut command = Command::new(executable);
-        configure_process_group(&mut command);
-        command
-            .args(entrypoint.command.iter().skip(1))
-            .current_dir(package_dir)
-            .env_clear()
-            .env(
-                "EULER_MANAGED_PROCESS_PROTOCOL",
-                MANAGED_PROCESS_PROTOCOL_VERSION,
-            )
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(path) = env::var_os("PATH") {
-            command.env("PATH", path);
+        #[cfg(not(unix))]
+        {
+            let _ = (package_dir, entrypoint, limits);
+            return Err(ManagedProcessRuntimeError::UnsupportedPlatform);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|_| ManagedProcessRuntimeError::LaunchFailed)?;
-        let (stdin, stdout, stderr) = take_child_pipes(&mut child)?;
-        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
-        let (outbound, outbound_receiver) = mpsc::sync_channel(MAX_PENDING_OUTBOUND_MESSAGES);
-        let stdout_limit_reached = Arc::new(AtomicBool::new(false));
-        let stderr_limit_reached = Arc::new(AtomicBool::new(false));
-        let writer_failed = Arc::new(AtomicBool::new(false));
-        let writer_thread = Some(spawn_stdin_writer(
-            stdin,
-            outbound_receiver,
-            Arc::clone(&writer_failed),
-        ));
-        let stdout_thread = Some(spawn_stdout_reader(
-            stdout,
-            sender,
-            Arc::clone(&stdout_limit_reached),
-            limits.max_message_bytes,
-            limits.max_protocol_messages,
-            limits.max_protocol_bytes,
-        ));
-        let stderr_thread = Some(spawn_stderr_drain(
-            stderr,
-            Arc::clone(&stderr_limit_reached),
-            limits.max_stderr_bytes,
-        ));
 
-        Ok(Self {
-            child,
-            outbound: Some(outbound),
-            receiver,
-            stdout_limit_reached,
-            stderr_limit_reached,
-            writer_failed,
-            writer_thread,
-            stdout_thread,
-            stderr_thread,
-            limits: limits.clone(),
-            progress: ProgressBudget::default(),
-            host_requests: 0,
-            invocation_started: false,
-            finished: false,
-        })
+        #[cfg(unix)]
+        {
+            let Some(executable) = entrypoint.command.first() else {
+                return Err(ManagedProcessRuntimeError::InvalidDescriptor);
+            };
+            let mut command = Command::new(executable);
+            configure_process_group(&mut command);
+            command
+                .args(entrypoint.command.iter().skip(1))
+                .current_dir(package_dir)
+                .env_clear()
+                .env(
+                    "EULER_MANAGED_PROCESS_PROTOCOL",
+                    MANAGED_PROCESS_PROTOCOL_VERSION,
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(path) = env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+            let mut child = command
+                .spawn()
+                .map_err(|_| ManagedProcessRuntimeError::LaunchFailed)?;
+            let (stdin, stdout, stderr) = take_child_pipes(&mut child)?;
+            // A synchronous HostApi call may temporarily stop the session loop
+            // from draining peer messages. The inbound queue therefore matches
+            // the declared total-message budget instead of mistaking ordinary
+            // protocol backpressure for a peer output-limit violation.
+            let (sender, receiver) = mpsc::sync_channel(limits.max_protocol_messages.max(1));
+            let (outbound, outbound_receiver) = mpsc::sync_channel(MAX_PENDING_OUTBOUND_MESSAGES);
+            let stdout_limit_reached = Arc::new(AtomicBool::new(false));
+            let stderr_limit_reached = Arc::new(AtomicBool::new(false));
+            let writer_failed = Arc::new(AtomicBool::new(false));
+            let writer_thread = Some(spawn_stdin_writer(
+                stdin,
+                outbound_receiver,
+                Arc::clone(&writer_failed),
+            ));
+            let stdout_thread = Some(spawn_stdout_reader(
+                stdout,
+                sender,
+                Arc::clone(&stdout_limit_reached),
+                limits.max_message_bytes,
+                limits.max_protocol_messages,
+                limits.max_protocol_bytes,
+            ));
+            let stderr_thread = Some(spawn_stderr_drain(
+                stderr,
+                Arc::clone(&stderr_limit_reached),
+                limits.max_stderr_bytes,
+            ));
+
+            Ok(Self {
+                child,
+                outbound: Some(outbound),
+                receiver,
+                stdout_limit_reached,
+                stderr_limit_reached,
+                writer_failed,
+                writer_thread,
+                stdout_thread,
+                stderr_thread,
+                limits: limits.clone(),
+                progress: ProgressBudget::default(),
+                host_requests: 0,
+                invocation_started: false,
+                child_reaped: false,
+                finished: false,
+            })
+        }
     }
 
     fn send(&mut self, message: Value) -> Result<(), ManagedProcessRuntimeError> {
@@ -476,6 +512,19 @@ impl RunningProcess {
         phase: CallPhase,
         host: &dyn HostApi,
     ) -> Result<Value, ManagedProcessRuntimeError> {
+        match self.await_response_body(expected_id, deadline, phase, host)? {
+            ResponseBody::Result(result) => Ok(result),
+            ResponseBody::Error => Err(ManagedProcessRuntimeError::CommandFailed),
+        }
+    }
+
+    fn await_response_body(
+        &mut self,
+        expected_id: &Value,
+        deadline: Instant,
+        phase: CallPhase,
+        host: &dyn HostApi,
+    ) -> Result<ResponseBody, ManagedProcessRuntimeError> {
         loop {
             if self.stdout_limit_reached.load(Ordering::Relaxed) {
                 return Err(ManagedProcessRuntimeError::OutputLimitExceeded);
@@ -510,10 +559,7 @@ impl RunningProcess {
                     self.observe_notification(&method, params)?;
                 }
                 Ok(Ok(IncomingMessage::Response { id, body })) if id == *expected_id => {
-                    return match body {
-                        ResponseBody::Result(result) => Ok(result),
-                        ResponseBody::Error => Err(ManagedProcessRuntimeError::CommandFailed),
-                    };
+                    return Ok(body);
                 }
                 Ok(Ok(IncomingMessage::Response { .. })) => {
                     return Err(ManagedProcessRuntimeError::ProtocolViolation);
@@ -577,13 +623,10 @@ impl RunningProcess {
             .filter(|message| !message.is_empty() && message.len() <= 4096)
             .ok_or(ManagedProcessRuntimeError::ProtocolViolation)?;
         if let Some(fraction) = params.get("fraction") {
-            let fraction = fraction
+            fraction
                 .as_f64()
                 .filter(|fraction| (0.0..=1.0).contains(fraction))
                 .ok_or(ManagedProcessRuntimeError::ProtocolViolation)?;
-            if !fraction.is_finite() {
-                return Err(ManagedProcessRuntimeError::ProtocolViolation);
-            }
         }
         self.progress.record(message, &self.limits)
     }
@@ -591,14 +634,14 @@ impl RunningProcess {
     fn close_cleanly(&mut self) -> Result<(), ManagedProcessRuntimeError> {
         self.close_input();
         self.wait_for_exit(Instant::now() + self.limits.shutdown_timeout)?;
+        self.finish_io();
         if self.output_limit_reached() {
             return Err(ManagedProcessRuntimeError::OutputLimitExceeded);
         }
         // A managed extension owns its process group. A normal child exits
-        // after `exit`; anything still holding the protocol pipes is an
-        // orphaned descendant and must not keep Euler's cleanup blocked.
-        self.force_stop_process_group();
-        self.finish_io();
+        // after `exit`; never signal that group after reaping its leader,
+        // because its numeric id may already have been reused. Error and
+        // timeout cleanup terminate the group before reaping instead.
         self.finished = true;
         Ok(())
     }
@@ -607,20 +650,15 @@ impl RunningProcess {
         if self.finished {
             return;
         }
-        if self.invocation_started {
+        if !self.child_reaped && self.invocation_started {
             let _ = self.send(notification(
                 "$/cancelRequest",
                 json!({"id": "euler-command-1"}),
             ));
         }
         self.close_input();
-        let deadline = Instant::now() + self.limits.cancel_grace;
-        self.wait_for_child_until(deadline);
-        self.request_process_group_stop();
-        self.force_stop_process_group();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if !self.child_reaped {
+            self.stop_after_cancellation_grace();
         }
         self.finish_io();
         self.finished = true;
@@ -635,6 +673,30 @@ impl RunningProcess {
             || self.stderr_limit_reached.load(Ordering::Relaxed)
     }
 
+    #[cfg(unix)]
+    fn stop_after_cancellation_grace(&mut self) {
+        // Do not poll `Child` before signaling: `try_wait` reaps the leader,
+        // which would make a later negative-PGID signal vulnerable to PID
+        // reuse. The unreaped child remains the process-group leader until
+        // this kill reaches ordinary descendants as well.
+        thread::sleep(self.limits.cancel_grace);
+        self.force_stop_process_group();
+        let _ = self.child.wait();
+        self.child_reaped = true;
+    }
+
+    #[cfg(not(unix))]
+    fn stop_after_cancellation_grace(&mut self) {
+        let deadline = Instant::now() + self.limits.cancel_grace;
+        self.wait_for_child_until(deadline);
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        self.child_reaped = true;
+    }
+
+    #[cfg(not(unix))]
     fn wait_for_child_until(&mut self, deadline: Instant) {
         while Instant::now() < deadline {
             match self.child.try_wait() {
@@ -647,8 +709,15 @@ impl RunningProcess {
     fn wait_for_exit(&mut self, deadline: Instant) -> Result<(), ManagedProcessRuntimeError> {
         loop {
             match self.child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(_)) | Err(_) => return Err(ManagedProcessRuntimeError::CommandFailed),
+                Ok(Some(status)) => {
+                    self.child_reaped = true;
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(ManagedProcessRuntimeError::CommandFailed)
+                    };
+                }
+                Err(_) => return Err(ManagedProcessRuntimeError::CommandFailed),
                 Ok(None) if Instant::now() >= deadline => {
                     return Err(ManagedProcessRuntimeError::ShutdownTimedOut);
                 }
@@ -657,13 +726,8 @@ impl RunningProcess {
         }
     }
 
-    fn request_process_group_stop(&self) {
-        #[cfg(unix)]
-        signal_process_group(&self.child, libc::SIGTERM);
-    }
-
+    #[cfg(unix)]
     fn force_stop_process_group(&self) {
-        #[cfg(unix)]
         signal_process_group(&self.child, libc::SIGKILL);
     }
 
@@ -679,9 +743,6 @@ impl RunningProcess {
 fn configure_process_group(command: &mut Command) {
     command.process_group(0);
 }
-
-#[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn signal_process_group(child: &Child, signal: libc::c_int) {
@@ -703,6 +764,9 @@ fn take_child_pipes(
     match (stdin, stdout, stderr) {
         (Some(stdin), Some(stdout), Some(stderr)) => Ok((stdin, stdout, stderr)),
         _ => {
+            #[cfg(unix)]
+            signal_process_group(child, libc::SIGKILL);
+            #[cfg(not(unix))]
             let _ = child.kill();
             let _ = child.wait();
             Err(ManagedProcessRuntimeError::LaunchFailed)

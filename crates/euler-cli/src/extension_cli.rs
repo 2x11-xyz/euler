@@ -184,7 +184,7 @@ fn run_list(stdout: &mut dyn Write) -> Result<()> {
         writeln!(stdout, "{} {status}", descriptor.id)?;
     }
     for linked in registry.linked_extensions()? {
-        let execution_enabled = registry.state(&linked.id)?.is_enabled();
+        let execution_enabled = current_linked_execution_enabled(&registry, &linked)?;
         writeln!(
             stdout,
             "{} {} {}",
@@ -201,7 +201,7 @@ fn run_status(id: &str, stdout: &mut dyn Write) -> Result<()> {
     if validate_known_extension_id(id).is_ok() {
         writeln!(stdout, "{} {}", id, status_label(registry.state(id)))?;
     } else if let Some(linked) = linked_extension(&registry, id)? {
-        let execution_enabled = registry.state(&linked.id)?.is_enabled();
+        let execution_enabled = current_linked_execution_enabled(&registry, &linked)?;
         writeln!(
             stdout,
             "{} {} {}",
@@ -218,8 +218,9 @@ fn run_status(id: &str, stdout: &mut dyn Write) -> Result<()> {
 fn run_info(id: &str, stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry()?;
     if let Some(linked) = linked_extension(&registry, id)? {
-        let execution_enabled = registry.state(&linked.id)?.is_enabled();
         let entrypoint = linked_process_entrypoint(&linked)?;
+        let execution_enabled =
+            entrypoint.is_some() && registry.linked_execution_enabled(&linked.id)?.is_enabled();
         writeln!(
             stdout,
             "{}",
@@ -246,12 +247,9 @@ fn run_search(search: &ExtensionSearchArgs, stdout: &mut dyn Write) -> Result<()
         ));
     }
     if let Some(registry) = &registry {
-        let enablement = registry.enablement_states().unwrap_or_default();
         for linked in linked_extensions_for_search(registry) {
             if bundled_extension_by_id(&linked.id).is_none() {
-                let execution_enabled = enablement
-                    .get(&linked.id)
-                    .is_some_and(|state| state.is_enabled());
+                let execution_enabled = current_linked_execution_enabled(registry, &linked)?;
                 results.push(search_result_for_linked(&linked, execution_enabled));
             }
         }
@@ -395,6 +393,9 @@ fn run_disable(id: &str, stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry()?;
     if let Some(linked) = linked_extension(&registry, id)? {
         if linked.materialization != ExtensionMaterialization::Linked {
+            return Err(non_runnable_extension_error(&linked, "disable"));
+        }
+        if linked.descriptor.runtime_kind != "managed-process" {
             return Err(non_runnable_extension_error(&linked, "disable"));
         }
         registry.set_linked_execution_enabled(id, false)?;
@@ -573,13 +574,21 @@ fn load_enabled_linked_process(
     linked: &LinkedExtension,
 ) -> Result<euler_sdk::LoadedExtensionPackage> {
     let package = load_linked_process_for_action(linked, "run")?;
-    if !registry.state(&linked.id)?.is_enabled() {
+    if !registry.linked_execution_enabled(&linked.id)?.is_enabled() {
         return Err(anyhow!(
             "linked extension is not enabled; run `euler extension enable {}` first",
             linked.id
         ));
     }
     Ok(package)
+}
+
+fn current_linked_execution_enabled(
+    registry: &ExtensionRegistry,
+    linked: &LinkedExtension,
+) -> Result<bool> {
+    Ok(registry.linked_execution_enabled(&linked.id)?.is_enabled()
+        && linked_process_entrypoint(linked)?.is_some())
 }
 
 fn linked_extension(registry: &ExtensionRegistry, id: &str) -> Result<Option<LinkedExtension>> {
