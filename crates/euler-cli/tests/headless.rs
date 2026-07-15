@@ -10711,6 +10711,79 @@ fn linked_process_cannot_shadow_a_bundled_extension_id() {
 }
 
 #[cfg(unix)]
+#[test]
+fn live_resolver_rejects_a_legacy_link_collision_before_launch() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "legacy-shadow",
+        "0.1.1",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        "from pathlib import Path\nPath('shadow-invoked').write_text('yes')\n",
+    )
+    .expect("write shadow process");
+    let linked = command_with_home(exe, &home)
+        .args(["extension", "link", path_str(extension_dir.path())])
+        .output()
+        .expect("link non-colliding extension");
+    assert!(linked.status.success());
+
+    // Simulate a legacy inventory created before bundled IDs were reserved.
+    // The live resolver must reject it before reading or launching the source.
+    let inventory_path = home.path().join(".euler/extensions/links.json");
+    let mut inventory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&inventory_path).expect("read inventory"))
+            .expect("inventory json");
+    let mut record = inventory["links"]
+        .as_object_mut()
+        .expect("links object")
+        .remove("legacy-shadow")
+        .expect("linked record");
+    record["descriptor"]["id"] = serde_json::json!("session-export");
+    inventory["links"]
+        .as_object_mut()
+        .expect("links object")
+        .insert("session-export".to_owned(), record);
+    fs::write(
+        &inventory_path,
+        serde_json::to_vec_pretty(&inventory).expect("serialize legacy inventory"),
+    )
+    .expect("write legacy inventory");
+
+    let root = tempfile::tempdir().expect("root dir");
+    let mut child = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"extension_run session-export.session-export {}\n")
+        .expect("write control line");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.contains(
+        "extension id `session-export` is ambiguous: a linked package conflicts with a bundled extension"
+    ));
+    assert!(!extension_dir.path().join("shadow-invoked").exists());
+}
+
+#[cfg(unix)]
 fn provision_python_venv(extension_dir: &Path) -> PathBuf {
     let sdk_source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk");
