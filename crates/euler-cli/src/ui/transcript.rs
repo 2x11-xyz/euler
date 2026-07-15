@@ -86,6 +86,12 @@ pub enum TranscriptItem {
     },
     PermissionPrompt {
         capability: String,
+        /// Complete set for an operation-level prompt. Legacy/single prompts
+        /// leave this empty and use `capability` directly.
+        capabilities: Vec<String>,
+        /// Operation name for an operation-level prompt. Legacy/single
+        /// prompts leave this absent and use `capability` directly.
+        operation: Option<String>,
         reason: String,
     },
     PermissionAsk {
@@ -103,6 +109,13 @@ pub enum TranscriptItem {
         selected_option: ApprovalOption,
         /// Companion persona/name when the ask bubbles from an in-flight companion.
         companion_name: Option<String>,
+    },
+    /// One user-facing operation whose individual capability decisions remain
+    /// separate in the event ledger.
+    PermissionBatchAsk {
+        operation: String,
+        capabilities: Vec<String>,
+        selected_option: ApprovalOption,
     },
     PermissionDecision {
         capability: String,
@@ -660,6 +673,19 @@ fn project_event_with_checkpoints(
         }),
         EventKind::PERMISSION_PROMPT => Some(TranscriptItem::PermissionPrompt {
             capability: payload_string(event, "capability").unwrap_or_default(),
+            capabilities: event
+                .payload
+                .get("capabilities")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            operation: payload_string(event, "operation"),
             reason: payload_string(event, "reason").unwrap_or_default(),
         }),
         EventKind::PERMISSION_DECISION => Some(TranscriptItem::PermissionDecision {

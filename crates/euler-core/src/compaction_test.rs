@@ -34,6 +34,35 @@ fn safe_boundary_rejects_open_permission_prompt() {
 }
 
 #[test]
+fn safe_boundary_rejects_partially_settled_permission_batch() {
+    let prompt = permission_batch_prompt(None);
+    let first = permission_batch_decision(&prompt, "fs-write");
+    let second = permission_batch_decision(&prompt, "network");
+
+    assert!(
+        !is_safe_boundary(&[prompt.clone(), first.clone()], 1),
+        "one decision cannot settle a two-capability operation"
+    );
+    assert!(is_safe_boundary(&[prompt, first, second], 2));
+}
+
+#[test]
+fn extension_static_grant_does_not_settle_user_permission_prompt() {
+    let prompt = permission_prompt(None);
+    let extension_decision = event(
+        EventKind::PERMISSION_DECISION,
+        Some(prompt.id.clone()),
+        object([
+            ("capability", "fs-write".into()),
+            ("mode", "static-grant".into()),
+            ("source", "extension".into()),
+        ]),
+    );
+
+    assert!(!is_safe_boundary(&[prompt, extension_decision], 1));
+}
+
+#[test]
 fn safe_boundary_rejects_open_model_call() {
     let events = vec![model_call()];
 
@@ -338,12 +367,32 @@ fn permission_decision(prompt: &EventEnvelope) -> EventEnvelope {
     event(
         EventKind::PERMISSION_DECISION,
         Some(prompt.id.clone()),
-        object([]),
+        object([("capability", "fs-write".into())]),
     )
 }
 
 fn permission_prompt(parent: Option<String>) -> EventEnvelope {
-    event(EventKind::PERMISSION_PROMPT, parent, object([]))
+    event(
+        EventKind::PERMISSION_PROMPT,
+        parent,
+        object([("capability", "fs-write".into())]),
+    )
+}
+
+fn permission_batch_prompt(parent: Option<String>) -> EventEnvelope {
+    event(
+        EventKind::PERMISSION_PROMPT,
+        parent,
+        object([("capabilities", json!(["fs-write", "network"]))]),
+    )
+}
+
+fn permission_batch_decision(prompt: &EventEnvelope, capability: &str) -> EventEnvelope {
+    event(
+        EventKind::PERMISSION_DECISION,
+        Some(prompt.id.clone()),
+        object([("capability", capability.to_owned().into())]),
+    )
 }
 
 fn model_result(call: &EventEnvelope) -> EventEnvelope {

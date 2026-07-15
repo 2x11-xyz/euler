@@ -97,6 +97,12 @@ pub(in crate::ui::transcript) struct PermissionAskView<'a> {
     pub(in crate::ui::transcript) companion_name: Option<&'a str>,
 }
 
+pub(in crate::ui::transcript) struct PermissionBatchAskView<'a> {
+    pub(in crate::ui::transcript) operation: &'a str,
+    pub(in crate::ui::transcript) capabilities: &'a [String],
+    pub(in crate::ui::transcript) selected_option: crate::ui::patch_approval::ApprovalOption,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PermissionPanelRowStyle {
     Title,
@@ -194,6 +200,55 @@ pub(in crate::ui::transcript) fn render_permission_ask(
                 PermissionPanelRow::selected(line.text)
             } else {
                 PermissionPanelRow::body(line.text)
+            }
+        }),
+    );
+    push_bordered_permission_panel(lines, &rows, theme, width);
+}
+
+/// Render a single operation-level approval. The choices deliberately omit
+/// durable/project scopes: the grouped choice covers several independent
+/// capabilities and must not make a broad persisted rule look narrow.
+pub(in crate::ui::transcript) fn render_permission_batch_ask(
+    lines: &mut Vec<Line<'static>>,
+    ask: PermissionBatchAskView<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    let count = ask.capabilities.len();
+    let count_label = if count == 1 {
+        "1 capability".to_owned()
+    } else {
+        format!("{count} capabilities")
+    };
+    let capabilities = ask.capabilities.join(" · ");
+    let mut rows = vec![
+        PermissionPanelRow::title_with_corner(
+            "Approve operation?",
+            format!("{count_label} · cwd {}", current_cwd_label()),
+        ),
+        PermissionPanelRow::body(ask.operation),
+        PermissionPanelRow::metadata(format!("requests: {capabilities}")),
+        PermissionPanelRow::body(String::new()),
+    ];
+    rows.extend(
+        [
+            (
+                crate::ui::patch_approval::ApprovalOption::AllowOnce,
+                "y  Allow once",
+            ),
+            (
+                crate::ui::patch_approval::ApprovalOption::AllowSession,
+                "a  Allow all requested capabilities for this session",
+            ),
+            (crate::ui::patch_approval::ApprovalOption::Deny, "n  Deny"),
+        ]
+        .into_iter()
+        .map(|(option, text)| {
+            if ask.selected_option == option {
+                PermissionPanelRow::selected(text)
+            } else {
+                PermissionPanelRow::body(text)
             }
         }),
     );

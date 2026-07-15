@@ -31,7 +31,8 @@ pub(super) use boundary::{
 pub(super) use companion::{render_companion_block, CompanionRender};
 
 pub(super) use permission::{
-    render_permission_ask, render_permission_decision, PermissionAskView, PermissionDecisionView,
+    render_permission_ask, render_permission_batch_ask, render_permission_decision,
+    PermissionAskView, PermissionBatchAskView, PermissionDecisionView,
 };
 
 pub(crate) use shell::normalized_shell_command;

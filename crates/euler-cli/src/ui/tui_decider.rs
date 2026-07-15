@@ -1,11 +1,25 @@
-use euler_core::permissions::{DeciderVerdict, PermissionRequest};
+use euler_core::permissions::{DeciderVerdict, PermissionRequest, PermissionRequestBatch};
 use euler_core::{GrantScope, PermissionDecider, ScopePattern};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 #[derive(Debug)]
 pub struct TuiDecider {
-    request_tx: Sender<PermissionRequest>,
+    request_tx: Sender<PermissionPrompt>,
     reply_rx: Receiver<PermissionReply>,
+}
+
+/// A single capability request or an operation-level request batch waiting for
+/// an answer from the terminal UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PermissionPrompt {
+    Request(PermissionRequest),
+    Batch(PermissionRequestBatch),
+}
+
+impl From<PermissionRequest> for PermissionPrompt {
+    fn from(request: PermissionRequest) -> Self {
+        Self::Request(request)
+    }
 }
 
 /// UI → decider reply for an approval panel decision.
@@ -29,7 +43,7 @@ pub enum PermissionReply {
 
 #[derive(Debug)]
 pub struct PermissionChannels {
-    pub request_rx: Receiver<PermissionRequest>,
+    pub request_rx: Receiver<PermissionPrompt>,
     pub reply_tx: Sender<PermissionReply>,
 }
 
@@ -52,7 +66,17 @@ impl TuiDecider {
 
 impl PermissionDecider for TuiDecider {
     fn decide(&mut self, request: &PermissionRequest) -> DeciderVerdict {
-        if self.request_tx.send(request.clone()).is_err() {
+        self.decide_prompt(PermissionPrompt::Request(request.clone()))
+    }
+
+    fn decide_batch(&mut self, batch: &PermissionRequestBatch) -> DeciderVerdict {
+        self.decide_prompt(PermissionPrompt::Batch(batch.clone()))
+    }
+}
+
+impl TuiDecider {
+    fn decide_prompt(&mut self, prompt: PermissionPrompt) -> DeciderVerdict {
+        if self.request_tx.send(prompt).is_err() {
             return DeciderVerdict::Deny;
         }
         match self.reply_rx.recv().unwrap_or(PermissionReply::Deny) {
@@ -86,8 +110,12 @@ impl PermissionDecider for TuiDecider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use euler_core::{Session, SessionConfig};
+    use euler_event::EventKind;
+    use euler_provider::ScriptedProvider;
     use euler_sdk::Capability;
     use std::thread;
+    use std::time::Duration;
 
     fn request() -> PermissionRequest {
         PermissionRequest::new(Capability::FsWrite, "edit file".to_owned())
@@ -99,13 +127,64 @@ mod tests {
         let handle = thread::spawn(move || decider.decide(&request()));
 
         let sent = channels.request_rx.recv().expect("request");
-        assert_eq!(sent, request());
+        assert_eq!(sent, PermissionPrompt::Request(request()));
         channels
             .reply_tx
             .send(PermissionReply::AllowOnce)
             .expect("reply");
 
         assert_eq!(handle.join().expect("join"), DeciderVerdict::Allow);
+    }
+
+    #[test]
+    fn extension_operation_arrives_as_one_tui_batch_and_records_each_capability() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().to_owned();
+        let (decider, channels) = TuiDecider::new();
+        let handle = thread::spawn(move || {
+            let mut session = Session::new(
+                SessionConfig::new(root),
+                ScriptedProvider::new(Vec::new()),
+                decider,
+            );
+            let result = session.approve_extension_capabilities(
+                "example",
+                "run",
+                &[Capability::FsWrite, Capability::Network],
+            );
+            (result, session.events().to_vec())
+        });
+
+        let prompt = channels
+            .request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("one operation prompt");
+        let PermissionPrompt::Batch(batch) = prompt else {
+            panic!("extension capabilities must use one batch prompt");
+        };
+        assert_eq!(batch.operation(), "extension example.run");
+        assert_eq!(
+            batch.capabilities().collect::<Vec<_>>(),
+            vec![Capability::FsWrite, Capability::Network]
+        );
+        channels
+            .reply_tx
+            .send(PermissionReply::AllowSessionScope(String::new()))
+            .expect("reply");
+
+        let (result, events) = handle.join().expect("join");
+        result.expect("allow operation");
+        let decisions = events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions
+            .iter()
+            .all(|event| event.payload["allowed"] == true));
+        assert!(decisions
+            .iter()
+            .all(|event| event.payload["scope"] == "session"));
     }
 
     #[test]

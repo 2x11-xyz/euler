@@ -176,7 +176,7 @@ impl AppCore {
                 VisualBlockRole::PermissionAsk,
                 self.patch_approval_canvas_lines(modal, width),
             ),
-            Some(Modal::Permission(_)) | None => {}
+            Some(Modal::Permission(_) | Modal::PermissionBatch(_)) | None => {}
         }
     }
 
