@@ -90,16 +90,20 @@ use. Rules (normative; enforced in code, not only in the guardian prompt):
 ## Extension capability approval
 
 A command descriptor's `required_capabilities` is a *declaration*, never a
-grant. On surfaces that can ask the user (the TUI), each declared capability
-becomes a real permission decision before the command executes: explicit
-`session-allow` grants silently, explicit `always-deny` denies without a
-prompt, and `ask` or unconfigured capabilities prompt the user — recorded as
-`permission.prompt`/`permission.decision` events carrying `extension_id` and
+grant. On surfaces that can ask the user (the TUI), one extension command
+gets one operation-level prompt listing every uncovered static capability:
+explicit `session-allow` grants silently, explicit `always-deny` rejects the
+whole operation before a prompt, and remaining `ask` or unconfigured
+capabilities form the batch. An allow or deny applies to the operation as a
+whole, but the ledger records one `permission.decision` per listed capability,
+all parented to the shared `permission.prompt` and carrying `extension_id` and
 `command`. Session-scoped approvals cover later runs (covered requests run
-under the original decision, with no fresh record). Piped headless runs
-cannot prompt (stdin is the command protocol): there, explicitly invoking a
-named command grants its declared capabilities for that run, announced on
-stderr — visible, never silent.
+under the original decision, with no fresh record). Batch approval offers only
+once and unscoped session scope; it never turns a multi-capability operation
+into a project or durable user rule. Piped headless runs cannot prompt (stdin
+is the command protocol): there, explicitly invoking a named command grants
+its declared capabilities for that run, announced on stderr — visible, never
+silent.
 
 ## Scoped Grants
 

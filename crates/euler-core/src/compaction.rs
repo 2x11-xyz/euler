@@ -1,7 +1,8 @@
+use crate::permissions::permission_prompt_capabilities;
 use euler_event::{EventEnvelope, EventKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Schema version for the working-state projection.
 pub const PROJECTION_SCHEMA_VERSION: &str = "1";
@@ -363,7 +364,7 @@ pub fn is_safe_boundary(events: &[EventEnvelope], index: usize) -> bool {
     }
 
     let mut open_tools = BTreeSet::new();
-    let mut open_permissions = BTreeSet::new();
+    let mut open_permissions = BTreeMap::new();
     let mut open_models = BTreeSet::new();
 
     for event in &events[..=index] {
@@ -377,11 +378,22 @@ pub fn is_safe_boundary(events: &[EventEnvelope], index: usize) -> bool {
                 }
             }
             EventKind::PERMISSION_PROMPT => {
-                open_permissions.insert(event.id.clone());
+                open_permissions.insert(
+                    event.id.clone(),
+                    permission_prompt_capabilities(&event.payload),
+                );
             }
-            EventKind::PERMISSION_DECISION => {
-                if let Some(parent) = event.parent.as_deref() {
-                    open_permissions.remove(parent);
+            EventKind::PERMISSION_DECISION if !extension_permission_decision(event) => {
+                if let (Some(parent), Some(capability)) =
+                    (event.parent.as_deref(), payload_str(event, "capability"))
+                {
+                    let resolved = open_permissions.get_mut(parent).is_some_and(|expected| {
+                        expected.remove(capability);
+                        expected.is_empty()
+                    });
+                    if resolved {
+                        open_permissions.remove(parent);
+                    }
                 }
             }
             EventKind::MODEL_CALL => {
@@ -413,6 +425,14 @@ pub fn find_safe_boundary(events: &[EventEnvelope], index: usize) -> Option<usiz
 
 fn payload_str<'a>(event: &'a EventEnvelope, key: &str) -> Option<&'a str> {
     event.payload.get(key)?.as_str()
+}
+
+/// Static extension-host grants are not answers to a user prompt. Keeping
+/// them out of this settlement check matches resume recovery and prevents a
+/// malformed or interrupted extension tail from making a user ask look safe.
+fn extension_permission_decision(event: &EventEnvelope) -> bool {
+    payload_str(event, "source") == Some("extension")
+        || payload_str(event, "mode") == Some("static-grant")
 }
 
 #[cfg(test)]

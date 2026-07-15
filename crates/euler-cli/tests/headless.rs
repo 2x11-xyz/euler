@@ -7706,11 +7706,25 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
         "streamed response did not render:\n{}",
         tui.screen_text()
     );
+    assert!(
+        tui.wait_for_home_session_event_count(temp.path(), EventKind::ASSISTANT_MESSAGE, 1),
+        "first turn did not commit its assistant message before resize:\n{}",
+        tui.screen_text()
+    );
     // Resize after the turn completed and history is committed.
-    tui.resize(24, 100);
+    let resize_output_offset = tui.resize(24, 100);
+    assert!(
+        tui.wait_for_output_after(resize_output_offset, b"\x1b[3J"),
+        "resize did not complete its settled history replay:\n{}",
+        tui.screen_text()
+    );
     // Provoke a post-resize repaint + another committed event.
     tui.write("second message\r");
-    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        tui.wait_for_screen("Post-resize response committed once."),
+        "post-resize response did not render:\n{}",
+        tui.screen_text()
+    );
     tui.quit();
 
     let resizes = tui.resizes.clone();
@@ -8905,11 +8919,12 @@ impl PtyHarness {
 
     /// Resize the PTY mid-session, recording the output offset so final-state
     /// reconstruction can resize its emulator at the same point.
-    fn resize(&mut self, rows: u16, cols: u16) {
+    fn resize(&mut self, rows: u16, cols: u16) -> usize {
         // Drain pending output so the offset is accurate.
         let deadline = Instant::now() + Duration::from_millis(300);
         let _ = self.wait_for_stable_screen(Duration::from_millis(250), |_| false);
         let _ = deadline;
+        let output_offset = self.output.len();
         self.master
             .resize(PtySize {
                 rows,
@@ -8918,7 +8933,8 @@ impl PtyHarness {
                 pixel_height: 0,
             })
             .expect("pty resize");
-        self.resizes.push((self.output.len(), rows, cols));
+        self.resizes.push((output_offset, rows, cols));
+        output_offset
     }
 
     fn write(&mut self, input: &str) {
@@ -8977,6 +8993,46 @@ impl PtyHarness {
 
     fn wait_ready_composer(&mut self) -> bool {
         self.wait_for_stable_screen(Duration::from_secs(5), screen_has_ready_composer)
+    }
+
+    /// Wait for a completed turn's persisted event while continuing to drain
+    /// the PTY. Rendered streaming text alone is not a completion barrier:
+    /// the final delta can arrive before the session commits its assistant
+    /// message and before the TUI accepts the next composer submission.
+    fn wait_for_home_session_event_count(
+        &mut self,
+        home: &Path,
+        kind: &str,
+        expected: usize,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if home_session_persisted_event_count(home, kind).is_some_and(|count| count >= expected)
+            {
+                return true;
+            }
+            self.read_next_chunk(deadline);
+        }
+        home_session_persisted_event_count(home, kind).is_some_and(|count| count >= expected)
+    }
+
+    /// Wait for a terminal sequence emitted after a specific output offset.
+    /// Resize replays use the scrollback purge as their observable completion
+    /// point, so the next submission cannot race the debounce/repaint path.
+    fn wait_for_output_after(&mut self, offset: usize, needle: &[u8]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.output[offset..]
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
+                return true;
+            }
+            self.read_next_chunk(deadline);
+        }
+        self.output[offset..]
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     fn wait_for_stable_screen(
@@ -9288,6 +9344,29 @@ fn home_session_log(home: &Path, session_id: &str) -> std::path::PathBuf {
         .join("sessions")
         .join(session_id)
         .join("events.jsonl")
+}
+
+/// Read whatever complete JSONL records are currently visible. The TUI owns
+/// the writer, so this intentionally tolerates a partial final line while it
+/// polls for a turn-completion barrier.
+fn home_session_persisted_event_count(home: &Path, kind: &str) -> Option<usize> {
+    let sessions = home.join(".euler").join("sessions");
+    let session_id = fs::read_to_string(sessions.join("index.jsonl"))
+        .ok()?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|entry| {
+            (entry.get("op").and_then(serde_json::Value::as_str) == Some("created"))
+                .then(|| entry.get("id")?.as_str().map(str::to_owned))?
+        })?;
+    let events = fs::read_to_string(sessions.join(session_id).join("events.jsonl")).ok()?;
+    Some(
+        events
+            .lines()
+            .filter_map(|line| EventEnvelope::from_json_line(line).ok())
+            .filter(|event| event.kind.as_str() == kind)
+            .count(),
+    )
 }
 
 fn append_session_rename_event(log: &Path, session_id: &str, name: &str) {

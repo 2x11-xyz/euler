@@ -6,7 +6,7 @@ use crate::extensions::{
     ExtensionHost, ExtensionHostError, ExtensionSpawner, QueuedExtensionEvents,
 };
 use crate::permissions::PermissionDecider;
-use crate::permissions::{ApprovalMode, PermissionRequest};
+use crate::permissions::{ApprovalMode, PermissionRequest, PermissionRequestBatch};
 use euler_agents::{AgentBudget, AgentError, AgentTask};
 use euler_event::{object, EventKind};
 use euler_sdk::{AgentOutcome, Capability, Extension, ExtensionError, Invocation, SpawnAgentTask};
@@ -218,10 +218,10 @@ impl<D> Session<D> {
     /// through the permission gate, recording prompt/decision provenance —
     /// capabilities are never granted merely because a descriptor declares
     /// them. Explicit `session-allow` grants silently; explicit `always-deny`
-    /// denies without a prompt; `ask` and unconfigured capabilities prompt
-    /// the decider unless an existing grant covers them (covered requests
-    /// run under the original decision, with no fresh record). The first
-    /// denial aborts the run.
+    /// denies the whole operation before a prompt; `ask` and unconfigured
+    /// capabilities not covered by an existing grant share one operation
+    /// prompt and retain individual decision records. A denial aborts the
+    /// whole run.
     pub fn approve_extension_capabilities(
         &mut self,
         extension_id: &str,
@@ -231,6 +231,8 @@ impl<D> Session<D> {
     where
         D: crate::permissions::PermissionDecider,
     {
+        let operation = format!("extension {extension_id}.{command}");
+        let mut pending = Vec::new();
         for &capability in required {
             let mode = self
                 .permissions
@@ -242,39 +244,77 @@ impl<D> Session<D> {
                     return Err(ExtensionExecutionError::CapabilityDenied { capability });
                 }
                 ApprovalMode::Ask => {
-                    let request = PermissionRequest::new(
-                        capability,
-                        format!("extension {extension_id}.{command}"),
-                    );
-                    if self.permissions.granted_source(&request).is_some() {
-                        continue;
-                    }
-                    let prompt_id = self
-                        .emit(
-                            EventKind::PERMISSION_PROMPT,
-                            object([
-                                ("capability", capability.as_str().into()),
-                                ("reason", request.reason.clone().into()),
-                                ("extension_id", extension_id.into()),
-                                ("command", command.into()),
-                            ]),
-                        )
-                        .map_err(|_| ExtensionExecutionError::CapabilityDenied { capability })?;
-                    let decision = self
-                        .permissions
-                        .decide_detailed(&request, ApprovalMode::Ask);
-                    let allowed = decision.allowed();
-                    let mut payload =
-                        permission_decision_payload(&decision, approval_mode_str(mode), mode);
-                    payload.insert("extension_id".to_owned(), extension_id.into());
-                    payload.insert("command".to_owned(), command.into());
-                    self.emit_with_parent(EventKind::PERMISSION_DECISION, payload, Some(prompt_id))
-                        .map_err(|_| ExtensionExecutionError::CapabilityDenied { capability })?;
-                    if !allowed {
-                        return Err(ExtensionExecutionError::CapabilityDenied { capability });
+                    let request = PermissionRequest::new(capability, operation.clone());
+                    if self.permissions.granted_source(&request).is_none()
+                        && !pending
+                            .iter()
+                            .any(|request: &PermissionRequest| request.capability == capability)
+                    {
+                        pending.push(request);
                     }
                 }
             }
+        }
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let batch = PermissionRequestBatch::new(operation, pending);
+        let primary = batch.requests()[0].capability;
+        let capabilities = Value::Array(
+            batch
+                .capabilities()
+                .map(|capability| capability.as_str().to_owned().into())
+                .collect(),
+        );
+        let prompt_id = self
+            .emit(
+                EventKind::PERMISSION_PROMPT,
+                object([
+                    ("capability", primary.as_str().into()),
+                    ("capabilities", capabilities),
+                    ("reason", batch.operation().to_owned().into()),
+                    ("operation", batch.operation().to_owned().into()),
+                    ("batch", true.into()),
+                    ("extension_id", extension_id.into()),
+                    ("command", command.into()),
+                ]),
+            )
+            .map_err(|_| ExtensionExecutionError::CapabilityDenied {
+                capability: primary,
+            })?;
+        let decisions = self.permissions.decide_batch_detailed(&batch);
+        let denied = decisions
+            .iter()
+            .find(|decision| !decision.allowed())
+            .map(|decision| decision.capability);
+        for decision in &decisions {
+            let mut payload = permission_decision_payload(
+                decision,
+                approval_mode_str(ApprovalMode::Ask),
+                ApprovalMode::Ask,
+            );
+            payload.insert("batch".to_owned(), true.into());
+            payload.insert("operation".to_owned(), batch.operation().to_owned().into());
+            payload.insert("extension_id".to_owned(), extension_id.into());
+            payload.insert("command".to_owned(), command.into());
+            self.emit_with_parent(
+                EventKind::PERMISSION_DECISION,
+                payload,
+                Some(prompt_id.clone()),
+            )
+            .map_err(|_| ExtensionExecutionError::CapabilityDenied {
+                capability: decision.capability,
+            })?;
+        }
+        // Install session-wide grants only after every per-capability decision
+        // has been accepted by the owning writer. A failed mid-batch append
+        // must leave the live session asking again rather than carrying a
+        // partial authorization the ledger cannot substantiate.
+        self.permissions.commit_batch_decisions(&decisions);
+        if let Some(capability) = denied {
+            return Err(ExtensionExecutionError::CapabilityDenied { capability });
         }
         Ok(())
     }
