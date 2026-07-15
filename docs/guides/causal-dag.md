@@ -118,8 +118,10 @@ accepted value is `128`.
 ### `observer-brief`
 
 Build a one-turn companion-agent task from the compact active graph plus the
-next bounded event window. The companion returns raw
-`euler.causal_dag.hints.v2` JSON.
+next bounded event window. In the default v3 graph mode, the companion returns
+raw `euler.causal_dag.hints.v2` JSON. After `causal-dag.research-enable`, the
+same command pair switches to the durable research-record contract and the
+companion returns raw `euler.research_record.proposals.v1` JSON instead.
 
 ```sh
 euler extension run causal-dag.observer-brief ./session.jsonl --limit 64 --max-tokens 24576
@@ -127,14 +129,17 @@ euler extension run causal-dag.observer-brief ./session.jsonl --limit 64 --max-t
 
 Flags: `--limit`, `--scan-limit`, `--after-event-id`, `--max-tokens`.
 
-The brief output carries an `apply` object (the observe window, active-graph
-predecessor, and session assertion) that the in-session round observer echoes
-untouched into `observer-apply`. The private feed cursor advances across pages
-that contain only extension-owned or otherwise unobservable events, so those
-pages cannot repeatedly fill the bounded window. If a bounded page ends in the
-middle of a prior observer companion run, the cursor remains before that span
-and the command asks for a larger limit instead of treating companion output
-as driver cognition.
+When work is available, the brief output carries an `apply` object (the observe
+window, active-graph predecessor, and session assertion) that the in-session
+round observer echoes untouched into `observer-apply`. In research-record mode,
+the brief returns `{ "status": "idle" }` when the feed is caught up or when the
+current bounded page contains only extension-owned or otherwise unobservable
+events. Core records a successful tick without spawning a companion or invoking
+apply. In the filtered-page case, the private feed cursor advances so the page
+cannot repeatedly fill the bounded window; a later tick may still find work.
+If a bounded page ends in the middle of a prior observer companion run, the
+cursor remains before that span and the command asks for a larger limit instead
+of treating companion output as driver cognition.
 
 ### `observer-apply`
 

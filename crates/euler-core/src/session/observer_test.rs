@@ -265,6 +265,64 @@ fn malformed_brief_envelope_is_fail_open_without_companion() {
 }
 
 #[test]
+fn idle_brief_is_a_successful_noop_without_companion_or_apply() {
+    let (_temp, mut session) = observer_session(
+        vec![
+            tool_round(),
+            FixtureResponse::Assistant("driver done".to_owned()),
+        ],
+        1,
+    );
+    let calls = wire_extension(
+        &mut session,
+        Ok(json!({
+            "status": "idle",
+            "watermark_event_id": "event-current",
+        })),
+    );
+
+    let events = session.run_turn("go").expect("turn");
+
+    assert_eq!(last_assistant_content(&events), "driver done");
+    assert_eq!(count_kind(&events, EventKind::AGENT_SPAWN), 0);
+    assert_eq!(count_kind(&events, EventKind::AGENT_RESULT), 0);
+    assert_eq!(
+        calls
+            .lock()
+            .expect("call log")
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["brief"]
+    );
+}
+
+#[test]
+fn idle_brief_rejects_mixed_task_fields() {
+    for field in [
+        "task",
+        "provider",
+        "model",
+        "persona",
+        "system_prompt",
+        "budget",
+        "apply",
+    ] {
+        let mut brief = json!({"status": "idle"});
+        brief[field] = json!(null);
+        assert_eq!(
+            observer_task(&brief),
+            Err("envelope"),
+            "idle brief must reject `{field}`"
+        );
+    }
+    assert_eq!(
+        observer_task(&json!({"status": "caught_up"})),
+        Err("envelope")
+    );
+}
+
+#[test]
 fn companion_rounds_do_not_trigger_the_observer() {
     // Observer configured at every round; a directly spawned companion
     // running a tool round + completion must never tick it.

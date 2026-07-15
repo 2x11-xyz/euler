@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod semantics;
-use semantics::validate_record_semantics;
+use semantics::{validate_new_lineage_relation, validate_record_semantics};
 mod validation;
 use validation::{
     append_batch_ledger, append_new_episodes, validate_assessment, validate_assessment_fields,
@@ -186,6 +186,18 @@ pub(crate) enum InvestigationOutcome {
     DeadEnd,
     Completed,
     Abandoned,
+}
+
+impl InvestigationOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::DeadEnd => "dead_end",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -539,6 +551,47 @@ impl AcceptedRecord {
         })
     }
 
+    /// Canonical current predecessor evidence for a newly proposed successor
+    /// lineage. A lineage edge describes the state being continued, repaired,
+    /// or pivoted from, so an investigation without an outcome has no anchor.
+    pub(crate) fn lineage_anchor_for(&self, investigation_id: &str) -> Option<&str> {
+        self.latest_outcome_for(investigation_id)
+            .and_then(|outcome| outcome.source_event_ids.first())
+            .map(String::as_str)
+    }
+
+    /// Resolve the most recent historical outcome evidence a durable relation
+    /// actually cites. This intentionally does not follow the investigation's
+    /// current outcome: later supersession must not rewrite old lineage.
+    pub(crate) fn latest_outcome_anchored_by(
+        &self,
+        investigation_id: &str,
+        source_event_ids: &[String],
+    ) -> Option<&ResearchOutcome> {
+        self.outcome_order.iter().rev().find_map(|id| {
+            self.outcomes.get(id).filter(|outcome| {
+                outcome.investigation_id == investigation_id
+                    && outcome
+                        .source_event_ids
+                        .first()
+                        .is_some_and(|anchor| source_event_ids.contains(anchor))
+            })
+        })
+    }
+
+    pub(crate) fn is_productive_investigation(&self, investigation_id: &str) -> bool {
+        self.relations.values().any(|relation| {
+            relation.kind == RelationKind::Produces
+                && relation.from == investigation_id
+                && self.entities.get(&relation.to).is_some_and(|entity| {
+                    matches!(
+                        entity.kind,
+                        EntityKind::Observation | EntityKind::Artifact | EntityKind::Claim
+                    )
+                })
+        })
+    }
+
     pub(crate) fn viable_decomposition_parent(&self, entity_id: &str) -> bool {
         !matches!(
             self.latest_outcome_for(entity_id)
@@ -566,7 +619,7 @@ pub(crate) struct AppendInput<'a> {
 pub(crate) fn append_observer_batch(
     input: AppendInput<'_>,
 ) -> Result<ResearchRecord, ExtensionError> {
-    validate_batch_header(&input.batch)?;
+    validate_batch_header(&input.batch, input.prior.is_some())?;
     let mut record = record_for_append(&input)?;
     let accepted = record.accepted()?;
     let source_context = SourceContext::new(&record, &accepted, input.events);
@@ -672,19 +725,23 @@ fn capture_record(
     ))
 }
 
-fn validate_batch_header(batch: &ObserverProposalBatch) -> Result<(), ExtensionError> {
+fn validate_batch_header(
+    batch: &ObserverProposalBatch,
+    allows_no_semantic_change: bool,
+) -> Result<(), ExtensionError> {
     if batch.schema != RESEARCH_PROPOSALS_SCHEMA {
         return Err(input_error(format!(
             "research observer output must use `{RESEARCH_PROPOSALS_SCHEMA}`"
         )));
     }
-    if batch.entities.is_empty()
+    if !allows_no_semantic_change
+        && batch.entities.is_empty()
         && batch.outcomes.is_empty()
         && batch.relations.is_empty()
         && batch.assessments.is_empty()
     {
         return Err(input_error(
-            "research observer output contains no proposals",
+            "initial research-record capture requires at least one proposal",
         ));
     }
     Ok(())
@@ -721,6 +778,10 @@ impl SourceContext {
             )));
         }
         Ok(())
+    }
+
+    fn is_new(&self, source_event_id: &str) -> bool {
+        self.new_ids.contains(source_event_id)
     }
 }
 
@@ -805,7 +866,11 @@ fn validate_batch(
         outcome_order,
         assessment_order,
     };
-    validate_record_semantics(&candidate)
+    validate_record_semantics(&candidate)?;
+    for relation in &batch.relations {
+        validate_new_lineage_relation(relation, &candidate)?;
+    }
+    Ok(())
 }
 
 fn semantic_ids(accepted: &AcceptedRecord) -> BTreeSet<String> {

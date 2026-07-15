@@ -1,6 +1,7 @@
 use super::*;
 use crate::research_record::{
-    EntityKind, EntityLifecycle, RelationKind, ResearchEntity, ResearchRelation,
+    EntityKind, EntityLifecycle, InvestigationOutcome, RelationKind, ResearchEntity,
+    ResearchOutcome, ResearchRelation,
 };
 use euler_event::{object, EventKind};
 use std::collections::BTreeMap;
@@ -115,6 +116,24 @@ fn task_preserves_repair_and_pivot_direction_rules() {
                 source_event_ids: vec!["event-0".to_owned()],
             },
             crate::research_record::LedgerEntry::Proposal {
+                id: "proposal-z".to_owned(),
+                semantic: crate::research_record::SemanticRecord::Entity(ResearchEntity {
+                    id: "z".to_owned(),
+                    kind: EntityKind::Investigation,
+                    title: "Z".to_owned(),
+                    summary: "A later investigation identity.".to_owned(),
+                    lifecycle: Some(EntityLifecycle::Active),
+                    source_event_ids: vec!["event-0".to_owned()],
+                }),
+            },
+            crate::research_record::LedgerEntry::Decision {
+                id: "decision-z".to_owned(),
+                proposal_id: "proposal-z".to_owned(),
+                outcome: crate::research_record::DecisionOutcome::Accepted,
+                policy: crate::research_record::AUTO_ACCEPT_POLICY.to_owned(),
+                source_event_ids: vec!["event-0".to_owned()],
+            },
+            crate::research_record::LedgerEntry::Proposal {
                 id: "proposal-r".to_owned(),
                 semantic: crate::research_record::SemanticRecord::Relation(ResearchRelation {
                     id: "r".to_owned(),
@@ -132,6 +151,84 @@ fn task_preserves_repair_and_pivot_direction_rules() {
                 policy: crate::research_record::AUTO_ACCEPT_POLICY.to_owned(),
                 source_event_ids: vec!["event-0".to_owned()],
             },
+            crate::research_record::LedgerEntry::Proposal {
+                id: "proposal-outcome-old".to_owned(),
+                semantic: crate::research_record::SemanticRecord::InvestigationOutcome(
+                    ResearchOutcome {
+                        id: "outcome-old".to_owned(),
+                        investigation_id: "a".to_owned(),
+                        outcome: InvestigationOutcome::Active,
+                        summary: "The first active state.".to_owned(),
+                        supersedes_outcome_id: None,
+                        source_event_ids: vec!["event-0".to_owned()],
+                    },
+                ),
+            },
+            crate::research_record::LedgerEntry::Decision {
+                id: "decision-outcome-old".to_owned(),
+                proposal_id: "proposal-outcome-old".to_owned(),
+                outcome: crate::research_record::DecisionOutcome::Accepted,
+                policy: crate::research_record::AUTO_ACCEPT_POLICY.to_owned(),
+                source_event_ids: vec!["event-0".to_owned()],
+            },
+            crate::research_record::LedgerEntry::Proposal {
+                id: "proposal-outcome-current".to_owned(),
+                semantic: crate::research_record::SemanticRecord::InvestigationOutcome(
+                    ResearchOutcome {
+                        id: "outcome-current".to_owned(),
+                        investigation_id: "a".to_owned(),
+                        outcome: InvestigationOutcome::Completed,
+                        summary: "The current completed state.".to_owned(),
+                        supersedes_outcome_id: Some("outcome-old".to_owned()),
+                        source_event_ids: vec!["event-outcome-current".to_owned()],
+                    },
+                ),
+            },
+            crate::research_record::LedgerEntry::Decision {
+                id: "decision-outcome-current".to_owned(),
+                proposal_id: "proposal-outcome-current".to_owned(),
+                outcome: crate::research_record::DecisionOutcome::Accepted,
+                policy: crate::research_record::AUTO_ACCEPT_POLICY.to_owned(),
+                source_event_ids: vec!["event-0".to_owned()],
+            },
+            crate::research_record::LedgerEntry::Proposal {
+                id: "proposal-outcome-z".to_owned(),
+                semantic: crate::research_record::SemanticRecord::InvestigationOutcome(
+                    ResearchOutcome {
+                        id: "outcome-z".to_owned(),
+                        investigation_id: "z".to_owned(),
+                        outcome: InvestigationOutcome::Blocked,
+                        summary: "The most recently updated investigation state.".to_owned(),
+                        supersedes_outcome_id: None,
+                        source_event_ids: vec!["event-0".to_owned()],
+                    },
+                ),
+            },
+            crate::research_record::LedgerEntry::Decision {
+                id: "decision-outcome-z".to_owned(),
+                proposal_id: "proposal-outcome-z".to_owned(),
+                outcome: crate::research_record::DecisionOutcome::Accepted,
+                policy: crate::research_record::AUTO_ACCEPT_POLICY.to_owned(),
+                source_event_ids: vec!["event-0".to_owned()],
+            },
+            crate::research_record::LedgerEntry::Proposal {
+                id: "proposal-q-rejected".to_owned(),
+                semantic: crate::research_record::SemanticRecord::Entity(ResearchEntity {
+                    id: "q".to_owned(),
+                    kind: EntityKind::Question,
+                    title: "Rejected duplicate Q".to_owned(),
+                    summary: "A rejected duplicate must not enter the collision fence.".to_owned(),
+                    lifecycle: None,
+                    source_event_ids: vec!["event-0".to_owned()],
+                }),
+            },
+            crate::research_record::LedgerEntry::Decision {
+                id: "decision-q-rejected".to_owned(),
+                proposal_id: "proposal-q-rejected".to_owned(),
+                outcome: crate::research_record::DecisionOutcome::Rejected,
+                policy: crate::research_record::AUTO_ACCEPT_POLICY.to_owned(),
+                source_event_ids: vec!["event-0".to_owned()],
+            },
         ],
     };
     let lines = task_prefix(Some(&record));
@@ -141,6 +238,31 @@ fn task_preserves_repair_and_pivot_direction_rules() {
     assert!(task.contains("repairs/pivots_from require a predecessor whose latest accepted outcome is blocked or dead_end"));
     assert!(task.contains("continues_from requires an active/completed productive predecessor"));
     assert!(task.contains("never change an outcome to force lineage"));
+    assert!(task.contains("all arrays empty instead of duplicating recap material"));
+    assert!(task.contains("RECENT ACCEPTED SEMANTIC IDS is a collision fence"));
+    assert!(task.contains("RECENT ACCEPTED SEMANTIC IDS (do not re-emit):"));
+    assert!(task.contains("CURRENT INVESTIGATION LEDGER:"));
+    assert!(task.contains("current_outcome_id=outcome-current"));
+    assert!(task.contains("current_outcome=completed"));
+    assert!(task.contains("lineage_anchor=event-outcome-current"));
+    assert!(
+        task.find("CURRENT investigation=z")
+            .expect("recent investigation")
+            < task
+                .find("CURRENT investigation=a")
+                .expect("older investigation")
+    );
+    let fence = task
+        .lines()
+        .find(|line| line.starts_with("RECENT ACCEPTED SEMANTIC IDS (do not re-emit):"))
+        .expect("collision fence");
+    let ids = fence
+        .split_once(": ")
+        .expect("fence separator")
+        .1
+        .split(',')
+        .collect::<Vec<_>>();
+    assert_eq!(ids.iter().filter(|id| **id == "q").count(), 1);
 }
 
 #[test]
@@ -192,6 +314,7 @@ fn dense_accepted_record_keeps_room_for_new_evidence() {
     assert_eq!(count, 1);
     assert!(task.len() <= euler_agents::MAX_TASK_BYTES);
     assert!(task.contains("EVENT id=event-new"));
+    assert!(task.contains("artifact-127"));
 }
 
 #[test]

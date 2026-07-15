@@ -51,6 +51,15 @@ pub(super) fn validate_outcome(
         ));
     }
     sources.validate(&outcome.source_event_ids, "investigation outcome")?;
+    if !outcome
+        .source_event_ids
+        .first()
+        .is_some_and(|anchor| sources.is_new(anchor))
+    {
+        return Err(input_error(
+            "research investigation outcome must use a newly observed event as its first lineage anchor",
+        ));
+    }
     let current = outcome_order.iter().rev().find(|id| {
         outcomes
             .get(id.as_str())

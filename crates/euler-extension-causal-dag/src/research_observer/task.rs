@@ -1,15 +1,20 @@
 use super::{compact, input_error};
 use crate::research_record::{
-    AcceptedRecord, EntityKind, ResearchRecord, RESEARCH_PROPOSALS_SCHEMA,
+    AcceptedRecord, DecisionOutcome, EntityKind, LedgerEntry, ResearchRecord, SemanticRecord,
+    RESEARCH_PROPOSALS_SCHEMA,
 };
 use euler_agents::MAX_TASK_BYTES;
 use euler_event::EventEnvelope;
 use euler_sdk::ExtensionError;
+use std::collections::{BTreeMap, BTreeSet};
 
 const EVENT_EXTRACT_CHARS: usize = 240;
 const MAX_KNOWN_ENTITIES: usize = 96;
 const MAX_KNOWN_RELATIONS: usize = 128;
 const MAX_KNOWN_ASSESSMENTS: usize = 64;
+const MAX_CURRENT_INVESTIGATIONS: usize = 32;
+const MAX_RECENT_SEMANTIC_IDS: usize = 24;
+const MAX_RECENT_SEMANTIC_ID_BYTES: usize = 1536;
 // A fresh observer must always receive enough room to ground at least one new
 // event. The accepted record is context, not a replacement for the evidence
 // window it is meant to reconcile.
@@ -46,11 +51,12 @@ pub(super) fn fit_task(
 
 pub(super) fn task_prefix(record: Option<&ResearchRecord>) -> Vec<String> {
     let mut lines = vec![
-        "Observe only this pilot evidence. Do not solve, call tools, infer hidden reasoning, or add prose. Return exactly one proposal JSON object; every array is required.".to_owned(),
+        "Observe only this pilot evidence. Do not solve, call tools, infer hidden reasoning, or add prose. Return exactly one proposal JSON object; every array is required. When an accepted record exists, a window with no new durable semantic change may return all arrays empty instead of duplicating recap material.".to_owned(),
         "Use only NEW EVENT ids or ids in ACCEPTED RECORD. Every new semantic record cites at least one NEW EVENT.".to_owned(),
+        "RECENT ACCEPTED SEMANTIC IDS is a collision fence: omit any listed id instead of re-emitting it from overlapping or recap evidence.".to_owned(),
         "Each investigation has investigates(investigation,question); an attempt claim also has investigates(investigation,claim) or produces(investigation,claim). repairs/continues_from/pivots_from are successor→predecessor; decomposes is whole→component; produces is investigation→output.".to_owned(),
-        "repairs/pivots_from require a predecessor whose latest accepted outcome is blocked or dead_end. continues_from requires an active/completed productive predecessor. Cite both lines; never change an outcome to force lineage—continue or omit it.".to_owned(),
-        "Outcomes append, never edit: first supersedes_outcome_id=null; a revision names the current outcome. Claims use scoped assessments: proven only formal_proof; refuted only counterexample or formal_proof; a revision preserves exact claim and scope.".to_owned(),
+        "repairs/pivots_from require a predecessor whose latest accepted outcome is blocked or dead_end. continues_from requires an active/completed productive predecessor. For any lineage relation, cite its predecessor's listed lineage_anchor and a successor source; never change an outcome to force lineage—continue or omit it.".to_owned(),
+        "Outcomes append, never edit: first supersedes_outcome_id=null; a revision names the exact current_outcome_id from the CURRENT INVESTIGATION LEDGER. Claims use scoped assessments: proven only formal_proof; refuted only counterexample or formal_proof; a revision preserves exact claim and scope.".to_owned(),
         "Synthesis needs addresses(synthesis,question) plus two distinct integrates(synthesis,input); integrates never chooses its backbone parent.".to_owned(),
         "FIELDS: entities {id,kind,title,summary,lifecycle,source_event_ids}; outcomes {id,investigation_id,outcome,summary,supersedes_outcome_id,source_event_ids}; relations {id,kind,from,to,summary,source_event_ids}; assessments {id,claim_id,scope,verdict,standard,summary,supersedes_assessment_id,source_event_ids}. No alias fields.".to_owned(),
         "ENUMS: kind=question|claim|investigation|observation|artifact|synthesis; lifecycle=draft|active|withdrawn|archived|null; outcome=active|blocked|dead_end|completed|abandoned; relation=investigates|produces|evidence_for|evidence_against|repairs|continues_from|pivots_from|decomposes|addresses|integrates; verdict=supported|corroborated|proven|refuted|inconclusive; standard=formal_proof|counterexample|derivation|experiment|replication|measurement|benchmark|simulation|computation|argument|review.".to_owned(),
@@ -79,16 +85,172 @@ fn render_record_summary(record: &ResearchRecord, budget: usize) -> Vec<String> 
     let Ok(accepted) = record.accepted() else {
         return vec!["accepted record could not be read".to_owned()];
     };
-    trim_to_budget(summary_candidates(&accepted), budget)
+    let mut candidates = recent_semantic_id_lines(record, &accepted);
+    candidates.extend(summary_candidates(record, &accepted));
+    trim_to_budget(candidates, budget)
 }
 
-fn summary_candidates(accepted: &AcceptedRecord) -> Vec<String> {
-    let mut lines = entity_summary_lines(accepted, true);
+fn recent_semantic_id_lines(record: &ResearchRecord, accepted: &AcceptedRecord) -> Vec<String> {
+    let accepted_proposals = accepted_proposal_ids(record);
+    let accepted_ids = accepted
+        .entities
+        .keys()
+        .chain(accepted.outcomes.keys())
+        .chain(accepted.relations.keys())
+        .chain(accepted.assessments.keys())
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut ids = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+    let mut bytes = 0usize;
+    for entry in record.ledger.iter().rev() {
+        let LedgerEntry::Proposal {
+            id: proposal_id,
+            semantic,
+        } = entry
+        else {
+            continue;
+        };
+        let id = semantic_id(semantic);
+        if !accepted_proposals.contains(proposal_id.as_str())
+            || !accepted_ids.contains(id)
+            || !seen_ids.insert(id)
+        {
+            continue;
+        }
+        let separator = if ids.is_empty() { 0 } else { 1 };
+        let next = bytes.saturating_add(separator).saturating_add(id.len());
+        if ids.len() == MAX_RECENT_SEMANTIC_IDS || next > MAX_RECENT_SEMANTIC_ID_BYTES {
+            break;
+        }
+        bytes = next;
+        ids.push(id);
+    }
+    if ids.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "RECENT ACCEPTED SEMANTIC IDS (do not re-emit): {}",
+            ids.join(",")
+        )]
+    }
+}
+
+fn semantic_id(semantic: &SemanticRecord) -> &str {
+    match semantic {
+        SemanticRecord::Entity(value) => &value.id,
+        SemanticRecord::InvestigationOutcome(value) => &value.id,
+        SemanticRecord::Relation(value) => &value.id,
+        SemanticRecord::Assessment(value) => &value.id,
+    }
+}
+
+fn accepted_proposal_ids(record: &ResearchRecord) -> BTreeSet<&str> {
+    record
+        .ledger
+        .iter()
+        .filter_map(|entry| match entry {
+            LedgerEntry::Decision {
+                proposal_id,
+                outcome,
+                ..
+            } if *outcome == DecisionOutcome::Accepted => Some(proposal_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn summary_candidates(record: &ResearchRecord, accepted: &AcceptedRecord) -> Vec<String> {
+    let investigations = current_investigation_lines(record, accepted);
+    let mut lines = Vec::new();
+    if !investigations.is_empty() {
+        lines.push("CURRENT INVESTIGATION LEDGER:".to_owned());
+        lines.extend(investigations);
+    }
+    lines.extend(entity_summary_lines(accepted, true));
     lines.extend(outcome_summary_lines(accepted));
     lines.extend(relation_summary_lines(accepted));
     lines.extend(entity_summary_lines(accepted, false));
     lines.extend(assessment_summary_lines(accepted));
     lines
+}
+
+fn current_investigation_lines(record: &ResearchRecord, accepted: &AcceptedRecord) -> Vec<String> {
+    let positions = latest_investigation_positions(record, accepted);
+    let mut investigations = accepted
+        .entities
+        .values()
+        .filter(|entity| entity.kind == EntityKind::Investigation)
+        .collect::<Vec<_>>();
+    investigations.sort_by(|left, right| {
+        positions
+            .get(&right.id)
+            .cmp(&positions.get(&left.id))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    investigations
+        .into_iter()
+        .take(MAX_CURRENT_INVESTIGATIONS)
+        .map(|investigation| {
+            let (current_outcome_id, current_outcome) = accepted
+                .latest_outcome_for(&investigation.id)
+                .map(|outcome| (outcome.id.as_str(), outcome.outcome.as_str()))
+                .unwrap_or(("-", "none"));
+            format!(
+                "CURRENT investigation={} current_outcome_id={} current_outcome={} productive={} lineage_anchor={}",
+                investigation.id,
+                current_outcome_id,
+                current_outcome,
+                accepted.is_productive_investigation(&investigation.id),
+                accepted
+                    .lineage_anchor_for(&investigation.id)
+                    .unwrap_or("-"),
+            )
+        })
+        .collect()
+}
+
+fn latest_investigation_positions(
+    record: &ResearchRecord,
+    accepted: &AcceptedRecord,
+) -> BTreeMap<String, usize> {
+    let accepted_proposals = accepted_proposal_ids(record);
+    let investigation_ids = accepted
+        .entities
+        .values()
+        .filter(|entity| entity.kind == EntityKind::Investigation)
+        .map(|entity| entity.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut positions = BTreeMap::new();
+    for (position, entry) in record.ledger.iter().enumerate() {
+        let LedgerEntry::Proposal {
+            id: proposal_id,
+            semantic,
+        } = entry
+        else {
+            continue;
+        };
+        if !accepted_proposals.contains(proposal_id.as_str()) {
+            continue;
+        }
+        for investigation_id in semantic_investigation_ids(semantic) {
+            if investigation_ids.contains(investigation_id) {
+                positions.insert(investigation_id.to_owned(), position);
+            }
+        }
+    }
+    positions
+}
+
+fn semantic_investigation_ids(semantic: &SemanticRecord) -> Vec<&str> {
+    match semantic {
+        SemanticRecord::Entity(entity) if entity.kind == EntityKind::Investigation => {
+            vec![entity.id.as_str()]
+        }
+        SemanticRecord::InvestigationOutcome(outcome) => vec![outcome.investigation_id.as_str()],
+        SemanticRecord::Relation(relation) => vec![relation.from.as_str(), relation.to.as_str()],
+        SemanticRecord::Entity(_) | SemanticRecord::Assessment(_) => Vec::new(),
+    }
 }
 
 fn entity_summary_lines(accepted: &AcceptedRecord, core: bool) -> Vec<String> {

@@ -20,11 +20,12 @@ pub struct RoundObserverConfig {
     /// Run the observer chain at every mid-turn boundary where the
     /// completed driver round count is a multiple of this cadence.
     pub cadence_rounds: NonZeroU64,
-    /// Extension command producing the observer brief envelope: a JSON
-    /// object with `task` (required string), optional `provider`/`model`
-    /// (both or neither), optional `system_prompt` (string), optional
-    /// `budget` (`max_turns`, `max_tool_calls`, `max_tokens`), and an
-    /// opaque `apply` value passed back untouched.
+    /// Extension command producing either an observer task envelope or the
+    /// generic no-work envelope `{ "status": "idle" }`. A task envelope has
+    /// `task` (required string), optional `provider`/`model` (both or neither),
+    /// optional `system_prompt` (string), optional `budget` (`max_turns`,
+    /// `max_tool_calls`, `max_tokens`), and an opaque `apply` value passed back
+    /// untouched.
     pub brief_command: String,
     /// Extension command receiving `{ "apply": <brief apply value>,
     /// "companion": { ok, summary, output, error, ids... } }`.
@@ -74,7 +75,9 @@ impl<D: PermissionDecider> Session<D> {
                 granted.iter().copied(),
             )
             .map_err(|_| "brief")?;
-        let (task, apply) = observer_task(&brief)?;
+        let Some((task, apply)) = observer_task(&brief)? else {
+            return Ok(());
+        };
         // The observer companion is a one-turn generation task: it only
         // PRODUCES the observation. It runs with an empty capability set —
         // extension-host capabilities (artifact-write, context-slot, ...)
@@ -92,7 +95,26 @@ impl<D: PermissionDecider> Session<D> {
     }
 }
 
-fn observer_task(brief: &Value) -> Result<(AgentTask, Value), &'static str> {
+fn observer_task(brief: &Value) -> Result<Option<(AgentTask, Value)>, &'static str> {
+    match brief.get("status") {
+        Some(Value::String(status)) if status == "idle" => {
+            const TASK_FIELDS: [&str; 7] = [
+                "task",
+                "provider",
+                "model",
+                "persona",
+                "system_prompt",
+                "budget",
+                "apply",
+            ];
+            if TASK_FIELDS.iter().any(|field| brief.get(*field).is_some()) {
+                return Err("envelope");
+            }
+            return Ok(None);
+        }
+        Some(_) => return Err("envelope"),
+        None => {}
+    }
     let text = brief
         .get("task")
         .and_then(Value::as_str)
@@ -133,7 +155,10 @@ fn observer_task(brief: &Value) -> Result<(AgentTask, Value), &'static str> {
         .map_err(|_| "envelope")?;
         task = task.with_budget(budget);
     }
-    Ok((task, brief.get("apply").cloned().unwrap_or(Value::Null)))
+    Ok(Some((
+        task,
+        brief.get("apply").cloned().unwrap_or(Value::Null),
+    )))
 }
 
 fn budget_u32(budget: &Value, key: &str) -> Result<Option<u32>, &'static str> {
