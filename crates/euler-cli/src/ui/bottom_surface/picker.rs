@@ -77,6 +77,8 @@ pub(super) enum PickerKind {
     CausalDagActions,
     CausalDagFormats,
     Compaction,
+    /// §5.1 Advanced, one level down from the posture picker.
+    PermissionsAdvanced,
 }
 
 impl PickerKind {
@@ -132,9 +134,10 @@ impl ReplacementPicker {
             // radio — every option unfilled is the honest reading.
             PickerKind::Generic if self.is_posture_list() => Some(dot),
             PickerKind::Generic => self.items.iter().any(|item| item.current).then_some(dot),
-            PickerKind::Resume | PickerKind::CausalDagActions | PickerKind::CausalDagFormats => {
-                None
-            }
+            PickerKind::Resume
+            | PickerKind::CausalDagActions
+            | PickerKind::CausalDagFormats
+            | PickerKind::PermissionsAdvanced => None,
         }
     }
 
@@ -234,6 +237,12 @@ impl ReplacementPicker {
                     self.active_posture_label().unwrap_or("custom")
                 )],
                 footer: "↑↓ move · ⏎ select · esc cancel".to_owned(),
+                empty: "no matches",
+            },
+            PickerKind::PermissionsAdvanced => PickerChrome {
+                title: self.title.clone(),
+                params: Vec::new(),
+                footer: "↑↓ move · ⏎ select · ⌫ back · esc cancel".to_owned(),
                 empty: "no matches",
             },
             PickerKind::CausalDagActions | PickerKind::Generic => PickerChrome {
@@ -689,6 +698,11 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             "Permissions".to_owned(),
             permission_items(choices),
         ),
+        PickerSpec::PermissionsAdvanced(choices) => (
+            PickerKind::PermissionsAdvanced,
+            "Permissions › Advanced".to_owned(),
+            permission_items(choices),
+        ),
         PickerSpec::Resume(items) => (
             PickerKind::Resume,
             "Resume a previous session".to_owned(),
@@ -909,6 +923,15 @@ fn permission_items(choices: Vec<PermissionChoice>) -> Vec<PickerItem> {
                 current,
                 action: CommandAction::SetPermissionPosture { posture },
             },
+            PermissionChoice::Advanced { label, detail } => PickerItem {
+                label,
+                detail: Some(detail),
+                status: None,
+                group: None,
+                provider_tag: None,
+                current: false,
+                action: CommandAction::OpenPermissionsAdvanced,
+            },
             PermissionChoice::Unavailable { label, detail } => PickerItem {
                 label,
                 detail: Some(detail),
@@ -926,7 +949,9 @@ fn permission_items(choices: Vec<PermissionChoice>) -> Vec<PickerItem> {
                 label: human_permission_label(capability, mode).to_owned(),
                 detail: None,
                 status: None,
-                group: Some(format!("Advanced · {}", capability_group_label(capability))),
+                // The picker's own title already says "› Advanced"; repeating
+                // it on every group header is noise (§4.2).
+                group: Some(capability_group_label(capability).to_owned()),
                 provider_tag: None,
                 current: false,
                 action: CommandAction::SetPermissionMode { capability, mode },

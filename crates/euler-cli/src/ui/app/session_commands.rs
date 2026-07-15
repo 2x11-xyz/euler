@@ -390,6 +390,22 @@ impl AppCore {
         CoreEffect::Render
     }
 
+    /// §5.1 Advanced: the per-capability controls, one level down from the
+    /// posture picker. Rebuilt from the live session rather than carried in
+    /// the parent picker, so revoking a grant here can never show a stale set.
+    pub(super) fn open_permissions_advanced_picker(&mut self) -> CoreEffect {
+        let AppState::Idle { session } = &self.state else {
+            return self.notice_item("permissions wait for the active turn".to_owned());
+        };
+        let grants = session.list_grants();
+        let choices = crate::ui::commands::permission_advanced_choices(&grants);
+        self.bottom
+            .open_picker(crate::ui::commands::PickerSpec::PermissionsAdvanced(
+                choices,
+            ));
+        CoreEffect::Render
+    }
+
     pub(super) fn revoke_grant(
         &mut self,
         capability: Capability,

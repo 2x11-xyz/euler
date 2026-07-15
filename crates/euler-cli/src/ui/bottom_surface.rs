@@ -263,6 +263,17 @@ impl BottomSurface {
 
     /// Step backward through picker drill-downs without discarding the saved
     /// composer draft. Returns true when a transition was performed.
+    /// Whether `⌫` on this picker should step back to the `/permissions`
+    /// posture list (§5.1). The parent is re-derived from the live session by
+    /// the caller rather than restored from a snapshot, so a revoke made under
+    /// Advanced is reflected on the way back out.
+    pub fn picker_backspace_leaves_permissions_advanced(&self) -> bool {
+        let BottomOwner::Picker(picker) = &self.owner else {
+            return false;
+        };
+        picker.kind == PickerKind::PermissionsAdvanced && picker.query_is_empty()
+    }
+
     pub fn picker_backspace_steps_back(&mut self) -> bool {
         let BottomOwner::Picker(picker) = &self.owner else {
             return false;

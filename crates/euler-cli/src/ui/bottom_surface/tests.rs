@@ -788,7 +788,7 @@ fn permissions_picker_leads_with_honest_session_postures() {
     // §5.1: the title carries the posture in force. `permission_choices()`
     // builds the list with no session behind it, so nothing is current — and
     // "custom" is the honest reading of modes no posture describes.
-    assert!(rendered.contains("Permissions · Current: custom · (1/40)"));
+    assert!(rendered.contains("Permissions · Current: custom · (1/5)"));
     assert!(rendered.contains("QUICK SETTINGS"));
     // §5.1 radio variant: postures render ●/○, never a caret-only list.
     assert!(rendered.contains("○ Read only"));
@@ -804,27 +804,48 @@ fn permissions_picker_leads_with_honest_session_postures() {
     );
 }
 
+/// §5.1: the per-capability controls still exist, but one level down behind
+/// a single nested entry — they are no longer the primary mental model. The
+/// posture list itself is four postures + the unavailable sandbox row +
+/// Advanced, not a wall of forty toggles.
 #[test]
 fn permissions_picker_keeps_per_capability_controls_under_advanced() {
     let mut surface = BottomSurface::new(CommandContext::default());
     surface.open_picker(PickerSpec::Permissions(permission_choices()));
-    for _ in 0..8 {
-        surface.move_selection_down();
-    }
 
-    let rendered = surface
+    let postures = surface
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("ADVANCED · FILES: WRITE"));
-    assert!(rendered.contains("Allow file writes this session"));
+    assert!(postures.contains("Advanced capability settings ›"));
+    assert!(
+        !postures.contains("Allow file writes this session"),
+        "per-capability controls must not spill into the posture list: {postures}"
+    );
+
+    // The nested entry drills down; the host rebuilds the rows from the live
+    // session, so the picker asks for them rather than carrying a snapshot.
+    for _ in 0..4 {
+        surface.move_selection_down();
+    }
     assert_eq!(
         surface.confirm(),
-        SurfaceEvent::Action(CommandAction::SetPermissionMode {
-            capability: Capability::FsWrite,
-            mode: ApprovalMode::SessionAllow,
-        })
+        SurfaceEvent::Action(CommandAction::OpenPermissionsAdvanced)
     );
+
+    surface.open_picker(PickerSpec::PermissionsAdvanced(
+        crate::ui::commands::permission_advanced_choices(&[]),
+    ));
+    let advanced = surface
+        .surface_lines(80)
+        .expect("advanced picker")
+        .join("\n");
+    assert!(advanced.contains("Permissions › Advanced"));
+    assert!(advanced.contains("⌫ back"));
+    assert!(advanced.contains("Allow file writes this session"));
+
+    // `⌫` leaves Advanced; the caller re-derives the postures from the session.
+    assert!(surface.picker_backspace_leaves_permissions_advanced());
 }
 
 #[test]
@@ -844,8 +865,10 @@ fn permissions_picker_marks_sandbox_posture_unavailable_instead_of_faking_it() {
 #[test]
 fn permissions_picker_exposes_agent_spawn_controls() {
     let mut surface = BottomSurface::new(CommandContext::default());
-    surface.open_picker(PickerSpec::Permissions(permission_choices()));
-    for _ in 0..22 {
+    surface.open_picker(PickerSpec::PermissionsAdvanced(
+        crate::ui::commands::permission_advanced_choices(&[]),
+    ));
+    for _ in 0..18 {
         surface.move_selection_down();
     }
 
@@ -853,7 +876,7 @@ fn permissions_picker_exposes_agent_spawn_controls() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("ADVANCED · AGENTS"));
+    assert!(rendered.contains("AGENTS"), "rendered:\n{rendered}");
     assert!(rendered.contains("Ask before spawning agents"));
     assert_eq!(
         surface.confirm(),

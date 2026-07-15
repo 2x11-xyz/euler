@@ -534,6 +534,8 @@ pub enum CommandAction {
     PermissionSandboxUnavailable,
     /// Open the permissions picker with live session/project grants.
     OpenPermissions,
+    /// §5.1: drill into the per-capability controls from the posture picker.
+    OpenPermissionsAdvanced,
     RevokeGrant {
         capability: Capability,
         pattern: String,
@@ -610,6 +612,8 @@ pub enum PickerSpec {
     CausalDagActions(CausalDagStats),
     CausalDagFormats(CausalDagStats),
     Compaction(CompactionSettings),
+    /// §5.1 Advanced, one level down from the posture picker.
+    PermissionsAdvanced(Vec<PermissionChoice>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -623,6 +627,13 @@ pub enum PermissionChoice {
         current: bool,
     },
     Unavailable {
+        label: String,
+        detail: String,
+    },
+    /// §5.1: the one nested-entry row under the postures. Opens the existing
+    /// per-capability controls one level down, rather than spilling them into
+    /// the posture list.
+    Advanced {
         label: String,
         detail: String,
     },
@@ -912,7 +923,9 @@ pub fn permission_choices() -> Vec<PermissionChoice> {
     permission_choices_with_state(&[], None)
 }
 
-/// Quick session postures, active grants, then per-capability advanced modes.
+/// §5.1: the posture picker's rows — four plain-language session postures and
+/// the one nested Advanced entry. Day to day a user picks a posture and moves
+/// on; the per-capability controls live in [`permission_advanced_choices`].
 /// `active` is the posture currently in effect (see
 /// [`PermissionPosture::active`]); `None` renders no filled radio, which is
 /// what a hand-tuned Advanced configuration honestly is.
@@ -929,30 +942,48 @@ pub fn permission_choices_with_state(
             current: active == Some(posture),
         })
         .collect::<Vec<_>>();
+    // Shown, never hidden, so the roadmap stays legible — but not selectable
+    // until a verified Linux workspace-sandbox backend exists (ADR 0014).
     choices.push(PermissionChoice::Unavailable {
         label: "Auto in workspace sandbox (not available)".to_owned(),
         detail: "requires the Linux workspace sandbox; selecting this does not change permissions"
             .to_owned(),
     });
-    choices.extend(grants.iter().map(|(source, grant)| {
-        let pattern = grant.pattern.as_str();
-        let pattern_label = if pattern.is_empty() {
-            "all".to_owned()
-        } else {
-            format!("{pattern}*")
-        };
-        PermissionChoice::Revoke {
-            capability: grant.capability,
-            pattern: pattern.to_owned(),
-            source: *source,
-            label: format!(
-                "Revoke {} {} ({})",
-                source.as_str(),
-                grant.capability.as_str(),
-                pattern_label
-            ),
-        }
-    }));
+    choices.push(PermissionChoice::Advanced {
+        label: "Advanced capability settings ›".to_owned(),
+        detail: format!(
+            "per-capability modes, matching rules, and revocation · {} active grant(s)",
+            grants.len()
+        ),
+    });
+    choices
+}
+
+/// §5.1 Advanced: per-capability grants, revocation, and policy detail. Still
+/// available, one level down — no longer the primary mental model.
+pub fn permission_advanced_choices(grants: &[(GrantSource, ActiveGrant)]) -> Vec<PermissionChoice> {
+    let mut choices = grants
+        .iter()
+        .map(|(source, grant)| {
+            let pattern = grant.pattern.as_str();
+            let pattern_label = if pattern.is_empty() {
+                "all".to_owned()
+            } else {
+                format!("{pattern}*")
+            };
+            PermissionChoice::Revoke {
+                capability: grant.capability,
+                pattern: pattern.to_owned(),
+                source: *source,
+                label: format!(
+                    "Revoke {} {} ({})",
+                    source.as_str(),
+                    grant.capability.as_str(),
+                    pattern_label
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
     choices.extend(Capability::ALL.iter().copied().flat_map(permission_modes));
     choices
 }

@@ -1253,6 +1253,9 @@ impl AppCore {
                 CoreEffect::Render
             }
             KeyCode::Backspace => {
+                if self.bottom.picker_backspace_leaves_permissions_advanced() {
+                    return self.open_permissions_picker();
+                }
                 if self.bottom.picker_backspace_steps_back() {
                     return CoreEffect::Render;
                 }
@@ -1855,6 +1858,7 @@ impl AppCore {
                     .to_owned(),
             ),
             CommandAction::OpenPermissions => self.open_permissions_picker(),
+            CommandAction::OpenPermissionsAdvanced => self.open_permissions_advanced_picker(),
             CommandAction::RevokeGrant {
                 capability,
                 pattern,
