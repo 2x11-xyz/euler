@@ -202,10 +202,9 @@ fn current_investigation_lines(record: &ResearchRecord, accepted: &AcceptedRecor
                 current_outcome_id,
                 current_outcome,
                 accepted.is_productive_investigation(&investigation.id),
-                investigation
-                    .source_event_ids
-                    .first()
-                    .map_or("-", String::as_str),
+                accepted
+                    .lineage_anchor_for(&investigation.id)
+                    .unwrap_or("-"),
             )
         })
         .collect()

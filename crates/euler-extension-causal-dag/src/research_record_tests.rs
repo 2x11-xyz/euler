@@ -616,7 +616,91 @@ fn repair_requires_shared_predecessor_and_successor_evidence() {
     .expect_err("repair without predecessor evidence must fail");
     assert!(error
         .to_string()
-        .contains("lineage relation must cite evidence from both"));
+        .contains("must cite the predecessor lineage anchor"));
+}
+
+#[test]
+fn repair_requires_latest_failure_anchor_not_investigation_creation() {
+    let prior_events = vec![
+        event("event-user", EventKind::USER_MESSAGE),
+        event("event-attempt", EventKind::TOOL_RESULT),
+        event("event-failure", EventKind::TOOL_RESULT),
+    ];
+    let mut initial = batch();
+    initial.entities[1].source_event_ids = vec!["event-attempt".to_owned()];
+    initial.outcomes[0].source_event_ids = vec!["event-failure".to_owned()];
+    initial.relations[0].source_event_ids = vec!["event-attempt".to_owned()];
+    let prior = append_observer_batch(AppendInput {
+        prior: None,
+        predecessor_record_artifact_event_id: None,
+        events: &prior_events,
+        batch: initial,
+        watermark_event_id: "event-failure".to_owned(),
+        generated_at: prior_events[2].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("prior record with distinct attempt and failure evidence");
+
+    let repair_events = vec![event("event-repair", EventKind::TOOL_RESULT)];
+    let repair_batch = |predecessor_source: &str| ObserverProposalBatch {
+        schema: RESEARCH_PROPOSALS_SCHEMA.to_owned(),
+        entities: vec![ResearchEntity {
+            id: "i-repair".to_owned(),
+            kind: EntityKind::Investigation,
+            title: "Repair recurrence".to_owned(),
+            summary: "Reuse the documented contradiction.".to_owned(),
+            lifecycle: Some(EntityLifecycle::Active),
+            source_event_ids: vec!["event-repair".to_owned()],
+        }],
+        outcomes: Vec::new(),
+        relations: vec![
+            ResearchRelation {
+                id: "r-repair-investigates".to_owned(),
+                kind: RelationKind::Investigates,
+                from: "i-repair".to_owned(),
+                to: "q-knuth".to_owned(),
+                summary: "The repair stays on the question.".to_owned(),
+                source_event_ids: vec!["event-repair".to_owned()],
+            },
+            ResearchRelation {
+                id: "r-repairs".to_owned(),
+                kind: RelationKind::Repairs,
+                from: "i-repair".to_owned(),
+                to: "i-recurrence".to_owned(),
+                summary: "The repair reuses the documented failure.".to_owned(),
+                source_event_ids: vec![predecessor_source.to_owned(), "event-repair".to_owned()],
+            },
+        ],
+        assessments: Vec::new(),
+    };
+
+    let error = append_observer_batch(AppendInput {
+        prior: Some(&prior),
+        predecessor_record_artifact_event_id: Some("record-prior"),
+        events: &repair_events,
+        batch: repair_batch("event-attempt"),
+        watermark_event_id: "event-repair".to_owned(),
+        generated_at: repair_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect_err("investigation creation must not stand in for failure evidence");
+    assert!(error
+        .to_string()
+        .contains("must cite the predecessor lineage anchor"));
+
+    append_observer_batch(AppendInput {
+        prior: Some(&prior),
+        predecessor_record_artifact_event_id: Some("record-prior"),
+        events: &repair_events,
+        batch: repair_batch("event-failure"),
+        watermark_event_id: "event-repair".to_owned(),
+        generated_at: repair_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("repair citing the latest failure anchor");
 }
 
 #[test]

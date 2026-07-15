@@ -99,7 +99,7 @@ pub(crate) fn execute_brief(
     let input = BriefInput::parse(&context.input)?;
     match prepare_brief(host, input.clone())? {
         Some(prepared) => Ok(brief_output(&input, prepared)),
-        None => caught_up_output(host),
+        None => idle_output(host),
     }
 }
 
@@ -289,14 +289,14 @@ fn brief_output(input: &BriefInput, prepared: PreparedBrief) -> Value {
     })
 }
 
-fn caught_up_output(host: &dyn HostApi) -> Result<Value, ExtensionError> {
+fn idle_output(host: &dyn HostApi) -> Result<Value, ExtensionError> {
     let state = ResearchState::load(host)?.ok_or_else(|| {
         input_error("research-record pilot is not enabled; run causal-dag.research-enable first")
     })?;
     Ok(json!({
         "schema": RESEARCH_BRIEF_SCHEMA,
         "mode": RESEARCH_MODE,
-        "status": "caught_up",
+        "status": "idle",
         "watermark_event_id": state.observed_through_event_id(),
         "listed_event_count": 0
     }))

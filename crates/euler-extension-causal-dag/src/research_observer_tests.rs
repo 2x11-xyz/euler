@@ -180,7 +180,7 @@ fn task_preserves_repair_and_pivot_direction_rules() {
                         outcome: InvestigationOutcome::Completed,
                         summary: "The current completed state.".to_owned(),
                         supersedes_outcome_id: Some("outcome-old".to_owned()),
-                        source_event_ids: vec!["event-0".to_owned()],
+                        source_event_ids: vec!["event-outcome-current".to_owned()],
                     },
                 ),
             },
@@ -244,7 +244,7 @@ fn task_preserves_repair_and_pivot_direction_rules() {
     assert!(task.contains("CURRENT INVESTIGATION LEDGER:"));
     assert!(task.contains("current_outcome_id=outcome-current"));
     assert!(task.contains("current_outcome=completed"));
-    assert!(task.contains("lineage_anchor=event-0"));
+    assert!(task.contains("lineage_anchor=event-outcome-current"));
     assert!(
         task.find("CURRENT investigation=z")
             .expect("recent investigation")

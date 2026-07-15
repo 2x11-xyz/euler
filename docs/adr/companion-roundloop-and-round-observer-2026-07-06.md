@@ -106,12 +106,16 @@ in-session loop from ever closing.
   core executes with the extension's manifest grant (the existing
   capability-gated path); the brief and apply commands keep that grant
   unchanged.
-- **Brief envelope**: a JSON object with `task` (required string), optional
+- **Brief envelope**: either a task object or the generic no-work object
+  `{ "status": "idle" }`. A task object has `task` (required string), optional
   `provider`/`model` (both or neither), optional `system_prompt` (string,
   becomes the companion's system instructions — this is how the extension
   teaches the observer its output schema), optional `budget`
   (`max_turns`/`max_tool_calls`/`max_tokens`), and an opaque `apply` value.
-  Unknown fields are ignored; a malformed envelope fails the tick fail-open
+  An idle object may carry extension-owned informational fields, but none of
+  the recognized task fields; core records a successful tick and runs neither
+  companion nor apply. Unknown fields on a task object are ignored; an unknown
+  status or mixed idle/task envelope fails the tick fail-open
   (`failed_stage="envelope"` semantics under the brief stage).
 - **Apply envelope**: core calls the apply command with exactly
   `{ "apply": <brief apply value untouched>, "companion": { ok, summary,

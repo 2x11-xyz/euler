@@ -127,14 +127,17 @@ euler extension run causal-dag.observer-brief ./session.jsonl --limit 64 --max-t
 
 Flags: `--limit`, `--scan-limit`, `--after-event-id`, `--max-tokens`.
 
-The brief output carries an `apply` object (the observe window, active-graph
-predecessor, and session assertion) that the in-session round observer echoes
-untouched into `observer-apply`. The private feed cursor advances across pages
-that contain only extension-owned or otherwise unobservable events, so those
-pages cannot repeatedly fill the bounded window. If a bounded page ends in the
-middle of a prior observer companion run, the cursor remains before that span
-and the command asks for a larger limit instead of treating companion output
-as driver cognition.
+When work is available, the brief output carries an `apply` object (the observe
+window, active-graph predecessor, and session assertion) that the in-session
+round observer echoes untouched into `observer-apply`. In research-record mode,
+an already caught-up feed returns `{ "status": "idle" }`; core records a
+successful tick without spawning a companion or invoking apply. The private
+feed cursor
+advances across pages that contain only extension-owned or otherwise
+unobservable events, so those pages cannot repeatedly fill the bounded window.
+If a bounded page ends in the middle of a prior observer companion run, the
+cursor remains before that span and the command asks for a larger limit instead
+of treating companion output as driver cognition.
 
 ### `observer-apply`
 

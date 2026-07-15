@@ -551,6 +551,21 @@ impl AcceptedRecord {
         })
     }
 
+    /// Canonical predecessor evidence for successor lineage. The latest
+    /// accepted outcome is the current state being continued, repaired, or
+    /// pivoted from; investigation-creation evidence is only a fallback for
+    /// an investigation that has no accepted outcome yet.
+    pub(crate) fn lineage_anchor_for(&self, investigation_id: &str) -> Option<&str> {
+        self.latest_outcome_for(investigation_id)
+            .and_then(|outcome| outcome.source_event_ids.first())
+            .or_else(|| {
+                self.entities
+                    .get(investigation_id)
+                    .and_then(|entity| entity.source_event_ids.first())
+            })
+            .map(String::as_str)
+    }
+
     pub(crate) fn is_productive_investigation(&self, investigation_id: &str) -> bool {
         self.relations.values().any(|relation| {
             relation.kind == RelationKind::Produces

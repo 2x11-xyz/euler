@@ -298,9 +298,14 @@ fn require_lineage_source_overlap(
     accepted: &AcceptedRecord,
 ) -> Result<(), ExtensionError> {
     let relation_sources = relation.source_event_ids.iter().collect::<BTreeSet<_>>();
-    let predecessor_seen = investigation_material_sources(predecessor, accepted)
-        .iter()
-        .any(|source| relation_sources.contains(source));
+    let predecessor_seen = accepted
+        .lineage_anchor_for(&predecessor.id)
+        .is_some_and(|anchor| {
+            relation
+                .source_event_ids
+                .iter()
+                .any(|source| source == anchor)
+        });
     let successor_seen = investigation_material_sources(successor, accepted)
         .iter()
         .any(|source| relation_sources.contains(source));
@@ -308,7 +313,7 @@ fn require_lineage_source_overlap(
         Ok(())
     } else {
         Err(input_error(
-            "research lineage relation must cite evidence from both predecessor and successor",
+            "research lineage relation must cite the predecessor lineage anchor and successor evidence",
         ))
     }
 }
