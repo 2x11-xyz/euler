@@ -242,44 +242,47 @@ fn validate_lineage_relation(
     relation: &ResearchRelation,
     accepted: &AcceptedRecord,
 ) -> Result<(), ExtensionError> {
-    let requires_predecessor = matches!(
+    if !matches!(
         relation.kind,
         RelationKind::Repairs | RelationKind::PivotsFrom | RelationKind::ContinuesFrom
-    );
-    if !requires_predecessor {
+    ) {
         return Ok(());
     }
     let successor = accepted.entity(&relation.from)?;
     let predecessor = accepted.entity(&relation.to)?;
     let predecessor_outcome = accepted
-        .latest_outcome_for(&predecessor.id)
-        .map(|outcome| outcome.outcome)
-        .ok_or_else(|| {
-            input_error("lineage predecessor needs an accepted investigation outcome")
-        })?;
-    let terminal = matches!(
-        predecessor_outcome,
-        InvestigationOutcome::Blocked | InvestigationOutcome::DeadEnd
-    );
-    match relation.kind {
-        RelationKind::Repairs | RelationKind::PivotsFrom if !terminal => {
-            return Err(input_error(
-                "repair and pivot relations require a blocked or dead-end predecessor",
-            ));
+        .latest_outcome_anchored_by(&predecessor.id, &relation.source_event_ids)
+        .map(|outcome| outcome.outcome);
+    if let Some(predecessor_outcome) = predecessor_outcome {
+        let terminal = matches!(
+            predecessor_outcome,
+            InvestigationOutcome::Blocked | InvestigationOutcome::DeadEnd
+        );
+        match relation.kind {
+            RelationKind::Repairs | RelationKind::PivotsFrom if !terminal => {
+                return Err(input_error(
+                    "repair and pivot relations require a blocked or dead-end predecessor",
+                ));
+            }
+            RelationKind::ContinuesFrom
+                if matches!(
+                    predecessor_outcome,
+                    InvestigationOutcome::Blocked
+                        | InvestigationOutcome::DeadEnd
+                        | InvestigationOutcome::Abandoned
+                ) =>
+            {
+                return Err(input_error(
+                    "continuation requires an active or completed productive predecessor",
+                ));
+            }
+            _ => {}
         }
-        RelationKind::ContinuesFrom
-            if matches!(
-                predecessor_outcome,
-                InvestigationOutcome::Blocked
-                    | InvestigationOutcome::DeadEnd
-                    | InvestigationOutcome::Abandoned
-            ) =>
-        {
-            return Err(input_error(
-                "continuation requires an active or completed productive predecessor",
-            ));
-        }
-        _ => {}
+    } else {
+        // The merged v1 pilot accepted lineage backed by any predecessor
+        // material. Preserve those durable records at the load boundary; new
+        // proposals are separately required to cite the current outcome below.
+        require_predecessor_evidence(relation, predecessor, accepted)?;
     }
     if relation.kind == RelationKind::ContinuesFrom
         && !accepted.is_productive_investigation(&predecessor.id)
@@ -288,32 +291,71 @@ fn validate_lineage_relation(
             "continuation requires a productive predecessor with an accepted output",
         ));
     }
-    require_lineage_source_overlap(relation, predecessor, successor, accepted)
+    require_successor_evidence(relation, successor, accepted)
 }
 
-fn require_lineage_source_overlap(
+pub(super) fn validate_new_lineage_relation(
     relation: &ResearchRelation,
-    predecessor: &ResearchEntity,
+    accepted: &AcceptedRecord,
+) -> Result<(), ExtensionError> {
+    // Durable validation above resolves the outcome the relation historically
+    // cites. At proposal time we additionally require the current anchor so a
+    // new relation cannot reach back to a superseded outcome.
+    if !matches!(
+        relation.kind,
+        RelationKind::Repairs | RelationKind::PivotsFrom | RelationKind::ContinuesFrom
+    ) {
+        return Ok(());
+    }
+    let predecessor = accepted.entity(&relation.to)?;
+    let current_anchor = accepted
+        .lineage_anchor_for(&predecessor.id)
+        .ok_or_else(|| input_error("lineage predecessor needs an accepted outcome anchor"))?;
+    if relation
+        .source_event_ids
+        .iter()
+        .any(|source| source == current_anchor)
+    {
+        Ok(())
+    } else {
+        Err(input_error(
+            "new research lineage relation must cite the current predecessor lineage anchor",
+        ))
+    }
+}
+
+fn require_successor_evidence(
+    relation: &ResearchRelation,
     successor: &ResearchEntity,
     accepted: &AcceptedRecord,
 ) -> Result<(), ExtensionError> {
     let relation_sources = relation.source_event_ids.iter().collect::<BTreeSet<_>>();
-    let predecessor_seen = accepted
-        .lineage_anchor_for(&predecessor.id)
-        .is_some_and(|anchor| {
-            relation
-                .source_event_ids
-                .iter()
-                .any(|source| source == anchor)
-        });
     let successor_seen = investigation_material_sources(successor, accepted)
         .iter()
         .any(|source| relation_sources.contains(source));
-    if predecessor_seen && successor_seen {
+    if successor_seen {
         Ok(())
     } else {
         Err(input_error(
-            "research lineage relation must cite the predecessor lineage anchor and successor evidence",
+            "research lineage relation must cite successor evidence",
+        ))
+    }
+}
+
+fn require_predecessor_evidence(
+    relation: &ResearchRelation,
+    predecessor: &ResearchEntity,
+    accepted: &AcceptedRecord,
+) -> Result<(), ExtensionError> {
+    let relation_sources = relation.source_event_ids.iter().collect::<BTreeSet<_>>();
+    if investigation_material_sources(predecessor, accepted)
+        .iter()
+        .any(|source| relation_sources.contains(source))
+    {
+        Ok(())
+    } else {
+        Err(input_error(
+            "lineage relation must cite accepted predecessor evidence",
         ))
     }
 }

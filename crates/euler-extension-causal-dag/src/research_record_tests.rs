@@ -616,31 +616,77 @@ fn repair_requires_shared_predecessor_and_successor_evidence() {
     .expect_err("repair without predecessor evidence must fail");
     assert!(error
         .to_string()
-        .contains("must cite the predecessor lineage anchor"));
+        .contains("must cite accepted predecessor evidence"));
 }
 
 #[test]
-fn repair_requires_latest_failure_anchor_not_investigation_creation() {
-    let prior_events = vec![
+fn repair_uses_current_failure_anchor_but_survives_later_outcome_revision() {
+    let initial_events = vec![
         event("event-user", EventKind::USER_MESSAGE),
         event("event-attempt", EventKind::TOOL_RESULT),
-        event("event-failure", EventKind::TOOL_RESULT),
+        event("event-failure-old", EventKind::TOOL_RESULT),
     ];
     let mut initial = batch();
     initial.entities[1].source_event_ids = vec!["event-attempt".to_owned()];
-    initial.outcomes[0].source_event_ids = vec!["event-failure".to_owned()];
+    initial.outcomes[0].source_event_ids = vec!["event-failure-old".to_owned()];
     initial.relations[0].source_event_ids = vec!["event-attempt".to_owned()];
-    let prior = append_observer_batch(AppendInput {
+    let initial = append_observer_batch(AppendInput {
         prior: None,
         predecessor_record_artifact_event_id: None,
-        events: &prior_events,
+        events: &initial_events,
         batch: initial,
-        watermark_event_id: "event-failure".to_owned(),
-        generated_at: prior_events[2].ts.clone(),
+        watermark_event_id: "event-failure-old".to_owned(),
+        generated_at: initial_events[2].ts.clone(),
         session_id: None,
         observer_result_event_id: None,
     })
-    .expect("prior record with distinct attempt and failure evidence");
+    .expect("initial record with distinct attempt and failure evidence");
+    let revised_failure_events = vec![event("event-failure-current", EventKind::TOOL_RESULT)];
+    let mut revised_failure_batch = ObserverProposalBatch {
+        schema: RESEARCH_PROPOSALS_SCHEMA.to_owned(),
+        entities: Vec::new(),
+        outcomes: vec![ResearchOutcome {
+            id: "outcome-recurrence-current".to_owned(),
+            investigation_id: "i-recurrence".to_owned(),
+            outcome: InvestigationOutcome::DeadEnd,
+            summary: "The refined check documents the current failure.".to_owned(),
+            supersedes_outcome_id: Some("outcome-recurrence-dead".to_owned()),
+            source_event_ids: vec![
+                "event-failure-old".to_owned(),
+                "event-failure-current".to_owned(),
+            ],
+        }],
+        relations: Vec::new(),
+        assessments: Vec::new(),
+    };
+    let error = append_observer_batch(AppendInput {
+        prior: Some(&initial),
+        predecessor_record_artifact_event_id: Some("record-initial"),
+        events: &revised_failure_events,
+        batch: revised_failure_batch.clone(),
+        watermark_event_id: "event-failure-current".to_owned(),
+        generated_at: revised_failure_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect_err("a reused event must not become a new outcome anchor");
+    assert!(error
+        .to_string()
+        .contains("newly observed event as its first lineage anchor"));
+    revised_failure_batch.outcomes[0]
+        .source_event_ids
+        .swap(0, 1);
+    let prior = append_observer_batch(AppendInput {
+        prior: Some(&initial),
+        predecessor_record_artifact_event_id: Some("record-initial"),
+        events: &revised_failure_events,
+        batch: revised_failure_batch,
+        watermark_event_id: "event-failure-current".to_owned(),
+        generated_at: revised_failure_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("current failure outcome");
 
     let repair_events = vec![event("event-repair", EventKind::TOOL_RESULT)];
     let repair_batch = |predecessor_source: &str| ObserverProposalBatch {
@@ -679,28 +725,254 @@ fn repair_requires_latest_failure_anchor_not_investigation_creation() {
         prior: Some(&prior),
         predecessor_record_artifact_event_id: Some("record-prior"),
         events: &repair_events,
-        batch: repair_batch("event-attempt"),
+        batch: repair_batch("event-failure-old"),
         watermark_event_id: "event-repair".to_owned(),
         generated_at: repair_events[0].ts.clone(),
         session_id: None,
         observer_result_event_id: None,
     })
-    .expect_err("investigation creation must not stand in for failure evidence");
+    .expect_err("superseded failure evidence must not anchor a new repair");
     assert!(error
         .to_string()
-        .contains("must cite the predecessor lineage anchor"));
+        .contains("must cite the current predecessor lineage anchor"));
 
+    let pivot_batch = |predecessor_source: &str| {
+        let mut batch = repair_batch(predecessor_source);
+        batch.entities[0].id = "i-pivot".to_owned();
+        batch.entities[0].title = "Pivot from recurrence".to_owned();
+        batch.relations[0].id = "r-pivot-investigates".to_owned();
+        batch.relations[0].from = "i-pivot".to_owned();
+        batch.relations[1].id = "r-pivots".to_owned();
+        batch.relations[1].kind = RelationKind::PivotsFrom;
+        batch.relations[1].from = "i-pivot".to_owned();
+        batch
+    };
+    let error = append_observer_batch(AppendInput {
+        prior: Some(&prior),
+        predecessor_record_artifact_event_id: Some("record-prior"),
+        events: &repair_events,
+        batch: pivot_batch("event-failure-old"),
+        watermark_event_id: "event-repair".to_owned(),
+        generated_at: repair_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect_err("superseded failure evidence must not anchor a new pivot");
+    assert!(error
+        .to_string()
+        .contains("must cite the current predecessor lineage anchor"));
     append_observer_batch(AppendInput {
         prior: Some(&prior),
         predecessor_record_artifact_event_id: Some("record-prior"),
         events: &repair_events,
-        batch: repair_batch("event-failure"),
+        batch: pivot_batch("event-failure-current"),
+        watermark_event_id: "event-repair".to_owned(),
+        generated_at: repair_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("pivot citing the latest failure anchor");
+
+    let repaired = append_observer_batch(AppendInput {
+        prior: Some(&prior),
+        predecessor_record_artifact_event_id: Some("record-prior"),
+        events: &repair_events,
+        batch: repair_batch("event-failure-current"),
         watermark_event_id: "event-repair".to_owned(),
         generated_at: repair_events[0].ts.clone(),
         session_id: None,
         observer_result_event_id: None,
     })
     .expect("repair citing the latest failure anchor");
+
+    let abandoned_batch = || ObserverProposalBatch {
+        schema: RESEARCH_PROPOSALS_SCHEMA.to_owned(),
+        entities: Vec::new(),
+        outcomes: vec![ResearchOutcome {
+            id: "outcome-recurrence-abandoned".to_owned(),
+            investigation_id: "i-recurrence".to_owned(),
+            outcome: InvestigationOutcome::Abandoned,
+            summary: "The failed line is no longer active.".to_owned(),
+            supersedes_outcome_id: Some("outcome-recurrence-current".to_owned()),
+            source_event_ids: vec!["event-abandoned".to_owned()],
+        }],
+        relations: Vec::new(),
+        assessments: Vec::new(),
+    };
+    let later_events = vec![event("event-abandoned", EventKind::TOOL_RESULT)];
+    let revised = append_observer_batch(AppendInput {
+        prior: Some(&repaired),
+        predecessor_record_artifact_event_id: Some("record-repaired"),
+        events: &later_events,
+        batch: abandoned_batch(),
+        watermark_event_id: "event-abandoned".to_owned(),
+        generated_at: later_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("later outcome revisions must not invalidate historical lineage");
+    ResearchRecord::from_value(&revised.value().expect("record value"))
+        .expect("revised record reloads with historical repair intact");
+
+    let mut legacy = repaired.clone();
+    let legacy_relation = legacy
+        .ledger
+        .iter_mut()
+        .find_map(|entry| match entry {
+            LedgerEntry::Proposal {
+                semantic: SemanticRecord::Relation(relation),
+                ..
+            } if relation.id == "r-repairs" => Some(relation),
+            _ => None,
+        })
+        .expect("accepted repair proposal");
+    legacy_relation.source_event_ids = vec!["event-attempt".to_owned(), "event-repair".to_owned()];
+    ResearchRecord::from_value(&legacy.value().expect("legacy record value"))
+        .expect("v1 lineage backed by predecessor material remains readable");
+    let revised_legacy = append_observer_batch(AppendInput {
+        prior: Some(&legacy),
+        predecessor_record_artifact_event_id: Some("record-legacy"),
+        events: &later_events,
+        batch: abandoned_batch(),
+        watermark_event_id: "event-abandoned".to_owned(),
+        generated_at: later_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("later outcomes do not invalidate v1 lineage evidence");
+    ResearchRecord::from_value(&revised_legacy.value().expect("revised legacy value"))
+        .expect("revised v1 record remains readable");
+}
+
+#[test]
+fn continuation_requires_the_current_productive_outcome_anchor() {
+    let initial_events = vec![
+        event("event-user", EventKind::USER_MESSAGE),
+        event("event-attempt", EventKind::TOOL_RESULT),
+        event("event-active", EventKind::TOOL_RESULT),
+        event("event-output", EventKind::TOOL_RESULT),
+    ];
+    let mut initial = batch();
+    initial.entities[1].source_event_ids = vec!["event-attempt".to_owned()];
+    initial.outcomes[0].outcome = InvestigationOutcome::Active;
+    initial.outcomes[0].source_event_ids = vec!["event-active".to_owned()];
+    initial.relations[0].source_event_ids = vec!["event-attempt".to_owned()];
+    initial.entities.push(ResearchEntity {
+        id: "o-result".to_owned(),
+        kind: EntityKind::Observation,
+        title: "Productive result".to_owned(),
+        summary: "The investigation produced a reusable observation.".to_owned(),
+        lifecycle: Some(EntityLifecycle::Active),
+        source_event_ids: vec!["event-output".to_owned()],
+    });
+    initial.relations.push(ResearchRelation {
+        id: "r-produces-result".to_owned(),
+        kind: RelationKind::Produces,
+        from: "i-recurrence".to_owned(),
+        to: "o-result".to_owned(),
+        summary: "The investigation produced the observation.".to_owned(),
+        source_event_ids: vec!["event-output".to_owned()],
+    });
+    let initial = append_observer_batch(AppendInput {
+        prior: None,
+        predecessor_record_artifact_event_id: None,
+        events: &initial_events,
+        batch: initial,
+        watermark_event_id: "event-output".to_owned(),
+        generated_at: initial_events[3].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("productive active predecessor");
+
+    let completed_events = vec![event("event-completed", EventKind::TOOL_RESULT)];
+    let prior = append_observer_batch(AppendInput {
+        prior: Some(&initial),
+        predecessor_record_artifact_event_id: Some("record-initial"),
+        events: &completed_events,
+        batch: ObserverProposalBatch {
+            schema: RESEARCH_PROPOSALS_SCHEMA.to_owned(),
+            entities: Vec::new(),
+            outcomes: vec![ResearchOutcome {
+                id: "outcome-recurrence-completed".to_owned(),
+                investigation_id: "i-recurrence".to_owned(),
+                outcome: InvestigationOutcome::Completed,
+                summary: "The productive investigation completed.".to_owned(),
+                supersedes_outcome_id: Some("outcome-recurrence-dead".to_owned()),
+                source_event_ids: vec!["event-completed".to_owned()],
+            }],
+            relations: Vec::new(),
+            assessments: Vec::new(),
+        },
+        watermark_event_id: "event-completed".to_owned(),
+        generated_at: completed_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("current completed outcome");
+
+    let continuation_events = vec![event("event-continuation", EventKind::TOOL_RESULT)];
+    let continuation_batch = |predecessor_source: &str| ObserverProposalBatch {
+        schema: RESEARCH_PROPOSALS_SCHEMA.to_owned(),
+        entities: vec![ResearchEntity {
+            id: "i-continuation".to_owned(),
+            kind: EntityKind::Investigation,
+            title: "Continue the productive line".to_owned(),
+            summary: "Extend the accepted observation.".to_owned(),
+            lifecycle: Some(EntityLifecycle::Active),
+            source_event_ids: vec!["event-continuation".to_owned()],
+        }],
+        outcomes: Vec::new(),
+        relations: vec![
+            ResearchRelation {
+                id: "r-continuation-investigates".to_owned(),
+                kind: RelationKind::Investigates,
+                from: "i-continuation".to_owned(),
+                to: "q-knuth".to_owned(),
+                summary: "The continuation stays on the question.".to_owned(),
+                source_event_ids: vec!["event-continuation".to_owned()],
+            },
+            ResearchRelation {
+                id: "r-continues".to_owned(),
+                kind: RelationKind::ContinuesFrom,
+                from: "i-continuation".to_owned(),
+                to: "i-recurrence".to_owned(),
+                summary: "The new line continues the productive predecessor.".to_owned(),
+                source_event_ids: vec![
+                    predecessor_source.to_owned(),
+                    "event-continuation".to_owned(),
+                ],
+            },
+        ],
+        assessments: Vec::new(),
+    };
+
+    let error = append_observer_batch(AppendInput {
+        prior: Some(&prior),
+        predecessor_record_artifact_event_id: Some("record-prior"),
+        events: &continuation_events,
+        batch: continuation_batch("event-active"),
+        watermark_event_id: "event-continuation".to_owned(),
+        generated_at: continuation_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect_err("superseded active outcome must not anchor a new continuation");
+    assert!(error
+        .to_string()
+        .contains("must cite the current predecessor lineage anchor"));
+
+    append_observer_batch(AppendInput {
+        prior: Some(&prior),
+        predecessor_record_artifact_event_id: Some("record-prior"),
+        events: &continuation_events,
+        batch: continuation_batch("event-completed"),
+        watermark_event_id: "event-continuation".to_owned(),
+        generated_at: continuation_events[0].ts.clone(),
+        session_id: None,
+        observer_result_event_id: None,
+    })
+    .expect("continuation citing the current completed outcome");
 }
 
 #[test]

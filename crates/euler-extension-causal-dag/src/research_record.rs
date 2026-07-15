@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod semantics;
-use semantics::validate_record_semantics;
+use semantics::{validate_new_lineage_relation, validate_record_semantics};
 mod validation;
 use validation::{
     append_batch_ledger, append_new_episodes, validate_assessment, validate_assessment_fields,
@@ -551,19 +551,32 @@ impl AcceptedRecord {
         })
     }
 
-    /// Canonical predecessor evidence for successor lineage. The latest
-    /// accepted outcome is the current state being continued, repaired, or
-    /// pivoted from; investigation-creation evidence is only a fallback for
-    /// an investigation that has no accepted outcome yet.
+    /// Canonical current predecessor evidence for a newly proposed successor
+    /// lineage. A lineage edge describes the state being continued, repaired,
+    /// or pivoted from, so an investigation without an outcome has no anchor.
     pub(crate) fn lineage_anchor_for(&self, investigation_id: &str) -> Option<&str> {
         self.latest_outcome_for(investigation_id)
             .and_then(|outcome| outcome.source_event_ids.first())
-            .or_else(|| {
-                self.entities
-                    .get(investigation_id)
-                    .and_then(|entity| entity.source_event_ids.first())
-            })
             .map(String::as_str)
+    }
+
+    /// Resolve the most recent historical outcome evidence a durable relation
+    /// actually cites. This intentionally does not follow the investigation's
+    /// current outcome: later supersession must not rewrite old lineage.
+    pub(crate) fn latest_outcome_anchored_by(
+        &self,
+        investigation_id: &str,
+        source_event_ids: &[String],
+    ) -> Option<&ResearchOutcome> {
+        self.outcome_order.iter().rev().find_map(|id| {
+            self.outcomes.get(id).filter(|outcome| {
+                outcome.investigation_id == investigation_id
+                    && outcome
+                        .source_event_ids
+                        .first()
+                        .is_some_and(|anchor| source_event_ids.contains(anchor))
+            })
+        })
     }
 
     pub(crate) fn is_productive_investigation(&self, investigation_id: &str) -> bool {
@@ -766,6 +779,10 @@ impl SourceContext {
         }
         Ok(())
     }
+
+    fn is_new(&self, source_event_id: &str) -> bool {
+        self.new_ids.contains(source_event_id)
+    }
 }
 
 fn validate_batch(
@@ -849,7 +866,11 @@ fn validate_batch(
         outcome_order,
         assessment_order,
     };
-    validate_record_semantics(&candidate)
+    validate_record_semantics(&candidate)?;
+    for relation in &batch.relations {
+        validate_new_lineage_relation(relation, &candidate)?;
+    }
+    Ok(())
 }
 
 fn semantic_ids(accepted: &AcceptedRecord) -> BTreeSet<String> {

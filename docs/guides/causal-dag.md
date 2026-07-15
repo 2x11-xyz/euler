@@ -118,8 +118,10 @@ accepted value is `128`.
 ### `observer-brief`
 
 Build a one-turn companion-agent task from the compact active graph plus the
-next bounded event window. The companion returns raw
-`euler.causal_dag.hints.v2` JSON.
+next bounded event window. In the default v3 graph mode, the companion returns
+raw `euler.causal_dag.hints.v2` JSON. After `causal-dag.research-enable`, the
+same command pair switches to the durable research-record contract and the
+companion returns raw `euler.research_record.proposals.v1` JSON instead.
 
 ```sh
 euler extension run causal-dag.observer-brief ./session.jsonl --limit 64 --max-tokens 24576
