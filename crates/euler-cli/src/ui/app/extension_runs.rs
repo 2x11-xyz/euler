@@ -206,14 +206,43 @@ impl AppCore {
         mut session: Box<Session<TuiDecider>>,
     ) {
         let (worker_tx, worker_rx) = mpsc::channel();
-        let worker_request = request.clone();
+        let mut worker_request = request.clone();
         let label = request.label();
         std::thread::spawn(move || {
             let start = session.events().len();
-            // Successful linked-process resolution above proves the registry
-            // launch grant is current. Mirror it into this live session before
-            // the common execution bridge applies its session-local gate.
+            // A request can wait behind an in-flight turn. Re-resolve at actual
+            // execution time so disable, reload, or a manifest change revokes
+            // launch consent even after the command was queued.
             if matches!(worker_request.extension, LiveExtension::Managed(_)) {
+                match crate::extension_cli::resolve_live_linked_process_command(
+                    &worker_request.id,
+                    &worker_request.command,
+                ) {
+                    Ok(Some((extension, descriptor))) => {
+                        worker_request.extension = LiveExtension::Managed(Box::new(extension));
+                        worker_request.capabilities = descriptor.required_capabilities;
+                    }
+                    Ok(None) => {
+                        let _ = worker_tx.send(TurnEvent::ExtensionDone {
+                            request: worker_request,
+                            outcome: ExtensionOutcome::Failed(
+                                "linked extension is no longer available".to_owned(),
+                            ),
+                            events: Vec::new(),
+                            session,
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = worker_tx.send(TurnEvent::ExtensionDone {
+                            request: worker_request,
+                            outcome: ExtensionOutcome::Failed(error.to_string()),
+                            events: Vec::new(),
+                            session,
+                        });
+                        return;
+                    }
+                }
                 session.set_extension_enabled(worker_request.id.clone(), true);
             }
             // Gated: declared capabilities become grants only through the
@@ -261,13 +290,7 @@ pub(super) fn list_extension_manager_items(
     let enablement = registry.enablement_states().unwrap_or_default();
     let audit_by_id = audit_status_by_id(&registry);
     let mut items = bundled_manager_items(session_enabled, &enablement, &audit_by_id);
-    append_linked_manager_items(
-        &mut items,
-        &registry,
-        session_enabled,
-        &enablement,
-        &audit_by_id,
-    );
+    append_linked_manager_items(&mut items, &registry, session_enabled, &audit_by_id);
     items
 }
 
@@ -339,7 +362,6 @@ fn append_linked_manager_items(
     items: &mut Vec<crate::ui::commands::ExtensionManagerItem>,
     registry: &ExtensionRegistry,
     session_enabled: Option<&std::collections::BTreeSet<String>>,
-    enablement: &std::collections::BTreeMap<String, ExtensionEnablement>,
     audit_by_id: &std::collections::BTreeMap<String, String>,
 ) {
     let Ok(linked) = registry.linked_extensions() else {
@@ -349,10 +371,15 @@ fn append_linked_manager_items(
         if items.iter().any(|item| item.id == link.id) {
             continue;
         }
+        let linked_enabled =
+            crate::extension_cli::current_linked_execution_enabled(registry, &link)
+                .unwrap_or(false);
         items.push(crate::ui::commands::ExtensionManagerItem {
             id: link.id.clone(),
             display_name: link.descriptor.display_name.clone(),
-            enabled: extension_is_enabled(&link.id, session_enabled, enablement),
+            enabled: session_enabled
+                .map(|set| set.contains(&link.id) && linked_enabled)
+                .unwrap_or(linked_enabled),
             bundled: false,
             materialization: Some(link.materialization.as_str().to_owned()),
             version: link.descriptor.version.clone(),
@@ -372,6 +399,9 @@ fn append_linked_manager_items(
 }
 
 fn set_extension_enabled(id: &str, enable: bool) -> Result<()> {
+    if crate::extension_cli::set_live_linked_process_enabled(id, enable)? {
+        return Ok(());
+    }
     let registry = ExtensionRegistry::new(EulerHome::resolve()?)?;
     if enable {
         registry.enable(id)?;

@@ -605,7 +605,25 @@ pub(crate) fn resolve_live_linked_process_command(
     Ok(Some((extension, descriptor)))
 }
 
-fn current_linked_execution_enabled(
+/// Change linked-process launch consent through the same validation boundary
+/// as the CLI enable/disable actions. Returns `false` when `id` is not linked.
+pub(crate) fn set_live_linked_process_enabled(id: &str, enabled: bool) -> Result<bool> {
+    let registry = extension_registry()?;
+    let Some(linked) = linked_extension(&registry, id)? else {
+        return Ok(false);
+    };
+    if enabled {
+        validate_linked_process_for_activation(&linked)?;
+    } else if linked.materialization != ExtensionMaterialization::Linked
+        || linked.descriptor.runtime_kind != "managed-process"
+    {
+        return Err(non_runnable_extension_error(&linked, "disable"));
+    }
+    registry.set_linked_execution_enabled(id, enabled)?;
+    Ok(true)
+}
+
+pub(crate) fn current_linked_execution_enabled(
     registry: &ExtensionRegistry,
     linked: &LinkedExtension,
 ) -> Result<bool> {
