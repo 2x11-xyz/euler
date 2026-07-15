@@ -16,8 +16,15 @@ pub(crate) const DIFF_PREVIEW_ROWS: usize = 6;
 pub(crate) const NEW_FILE_PREVIEW_ROWS: usize = 5;
 
 /// Compact Codex-style diff row: `{number:>width} {sign} {source}`. One
-/// right-aligned line-number column (old number for deletions, new number
-/// for insertions and context), a colored sign, then the source text.
+/// right-aligned faint line-number column (old number for deletions, new
+/// number for insertions and context), a colored sign, then the source text
+/// with indentation preserved verbatim.
+///
+/// Spec §4.1: no row-fill background anywhere. Semantics ride on the sign
+/// column plus luminance, so the diff survives no-color terminals and any
+/// user theme (light/dark/custom) unchanged, with nothing to re-tune per
+/// theme.
+///
 /// Deliberate spec deviation for usability: deletion rows cite old-file lines.
 pub(crate) fn compact_diff_row(
     number: usize,
@@ -27,25 +34,16 @@ pub(crate) fn compact_diff_row(
     body_spans: Vec<Span<'static>>,
     theme: &Theme,
 ) -> UiLine<'static> {
-    let row_bg = diff_row_background(sign, theme);
     let mut spans = vec![
         Span::styled(
             format!("{number:>number_width$} "),
-            with_bg(theme.scopes.diff.context, row_bg),
+            theme.scopes.diff.line_number,
         ),
-        Span::styled(sign.to_owned(), with_bg(sign_style, row_bg)),
-        Span::styled(" ".to_owned(), with_bg(theme.scopes.diff.context, row_bg)),
+        Span::styled(sign.to_owned(), sign_style),
+        Span::styled(" ".to_owned(), theme.scopes.diff.line_number),
     ];
-    spans.extend(
-        body_spans
-            .into_iter()
-            .map(|span| Span::styled(span.content.into_owned(), with_bg(span.style, row_bg))),
-    );
-    let mut line = UiLine::from(spans);
-    if let Some(bg) = row_bg {
-        line = line.style(Style::default().bg(bg));
-    }
-    line
+    spans.extend(body_spans);
+    UiLine::from(spans)
 }
 
 pub(crate) fn compact_hunk_row(
@@ -70,21 +68,6 @@ pub(crate) fn compact_muted_row(
         Span::styled(" ".repeat(number_width + 1), theme.transcript.gutter),
         Span::styled(body, theme.transcript.muted),
     ])
-}
-
-fn diff_row_background(sign: &str, theme: &Theme) -> Option<ratatui::style::Color> {
-    match sign {
-        "+" => Some(theme.palette.added_tint),
-        "-" => Some(theme.palette.removed_tint),
-        _ => None,
-    }
-}
-
-fn with_bg(mut style: Style, bg: Option<ratatui::style::Color>) -> Style {
-    if let Some(bg) = bg {
-        style = style.bg(bg);
-    }
-    style
 }
 
 pub(crate) struct PatchDisplay<'a> {
@@ -651,7 +634,7 @@ mod tests {
 
         assert_eq!(line_text(row), "   1 + pub fn main() {");
         assert!(row.spans.len() > 4, "spans: {:?}", row.spans);
-        assert_eq!(row.spans[0].style.fg, theme.scopes.diff.context.fg);
+        assert_eq!(row.spans[0].style.fg, theme.scopes.diff.line_number.fg);
         assert_eq!(row.spans[1].style, theme.scopes.diff.inserted);
         assert!(row.spans[3..]
             .iter()
@@ -679,9 +662,9 @@ mod tests {
         let row = find_plain_row(&rows, "   1 + pub fn main").expect("insert row");
 
         assert_eq!(row.spans.len(), 4);
-        assert_eq!(row.spans[0].style.fg, theme.scopes.diff.context.fg);
+        assert_eq!(row.spans[0].style.fg, theme.scopes.diff.line_number.fg);
         assert_eq!(row.spans[1].style, theme.scopes.diff.inserted);
-        assert_eq!(row.spans[2].style.fg, theme.scopes.diff.context.fg);
+        assert_eq!(row.spans[2].style.fg, theme.scopes.diff.line_number.fg);
         assert_eq!(row.spans[3].style, theme.scopes.diff.inserted_body);
     }
 
@@ -707,9 +690,9 @@ mod tests {
         assert_eq!(line_text(inserted), "   1 + pub fn new_name() {}");
         assert_eq!(deleted.spans[1].content.as_ref(), "-");
         assert_eq!(inserted.spans[1].content.as_ref(), "+");
-        assert_eq!(deleted.spans[0].style.fg, theme.scopes.diff.context.fg);
+        assert_eq!(deleted.spans[0].style.fg, theme.scopes.diff.line_number.fg);
         assert_eq!(deleted.spans[1].style, theme.scopes.diff.deleted);
-        assert_eq!(inserted.spans[0].style.fg, theme.scopes.diff.context.fg);
+        assert_eq!(inserted.spans[0].style.fg, theme.scopes.diff.line_number.fg);
         assert_eq!(inserted.spans[1].style, theme.scopes.diff.inserted);
         assert!(
             inserted.spans.len() > 4,
@@ -743,7 +726,7 @@ mod tests {
         assert_eq!(line_text(deleted), "   1 - fn removed() {}");
         assert_eq!(deleted.spans.len(), 4, "spans: {:?}", deleted.spans);
         assert_eq!(deleted.spans[0].content.as_ref(), "   1 ");
-        assert_eq!(deleted.spans[0].style.fg, theme.scopes.diff.context.fg);
+        assert_eq!(deleted.spans[0].style.fg, theme.scopes.diff.line_number.fg);
         assert_eq!(deleted.spans[1].content.as_ref(), "-");
         assert_eq!(deleted.spans[1].style, theme.scopes.diff.deleted);
         assert_eq!(
