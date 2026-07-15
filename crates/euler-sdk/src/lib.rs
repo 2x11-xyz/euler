@@ -19,16 +19,20 @@ pub use event_wake::{
     MAX_EVENT_WAKE_RECEIVERS,
 };
 pub use extension_package::{
-    load_extension_package, manifest_sha256_hex, parse_extension_manifest_bytes,
-    valid_extension_identifier, ExtensionMaterialization, ExtensionPackageError, LinkedExtension,
-    LinkedExtensionStatus, LoadedExtensionPackage, StaticCommandDescriptor,
-    StaticExtensionDescriptor, EXTENSION_MANIFEST_FILE, MAX_EXTENSION_MANIFEST_BYTES,
+    load_extension_package, managed_process_entrypoint_from_manifest_bytes, manifest_sha256_hex,
+    parse_extension_manifest_bytes, valid_extension_identifier, ExtensionMaterialization,
+    ExtensionPackageError, LinkedExtension, LinkedExtensionStatus, LoadedExtensionPackage,
+    ManagedProcessEntrypoint, StaticCommandDescriptor, StaticExtensionDescriptor,
+    EXTENSION_MANIFEST_FILE, MAX_EXTENSION_MANIFEST_BYTES,
 };
 
 pub const MAX_CONTEXT_SLOT_CONTENT_BYTES: usize = 4096;
 pub const MAX_CONTEXT_SLOTS_PER_SESSION: usize = 8;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum Capability {
     FsRead,
     FsWrite,
@@ -198,7 +202,7 @@ pub enum ArgValueKind {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ProvenanceQuery {
     pub after_event_id: Option<String>,
     pub kinds: Vec<String>,
@@ -221,7 +225,7 @@ impl ProvenanceQuery {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ProvenancePage {
     pub events: Vec<EventEnvelope>,
     pub applied_limit: usize,
@@ -232,13 +236,13 @@ pub struct ProvenancePage {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct DiagnosticsQuery {
     pub tail_lines: usize,
     pub max_bytes: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct DiagnosticsPage {
     pub lines: Vec<String>,
     pub truncated: bool,
@@ -246,7 +250,7 @@ pub struct DiagnosticsPage {
 
 /// Task description for `HostApi::spawn_agent` (mirrors the fields the
 /// session companion path validates; free-form fields are bounded by core).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SpawnAgentTask {
     pub task: String,
     pub persona: String,
@@ -269,7 +273,7 @@ pub struct SpawnAgentTask {
 
 /// Outcome of a completed `spawn_agent` call: what provenance recorded,
 /// with the event ids so extensions can cite it without re-querying.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct AgentOutcome {
     pub ok: bool,
     pub summary: String,
@@ -294,7 +298,7 @@ pub struct ArtifactWrite {
     pub metadata: JsonObject,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ArtifactRecord {
     pub persisted_event_id: String,
     pub relative_path: String,
@@ -302,14 +306,14 @@ pub struct ArtifactRecord {
     pub byte_len: usize,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct HostAgentBudget {
     pub max_turns: Option<u32>,
     pub max_tool_calls: Option<u32>,
     pub max_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct HostAgentTask {
     pub task: String,
     pub persona: String,
@@ -320,7 +324,7 @@ pub struct HostAgentTask {
     pub result_schema: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct HostAgentResult {
     pub ok: bool,
     pub summary: String,
@@ -352,7 +356,7 @@ impl HostAgentResult {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct HostAgentRecord {
     pub child_agent_id: String,
     pub spawn_event_id: String,

@@ -12,15 +12,17 @@ There are no trusted bypass flags for normal workflows. If a first-party extensi
 
 ## Trust Model Honesty
 
-Native Rust extensions run in-process. They are trusted, audited code: the
-capability model constrains what the *host APIs* will do for them and records
-every decision in provenance, but it is not a sandbox — in-process native code
-that ignores the host APIs is limited only by the operating system. What
-capabilities buy for native extensions is least-privilege discipline, a
-reviewable declared-authority surface, and an audit trail; containment of
-actually-untrusted code requires the out-of-process transport (roadmap) with
-OS-level isolation. Do not describe native extension capabilities as a
-security boundary against malicious extensions.
+Native Rust extensions run in-process. Managed-process extensions run as a
+child process and the host owns their protocol, lifecycle, capability-gated
+host APIs, provenance events, and canvas admission. Both are trusted-code
+surfaces: the capability model constrains what the *host APIs* will do and
+records every decision in provenance, but neither runtime is an OS sandbox. A
+native extension or child process that ignores host APIs is limited only by the
+operating system. What capabilities buy is least-privilege discipline, a
+reviewable declared-authority surface, and an audit trail. Containment of
+actually-untrusted code requires a separate OS-level isolation milestone; a
+subprocess alone is not that boundary. Do not describe extension capabilities
+as a security boundary against malicious extension code.
 
 ## V0 Capability Scopes
 

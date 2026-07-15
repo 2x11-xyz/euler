@@ -18,6 +18,8 @@ const MAX_VERSION_BYTES: usize = 64;
 const MAX_SUMMARY_BYTES: usize = 512;
 const MAX_COMMANDS: usize = 64;
 const MAX_CAPABILITIES: usize = 16;
+const MAX_MANAGED_PROCESS_ENTRYPOINT_ARGS: usize = 32;
+const MAX_MANAGED_PROCESS_ENTRYPOINT_ARG_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadedExtensionPackage {
@@ -35,6 +37,16 @@ pub struct StaticExtensionDescriptor {
     pub runtime_kind: String,
     pub capabilities: Vec<String>,
     pub commands: Vec<StaticCommandDescriptor>,
+}
+
+/// A shell-free argv entrypoint for a managed process extension.
+///
+/// The host executes this directly with the package directory as the child
+/// current working directory. There is deliberately no shell string or
+/// environment interpolation in the manifest surface.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedProcessEntrypoint {
+    pub command: Vec<String>,
 }
 
 impl StaticExtensionDescriptor {
@@ -269,6 +281,7 @@ pub fn parse_extension_manifest_bytes(
             "display_name",
             "extension_version",
             "runtime_kind",
+            "entrypoint",
             "capabilities",
             "commands",
         ],
@@ -295,15 +308,7 @@ pub fn parse_extension_manifest_bytes(
         "manifest extension_version",
         MAX_VERSION_BYTES,
     )?;
-    let runtime_kind = required_bounded_string(
-        root,
-        "runtime_kind",
-        "manifest runtime_kind",
-        MAX_VERSION_BYTES,
-    )?;
-    if runtime_kind != "native-rust" {
-        return Err(invalid("manifest runtime_kind must be native-rust"));
-    }
+    let runtime_kind = parse_manifest_runtime(root)?;
 
     let capabilities = required_string_list(root, "capabilities", "manifest capabilities")?;
     validate_capabilities(&capabilities, "manifest capabilities")?;
@@ -328,6 +333,102 @@ pub fn parse_extension_manifest_bytes(
         capabilities,
         commands,
     })
+}
+
+/// Read the reviewed shell-free entrypoint for an already-valid managed-process
+/// manifest. Static package descriptors intentionally remain runtime-agnostic:
+/// adding a required field to that public SDK struct would make every
+/// downstream descriptor literal source-incompatible.
+pub fn managed_process_entrypoint_from_manifest_bytes(
+    bytes: &[u8],
+) -> Result<ManagedProcessEntrypoint, ExtensionPackageError> {
+    let descriptor = parse_extension_manifest_bytes(bytes)?;
+    if descriptor.runtime_kind != "managed-process" {
+        return Err(invalid(
+            "manifest entrypoint is only valid for runtime_kind managed-process",
+        ));
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        ExtensionPackageError::InvalidManifest(format!("manifest is not valid JSON: {error}"))
+    })?;
+    let root = value.as_object().ok_or_else(|| {
+        ExtensionPackageError::InvalidManifest("manifest root must be an object".to_owned())
+    })?;
+    parse_managed_process_entrypoint(root)?
+        .ok_or_else(|| invalid("manifest runtime_kind managed-process requires entrypoint"))
+}
+
+fn parse_manifest_runtime(root: &Map<String, Value>) -> Result<String, ExtensionPackageError> {
+    let runtime_kind = required_bounded_string(
+        root,
+        "runtime_kind",
+        "manifest runtime_kind",
+        MAX_VERSION_BYTES,
+    )?;
+    let entrypoint = parse_managed_process_entrypoint(root)?;
+    match (runtime_kind.as_str(), entrypoint.is_some()) {
+        ("native-rust", false) | ("managed-process", true) => Ok(runtime_kind),
+        ("native-rust", true) => Err(invalid(
+            "manifest entrypoint is only valid for runtime_kind managed-process",
+        )),
+        ("managed-process", false) => Err(invalid(
+            "manifest runtime_kind managed-process requires entrypoint",
+        )),
+        _ => Err(invalid(
+            "manifest runtime_kind must be native-rust or managed-process",
+        )),
+    }
+}
+
+fn parse_managed_process_entrypoint(
+    root: &Map<String, Value>,
+) -> Result<Option<ManagedProcessEntrypoint>, ExtensionPackageError> {
+    let Some(value) = root.get("entrypoint") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("manifest entrypoint must be an object"))?;
+    validate_fields(object, &["command"], "manifest entrypoint")?;
+    let command = object
+        .get("command")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("manifest entrypoint command must be an array"))?;
+    if command.is_empty() {
+        return Err(invalid("manifest entrypoint command must not be empty"));
+    }
+    if command.len() > MAX_MANAGED_PROCESS_ENTRYPOINT_ARGS {
+        return Err(invalid(format!(
+            "manifest entrypoint command has {} entries; maximum is {MAX_MANAGED_PROCESS_ENTRYPOINT_ARGS}",
+            command.len()
+        )));
+    }
+    let mut argv = Vec::with_capacity(command.len());
+    for (index, value) in command.iter().enumerate() {
+        let argument = value.as_str().ok_or_else(|| {
+            invalid(format!(
+                "manifest entrypoint command entry #{index} must be a string"
+            ))
+        })?;
+        if argument.is_empty() {
+            return Err(invalid(format!(
+                "manifest entrypoint command entry #{index} must not be empty"
+            )));
+        }
+        if argument.len() > MAX_MANAGED_PROCESS_ENTRYPOINT_ARG_BYTES {
+            return Err(invalid(format!(
+                "manifest entrypoint command entry #{index} is too long: {} bytes exceeds {MAX_MANAGED_PROCESS_ENTRYPOINT_ARG_BYTES}",
+                argument.len()
+            )));
+        }
+        if argument.chars().any(char::is_control) {
+            return Err(invalid(format!(
+                "manifest entrypoint command entry #{index} must not contain control characters"
+            )));
+        }
+        argv.push(argument.to_owned());
+    }
+    Ok(Some(ManagedProcessEntrypoint { command: argv }))
 }
 
 pub fn apply_link_package(

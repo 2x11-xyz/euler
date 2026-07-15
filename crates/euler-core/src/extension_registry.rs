@@ -134,7 +134,9 @@ impl ExtensionAuditErrorCode {
             | ExtensionRegistryError::InvalidExtensionId { .. } => Self::RegistryInventoryInvalid,
             ExtensionRegistryError::UnknownLinkedExtension { .. }
             | ExtensionRegistryError::UnknownInstalledExtension { .. }
-            | ExtensionRegistryError::WrongExtensionMode { .. } => Self::RegistryRecordInvalid,
+            | ExtensionRegistryError::WrongExtensionMode { .. }
+            | ExtensionRegistryError::NotManagedProcess { .. }
+            | ExtensionRegistryError::BrokenLinkedExtension { .. } => Self::RegistryRecordInvalid,
             ExtensionRegistryError::UnsupportedVersion { .. }
             | ExtensionRegistryError::InvalidStateLine(_)
             | ExtensionRegistryError::Serialize(_) => Self::RegistryStateInvalid,
@@ -174,6 +176,13 @@ impl ExtensionRegistry {
     ) -> Result<ExtensionEnablement, ExtensionRegistryError> {
         validate_extension_id(id)?;
         let _lock = self.acquire_lock()?;
+        self.set_enabled_locked(id, enabled)
+    }
+    fn set_enabled_locked(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<ExtensionEnablement, ExtensionRegistryError> {
         let _states = self.fold_states()?;
         let state = if enabled {
             ExtensionEnablement::Enabled
@@ -199,6 +208,35 @@ impl ExtensionRegistry {
     pub fn linked_extensions(&self) -> Result<Vec<LinkedExtension>, ExtensionRegistryError> {
         Ok(self.read_link_inventory()?.into_values().collect())
     }
+    /// Record an explicit local decision to launch (or stop launching) a
+    /// linked package. This is package activation, not a capability grant:
+    /// command capabilities remain mediated by the extension host at run time.
+    pub fn set_linked_execution_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<ExtensionEnablement, ExtensionRegistryError> {
+        validate_extension_id(id)?;
+        let _lock = self.acquire_link_lock()?;
+        let links = self.read_link_inventory()?;
+        let existing = extension_record(
+            &links,
+            id,
+            ExtensionMaterialization::Linked,
+            MissingExtensionRecord::Linked,
+        )?;
+        if existing.descriptor.runtime_kind != "managed-process" {
+            return Err(ExtensionRegistryError::NotManagedProcess {
+                id: id.to_owned(),
+                runtime_kind: existing.descriptor.runtime_kind,
+            });
+        }
+        if existing.status == LinkedExtensionStatus::Broken {
+            return Err(ExtensionRegistryError::BrokenLinkedExtension { id: id.to_owned() });
+        }
+        let _state_lock = self.acquire_lock()?;
+        self.set_enabled_locked(id, enabled)
+    }
     pub fn audit(&self) -> Result<ExtensionAuditReport, ExtensionRegistryError> {
         let entries = self
             .read_link_inventory()?
@@ -218,6 +256,8 @@ impl ExtensionRegistry {
         let _lock = self.acquire_link_lock()?;
         let mut links = self.read_link_inventory()?;
         let linked = apply_link_package(&mut links, package)?;
+        let _state_lock = self.acquire_lock()?;
+        self.set_enabled_locked(&linked.id, false)?;
         self.write_link_inventory_locked(&links)?;
         Ok(linked)
     }
@@ -267,6 +307,8 @@ impl ExtensionRegistry {
             Err(error) => existing.with_broken(error.to_string()),
         };
         links.insert(id.to_owned(), linked.clone());
+        let _state_lock = self.acquire_lock()?;
+        self.set_enabled_locked(id, false)?;
         self.write_link_inventory_locked(&links)?;
         Ok(linked)
     }
@@ -280,6 +322,8 @@ impl ExtensionRegistry {
             ExtensionMaterialization::Linked,
             MissingExtensionRecord::Linked,
         )?;
+        let _state_lock = self.acquire_lock()?;
+        self.set_enabled_locked(id, false)?;
         links.remove(id);
         self.write_link_inventory_locked(&links)?;
         Ok(())
@@ -812,6 +856,10 @@ pub enum ExtensionRegistryError {
         existing_mode: &'static str,
         required_mode: &'static str,
     },
+    #[error("linked extension id `{id}` has non-runnable runtime kind `{runtime_kind}`")]
+    NotManagedProcess { id: String, runtime_kind: String },
+    #[error("linked extension id `{id}` is broken; reload it before changing activation")]
+    BrokenLinkedExtension { id: String },
     #[error("failed to serialize registry state: {0}")]
     Serialize(serde_json::Error),
     #[error("registry io failed: {0}")]

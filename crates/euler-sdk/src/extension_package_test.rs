@@ -82,6 +82,56 @@ fn parses_agent_record_capability_in_manifest_and_command() {
 }
 
 #[test]
+fn parses_managed_process_entrypoint_and_rejects_ambiguous_runtime_shapes() {
+    let manifest = valid_manifest("process-extension").replace(
+        r#""runtime_kind": "native-rust","#,
+        r#""runtime_kind": "managed-process",
+      "entrypoint": {"command": ["python3", "-u", "extension.py"]},"#,
+    );
+    let parsed = parse_extension_manifest_bytes(manifest.as_bytes()).expect("managed manifest");
+    assert_eq!(parsed.runtime_kind, "managed-process");
+    assert_eq!(
+        managed_process_entrypoint_from_manifest_bytes(manifest.as_bytes()).expect("entrypoint"),
+        ManagedProcessEntrypoint {
+            command: vec![
+                "python3".to_owned(),
+                "-u".to_owned(),
+                "extension.py".to_owned()
+            ]
+        }
+    );
+
+    let missing_entrypoint = valid_manifest("process-extension").replace(
+        r#""runtime_kind": "native-rust""#,
+        r#""runtime_kind": "managed-process""#,
+    );
+    assert!(
+        parse_extension_manifest_bytes(missing_entrypoint.as_bytes())
+            .expect_err("entrypoint is required")
+            .to_string()
+            .contains("requires entrypoint")
+    );
+
+    let native_with_entrypoint = valid_manifest("native-extension").replace(
+        r#""capabilities": ["provenance-read"],"#,
+        r#""entrypoint": {"command": ["python3", "extension.py"]},
+      "capabilities": ["provenance-read"],"#,
+    );
+    assert!(
+        parse_extension_manifest_bytes(native_with_entrypoint.as_bytes())
+            .expect_err("native entrypoint")
+            .to_string()
+            .contains("only valid for runtime_kind managed-process")
+    );
+
+    let control_character = manifest.replace("extension.py", "bad\\nscript.py");
+    assert!(parse_extension_manifest_bytes(control_character.as_bytes())
+        .expect_err("control character")
+        .to_string()
+        .contains("must not contain control characters"));
+}
+
+#[test]
 fn rejects_unknown_and_secret_like_fields_without_values() {
     let secret_manifest = r#"{
       "version": 1,
@@ -236,10 +286,10 @@ fn link_inventory_round_trips_status_and_rejects_bad_schema() {
     assert_eq!(linked.broken_reason.as_deref(), Some("manifest missing"));
     assert_eq!(linked.updated_ts_ms, 7);
 
-    let bad_version = text.replacen(r#""v": 1"#, r#""v": 2"#, 1);
+    let bad_version = text.replacen(r#""v": 1"#, r#""v": 99"#, 1);
     assert!(matches!(
         decode_link_inventory(&bad_version),
-        Err(LinkInventoryError::UnsupportedVersion { version: 2 })
+        Err(LinkInventoryError::UnsupportedVersion { version: 99 })
     ));
 
     let unknown = text.replacen(r#""links":"#, r#""unknown": 1, "links":"#, 1);
@@ -247,6 +297,30 @@ fn link_inventory_round_trips_status_and_rejects_bad_schema() {
         decode_link_inventory(&unknown),
         Err(LinkInventoryError::Json(_))
     ));
+}
+
+#[test]
+fn link_inventory_keeps_the_existing_v1_wire_format() {
+    let mut links = BTreeMap::new();
+    links.insert(
+        "example-extension".to_owned(),
+        linked_extension(
+            "example-extension",
+            LinkedExtensionStatus::NeedsReview,
+            None,
+        ),
+    );
+    let encoded = String::from_utf8(encode_link_inventory(&links).expect("encode inventory"))
+        .expect("inventory utf8");
+    assert!(encoded.contains(r#""v": 1"#));
+    let decoded = decode_link_inventory(&encoded).expect("decode v1 inventory");
+    assert_eq!(
+        decoded
+            .get("example-extension")
+            .expect("legacy package")
+            .status,
+        LinkedExtensionStatus::NeedsReview
+    );
 }
 
 #[test]

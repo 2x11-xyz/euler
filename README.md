@@ -111,9 +111,10 @@ extensions.
 ## Extensions
 
 Euler is designed as a platform, not a fixed agent. Bundled native extensions run
-today and can be enabled, disabled, or selected per session. Local extension
-packages can already be validated, linked, installed, searched, and audited; full
-runtime execution for external packages is on the roadmap.
+today and can be enabled, disabled, or selected per session. Local packages can
+be validated, linked, installed, searched, and audited. Explicitly enabled,
+linked `managed-process` packages can also run through the language-neutral
+JSON-RPC stdio runtime; Python is the first SDK, not a special runtime kind.
 
 ```sh
 euler extension list
@@ -123,10 +124,11 @@ euler extension run causal-dag.export ./session.jsonl   # your session as a DAG
 euler extension run session-export.session-export ./session.jsonl
 ```
 
-Build your own with a native Rust crate implementing the `euler-sdk` traits,
-registered alongside the bundled set. See
-[docs/guides/extensions.md](docs/guides/extensions.md). The design contracts
-extensions rely on live in [docs/contracts/](docs/contracts/).
+Build your own with a native Rust crate implementing the `euler-sdk` traits, or
+with a managed-process package such as
+[`examples/python-managed-process-extension`](examples/python-managed-process-extension).
+See [docs/guides/extensions.md](docs/guides/extensions.md). The design
+contracts extensions rely on live in [docs/contracts/](docs/contracts/).
 
 ## Documentation
 
@@ -134,7 +136,7 @@ extensions rely on live in [docs/contracts/](docs/contracts/).
 - [Headless & long-horizon runs](docs/guides/headless.md): fleets, briefs,
   provenance monitoring, auto-compaction policies
 - [Building extensions](docs/guides/extensions.md): SDK traits, commands,
-  context slots, out-of-process status
+  context slots, and Python/managed-process packages
 - [The causal DAG](docs/guides/causal-dag.md): observations, hints schema,
   export, rendering
 - [Design contracts](docs/contracts/): canvas, provenance, tools,

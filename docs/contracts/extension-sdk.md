@@ -4,10 +4,12 @@ Extensions register tools, commands, context slots, and workflows through a stab
 
 Implementation status: commands, the bounded event feed, bounded diagnostics
 reads, artifact writes, agent task records, checkpoints, context slot updates,
-and the local wake primitive exist today. Extension-registered tools are roadmap
-(Phase 2 of the SDK consolidation); nothing in core registers them yet, and this
-contract's mention of them binds their eventual shape, not their present
-existence.
+the local wake primitive, and a generic managed-process adapter exist today.
+The first runnable package surface is explicitly enabled local packages through
+`euler extension run`; native extensions remain the currently wired live-session
+path. Extension-registered tools are roadmap (Phase 2 of the SDK consolidation);
+nothing in core registers them yet, and this contract's mention of them binds
+their eventual shape, not their present existence.
 
 Core must provide enough SDK surface that extensions do not need to shadow runtime state, parse raw logs directly, or bypass permissions.
 Powerful extensions should be easy because the SDK exposes the right generic
@@ -209,7 +211,7 @@ Capability rules:
 - store may perform internal directory reads needed for safe overwrite, quota,
   and file-type validation, but it does not return prior checkpoint contents.
 
-Native command capability rules:
+Command capability rules:
 
 - `ExtensionManifest.capabilities` is the extension's maximum capability
   envelope.
@@ -225,6 +227,93 @@ Native command capability rules:
 - V0 command-scoped registration still calls the extension's normal
   `register()` method to discover commands, and validates the command names it
   reports. Extension registration must remain side-effect-free.
+
+## Managed Process Runtime v0
+
+`runtime_kind: "managed-process"` is a language-neutral package runtime. Its
+manifest includes `entrypoint.command`: a nonempty, bounded argv array. Euler
+starts that argv directly, with the package directory as the working directory;
+it does not invoke a shell or interpolate environment values. The package's
+static id, version, capability envelope, command names, and per-command
+capabilities remain canonical: a child process cannot redefine them at runtime.
+
+The transport is newline-delimited JSON-RPC 2.0 messages on stdin/stdout. A
+peer can be implemented by any language; Python is an SDK client, not a wire
+variant. Version `euler-managed-process/1` has this lifecycle:
+
+1. Euler sends an `initialize` request with the offered protocol versions,
+   static extension identity, and host output limit. The peer responds with the
+   selected `protocol_version`.
+2. Euler sends `initialized`, then one `euler/command` request containing the
+   declared command name and its JSON input value.
+3. While that command is active, the peer may send bounded
+   `euler/progress` notifications and JSON-RPC requests for the host methods
+   below. The command's terminal response must be a JSON object.
+4. On successful completion Euler sends `shutdown`, waits for its response,
+   then sends `exit` and reaps the child. On timeout or protocol failure Euler
+   sends `$/cancelRequest` for the command, allows a short grace period, then
+   terminates and reaps the child and its normal descendants.
+
+The current host request methods map one-for-one to `HostApi`:
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `euler/host/query-provenance` | `ProvenanceQuery` JSON | `ProvenancePage` JSON |
+| `euler/host/read-diagnostics` | `DiagnosticsQuery` JSON | `DiagnosticsPage` JSON |
+| `euler/host/state-dir` | `{}` | `{ "path": string }` |
+| `euler/host/write-artifact` | `{ display_name, media_type, bytes_base64, source_event_ids?, metadata? }` | `ArtifactRecord` JSON |
+| `euler/host/load-checkpoint` | `{ name }` | `EventFeedCheckpoint` JSON or `null` |
+| `euler/host/store-checkpoint` | `{ name, checkpoint }` | `{}` |
+| `euler/host/record-agent-task-result` | `{ task: HostAgentTask, result: HostAgentResult }` | `HostAgentRecord` JSON |
+| `euler/host/update-context-slot` | `{ slot, content }` | `{}` |
+| `euler/host/spawn-agent` | `SpawnAgentTask` JSON | `AgentOutcome` JSON |
+| `euler/host/spawn-agents` | `{ tasks: SpawnAgentTask[] }` | `AgentOutcome[]` JSON |
+
+The DTO field names are the `serde` names in `euler-sdk`; the Python SDK and
+the raw JSON-RPC conformance test are normative executable examples. Progress
+uses the notification `euler/progress` with
+`{ message: string, fraction?: number }`; the message is 1–4096 UTF-8 bytes
+and the optional fraction is finite and in `[0, 1]`. All host requests and
+progress notifications are valid only after `euler/command` and before its
+terminal response.
+
+Every one of these calls reaches the existing host implementation, so bounds,
+capability checks and prompts, quotas, redaction, provenance attribution, and
+live-agent policy remain host-owned. A host rejection is returned as a safe
+JSON-RPC error; raw host failure details are not serialized to the process.
+
+The runtime bounds every protocol message, aggregate protocol messages and
+bytes, pending inbound/outbound queues, host request count, progress budget,
+invocation, shutdown, and stderr byte budget. Stderr is discarded without
+entering provenance or canvas; crossing its host byte limit aborts the
+invocation. Non-protocol stdout, malformed protocol messages, and process error
+bodies similarly become safe generic extension failures. Structured progress is
+validated and bounded, but is not implicitly admitted to the model canvas or
+transcript. Default ceilings are 1 MiB per JSON payload, 4 MiB/512 messages of
+total peer output, 64 host requests, 128 progress messages, and 64 KiB stderr.
+
+Process transport writes are isolated from the session loop, so a peer that
+stops reading stdin cannot block the command deadline. `HostApi` calls remain
+the existing synchronous core contract shared with native extensions: their own
+host quotas and operation deadlines govern their duration, and they cannot be
+forcibly preempted by the managed-process transport. A cancellable host-call
+SDK boundary is a separate core design change, not a hidden process-runtime
+exception.
+
+`link` alone never launches a package. A linked managed-process package begins
+in `needs-review`; `validate`, `link`, and `info` expose its exact argv, and
+`enable` echoes that argv while recording explicit local launch consent.
+`disable` and `reload` return it to `needs-review`. Installed packages remain
+inert in this slice. This consent is separate from capabilities: each
+invocation is still checked against its command's declared capability subset.
+
+This runtime is a process-management boundary, not OS-level containment. It is
+for trusted local packages. On Unix (including macOS), Euler launches the peer
+in its own process group and terminates ordinary descendants on cleanup so they
+cannot retain protocol pipes. Other platforms still bound Euler's own cleanup
+and detach a stuck I/O helper rather than blocking the caller; full descendant
+control is separate work. Sandboxing untrusted third-party code, including
+filesystem/network isolation, remains a separate security milestone.
 
 ## Command Invocation v0
 
@@ -299,10 +388,9 @@ product-neutral wake capability.
 Primary extension paths:
 
 1. Native Rust crates implementing `euler-sdk` traits (implemented today).
-2. Out-of-process extensions over a generic stdio subprocess protocol
-   (product-neutral; core names no protocol). Roadmap: no stdio transport
-   exists yet. Protocol-specific adapters such as MCP are first-party
-   extensions built on this transport, not core. See
-   the extension-composition principle above.
+2. Out-of-process extensions over the generic managed-process JSON-RPC stdio
+   protocol (implemented for explicit linked-package runs). Protocol-specific
+   adapters such as MCP are first-party extensions built on this transport, not
+   core. See the extension-composition principle above.
 
 Rhai is not the primary extension mechanism.

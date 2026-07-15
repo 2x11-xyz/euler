@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "python-proof",
+  "display_name": "Python proof extension",
+  "extension_version": "0.1.1",
+  "runtime_kind": "managed-process",
+  "entrypoint": {
+    "command": ["python3", "-B", "-u", "extension.py"]
+  },
+  "capabilities": ["provenance-read", "artifact-write"],
+  "commands": [
+    {
+      "name": "inspect",
+      "display_name": "Inspect session",
+      "summary": "Read a bounded provenance page and write an artifact.",
+      "required_capabilities": ["provenance-read", "artifact-write"]
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 use super::ExtensionSearchArgs;
 use crate::bundled_extensions::BundledDescriptor;
 use euler_core::{ExtensionMaterialization, LinkedExtension};
-use euler_sdk::{LoadedExtensionPackage, StaticCommandDescriptor};
+use euler_sdk::{LoadedExtensionPackage, ManagedProcessEntrypoint, StaticCommandDescriptor};
 use serde::Serialize;
 use std::path::Path;
 
@@ -13,6 +13,8 @@ pub(super) struct PackageValidationInfo<'a> {
     source_path: String,
     manifest_sha256: &'a str,
     runtime_kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entrypoint: Option<&'a ManagedProcessEntrypoint>,
     command_count: usize,
     status: &'a str,
 }
@@ -24,6 +26,8 @@ pub(super) struct LinkedLinkInfo<'a> {
     manifest_sha256: &'a str,
     updated_ts_ms: u64,
     runtime_kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entrypoint: Option<&'a ManagedProcessEntrypoint>,
     status: &'static str,
     broken_reason: Option<&'a str>,
 }
@@ -35,6 +39,8 @@ pub(super) struct LinkedInfo<'a> {
     version: &'a str,
     source_kind: &'static str,
     runtime_kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entrypoint: Option<&'a ManagedProcessEntrypoint>,
     capabilities: &'a [String],
     commands: &'a [StaticCommandDescriptor],
     source_path: Option<String>,
@@ -77,6 +83,7 @@ pub(super) struct InstalledInfo<'a> {
 
 pub(super) fn package_validation_info<'a>(
     package: &'a LoadedExtensionPackage,
+    entrypoint: Option<&'a ManagedProcessEntrypoint>,
     status: &'a str,
 ) -> PackageValidationInfo<'a> {
     PackageValidationInfo {
@@ -86,19 +93,25 @@ pub(super) fn package_validation_info<'a>(
         source_path: display_path(&package.canonical_dir),
         manifest_sha256: &package.manifest_sha256,
         runtime_kind: &package.descriptor.runtime_kind,
+        entrypoint,
         command_count: package.descriptor.commands.len(),
         status,
     }
 }
 
-pub(super) fn linked_link_info(linked: &LinkedExtension) -> LinkedLinkInfo<'_> {
+pub(super) fn linked_link_info<'a>(
+    linked: &'a LinkedExtension,
+    entrypoint: Option<&'a ManagedProcessEntrypoint>,
+    execution_enabled: bool,
+) -> LinkedLinkInfo<'a> {
     LinkedLinkInfo {
         id: &linked.id,
         source_path: display_path(&linked.source_path),
         manifest_sha256: &linked.manifest_sha256,
         updated_ts_ms: linked.updated_ts_ms,
         runtime_kind: &linked.descriptor.runtime_kind,
-        status: linked.status.as_str(),
+        entrypoint,
+        status: linked_status(linked, execution_enabled),
         broken_reason: linked.broken_reason.as_deref(),
     }
 }
@@ -119,22 +132,29 @@ pub(super) fn installed_info_summary(linked: &LinkedExtension) -> InstalledInfo<
     }
 }
 
-pub(super) fn linked_info(linked: &LinkedExtension) -> LinkedInfo<'_> {
+pub(super) fn linked_info<'a>(
+    linked: &'a LinkedExtension,
+    entrypoint: Option<&'a ManagedProcessEntrypoint>,
+    execution_enabled: bool,
+) -> LinkedInfo<'a> {
     let is_linked = linked.materialization == ExtensionMaterialization::Linked;
+    let status = linked_status(linked, execution_enabled);
+    let execution_granted = status == "enabled";
     LinkedInfo {
         id: &linked.id,
         display_name: &linked.descriptor.display_name,
         version: &linked.descriptor.version,
         source_kind: linked.materialization.as_str(),
         runtime_kind: &linked.descriptor.runtime_kind,
+        entrypoint,
         capabilities: &linked.descriptor.capabilities,
         commands: &linked.descriptor.commands,
         source_path: is_linked.then(|| display_path(&linked.source_path)),
         manifest_sha256: &linked.manifest_sha256,
         updated_ts_ms: linked.updated_ts_ms,
-        status: linked.status.as_str(),
-        execution_granted: false,
-        requires_review: is_linked,
+        status,
+        execution_granted,
+        requires_review: is_linked && status == "needs-review",
         requires_execution_grant: !is_linked,
         broken_reason: linked.broken_reason.as_deref(),
     }
@@ -232,8 +252,13 @@ pub(super) fn search_result_for_bundled(
     }
 }
 
-pub(super) fn search_result_for_linked(linked: &LinkedExtension) -> SearchResult {
+pub(super) fn search_result_for_linked(
+    linked: &LinkedExtension,
+    execution_enabled: bool,
+) -> SearchResult {
     let is_linked = linked.materialization == ExtensionMaterialization::Linked;
+    let status = linked_status(linked, execution_enabled);
+    let execution_granted = status == "enabled";
     SearchResult {
         order: usize::MAX,
         id: linked.id.clone(),
@@ -241,9 +266,9 @@ pub(super) fn search_result_for_linked(linked: &LinkedExtension) -> SearchResult
         version: linked.descriptor.version.clone(),
         source_kind: linked.materialization.as_str().to_owned(),
         runtime_kind: linked.descriptor.runtime_kind.clone(),
-        status: linked.status.as_str().to_owned(),
-        execution_granted: false,
-        requires_review: is_linked,
+        status: status.to_owned(),
+        execution_granted,
+        requires_review: is_linked && status == "needs-review",
         requires_execution_grant: !is_linked,
         capabilities: linked.descriptor.capabilities.clone(),
         commands: linked
@@ -257,6 +282,20 @@ pub(super) fn search_result_for_linked(linked: &LinkedExtension) -> SearchResult
                 required_capabilities: command.required_capabilities.clone(),
             })
             .collect(),
+    }
+}
+
+pub(super) fn linked_status(linked: &LinkedExtension, execution_enabled: bool) -> &'static str {
+    if linked.status.as_str() == "broken" || linked.status.as_str() == "installed-inert" {
+        return linked.status.as_str();
+    }
+    if linked.materialization == ExtensionMaterialization::Linked
+        && linked.descriptor.runtime_kind == "managed-process"
+        && execution_enabled
+    {
+        "enabled"
+    } else {
+        linked.status.as_str()
     }
 }
 
