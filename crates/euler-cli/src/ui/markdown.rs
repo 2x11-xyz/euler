@@ -308,32 +308,41 @@ impl<'a> Renderer<'a> {
 
     fn push_code_lines(&mut self, text: &str) {
         // §4.1a: one continuous left hairline (the same rail as thinking and
-        // diff bodies), code behind it, no background fill. Each logical code
-        // line is one rendered row — code is preformatted, so it clips rather
-        // than wraps (wrapping would break the rail's alignment and the code's
-        // own indentation). Rendered directly rather than through the prose
-        // wrap path, which paints prefixes unstyled and so can't colour a rail.
+        // diff bodies), code behind it, no background fill. A long code line
+        // wraps to the content width with the rail repeated on every physical
+        // row — clipping would lose code, and letting the terminal wrap it
+        // would produce continuation rows with no rail. Rendered directly
+        // rather than through the prose wrap path, which paints prefixes
+        // unstyled and so can't colour a rail.
         self.flush_current();
         let quote = quote_prefix(self.quote_depth);
+        let rail_style = Style::default().fg(self.theme.palette.composer_rule);
+        let indent = display_width(&quote) + display_width(CODE_RAIL);
+        let available = usize::from(self.width).saturating_sub(indent).max(1);
         for raw in text.split_inclusive('\n') {
             let line = raw.strip_suffix('\n').unwrap_or(raw);
-            let mut spans = Vec::new();
-            if !quote.is_empty() {
-                spans.push(Span::styled(quote.clone(), self.theme.transcript.gutter));
+            let content =
+                super::syntax::highlight_markdown_code_line(&self.code_language, line, self.theme);
+            // Wrap the code (no prefixes) to the width behind the rail, then
+            // seat the rail — and the quote prefix, if any — on each row.
+            let wrapped = wrap_spans("", "", &content, available.try_into().unwrap_or(u16::MAX));
+            let wrapped = if wrapped.is_empty() {
+                vec![Line::default()]
+            } else {
+                wrapped
+            };
+            for physical in wrapped {
+                let mut spans = Vec::new();
+                if !quote.is_empty() {
+                    spans.push(Span::styled(quote.clone(), self.theme.transcript.gutter));
+                }
+                spans.push(Span::styled(CODE_RAIL.to_owned(), rail_style));
+                spans.extend(physical.spans);
+                if std::mem::take(&mut self.code_first_line) && !self.code_language.is_empty() {
+                    self.append_language_tag(&mut spans);
+                }
+                self.lines.push(Line::from(spans));
             }
-            spans.push(Span::styled(
-                CODE_RAIL.to_owned(),
-                Style::default().fg(self.theme.palette.composer_rule),
-            ));
-            spans.extend(super::syntax::highlight_markdown_code_line(
-                &self.code_language,
-                line,
-                self.theme,
-            ));
-            if std::mem::take(&mut self.code_first_line) && !self.code_language.is_empty() {
-                self.append_language_tag(&mut spans);
-            }
-            self.lines.push(Line::from(spans));
         }
     }
 

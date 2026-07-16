@@ -64,6 +64,44 @@ fn code_block_uses_a_left_hairline_and_no_background_fill() {
     }
 }
 
+/// A code line wider than the block wraps to the content width with the rail
+/// repeated on every physical row — never clipped (losing code) and never
+/// left to the terminal to wrap (which would produce continuation rows with
+/// no rail).
+#[test]
+fn long_code_line_wraps_with_the_rail_on_every_row() {
+    let theme = Theme::warm_ledger();
+    let width = 24u16;
+    let long = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj";
+    let lines = render_agent_markdown(&format!("```\n{long}\n```\n"), &theme, width);
+    let text = strings(lines);
+
+    let rail_rows: Vec<&String> = text.iter().filter(|line| line.contains('▏')).collect();
+    assert!(
+        rail_rows.len() > 1,
+        "a line this long must wrap to several rows: {text:?}"
+    );
+    for row in &rail_rows {
+        assert!(
+            row.trim_start().starts_with('▏'),
+            "every row keeps the rail: {row:?}"
+        );
+        assert!(
+            display_width(row) <= usize::from(width),
+            "no row exceeds the width: {row:?} ({} cols)",
+            display_width(row)
+        );
+    }
+    // Nothing was clipped: every word survives across the wrapped rows.
+    let joined = rail_rows
+        .iter()
+        .map(|row| row.replace('▏', ""))
+        .collect::<String>();
+    for word in long.split(' ') {
+        assert!(joined.contains(word), "word {word:?} was clipped: {text:?}");
+    }
+}
+
 /// §4.1a: inline code is a plain teal color shift (the references role) — no
 /// chip, box, or background.
 #[test]

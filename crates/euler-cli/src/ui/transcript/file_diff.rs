@@ -85,8 +85,17 @@ pub(super) fn render_file_diff_cell(
     );
 }
 
-pub(super) fn file_diff_is_foldable(diff: &str, limit: usize) -> bool {
-    let row_count = parse_unified_diff(diff).rows.len();
+/// Whether the folded preview would hide rows — must count exactly the rows
+/// the cell renders, or a `… ctrl+o expand` marker can appear on a cell that
+/// the global fold has not registered as foldable and so cannot target. That
+/// means parsing with the same `path` and new-file flag the render uses:
+/// header resolution keeps resolved symbol-label rows (and drops the rest),
+/// so the count depends on both.
+pub(super) fn file_diff_is_foldable(diff: &str, path: &str, action: &str, limit: usize) -> bool {
+    let new_file = file_change_action_label(action) == "add";
+    let row_count = parse_unified_diff_for_path(diff, Some(path), new_file)
+        .rows
+        .len();
     row_count > preview_cap(row_count, limit)
 }
 
@@ -215,6 +224,10 @@ enum FileDiffLineKind {
     Muted,
 }
 
+/// Path-less parse used only by tests that inspect row structure directly.
+/// Production always parses with the real path and new-file flag (foldability
+/// must match the render — see `file_diff_is_foldable`).
+#[cfg(test)]
 fn parse_unified_diff(diff: &str) -> ParsedFileDiff {
     parse_unified_diff_for_path(diff, None, false)
 }
@@ -846,6 +859,36 @@ mod tests {
         assert!(text.contains("calibrate()"), "text: {text:?}");
         assert!(!text.contains("@@"), "text: {text:?}");
         assert!(!text.contains("· line 10"), "text: {text:?}");
+    }
+
+    /// Foldability must count the rows the cell actually renders. A resolved
+    /// symbol-label row is kept by the render (path known) but was dropped by
+    /// the old path-less foldability parse — so a diff sitting one row over
+    /// the budget *because of* its label showed a `ctrl+o expand` marker the
+    /// global fold could not target. The label here is exactly that tipping
+    /// row: 7 body rows (under the 7-row budget) plus one `calibrate()` label
+    /// makes 8, which must fold.
+    #[test]
+    fn foldability_counts_resolved_symbol_label_rows() {
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,7 @@\n \
+                    fn calibrate() {\n+    a();\n+    b();\n+    c();\n+    d();\n\
+                    +    e();\n+    f();\n";
+        let limit = crate::ui::transcript::TOOL_CALL_MAX_LINES;
+
+        // The render keeps the label, so the cell folds.
+        assert!(
+            file_diff_is_foldable(diff, "src/lib.rs", "modify", limit),
+            "a diff whose symbol label tips it over the budget must fold"
+        );
+
+        // And the foldability count matches the parse the render uses.
+        let rendered_rows = parse_unified_diff_for_path(diff, Some("src/lib.rs"), false)
+            .rows
+            .len();
+        assert!(
+            rendered_rows > preview_cap(rendered_rows, limit),
+            "render row count {rendered_rows} must exceed the cap"
+        );
     }
 
     fn line_text(line: &Line<'_>) -> String {

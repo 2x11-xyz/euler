@@ -1259,8 +1259,11 @@ impl TranscriptItem {
                 )
             }
             Self::FileDiff {
-                diff: Some(diff), ..
-            } => file_diff_is_foldable(diff, output_limit_lines),
+                diff: Some(diff),
+                path,
+                action,
+                ..
+            } => file_diff_is_foldable(diff, path, action, output_limit_lines),
             // Done companions collapse to one line by default; expand shows rows.
             Self::Companion {
                 status: CompanionStatus::Done { .. },
