@@ -249,11 +249,6 @@ pub struct AppCore {
     /// re-seeds secret redaction (see [`AppOptions::auth_file`]).
     auth_file: Option<PathBuf>,
     turn_event_start: usize,
-    /// ctx input-token count when the current turn was spawned (review v3
-    /// §R5(b)): compared against the count at turn end to decide whether
-    /// context moved less than ~1%, one leg of the empty-turn recap
-    /// suppression (0 files changed AND ctx <1% AND no tests run).
-    turn_start_input_tokens: u64,
     last_turn_activity_at: Option<Instant>,
     stall_notified: bool,
     terminal_focused: bool,
@@ -829,7 +824,6 @@ impl AppCore {
             observe: boot.observe,
             auth_file: boot.auth_file,
             turn_event_start: 0,
-            turn_start_input_tokens: 0,
             last_turn_activity_at: None,
             stall_notified: false,
             terminal_focused: true,
@@ -1837,7 +1831,6 @@ impl AppCore {
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         self.turn_event_start = self.transcript.events().len();
-        self.turn_start_input_tokens = self.token_usage.input_tokens;
         self.note_turn_activity();
     }
 

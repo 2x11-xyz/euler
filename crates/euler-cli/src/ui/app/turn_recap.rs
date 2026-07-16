@@ -11,7 +11,6 @@ pub struct TurnRecap {
     pub removed: usize,
     pub paths: Vec<String>,
     pub test_status: Option<TestStatus>,
-    pub ctx_percent: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,10 +47,9 @@ impl TurnRecap {
         if let Some(status) = self.test_status {
             parts.push(status.label().to_owned());
         }
-        match self.ctx_percent {
-            Some(pct) => parts.push(format!("ctx {}%", pct.min(99))),
-            None => parts.push("ctx ?%".to_owned()),
-        }
+        // Context percentage is deliberately not repeated here: it already
+        // lives in the footer status line, and the recap is for what the turn
+        // *changed*. (Owner preference, 2026-07-16.)
         parts.join(" · ")
     }
 
@@ -64,11 +62,7 @@ impl TurnRecap {
     }
 }
 
-pub fn turn_recap_from_events(
-    events: &[EventEnvelope],
-    start: usize,
-    ctx_percent: Option<u64>,
-) -> TurnRecap {
+pub fn turn_recap_from_events(events: &[EventEnvelope], start: usize) -> TurnRecap {
     let slice = events.get(start..).unwrap_or(&[]);
     let (paths, added, removed) = aggregate_turn_files(slice);
     let test_status = detect_test_status(slice);
@@ -78,7 +72,6 @@ pub fn turn_recap_from_events(
         removed,
         paths,
         test_status,
-        ctx_percent,
     }
 }
 
@@ -339,15 +332,6 @@ fn payload_str<'a>(event: &'a EventEnvelope, key: &str) -> Option<&'a str> {
     event.payload.get(key).and_then(|v| v.as_str())
 }
 
-pub fn ctx_percent(input_tokens: u64, window: Option<u64>) -> Option<u64> {
-    let window = window.filter(|w| *w > 0)?;
-    let numerator = u128::from(input_tokens)
-        .saturating_mul(100)
-        .saturating_add(u128::from(window / 2));
-    let percent = numerator / u128::from(window);
-    Some(u64::try_from(percent).unwrap_or(u64::MAX).min(99))
-}
-
 pub fn session_files_changed_count(events: &[EventEnvelope]) -> usize {
     let mut paths = std::collections::BTreeSet::new();
     for event in events {
@@ -444,11 +428,8 @@ mod tests {
                 ]),
             ),
         ];
-        let recap = turn_recap_from_events(&events, 0, Some(12));
-        assert_eq!(
-            recap.summary_line(),
-            "1 file · +2 −1 · tests pass · ctx 12%"
-        );
+        let recap = turn_recap_from_events(&events, 0);
+        assert_eq!(recap.summary_line(), "1 file · +2 −1 · tests pass");
         assert_eq!(recap.files_line().as_deref(), Some("src/a.rs"));
     }
 
@@ -511,9 +492,9 @@ mod tests {
 
         // Also verify the turn recap surfaces (isn't suppressed as "no
         // tests ran") for a real turn_recap_from_events call.
-        let recap = turn_recap_from_events(&events, 0, Some(10));
+        let recap = turn_recap_from_events(&events, 0);
         assert!(recap.test_status.is_some());
-        assert_eq!(recap.summary_line(), "0 files · tests pass · ctx 10%");
+        assert_eq!(recap.summary_line(), "0 files · tests pass");
     }
 
     #[test]

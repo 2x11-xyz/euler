@@ -1152,14 +1152,19 @@ fn final_completion_collapses_live_viewport_without_blank_gap() {
     let rows = terminal.backend().screen_rows();
     let final_answer = row_containing(&rows, "final answer");
     let worked = row_containing(&rows, "Worked for 41s");
-    let recap = row_containing(&rows, "0 files · ctx");
     let prompt = row_containing(&rows, "▌");
     let status = row_containing(&rows, "echo · ctx");
     assert!(final_answer < worked, "rows: {rows:?}");
-    assert!(worked < recap, "recap follows worked-for, rows: {rows:?}");
+    // This turn changed no files, so there is no recap line — the divider is
+    // the last content row and the composer must collapse tight against it,
+    // with no stray blank gap (the point of this test).
     assert!(
-        prompt.saturating_sub(recap) <= 4,
-        "final recap row should be adjacent to prompt/status, rows: {rows:?}"
+        !rows.iter().any(|row| row.contains("0 files")),
+        "a zero-file turn must not render a recap: {rows:?}"
+    );
+    assert!(
+        prompt.saturating_sub(worked) <= 4,
+        "divider should be adjacent to prompt/status, rows: {rows:?}"
     );
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
     assert_eq!(status, prompt + 2, "rows: {rows:?}");
@@ -1886,7 +1891,7 @@ fn interrupted_model_calls_do_not_duplicate_completed_tool_block() {
 }
 
 #[test]
-fn turn_end_recap_follows_worked_duration_with_files_and_ctx() {
+fn turn_end_recap_follows_worked_duration_with_files() {
     let mut core = core();
     core.drain_finalized_visual_lines(72);
     core.turn_event_start = 0;
@@ -1904,8 +1909,18 @@ fn turn_end_recap_follows_worked_duration_with_files_and_ctx() {
     core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(8)));
     let text = drain_finalized_visual_text(&mut core, 72);
     assert!(text.contains("Worked for 8s"), "{text}");
-    assert!(text.contains("1 file · +2 −1 · ctx ?%"), "{text}");
+    assert!(text.contains("1 file · +2 −1"), "{text}");
     assert!(text.contains("src/lib.rs"), "{text}");
+    // Owner preference: the recap no longer repeats ctx% (it lives in the
+    // footer). Guards against the recap line reintroducing it.
+    let recap_line = text
+        .lines()
+        .find(|line| line.contains("1 file"))
+        .expect("recap line");
+    assert!(
+        !recap_line.contains("ctx"),
+        "recap carries ctx: {recap_line:?}"
+    );
 }
 
 #[test]

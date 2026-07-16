@@ -2549,7 +2549,7 @@ fn expanded_tool_run_keeps_full_output_without_result_line_prefix() {
 fn turn_recap_omits_files_line_when_no_files_changed() {
     let theme = Theme::default();
     let items = vec![TranscriptItem::TurnRecap {
-        summary: "0 files · ctx 5%".to_owned(),
+        summary: "0 files".to_owned(),
         files: None,
     }];
 
@@ -2560,14 +2560,18 @@ fn turn_recap_omits_files_line_when_no_files_changed() {
         1,
         "zero-file turn should render only the summary line: {texts:?}"
     );
-    assert!(texts[0].contains("0 files · ctx 5%"), "texts: {texts:?}");
+    assert!(texts[0].contains("0 files"), "texts: {texts:?}");
+    assert!(
+        !texts[0].contains("ctx"),
+        "recap no longer carries ctx: {texts:?}"
+    );
 }
 
 #[test]
 fn turn_recap_renders_faint_files_line_when_files_changed() {
     let theme = Theme::default();
     let items = vec![TranscriptItem::TurnRecap {
-        summary: "2 files · +3 −1 · ctx 5%".to_owned(),
+        summary: "2 files · +3 −1".to_owned(),
         files: Some("src/a.rs  src/b.rs".to_owned()),
     }];
 
@@ -2575,10 +2579,7 @@ fn turn_recap_renders_faint_files_line_when_files_changed() {
     let texts = line_texts(&lines);
     let joined = texts.join("\n");
 
-    assert!(
-        joined.contains("2 files · +3 −1 · ctx 5%"),
-        "texts: {texts:?}"
-    );
+    assert!(joined.contains("2 files · +3 −1"), "texts: {texts:?}");
     assert!(joined.contains("src/a.rs  src/b.rs"), "texts: {texts:?}");
 
     // The files line is the dimmer of the two rows (review v2 §14.3): the

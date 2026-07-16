@@ -3212,11 +3212,8 @@ fn turn_recap_never_renders_without_its_worked_divider() {
 // moved context by less than ~1%, and ran no tests renders the divider
 // (there was elapsed time worth naming) but not the recap line itself.
 #[test]
-fn empty_turn_suppresses_recap_line_but_keeps_the_divider() {
+fn zero_file_turn_suppresses_recap_line_but_keeps_the_divider() {
     let mut core = core();
-    core.token_usage.context_window_tokens = Some(100_000);
-    core.turn_start_input_tokens = core.token_usage.input_tokens;
-
     core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(10)));
 
     let text = drain_finalized_visual_text(&mut core, 80);
@@ -3228,7 +3225,43 @@ fn empty_turn_suppresses_recap_line_but_keeps_the_divider() {
     // token alone isn't distinctive enough — it renders every turn).
     assert!(
         !text.contains("0 files"),
-        "0 files, negligible ctx move, and no tests must suppress the recap line: {text:?}"
+        "a turn that changed no files must suppress the recap line: {text:?}"
+    );
+}
+
+/// Owner preference (2026-07-16): a turn that changed no files earns no
+/// recap, even if a test-like command ran. Previously such a turn rendered
+/// `0 files · tests …`; now the recap is suppressed and only the divider
+/// remains. The test outcome is still visible in the tool output above.
+#[test]
+fn zero_file_turn_that_ran_tests_still_suppresses_the_recap() {
+    let mut core = core();
+    core.turn_event_start = 0;
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "c1".into()),
+            ("name", "run_shell".into()),
+            ("input", serde_json::json!({"command": "cargo test -q"})),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "c1".into()),
+            ("name", "run_shell".into()),
+            ("ok", true.into()),
+            ("exit_code", 0.into()),
+            ("output", "test result: ok. 3 passed; 0 failed".into()),
+        ]),
+    )));
+    core.handle_turn_outcome(TurnOutcome::Complete, Some(Duration::from_secs(10)));
+
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("Worked for"), "divider still shows: {text:?}");
+    assert!(
+        !text.contains("tests pass") && !text.contains("0 files"),
+        "no files changed, so no recap line even with tests: {text:?}"
     );
 }
 
