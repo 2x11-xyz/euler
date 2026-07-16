@@ -31,7 +31,7 @@ use file_diff::file_diff_is_foldable;
 use line::render_line_oriented_item;
 #[cfg(test)]
 use render::{bottom_aligned, bottom_aligned_with_offset, render_projected_entries};
-use render::{render_projected_items, TranscriptRenderLimits};
+use render::{render_projected_items, TranscriptRenderLimits, TranscriptRenderParams};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptItem {
@@ -846,12 +846,14 @@ pub(crate) fn render_items_for_history_with_offsets(
         .collect();
     render::render_projected_entries_with_expansion_and_offsets(
         &entries,
-        theme,
-        width,
-        TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
-        expanded,
-        true,
-        0,
+        TranscriptRenderParams {
+            theme,
+            width,
+            limits: TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+            expanded,
+            show_turn_footer: true,
+            render_from: 0,
+        },
     )
 }
 
@@ -875,12 +877,14 @@ pub(crate) fn render_entries_for_history_with_offsets(
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     render::render_projected_entries_with_expansion_and_offsets(
         entries,
-        theme,
-        width,
-        TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
-        expanded,
-        false,
-        render_from,
+        TranscriptRenderParams {
+            theme,
+            width,
+            limits: TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+            expanded,
+            show_turn_footer: false,
+            render_from,
+        },
     )
 }
 

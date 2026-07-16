@@ -157,12 +157,18 @@ impl VisualCanvasState {
     /// `Notice` run. A notice's trailing blank is suppressed only when the
     /// item after it is also a notice (the renderer's rhythm rule), so a
     /// notice adjacent to the mutated region must re-render too — its blank
-    /// may need to reappear or vanish. Callers only ever touch items past the
-    /// committed boundary, so this never disturbs rows already in native
-    /// scrollback.
+    /// may need to reappear or vanish.
+    ///
+    /// The truncation point (and the walk-back) is clamped to the committed
+    /// boundary: items below `committed_items` are physically in native
+    /// scrollback and cannot be rewritten, so their cached rows are never
+    /// truncated. Callers only ever touch items past the boundary; the clamp
+    /// on `index` is a defensive floor so a stray earlier index can never
+    /// retract a committed row.
     fn mark_history_dirty_from(&mut self, index: usize) {
-        let mut from = index;
-        while from > 0
+        let boundary = self.committed_items;
+        let mut from = index.max(boundary);
+        while from > boundary
             && matches!(
                 self.finalized.get(from - 1).map(|entry| &entry.item),
                 Some(TranscriptItem::Notice(_))
@@ -269,7 +275,7 @@ impl VisualCanvasState {
             let (mut new_lines, new_offsets) =
                 render_finalized(&self.finalized, cached_items, width);
             let retract_seam_blank =
-                seam_retracts_trailing_blank(&self.finalized, cached_items);
+                seam_retracts_trailing_blank(&self.finalized, cached_items, self.committed_items);
             let cache = self
                 .history_cache
                 .as_mut()
@@ -303,11 +309,25 @@ impl VisualCanvasState {
 /// `finalized[..boundary]` must retract the last cached item's trailing blank:
 /// the cached last item and the first new item are both notices, and the
 /// renderer stacks consecutive notices with no blank between them.
-fn seam_retracts_trailing_blank(finalized: &[ProjectedEntry], boundary: usize) -> bool {
-    let (Some(prev), Some(next)) = (
-        boundary.checked_sub(1).and_then(|index| finalized.get(index)),
-        finalized.get(boundary),
-    ) else {
+///
+/// The retraction is refused when the preceding notice (`boundary - 1`) is
+/// already inside `committed_items`: its rows — trailing blank included — are
+/// physically in native scrollback and cannot be rewritten. The incremental
+/// render must preserve everything above the committed boundary byte-for-byte,
+/// even where a fresh full render would drop the blank; scrollback consistency
+/// wins over the rhythm rule.
+fn seam_retracts_trailing_blank(
+    finalized: &[ProjectedEntry],
+    boundary: usize,
+    committed_items: usize,
+) -> bool {
+    let Some(prev_index) = boundary.checked_sub(1) else {
+        return false;
+    };
+    if prev_index < committed_items {
+        return false;
+    }
+    let (Some(prev), Some(next)) = (finalized.get(prev_index), finalized.get(boundary)) else {
         return false;
     };
     super::transcript::consecutive_notices(&prev.item, &next.item)
@@ -1212,8 +1232,14 @@ mod tests {
         assert_eq!(incremental.history_item_offsets, full.history_item_offsets);
         // The two notices really are adjacent (no blank between them).
         let texts = line_texts(&incremental.active_frame_lines);
-        let first = texts.iter().position(|t| t == "notice:first").expect("first");
-        assert_eq!(texts.get(first + 1).map(String::as_str), Some("notice:second"));
+        let first = texts
+            .iter()
+            .position(|t| t == "notice:first")
+            .expect("first");
+        assert_eq!(
+            texts.get(first + 1).map(String::as_str),
+            Some("notice:second")
+        );
     }
 
     #[test]
@@ -1282,6 +1308,91 @@ mod tests {
             "committed prefix rows must be byte-identical after later appends"
         );
         assert!(after.active_frame_lines.len() > committed_rows);
+    }
+
+    #[test]
+    fn committed_notice_seam_keeps_its_blank_and_commits_the_next_notice_once() {
+        // Regression (review items 1-3): Notice A is rendered and committed to
+        // native scrollback — its trailing blank included. A later Notice B is
+        // appended. A fresh full render stacks consecutive notices with no
+        // blank between them, so the naive incremental path retracted Notice
+        // A's trailing blank. But A's rows are already physically in scrollback
+        // and cannot be rewritten: the committed prefix (lines AND offsets)
+        // must stay byte-identical, and Notice B must commit exactly once,
+        // starting right where Notice A ended.
+        let mut state = VisualCanvasState::default();
+        state.push_finalized(TranscriptItem::AssistantMessage("prose".to_owned()));
+        state.push_finalized(TranscriptItem::Notice("A".to_owned()));
+        let committed_frame = render_incremental(&mut state, 80);
+
+        // Commit both items to native scrollback (prose + Notice A, blank and
+        // all), then advance the canvas's committed boundary to match.
+        let committed_items = 2;
+        state.set_committed_items(committed_items);
+        let committed_rows = committed_frame.history_item_offsets[committed_items - 1];
+        assert_eq!(
+            committed_frame.active_frame_lines[committed_rows - 1].text(),
+            "",
+            "Notice A's committed tail ends in its trailing blank"
+        );
+
+        // Append Notice B and re-render incrementally.
+        state.push_finalized(TranscriptItem::Notice("B".to_owned()));
+        let after = render_incremental(&mut state, 80);
+
+        // 1) The committed prefix — lines and offsets — is byte-identical.
+        //    Notice A's trailing blank is NOT retracted, even though a fresh
+        //    full render would drop it: scrollback consistency wins over the
+        //    notice-run rhythm rule above the committed boundary.
+        assert_eq!(
+            after.active_frame_lines[..committed_rows],
+            committed_frame.active_frame_lines[..committed_rows],
+            "committed prefix rows (incl. Notice A's blank) must be unchanged"
+        );
+        assert_eq!(
+            after.history_item_offsets[..committed_items],
+            committed_frame.history_item_offsets[..committed_items],
+            "committed item offsets must be unchanged"
+        );
+        assert_eq!(
+            after.active_frame_lines[committed_rows - 1].text(),
+            "",
+            "Notice A keeps its committed trailing blank after Notice B lands"
+        );
+
+        // 2) Terminal-side commit accounting (terminal.rs
+        //    `set_committed_active_rows` / `commit_scrolled_history`): the
+        //    already-committed row count is `committed_rows`; the next draw
+        //    commits the slice [committed_rows .. history_rows). It must start
+        //    exactly at the boundary (no re-emit, no gap) and cover Notice B
+        //    exactly once — partition_point advances by one whole item.
+        let new_commit_start = committed_rows;
+        let new_commit_end = after.history_rows;
+        assert_eq!(
+            after.history_item_offsets[committed_items - 1],
+            new_commit_start,
+            "Notice A still ends exactly at the committed boundary row"
+        );
+        assert_eq!(
+            after.history_item_offsets[committed_items], new_commit_end,
+            "Notice B is the only item past the boundary; its end is the new tail"
+        );
+        let items_before = committed_frame
+            .history_item_offsets
+            .partition_point(|end| *end <= new_commit_start);
+        let items_after = after
+            .history_item_offsets
+            .partition_point(|end| *end <= new_commit_end);
+        assert_eq!(items_before, committed_items);
+        assert_eq!(
+            items_after,
+            committed_items + 1,
+            "Notice B commits exactly once (partition_point advances by one item)"
+        );
+        assert!(
+            new_commit_end > new_commit_start,
+            "Notice B contributes at least one newly committed row"
+        );
     }
 
     #[test]

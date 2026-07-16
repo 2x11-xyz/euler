@@ -50,6 +50,31 @@ impl TranscriptRenderLimits {
     }
 }
 
+/// Bundled knobs for `render_projected_entries_with_expansion_and_offsets`.
+/// Keeps the render entry points to two parameters — the entries and this
+/// options object — instead of the flat argument list that grew past clippy's
+/// `too_many_arguments` threshold when `render_from` landed.
+#[derive(Clone, Copy)]
+pub(super) struct TranscriptRenderParams<'a> {
+    pub(super) theme: &'a Theme,
+    pub(super) width: u16,
+    pub(super) limits: TranscriptRenderLimits,
+    /// The single global `ctrl+o` fold state (issue #49) — every foldable item
+    /// shares it; there is no per-item targeting.
+    pub(super) expanded: bool,
+    /// Render the trailing "elapsed since first event" turn footer. Correct for
+    /// a single bounded batch (the CLI/test transcript widget); the visual
+    /// canvas's incrementally growing whole-session history is never one batch,
+    /// so it passes `false`.
+    pub(super) show_turn_footer: bool,
+    /// Render only the tail `entries[render_from..]`, emitting those items'
+    /// lines and offsets (offsets relative to the returned segment). Earlier
+    /// items stay visible to the loop's cross-item lookups, so a suffix render
+    /// is byte-identical to the same items' tail of a full render — the seam the
+    /// visual canvas's incremental history cache appends through.
+    pub(super) render_from: usize,
+}
+
 pub(super) fn render_projected_items(
     items: &[TranscriptItem],
     theme: &Theme,
@@ -92,7 +117,15 @@ pub(super) fn render_projected_entries_with_expansion(
     expanded: bool,
 ) -> Vec<Line<'static>> {
     render_projected_entries_with_expansion_and_offsets(
-        entries, theme, width, limits, expanded, true, 0,
+        entries,
+        TranscriptRenderParams {
+            theme,
+            width,
+            limits,
+            expanded,
+            show_turn_footer: true,
+            render_from: 0,
+        },
     )
     .0
 }
@@ -102,36 +135,29 @@ pub(super) fn render_projected_entries_with_expansion(
 /// native scrollback at item boundaries so a width change can remap its
 /// committed prefix exactly (no lost rows, no duplicates).
 ///
-/// `show_turn_footer` renders the trailing "elapsed since first event"
-/// footer when the last entry carries timing. That reads correctly for a
-/// single bounded batch (the CLI/test transcript widget); the visual
-/// canvas's incrementally growing whole-session history is never one batch,
-/// so it passes `false`.
-///
-/// `expanded` is the single global `ctrl+o` fold state (issue #49) — every
-/// foldable item in `entries` shares it; there is no per-item targeting.
-///
-/// `render_from` renders only items `entries[render_from..]`, emitting their
-/// lines and offsets (offsets are relative to the returned segment). Earlier
-/// items are still visible to the loop's cross-item lookups — reasoning
-/// elapsed scans backward for its `ModelCall`, notice-run continuation peeks
-/// forward — so a suffix render is byte-identical to the same items' tail of a
-/// full render. This is the seam the visual canvas's incremental history cache
-/// appends through: only the newly finalized items pay the markdown/highlight
-/// cost, not the whole session (`VisualCanvasState::render_history`).
+/// The render knobs (theme/width/limits/`expanded`/`show_turn_footer`/
+/// `render_from`) travel as a [`TranscriptRenderParams`] options object; see
+/// its field docs. In particular `render_from` renders only the tail
+/// `entries[render_from..]` while earlier items stay visible to the loop's
+/// cross-item lookups — reasoning elapsed scans backward for its `ModelCall`,
+/// notice-run continuation peeks forward — so a suffix render is byte-identical
+/// to the same items' tail of a full render. This is the seam the visual
+/// canvas's incremental history cache appends through: only the newly finalized
+/// items pay the markdown/highlight cost, not the whole session
+/// (`VisualCanvasState::render_history`).
 #[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
-// ratchet: render knobs (expanded/footer/render_from) thread as flat args; a
-// params struct is the refactor target alongside the match above.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn render_projected_entries_with_expansion_and_offsets(
     entries: &[ProjectedEntry],
-    theme: &Theme,
-    width: u16,
-    limits: TranscriptRenderLimits,
-    expanded: bool,
-    show_turn_footer: bool,
-    render_from: usize,
+    params: TranscriptRenderParams<'_>,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
+    let TranscriptRenderParams {
+        theme,
+        width,
+        limits,
+        expanded,
+        show_turn_footer,
+        render_from,
+    } = params;
     let mut lines = Vec::new();
     let mut item_end_offsets = Vec::with_capacity(entries.len().saturating_sub(render_from));
 
@@ -1469,6 +1495,97 @@ mod tests {
                 "rewrapped body at width {width} must reproduce the full content with no words lost"
             );
         }
+    }
+
+    #[test]
+    fn real_renderer_suffix_splice_is_byte_identical_to_full_render() {
+        // Review item 5: the incremental history cache appends suffix renders
+        // (`render_from > 0`) onto a cached prefix. Most incremental unit tests
+        // use the fake renderer; this one drives the REAL markdown/highlight
+        // renderer and proves the seam holds for it: a suffix render of
+        // entries[k..] spliced onto a full render of entries[..k] is
+        // byte-identical to a full render of every entry — lines AND per-item
+        // offsets — for a mixed item set (markdown, a tool item, a notice run).
+        let entries = vec![
+            ProjectedEntry {
+                item: TranscriptItem::AssistantMessage(
+                    "# Heading\n\nSome **bold** and `code` in a wrapping paragraph.".to_owned(),
+                ),
+                timing: None,
+            },
+            ProjectedEntry {
+                item: TranscriptItem::ToolCall {
+                    name: "read_file".to_owned(),
+                },
+                timing: None,
+            },
+            ProjectedEntry {
+                item: TranscriptItem::Notice("first notice line".to_owned()),
+                timing: None,
+            },
+            ProjectedEntry {
+                item: TranscriptItem::Notice("second notice line".to_owned()),
+                timing: None,
+            },
+            ProjectedEntry {
+                item: TranscriptItem::AssistantMessage("wrapping up the work".to_owned()),
+                timing: None,
+            },
+        ];
+
+        let theme = Theme::default();
+        let render = |slice: &[ProjectedEntry], render_from: usize| {
+            render_projected_entries_with_expansion_and_offsets(
+                slice,
+                TranscriptRenderParams {
+                    theme: &theme,
+                    width: 72,
+                    limits: TranscriptRenderLimits::default(),
+                    expanded: false,
+                    // The visual canvas never shows the turn footer; matching
+                    // that keeps the suffix seam a pure per-item append.
+                    show_turn_footer: false,
+                    render_from,
+                },
+            )
+        };
+
+        // `k` is a clean boundary: entries[k - 1] is a tool item, not a notice,
+        // so no seam-blank retraction is needed and the naive splice matches
+        // production. The notice run lives entirely inside the rendered tail,
+        // exercising the notice-run rhythm under `render_from > 0`.
+        let k = 2;
+        let (full_lines, full_offsets) = render(&entries, 0);
+        let (prefix_lines, prefix_offsets) = render(&entries[..k], 0);
+        let (tail_lines, tail_offsets) = render(&entries, k);
+
+        assert_eq!(prefix_offsets.len(), k, "prefix render covers entries[..k]");
+        assert_eq!(
+            tail_offsets.len(),
+            entries.len() - k,
+            "tail render emits only entries[k..] (render_from > 0 exercised)"
+        );
+
+        // Splice: prefix ++ tail, tail offsets shifted by the prefix row count.
+        let base = prefix_lines.len();
+        let mut spliced_lines = prefix_lines;
+        spliced_lines.extend(tail_lines);
+        let mut spliced_offsets = prefix_offsets;
+        spliced_offsets.extend(tail_offsets.into_iter().map(|end| end + base));
+
+        assert_eq!(
+            plain_text(&spliced_lines),
+            plain_text(&full_lines),
+            "suffix splice text must equal the full render"
+        );
+        assert_eq!(
+            spliced_lines, full_lines,
+            "spliced lines must be byte-identical (spans and styles included)"
+        );
+        assert_eq!(
+            spliced_offsets, full_offsets,
+            "spliced per-item offsets must match the full render"
+        );
     }
 
     fn plain_text(lines: &[Line<'_>]) -> String {

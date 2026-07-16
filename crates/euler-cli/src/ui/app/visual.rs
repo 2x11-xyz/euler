@@ -55,18 +55,20 @@ impl AppCore {
         let theme = self.theme.clone();
         let expanded = self.tool_output_expanded;
         let show_ts = self.show_timestamp_gutter;
-        let mut frame = self.visual_canvas.render(snapshot, |items, render_from, width| {
-            crate::ui::text::with_timestamp_gutter(show_ts, || {
-                render_finalized_visual_items_with_offsets(
-                    items,
-                    &theme,
-                    width,
-                    TOOL_CALL_MAX_LINES,
-                    expanded,
-                    render_from,
-                )
-            })
-        });
+        let mut frame = self
+            .visual_canvas
+            .render(snapshot, |items, render_from, width| {
+                crate::ui::text::with_timestamp_gutter(show_ts, || {
+                    render_finalized_visual_items_with_offsets(
+                        items,
+                        &theme,
+                        width,
+                        TOOL_CALL_MAX_LINES,
+                        expanded,
+                        render_from,
+                    )
+                })
+            });
         // Only finalized event projections enter native scrollback. Even a
         // newline-stable live prefix remains app-owned until MODEL_RESULT;
         // otherwise its rows cannot be atomically replaced by the canonical
