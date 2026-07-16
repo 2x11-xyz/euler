@@ -13,7 +13,6 @@ use ratatui::{
 pub(super) struct FileDiffRender<'a> {
     pub(super) path: &'a str,
     pub(super) action: &'a str,
-    pub(super) origin: &'a str,
     pub(super) diff: Option<&'a str>,
     pub(super) truncated: bool,
     pub(super) truncation: &'a str,
@@ -23,7 +22,6 @@ pub(super) struct FileDiffRender<'a> {
 
 struct FileDiffRows {
     rows: Vec<Line<'static>>,
-    total_rows: usize,
     added: usize,
     removed: usize,
 }
@@ -51,13 +49,14 @@ pub(super) fn render_file_diff_cell(
 ) {
     let path = file_change_path_label(diff.path);
     let action = file_change_action_label(diff.action);
+    let new_file = action == "add";
     let (title, rows, footer) = match diff.diff {
         Some(diff_text) => {
-            let rows = file_diff_artifact_rows(diff_text, theme, diff.path, limit);
+            let rows = file_diff_artifact_rows(diff_text, theme, diff.path, new_file, limit);
             (
                 file_diff_title(&path, &action, Some((rows.added, rows.removed))),
                 rows.rows,
-                file_diff_footer(diff, &action, rows.total_rows),
+                file_diff_footer(diff),
             )
         }
         None => {
@@ -65,7 +64,7 @@ pub(super) fn render_file_diff_cell(
             (
                 file_diff_title(&path, &action, None),
                 vec![metadata_row("diff", &reason, theme.transcript.muted)],
-                file_diff_omitted_footer(diff, &action),
+                file_diff_footer(diff),
             )
         }
     };
@@ -91,8 +90,14 @@ pub(super) fn file_diff_is_foldable(diff: &str, limit: usize) -> bool {
     row_count > preview_cap(row_count, limit)
 }
 
-fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str, limit: usize) -> FileDiffRows {
-    let parsed = parse_unified_diff_for_path(diff, Some(path));
+fn file_diff_artifact_rows(
+    diff: &str,
+    theme: &Theme,
+    path: &str,
+    new_file: bool,
+    limit: usize,
+) -> FileDiffRows {
+    let parsed = parse_unified_diff_for_path(diff, Some(path), new_file);
     let total_rows = parsed.rows.len();
     if total_rows == 0 {
         return FileDiffRows {
@@ -100,7 +105,6 @@ fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str, limit: usize) 
                 "  no diff lines",
                 theme.transcript.muted,
             ))],
-            total_rows,
             added: parsed.added,
             removed: parsed.removed,
         };
@@ -115,7 +119,6 @@ fn file_diff_artifact_rows(diff: &str, theme: &Theme, path: &str, limit: usize) 
         .collect::<Vec<_>>();
     FileDiffRows {
         rows: rendered,
-        total_rows,
         added: parsed.added,
         removed: parsed.removed,
     }
@@ -213,10 +216,10 @@ enum FileDiffLineKind {
 }
 
 fn parse_unified_diff(diff: &str) -> ParsedFileDiff {
-    parse_unified_diff_for_path(diff, None)
+    parse_unified_diff_for_path(diff, None, false)
 }
 
-fn parse_unified_diff_for_path(diff: &str, path: Option<&str>) -> ParsedFileDiff {
+fn parse_unified_diff_for_path(diff: &str, path: Option<&str>, new_file: bool) -> ParsedFileDiff {
     let rows = normalized_output_rows(diff);
     let mut parsed = ParsedFileDiff {
         rows: Vec::new(),
@@ -254,9 +257,7 @@ fn parse_unified_diff_for_path(diff: &str, path: Option<&str>) -> ParsedFileDiff
         }
         parsed.push_source_row(row, &mut old_line, &mut new_line, saw_hunk);
     }
-    if let Some(path) = path {
-        resolve_hunk_headers(&mut parsed.rows, path);
-    }
+    resolve_hunk_headers(&mut parsed.rows, path, new_file);
     parsed.compact_context();
     parsed
 }
@@ -268,25 +269,41 @@ struct ParsedHunkHeader {
     raw: String,
 }
 
-fn resolve_hunk_headers(rows: &mut [FileDiffRow], path: &str) {
-    let replacements = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| matches!(row.kind, FileDiffLineKind::Hunk))
-        .filter_map(|(index, row)| resolved_hunk_header(rows, index, path, &row.body))
-        .collect::<Vec<_>>();
-    for (index, header) in replacements {
-        rows[index].body = header;
+/// §4.1 (Diff Header): rewrite each `@@ … @@` hunk row to a bare symbol label,
+/// or drop the row when there is no symbol to show — never a git fence. A new
+/// file has no hunks to separate, so every header goes. The `⋮` separators
+/// between hunks stay; the line-number column and that gap already delimit the
+/// hunks without a label.
+fn resolve_hunk_headers(rows: &mut Vec<FileDiffRow>, path: Option<&str>, new_file: bool) {
+    let mut labels: Vec<Option<String>> = Vec::new();
+    for index in 0..rows.len() {
+        if !matches!(rows[index].kind, FileDiffLineKind::Hunk) {
+            continue;
+        }
+        let label = if new_file {
+            None
+        } else {
+            path.and_then(|path| resolved_hunk_symbol(rows, index, path))
+        };
+        labels.push(label);
     }
+    let mut labels = labels.into_iter();
+    rows.retain_mut(|row| {
+        if !matches!(row.kind, FileDiffLineKind::Hunk) {
+            return true;
+        }
+        match labels.next().flatten() {
+            Some(symbol) => {
+                row.body = symbol;
+                true
+            }
+            None => false,
+        }
+    });
 }
 
-fn resolved_hunk_header(
-    rows: &[FileDiffRow],
-    hunk_index: usize,
-    path: &str,
-    raw_header: &str,
-) -> Option<(usize, String)> {
-    let header = parse_hunk_header(raw_header)?;
+fn resolved_hunk_symbol(rows: &[FileDiffRow], hunk_index: usize, path: &str) -> Option<String> {
+    let header = parse_hunk_header(&rows[hunk_index].body)?;
     let next_hunk = rows
         .iter()
         .enumerate()
@@ -294,18 +311,14 @@ fn resolved_hunk_header(
         .find(|(_, row)| matches!(row.kind, FileDiffLineKind::Hunk))
         .map_or(rows.len(), |(index, _)| index);
     let sources = hunk_sources(&rows[hunk_index + 1..next_hunk]);
-    let symbol = crate::ui::patch_diff::hunk_symbol(
+    crate::ui::patch_diff::hunk_symbol(
         path,
         &sources.old,
         &sources.new,
         sources.old_lookup_line,
         sources.new_lookup_line,
         header.function_context.as_deref(),
-    )?;
-    Some((
-        hunk_index,
-        format!("@@ {symbol} · line {} @@", header.new_start),
-    ))
+    )
 }
 
 struct HunkSources {
@@ -499,14 +512,17 @@ fn file_diff_line_style(kind: FileDiffLineKind, theme: &Theme) -> Style {
 /// the file-diff cell reads the same as the edit cell it sits beside. (The
 /// `add`/`modify` arms were the last lowercase holdouts here — `Deleted` and
 /// `Changed` were already capitalized.)
+/// §4.1 (Diff Header): a single diffstat on the file row, and nothing else —
+/// no double line count (`41 lines · add · 42 lines`), no tool-name echo. New
+/// files show their added count as `+A`; edits show `+A −R`.
 fn file_diff_title(path: &str, action: &str, stats: Option<(usize, usize)>) -> String {
     match (action, stats) {
-        ("add", Some((added, _))) => format!("Wrote {path} · new · {added} lines"),
-        ("delete", Some((_, removed))) => format!("Deleted {path} (-{removed})"),
+        ("add", Some((added, _))) => format!("Wrote {path} · new · +{added}"),
+        ("delete", Some((_, removed))) => format!("Deleted {path} · −{removed}"),
         ("modify" | "update", Some((added, removed))) => {
             format!("Edited {path} · +{added} −{removed}")
         }
-        (_, Some((added, removed))) => format!("Changed {path} (+{added} -{removed})"),
+        (_, Some((added, removed))) => format!("Changed {path} · +{added} −{removed}"),
         ("add", None) => format!("Wrote {path} · new"),
         ("delete", None) => format!("Deleted {path}"),
         ("modify" | "update", None) => format!("Edited {path}"),
@@ -514,36 +530,18 @@ fn file_diff_title(path: &str, action: &str, stats: Option<(usize, usize)>) -> S
     }
 }
 
-fn file_diff_footer(diff: FileDiffRender<'_>, action: &str, total_rows: usize) -> String {
-    file_diff_footer_with(diff, action, line_count_label(total_rows))
-}
-
-fn file_diff_omitted_footer(diff: FileDiffRender<'_>, action: &str) -> String {
-    file_diff_footer_with(diff, action, "omitted".to_owned())
-}
-
-fn file_diff_footer_with(diff: FileDiffRender<'_>, action: &str, detail: String) -> String {
-    let mut parts = vec![action.to_owned(), detail];
-    let origin = sanitize_metadata_text(diff.origin);
-    if !origin.trim().is_empty() {
-        parts.push(origin);
+/// §4.1: the file row carries the diffstat; the footer echoes neither the
+/// action verb (already the header) nor the origin tool name (`write_file`).
+/// Only a genuine truncation still earns a marker.
+fn file_diff_footer(diff: FileDiffRender<'_>) -> String {
+    if !diff.truncated {
+        return String::new();
     }
-    if diff.truncated {
-        let truncation = sanitize_metadata_text(diff.truncation);
-        if truncation.trim().is_empty() {
-            parts.push("truncated".to_owned());
-        } else {
-            parts.push(format!("truncated {truncation}"));
-        }
-    }
-    parts.join(" · ")
-}
-
-fn line_count_label(total_rows: usize) -> String {
-    if total_rows == 1 {
-        "1 line".to_owned()
+    let truncation = sanitize_metadata_text(diff.truncation);
+    if truncation.trim().is_empty() {
+        "truncated".to_owned()
     } else {
-        format!("{total_rows} lines")
+        format!("truncated {truncation}")
     }
 }
 
@@ -615,7 +613,10 @@ mod tests {
             .map(|row| row.body.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(rendered, vec!["@@ -1 +1 @@", "old", "new"]);
+        // §4.1: no path is supplied, so no symbol resolves and the hunk header
+        // row is omitted entirely — never a git `@@ … @@` fence. The body rows
+        // follow straight after.
+        assert_eq!(rendered, vec!["old", "new"]);
         assert_eq!(parsed.added, 1);
         assert_eq!(parsed.removed, 1);
     }
@@ -673,15 +674,16 @@ mod tests {
             .map(|row| line_text(&file_diff_line(row, &theme, "src/lib.rs", false, width)))
             .collect::<Vec<_>>();
 
+        // §4.1: no path is supplied, so no symbol resolves and both hunk header
+        // rows are omitted — the `⋮` gap plus the line-number column still
+        // delimit the two hunks.
         assert_eq!(
             texts,
             vec![
-                "       @@ -1,2 +1,3 @@",
                 "   1   a", // context: new number
                 "   2 + b", // insert: new number
-                "   3   c",
-                "     ⋮", // explicit hunk gap
-                "       @@ -10,2 +11,2 @@",
+                "   3   c", // context: new number
+                "     ⋮",   // explicit hunk gap
                 "  11   d", // context after divergence: new number, not old 10
                 "  11 - e", // delete: old number
                 "  12 + f", // insert: new number
@@ -702,15 +704,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(width, 5);
-        assert_eq!(
-            texts,
-            vec![
-                "        @@ -99998,2 +99998,2 @@",
-                "99998   old",
-                "99999 - gone",
-                "99999 + kept",
-            ]
-        );
+        // §4.1: no path is supplied, so no symbol resolves and the hunk header
+        // row is omitted — the widened line-number column still aligns.
+        assert_eq!(texts, vec!["99998   old", "99999 - gone", "99999 + kept"]);
     }
 
     #[test]
@@ -723,10 +719,11 @@ mod tests {
             .map(|row| (row.old_line, row.new_line))
             .collect::<Vec<_>>();
 
+        // §4.1: no path is supplied, so no symbol resolves and the hunk header
+        // row (None, None) is omitted — the body rows keep their aligned numbers.
         assert_eq!(
             numbers,
             vec![
-                (None, None),
                 (Some(1), Some(1)),
                 (Some(2), Some(2)), // blank context emitted as "" by some generators
                 (Some(3), None),
@@ -791,7 +788,6 @@ mod tests {
             FileDiffRender {
                 path: "src/lib.rs",
                 action: "modify",
-                origin: "apply_patch",
                 diff: Some("+println!(\"hello from a narrow file diff artifact\");\n-old line\n"),
                 truncated: false,
                 truncation: "none",
@@ -826,7 +822,6 @@ mod tests {
             FileDiffRender {
                 path: "src/lib.rs",
                 action: "modify",
-                origin: "apply_patch",
                 diff: Some(concat!(
                     "--- a/src/lib.rs\n",
                     "+++ b/src/lib.rs\n",
@@ -846,11 +841,11 @@ mod tests {
         );
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
-        assert!(
-            text.contains("@@ calibrate() · line 10 @@"),
-            "text: {text:?}"
-        );
-        assert!(!text.contains("@@ -10,2 +10,3 @@"), "text: {text:?}");
+        // §4.1: the resolved symbol renders as a bare, faint label — no git
+        // `@@ … @@` fence and no `· line N` suffix.
+        assert!(text.contains("calibrate()"), "text: {text:?}");
+        assert!(!text.contains("@@"), "text: {text:?}");
+        assert!(!text.contains("· line 10"), "text: {text:?}");
     }
 
     fn line_text(line: &Line<'_>) -> String {

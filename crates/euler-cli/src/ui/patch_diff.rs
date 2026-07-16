@@ -193,22 +193,31 @@ fn bounded_rows(rows: Vec<DiffRow>, limit: usize) -> Vec<DiffRow> {
 }
 
 fn patch_rows(patch: &diffy::Patch<'_, str>, path: &str, old: &str, new: &str) -> Vec<DiffRow> {
+    // §4.1 (Diff Header): a new-file write has no hunks to separate — go
+    // straight from the file row into the all-added body, no headers.
+    let new_file = old.is_empty();
     let mut rows = Vec::new();
+    let mut first_hunk = true;
     for hunk in patch.hunks() {
-        if !rows.is_empty() {
+        if !first_hunk {
             rows.push(DiffRow::new("⋮".to_owned(), RowKind::Muted));
         }
-        rows.push(DiffRow::new(
-            hunk_header(
+        first_hunk = false;
+        // Hunk context is a quiet symbol label, never git `@@ … @@` fences.
+        // Unresolved → omit it entirely (the ⋮ gap + line numbers already
+        // separate hunks); a new file gets none at all.
+        if !new_file {
+            if let Some(symbol) = hunk_symbol(
                 path,
                 old,
                 new,
-                hunk.old_range(),
-                hunk.new_range(),
+                hunk.old_range().start(),
+                hunk.new_range().start(),
                 hunk.function_context(),
-            ),
-            RowKind::Hunk,
-        ));
+            ) {
+                rows.push(DiffRow::new(symbol, RowKind::Hunk));
+            }
+        }
         rows.extend(hunk_rows(
             hunk.old_range(),
             hunk.new_range(),
@@ -216,27 +225,6 @@ fn patch_rows(patch: &diffy::Patch<'_, str>, path: &str, old: &str, new: &str) -
         ));
     }
     rows
-}
-
-fn hunk_header(
-    path: &str,
-    old: &str,
-    new: &str,
-    old_range: HunkRange,
-    new_range: HunkRange,
-    function_context: Option<&str>,
-) -> String {
-    if let Some(symbol) = hunk_symbol(
-        path,
-        old,
-        new,
-        old_range.start(),
-        new_range.start(),
-        function_context,
-    ) {
-        return format!("@@ {symbol} · line {} @@", new_range.start());
-    }
-    format!("@@ -{old_range} +{new_range} @@")
 }
 
 pub(crate) fn hunk_symbol(
@@ -528,10 +516,16 @@ mod tests {
         let text = plain_text(&rows);
 
         assert!(text.contains("* Patch proposed (update): src/lib.rs"));
-        assert!(text.contains("@@ -1,3 +1,4 @@"));
-        assert!(text.contains("   2 - b"));
-        assert!(text.contains("   2 + beta"));
-        assert!(text.contains("ctrl+o expand"));
+        // §4.1: no git `@@ … @@` fences; an unresolved symbol omits the header
+        // row entirely — the body follows straight after the file row.
+        assert!(!text.contains("@@"), "no hunk fences: {text:?}");
+        assert!(text.contains("   2 - b"), "{text:?}");
+        assert!(text.contains("   2 + beta"), "{text:?}");
+        // With the header row omitted the 4-line change is exactly `limit`
+        // rows, so the whole body renders un-folded (last row included) and no
+        // `ctrl+o expand` bound-marker appears.
+        assert!(text.contains("   4 + d"), "{text:?}");
+        assert!(!text.contains("ctrl+o expand"), "{text:?}");
     }
 
     #[test]
@@ -808,7 +802,10 @@ mod tests {
 
         assert_eq!(rows.len(), 9);
         assert!(text.contains("ctrl+o expand"));
-        assert!(text.contains("@@"), "hunk header missing: {text:?}");
+        // §4.1: no git `@@ … @@` fences; these top-level lets resolve no
+        // enclosing symbol, so the header row is omitted and the body follows
+        // straight after the file row.
+        assert!(!text.contains("@@"), "no hunk fences: {text:?}");
         assert!(text.contains("   1 - let value_0 = 0;"));
         assert!(!syntax::source_pair_within_budget(Some(&old), Some(&new)));
     }
