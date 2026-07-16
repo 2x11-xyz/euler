@@ -177,35 +177,18 @@ impl AppCore {
         let Some((epoch, committed_len)) = self.transcript.live_committed_revision() else {
             // Round boundary / nothing committed yet: drop the cache so a new
             // round can never alias a prior round's committed render.
-            self.live_committed_cache = None;
+            self.live_committed_cache.clear();
             return Vec::new();
         };
         let show_ts = self.show_timestamp_gutter;
-        if let Some(cache) = &self.live_committed_cache {
-            if cache.epoch == epoch
-                && cache.committed_len == committed_len
-                && cache.width == width
-                && cache.show_ts == show_ts
-                && cache.theme == self.theme
-            {
-                return cache.lines.clone();
-            }
-        }
+        let theme = self.theme.clone();
+        let key = LiveCommittedKey::new(epoch, committed_len, width, show_ts, theme.clone());
         let items = self.transcript.live_committed_items();
-        let lines = ratatui_lines_to_canvas(crate::ui::text::with_timestamp_gutter(show_ts, || {
-            transcript::render_items_for_history(&items, &self.theme, width)
-        }));
-        #[cfg(test)]
-        live_committed_render_probe::note();
-        self.live_committed_cache = Some(LiveCommittedCache {
-            epoch,
-            committed_len,
-            width,
-            show_ts,
-            theme: self.theme.clone(),
-            lines: lines.clone(),
-        });
-        lines
+        self.live_committed_cache.lines_with(key, || {
+            ratatui_lines_to_canvas(crate::ui::text::with_timestamp_gutter(show_ts, || {
+                transcript::render_items_for_history(&items, &theme, width)
+            }))
+        })
     }
 
     fn push_visual_modal_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) {
@@ -425,17 +408,71 @@ fn push_visual_block(blocks: &mut Vec<VisualBlock>, role: VisualBlockRole, lines
     }
 }
 
-/// Memoized render of the committed prefix of the streaming answer. The cache
-/// is valid only while every field that shaped `lines` is unchanged; any
-/// difference (new committed content, resize, `/timestamps` toggle, theme
-/// switch) is a miss that re-renders and refreshes the whole entry.
-pub(super) struct LiveCommittedCache {
+/// Everything that shapes the rendered committed-prefix rows. The cache holds
+/// exactly one entry; any difference from the stored key (new committed
+/// content, resize, `/timestamps` toggle, theme switch) is a miss.
+#[derive(Clone, PartialEq)]
+pub(super) struct LiveCommittedKey {
     epoch: u64,
     committed_len: usize,
     width: u16,
     show_ts: bool,
     theme: Theme,
-    lines: Vec<CanvasLine>,
+}
+
+impl LiveCommittedKey {
+    pub(super) fn new(
+        epoch: u64,
+        committed_len: usize,
+        width: u16,
+        show_ts: bool,
+        theme: Theme,
+    ) -> Self {
+        Self {
+            epoch,
+            committed_len,
+            width,
+            show_ts,
+            theme,
+        }
+    }
+}
+
+/// Memoizes the rendered committed prefix of the streaming answer. The render
+/// closure runs only on a key change (a miss); an unchanged key returns a clone
+/// of the cached rows, so a spinner-forced repaint with no new committed content
+/// does near-zero markdown/syntax work. Self-contained and renderer-agnostic:
+/// production passes the real render closure, tests pass a counting one — no
+/// globals, no `cfg(test)` on the production path.
+#[derive(Default)]
+pub(super) struct LiveCommittedCache {
+    entry: Option<(LiveCommittedKey, Vec<CanvasLine>)>,
+}
+
+impl LiveCommittedCache {
+    /// Committed-prefix rows for `key`, running `render` only on a miss. The
+    /// returned value is a fresh clone the caller owns (the search-highlight
+    /// pass mutates it), so the cached entry stays pristine for the next hit.
+    pub(super) fn lines_with(
+        &mut self,
+        key: LiveCommittedKey,
+        render: impl FnOnce() -> Vec<CanvasLine>,
+    ) -> Vec<CanvasLine> {
+        if let Some((cached_key, lines)) = &self.entry {
+            if *cached_key == key {
+                return lines.clone();
+            }
+        }
+        let lines = render();
+        self.entry = Some((key, lines.clone()));
+        lines
+    }
+
+    /// Drop the cached entry at a round boundary / when nothing is committed, so
+    /// a new round can never alias a prior round's committed render.
+    pub(super) fn clear(&mut self) {
+        self.entry = None;
+    }
 }
 
 /// One blank spacer row — but only when the preceding content doesn't
@@ -535,29 +572,5 @@ fn overflow_indicator_label(indicator: OverflowIndicator) -> &'static str {
         OverflowIndicator::Above => "↑ ",
         OverflowIndicator::Below => "↓ ",
         OverflowIndicator::Both => "↑↓ ",
-    }
-}
-
-/// Test-only instrument: counts how many times the committed live block was
-/// actually re-rendered (cache misses), so a memoization test can prove an
-/// unchanged frame did zero markdown/syntax work. cargo-nextest runs each
-/// test in its own process, so this process-global counter never races across
-/// tests. Declared last so it stays out of the way of `items_after_test_module`.
-#[cfg(test)]
-pub(super) mod live_committed_render_probe {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static RENDERS: AtomicUsize = AtomicUsize::new(0);
-
-    pub(crate) fn note() {
-        RENDERS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn count() -> usize {
-        RENDERS.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn reset() {
-        RENDERS.store(0, Ordering::Relaxed);
     }
 }
