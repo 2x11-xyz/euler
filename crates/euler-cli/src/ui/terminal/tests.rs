@@ -166,6 +166,95 @@ mod terminal_tests {
         );
     }
 
+    /// A frame with no pinned chrome has no known-safe region to erase: the
+    /// teardown must fall back to a fresh line, not clear from the viewport
+    /// top — which would destroy transcript rows never committed to native
+    /// scrollback.
+    #[test]
+    fn exit_clear_with_no_chrome_band_erases_nothing() {
+        let backend = VT100Backend::new(40, 10);
+        let mut terminal = InlineTerminal::new(backend, 8).expect("inline terminal");
+        let frame = VisualCanvasFrame {
+            active_frame_lines: vec![CanvasLine::plain("Paragraph 1: transcript content")],
+            cursor: None,
+            required_height: 1,
+            history_rows: 0,
+            history_item_offsets: Vec::new(),
+            prefer_stable_height: false,
+            committable_rows: 1,
+            pinned_rows: 0,
+        };
+        terminal.draw_visual_frame(&frame).expect("draw frame");
+
+        terminal.backend_mut().clear_raw_output();
+        terminal
+            .clear_live_band_for_exit()
+            .expect("exit clear succeeds");
+
+        // The fallback's fresh-line LF may scroll the screen by one row (the
+        // draw parks the cursor at the screen bottom), which moves content
+        // into scrollback — preserved, exactly like ordinary terminal output.
+        // What must never happen is an erase.
+        let surviving = format!(
+            "{}\n{}",
+            terminal.backend().scrollback_rows().join("\n"),
+            terminal.backend().screen_contents()
+        );
+        assert!(
+            surviving.contains("Paragraph 1: transcript content"),
+            "content must survive a chrome-less teardown: {surviving:?}"
+        );
+        let raw = String::from_utf8_lossy(terminal.backend().raw_output()).into_owned();
+        assert!(
+            !raw.contains("\x1b[J") && !raw.contains("\x1b[0J"),
+            "no erase may be emitted without a known band: {raw:?}"
+        );
+    }
+
+    /// A signal-driven shutdown discards the queued resize (`drain_ready`
+    /// clears `pending_resize` before `Shutdown`), so the band measured at
+    /// the previous draw can name rows that no longer exist. Teardown on
+    /// geometry that differs from the measurement must refuse to erase.
+    #[test]
+    fn exit_clear_on_stale_geometry_erases_nothing() {
+        let backend = VT100Backend::new(40, 10);
+        let mut terminal = InlineTerminal::new(backend, 8).expect("inline terminal");
+        let frame = VisualCanvasFrame {
+            active_frame_lines: vec![
+                CanvasLine::plain("Paragraph 1: transcript content"),
+                CanvasLine::plain("▌ /quit"),
+                CanvasLine::plain("footer"),
+            ],
+            cursor: None,
+            required_height: 3,
+            history_rows: 0,
+            history_item_offsets: Vec::new(),
+            prefer_stable_height: false,
+            committable_rows: 1,
+            pinned_rows: 2,
+        };
+        terminal.draw_visual_frame(&frame).expect("draw frame");
+
+        // The OS resizes the terminal; the resize event never reaches a
+        // redraw because shutdown preempts it.
+        terminal.backend_mut().resize(40, 6);
+
+        terminal.backend_mut().clear_raw_output();
+        terminal
+            .clear_live_band_for_exit()
+            .expect("exit clear succeeds");
+
+        let raw = String::from_utf8_lossy(terminal.backend().raw_output()).into_owned();
+        assert!(
+            !raw.contains("\x1b[J") && !raw.contains("\x1b[0J"),
+            "no erase may be emitted on stale geometry: {raw:?}"
+        );
+        assert!(
+            raw.contains("\x1b[0m"),
+            "attributes still reset for the recap: {raw:?}"
+        );
+    }
+
     #[test]
     fn visual_frame_shows_cursor_only_when_frame_has_cursor_target() {
         let backend = VT100Backend::new(30, 6);
