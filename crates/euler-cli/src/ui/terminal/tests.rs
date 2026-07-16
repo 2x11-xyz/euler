@@ -108,6 +108,64 @@ mod terminal_tests {
         assert!(rows[1].contains("status"), "rows: {rows:?}");
     }
 
+    /// Exit teardown (§5.8): only the pinned chrome band — composer, footer
+    /// — is cleared, with the terminal's *default* attributes, not the
+    /// theme's. Transcript rows above it in the viewport may never have been
+    /// committed to native scrollback (the bridge commits lazily), so they
+    /// must survive quit. And the SGR reset must precede the clear in the
+    /// emitted byte stream: a clear issued while the theme background
+    /// attribute is still active repaints the region in theme colors, which
+    /// on a mismatched terminal is the inverted band left above the shell
+    /// prompt.
+    #[test]
+    fn exit_clear_drops_only_the_chrome_band_in_native_colors() {
+        let backend = VT100Backend::new(40, 10);
+        let mut terminal = InlineTerminal::new(backend, 8).expect("inline terminal");
+        let frame = VisualCanvasFrame {
+            active_frame_lines: vec![
+                CanvasLine::plain("Paragraph 1: transcript content"),
+                CanvasLine::plain("▌ /quit"),
+                CanvasLine::plain("footer"),
+            ],
+            cursor: None,
+            required_height: 3,
+            history_rows: 0,
+            history_item_offsets: Vec::new(),
+            prefer_stable_height: false,
+            committable_rows: 1,
+            pinned_rows: 2,
+        };
+        terminal.draw_visual_frame(&frame).expect("draw frame");
+        assert!(terminal.backend().screen_contents().contains("/quit"));
+
+        terminal.backend_mut().clear_raw_output();
+        terminal
+            .clear_live_band_for_exit()
+            .expect("exit clear succeeds");
+
+        // The chrome is gone; the uncommitted transcript row survives.
+        let contents = terminal.backend().screen_contents();
+        assert!(
+            !contents.contains("/quit") && !contents.contains("footer"),
+            "chrome rows must be cleared: {contents:?}"
+        );
+        assert!(
+            contents.contains("Paragraph 1: transcript content"),
+            "uncommitted transcript rows must survive quit: {contents:?}"
+        );
+
+        // And it was cleared in native colors: the SGR reset comes before
+        // the erase-below in the byte stream the terminal actually received.
+        let raw = String::from_utf8_lossy(terminal.backend().raw_output()).into_owned();
+        let reset = raw.find("\x1b[0m").expect("SGR reset emitted");
+        let clear = raw.find("\x1b[J").or_else(|| raw.find("\x1b[0J"));
+        let clear = clear.expect("erase-below emitted");
+        assert!(
+            reset < clear,
+            "reset must precede the clear or the band repaints in theme colors: {raw:?}"
+        );
+    }
+
     #[test]
     fn visual_frame_shows_cursor_only_when_frame_has_cursor_target() {
         let backend = VT100Backend::new(30, 6);

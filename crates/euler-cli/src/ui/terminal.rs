@@ -286,6 +286,11 @@ where
     last_drawn_area: Option<Rect>,
     last_drawn_lines: Vec<CanvasLine>,
     review_scroll_offset: usize,
+    /// Rows of the pinned bottom band (composer / footer / HUD chrome) in the
+    /// most recent drawn frame — the region the exit teardown clears.
+    /// Everything above it in the viewport is transcript content that may not
+    /// have been committed to native scrollback yet and must survive quit.
+    last_pinned_band_rows: u16,
     linefeed_history_insert_enabled: bool,
     linefeed_history_insert_suspended_after_resize: bool,
     cursor_position_authoritative: bool,
@@ -324,6 +329,7 @@ where
             last_drawn_area: None,
             last_drawn_lines: Vec::new(),
             review_scroll_offset: 0,
+            last_pinned_band_rows: 0,
             linefeed_history_insert_enabled: false,
             linefeed_history_insert_suspended_after_resize: false,
             cursor_position_authoritative: false,
@@ -497,6 +503,12 @@ where
             self.review_scroll_offset,
             frame.pinned_rows,
         );
+        self.last_pinned_band_rows = visible
+            .visible_pinned_bottom_band_rows(
+                &frame.active_frame_lines,
+                usize::from(self.viewport_area.width).max(1),
+            )
+            .unwrap_or(0);
         let cursor = visible_cursor(frame.cursor, &visible);
         self.draw_canvas_lines(&visible.lines, cursor)
     }
@@ -673,6 +685,45 @@ where
     pub(crate) fn end_synchronized_update(&mut self) -> io::Result<()> {
         let writer = self.inner.backend_mut();
         writer.write_all(SYNC_UPDATE_END)?;
+        flush_terminal_writer(writer)
+    }
+
+    /// Exit teardown (§5.8): clear the pinned bottom band — composer,
+    /// footer, HUD chrome — with the **terminal's own default** attributes,
+    /// and park the cursor at the band's top-left column.
+    ///
+    /// Only the chrome goes. Transcript rows above it inside the viewport
+    /// may never have been committed to native scrollback (the bridge
+    /// commits lazily, as rows scroll out), so clearing from the viewport
+    /// top would destroy real session content on quit — they stay on screen
+    /// and scroll into native scrollback under the shell like any other
+    /// output.
+    ///
+    /// The SGR reset before the clear is the point: the inline viewport
+    /// paints the theme background into cells (opaque mode), and a clear
+    /// issued with those attributes still active would repaint the region
+    /// in theme colors — on a terminal whose native background differs,
+    /// that is the "inverted band above the shell prompt" bug. After this,
+    /// the exit recap prints as plain text on the native background,
+    /// starting at column 0 of a cleared row.
+    pub(crate) fn clear_live_band_for_exit(&mut self) -> io::Result<()> {
+        let area = self.viewport_area;
+        let band_rows = self.last_pinned_band_rows.min(area.height);
+        // No draw yet (or a chrome-less frame): nothing is known to be
+        // chrome, so clear the whole (at most 1-row startup) viewport only
+        // when it cannot hold content.
+        let band_top = if band_rows == 0 {
+            area.top()
+        } else {
+            area.bottom().saturating_sub(band_rows)
+        };
+        let writer = self.inner.backend_mut();
+        writer.write_all(b"\x1b[0m")?;
+        queue!(
+            writer,
+            MoveTo(0, band_top),
+            Clear(ClearType::FromCursorDown)
+        )?;
         flush_terminal_writer(writer)
     }
 
