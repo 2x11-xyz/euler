@@ -2728,7 +2728,7 @@ fn patch_artifact_cells_are_bounded_and_keep_independent_borders() {
 }
 
 #[test]
-fn patch_proposed_artifact_uses_boxed_title_and_not_old_child_rows() {
+fn patch_proposed_artifact_uses_anchored_title_and_not_old_child_rows() {
     let theme = Theme::default();
     let items = [
         TranscriptItem::PatchProposed {
@@ -2753,10 +2753,10 @@ fn patch_proposed_artifact_uses_boxed_title_and_not_old_child_rows() {
     );
     assert!(joined.contains("Patch proposed src/a.rs"));
     assert!(joined.contains("     1 - a"));
-    assert!(
-        joined.contains("@@ -1 +1 @@"),
-        "hunk header missing: {texts:?}"
-    );
+    assert!(joined.contains("     1 + aa"));
+    // §4.1: no git `@@ … @@` fences; `a`→`aa` resolves no symbol, so the header
+    // row is omitted and the body follows straight after the file row.
+    assert!(!joined.contains("@@"), "no hunk fences: {texts:?}");
     assert_no_box_chars(&texts);
     // v2: `• Patch proposed` at column 0 is the spine-anchored title row;
     // an old-style parent row would carry a `*` glyph or sit indented
@@ -2826,8 +2826,13 @@ fn patch_artifact_is_not_controlled_by_shell_fold_limit() {
     let joined = bounded.join("\n");
     assert!(!joined.contains("bounded patch"), "bounded: {bounded:?}");
     assert!(joined.contains("ctrl+o expand"), "bounded: {bounded:?}");
-    assert!(joined.contains("update · "), "bounded: {bounded:?}");
-    assert!(joined.contains("visible rows"), "bounded: {bounded:?}");
+    // §4.1: single diffstat on the file row, no old `update · N visible rows`
+    // footer.
+    assert!(
+        joined.contains("Edited src/lib.rs · +1 −20"),
+        "bounded: {bounded:?}"
+    );
+    assert!(!joined.contains("visible rows"), "bounded: {bounded:?}");
 }
 
 #[test]
@@ -2855,8 +2860,13 @@ fn patch_proposed_artifact_is_not_controlled_by_shell_fold_limit() {
     let joined = bounded.join("\n");
     assert!(!joined.contains("bounded patch"), "bounded: {bounded:?}");
     assert!(joined.contains("ctrl+o expand"), "bounded: {bounded:?}");
-    assert!(joined.contains("update · "), "bounded: {bounded:?}");
-    assert!(joined.contains("visible rows"), "bounded: {bounded:?}");
+    // §4.1: the proposed file row carries no old `update · N visible rows`
+    // footer.
+    assert!(
+        joined.contains("Patch proposed src/lib.rs"),
+        "bounded: {bounded:?}"
+    );
+    assert!(!joined.contains("visible rows"), "bounded: {bounded:?}");
 }
 
 #[test]
@@ -2873,7 +2883,8 @@ fn path_only_patch_artifact_uses_fallback_title_and_body() {
 
     assert!(joined.contains("Edited src/lib.rs"));
     assert!(joined.contains("no line changes"));
-    assert!(joined.contains("unknown · 1 visible rows"));
+    // §4.1: no old `unknown · N visible rows` footer.
+    assert!(!joined.contains("visible rows"));
     assert!(!joined.contains("* Edited"));
 }
 
@@ -2890,11 +2901,12 @@ fn patch_applied_artifact_keeps_exact_render_shape() {
 
     // v2 anchor spine shape: `•` anchor + title at column 0, diff body rows
     // padded inside the cell, one blank separator row (hairlines are gone).
+    // §4.1: single diffstat file row, no `@@ … @@` fence (`a`→`b` resolves no
+    // symbol so the header row is omitted).
     assert_eq!(
         texts,
         vec![
-            "• Edited src/lib.rs · +1 −1 · update · 3 visible",
-            "           @@ -1 +1 @@                          ",
+            "• Edited src/lib.rs · +1 −1",
             "       1 - a                                    ",
             "       1 + b                                    ",
             "",
@@ -3143,7 +3155,9 @@ fn file_diff_renders_unified_diff_as_source_first_artifact() {
     assert_no_box_chars(&texts);
     assert!(!joined.contains("--- a/src/lib.rs"));
     assert!(!joined.contains("+++ b/src/lib.rs"));
-    assert!(joined.contains("@@ -1 +1 @@"));
+    // §4.1: no git `@@ … @@` fences; `old`→`new` resolves no symbol, so the
+    // header row is omitted and the body follows straight after the file row.
+    assert!(!joined.contains("@@"));
 }
 
 #[test]
@@ -3264,12 +3278,14 @@ fn file_diff_ignores_shell_artifact_limit_and_renders_full_code() {
     assert!(default.contains("ctrl+o expand"), "default: {default:?}");
     assert!(!default.contains("line 11"), "default: {default:?}");
     assert!(expanded.contains("line 11"), "expanded: {expanded:?}");
-    // Title row is `edit path · +N −M · action · lines · origin · truncated …`;
-    // at width 80 the 9-cell gutter can soft-truncate the final "tail".
+    // §4.1: file row is `Edited path · +A −R · truncated <mode>` — a single
+    // diffstat, no `N lines`/origin tool echo.
     assert!(
-        default.contains("modify · 12 lines · apply_patch · truncated"),
+        default.contains("Edited src/lib.rs · +12 −0 · truncated"),
         "default: {default:?}"
     );
+    assert!(!default.contains("12 lines"), "default: {default:?}");
+    assert!(!default.contains("apply_patch"), "default: {default:?}");
 }
 
 #[test]
@@ -3343,7 +3359,9 @@ fn file_change_and_file_diff_artifacts_are_distinct_and_ordered() {
     assert!(contents.contains("  diff: omitted (metadata only)"));
     assert!(contents.contains("     1 - a"));
     assert!(contents.contains("     1 + b"));
-    assert!(contents.contains("@@ -1 +1 @@"));
+    // §4.1: no git `@@ … @@` fences; `a`→`b` resolves no symbol, so the header
+    // row is omitted and the body follows straight after the file row.
+    assert!(!contents.contains("@@"));
 
     let change_block = &contents[change_index..diff_index];
     assert!(
@@ -3582,7 +3600,10 @@ fn patch_and_file_change_artifacts_are_distinct_and_ordered() {
 
     assert!(patch_index < change_index, "contents: {contents:?}");
     assert!(contents.contains("     1 - a"));
-    assert!(contents.contains("@@"), "hunk header missing");
+    assert!(contents.contains("     1 + b"));
+    // §4.1: no git `@@ … @@` fences; `a`→`b` resolves no symbol, so the header
+    // row is omitted and the body follows straight after the file row.
+    assert!(!contents.contains("@@"), "no hunk fences");
     assert!(contents.contains("  diff: omitted (metadata only)"));
 }
 

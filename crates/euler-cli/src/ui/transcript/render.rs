@@ -489,7 +489,9 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             TranscriptItem::FileDiff {
                 path,
                 action,
-                origin,
+                // §4.1: the origin tool (`write_file`) is provenance on the
+                // item, never echoed on the diff header.
+                origin: _,
                 diff,
                 truncated,
                 truncation,
@@ -501,7 +503,6 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     FileDiffRender {
                         path,
                         action,
-                        origin,
                         diff: diff.as_deref(),
                         truncated: *truncated,
                         truncation,
