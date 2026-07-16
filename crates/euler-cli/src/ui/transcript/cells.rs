@@ -91,7 +91,9 @@ pub(super) fn render_edit_cell(
         patch_diff::action(edit.old, edit.new),
         diffstat(edit.old, edit.new),
     ) {
-        ("add", Some((added, _))) => format!("Wrote {} · new · {added} lines", edit.path),
+        // §4.1 (Diff Header): a single diffstat on the row — `+A` for a new
+        // file, `+A −R` for an edit. No `N lines` double count.
+        ("add", Some((added, _))) => format!("Wrote {} · new · +{added}", edit.path),
         (_, Some((added, removed))) => format!("Edited {} · +{added} −{removed}", edit.path),
         _ => format!("Edited {}", edit.path),
     };
@@ -131,21 +133,18 @@ pub(super) fn render_patch_cell(
     .into_iter();
     let _header = rows.next();
     let mut body = rows.collect::<Vec<_>>();
-    let visible_rows = body.len();
     if body.is_empty() {
         body.push(Line::from(""));
     }
-    let footer = format!(
-        "{} · {visible_rows} visible rows",
-        patch_diff::action(patch.old, patch.new)
-    );
+    // §4.1 (Diff Header): the diffstat lives on the title row; the footer adds
+    // no `add · N visible rows` metadata cluster.
     push_artifact_cell(
         lines,
         ArtifactCellRender {
             title: &patch.title,
             title_suffix: None,
             rows: &body,
-            footer: &footer,
+            footer: "",
             style: theme.transcript.patch,
             width,
         },

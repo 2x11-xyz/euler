@@ -68,7 +68,9 @@ fn vt100_renders_patch_diff_with_line_numbers_and_bounded_preview() {
     let contents = rendered_screen(&events, &theme, 80, 32);
 
     assert!(contents.contains("Edited src/lib.rs"));
-    assert!(contents.contains("@@"), "hunk header missing");
+    // §4.1: no git `@@ … @@` fences; this diff resolves no symbol, so the
+    // header row is omitted and the body follows straight after the file row.
+    assert!(!contents.contains("@@"), "no hunk fences");
     assert!(contents.contains("     2 - b"));
     assert!(contents.contains("     2 + beta"));
     assert!(!contents.contains("bounded patch"));

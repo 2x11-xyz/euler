@@ -610,7 +610,11 @@ impl MarkupScopes {
             strong: Style::default()
                 .fg(palette.foreground)
                 .add_modifier(Modifier::BOLD),
-            code: Style::default().fg(palette.tool).bg(palette.surface),
+            // §4.1a: code is a plain teal (references role) color shift — no
+            // background fill. A gray band (and especially a ragged per-line
+            // one) is forbidden; hierarchy is color plus a single hairline,
+            // the same law diffs (§4.1) and thinking (§4) follow.
+            code: Style::default().fg(palette.tool),
             link: Style::default()
                 .fg(palette.tool)
                 .add_modifier(Modifier::UNDERLINED),

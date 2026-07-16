@@ -31,6 +31,95 @@ fn renders_basic_markdown_constructs() {
     assert!(text.iter().any(|line| line.contains("let x = 1;")));
 }
 
+/// §4.1a: a fenced code block gets one continuous left hairline (`▏`), the
+/// code behind it with syntax color, and no background fill of any kind. The
+/// language shows as a faint right-corner tag on the first line, never a
+/// heading line above the block.
+#[test]
+fn code_block_uses_a_left_hairline_and_no_background_fill() {
+    let theme = Theme::warm_ledger();
+    let lines = render_agent_markdown("```sh\neuler run\nsecond line\n```\n", &theme, 40);
+    let text = strings(lines.clone());
+
+    // No heading line above the block (the old `    sh` row is gone).
+    assert!(
+        !text.iter().any(|line| line.trim() == "sh"),
+        "language must not be a heading line: {text:?}"
+    );
+    // Every code row opens with the hairline rail; none is a bare 4-space
+    // indent, and the language tag rides the first row's right corner.
+    let code_rows: Vec<&String> = text.iter().filter(|line| line.contains('▏')).collect();
+    assert_eq!(code_rows.len(), 2, "one rail per code line: {text:?}");
+    assert!(code_rows[0].contains("euler run"), "text: {text:?}");
+    assert!(
+        code_rows[0].trim_end().ends_with("sh"),
+        "language tag rides the first code line's right corner: {:?}",
+        code_rows[0]
+    );
+    assert!(!code_rows[1].contains("sh"), "tag only on the first line");
+
+    // No span in the block carries a background fill.
+    for span in all_spans(&lines) {
+        assert_eq!(span.style.bg, None, "code carries no background: {span:?}");
+    }
+}
+
+/// A code line wider than the block wraps to the content width with the rail
+/// repeated on every physical row — never clipped (losing code) and never
+/// left to the terminal to wrap (which would produce continuation rows with
+/// no rail).
+#[test]
+fn long_code_line_wraps_with_the_rail_on_every_row() {
+    let theme = Theme::warm_ledger();
+    let width = 24u16;
+    let long = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj";
+    let lines = render_agent_markdown(&format!("```\n{long}\n```\n"), &theme, width);
+    let text = strings(lines);
+
+    let rail_rows: Vec<&String> = text.iter().filter(|line| line.contains('▏')).collect();
+    assert!(
+        rail_rows.len() > 1,
+        "a line this long must wrap to several rows: {text:?}"
+    );
+    for row in &rail_rows {
+        assert!(
+            row.trim_start().starts_with('▏'),
+            "every row keeps the rail: {row:?}"
+        );
+        assert!(
+            display_width(row) <= usize::from(width),
+            "no row exceeds the width: {row:?} ({} cols)",
+            display_width(row)
+        );
+    }
+    // Nothing was clipped: every word survives across the wrapped rows.
+    let joined = rail_rows
+        .iter()
+        .map(|row| row.replace('▏', ""))
+        .collect::<String>();
+    for word in long.split(' ') {
+        assert!(joined.contains(word), "word {word:?} was clipped: {text:?}");
+    }
+}
+
+/// §4.1a: inline code is a plain teal color shift (the references role) — no
+/// chip, box, or background.
+#[test]
+fn inline_code_is_teal_with_no_background() {
+    let theme = Theme::warm_ledger();
+    let lines = render_agent_markdown("run `euler status` now\n", &theme, 80);
+    let code = all_spans(&lines)
+        .into_iter()
+        .find(|span| span.content.contains("euler status"))
+        .expect("inline code span");
+    assert_eq!(
+        code.style.fg,
+        Some(theme.palette.tool),
+        "inline code is teal"
+    );
+    assert_eq!(code.style.bg, None, "inline code has no background chip");
+}
+
 #[test]
 fn wrapped_list_continuations_stay_under_item_text() {
     let theme = Theme::default_dark();

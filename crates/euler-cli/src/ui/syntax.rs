@@ -111,18 +111,12 @@ pub(crate) fn highlight_markdown_code_line(
     if tokens.is_empty() {
         return vec![fallback];
     }
+    // §4.1a: no background fill on code — syntax color alone. The block's
+    // single left hairline carries the grouping, so the per-token band the
+    // old `.bg(surface)` painted (ragged at each line's text end) is gone.
     tokens
         .into_iter()
-        .map(|token| {
-            Span::styled(
-                token.text,
-                theme
-                    .scopes
-                    .syntax
-                    .style(token.kind)
-                    .bg(theme.palette.surface),
-            )
-        })
+        .map(|token| Span::styled(token.text, theme.scopes.syntax.style(token.kind)))
         .collect()
 }
 
