@@ -291,6 +291,17 @@ envelope `v` per `docs/contracts/persistence.md`.
   a valid `session.json.name` may be used only as a display fallback when the
   event stream is readable and contains no `session.renamed`; the next rename
   writes this canonical event and refreshes the sidecar projection.
+  Projection caching: `session.json` may additionally carry the cached
+  event-log projection (status/name/title/root/kind) keyed by the event
+  log's `(byte length, mtime)`. While the key matches the live log, listings
+  serve the cached projection verbatim instead of re-deriving it — the
+  events remain the sole naming authority, but their authority is enforced
+  at projection time, not on every read. A hand-edited sidecar can therefore
+  misreport display fields until the event log next changes; that is inside
+  the store's trust boundary (the same actor could edit the log itself) and
+  outside its integrity model. Any event append or log rewrite moves the key
+  and forces re-projection, and integrity failures (`invalid` status) are
+  never cached, so they are re-checked on every listing.
 - `canvas.snapshot`: `selected_event_ids`, `counts`, retention telemetry
   `retained_items`, `retained_bytes`, `demoted_items`, `automatic`, `stubs`,
   `tier`, `budget_bytes`,

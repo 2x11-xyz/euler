@@ -93,7 +93,6 @@ pub(super) fn read_terminal_event() -> Result<Option<UiEvent>> {
 pub(super) struct CommandContextParts {
     pub current_effort: ReasoningEffort,
     pub current_theme: ThemeChoice,
-    pub current_session_id: Option<String>,
     pub checkpoint_items: Vec<CheckpointItem>,
     pub extension_items: Vec<super::super::commands::ExtensionManagerItem>,
     pub extension_slash_commands: Vec<super::super::commands::ExtensionSlashCommand>,
@@ -133,7 +132,6 @@ pub(super) fn command_context(
         code_swarm_model_choices,
         effort_choices: effort_choices(parts.current_effort, provider, model),
         theme_choices: theme_choices(parts.current_theme),
-        resume_items: resume_items_from_home(parts.current_session_id.as_deref()),
         checkpoint_items: parts.checkpoint_items,
         extension_items: parts.extension_items,
         extension_slash_commands: parts.extension_slash_commands,
@@ -270,7 +268,10 @@ fn ensure_current_model_choice(
     choices.push(ModelChoice::current(current_provider, current_model));
 }
 
-fn resume_items_from_home(current_session_id: Option<&str>) -> Vec<ResumeItem> {
+/// Lists every session record under the Euler home — full-store disk work —
+/// so this must only run on user-initiated picker opens, never inside
+/// `command_context` rebuilds (which sit on the submit/turn-end hot path).
+pub(super) fn resume_items_from_home(current_session_id: Option<&str>) -> Vec<ResumeItem> {
     let Ok(home) = EulerHome::resolve() else {
         return Vec::new();
     };

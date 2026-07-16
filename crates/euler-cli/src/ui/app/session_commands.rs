@@ -204,7 +204,15 @@ impl AppCore {
                 // immediately even if the store refresh fails.
                 self.status.session_name = Some(normalized.clone());
                 self.rebuild_bottom_surface();
-                let message = match self.refresh_current_session_metadata(&session_id) {
+                // A rename is a user-initiated lifecycle point: run the
+                // projecting refresh so the sidecar picks the new name up
+                // from the rename event (the turn-boundary path only touches
+                // recency and would leave the sidecar name stale).
+                let refreshed = self.session_store().and_then(|store| {
+                    store.refresh_session_metadata(&session_id)?;
+                    Ok(())
+                });
+                let message = match refreshed {
                     Ok(()) => format!("session named {normalized}"),
                     Err(error) => {
                         format!("session named {normalized}; metadata refresh failed: {error}")
