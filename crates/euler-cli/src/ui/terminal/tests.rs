@@ -2440,6 +2440,90 @@ mod terminal_tests {
         );
     }
 
+    /// Cursor-authority hardening (draw path). A successful draw establishes
+    /// authority; a subsequent terminal write that fails must NOT leave a stale
+    /// `true` behind. Otherwise the next scrollback commit would derive the
+    /// cursor from `last_known_cursor_pos` — the spot the *successful* draw
+    /// parked at — even though the failed write may have moved the physical
+    /// cursor. Authority must drop so the retry re-queries (`ESC[6n`) instead.
+    #[test]
+    fn failed_write_after_draw_drops_cursor_authority() {
+        let backend = VT100Backend::new(40, 12);
+        let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
+        let frame = VisualCanvasFrame {
+            active_frame_lines: vec![CanvasLine::plain("live"), CanvasLine::plain("status")],
+            cursor: None,
+            required_height: 2,
+            history_rows: 0,
+            history_item_offsets: Vec::new(),
+            prefer_stable_height: false,
+            committable_rows: 0,
+            pinned_rows: 0,
+        };
+
+        // A successful draw parks the cursor at a known position and marks the
+        // tracked position authoritative.
+        terminal.draw_visual_frame(&frame).expect("initial draw");
+        assert!(
+            terminal.cursor_position_authoritative(),
+            "a successful draw must establish cursor authority",
+        );
+
+        // The next draw fails on its first cursor-moving write. `set_write_error`
+        // forces the backend to reject writes/flushes — standing in for a
+        // partial or failed terminal write, after which the physical cursor
+        // position is no longer knowable.
+        terminal.backend_mut().set_write_error(true);
+        terminal
+            .draw_visual_frame(&frame)
+            .expect_err("forced write failure must surface");
+        terminal.backend_mut().set_write_error(false);
+
+        // The retry must not trust the stale tracked position: authority is now
+        // false, which forces the next commit down the DSR-query branch.
+        assert!(
+            !terminal.cursor_position_authoritative(),
+            "a failed terminal write must drop cursor authority, not leave a stale `true`",
+        );
+
+        // A clean redraw re-establishes authority.
+        terminal
+            .draw_visual_frame(&frame)
+            .expect("redraw after recovery");
+        assert!(
+            terminal.cursor_position_authoritative(),
+            "a successful redraw must re-establish cursor authority",
+        );
+    }
+
+    /// Cursor-authority hardening (replay path). `reset_for_history_replay`
+    /// parks the cursor at the origin and marks it authoritative, but a replay
+    /// whose clear writes fail never actually parks the cursor — so it must not
+    /// leave the `true` from a prior successful replay standing.
+    #[test]
+    fn failed_history_replay_drops_cursor_authority() {
+        let backend = VT100Backend::new(40, 12);
+        let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
+
+        terminal
+            .reset_for_history_replay(false)
+            .expect("initial replay");
+        assert!(
+            terminal.cursor_position_authoritative(),
+            "a successful replay must establish cursor authority",
+        );
+
+        terminal.backend_mut().set_write_error(true);
+        terminal
+            .reset_for_history_replay(false)
+            .expect_err("forced write failure must surface");
+        terminal.backend_mut().set_write_error(false);
+        assert!(
+            !terminal.cursor_position_authoritative(),
+            "a failed replay must drop cursor authority, not leave a stale `true`",
+        );
+    }
+
     fn row_containing(rows: &[String], needle: &str) -> usize {
         rows.iter()
             .position(|row| row.contains(needle))
