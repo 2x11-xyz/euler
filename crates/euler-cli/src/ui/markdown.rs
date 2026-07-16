@@ -13,6 +13,10 @@ use ratatui::{
 };
 use std::{borrow::Cow, ops::Range};
 
+/// §4.1a: the code-block left rail — one continuous hairline (`▏`, U+258F),
+/// the same glyph the thinking and diff bodies use, plus one space of inset.
+const CODE_RAIL: &str = "▏ ";
+
 // Grid tables are useful up to a modest column count when each column still has
 // enough room to wrap readably. Beyond that, use a stacked shape rather than
 // squeezing many narrow columns into unreadable rows. Committed terminal
@@ -101,6 +105,11 @@ struct Renderer<'a> {
     lists: Vec<ListState>,
     code_block: bool,
     code_language: String,
+    /// §4.1a: the language tag rides the block's first code line (a faint
+    /// right-corner tag), not a heading above it. True until that line is
+    /// emitted, which survives streaming (code arrives across several
+    /// `push_code_lines` calls).
+    code_first_line: bool,
     heading: Option<HeadingLevel>,
     quote_depth: usize,
     table: Option<TableState>,
@@ -123,6 +132,7 @@ impl<'a> Renderer<'a> {
             lists: Vec::new(),
             code_block: false,
             code_language: String::new(),
+            code_first_line: false,
             heading: None,
             quote_depth: 0,
             table: None,
@@ -237,18 +247,16 @@ impl<'a> Renderer<'a> {
                 .to_owned(),
             CodeBlockKind::Indented => String::new(),
         };
-        if !self.code_language.is_empty() {
-            self.lines.push(Line::from(Span::styled(
-                format!("    {}", self.code_language),
-                self.theme.transcript.gutter,
-            )));
-        }
+        // §4.1a: no language heading line above the block — the tag rides the
+        // first code line's right corner instead (see `push_code_lines`).
+        self.code_first_line = true;
     }
 
     fn end_code_block(&mut self) {
         self.flush_current();
         self.code_block = false;
         self.code_language.clear();
+        self.code_first_line = false;
     }
 
     fn start_heading(&mut self, level: HeadingLevel) {
@@ -299,20 +307,53 @@ impl<'a> Renderer<'a> {
     }
 
     fn push_code_lines(&mut self, text: &str) {
-        for line in text.split_inclusive('\n') {
-            let line = line.strip_suffix('\n').unwrap_or(line);
-            self.current.push(Span::styled(
-                "    ".to_owned(),
-                self.theme.scopes.markup.code,
+        // §4.1a: one continuous left hairline (the same rail as thinking and
+        // diff bodies), code behind it, no background fill. Each logical code
+        // line is one rendered row — code is preformatted, so it clips rather
+        // than wraps (wrapping would break the rail's alignment and the code's
+        // own indentation). Rendered directly rather than through the prose
+        // wrap path, which paints prefixes unstyled and so can't colour a rail.
+        self.flush_current();
+        let quote = quote_prefix(self.quote_depth);
+        for raw in text.split_inclusive('\n') {
+            let line = raw.strip_suffix('\n').unwrap_or(raw);
+            let mut spans = Vec::new();
+            if !quote.is_empty() {
+                spans.push(Span::styled(quote.clone(), self.theme.transcript.gutter));
+            }
+            spans.push(Span::styled(
+                CODE_RAIL.to_owned(),
+                Style::default().fg(self.theme.palette.composer_rule),
             ));
-            self.current
-                .extend(super::syntax::highlight_markdown_code_line(
-                    &self.code_language,
-                    line,
-                    self.theme,
-                ));
-            self.flush_current();
+            spans.extend(super::syntax::highlight_markdown_code_line(
+                &self.code_language,
+                line,
+                self.theme,
+            ));
+            if std::mem::take(&mut self.code_first_line) && !self.code_language.is_empty() {
+                self.append_language_tag(&mut spans);
+            }
+            self.lines.push(Line::from(spans));
         }
+    }
+
+    /// Right-align the faint language tag on the first code line. Dropped
+    /// silently when the line is already too wide to seat it — the tag is a
+    /// nicety, never worth pushing the code off-screen or wrapping the row.
+    fn append_language_tag(&self, spans: &mut Vec<Span<'static>>) {
+        let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
+        let tag_width = display_width(&self.code_language);
+        let Some(pad) = usize::from(self.width)
+            .checked_sub(used + tag_width + 1)
+            .filter(|pad| *pad >= 1)
+        else {
+            return;
+        };
+        spans.push(Span::styled(" ".repeat(pad), self.theme.transcript.gutter));
+        spans.push(Span::styled(
+            self.code_language.clone(),
+            self.theme.transcript.gutter,
+        ));
     }
 
     fn push_style(&mut self, style: Style) {
