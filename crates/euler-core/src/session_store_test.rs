@@ -268,9 +268,7 @@ fn refresh_preserves_newer_index_timestamp_when_sidecar_is_stale() {
 fn listing_backfills_projection_cache_and_reuses_it_without_projecting() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");
-    store
-        .name_session(record.id(), "event name")
-        .expect("name");
+    store.name_session(record.id(), "event name").expect("name");
 
     // First listing projects from events and backfills the cache key.
     let listed = store
@@ -278,15 +276,19 @@ fn listing_backfills_projection_cache_and_reuses_it_without_projecting() {
         .expect("find")
         .expect("record");
     assert_eq!(listed.name(), Some("event name"));
-    let sidecar: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(record.session_json_path()).expect("sidecar"),
-    )
-    .expect("json");
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
     assert!(sidecar["projected_events_len"].is_u64());
     assert!(sidecar["projected_events_modified_ns"].is_u64());
 
-    // Hand-edit the cached name while keeping the key: a hit must serve the
-    // sidecar fields verbatim, proving the event log was not re-projected.
+    // Hand-edit the cached name while keeping the key. Within a matching
+    // key the cache is served verbatim — the observation here is the proof
+    // that the event log was NOT re-projected on a warm hit. This is the
+    // documented trust boundary (docs/contracts/events.md,
+    // `session.renamed`): event authority is enforced at projection time,
+    // not on every read, and a tampered sidecar is out of the integrity
+    // model until the log next changes (asserted below).
     let mut edited = sidecar.clone();
     edited["name"] = serde_json::Value::String("cached name".to_owned());
     fs::write(
@@ -323,10 +325,9 @@ fn invalid_projection_is_never_cached_and_can_recover() {
         .expect("find")
         .expect("record");
     assert_eq!(listed.status(), SessionStatus::Invalid);
-    let sidecar: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(record.session_json_path()).expect("sidecar"),
-    )
-    .expect("json");
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
     assert!(sidecar.get("projected_events_len").is_none());
 
     // Repairing the log recovers on the next listing — nothing pinned the
@@ -352,10 +353,9 @@ fn touch_preserves_projection_cache_fields() {
         .touch_session_updated_at(record.id())
         .expect("touch metadata");
 
-    let sidecar: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(record.session_json_path()).expect("sidecar"),
-    )
-    .expect("json");
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
     assert!(sidecar["projected_events_len"].is_u64());
     assert!(sidecar["projected_events_modified_ns"].is_u64());
 }

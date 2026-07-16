@@ -627,6 +627,14 @@ struct SessionMetadata {
     /// reads and integrity-checks the whole log plus its blobs). Absent on
     /// sidecars written before this cache existed and after an Invalid
     /// projection (never cached, so integrity errors stay re-checked).
+    ///
+    /// Trust boundary (docs/contracts/events.md, `session.renamed`): the
+    /// events remain the sole naming/root authority, enforced at projection
+    /// time rather than on every read. Within a matching key the cached
+    /// fields are served verbatim, so a hand-edited sidecar can misreport
+    /// display fields until the log next changes — the same actor could edit
+    /// the log itself, so this stays inside the store's existing trust
+    /// boundary. Any log append/rewrite moves the key and re-projects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     projected_events_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
