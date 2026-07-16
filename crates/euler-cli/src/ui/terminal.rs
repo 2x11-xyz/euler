@@ -326,6 +326,14 @@ where
     /// derive the cursor from tracked state or pay the blocking round-trip.
     /// In steady state (draw → commit → draw …) the flag is always `true`, so
     /// a normal streamed turn issues zero `ESC[6n` queries.
+    ///
+    /// Failure story: every cursor-moving path drops authority to `false`
+    /// BEFORE its first cursor-moving write and restores `true` only after the
+    /// final write and flush have succeeded. A write that fails partway (`?`
+    /// out of a queue or flush, possibly after bytes were already flushed)
+    /// therefore leaves authority `false`, never a stale `true` left over from
+    /// the position the aborted write started from — so the retry re-queries
+    /// instead of trusting a cursor position it never actually reached.
     cursor_position_authoritative: bool,
     foreground: RatatuiColor,
     background: RatatuiColor,
@@ -421,6 +429,12 @@ where
         let area = self.viewport_area;
         let screen_size = self.inner.size()?;
         let cursor_authoritative = self.cursor_position_authoritative;
+        // Drop authority before the first cursor-moving write below; it is
+        // restored to `true` only after the final flush succeeds (see the field
+        // doc's failure story). If any queue or the flush fails with `?`, the
+        // flag stays false so the next commit re-queries instead of trusting a
+        // position this aborted write never finished reaching.
+        self.cursor_position_authoritative = false;
         let writer = self.inner.backend_mut();
         queue_clear_area(writer, area, self.background)?;
         queue!(writer, MoveTo(0, area.top()))?;
@@ -464,9 +478,9 @@ where
         self.last_known_screen_size = screen_size;
         self.last_reported_resize_size = screen_size;
         self.last_known_cursor_pos = cursor_pos;
-        // Whether derived or queried, the cursor now sits at `cursor_pos` (the
-        // deterministic print loop ended there, or the query reported it): the
-        // tracked position is authoritative again.
+        // The final flush above succeeded and, whether derived or queried, the
+        // cursor now sits at `cursor_pos` (the deterministic print loop ended
+        // there, or the query reported it): restore authority.
         self.cursor_position_authoritative = true;
         let height = self
             .viewport_area
@@ -494,7 +508,15 @@ where
         else {
             return Ok(false);
         };
-        let cursor_pos = if self.cursor_position_authoritative {
+        // Capture, then drop, authority before the first cursor-moving write
+        // below; it is restored to `true` only after the trailing MoveTo and
+        // flush succeed (see the field doc's failure story). A `?` out of the
+        // emit loop or the flush then leaves the flag false, so the next commit
+        // re-queries instead of trusting a position this aborted write never
+        // finished reaching.
+        let cursor_authoritative = self.cursor_position_authoritative;
+        self.cursor_position_authoritative = false;
+        let cursor_pos = if cursor_authoritative {
             // Steady state: the preceding draw (or a replay, or the prior
             // commit) parked the cursor at a known position and nothing
             // untracked has moved it since, so `last_known_cursor_pos` is
@@ -536,10 +558,11 @@ where
         self.last_known_screen_size = screen_size;
         self.last_reported_resize_size = screen_size;
         self.last_known_cursor_pos = cursor_pos;
-        // The trailing `MoveTo` restored the cursor to `cursor_pos`, so the
-        // tracked position is exact again. (The following draw fully repaints
-        // anyway — `invalidate_draw_cache` forces it — but keep the invariant
-        // truthful in its own right.)
+        // The flush above succeeded and the trailing `MoveTo` restored the
+        // cursor to `cursor_pos`, so the tracked position is exact again:
+        // restore authority. (The following draw fully repaints anyway —
+        // `invalidate_draw_cache` forces it — but keep the invariant truthful
+        // in its own right.)
         self.cursor_position_authoritative = true;
         self.invalidate_draw_cache();
         Ok(true)
@@ -824,6 +847,13 @@ where
             metrics::record(metrics::Metric::ScrollbackPurge);
         }
         let screen_size = self.inner.size()?;
+        // Drop authority before the first cursor-moving queue below; it is
+        // restored to `true` only once every queue has succeeded (see the field
+        // doc's failure story). A `?` out of any queue then leaves the flag
+        // false rather than a stale `true` from a prior replay, so the next
+        // commit re-queries instead of trusting an origin this aborted replay
+        // never actually parked the cursor at.
+        self.cursor_position_authoritative = false;
         let writer = self.inner.backend_mut();
         queue_span_style(writer, Style::default(), self.foreground, self.background)?;
         if purge_scrollback {
@@ -842,6 +872,8 @@ where
         self.last_known_screen_size = screen_size;
         self.last_reported_resize_size = screen_size;
         self.last_known_cursor_pos = Position::ORIGIN;
+        // Every queue above succeeded: the clear parks the cursor at the origin
+        // (its bytes flush with the next commit), so restore authority.
         self.cursor_position_authoritative = true;
         self.committed_active_rows = 0;
         self.committed_history_items = 0;
@@ -905,6 +937,11 @@ where
     #[cfg(test)]
     pub(crate) fn viewport_area(&self) -> Rect {
         self.viewport_area
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_position_authoritative(&self) -> bool {
+        self.cursor_position_authoritative
     }
 
     fn queried_cursor_position(&mut self) -> io::Result<Position> {
@@ -1035,6 +1072,13 @@ where
         let repaint_screen_background = self.last_background_fill != Some(background_fill_key);
         let last_area = self.last_drawn_area;
         let last_lines = self.last_drawn_lines.clone();
+        // Drop authority before the first cursor-moving write below; it is
+        // restored to `true` only after the final flush parks the cursor at a
+        // known spot (see the field doc's failure story). A `?` out of any
+        // queue or the flush then leaves the flag false rather than a stale
+        // `true` from a prior draw or replay, so the next commit re-queries
+        // instead of trusting a position this aborted draw never reached.
+        self.cursor_position_authoritative = false;
         let writer = self.inner.backend_mut();
         queue!(writer, Hide)?;
         for row in 0..area.height {
@@ -1096,11 +1140,12 @@ where
             .take(usize::from(area.height))
             .cloned()
             .collect();
-        // The draw parked the physical cursor at `parked_cursor`, and nothing
-        // untracked runs before the next commit, so the tracked position is
-        // authoritative: the next finalized-write/bridge commit restores the
-        // cursor from it with no DSR round-trip. This is the per-frame write
-        // that keeps a normal streamed turn zero-DSR.
+        // The final flush above succeeded: the draw parked the physical cursor
+        // at `parked_cursor`, and nothing untracked runs before the next
+        // commit, so the tracked position is authoritative again — the next
+        // finalized-write/bridge commit restores the cursor from it with no DSR
+        // round-trip. This is the per-frame write that keeps a normal streamed
+        // turn zero-DSR.
         self.last_known_cursor_pos = parked_cursor;
         self.cursor_position_authoritative = true;
         Ok(())
