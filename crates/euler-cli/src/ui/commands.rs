@@ -90,16 +90,6 @@ impl ExtensionCommandItem {
 }
 
 impl ExtensionManagerItem {
-    pub fn label(&self) -> String {
-        let mark = if self.enabled { "●" } else { "○" };
-        let kind = if self.bundled {
-            "bundled"
-        } else {
-            self.materialization.as_deref().unwrap_or("linked")
-        };
-        format!("{mark} {}  ({kind})", self.id)
-    }
-
     pub fn details_text(&self) -> String {
         let mut lines = vec![
             format!("{}  v{}", self.display_name, self.version),
@@ -395,6 +385,11 @@ pub enum PermissionPosture {
     FullAccess,
 }
 
+/// §5.1 envelope for per-capability modes that match no posture. Named rather
+/// than inlined so `/status` and the picker title cannot drift apart on what
+/// "no posture describes this" is called.
+pub const CUSTOM_PERMISSION_ENVELOPE: &str = "custom · per-capability modes";
+
 impl PermissionPosture {
     pub const ALL: [Self; 3] = [Self::ReadOnly, Self::AskEveryTime, Self::FullAccess];
 
@@ -429,6 +424,49 @@ impl PermissionPosture {
             Self::AskEveryTime => ApprovalMode::Ask,
             Self::FullAccess => ApprovalMode::SessionAllow,
         }
+    }
+
+    /// The posture and its envelope, in one line (§5.1). It states the
+    /// envelope and never just the name, so the boundary in force is legible
+    /// without cross-referencing what the posture means. Sandbox diagnostics
+    /// and mount paths never appear here (ADR 0014).
+    ///
+    /// The envelope describes what the gate *effectively* does, not the mode
+    /// it was configured with. Under `Ask` an operation runs without a prompt
+    /// when a durable grant already covers it, or when it is a statically-safe
+    /// shell command (`tool_dispatch.rs`, issue #78) — so "every capability
+    /// asks" would be a comfortable lie in the one line whose whole job is to
+    /// be exact about the boundary.
+    pub fn envelope(self) -> &'static str {
+        match self {
+            // Reads are session-allowed; everything else is AlwaysDeny, which
+            // is never softened by a grant — grants are consulted under Ask.
+            Self::ReadOnly => "Read only · reads allowed · writes, commands, and network denied",
+            Self::AskEveryTime => {
+                "Ask every time · uncovered operations ask · durable grants and \
+                 statically-safe commands run without one"
+            }
+            Self::FullAccess => "Full access · unsandboxed · every capability allowed this session",
+        }
+    }
+
+    /// The posture currently in effect, if the session's per-capability modes
+    /// match one exactly. `None` means the modes were tuned individually under
+    /// Advanced and no posture describes them — the radio then shows nothing
+    /// current, which is honest: claiming a posture the gate isn't actually
+    /// enforcing is worse than showing none.
+    pub fn active(
+        mode_for_capability: impl Fn(Capability) -> Option<ApprovalMode>,
+    ) -> Option<Self> {
+        let modes = Capability::ALL
+            .iter()
+            .map(|capability| mode_for_capability(*capability).map(|mode| (*capability, mode)))
+            .collect::<Option<Vec<_>>>()?;
+        Self::ALL.into_iter().find(|posture| {
+            modes
+                .iter()
+                .all(|(capability, mode)| posture.mode_for(*capability) == *mode)
+        })
     }
 }
 
@@ -503,6 +541,8 @@ pub enum CommandAction {
     PermissionSandboxUnavailable,
     /// Open the permissions picker with live session/project grants.
     OpenPermissions,
+    /// §5.1: drill into the per-capability controls from the posture picker.
+    OpenPermissionsAdvanced,
     RevokeGrant {
         capability: Capability,
         pattern: String,
@@ -579,6 +619,8 @@ pub enum PickerSpec {
     CausalDagActions(CausalDagStats),
     CausalDagFormats(CausalDagStats),
     Compaction(CompactionSettings),
+    /// §5.1 Advanced, one level down from the posture picker.
+    PermissionsAdvanced(Vec<PermissionChoice>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -587,8 +629,18 @@ pub enum PermissionChoice {
         posture: PermissionPosture,
         label: String,
         detail: String,
+        /// Whether this posture is the one currently in effect — drives the
+        /// `●`/`○` radio (§5.1).
+        current: bool,
     },
     Unavailable {
+        label: String,
+        detail: String,
+    },
+    /// §5.1: the one nested-entry row under the postures. Opens the existing
+    /// per-capability controls one level down, rather than spilling them into
+    /// the posture list.
+    Advanced {
         label: String,
         detail: String,
     },
@@ -875,12 +927,18 @@ pub fn dispatch_command(input: &str, context: &CommandContext) -> CommandEffect 
 
 #[cfg(test)]
 pub fn permission_choices() -> Vec<PermissionChoice> {
-    permission_choices_with_grants(&[])
+    permission_choices_with_state(&[], None)
 }
 
-/// Quick session postures, active grants, then per-capability advanced modes.
-pub fn permission_choices_with_grants(
+/// §5.1: the posture picker's rows — four plain-language session postures and
+/// the one nested Advanced entry. Day to day a user picks a posture and moves
+/// on; the per-capability controls live in [`permission_advanced_choices`].
+/// `active` is the posture currently in effect (see
+/// [`PermissionPosture::active`]); `None` renders no filled radio, which is
+/// what a hand-tuned Advanced configuration honestly is.
+pub fn permission_choices_with_state(
     grants: &[(GrantSource, ActiveGrant)],
+    active: Option<PermissionPosture>,
 ) -> Vec<PermissionChoice> {
     let mut choices = PermissionPosture::ALL
         .into_iter()
@@ -888,32 +946,51 @@ pub fn permission_choices_with_grants(
             posture,
             label: posture.label().to_owned(),
             detail: posture.detail().to_owned(),
+            current: active == Some(posture),
         })
         .collect::<Vec<_>>();
+    // Shown, never hidden, so the roadmap stays legible — but not selectable
+    // until a verified Linux workspace-sandbox backend exists (ADR 0014).
     choices.push(PermissionChoice::Unavailable {
         label: "Auto in workspace sandbox (not available)".to_owned(),
         detail: "requires the Linux workspace sandbox; selecting this does not change permissions"
             .to_owned(),
     });
-    choices.extend(grants.iter().map(|(source, grant)| {
-        let pattern = grant.pattern.as_str();
-        let pattern_label = if pattern.is_empty() {
-            "all".to_owned()
-        } else {
-            format!("{pattern}*")
-        };
-        PermissionChoice::Revoke {
-            capability: grant.capability,
-            pattern: pattern.to_owned(),
-            source: *source,
-            label: format!(
-                "Revoke {} {} ({})",
-                source.as_str(),
-                grant.capability.as_str(),
-                pattern_label
-            ),
-        }
-    }));
+    choices.push(PermissionChoice::Advanced {
+        label: "Advanced capability settings ›".to_owned(),
+        detail: format!(
+            "per-capability modes, matching rules, and revocation · {} active grant(s)",
+            grants.len()
+        ),
+    });
+    choices
+}
+
+/// §5.1 Advanced: per-capability grants, revocation, and policy detail. Still
+/// available, one level down — no longer the primary mental model.
+pub fn permission_advanced_choices(grants: &[(GrantSource, ActiveGrant)]) -> Vec<PermissionChoice> {
+    let mut choices = grants
+        .iter()
+        .map(|(source, grant)| {
+            let pattern = grant.pattern.as_str();
+            let pattern_label = if pattern.is_empty() {
+                "all".to_owned()
+            } else {
+                format!("{pattern}*")
+            };
+            PermissionChoice::Revoke {
+                capability: grant.capability,
+                pattern: pattern.to_owned(),
+                source: *source,
+                label: format!(
+                    "Revoke {} {} ({})",
+                    source.as_str(),
+                    grant.capability.as_str(),
+                    pattern_label
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
     choices.extend(Capability::ALL.iter().copied().flat_map(permission_modes));
     choices
 }

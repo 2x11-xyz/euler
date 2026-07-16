@@ -495,17 +495,21 @@ fn file_diff_line_style(kind: FileDiffLineKind, theme: &Theme) -> Style {
     }
 }
 
+/// Codex vocabulary (§4): every arm opens with a bold capitalized verb, so
+/// the file-diff cell reads the same as the edit cell it sits beside. (The
+/// `add`/`modify` arms were the last lowercase holdouts here — `Deleted` and
+/// `Changed` were already capitalized.)
 fn file_diff_title(path: &str, action: &str, stats: Option<(usize, usize)>) -> String {
     match (action, stats) {
-        ("add", Some((added, _))) => format!("write {path} · new · {added} lines"),
+        ("add", Some((added, _))) => format!("Wrote {path} · new · {added} lines"),
         ("delete", Some((_, removed))) => format!("Deleted {path} (-{removed})"),
         ("modify" | "update", Some((added, removed))) => {
-            format!("edit {path} · +{added} −{removed}")
+            format!("Edited {path} · +{added} −{removed}")
         }
         (_, Some((added, removed))) => format!("Changed {path} (+{added} -{removed})"),
-        ("add", None) => format!("write {path} · new"),
+        ("add", None) => format!("Wrote {path} · new"),
         ("delete", None) => format!("Deleted {path}"),
-        ("modify" | "update", None) => format!("edit {path}"),
+        ("modify" | "update", None) => format!("Edited {path}"),
         _ => format!("Changed {path}"),
     }
 }
@@ -567,7 +571,7 @@ mod tests {
         assert_eq!(line_text(&deleted), "   1 - old");
         assert_eq!(inserted.spans.len(), 4);
         assert_eq!(deleted.spans.len(), 4);
-        assert_eq!(inserted.spans[0].style.fg, theme.scopes.diff.context.fg);
+        assert_eq!(inserted.spans[0].style.fg, theme.scopes.diff.line_number.fg);
         assert_eq!(inserted.spans[1].content.as_ref(), "+");
         assert_eq!(inserted.spans[1].style, theme.scopes.diff.inserted);
         assert_eq!(inserted.spans[3].content.as_ref(), "new");
@@ -578,6 +582,10 @@ mod tests {
         assert_eq!(deleted.spans[3].style, theme.scopes.diff.deleted_body);
     }
 
+    /// Spec §4.1: semantics ride on the sign column + luminance only, so a
+    /// diff must survive any user theme unchanged with nothing to re-tune.
+    /// A background fill would have to be re-blended per theme to stay
+    /// legible — so no row, and no span within a row, may carry one.
     #[test]
     fn file_diff_sign_only_styles_hold_for_light_theme() {
         let theme = Theme::default_light();
@@ -585,11 +593,16 @@ mod tests {
         let deleted = rendered_row("-old", &theme, "src/lib.rs", false);
 
         assert_eq!(inserted.spans[1].style, theme.scopes.diff.inserted);
-        assert_eq!(inserted.spans[1].style.bg, Some(theme.palette.added_tint));
         assert_eq!(inserted.spans[3].style, theme.scopes.diff.inserted_body);
         assert_eq!(deleted.spans[1].style, theme.scopes.diff.deleted);
-        assert_eq!(deleted.spans[1].style.bg, Some(theme.palette.removed_tint));
         assert_eq!(deleted.spans[3].style, theme.scopes.diff.deleted_body);
+
+        for row in [&inserted, &deleted] {
+            assert_eq!(row.style.bg, None, "row-fill background: {row:?}");
+            for span in &row.spans {
+                assert_eq!(span.style.bg, None, "span background: {span:?}");
+            }
+        }
     }
 
     #[test]
@@ -765,7 +778,7 @@ mod tests {
 
         assert_eq!(inserted.spans.len(), 4);
         assert_eq!(inserted.spans[1].style, theme.scopes.diff.inserted);
-        assert_eq!(inserted.spans[2].style.fg, theme.scopes.diff.context.fg);
+        assert_eq!(inserted.spans[2].style.fg, theme.scopes.diff.line_number.fg);
         assert_eq!(inserted.spans[3].style, theme.scopes.diff.inserted_body);
     }
 

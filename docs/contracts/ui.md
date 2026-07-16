@@ -45,19 +45,53 @@ emission + unrelated renderers.
 
 ### Ledger layout
 
-- Default **two-column** transcript: fixed **9-character** timestamp gutter
-  (`HH:MM:SS`, faint) + content column. Gutter is toggleable via user pref
-  (`/timestamps`); hairlines and layout rules otherwise unchanged.
-- **Hairline** under each **meaningful** event. Meaningful events include:
-  user message, assistant prose block, tool group, decision record, companion
-  block, resume boundary, interrupt/failure top-level records.
-- **Not** meaningful (no own timestamp/hairline): tool children, output tails,
-  live shell tail lines, nested thinking body, queued-input rows.
+- Default **single-column** transcript on a **2-character anchor spine**: one
+  glyph anchor at column 0 per event (`•` default, `✱` thinking, `✓`/`✗`
+  decision records, `◆` companion, `↩` revert, `■` interrupt), then content.
+  User messages are the exception — the `▌` rail replaces the anchor.
+- Timestamps are **off by default**. `/timestamps` opts into a fixed
+  **9-character** left gutter (`HH:MM:SS`, faint) beside the spine; the whole
+  column shifts right together so composer and transcript keep one left edge.
+  Timestamps always exist per-event in provenance regardless of the setting.
+- Separation is the spine **plus one blank line** between events. There is
+  **no hairline per event**. The only horizontal rules in the flow are turn
+  dividers (`── Worked for Ns ──`) and the composer rule.
+- Sub-steps (tool children, output tails, live shell tail lines, nested
+  thinking body, queued-input rows) indent under `├`/`└` and never get their
+  own anchor.
 - **No box-drawing borders** in the flow. **Exception:** approval panels
   (single 1px attention-role border).
-- Tool groups use lowercase verb headers (e.g. `explore · N steps · Ts`) and
-  `├` / `└` children with per-step result data.
+- Tool groups use the **Codex vocabulary**: a **bold capitalized** verb, and
+  `├`/`└` children each opening with a bold capitalized sub-verb (`Read`,
+  `Search`, `List`) + target. The group header is the **verb alone**
+  (`Explored`) — no step count, no duration — and children carry **no
+  per-step result data** (no `· 84 lines`, no `· 0 matches`). Repeated reads
+  fold onto one row: `Read a.rs, b.rs, c.rs`. This supersedes the earlier
+  lowercase `explore · N steps · Ts` phrasing (design review v3 §R3).
 - Fold marker language: `… N more lines · ctrl+o expand` (and matching collapse).
+
+### Diff rendering
+
+Diffs use a **sign + luminance** model with **no background fills**, so they
+survive no-color terminals and any user theme unchanged, with nothing to
+re-tune per theme. (This supersedes the earlier `added_tint`/`removed_tint`
+row-fill approach: a tint has to be re-blended per terminal theme to stay
+legible and fights user palettes.)
+
+- Columns: a **4-char right-aligned faint line-number** column (added/context
+  use new-file numbering, removed use old-file numbering), a **1-char sign**
+  column (`+` green / `-` dim red / blank for context), then code with
+  indentation preserved verbatim. The sign column is **ASCII** (`+` / `-`):
+  it is diff syntax, not typography — a row copied out of the transcript has
+  to paste back as a valid diff, which a Unicode minus (`−`, U+2212) breaks.
+  The diffstat below is prose and does use `−`.
+- **Added** rows: normal luminance with full syntax highlighting — they read
+  like a normal code block. Added code is the star.
+- **Removed** rows: the whole row dims to **faint**, with syntax accents
+  suppressed. Removed code is evidence it's gone, not reading material.
+- **Context** rows: `fg` with syntax highlighting, no sign.
+- Semantics ride on the sign column + luminance **only**. No row-fill
+  background anywhere, on any row or any span within a row.
 
 ### Collapsed tool output preview (v4 spec amendment)
 
@@ -65,6 +99,13 @@ Collapsed tool-run blocks use the Codex head+tail preview model. This
 supersedes the earlier "exactly one `└ ` result line" rule (review v2 §14.2)
 and its most-informative-line scoring: the collapsed preview never selects,
 promotes, or reorders lines.
+
+> **Precedence.** This amendment (2026-07-11) **postdates** the Warm Spine
+> design spec v2.1 (2026-07-10), so it wins over that spec's §1/§4 "exactly
+> one `└ ` result line when collapsed" and its §6 "first surfaced output line
+> must be the most informative one". The spec is normative for everything it
+> is current on; it is not current here. Do not "restore" one-line/most-
+> informative selection while reconciling the rest of the spec.
 
 - **Head** = the literal first **2** buffer lines; **tail** = the literal
   last **3** buffer lines; both strictly in buffer order. The tail is where
@@ -100,7 +141,12 @@ promotes, or reorders lines.
 ### Typography
 
 - One mono family (the terminal’s). Hierarchy from color and **weight**, never size.
-- **Bold** only for: user messages, markdown headings, picker/approval titles.
+- **Bold** only for: user messages, markdown headings, picker/approval titles,
+  and the Codex tool verb that opens a ledger row (`Explored`, `Read`,
+  `Search`, `List`, `Git`, `Ran`, `Edited`, `Wrote`, `Deleted`, `Changed`).
+  The verb is a **closed set** (`CODEX_VERBS`) — capitalization alone does not
+  earn bold, or titles like `File added …` and uppercase filenames would take
+  it. Only the verb is bold; the target keeps the row’s own weight.
 - **No bold inside code.**
 - Italic only where specified (e.g. reasoning, hunk headers, comments).
 

@@ -205,6 +205,7 @@ impl AppCore {
         request: ExtensionRunRequest,
         mut session: Box<Session<TuiDecider>>,
     ) {
+        self.snapshot_permission_envelope(&session);
         let (worker_tx, worker_rx) = mpsc::channel();
         let mut worker_request = request.clone();
         let label = request.label();

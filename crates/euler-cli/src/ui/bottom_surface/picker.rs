@@ -77,12 +77,340 @@ pub(super) enum PickerKind {
     CausalDagActions,
     CausalDagFormats,
     Compaction,
+    /// §5.1 Advanced, one level down from the posture picker.
+    PermissionsAdvanced,
 }
 
 impl PickerKind {
     fn searchable(self) -> bool {
         matches!(self, Self::Model | Self::Resume | Self::CodeSwarmModels)
     }
+}
+
+/// §4.2 chrome — the one shape every list-select surface renders in. There is
+/// no second picker style; a new surface fills this in rather than inventing
+/// a layout. The canonical reference is the `/code-swarm` / `/dag view`
+/// submenu.
+struct PickerChrome {
+    /// Scope token — the submenu name, first on the title line.
+    title: String,
+    /// `·`-separated parameters after the title (tier, selection count,
+    /// min/max). The position counter follows them on this same line.
+    params: Vec<String>,
+    /// Footer hint: glyph verbs only, lowercase, `·`-separated. Never prose
+    /// ("Press enter to confirm"), never capitalized word-only hints
+    /// ("Enter select Esc close").
+    footer: String,
+    /// Row shown when type-to-filter matches nothing.
+    empty: &'static str,
+}
+
+impl ReplacementPicker {
+    /// §4.2 state-marker column. `None` means the row carries no state — a
+    /// plain action list, or an action row inside an otherwise stateful list.
+    ///
+    /// Glyph choice follows the row's semantics, not the picker's: `●`/`○`
+    /// reads as "this is the current state", `[x]`/`[ ]` as "these are
+    /// independently selected". Extensions therefore keep `●`/`○` per §5.11
+    /// even though `space` toggles them — enabled/disabled is a state, not a
+    /// selection.
+    fn state_marker(&self, item: &PickerItem) -> Option<&'static str> {
+        let checkbox = if item.current { "[x]" } else { "[ ]" };
+        let dot = if item.current { "●" } else { "○" };
+        // A marker is a claim about the *row*: that it has a state you can be
+        // in. An action row has none, and marking it `○` says it is a posture
+        // you have not chosen — a lie about what ⏎ will do. So the row's own
+        // action decides; only then does the picker's kind pick the glyph.
+        if matches!(
+            item.action,
+            CommandAction::OpenPermissionsAdvanced
+                | CommandAction::PermissionSandboxUnavailable
+                | CommandAction::CompactSession
+        ) {
+            return None;
+        }
+        match self.kind {
+            PickerKind::CodeSwarmModels => Some(checkbox),
+            PickerKind::Compaction => Some(checkbox),
+            PickerKind::Extensions => Some(dot),
+            // §4.2 names the model picker a radio outright — it stays one even
+            // when nothing is current yet (no configured model), because a
+            // caret-only list is exactly the deviation being removed.
+            PickerKind::Model => Some(dot),
+            // Generic is a catch-all: effort/theme/permission postures are
+            // state pickers and carry a current value; a checkpoint or action
+            // list does not, and gets no state column. A posture list with no
+            // current value (hand-tuned under Advanced) still renders the
+            // radio — every option unfilled is the honest reading.
+            PickerKind::Generic if self.is_posture_list() => {
+                matches!(item.action, CommandAction::SetPermissionPosture { .. }).then_some(dot)
+            }
+            PickerKind::Generic => self.items.iter().any(|item| item.current).then_some(dot),
+            PickerKind::Resume
+            | PickerKind::CausalDagActions
+            | PickerKind::CausalDagFormats
+            | PickerKind::PermissionsAdvanced => None,
+        }
+    }
+
+    /// Whether this generic picker is the `/permissions` posture list, which
+    /// §5.1 specifies as a radio regardless of whether any posture currently
+    /// matches the session's modes.
+    fn is_posture_list(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item.action, CommandAction::SetPermissionPosture { .. }))
+    }
+
+    /// The posture currently in effect, for the title line.
+    fn active_posture_label(&self) -> Option<&str> {
+        self.items
+            .iter()
+            .find(|item| {
+                item.current && matches!(item.action, CommandAction::SetPermissionPosture { .. })
+            })
+            .map(|item| item.label.as_str())
+    }
+
+    /// Width of the state-marker column, or 0 when this picker has no state
+    /// column at all. A picker that marks *some* rows pads the rest, so the
+    /// label column stays aligned.
+    fn marker_width(&self) -> usize {
+        self.items
+            .iter()
+            .filter_map(|item| self.state_marker(item))
+            .map(display_width)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn chrome(&self) -> PickerChrome {
+        let selected_count = self.items.iter().filter(|item| item.current).count();
+        match self.kind {
+            PickerKind::CodeSwarmModels => PickerChrome {
+                title: self.title.clone(),
+                params: vec![format!("{selected_count} selected"), "1–5".to_owned()],
+                footer: "↑↓ move · space toggle · ⏎ save · ⌫ back · esc cancel · min 1 · max 5"
+                    .to_owned(),
+                empty: "no matches",
+            },
+            PickerKind::Compaction => {
+                let state = |index: usize| {
+                    if self.items.get(index).is_some_and(|item| item.current) {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                };
+                PickerChrome {
+                    title: "Compaction".to_owned(),
+                    params: vec![
+                        format!("automatic {}", state(1)),
+                        format!("stubs {}", state(2)),
+                    ],
+                    footer: "↑↓ move · space toggle · ⏎ select · esc cancel".to_owned(),
+                    empty: "no matches",
+                }
+            }
+            PickerKind::Extensions => PickerChrome {
+                title: "Extensions".to_owned(),
+                params: vec![format!("{selected_count} enabled")],
+                footer: "↑↓ move · space toggle · a add · x remove · ⏎ details · esc cancel"
+                    .to_owned(),
+                empty: "no matches",
+            },
+            PickerKind::Model => PickerChrome {
+                title: "Model".to_owned(),
+                params: vec!["configured providers only".to_owned()],
+                footer: "↑↓ move · ⏎ select · esc cancel".to_owned(),
+                empty: "no matches",
+            },
+            PickerKind::Resume => PickerChrome {
+                title: "Resume".to_owned(),
+                params: vec!["newest first".to_owned()],
+                footer: "↑↓ move · ⏎ resume · ctrl+o preview · esc cancel".to_owned(),
+                empty: "no matches",
+            },
+            PickerKind::CausalDagFormats => PickerChrome {
+                title: self.title.clone(),
+                params: Vec::new(),
+                footer: "↑↓ move · ⏎ export · ⌫ back · esc cancel".to_owned(),
+                empty: "no matches",
+            },
+            // §5.1: the posture picker's title carries the current state, so
+            // the boundary in force is legible without reading every row.
+            // "Current: custom" is the honest label for modes tuned under
+            // Advanced that no posture describes.
+            PickerKind::Generic if self.is_posture_list() => PickerChrome {
+                title: self.title.clone(),
+                params: vec![format!(
+                    "Current: {}",
+                    self.active_posture_label().unwrap_or("custom")
+                )],
+                footer: "↑↓ move · ⏎ select · esc cancel".to_owned(),
+                empty: "no matches",
+            },
+            PickerKind::PermissionsAdvanced => PickerChrome {
+                title: self.title.clone(),
+                params: Vec::new(),
+                footer: "↑↓ move · ⏎ select · ⌫ back · esc cancel".to_owned(),
+                empty: "no matches",
+            },
+            PickerKind::CausalDagActions | PickerKind::Generic => PickerChrome {
+                title: self.title.clone(),
+                params: Vec::new(),
+                footer: "↑↓ move · ⏎ select · esc cancel".to_owned(),
+                empty: "no matches",
+            },
+        }
+    }
+
+    /// §4.2 anatomy, top to bottom: title line (scope token · params ·
+    /// counter), rows (caret + state marker + label + aligned description
+    /// column), then one footer hint line. The counter never lives below the
+    /// rows and there is never a separate `Filter:` line — the typed query
+    /// echoes inline as a parameter.
+    ///
+    /// `row` renders one line; `selected` drives the full-width select bar,
+    /// which every picker has (selection is never conveyed by caret alone).
+    fn canonical_lines<T>(&self, width: u16, row: impl Fn(String, bool) -> T) -> Vec<T> {
+        let chrome = self.chrome();
+        let cols = usize::from(width);
+        // One hairline separates the picker region from the transcript. The
+        // `/dag` picker used to draw two (above and below the rows); the rule
+        // below the rows was chrome the footer already delimits.
+        let mut lines = vec![row("─".repeat(cols), false)];
+
+        let mut title_parts = vec![chrome.title];
+        title_parts.extend(chrome.params);
+        if !self.query.is_empty() {
+            title_parts.push(format!("/{}", self.query));
+        }
+        title_parts.push(self.position_indicator());
+        lines.push(row(truncate_display(&title_parts.join(" · "), cols), false));
+
+        let visible = self.visible_item_indices();
+        if self.filtered_indices().is_empty() {
+            lines.push(row(truncate_display(chrome.empty, cols), false));
+        }
+        let marker_width = self.marker_width();
+        let label_width = visible
+            .iter()
+            .map(|index| display_width(&self.items[*index].label))
+            .max()
+            .unwrap_or(0);
+        // Group headers show only in the unfiltered list; while filtering, a
+        // row's provenance rides in its description column instead, so a
+        // match never loses its source (§4.2).
+        let show_groups = self.query.is_empty();
+        let mut current_group: Option<&str> = None;
+        for (offset, item_index) in visible.iter().enumerate() {
+            let selected = self.scroll_offset + offset == self.selected;
+            let layout = RowLayout {
+                marker_width,
+                label_width,
+                selected,
+                width: cols,
+            };
+            if show_groups {
+                let group = self.items[*item_index].group.as_deref();
+                if group != current_group {
+                    current_group = group;
+                    if let Some(group) = group {
+                        lines.push(row(truncate_display(&group.to_uppercase(), cols), false));
+                    }
+                }
+            }
+            lines.push(row(self.canonical_row(*item_index, &layout), selected));
+            // Preview / detail (id, root, second-line metadata) renders under
+            // the selected row only.
+            if selected {
+                if let Some(detail) = self.selected_detail() {
+                    lines.push(row(truncate_display(&format!("    {detail}"), cols), false));
+                }
+            }
+        }
+        if let Some(preview) = &self.resume_preview {
+            lines.push(row(
+                truncate_display("    ── ledger tail (read-only) ──", cols),
+                false,
+            ));
+            for line in preview {
+                lines.push(row(truncate_display(&format!("    {line}"), cols), false));
+            }
+        }
+        lines.push(row(truncate_display(&chrome.footer, cols), false));
+        lines
+    }
+
+    /// One row: caret column + optional state marker + primary label +
+    /// aligned description column. Descriptions align in a real column across
+    /// all rows — never an inline `label - desc - value` run, and never the
+    /// value repeated at the end of the row.
+    fn canonical_row(&self, item_index: usize, layout: &RowLayout) -> String {
+        let item = &self.items[item_index];
+        // The selected row is marked `›` — never `→`, never a bare `>`.
+        let caret = if layout.selected { "›" } else { " " };
+        let mut text = format!("{caret} ");
+        if layout.marker_width > 0 {
+            let marker = self.state_marker(item).unwrap_or("");
+            let pad = layout.marker_width.saturating_sub(display_width(marker));
+            text.push_str(&format!("{marker}{} ", " ".repeat(pad)));
+        }
+        let description = self.row_description(item);
+        if description.is_empty() {
+            text.push_str(&item.label);
+        } else {
+            let pad = layout
+                .label_width
+                .saturating_sub(display_width(&item.label));
+            text.push_str(&format!("{}{}  {description}", item.label, " ".repeat(pad)));
+        }
+        truncate_display(&text, layout.width)
+    }
+
+    /// The description column's text. Provenance for extension-provided rows
+    /// rides here as the source name, which survives filtering when the group
+    /// header isn't shown.
+    fn row_description(&self, item: &PickerItem) -> String {
+        let mut parts = Vec::new();
+        if !self.detail_is_metadata() {
+            if let Some(detail) = item.detail.as_deref() {
+                if !detail.is_empty() {
+                    parts.push(detail.to_owned());
+                }
+            }
+        }
+        if let Some(provider) = item.provider_tag.as_deref() {
+            if !provider.is_empty() {
+                parts.push(provider.to_owned());
+            }
+        }
+        // While filtering, the group header isn't shown, so the row carries
+        // its own provenance here — a match must never lose its source.
+        if !self.query.is_empty() {
+            if let Some(group) = item.group.as_deref() {
+                if !group.is_empty() {
+                    parts.push(group.to_owned());
+                }
+            }
+        }
+        // `status` is the row's own right-hand fact (a resume age, an export
+        // suffix). It is not repeated from the label.
+        if let Some(status) = item.status.as_deref() {
+            if !status.is_empty() {
+                parts.push(status.to_owned());
+            }
+        }
+        parts.join(" · ")
+    }
+}
+
+struct RowLayout {
+    marker_width: usize,
+    label_width: usize,
+    selected: bool,
+    width: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,12 +422,6 @@ pub struct PickerItem {
     pub provider_tag: Option<String>,
     pub current: bool,
     pub action: CommandAction,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PickerRenderedRow {
-    pub selected: bool,
-    pub text: String,
 }
 
 impl ReplacementPicker {
@@ -160,6 +482,12 @@ impl ReplacementPicker {
         self.selected
     }
 
+    /// Number of item rows currently on screen (excludes chrome).
+    #[cfg(test)]
+    pub fn visible_row_count(&self) -> usize {
+        self.visible_item_indices().len()
+    }
+
     pub fn position_indicator(&self) -> String {
         let count = self.filtered_indices().len();
         if count == 0 {
@@ -168,204 +496,28 @@ impl ReplacementPicker {
         format!("({}/{count})", self.selected + 1)
     }
 
-    pub fn visible_rows(&self, width: u16) -> Vec<PickerRenderedRow> {
-        self.visible_item_indices()
-            .iter()
-            .enumerate()
-            .map(|(offset, item_index)| {
-                let selected = self.scroll_offset + offset == self.selected;
-                rendered_picker_row(selected, &self.items[*item_index], width)
-            })
-            .collect()
+    /// Every picker renders through the one §4.2 component — there is no
+    /// per-kind layout. Kind-specific text lives in [`Self::chrome`].
+    pub fn render_lines(&self, width: u16) -> Vec<String> {
+        self.canonical_lines(width, |text, _| text)
     }
 
-    pub fn render_lines(&self, width: u16) -> Vec<String> {
-        if self.kind == PickerKind::Model {
-            return self.render_model_lines(width);
-        }
-        if self.kind == PickerKind::Resume {
-            return self.render_resume_lines(width);
-        }
-        if self.kind == PickerKind::Extensions {
-            return self.render_extension_lines(width);
-        }
-        if self.kind == PickerKind::CodeSwarmModels {
-            return self.render_code_swarm_lines(width);
-        }
-        if self.kind == PickerKind::Compaction {
-            return self.render_compaction_lines(width);
-        }
-        if matches!(
-            self.kind,
-            PickerKind::CausalDagActions | PickerKind::CausalDagFormats
-        ) {
-            return self.render_causal_dag_lines(width);
-        }
-        let mut lines = vec![truncate_display(
-            &format!("{} {}", self.title, self.position_indicator()),
-            usize::from(width),
-        )];
-        lines.extend(
-            self.visible_rows(width)
-                .into_iter()
-                .map(|row| row.text)
-                .collect::<Vec<_>>(),
-        );
-        lines.push(truncate_display(
-            " Enter select  Esc close",
-            usize::from(width),
-        ));
-        lines
+    /// Themed variant: identical grammar, with the full-width select bar on
+    /// the focused row (§4.2 — there is no un-highlighted picker).
+    pub(super) fn render_canvas_lines(&self, theme: &Theme, width: u16) -> Vec<CanvasLine> {
+        self.canonical_lines(width, |text, selected| {
+            if selected {
+                select_bar_canvas_line(&text, width, theme)
+            } else {
+                CanvasLine::plain_lossy(text)
+            }
+        })
     }
 
     /// Whether the type-to-filter query is empty — issue #24: `⌫` on an
     /// empty query steps back to the slash palette instead of exiting.
     pub(super) fn query_is_empty(&self) -> bool {
         self.query.is_empty()
-    }
-
-    /// Themed lines for the `/code-swarm` picker, matching the palette's
-    /// select-bar styling (issue #24): full-width select-token background +
-    /// warning-token (gold) text on the highlighted row.
-    pub(super) fn render_code_swarm_canvas_lines(
-        &self,
-        theme: &Theme,
-        width: u16,
-    ) -> Vec<CanvasLine> {
-        let checked = self.items.iter().filter(|item| item.current).count();
-        let mut lines = vec![CanvasLine::plain_lossy(truncate_display(
-            &format!(
-                "{}  ·  {checked} selected · 1–5  {}",
-                self.title,
-                self.position_indicator()
-            ),
-            usize::from(width),
-        ))];
-        if !self.query.is_empty() {
-            lines.push(CanvasLine::plain_lossy(truncate_display(
-                &format!(
-                    " / {}  ·  {} shown · esc clears filter",
-                    self.query,
-                    self.filtered_indices().len()
-                ),
-                usize::from(width),
-            )));
-        }
-        for (offset, item_index) in self.visible_item_indices().iter().enumerate() {
-            let selected = self.scroll_offset + offset == self.selected;
-            let item = &self.items[*item_index];
-            let marker = if selected { "›" } else { " " };
-            let checkbox = if item.current { "[x]" } else { "[ ]" };
-            let text = format!("{marker} {checkbox} {}", item.label);
-            lines.push(if selected {
-                select_bar_canvas_line(&text, width, theme)
-            } else {
-                CanvasLine::plain_lossy(truncate_display(&text, usize::from(width)))
-            });
-        }
-        lines.push(CanvasLine::plain_lossy(truncate_display(
-            &format!(" swarm runs {checked} models in parallel · space toggle · ⏎ save · ⌫ back · esc cancel · min 1 · max 5"),
-            usize::from(width),
-        )));
-        lines
-    }
-
-    fn render_code_swarm_lines(&self, width: u16) -> Vec<String> {
-        let checked = self.items.iter().filter(|item| item.current).count();
-        let mut lines = vec![truncate_display(
-            &format!(
-                "{}  ·  {checked} selected · 1–5  {}",
-                self.title,
-                self.position_indicator()
-            ),
-            usize::from(width),
-        )];
-        if !self.query.is_empty() {
-            lines.push(truncate_display(
-                &format!(
-                    " / {}  ·  {} shown · esc clears filter",
-                    self.query,
-                    self.filtered_indices().len()
-                ),
-                usize::from(width),
-            ));
-        }
-        for (offset, item_index) in self.visible_item_indices().iter().enumerate() {
-            let selected = self.scroll_offset + offset == self.selected;
-            let item = &self.items[*item_index];
-            let marker = if selected { "›" } else { " " };
-            let checkbox = if item.current { "[x]" } else { "[ ]" };
-            lines.push(truncate_display(
-                &format!("{marker} {checkbox} {}", item.label),
-                usize::from(width),
-            ));
-        }
-        lines.push(truncate_display(
-            &format!(" swarm runs {checked} models in parallel · space toggle · ⏎ save · ⌫ back · esc cancel · min 1 · max 5"),
-            usize::from(width),
-        ));
-        lines
-    }
-
-    fn render_extension_lines(&self, width: u16) -> Vec<String> {
-        let mut lines = vec![truncate_display(
-            &format!("Extensions {}", self.position_indicator()),
-            usize::from(width),
-        )];
-        lines.extend(
-            self.visible_rows(width)
-                .into_iter()
-                .map(|row| row.text)
-                .collect::<Vec<_>>(),
-        );
-        lines.push(truncate_display(
-            " space toggle  a add  x remove  Enter details  Esc close",
-            usize::from(width),
-        ));
-        lines
-    }
-
-    fn render_compaction_lines(&self, width: u16) -> Vec<String> {
-        let automatic = self.items.get(1).is_some_and(|item| item.current);
-        let stubs = self.items.get(2).is_some_and(|item| item.current);
-        let mut lines = vec![truncate_display(
-            &format!(
-                "COMPACTION · automatic {} · stubs {}  {}",
-                if automatic { "on" } else { "off" },
-                if stubs { "on" } else { "off" },
-                self.position_indicator()
-            ),
-            usize::from(width),
-        )];
-        for (offset, item_index) in self.visible_item_indices().iter().enumerate() {
-            let selected = self.scroll_offset + offset == self.selected;
-            let item = &self.items[*item_index];
-            let marker = if selected { "›" } else { " " };
-            let checkbox = if *item_index == 0 {
-                "   "
-            } else if item.current {
-                "[✓]"
-            } else {
-                "[ ]"
-            };
-            lines.push(truncate_display(
-                &format!("{marker} {checkbox} {}", item.label),
-                usize::from(width),
-            ));
-            if selected {
-                if let Some(detail) = &item.detail {
-                    lines.push(truncate_display(
-                        &format!("    {detail}"),
-                        usize::from(width),
-                    ));
-                }
-            }
-        }
-        lines.push(truncate_display(
-            " ↑↓ move · ⏎ select/apply · space toggle · esc close",
-            usize::from(width),
-        ));
-        lines
     }
 
     pub(super) fn selected_extension_item(&self) -> Option<ExtensionManagerItem> {
@@ -376,12 +528,15 @@ impl ReplacementPicker {
         let CommandAction::ExtensionDetails { id } = &item.action else {
             return None;
         };
+        // The row's group column is the extension's kind: "bundled", or the
+        // materialization for a linked package.
+        let bundled = item.group.as_deref() == Some("bundled");
         Some(ExtensionManagerItem {
             id: id.clone(),
             display_name: item.label.clone(),
             enabled: item.current,
-            bundled: item.group.as_deref() == Some("bundled"),
-            materialization: item.status.clone(),
+            bundled,
+            materialization: (!bundled).then(|| item.group.clone()).flatten(),
             version: String::new(),
             commands: Vec::new(),
             capabilities: Vec::new(),
@@ -389,152 +544,33 @@ impl ReplacementPicker {
         })
     }
 
-    fn render_resume_lines(&self, width: u16) -> Vec<String> {
-        let filtered_count = self.filtered_indices().len();
-        let position = if filtered_count == 0 {
-            0
-        } else {
-            self.selected + 1
-        };
-        let query = if self.query.is_empty() {
-            "Type to search".to_owned()
-        } else {
-            format!("Search: {}", self.query)
-        };
-        let mut lines = vec![
-            truncate_display("Resume a previous session", usize::from(width)),
-            truncate_display(&query, usize::from(width)),
-        ];
-        lines.extend(
-            self.visible_resume_rows(width)
-                .into_iter()
-                .map(|row| row.text)
-                .collect::<Vec<_>>(),
-        );
-        if filtered_count == 0 {
-            lines.push(truncate_display("No matching sessions", usize::from(width)));
-        }
-        lines.push(truncate_display(
-            &format!("({position}/{filtered_count})  newest first"),
-            usize::from(width),
-        ));
-        if let Some(preview) = &self.resume_preview {
-            lines.push(truncate_display(
-                "── ledger tail (read-only) ──",
-                usize::from(width),
-            ));
-            for line in preview {
-                lines.push(truncate_display(line, usize::from(width)));
-            }
-        }
-        lines.push(truncate_display(
-            "Enter resume  ctrl+o preview  Esc close",
-            usize::from(width),
-        ));
-        lines
-    }
-
-    fn render_model_lines(&self, width: u16) -> Vec<String> {
-        let mut lines = vec![
-            truncate_display("Select Model", usize::from(width)),
-            truncate_display(&format!("Filter: {}", self.query), usize::from(width)),
-            truncate_display(
-                "Only showing models from configured providers. Use /login to add providers.",
-                usize::from(width),
-            ),
-        ];
-        lines.extend(
-            self.visible_model_rows(width)
-                .into_iter()
-                .map(|row| row.text)
-                .collect::<Vec<_>>(),
-        );
-        let filtered_count = self.filtered_indices().len();
-        if filtered_count == 0 {
-            lines.push(truncate_display("No matching models", usize::from(width)));
-        }
-        let position = if filtered_count == 0 {
-            0
-        } else {
-            self.selected + 1
-        };
-        lines.push(truncate_display(
-            &format!("({}/{filtered_count})", position),
-            usize::from(width),
-        ));
-        if let Some(detail) = self.selected_detail() {
-            lines.push(truncate_display(&detail, usize::from(width)));
-        }
-        lines.push(truncate_display(
-            "Press enter to confirm or esc to go back",
-            usize::from(width),
-        ));
-        lines
-    }
-
-    fn visible_model_rows(&self, width: u16) -> Vec<PickerRenderedRow> {
-        self.visible_item_indices()
-            .iter()
-            .enumerate()
-            .map(|(offset, item_index)| {
-                let selected = self.scroll_offset + offset == self.selected;
-                rendered_model_row(selected, &self.items[*item_index], width)
-            })
-            .collect()
-    }
-
-    fn visible_resume_rows(&self, width: u16) -> Vec<PickerRenderedRow> {
-        let filtered = self.filtered_indices();
-        let mut rows = Vec::new();
-        let mut previous_group: Option<&str> = None;
-        // Group header for the first visible row needs the group of the prior
-        // filtered item so a mid-list window still shows a header when needed.
-        if self.scroll_offset > 0 {
-            if let Some(prior) = filtered.get(self.scroll_offset - 1) {
-                previous_group = self.items[*prior].group.as_deref();
-            }
-        }
-        for (offset, item_index) in self.visible_item_indices().into_iter().enumerate() {
-            let item = &self.items[item_index];
-            let group = item.group.as_deref();
-            if group.is_some() && group != previous_group {
-                rows.push(PickerRenderedRow {
-                    selected: false,
-                    text: truncate_display(group.unwrap_or(""), usize::from(width)),
-                });
-            }
-            previous_group = group;
-            let selected = self.scroll_offset + offset == self.selected;
-            rows.push(rendered_resume_row(selected, item, width));
-            if selected {
-                if let Some(preview) = item.detail.as_deref() {
-                    rows.push(PickerRenderedRow {
-                        selected: false,
-                        text: truncate_display(&format!("  {preview}"), usize::from(width)),
-                    });
-                }
-            }
-        }
-        rows
-    }
-
+    /// §4.2: second-line metadata (an id, a root path) renders under the
+    /// selected row only — the resume picker's behavior, applied uniformly.
+    ///
+    /// A row's *description* is not metadata: it belongs in the aligned
+    /// column, and echoing it here as well is the "row repeats its own value"
+    /// deviation. Only kinds whose `detail` really is metadata answer here;
+    /// see [`Self::detail_is_metadata`].
     fn selected_detail(&self) -> Option<String> {
         let item = self.selected_item()?;
-        if self.kind == PickerKind::Model {
-            return match &item.action {
+        match self.kind {
+            PickerKind::Model => match &item.action {
                 CommandAction::SwitchModel { provider, model } => {
-                    Some(format!("Provider: {provider}  Model: {model}"))
+                    Some(format!("{provider} · {model}"))
                 }
                 _ => None,
-            };
+            },
+            PickerKind::Resume => item.detail.clone(),
+            _ => None,
         }
-        if self.kind == PickerKind::Resume {
-            // Resume preview lives under the selected row, not a footer detail.
-            return None;
-        }
-        item.detail
-            .as_ref()
-            .map(|detail| format!("Detail: {detail}"))
+    }
+
+    /// Whether this picker's `detail` field carries second-line metadata (an
+    /// id, a workspace root) rather than a description of the row. Metadata
+    /// goes under the selected row; a description goes in the aligned column.
+    /// Never both.
+    fn detail_is_metadata(&self) -> bool {
+        matches!(self.kind, PickerKind::Resume | PickerKind::Model)
     }
 
     #[cfg(test)]
@@ -562,33 +598,13 @@ impl ReplacementPicker {
     }
 
     #[cfg(test)]
+    /// Count the real layout rather than re-deriving it. This used to carry
+    /// per-kind arithmetic mirroring each bespoke renderer — a second source
+    /// of truth that drifts the moment a layout changes. `canonical_lines` is
+    /// the one owner of the layout, so ask it. Width only affects truncation,
+    /// never row count.
     pub(super) fn line_count(&self) -> u16 {
-        let filtered_count = self.filtered_indices().len();
-        let end = (self.scroll_offset + self.visible_rows).min(filtered_count);
-        let visible = end.saturating_sub(self.scroll_offset);
-        let rows = if matches!(
-            self.kind,
-            PickerKind::CausalDagActions | PickerKind::CausalDagFormats
-        ) {
-            4 + self.items.len()
-        } else if self.kind == PickerKind::Compaction {
-            2 + visible + usize::from(self.selected_detail().is_some())
-        } else if self.kind == PickerKind::Model {
-            5 + visible
-                + usize::from(filtered_count == 0)
-                + usize::from(self.selected_detail().is_some())
-        } else if self.kind == PickerKind::Resume {
-            // Width only affects truncation, not row count of list structure.
-            let list_rows = self.visible_resume_rows(u16::MAX).len();
-            let preview_rows = self
-                .resume_preview
-                .as_ref()
-                .map_or(0, |lines| 1 + lines.len());
-            // title + search + position + action + optional empty + list + ledger preview
-            4 + list_rows + usize::from(filtered_count == 0) + preview_rows
-        } else {
-            2 + visible
-        };
+        let rows = self.canonical_lines(u16::MAX, |_, _| ()).len();
         u16::try_from(rows).unwrap_or(u16::MAX)
     }
 
@@ -694,6 +710,11 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
         PickerSpec::Permissions(choices) => (
             PickerKind::Generic,
             "Permissions".to_owned(),
+            permission_items(choices),
+        ),
+        PickerSpec::PermissionsAdvanced(choices) => (
+            PickerKind::PermissionsAdvanced,
+            "Permissions › Advanced".to_owned(),
             permission_items(choices),
         ),
         PickerSpec::Resume(items) => (
@@ -820,26 +841,32 @@ fn code_swarm_model_items(choices: Vec<ModelChoice>, selected: &[String]) -> Vec
 /// Swarm cap (mirrors the extension's MAX_SWARM_AGENTS).
 const CODE_SWARM_MAX_MODELS: usize = 5;
 
+/// §4.2: the row is caret + state marker + label + description column, and it
+/// never repeats its own value. `ExtensionManagerItem::label()` predates the
+/// unified picker and bakes all three into one string — `● causal-dag
+/// (bundled)` — so using it here rendered the marker twice (the picker adds
+/// its own), the kind twice (it is also the group header), and the id twice
+/// (it was also the description). The id alone is the label; every other fact
+/// gets exactly one home.
 fn extension_manager_items(items: Vec<ExtensionManagerItem>) -> Vec<PickerItem> {
     items
         .into_iter()
         .map(|item| {
-            let label = item.label();
-            let group = if item.bundled {
-                Some("bundled".to_owned())
+            let kind = if item.bundled {
+                "bundled".to_owned()
             } else {
-                None
+                item.materialization
+                    .clone()
+                    .unwrap_or_else(|| "linked".to_owned())
             };
-            let status = item.materialization.clone();
             let id = item.id.clone();
-            let enabled = item.enabled;
             PickerItem {
-                label,
-                detail: Some(id.clone()),
-                status,
-                group,
+                label: id.clone(),
+                detail: None,
+                status: None,
+                group: Some(kind),
                 provider_tag: None,
-                current: enabled,
+                current: item.enabled,
                 action: CommandAction::ExtensionDetails { id },
             }
         })
@@ -906,14 +933,24 @@ fn permission_items(choices: Vec<PermissionChoice>) -> Vec<PickerItem> {
                 posture,
                 label,
                 detail,
+                current,
             } => PickerItem {
                 label,
                 detail: Some(detail),
                 status: None,
                 group: Some("Quick settings".to_owned()),
                 provider_tag: None,
-                current: false,
+                current,
                 action: CommandAction::SetPermissionPosture { posture },
+            },
+            PermissionChoice::Advanced { label, detail } => PickerItem {
+                label,
+                detail: Some(detail),
+                status: None,
+                group: None,
+                provider_tag: None,
+                current: false,
+                action: CommandAction::OpenPermissionsAdvanced,
             },
             PermissionChoice::Unavailable { label, detail } => PickerItem {
                 label,
@@ -932,7 +969,9 @@ fn permission_items(choices: Vec<PermissionChoice>) -> Vec<PickerItem> {
                 label: human_permission_label(capability, mode).to_owned(),
                 detail: None,
                 status: None,
-                group: Some(format!("Advanced · {}", capability_group_label(capability))),
+                // The picker's own title already says "› Advanced"; repeating
+                // it on every group header is noise (§4.2).
+                group: Some(capability_group_label(capability).to_owned()),
                 provider_tag: None,
                 current: false,
                 action: CommandAction::SetPermissionMode { capability, mode },
@@ -1021,60 +1060,6 @@ fn resume_items(items: Vec<ResumeItem>) -> Vec<PickerItem> {
             },
         })
         .collect()
-}
-
-fn rendered_picker_row(selected: bool, item: &PickerItem, width: u16) -> PickerRenderedRow {
-    let marker = if selected { ">" } else { " " };
-    let status = item.status.as_deref().unwrap_or("");
-    let group = item.group.as_deref().unwrap_or("");
-    let detail = item.detail.as_deref().unwrap_or("");
-    let text = [group, status, item.label.as_str(), detail]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" - ");
-    PickerRenderedRow {
-        selected,
-        text: truncate_display(&format!("{marker} {text}"), usize::from(width)),
-    }
-}
-
-fn rendered_model_row(selected: bool, item: &PickerItem, width: u16) -> PickerRenderedRow {
-    let marker = if selected { "→" } else { " " };
-    let provider = item
-        .provider_tag
-        .as_deref()
-        .map(|provider| format!(" [{provider}]"))
-        .unwrap_or_default();
-    let current = if item.current { " ✓" } else { "" };
-    PickerRenderedRow {
-        selected,
-        text: truncate_display(
-            &format!("{marker} {}{provider}{current}", item.label),
-            usize::from(width),
-        ),
-    }
-}
-
-fn rendered_resume_row(selected: bool, item: &PickerItem, width: u16) -> PickerRenderedRow {
-    let marker = if selected { "→" } else { " " };
-    let age = item.status.as_deref().unwrap_or("");
-    let width = usize::from(width);
-    let prefix = format!("{marker} ");
-    let age_width = display_width(age);
-    let label_budget = width
-        .saturating_sub(display_width(&prefix))
-        .saturating_sub(age_width)
-        .saturating_sub(1);
-    let label = truncate_display(&item.label, label_budget.max(1));
-    let used = display_width(&prefix) + display_width(&label) + age_width;
-    let gap = width
-        .saturating_sub(used)
-        .max(if age.is_empty() { 0 } else { 1 });
-    PickerRenderedRow {
-        selected,
-        text: truncate_display(&format!("{prefix}{label}{}{age}", " ".repeat(gap)), width),
-    }
 }
 
 fn model_item_matches(item: &PickerItem, query: &str) -> bool {

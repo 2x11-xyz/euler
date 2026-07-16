@@ -9,7 +9,9 @@ use super::cells::{
     PermissionBatchAskView, PermissionDecisionView, ResumeBoundaryRender, ToolRunRender,
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
-use super::{EventTiming, ProjectedEntry, TranscriptItem, TOOL_CALL_MAX_LINES};
+use super::{
+    EventTiming, ProjectedEntry, TranscriptItem, EXPLORED_GROUP_VERB, TOOL_CALL_MAX_LINES,
+};
 use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
 use crate::ui::text::{
@@ -17,7 +19,7 @@ use crate::ui::text::{
     timestamp_gutter_shown, tree_gutter_hairline, wrap_text,
 };
 use crate::ui::theme::Theme;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,8 +327,16 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             }
             TranscriptItem::Exploration { summaries } => {
                 let rows = super::coalesced_exploration_summaries(summaries);
-                let header = tool_group_header("explore", rows.len(), entry.timing.as_ref());
-                push_cell_parent(&mut lines, &header, theme.transcript.tool, theme, width);
+                // §4: the group header is the bold capitalized verb alone —
+                // no step count, no duration. The child rows below say what
+                // was explored; a count of them is not information.
+                push_cell_parent(
+                    &mut lines,
+                    EXPLORED_GROUP_VERB,
+                    theme.transcript.tool.add_modifier(Modifier::BOLD),
+                    theme,
+                    width,
+                );
                 push_child_rows(&mut lines, &rows, theme.transcript.muted, theme, width);
             }
             TranscriptItem::PermissionPrompt {
@@ -729,24 +739,6 @@ fn item_renders_inline_timing(item: &TranscriptItem) -> bool {
     )
 }
 
-fn tool_group_header(label: &str, steps: usize, timing: Option<&EventTiming>) -> String {
-    let mut parts = vec![label.to_owned(), step_count_label(steps)];
-    if timestamp_gutter_shown() {
-        if let Some(elapsed) = timing.and_then(|timing| timing.since_previous.as_deref()) {
-            parts.push(elapsed.to_owned());
-        }
-    }
-    parts.join(" · ")
-}
-
-fn step_count_label(steps: usize) -> String {
-    if steps == 1 {
-        "1 step".to_owned()
-    } else {
-        format!("{steps} steps")
-    }
-}
-
 /// v2 anchor spine: glyph + style for an event's first row (§1). `None`
 /// keeps the blank spine (separators have no anchor). Every anchor glyph —
 /// including the user-message rail — sits flush in this same slot (review
@@ -1102,13 +1094,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exploration_group_header_carries_steps_elapsed_and_tree_children() {
+    /// §4: the group header is the bold capitalized verb alone. Step counts
+    /// and duration are gone by design (they were data-slop), and so are the
+    /// per-step result counts on children. Supersedes design review v3 §R3,
+    /// which specified the lowercase `explore · N steps · Ts` header.
+    fn exploration_group_header_is_the_verb_alone_over_tree_children() {
         let entries = vec![ProjectedEntry {
             item: TranscriptItem::Exploration {
-                summaries: vec![
-                    "read Cargo.toml · 12 lines".to_owned(),
-                    "git diff".to_owned(),
-                ],
+                summaries: vec!["Read Cargo.toml".to_owned(), "Git diff".to_owned()],
             },
             timing: Some(EventTiming {
                 absolute: "12:00:06".to_owned(),
@@ -1117,8 +1110,9 @@ mod tests {
             }),
         }];
 
-        // Exploration step-elapsed is a timing decoration, toggle-gated in
-        // the real app (review v2 §6); opt in here to exercise it directly.
+        // Opt the timestamp gutter in: elapsed used to ride the header only
+        // when it was shown, so this is the configuration that would surface
+        // a duration if one leaked back in.
         let lines = crate::ui::text::with_timestamp_gutter(true, || {
             render_projected_entries(
                 &entries,
@@ -1129,17 +1123,153 @@ mod tests {
         });
         let text = plain_text(&lines);
 
-        // Lowercase verbs, single space, per-step result data (design review
-        // v3 §R3) — not the old capitalized, double-spaced alignment bug.
-        assert!(text.contains("explore · 2 steps · 6s"), "text: {text:?}");
-        assert!(
-            text.contains("├ read Cargo.toml · 12 lines"),
-            "text: {text:?}"
+        // Scope the header assertions to the header row: the turn footer
+        // legitimately carries an elapsed time, and that is not the header's.
+        let header = text.lines().next().expect("header row");
+        assert!(header.contains("Explored"), "text: {text:?}");
+        assert!(!header.contains("step"), "step count returned: {text:?}");
+        assert!(!header.contains("6s"), "duration returned: {text:?}");
+        assert!(text.contains("├ Read Cargo.toml"), "text: {text:?}");
+        assert!(text.contains("└ Git diff"), "text: {text:?}");
+        assert!(!text.contains("└ Read Cargo.toml"), "text: {text:?}");
+        assert!(!text.contains("├ Git diff"), "text: {text:?}");
+        // The earlier capitalized layout double-spaced the verb; single space.
+        assert!(!text.contains("Git  diff"), "text: {text:?}");
+    }
+
+    /// §1: exactly one anchor per event, in both gutter modes. The cell
+    /// prefix is only a placeholder for the spliced-in spine glyph, so a
+    /// second bullet means the placeholder survived. This regressed unseen
+    /// with `/timestamps` on because every other anchor test runs in the
+    /// default gutter-off mode, where the bug cannot appear.
+    #[test]
+    fn one_anchor_per_event_in_both_gutter_modes() {
+        let entries = vec![ProjectedEntry {
+            item: TranscriptItem::Exploration {
+                summaries: vec!["Read Cargo.toml".to_owned()],
+            },
+            timing: Some(EventTiming {
+                absolute: "12:00:06".to_owned(),
+                since_previous: Some("6s".to_owned()),
+                since_start: Some("6s".to_owned()),
+            }),
+        }];
+
+        for show_gutter in [false, true] {
+            let lines = crate::ui::text::with_timestamp_gutter(show_gutter, || {
+                render_projected_entries(
+                    &entries,
+                    &Theme::default(),
+                    80,
+                    TranscriptRenderLimits::default(),
+                )
+            });
+            let text = plain_text(&lines);
+            let header = text.lines().next().expect("header row");
+            assert_eq!(
+                header.matches('•').count(),
+                1,
+                "show_gutter={show_gutter}, header: {header:?}"
+            );
+            if show_gutter {
+                assert!(
+                    header.starts_with("12:00:06 • Explored"),
+                    "header: {header:?}"
+                );
+            } else {
+                assert!(header.starts_with("• Explored"), "header: {header:?}");
+            }
+        }
+    }
+
+    /// Bold marks membership in the Codex vocabulary, not capitalization. A
+    /// row can open with a capital for reasons that have nothing to do with a
+    /// verb — a title like `File added …`, or an uppercase filename — and
+    /// bolding those spends the weight on a word carrying no verb meaning.
+    #[test]
+    fn only_codex_verbs_earn_the_bold_lead() {
+        let theme = Theme::default();
+        let bolded = |summary: &str| {
+            let entries = vec![ProjectedEntry {
+                item: TranscriptItem::Exploration {
+                    summaries: vec![summary.to_owned()],
+                },
+                timing: None,
+            }];
+            let lines =
+                render_projected_entries(&entries, &theme, 80, TranscriptRenderLimits::default());
+            lines.iter().any(|line| {
+                line.spans.iter().any(|span| {
+                    span.style.add_modifier.contains(Modifier::BOLD)
+                        && !span.content.trim().is_empty()
+                        && span
+                            .content
+                            .contains(summary.split(' ').next().unwrap_or(""))
+                })
+            })
+        };
+
+        for verb in super::super::cells::CODEX_VERBS {
+            assert!(bolded(&format!("{verb} target.rs")), "verb: {verb}");
+        }
+        // Capitalized, but not verbs.
+        for row in ["File added foo.rs", "Patch proposed", "README.md"] {
+            assert!(!bolded(row), "must not bold a non-verb lead: {row:?}");
+        }
+    }
+
+    /// §4: the verb is the only bold token on a group row — the target keeps
+    /// the row's own weight, so the eye lands on what was done, not the path.
+    #[test]
+    fn exploration_verbs_are_bold_and_targets_are_not() {
+        let entries = vec![ProjectedEntry {
+            item: TranscriptItem::Exploration {
+                summaries: vec!["Read Cargo.toml".to_owned()],
+            },
+            timing: None,
+        }];
+        let lines = render_projected_entries(
+            &entries,
+            &Theme::default(),
+            80,
+            TranscriptRenderLimits::default(),
         );
-        assert!(text.contains("└ git diff"), "text: {text:?}");
-        assert!(!text.contains("└ read Cargo.toml"), "text: {text:?}");
-        assert!(!text.contains("├ git diff"), "text: {text:?}");
-        assert!(!text.contains("git  diff"), "text: {text:?}");
+
+        let header = lines
+            .iter()
+            .find(|line| plain_text(std::slice::from_ref(line)).contains("Explored"))
+            .expect("header row");
+        assert!(
+            header
+                .spans
+                .iter()
+                .any(|span| span.content.contains("Explored")
+                    && span.style.add_modifier.contains(Modifier::BOLD)),
+            "header verb must be bold: {header:?}"
+        );
+
+        let child = lines
+            .iter()
+            .find(|line| plain_text(std::slice::from_ref(line)).contains("Cargo.toml"))
+            .expect("child row");
+        let verb = child
+            .spans
+            .iter()
+            .find(|span| span.content.trim() == "Read")
+            .expect("child verb span");
+        assert!(
+            verb.style.add_modifier.contains(Modifier::BOLD),
+            "child verb must be bold: {child:?}"
+        );
+        let target = child
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Cargo.toml"))
+            .expect("child target span");
+        assert!(
+            !target.style.add_modifier.contains(Modifier::BOLD),
+            "child target must not be bold: {child:?}"
+        );
     }
 
     #[test]

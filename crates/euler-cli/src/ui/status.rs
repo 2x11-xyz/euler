@@ -58,6 +58,10 @@ pub struct StatusSnapshot {
     /// when the guardian reviews asks; `None` for the default user reviewer.
     /// Surfaced by `/status`, not the footer.
     pub permission_reviewer: Option<String>,
+    /// The active posture and its envelope (§5.1), cached here because
+    /// `/status` is answerable mid-turn and `AppState::TurnInFlight` does not
+    /// carry the session. Refreshed whenever the modes behind it change.
+    pub permission_envelope: Option<String>,
 }
 
 impl StatusSnapshot {
@@ -72,6 +76,7 @@ impl StatusSnapshot {
             session_name: None,
             extension_slots: StatusSlots::default(),
             permission_reviewer: None,
+            permission_envelope: None,
         }
     }
 }
