@@ -21,7 +21,6 @@ pub struct CommandContext {
     pub code_swarm_model_choices: Vec<ModelChoice>,
     pub effort_choices: Vec<EffortChoice>,
     pub theme_choices: Vec<ThemeChoiceItem>,
-    pub resume_items: Vec<ResumeItem>,
     pub checkpoint_items: Vec<CheckpointItem>,
     /// Bundled + linked extensions for the `/extension` manager and palette.
     pub extension_items: Vec<ExtensionManagerItem>,
@@ -548,6 +547,10 @@ pub enum CommandAction {
         pattern: String,
         source: GrantSource,
     },
+    /// Open the resume picker. Session records are listed at open time — a
+    /// full-store listing is too expensive to snapshot into every
+    /// `CommandContext` rebuild (it reads every session's event log).
+    OpenResumePicker,
     ResumeSession {
         session_id: String,
     },
@@ -1035,7 +1038,7 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
             }
         }),
         "/permissions" => CommandEffect::Action(CommandAction::OpenPermissions),
-        "/resume" => CommandEffect::OpenPicker(PickerSpec::Resume(context.resume_items.clone())),
+        "/resume" => CommandEffect::Action(CommandAction::OpenResumePicker),
         "/rollback" => rollback_effect(context),
         "/help" => CommandEffect::Action(CommandAction::ShowHelp { text: help_text() }),
         "/quit" => CommandEffect::Action(CommandAction::Quit),

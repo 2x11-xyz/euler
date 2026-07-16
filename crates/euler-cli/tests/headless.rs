@@ -8393,6 +8393,116 @@ fn tui_pty_tool_round_commits_canonical_narration_without_corruption() {
 }
 
 #[test]
+fn tui_pty_streamed_turn_issues_no_cursor_position_reports() {
+    // Performance regression target: every scrollback commit used to fire a
+    // synchronous DSR (`ESC[6n`) cursor-position round-trip, blocking the UI
+    // thread up to crossterm's ~2s timeout on each commit — measured as a
+    // back-to-back burst on a single Enter press. In steady state the renderer
+    // tracks the cursor itself, so a normal streamed turn must send ZERO
+    // `ESC[6n` queries. The harness auto-answers cursor reports on the input
+    // channel, so their answers never land in `output`; counting `ESC[6n` in
+    // `output` therefore measures queries SENT (not answered), distinguishing
+    // "no query sent" from "query answered".
+    let temp = tempfile::tempdir().expect("temp dir");
+    // Second response streams several wrapping paragraphs so many rows scroll
+    // off the active region and commit to native scrollback — the exact path
+    // that used to query per commit.
+    let mut stream_events = Vec::new();
+    for paragraph in 1..=6 {
+        let sentence = format!(
+            "Paragraph {paragraph}: streaming content long enough to wrap and \
+             scroll so history rows land in native scrollback and each commit \
+             exercises the cursor-restore path."
+        );
+        for chunk in sentence.as_bytes().chunks(8) {
+            stream_events.push(serde_json::json!({
+                "text_delta": String::from_utf8_lossy(chunk)
+            }));
+        }
+        stream_events.push(serde_json::json!({"text_delta": "\n\n"}));
+    }
+    stream_events.push(serde_json::json!({"finished": {"stop_reason": "completed"}}));
+    let script = write_fixture_script(
+        temp.path(),
+        "no-dsr-stream.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [
+                {"events": [
+                    {"text_delta": "Warmup response committed."},
+                    {"finished": {"stop_reason": "completed"}},
+                ]},
+                {"events": stream_events},
+            ]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(
+        tui.wait_for_screen("/ commands"),
+        "initial TUI did not render:\n{}",
+        tui.screen_text()
+    );
+    // Warm up past initial attach: the very first commit (before any draw has
+    // established an authoritative cursor position) is the one place tracked
+    // state is genuinely unknown and a query is legitimate. Retire it here so
+    // the measured window is pure steady state.
+    tui.write("warmup\r");
+    assert!(
+        tui.wait_for_screen("Warmup response committed."),
+        "warmup response did not render:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.wait_for_home_session_event_count(temp.path(), EventKind::ASSISTANT_MESSAGE, 1),
+        "warmup turn did not commit its assistant message:\n{}",
+        tui.screen_text()
+    );
+
+    // Everything from here is the steady-state turn under measurement.
+    let measure_from = tui.output.len();
+    tui.write("stream several paragraphs\r");
+    assert!(
+        tui.wait_for_screen("Paragraph 6:"),
+        "streamed response did not render:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.wait_for_home_session_event_count(temp.path(), EventKind::ASSISTANT_MESSAGE, 2),
+        "streamed turn did not commit its assistant message:\n{}",
+        tui.screen_text()
+    );
+
+    let dsr_queries = tui.output[measure_from..]
+        .windows(4)
+        .filter(|window| *window == b"\x1b[6n")
+        .count();
+    let private_dsr_queries = tui.output[measure_from..]
+        .windows(5)
+        .filter(|window| *window == b"\x1b[?6n")
+        .count();
+    assert_eq!(
+        dsr_queries + private_dsr_queries,
+        0,
+        "steady-state streamed turn sent {dsr_queries} plain and {private_dsr_queries} \
+         private cursor-position (DSR) queries; the renderer must derive the cursor from \
+         tracked state instead of a blocking ESC[6n round-trip per commit",
+    );
+
+    tui.quit();
+}
+
+#[test]
 fn tui_pty_streaming_reasoning_body_stays_viewport_only_until_the_gist_commits() {
     // Euler Thinking State design, "streaming" state: while the model
     // reasons, the delta text types out live behind the hairline in the
