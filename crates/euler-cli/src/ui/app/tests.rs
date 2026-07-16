@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 mod chrome_tests;
+mod live_memoization_tests;
 mod permission_tests;
 
 fn core() -> AppCore {

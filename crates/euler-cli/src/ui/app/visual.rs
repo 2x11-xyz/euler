@@ -52,6 +52,9 @@ impl AppCore {
     pub(super) fn render_visual_canvas(&mut self, width: u16) -> VisualCanvasFrame {
         self.composer_navigation_width = width;
         let snapshot = self.visual_canvas_snapshot(width);
+        // (borrow note) `visual_canvas_snapshot` now takes `&mut self` so the
+        // committed live-block render can be memoized; it returns an owned
+        // snapshot, so the mutable borrow ends here before `self.theme`.
         let theme = self.theme.clone();
         let expanded = self.tool_output_expanded;
         let show_ts = self.show_timestamp_gutter;
@@ -88,31 +91,31 @@ impl AppCore {
         self.render_visual_canvas(width)
     }
 
-    fn visual_canvas_snapshot(&self, width: u16) -> VisualCanvasSnapshot {
+    fn visual_canvas_snapshot(&mut self, width: u16) -> VisualCanvasSnapshot {
         let status = self.canvas_status_snapshot(width);
         let composer = self.canvas_composer_snapshot(width);
+        let focus = self.canvas_focus_owner();
         let blocks = self.visual_canvas_blocks(width, &status, &composer);
-        VisualCanvasSnapshot::new(width, blocks, status, composer, self.canvas_focus_owner())
+        VisualCanvasSnapshot::new(width, blocks, status, composer, focus)
     }
 
     fn visual_canvas_blocks(
-        &self,
+        &mut self,
         width: u16,
         status: &CanvasStatusSnapshot,
         composer: &CanvasComposerSnapshot,
     ) -> Vec<VisualBlock> {
         let mut blocks = Vec::new();
-        let show_ts = self.show_timestamp_gutter;
-        let mut history =
-            ratatui_lines_to_canvas(crate::ui::text::with_timestamp_gutter(show_ts, || {
-                transcript::render_items_for_history(
-                    &self.transcript.live_committed_items(),
-                    &self.theme,
-                    width,
-                )
-            }));
+        // The committed prefix of a streaming answer is append-only, so its
+        // markdown/syntax render is memoized (keyed on the committed revision,
+        // width, timestamp-gutter, and theme). A spinner-forced repaint with
+        // no new committed content reuses the cached lines instead of
+        // re-parsing the whole answer every frame (quadratic over a long
+        // stream). Only the mutable tail below re-renders per frame.
+        let mut history = self.live_committed_history_lines(width);
         self.apply_search_highlights(&mut history);
         push_visual_block(&mut blocks, VisualBlockRole::LiveTranscript, history);
+        let show_ts = self.show_timestamp_gutter;
         push_visual_block(
             &mut blocks,
             VisualBlockRole::LiveTranscript,
@@ -162,6 +165,33 @@ impl AppCore {
             vec![status.line.clone()],
         );
         blocks
+    }
+
+    /// Rendered canvas lines for the committed prefix of the streaming answer,
+    /// memoized so a repaint with no new committed content does near-zero
+    /// markdown/syntax work. The committed source is append-only within an
+    /// epoch, so `(epoch, committed_len)` — together with everything else that
+    /// affects the rendered rows (width, timestamp gutter, theme) — is a
+    /// sufficient cache key. A miss re-renders the whole committed prefix and
+    /// refreshes the cache; the search-highlight pass runs on the returned
+    /// clone every frame (it depends on transient search state, not the
+    /// stream), exactly as before.
+    pub(super) fn live_committed_history_lines(&mut self, width: u16) -> Vec<CanvasLine> {
+        let Some((epoch, committed_len)) = self.transcript.live_committed_revision() else {
+            // Round boundary / nothing committed yet: drop the cache so a new
+            // round can never alias a prior round's committed render.
+            self.live_committed_cache.clear();
+            return Vec::new();
+        };
+        let show_ts = self.show_timestamp_gutter;
+        let theme = self.theme.clone();
+        let key = LiveCommittedKey::new(epoch, committed_len, width, show_ts, theme.clone());
+        let items = self.transcript.live_committed_items();
+        self.live_committed_cache.lines_with(key, || {
+            ratatui_lines_to_canvas(crate::ui::text::with_timestamp_gutter(show_ts, || {
+                transcript::render_items_for_history(&items, &theme, width)
+            }))
+        })
     }
 
     fn push_visual_modal_block(&self, width: u16, blocks: &mut Vec<VisualBlock>) {
@@ -378,6 +408,73 @@ impl AppCore {
 fn push_visual_block(blocks: &mut Vec<VisualBlock>, role: VisualBlockRole, lines: Vec<CanvasLine>) {
     if !lines.is_empty() {
         blocks.push(VisualBlock::new(role, lines));
+    }
+}
+
+/// Everything that shapes the rendered committed-prefix rows. The cache holds
+/// exactly one entry; any difference from the stored key (new committed
+/// content, resize, `/timestamps` toggle, theme switch) is a miss.
+#[derive(Clone, PartialEq)]
+pub(super) struct LiveCommittedKey {
+    epoch: u64,
+    committed_len: usize,
+    width: u16,
+    show_ts: bool,
+    theme: Theme,
+}
+
+impl LiveCommittedKey {
+    pub(super) fn new(
+        epoch: u64,
+        committed_len: usize,
+        width: u16,
+        show_ts: bool,
+        theme: Theme,
+    ) -> Self {
+        Self {
+            epoch,
+            committed_len,
+            width,
+            show_ts,
+            theme,
+        }
+    }
+}
+
+/// Memoizes the rendered committed prefix of the streaming answer. The render
+/// closure runs only on a key change (a miss); an unchanged key returns a clone
+/// of the cached rows, so a spinner-forced repaint with no new committed content
+/// does near-zero markdown/syntax work. Self-contained and renderer-agnostic:
+/// production passes the real render closure, tests pass a counting one — no
+/// globals, no `cfg(test)` on the production path.
+#[derive(Default)]
+pub(super) struct LiveCommittedCache {
+    entry: Option<(LiveCommittedKey, Vec<CanvasLine>)>,
+}
+
+impl LiveCommittedCache {
+    /// Committed-prefix rows for `key`, running `render` only on a miss. The
+    /// returned value is a fresh clone the caller owns (the search-highlight
+    /// pass mutates it), so the cached entry stays pristine for the next hit.
+    pub(super) fn lines_with(
+        &mut self,
+        key: LiveCommittedKey,
+        render: impl FnOnce() -> Vec<CanvasLine>,
+    ) -> Vec<CanvasLine> {
+        if let Some((cached_key, lines)) = &self.entry {
+            if *cached_key == key {
+                return lines.clone();
+            }
+        }
+        let lines = render();
+        self.entry = Some((key, lines.clone()));
+        lines
+    }
+
+    /// Drop the cached entry at a round boundary / when nothing is committed, so
+    /// a new round can never alias a prior round's committed render.
+    pub(super) fn clear(&mut self) {
+        self.entry = None;
     }
 }
 
