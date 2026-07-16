@@ -484,6 +484,15 @@ impl TranscriptState {
             .collect()
     }
 
+    /// Cheap identity of `live_committed_items`: `(epoch, committed_len)`, or
+    /// `None` when there is no committed prefix. The committed source is
+    /// append-only within an epoch, so an unchanged value means the previously
+    /// rendered committed lines are still exact — the memoization key the
+    /// visual canvas uses to skip re-parsing the streamed answer every frame.
+    pub(crate) fn live_committed_revision(&self) -> Option<(u64, usize)> {
+        self.stream.committed_revision()
+    }
+
     pub fn live_mutable_items(&self) -> Vec<TranscriptItem> {
         if let Some(item) = self.live_reasoning_item() {
             return vec![item];

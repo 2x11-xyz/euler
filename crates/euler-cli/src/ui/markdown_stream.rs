@@ -10,11 +10,25 @@ use std::ops::Range;
 pub(crate) struct MarkdownStreamCollector {
     buffer: String,
     committed_len: usize,
+    /// Monotonic generation, bumped on every `clear`. The committed prefix
+    /// (`buffer[..committed_len]`) is append-only *within* a generation, so
+    /// `(epoch, committed_len)` uniquely identifies the committed source —
+    /// the live-render memoization key in the visual canvas. Without the
+    /// epoch, a new round that recommits to the same length as a prior round
+    /// would collide with the stale cached render.
+    epoch: u64,
 }
 
 impl MarkdownStreamCollector {
     pub(crate) fn push_delta(&mut self, delta: &str) {
         self.buffer.push_str(delta);
+    }
+
+    /// Identity of the current committed source: `(epoch, committed_len)`, or
+    /// `None` when nothing is committed yet. Cheap and append-only within an
+    /// epoch, so an unchanged value means the committed render is reusable.
+    pub(crate) fn committed_revision(&self) -> Option<(u64, usize)> {
+        (self.committed_len > 0).then_some((self.epoch, self.committed_len))
     }
 
     pub(crate) fn commit_complete_source(&mut self) -> Option<String> {
@@ -46,6 +60,9 @@ impl MarkdownStreamCollector {
     pub(crate) fn clear(&mut self) {
         self.buffer.clear();
         self.committed_len = 0;
+        // New generation: a subsequent commit that lands at the same length
+        // as the round we just cleared must not alias its cached render.
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     fn visible_end(&self) -> usize {

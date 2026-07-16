@@ -194,6 +194,10 @@ pub struct AppCore {
     token_usage: TokenUsageSnapshot,
     transcript: TranscriptState,
     visual_canvas: VisualCanvasState,
+    /// Memoized render of the committed prefix of the in-flight streamed
+    /// answer (see `visual::LiveCommittedCache`). Lets a spinner-forced
+    /// repaint with no new committed content skip re-parsing the whole answer.
+    live_committed_cache: Option<visual::LiveCommittedCache>,
     visual_scroll_offset: usize,
     composer_navigation_width: u16,
     last_working_elapsed_secs: Option<u64>,
@@ -802,6 +806,7 @@ impl AppCore {
             visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner {
                 session_id: Some(boot.session_id),
             }]),
+            live_committed_cache: None,
             visual_scroll_offset: 0,
             composer_navigation_width: 80,
             last_working_elapsed_secs: None,
