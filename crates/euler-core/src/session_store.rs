@@ -377,17 +377,19 @@ impl SessionStore {
             name: metadata
                 .name
                 .and_then(|name| session_name_for_display(&name)),
-            title: None,
+            title: metadata.title.clone(),
             root: metadata.root.as_deref().and_then(session_root_from_str),
             kind: metadata.kind,
         };
-        Some(SessionRecord::new(
-            id.to_owned(),
-            dir,
-            created_at_ms,
-            updated_at_ms,
-            projection,
-        ))
+        // Carry the projection cache key through so a metadata touch that
+        // rewrites the sidecar keeps the cached projection warm.
+        let key = metadata
+            .projected_events_len
+            .zip(metadata.projected_events_modified_ns);
+        Some(
+            SessionRecord::new(id.to_owned(), dir, created_at_ms, updated_at_ms, projection)
+                .with_projection_key(key),
+        )
     }
 
     fn record_from_parts(
@@ -415,13 +417,45 @@ impl SessionStore {
             .and_then(|metadata| metadata.root.as_deref())
             .and_then(session_root_from_str);
         let sidecar_kind = sidecar.as_ref().and_then(|metadata| metadata.kind);
+        let events_path = dir.join("events.jsonl");
+        // Stat before reading: if the log grows mid-projection the key
+        // describes an older file than what was read, so the next listing
+        // re-projects rather than serving a stale hit.
+        let events_key = events_stat_key(&events_path);
+        if let (Some(metadata), Some(key)) = (&sidecar, events_key) {
+            if metadata.projected_events_len == Some(key.0)
+                && metadata.projected_events_modified_ns == Some(key.1)
+            {
+                let projection = SessionProjection {
+                    status: metadata.status,
+                    name: sidecar_name
+                        .clone()
+                        .and_then(|name| session_name_for_display(&name)),
+                    title: metadata.title.clone(),
+                    root: sidecar_root.clone(),
+                    kind: sidecar_kind,
+                };
+                return SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projection)
+                    .with_projection_key(Some(key));
+            }
+        }
         let projection = session_projection_from_events_or_sidecar(
-            &dir.join("events.jsonl"),
+            &events_path,
             sidecar_name,
             sidecar_root,
             sidecar_kind,
         );
-        SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projection)
+        let record = SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projection)
+            .with_projection_key(events_key);
+        // Best-effort cache fill so the next listing reuses this projection.
+        // Invalid projections are never cached: an integrity failure (e.g. a
+        // missing blob) must be re-checked — and can recover — without the
+        // event log changing. Write errors only cost the cache, never the
+        // listing.
+        if record.status != SessionStatus::Invalid && record.projection_key.is_some() {
+            let _ = write_session_metadata_replace(&record);
+        }
+        record
     }
 }
 
@@ -439,6 +473,9 @@ pub struct SessionRecord {
     title: Option<String>,
     root: Option<PathBuf>,
     kind: Option<SessionKind>,
+    /// (len, mtime-ns) of events.jsonl that the projection fields describe;
+    /// carried into sidecar writes so metadata touches keep the cache warm.
+    projection_key: Option<(u64, u64)>,
 }
 
 impl SessionRecord {
@@ -462,7 +499,13 @@ impl SessionRecord {
             title: projection.title,
             root: projection.root,
             kind: projection.kind,
+            projection_key: None,
         }
+    }
+
+    fn with_projection_key(mut self, key: Option<(u64, u64)>) -> Self {
+        self.projection_key = key;
+        self
     }
 
     pub fn id(&self) -> &str {
@@ -574,6 +617,28 @@ struct SessionMetadata {
     kind: Option<SessionKind>,
     events_path: String,
     blobs_dir: String,
+    /// Cached first-user-message title, valid under the projection key below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Projection cache key: the byte length and mtime (nanoseconds since
+    /// epoch) of `events.jsonl` when status/name/title/root/kind above were
+    /// last derived from it. While the key matches the live file, listings
+    /// reuse these fields instead of re-projecting the event log (which
+    /// reads and integrity-checks the whole log plus its blobs). Absent on
+    /// sidecars written before this cache existed and after an Invalid
+    /// projection (never cached, so integrity errors stay re-checked).
+    ///
+    /// Trust boundary (docs/contracts/events.md, `session.renamed`): the
+    /// events remain the sole naming/root authority, enforced at projection
+    /// time rather than on every read. Within a matching key the cached
+    /// fields are served verbatim, so a hand-edited sidecar can misreport
+    /// display fields until the log next changes — the same actor could edit
+    /// the log itself, so this stays inside the store's existing trust
+    /// boundary. Any log append/rewrite moves the key and re-projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projected_events_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projected_events_modified_ns: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -669,8 +734,8 @@ fn create_empty_private_file(path: &Path) -> Result<(), SessionStoreError> {
     Ok(())
 }
 
-fn write_session_metadata(record: &SessionRecord) -> Result<(), SessionStoreError> {
-    let metadata = SessionMetadata {
+fn session_metadata_from_record(record: &SessionRecord) -> SessionMetadata {
+    SessionMetadata {
         version: SESSION_METADATA_VERSION,
         id: record.id.clone(),
         created_at_ms: record.created_at_ms,
@@ -684,8 +749,31 @@ fn write_session_metadata(record: &SessionRecord) -> Result<(), SessionStoreErro
         kind: record.kind,
         events_path: "events.jsonl".to_owned(),
         blobs_dir: "blobs".to_owned(),
-    };
-    write_json_private_new(record.session_json_path(), &metadata)
+        title: record.title.clone(),
+        projected_events_len: record.projection_key.map(|(len, _)| len),
+        projected_events_modified_ns: record.projection_key.map(|(_, modified)| modified),
+    }
+}
+
+/// Projection cache key for an event log: byte length plus mtime in
+/// nanoseconds since the epoch. Appends always move the length; the mtime
+/// covers same-length rewrites (e.g. a scrub).
+fn events_stat_key(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_ns = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((metadata.len(), u64::try_from(modified_ns).ok()?))
+}
+
+fn write_session_metadata(record: &SessionRecord) -> Result<(), SessionStoreError> {
+    write_json_private_new(
+        record.session_json_path(),
+        &session_metadata_from_record(record),
+    )
 }
 
 fn read_session_metadata(path: &Path) -> Result<SessionMetadata, SessionStoreError> {
@@ -694,22 +782,10 @@ fn read_session_metadata(path: &Path) -> Result<SessionMetadata, SessionStoreErr
 }
 
 fn write_session_metadata_replace(record: &SessionRecord) -> Result<(), SessionStoreError> {
-    let metadata = SessionMetadata {
-        version: SESSION_METADATA_VERSION,
-        id: record.id.clone(),
-        created_at_ms: record.created_at_ms,
-        updated_at_ms: Some(record.updated_at_ms),
-        status: record.status,
-        name: record.name.clone(),
-        root: record
-            .root
-            .as_ref()
-            .map(|root| root.to_string_lossy().into_owned()),
-        kind: record.kind,
-        events_path: "events.jsonl".to_owned(),
-        blobs_dir: "blobs".to_owned(),
-    };
-    write_json_private_replace(record.session_json_path(), &metadata)
+    write_json_private_replace(
+        record.session_json_path(),
+        &session_metadata_from_record(record),
+    )
 }
 
 fn write_json_private_new<T: Serialize>(path: &Path, value: &T) -> Result<(), SessionStoreError> {
