@@ -304,6 +304,28 @@ where
     last_band_measurement: Option<BandMeasurement>,
     linefeed_history_insert_enabled: bool,
     linefeed_history_insert_suspended_after_resize: bool,
+    /// Whether `last_known_cursor_pos` can be trusted as the true physical
+    /// cursor position WITHOUT a DSR (`ESC[6n`) round-trip.
+    ///
+    /// Invariant: `cursor_position_authoritative == true` iff
+    /// `last_known_cursor_pos` equals where the terminal's cursor physically
+    /// sits right now. Every code path that moves the cursor keeps this
+    /// honest:
+    /// - Set `true` after parking the cursor at a recorded position:
+    ///   `draw_canvas_lines` (the steady-state per-frame path),
+    ///   `reset_for_history_replay` (parks at origin), and both finalized-write
+    ///   commit paths (they restore/derive the cursor to a known position).
+    /// - Set `false` after moving the cursor to an UNKNOWN position:
+    ///   `new` (initial attach — the cursor is wherever the shell left it),
+    ///   `scroll_terminal_for_live_area` (`append_lines` scrolls
+    ///   unpredictably), and `invalidate_cursor_position_authority` (a failed
+    ///   replay). `write_terminal_sequence` is contractually cursor-neutral, so
+    ///   it leaves the flag alone (see its doc comment).
+    ///
+    /// The finalized-write commit paths consult this to decide whether to
+    /// derive the cursor from tracked state or pay the blocking round-trip.
+    /// In steady state (draw → commit → draw …) the flag is always `true`, so
+    /// a normal streamed turn issues zero `ESC[6n` queries.
     cursor_position_authoritative: bool,
     foreground: RatatuiColor,
     background: RatatuiColor,
@@ -398,7 +420,7 @@ where
         }
         let area = self.viewport_area;
         let screen_size = self.inner.size()?;
-        let cursor_authoritative = std::mem::take(&mut self.cursor_position_authoritative);
+        let cursor_authoritative = self.cursor_position_authoritative;
         let writer = self.inner.backend_mut();
         queue_clear_area(writer, area, self.background)?;
         queue!(writer, MoveTo(0, area.top()))?;
@@ -417,15 +439,17 @@ where
         flush_terminal_writer(writer)?;
 
         let cursor_pos = if cursor_authoritative {
-            // A history replay parked the cursor at a known position and the
-            // print loop above advances it deterministically (every row is
+            // The `MoveTo(0, area.top())` above re-homed the cursor and the
+            // print loop advances it deterministically (every row is
             // pre-wrapped to the width, so no auto-wrap): after R rows each
-            // followed by \r\n from `area.top()`, the cursor sits at
-            // min(top + R, bottom row). Deriving it avoids a DSR round-trip
-            // inside the DEC 2026 guard — which would flush a half-painted
-            // frame — and avoids trusting a cursor report from a terminal
-            // that may still be mid-resize (the reply then describes a grid
-            // we no longer paint against).
+            // followed by \r\n, the cursor sits at min(top + R, bottom row).
+            // Deriving it avoids a DSR round-trip inside the DEC 2026 guard —
+            // which would flush a half-painted frame — and avoids trusting a
+            // cursor report from a terminal that may still be mid-resize (the
+            // reply then describes a grid we no longer paint against). This
+            // branch is taken whenever the tracked cursor is authoritative
+            // (post-draw, post-commit, or post-replay); the query below is
+            // only for genuinely-unknown state (initial attach, post-scroll).
             let rows = u16::try_from(wrapped_lines.len()).unwrap_or(u16::MAX);
             Position::new(
                 0,
@@ -440,6 +464,10 @@ where
         self.last_known_screen_size = screen_size;
         self.last_reported_resize_size = screen_size;
         self.last_known_cursor_pos = cursor_pos;
+        // Whether derived or queried, the cursor now sits at `cursor_pos` (the
+        // deterministic print loop ended there, or the query reported it): the
+        // tracked position is authoritative again.
+        self.cursor_position_authoritative = true;
         let height = self
             .viewport_area
             .height
@@ -466,13 +494,23 @@ where
         else {
             return Ok(false);
         };
-        let cursor_pos = if std::mem::take(&mut self.cursor_position_authoritative) {
-            // A history replay just parked the cursor at a known position
-            // with the clear bytes still buffered. Querying now would flush
-            // the bare clear and block mid-guard on the DSR round-trip,
-            // exposing a blank screen on terminals without DEC 2026.
+        let cursor_pos = if self.cursor_position_authoritative {
+            // Steady state: the preceding draw (or a replay, or the prior
+            // commit) parked the cursor at a known position and nothing
+            // untracked has moved it since, so `last_known_cursor_pos` is
+            // exact. Trust it and skip the DSR round-trip — `ESC[6n` blocks
+            // the UI thread up to crossterm's ~2s timeout when the terminal
+            // answers slowly, and issuing it mid-DEC-2026-guard would flush
+            // the bare clear/half-painted frame (on a just-cleared replay
+            // screen that momentarily exposes a blank on terminals without
+            // DEC 2026). This is the hot path: one bridge commit per streamed
+            // frame, so trusting tracked state is what makes a normal turn
+            // zero-DSR.
             self.last_known_cursor_pos
         } else {
+            // Tracked state is untrustworthy — initial attach before the first
+            // draw, or a raw sequence / live-area scroll moved the cursor
+            // unpredictably. Query once to re-establish it.
             self.queried_cursor_position()
                 .unwrap_or(self.last_known_cursor_pos)
         };
@@ -498,6 +536,11 @@ where
         self.last_known_screen_size = screen_size;
         self.last_reported_resize_size = screen_size;
         self.last_known_cursor_pos = cursor_pos;
+        // The trailing `MoveTo` restored the cursor to `cursor_pos`, so the
+        // tracked position is exact again. (The following draw fully repaints
+        // anyway — `invalidate_draw_cache` forces it — but keep the invariant
+        // truthful in its own right.)
+        self.cursor_position_authoritative = true;
         self.invalidate_draw_cache();
         Ok(true)
     }
@@ -683,6 +726,15 @@ where
         self.linefeed_history_insert_enabled = enabled;
     }
 
+    /// Write a raw terminal control sequence outside the paint pipeline.
+    ///
+    /// Contract: `sequence` must be cursor-neutral — it must not move the
+    /// cursor. Every current caller obeys this (OSC 9 notifications, OSC 12
+    /// cursor-color, OSC 52 clipboard), which is why this does NOT invalidate
+    /// `cursor_position_authoritative`: the tracked cursor position stays exact
+    /// across the write. A caller that needs to move the cursor must call
+    /// `invalidate_cursor_position_authority` afterward so the next commit
+    /// re-queries instead of restoring a stale position.
     pub(crate) fn write_terminal_sequence(&mut self, sequence: &str) -> io::Result<()> {
         let writer = self.inner.backend_mut();
         writer.write_all(sequence.as_bytes())?;
@@ -1014,22 +1066,29 @@ where
             queue!(writer, MoveTo(0, row))?;
             queue_clear_until_new_line(writer, self.background)?;
         }
-        if let Some(cursor) = cursor.filter(|cursor| {
+        let parked_cursor = if let Some(cursor) = cursor.filter(|cursor| {
             cursor.row < area.height
                 && cursor.column < area.width
                 && area.y.saturating_add(cursor.row) < area.bottom()
         }) {
-            queue!(
-                writer,
-                MoveTo(
-                    area.x.saturating_add(cursor.column),
-                    area.y.saturating_add(cursor.row)
-                ),
-                Show
-            )?;
+            let pos = Position::new(
+                area.x.saturating_add(cursor.column),
+                area.y.saturating_add(cursor.row),
+            );
+            queue!(writer, MoveTo(pos.x, pos.y), Show)?;
+            pos
         } else {
-            queue!(writer, Hide)?;
-        }
+            // Park the hidden cursor at the active region's top-left before
+            // hiding it. The diff loop above leaves the physical cursor at an
+            // indeterminate spot (wherever the last repainted row or stale-row
+            // clear ended), so this explicit `MoveTo` is what makes the resting
+            // position deterministic — and therefore trackable without a DSR
+            // round-trip. `area`'s top-left is always on-screen and inside the
+            // viewport. The cursor is hidden, so this move has no visible cost.
+            let pos = Position::new(area.x, area.y);
+            queue!(writer, MoveTo(pos.x, pos.y), Hide)?;
+            pos
+        };
         flush_terminal_writer(writer)?;
         self.last_drawn_area = Some(area);
         self.last_drawn_lines = lines
@@ -1037,9 +1096,13 @@ where
             .take(usize::from(area.height))
             .cloned()
             .collect();
-        // The draw moved the physical cursor; a later bridge commit must
-        // query instead of trusting a replay-parked position.
-        self.cursor_position_authoritative = false;
+        // The draw parked the physical cursor at `parked_cursor`, and nothing
+        // untracked runs before the next commit, so the tracked position is
+        // authoritative: the next finalized-write/bridge commit restores the
+        // cursor from it with no DSR round-trip. This is the per-frame write
+        // that keeps a normal streamed turn zero-DSR.
+        self.last_known_cursor_pos = parked_cursor;
+        self.cursor_position_authoritative = true;
         Ok(())
     }
 
@@ -1047,6 +1110,10 @@ where
         if rows == 0 {
             return Ok(());
         }
+        // `append_lines` scrolls the screen and leaves the cursor at a position
+        // we do not track; drop cursor authority so the next commit re-queries
+        // rather than restoring a stale position. (A draw normally follows in
+        // the same `draw_visual_frame` and re-establishes authority.)
         self.cursor_position_authoritative = false;
         let screen_size = self.inner.size()?;
         let writer = self.inner.backend_mut();
