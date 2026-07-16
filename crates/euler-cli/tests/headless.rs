@@ -532,6 +532,49 @@ fn exec_observe_causal_dag_spawns_observer_companion_and_stays_fail_open() {
     );
 }
 
+#[test]
+fn bundled_observer_ignores_malformed_linked_inventory() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let registry_dir = home.path().join(".euler/extensions");
+    fs::create_dir_all(&registry_dir).expect("registry dir");
+    fs::write(registry_dir.join("links.json"), b"not valid json\n")
+        .expect("write malformed inventory");
+    let script = write_fixture_script(
+        root.path(),
+        "bundled-observer-malformed-links.json",
+        r#"{
+  "version": 1,
+  "responses": [{"events": [
+    {"text_delta": "driver done"},
+    {"finished": {"stop_reason": "completed"}}
+  ]}]
+}"#,
+    );
+    let output = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &format!("event-script={}", path_str(&script)),
+            "--extensions",
+            "causal-dag",
+            "--observe",
+            "causal-dag",
+            "finish directly",
+        ])
+        .output()
+        .expect("run bundled observer with malformed links");
+    assert!(
+        output.status.success(),
+        "bundled observer must not depend on links.json: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_observe_runs_enabled_linked_python_observer_automatically() {
@@ -596,6 +639,21 @@ fn exec_observe_runs_enabled_linked_python_observer_automatically() {
     )
     .expect("write observer process");
     configure_linked_extension(exe, &home, extension_dir.path(), "python-round-observer");
+    // Corrupt only the duplicated inventory descriptor. Runtime observer
+    // selection must come from the hash-checked source manifest, not links.json.
+    let inventory_path = home.path().join(".euler/extensions/links.json");
+    let mut inventory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&inventory_path).expect("read inventory"))
+            .expect("inventory json");
+    inventory["links"]["python-round-observer"]["descriptor"]["observer"]
+        ["default_cadence_rounds"] = serde_json::json!(0);
+    inventory["links"]["python-round-observer"]["descriptor"]["observer"]["brief_command"] =
+        serde_json::json!("observer-apply");
+    fs::write(
+        &inventory_path,
+        serde_json::to_vec_pretty(&inventory).expect("serialize tampered inventory"),
+    )
+    .expect("write tampered inventory");
     fs::write(root.path().join("input.txt"), "observer input\n").expect("write input");
     let script = write_fixture_script(
         root.path(),

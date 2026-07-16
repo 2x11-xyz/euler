@@ -207,6 +207,12 @@ pub(crate) fn resolve_round_observer(
     let Some(id) = options.extension_id.as_deref() else {
         return Ok(None);
     };
+    // Bundled IDs are reserved and must not depend on local linked-registry
+    // health. Resolve them first so a corrupt links.json cannot disable a
+    // built-in observer.
+    if bundled_extension_by_id(id).is_some() {
+        return bundled_round_observer(options, enabled);
+    }
     if let Some(observer) =
         crate::extension_cli::resolve_live_linked_observer(id, options.cadence_rounds)?
     {
