@@ -15,30 +15,21 @@ impl AppCore {
         self.queue_notification(NotifyEvent::Stall);
     }
 
-    /// Review v3 §R5(b): empty-turn suppression. When a turn changed 0
-    /// files AND context moved less than ~1% AND no tests ran, the divider
-    /// still renders (via the caller) but the recap line itself is skipped
-    /// — there's nothing worth summarizing.
+    /// Recap suppression (owner preference, 2026-07-16, superseding review
+    /// v3 §R5(b)): a turn that changed **no files** renders no recap line at
+    /// all — regardless of tests run or context moved. The divider still
+    /// renders via the caller on its own timing rule.
     fn push_turn_recap(&mut self) {
-        let ctx = super::turn_recap::ctx_percent(
-            self.token_usage.input_tokens,
-            self.token_usage.context_window_tokens,
-        );
         let recap = super::turn_recap::turn_recap_from_events(
             self.transcript.events(),
             self.turn_event_start,
-            ctx,
         );
-        let ctx_delta_tokens = self
-            .token_usage
-            .input_tokens
-            .abs_diff(self.turn_start_input_tokens);
-        let ctx_moved_negligible = super::turn_recap::ctx_percent(
-            ctx_delta_tokens,
-            self.token_usage.context_window_tokens,
-        )
-        .is_some_and(|moved_pct| moved_pct < 1);
-        if recap.file_count == 0 && recap.test_status.is_none() && ctx_moved_negligible {
+        // The recap is for what the turn changed to the workspace: a turn that
+        // touched no files earns no recap line at all (owner preference,
+        // 2026-07-16), regardless of tests run or context moved. The
+        // `── Worked for Ns ──` divider is a separate element and still
+        // renders on its own timing rule (see `handle_turn_outcome`).
+        if recap.file_count == 0 {
             return;
         }
         self.push_finalized_visual_item(TranscriptItem::TurnRecap {
