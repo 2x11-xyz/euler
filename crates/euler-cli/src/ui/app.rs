@@ -564,6 +564,11 @@ impl App {
             self.core.deny_open_modal();
         }
         let lines = self.core.exit_recap_lines();
+        // Clean clear (§5.8): drop the live band — the echoed `/quit`
+        // composer row included — in native colors, so the recap below is
+        // the only thing between the last transcript content and the shell
+        // prompt. Best-effort: a failed clear must never block the exit.
+        let _ = self.terminal.clear_live_band_for_exit();
         terminal::restore_terminal();
         print_exit_recap_lines(&lines);
         if hard_exit {
@@ -631,6 +636,13 @@ fn set_terminal_theme_colors(terminal: &mut CrosstermTerminal, core: &AppCore) -
 
 fn print_exit_recap_lines(lines: &[self::turn_recap::ExitRecapLine]) {
     let stdout_tty = io::stdout().is_terminal();
+    if stdout_tty {
+        // The recap is dim text on the terminal's native background — never a
+        // fill band. Reset once up front so no stale attribute from the
+        // session (theme background, dim, anything) can bleed into it, and
+        // start at column 0 even if the cursor was left mid-row.
+        let _ = write!(io::stdout(), "\x1b[0m\r");
+    }
     for line in lines {
         if line.is_faint() && stdout_tty {
             let _ = writeln!(io::stdout(), "\x1b[2m{}\x1b[0m", line.text());
