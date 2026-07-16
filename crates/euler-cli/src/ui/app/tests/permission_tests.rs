@@ -459,10 +459,11 @@ fn instruction_typed_inside_the_panel_denies_and_restores_the_stash() {
         reply_rx.recv().expect("reply"),
         PermissionReply::DenyWithInstruction("use ls".into())
     );
-    // The instruction queues as the next turn; the pre-ask draft returns to
-    // the composer.
+    // The instruction queues at the front — absorbed by the running turn's
+    // next round boundary (steering), or flushed as the next turn if the
+    // denial ended the turn. The pre-ask draft returns to the composer.
     assert_eq!(
-        core.queued_inputs.front().map(String::as_str),
+        core.queued_inputs.snapshot().first().map(String::as_str),
         Some("use ls")
     );
     assert_eq!(core.bottom.composer().submit_text(), "pre-ask draft");

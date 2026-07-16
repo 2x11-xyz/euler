@@ -48,6 +48,9 @@ mod observer;
 mod parallel_spawn;
 mod permissions_gate;
 mod round_loop;
+mod steering;
+
+pub use steering::SteeringQueue;
 mod swarm_tool;
 mod tool_dispatch;
 pub use background::{
@@ -340,6 +343,10 @@ pub struct Session<D> {
     context_limit_emitted: Option<ModelTarget>,
     open_agent_spawns: BTreeMap<String, String>,
     observer_extension: Option<Arc<dyn Extension>>,
+    /// Shared mid-turn steering queue (issue #146); drained at round
+    /// boundaries into canonical `user.message` events. `None` (headless,
+    /// companions) means no steering.
+    steering: Option<Arc<steering::SteeringQueue>>,
     /// Wired code-swarm extension backing the `code_swarm_review` tool; the
     /// tool is advertised to the root session's model only when this is set.
     code_swarm_extension: Option<Arc<dyn Extension>>,
@@ -518,6 +525,30 @@ where
         self.sink.flush(self.session.bus.events());
     }
 
+    fn absorb_steering(&mut self) -> Result<(), SessionError> {
+        let Some(queue) = self.session.steering.clone() else {
+            return Ok(());
+        };
+        let drained = queue.drain_for_round();
+        if drained.is_empty() {
+            return Ok(());
+        }
+        for content in drained {
+            // Canonical user.message with normal causal chaining: the parent
+            // is whatever the turn last emitted (a tool.result, the prior
+            // steering message, ...), and the flush below echoes it to the
+            // surface immediately. The next prepare_model_request assembles
+            // it from the bus like any other event — steering needs no
+            // parallel channel into the request.
+            self.session.emit(
+                EventKind::USER_MESSAGE,
+                object([("content", content.into())]),
+            )?;
+        }
+        self.sink.flush(self.session.bus.events());
+        Ok(())
+    }
+
     fn round_limit(&mut self) -> Result<(), SessionError> {
         self.session.emit(
             EventKind::ASSISTANT_MESSAGE,
@@ -615,6 +646,7 @@ impl<D> Session<D> {
             context_limit_emitted: None,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            steering: None,
             code_swarm_extension: None,
             scrub_candidates: Vec::new(),
         };
@@ -669,6 +701,15 @@ impl<D> Session<D> {
     /// observer executes; config without extension (or vice versa) is inert.
     pub fn set_observer_extension(&mut self, extension: Arc<dyn Extension>) {
         self.observer_extension = Some(extension);
+    }
+
+    /// Wire the shared mid-turn steering queue (issue #146). The interactive
+    /// surface keeps a clone and pushes while a turn is in flight; the round
+    /// loop drains it at each round boundary into `user.message` events, so
+    /// the next model call sees steering in-turn. Idempotent per turn —
+    /// surfaces re-wire it on every spawn.
+    pub fn set_steering_queue(&mut self, queue: Arc<steering::SteeringQueue>) {
+        self.steering = Some(queue);
     }
 
     /// Wire the code-swarm extension for the `code_swarm_review` tool
@@ -1004,6 +1045,7 @@ impl<D> Session<D> {
             context_limit_emitted,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            steering: None,
             code_swarm_extension: None,
             scrub_candidates: Vec::new(),
         };

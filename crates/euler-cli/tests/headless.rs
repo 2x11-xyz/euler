@@ -8327,6 +8327,104 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
 }
 
 #[test]
+fn tui_pty_mid_turn_input_steers_before_the_next_round() {
+    // Issue #146: a message typed while a turn is in flight is absorbed at
+    // the next round boundary as a canonical user.message — the model sees
+    // it in-turn — instead of waiting for the turn to complete. The fixture
+    // holds round 1 open with a sleep so the steering keystrokes land
+    // deterministically mid-round.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let script = write_fixture_script(
+        temp.path(),
+        "steering-transcript.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [
+                {"events": [
+                    {"text_delta": "phase one underway\n"},
+                    {"sleep_ms": 2500},
+                    {"tool_call": {
+                        "id": "call-read",
+                        "name": "read_file",
+                        "input": {"path": "Cargo.toml"}
+                    }},
+                    {"finished": {"stop_reason": "tool_use"}}
+                ]},
+                {"events": [
+                    {"text_delta": "final answer after steering"},
+                    {"finished": {"stop_reason": "completed"}}
+                ]}
+            ]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("/ commands"));
+    tui.write("start the task\r");
+    assert!(
+        tui.wait_for_screen("phase one underway"),
+        "round 1 did not start:\n{}",
+        tui.screen_text()
+    );
+    // Mid-round: round 1 is inside its scripted sleep. The running footer
+    // advertises steering.
+    assert!(
+        tui.wait_for_screen("⏎ steer"),
+        "running footer did not advertise steering:\n{}",
+        tui.screen_text()
+    );
+    tui.write("steer toward the tests\r");
+    assert!(
+        tui.wait_for_screen("final answer after steering"),
+        "turn did not finish:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    // The durable stream shows the steering user.message inside the turn:
+    // after round 1's tool result, before round 2's model call.
+    let session_id = only_home_session_id(temp.path());
+    let events = read_jsonl(&home_session_log(temp.path(), &session_id));
+    let steering_index = events
+        .iter()
+        .position(|event| {
+            event.kind.as_str() == "user.message"
+                && event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("steer toward the tests")
+        })
+        .expect("steering user.message persisted");
+    let tool_result_index = events
+        .iter()
+        .position(|event| event.kind.as_str() == "tool.result")
+        .expect("tool result persisted");
+    let second_model_call_index = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind.as_str() == "model.call")
+        .map(|(index, _)| index)
+        .nth(1)
+        .expect("second model call persisted");
+    assert!(
+        tool_result_index < steering_index && steering_index < second_model_call_index,
+        "steering was not absorbed at the round boundary: tool.result at {tool_result_index}, \
+         user.message at {steering_index}, second model.call at {second_model_call_index}"
+    );
+}
+
+#[test]
 fn tui_pty_tool_round_commits_canonical_narration_without_corruption() {
     let temp = tempfile::tempdir().expect("temp dir");
     let script = write_fixture_script(

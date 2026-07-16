@@ -294,10 +294,7 @@ fn submit_starts_in_flight_and_second_submit_queues() {
     core.handle_input(key(KeyCode::Enter));
 
     assert!(core.notice.is_none());
-    assert_eq!(
-        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
-        ["q"]
-    );
+    assert_eq!(core.queued_inputs.snapshot(), ["q"]);
     assert_eq!(core.bottom.composer().submit_text(), "");
 }
 
@@ -323,10 +320,7 @@ fn interrupt_keeps_queue_until_user_continues() {
     core.handle_input(key(KeyCode::Esc));
     wait_for_idle(&mut core);
 
-    assert_eq!(
-        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
-        ["queued"]
-    );
+    assert_eq!(core.queued_inputs.snapshot(), ["queued"]);
     assert_eq!(user_messages(&core), ["first"]);
 
     core.handle_input(key(KeyCode::Enter));
@@ -344,28 +338,19 @@ fn queued_input_recall_and_unqueue_use_selected_or_last() {
 
     assert_eq!(core.handle_input(key(KeyCode::Up)), CoreEffect::Render);
     assert_eq!(core.bottom.composer().submit_text(), "two");
-    assert_eq!(
-        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
-        ["one"]
-    );
+    assert_eq!(core.queued_inputs.snapshot(), ["one"]);
 
     core.handle_input(key(KeyCode::Enter));
     type_text(&mut core, "three");
     core.handle_input(key(KeyCode::Enter));
-    assert_eq!(
-        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
-        ["one", "two", "three"]
-    );
+    assert_eq!(core.queued_inputs.snapshot(), ["one", "two", "three"]);
 
     core.handle_input(key(KeyCode::Left));
     assert_eq!(
         core.handle_input(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
         CoreEffect::Render
     );
-    assert_eq!(
-        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
-        ["one", "three"]
-    );
+    assert_eq!(core.queued_inputs.snapshot(), ["one", "three"]);
 }
 
 #[test]
@@ -940,10 +925,7 @@ fn composer_accepts_next_draft_edits_while_turn_is_in_flight() {
     assert!(core.turn_in_flight());
     assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
     assert!(core.notice.is_none());
-    assert_eq!(
-        core.queued_inputs.iter().cloned().collect::<Vec<_>>(),
-        ["next\ndraft"]
-    );
+    assert_eq!(core.queued_inputs.snapshot(), ["next\ndraft"]);
     assert_eq!(core.bottom.composer().submit_text(), "");
 }
 

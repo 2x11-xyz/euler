@@ -5,7 +5,8 @@ use euler_core::permissions::{
 use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, AutoCompactionPolicy, CanvasItem,
     CompactionTier, ContextLimitConfig, GrantScope, ModelTarget, ProvenanceWriter, ReasoningEffort,
-    ScopePattern, Session, SessionConfig, SessionError, ToolRegistry, WorkingStateProjection,
+    ScopePattern, Session, SessionConfig, SessionError, SteeringQueue, ToolRegistry,
+    WorkingStateProjection,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{
@@ -4521,6 +4522,164 @@ fn test_projection() -> WorkingStateProjection {
         decisions: vec!["Frontier stays verbatim.".to_owned()],
         working_set: vec!["crates/euler-core/src/compaction.rs".to_owned()],
     }
+}
+
+/// Pushes one steering entry the moment the turn asks for permission —
+/// deterministically mid-round, with no thread timing.
+struct SteeringOnAskDecider {
+    queue: Arc<SteeringQueue>,
+    content: &'static str,
+}
+
+impl PermissionDecider for SteeringOnAskDecider {
+    fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
+        self.queue.push_back(self.content.to_owned());
+        DeciderVerdict::Allow
+    }
+}
+
+fn shell_ask_stream(id: &str) -> Vec<Result<ModelStreamEvent, ProviderError>> {
+    vec![
+        Ok(ModelStreamEvent::ToolCall(ToolCall {
+            id: id.to_owned(),
+            name: "run_shell".to_owned(),
+            // `sort` is deliberately not statically safe (issue #78): the
+            // command must reach the decider, whose ask is this test's
+            // mid-round steering push point.
+            input: json!({"command": "sort note.txt"}),
+        })),
+        finished(StopReason::ToolUse),
+    ]
+}
+
+#[test]
+fn steering_pushed_mid_round_lands_in_the_next_rounds_request() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![shell_ask_stream("call-shell"), text_stream("done")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        SteeringOnAskDecider {
+            queue: Arc::clone(&queue),
+            content: "steer: summarize instead",
+        },
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+
+    session.run_turn("run the sort").expect("turn");
+
+    // The steering user.message lands between round 1's tool result and
+    // round 2's model call — in-turn, not queued for the next turn.
+    let kinds_and_content: Vec<(String, Option<String>)> = session
+        .events()
+        .iter()
+        .map(|event| {
+            (
+                event.kind.as_str().to_owned(),
+                payload_str(event, "content").map(str::to_owned),
+            )
+        })
+        .collect();
+    let steering_index = kinds_and_content
+        .iter()
+        .position(|(kind, content)| {
+            kind == EventKind::USER_MESSAGE
+                && content.as_deref() == Some("steer: summarize instead")
+        })
+        .expect("steering user.message emitted");
+    let tool_result_index = kinds_and_content
+        .iter()
+        .position(|(kind, _)| kind == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    let second_model_call_index = kinds_and_content
+        .iter()
+        .enumerate()
+        .filter(|(_, (kind, _))| kind == EventKind::MODEL_CALL)
+        .map(|(index, _)| index)
+        .nth(1)
+        .expect("second model call");
+    assert!(tool_result_index < steering_index);
+    assert!(steering_index < second_model_call_index);
+
+    // Round 1's request predates the steering; round 2's request carries it.
+    let requests = request_log_guard(&requests);
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0]
+        .prompt_text()
+        .contains("steer: summarize instead"));
+    assert!(requests[1]
+        .prompt_text()
+        .contains("steer: summarize instead"));
+    // Absorbed means gone: nothing left to flush into the next turn.
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn paused_steering_stays_queued_and_out_of_the_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![shell_ask_stream("call-shell"), text_stream("done")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    queue.set_paused(true);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        SteeringOnAskDecider {
+            queue: Arc::clone(&queue),
+            content: "held for the next turn",
+        },
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+
+    session.run_turn("run the sort").expect("turn");
+
+    // Paused: no mid-turn user.message, no request contamination, entry kept.
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::USER_MESSAGE
+            && payload_str(event, "content") == Some("held for the next turn")
+    }));
+    let requests = request_log_guard(&requests);
+    assert!(!requests[1].prompt_text().contains("held for the next turn"));
+    assert_eq!(queue.snapshot(), vec!["held for the next turn"]);
+}
+
+#[test]
+fn steering_queued_before_the_turn_precedes_the_first_request() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new("fixture", vec![text_stream("done")], requests.clone());
+    let queue = Arc::new(SteeringQueue::default());
+    queue.push_back("pre-turn note".to_owned());
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+
+    session.run_turn("hello").expect("turn");
+
+    // Absorbed before round 1: both messages are in the only request, the
+    // turn's own user message first.
+    let requests = request_log_guard(&requests);
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0].prompt_text();
+    let turn_at = prompt.find("hello").expect("turn message");
+    let steer_at = prompt.find("pre-turn note").expect("steering message");
+    assert!(turn_at < steer_at);
+    assert!(queue.is_empty());
 }
 
 fn read_tool_stream(id: &str) -> Vec<Result<ModelStreamEvent, ProviderError>> {
