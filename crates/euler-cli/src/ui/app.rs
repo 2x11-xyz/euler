@@ -612,6 +612,11 @@ impl App {
         // close even when the replay fails.
         self.terminal.begin_synchronized_update()?;
         self.core.reset_committed_history_items();
+        // A replay rebuilds the whole canvas (theme switch, resize settle,
+        // session load). Drop the incremental history cache so the rebuild
+        // re-renders every finalized item at the current width/theme/config
+        // instead of serving stale cached rows.
+        self.core.invalidate_history_cache();
         let replay = self
             .terminal
             .reset_for_history_replay(purge_scrollback)
@@ -1959,6 +1964,11 @@ impl AppCore {
 
     fn toggle_timestamps(&mut self) -> CoreEffect {
         self.show_timestamp_gutter = !self.show_timestamp_gutter;
+        // The timestamp gutter reflows every finalized row, so the whole
+        // history render is stale — force a full rebuild. (With the
+        // incremental cache, the trailing notice this emits is only an append
+        // and would otherwise leave the prior rows rendered at the old gutter.)
+        self.visual_canvas.invalidate_history_cache();
         if let Some(path) = self.theme_preference_path.as_deref() {
             if let Err(error) =
                 model_preference::save_timestamps_preference(path, self.show_timestamp_gutter)
