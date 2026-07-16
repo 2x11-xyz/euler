@@ -38,6 +38,10 @@ impl ExtensionRunRequest {
 
 impl AppCore {
     pub(super) fn open_extension_manager(&mut self) -> CoreEffect {
+        // A user-initiated open re-reads the registry so out-of-band
+        // `euler extension` CLI changes show up; hot-path rebuilds reuse the
+        // cached listing.
+        self.invalidate_extension_registry_items();
         self.rebuild_bottom_surface();
         self.bottom.open_extension_manager();
         CoreEffect::Render
@@ -46,6 +50,7 @@ impl AppCore {
     pub(super) fn toggle_extension(&mut self, id: String, enable: bool) -> CoreEffect {
         match set_extension_enabled(&id, enable) {
             Ok(()) => {
+                self.invalidate_extension_registry_items();
                 if let AppState::Idle { session } = &mut self.state {
                     session.set_extension_enabled(&id, enable);
                 }
@@ -70,6 +75,7 @@ impl AppCore {
     pub(super) fn remove_extension(&mut self, id: String) -> CoreEffect {
         match remove_linked_extension(&id) {
             Ok(message) => {
+                self.invalidate_extension_registry_items();
                 if let AppState::Idle { session } = &mut self.state {
                     session.set_extension_enabled(&id, false);
                 }
@@ -84,6 +90,7 @@ impl AppCore {
     pub(super) fn add_extension(&mut self, path: String) -> CoreEffect {
         match add_local_extension(std::path::Path::new(&path)) {
             Ok(report) => {
+                self.invalidate_extension_registry_items();
                 if let AppState::Idle { session } = &mut self.state {
                     session.set_extension_enabled(&report.id, true);
                 }

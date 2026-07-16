@@ -17,6 +17,16 @@ pub(super) struct TuiResume {
 }
 
 impl AppCore {
+    /// `/resume` lists the session store when the picker opens, not on every
+    /// bottom-surface rebuild: listing reads each session's event log, which
+    /// is far too slow for the submit hot path.
+    pub(super) fn open_resume_picker(&mut self) -> CoreEffect {
+        let items = support::resume_items_from_home(self.status.session_id.as_deref());
+        self.bottom
+            .open_picker(crate::ui::commands::PickerSpec::Resume(items));
+        CoreEffect::Render
+    }
+
     pub(super) fn resume_session_from_picker(&mut self, session_id: String) -> CoreEffect {
         let current_session_id = match &self.state {
             AppState::Idle { session } => session.session_id().to_owned(),

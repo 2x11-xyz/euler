@@ -75,10 +75,33 @@ impl SessionStore {
 
     pub fn find_session(&self, id: &str) -> Result<Option<SessionRecord>, SessionStoreError> {
         validate_session_id(id)?;
-        Ok(self
-            .list_sessions()?
-            .into_iter()
-            .find(|record| record.id() == id))
+        ensure_private_dir(&self.sessions_dir())?;
+        // Targeted resolution: project only this session's record.
+        // `list_sessions` derives every session's projection from its event
+        // log, which is far too expensive for single-id lookups.
+        let entry = match self.records_from_index()?.remove(id) {
+            Some(Some(entry)) => Some(entry),
+            // Deleted tombstone: a lingering or reappearing directory must
+            // not resurrect the session (same rule as `list_sessions`).
+            Some(None) => return Ok(None),
+            None => {
+                let dir = self.sessions_dir().join(id);
+                let present = dir.is_dir()
+                    && (dir.join("events.jsonl").is_file() || dir.join("session.json").is_file());
+                if present {
+                    Some(IndexEntry {
+                        version: INDEX_ENTRY_VERSION,
+                        op: IndexOp::Created,
+                        id: id.to_owned(),
+                        created_at_ms: created_at_ms_from_metadata(&dir)?,
+                        updated_at_ms: None,
+                    })
+                } else {
+                    None
+                }
+            }
+        };
+        Ok(entry.and_then(|entry| self.record_from_index_entry(entry)))
     }
 
     /// Resolve a user-facing session reference.
@@ -162,6 +185,32 @@ impl SessionStore {
         write_session_metadata_replace(&refreshed)?;
         self.append_index_entry(&IndexEntry::updated(&refreshed))?;
         Ok(refreshed)
+    }
+
+    /// Bumps the session's `updated_at_ms` recency stamp without projecting
+    /// its event log. This is the turn-boundary hot-path variant of
+    /// [`Self::refresh_session_metadata`]: the TUI touches the active
+    /// session after every turn, and re-reading a multi-megabyte event log
+    /// (plus blob verification) per turn stalls the UI thread. The sidecar's
+    /// other fields are carried forward verbatim — event-derived truth
+    /// (status, rename events) still wins wherever records are projected,
+    /// and the next full refresh re-syncs the sidecar.
+    pub fn touch_session_updated_at(&self, id: &str) -> Result<(), SessionStoreError> {
+        validate_session_id(id)?;
+        let record = match self.record_from_sidecar(id) {
+            Some(record) => record,
+            // No readable sidecar: fall back to the projecting refresh,
+            // which also rewrites the sidecar for the next touch.
+            None => {
+                self.refresh_session_metadata(id)?;
+                return Ok(());
+            }
+        };
+        let updated_at_ms = record.updated_at_ms.max(now_unix_ms());
+        let refreshed = record.with_updated_at_ms(updated_at_ms);
+        write_session_metadata_replace(&refreshed)?;
+        self.append_index_entry(&IndexEntry::updated(&refreshed))?;
+        Ok(())
     }
 
     fn create_session_with_id(&self, id: String) -> Result<SessionRecord, SessionStoreError> {
@@ -306,6 +355,39 @@ impl SessionStore {
         }
         let updated_at_ms = entry.effective_updated_at_ms();
         Some(self.record_from_parts(entry.id, dir, entry.created_at_ms, updated_at_ms))
+    }
+
+    /// Builds the record for `id` from its `session.json` sidecar alone —
+    /// no event-log read, so no title and a possibly stale status/name
+    /// (events win over the sidecar for those when a full projection runs).
+    /// Suitable for metadata touches, not for user-facing listings.
+    fn record_from_sidecar(&self, id: &str) -> Option<SessionRecord> {
+        let dir = self.sessions_dir().join(id);
+        let metadata = read_session_metadata(&dir.join("session.json")).ok()?;
+        if metadata.id != id {
+            return None;
+        }
+        let created_at_ms = metadata.created_at_ms;
+        let updated_at_ms = metadata
+            .updated_at_ms
+            .unwrap_or(created_at_ms)
+            .max(created_at_ms);
+        let projection = SessionProjection {
+            status: metadata.status,
+            name: metadata
+                .name
+                .and_then(|name| session_name_for_display(&name)),
+            title: None,
+            root: metadata.root.as_deref().and_then(session_root_from_str),
+            kind: metadata.kind,
+        };
+        Some(SessionRecord::new(
+            id.to_owned(),
+            dir,
+            created_at_ms,
+            updated_at_ms,
+            projection,
+        ))
     }
 
     fn record_from_parts(

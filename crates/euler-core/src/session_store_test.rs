@@ -265,6 +265,79 @@ fn refresh_preserves_newer_index_timestamp_when_sidecar_is_stale() {
 }
 
 #[test]
+fn touch_bumps_updated_at_without_reading_the_event_log() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let stale_metadata = format!(
+        r#"{{"version":1,"id":"{}","created_at_ms":{},"updated_at_ms":{},"status":"active","name":"kept name","events_path":"events.jsonl","blobs_dir":"blobs"}}
+"#,
+        record.id(),
+        record.created_at_ms(),
+        record.created_at_ms()
+    );
+    fs::write(record.session_json_path(), stale_metadata).expect("stale metadata");
+    // A corrupt event log proves the touch never projects events: the
+    // projecting refresh would surface this as an Invalid status rewrite.
+    fs::write(record.events_path(), "not json\n").expect("corrupt events");
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    let metadata = fs::read_to_string(record.session_json_path()).expect("metadata");
+    // Sidecar fields carry forward verbatim; only the recency stamp moves.
+    assert!(metadata.contains("kept name"));
+    let parsed: serde_json::Value = serde_json::from_str(&metadata).expect("json");
+    assert!(parsed["updated_at_ms"].as_u64().expect("updated") > record.created_at_ms());
+}
+
+#[test]
+fn touch_without_sidecar_falls_back_to_projecting_refresh() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store.name_session(record.id(), "event name").expect("name");
+    fs::remove_file(record.session_json_path()).expect("drop sidecar");
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    // The fallback rewrote the sidecar from the event projection, so the
+    // next touch has current fields to carry forward.
+    let metadata = fs::read_to_string(record.session_json_path()).expect("metadata");
+    assert!(metadata.contains("event name"));
+}
+
+#[test]
+fn touch_keeps_event_derived_name_authoritative_in_listings() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store
+        .name_session(record.id(), "canonical name")
+        .expect("name");
+    let stale_metadata = format!(
+        r#"{{"version":1,"id":"{}","created_at_ms":{},"updated_at_ms":{},"status":"active","name":"stale sidecar name","events_path":"events.jsonl","blobs_dir":"blobs"}}
+"#,
+        record.id(),
+        record.created_at_ms(),
+        record.created_at_ms()
+    );
+    fs::write(record.session_json_path(), stale_metadata).expect("stale metadata");
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    // The touch carried the stale sidecar name forward, but projections
+    // still derive the name from events.
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.name(), Some("canonical name"));
+}
+
+#[test]
 fn deleted_tombstone_suppresses_session_and_later_update_does_not_resurrect_it() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");

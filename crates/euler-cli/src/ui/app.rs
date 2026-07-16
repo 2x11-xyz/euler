@@ -254,6 +254,13 @@ pub struct AppCore {
     terminal_focused: bool,
     notifications_enabled: bool,
     pending_notifications: VecDeque<NotifyEvent>,
+    /// Registry view of the extension manager items (computed with no
+    /// session overlay). Listing hits disk — enablement log, link inventory,
+    /// per-manifest reads — and `rebuild_bottom_surface` runs on the
+    /// submit/turn-end hot path, so the listing is cached here and only
+    /// invalidated by in-app extension mutations or a manager open (which
+    /// also picks up out-of-band `euler extension` CLI changes).
+    extension_registry_items: Option<Vec<crate::ui::commands::ExtensionManagerItem>>,
 }
 
 enum AppState {
@@ -841,6 +848,7 @@ impl AppCore {
             terminal_focused: true,
             notifications_enabled: boot.notifications_enabled,
             pending_notifications: VecDeque::new(),
+            extension_registry_items: None,
         }
     }
 
@@ -850,7 +858,6 @@ impl AppCore {
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
             current_theme: self.theme_choice,
-            current_session_id: self.status.session_id.clone(),
             checkpoint_items: self.current_checkpoint_items(),
             extension_items,
             extension_slash_commands,
@@ -873,7 +880,6 @@ impl AppCore {
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
             current_theme: self.theme_choice,
-            current_session_id: self.status.session_id.clone(),
             checkpoint_items: self.current_checkpoint_items(),
             extension_items,
             extension_slash_commands,
@@ -932,7 +938,7 @@ impl AppCore {
     }
 
     fn current_extension_context(
-        &self,
+        &mut self,
     ) -> (
         Vec<crate::ui::commands::ExtensionManagerItem>,
         Vec<crate::ui::commands::ExtensionSlashCommand>,
@@ -941,9 +947,32 @@ impl AppCore {
             AppState::Idle { session } => Some(session.extensions_enabled().clone()),
             _ => None,
         };
-        let items = list_extension_manager_items(session_enabled.as_ref());
+        // Registry listing is cached (disk-backed, hot path); the session's
+        // enablement overlay is applied per call. Bundled items take the
+        // session set when one is available — the same rule
+        // `list_extension_manager_items` applies — while linked items keep
+        // their separately persisted launch consent.
+        let mut items = match &self.extension_registry_items {
+            Some(items) => items.clone(),
+            None => {
+                let items = list_extension_manager_items(None);
+                self.extension_registry_items = Some(items.clone());
+                items
+            }
+        };
+        if let Some(enabled) = &session_enabled {
+            for item in items.iter_mut().filter(|item| item.bundled) {
+                item.enabled = enabled.contains(&item.id);
+            }
+        }
         let slash = crate::ui::commands::build_extension_slash_commands(&items);
         (items, slash)
+    }
+
+    /// Drops the cached registry listing so the next
+    /// `current_extension_context` re-reads the extension registry.
+    fn invalidate_extension_registry_items(&mut self) {
+        self.extension_registry_items = None;
     }
 
     fn current_causal_dag_stats(&self) -> Option<crate::ui::commands::CausalDagStats> {
@@ -1898,6 +1927,7 @@ impl AppCore {
                 source,
             } => self.revoke_grant(capability, pattern, source),
             CommandAction::ShowHelp { text } => self.notice_item(text),
+            CommandAction::OpenResumePicker => self.open_resume_picker(),
             CommandAction::ResumeSession { session_id } => {
                 self.resume_session_from_picker(session_id)
             }
@@ -2639,7 +2669,10 @@ impl AppCore {
     }
 
     fn refresh_current_session_metadata(&mut self, session_id: &str) -> Result<()> {
-        self.session_store()?.refresh_session_metadata(session_id)?;
+        // Turn-boundary recency touch: never project the event log here —
+        // this runs on the UI thread after every turn (see
+        // `SessionStore::touch_session_updated_at`).
+        self.session_store()?.touch_session_updated_at(session_id)?;
         Ok(())
     }
 
@@ -2663,7 +2696,6 @@ fn empty_command_context_parts(
     CommandContextParts {
         current_effort,
         current_theme,
-        current_session_id: current_session_id.clone(),
         checkpoint_items: Vec::new(),
         extension_items: Vec::new(),
         extension_slash_commands: Vec::new(),
