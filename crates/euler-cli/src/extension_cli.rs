@@ -1,3 +1,7 @@
+//! Justification for >1000 lines: this module owns the extension management
+//! CLI and linked-package registry workflow; runtime-specific observer logic
+//! is extracted into focused submodules.
+
 mod observer;
 mod output;
 
