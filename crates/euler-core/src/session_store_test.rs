@@ -265,6 +265,102 @@ fn refresh_preserves_newer_index_timestamp_when_sidecar_is_stale() {
 }
 
 #[test]
+fn listing_backfills_projection_cache_and_reuses_it_without_projecting() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store
+        .name_session(record.id(), "event name")
+        .expect("name");
+
+    // First listing projects from events and backfills the cache key.
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.name(), Some("event name"));
+    let sidecar: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(record.session_json_path()).expect("sidecar"),
+    )
+    .expect("json");
+    assert!(sidecar["projected_events_len"].is_u64());
+    assert!(sidecar["projected_events_modified_ns"].is_u64());
+
+    // Hand-edit the cached name while keeping the key: a hit must serve the
+    // sidecar fields verbatim, proving the event log was not re-projected.
+    let mut edited = sidecar.clone();
+    edited["name"] = serde_json::Value::String("cached name".to_owned());
+    fs::write(
+        record.session_json_path(),
+        serde_json::to_string_pretty(&edited).expect("serialize"),
+    )
+    .expect("edit sidecar");
+    let cached = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(cached.name(), Some("cached name"));
+
+    // Appending an event moves the key: the next listing re-projects and
+    // event-derived truth wins again.
+    store
+        .name_session(record.id(), "newer name")
+        .expect("rename");
+    let reprojected = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(reprojected.name(), Some("newer name"));
+}
+
+#[test]
+fn invalid_projection_is_never_cached_and_can_recover() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    fs::write(record.events_path(), "not json\n").expect("corrupt events");
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.status(), SessionStatus::Invalid);
+    let sidecar: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(record.session_json_path()).expect("sidecar"),
+    )
+    .expect("json");
+    assert!(sidecar.get("projected_events_len").is_none());
+
+    // Repairing the log recovers on the next listing — nothing pinned the
+    // Invalid status.
+    fs::write(record.events_path(), "").expect("repair events");
+    let recovered = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(recovered.status(), SessionStatus::Active);
+}
+
+#[test]
+fn touch_preserves_projection_cache_fields() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    let sidecar: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(record.session_json_path()).expect("sidecar"),
+    )
+    .expect("json");
+    assert!(sidecar["projected_events_len"].is_u64());
+    assert!(sidecar["projected_events_modified_ns"].is_u64());
+}
+
+#[test]
 fn touch_bumps_updated_at_without_reading_the_event_log() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");
