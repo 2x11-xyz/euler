@@ -1,3 +1,8 @@
+//! Justification for >1000 lines: this module owns the extension management
+//! CLI and linked-package registry workflow; runtime-specific observer logic
+//! is extracted into focused submodules.
+
+mod observer;
 mod output;
 
 use crate::bundled_extensions::{
@@ -606,6 +611,8 @@ pub(crate) fn resolve_live_linked_process_command(
         .clone();
     Ok(Some((extension, descriptor)))
 }
+
+pub(crate) use observer::resolve as resolve_live_linked_observer;
 
 fn reject_bundled_link_collision(id: &str) -> Result<()> {
     if bundled_extension_by_id(id).is_some() {

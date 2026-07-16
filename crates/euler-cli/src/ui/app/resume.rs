@@ -95,9 +95,12 @@ impl AppCore {
         );
         seed_config.extensions_enabled =
             resolve_session_extensions(&seed_config.root, &self.extensions)?;
-        let observer = bundled_round_observer(&self.observe, &seed_config.extensions_enabled)?;
+        let observer = resolve_round_observer(&self.observe, &seed_config.extensions_enabled)?;
         if let Some((observer_config, _)) = &observer {
             seed_config.round_observer = Some(observer_config.clone());
+            if let Some(id) = self.observe.extension_id.as_ref() {
+                seed_config.extensions_enabled.insert(id.clone());
+            }
         }
         let folded = fold_session(&seed_config, prefix)?;
         let original = folded

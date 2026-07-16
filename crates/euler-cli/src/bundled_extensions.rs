@@ -64,13 +64,9 @@ pub(crate) struct ObserveOptions {
 }
 
 impl ObserveOptions {
-    pub(crate) fn normalized(mut self) -> Result<Self> {
+    pub(crate) fn normalized(self) -> Result<Self> {
         match (&self.extension_id, self.cadence_rounds) {
             (None, Some(_)) => Err(anyhow!("--observe-cadence requires --observe")),
-            (Some(_), None) => {
-                self.cadence_rounds = Some(default_observe_cadence());
-                Ok(self)
-            }
             _ => Ok(self),
         }
     }
@@ -177,13 +173,6 @@ pub(crate) fn bundled_extension_by_id(id: &str) -> Option<&'static BundledExtens
         .find(|bundled| bundled.extension.manifest().id == id)
 }
 
-pub(crate) fn validate_observe_options(options: &ObserveOptions) -> Result<()> {
-    let Some(id) = options.extension_id.as_deref() else {
-        return Ok(());
-    };
-    observer_descriptor(id).map(|_| ())
-}
-
 pub(crate) fn bundled_round_observer(
     options: &ObserveOptions,
     enabled: &BTreeSet<String>,
@@ -209,6 +198,27 @@ pub(crate) fn bundled_round_observer(
         },
         extension,
     )))
+}
+
+pub(crate) fn resolve_round_observer(
+    options: &ObserveOptions,
+    enabled: &BTreeSet<String>,
+) -> Result<Option<(RoundObserverConfig, Arc<dyn Extension>)>> {
+    let Some(id) = options.extension_id.as_deref() else {
+        return Ok(None);
+    };
+    // Bundled IDs are reserved and must not depend on local linked-registry
+    // health. Resolve them first so a corrupt links.json cannot disable a
+    // built-in observer.
+    if bundled_extension_by_id(id).is_some() {
+        return bundled_round_observer(options, enabled);
+    }
+    if let Some(observer) =
+        crate::extension_cli::resolve_live_linked_observer(id, options.cadence_rounds)?
+    {
+        return Ok(Some(observer));
+    }
+    bundled_round_observer(options, enabled)
 }
 
 fn observer_descriptor(id: &str) -> Result<(BundledDescriptor, ObserverCommandPair)> {

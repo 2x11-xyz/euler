@@ -1746,28 +1746,22 @@ fn observe_flag_parses_valid_extension_and_default_cadence() {
     let args = parse_without_env(["--observe", "causal-dag"]);
 
     assert_eq!(args.observe.extension_id.as_deref(), Some("causal-dag"));
-    assert_eq!(args.observe.cadence_rounds.map(NonZeroU64::get), Some(8));
+    assert_eq!(args.observe.cadence_rounds, None);
 }
 
 #[test]
-fn observe_flag_rejects_unknown_extension() {
-    let error = parse_args_error(["--observe", "not-bundled"]);
-
-    // Only observer-capable extensions are suggested, not every bundled id.
+fn observe_flag_defers_extension_resolution_until_registry_is_available() {
+    let args = parse_without_env(["--observe", "possibly-linked"]);
     assert_eq!(
-        error.to_string(),
-        "unknown extension id for --observe: not-bundled; observer-capable extensions: causal-dag"
+        args.observe.extension_id.as_deref(),
+        Some("possibly-linked")
     );
 }
 
 #[test]
-fn observe_flag_rejects_observer_incapable_extension() {
-    let error = parse_args_error(["--observe", "session-export"]);
-
-    assert_eq!(
-        error.to_string(),
-        "--observe session-export is not supported: extension session-export declares no observer command pair"
-    );
+fn observe_flag_defers_observer_capability_validation() {
+    let args = parse_without_env(["--observe", "session-export"]);
+    assert_eq!(args.observe.extension_id.as_deref(), Some("session-export"));
 }
 
 #[test]
@@ -1812,7 +1806,7 @@ fn observe_requires_extension_enabled_set() {
     let root = tempfile::tempdir().expect("root");
     let enabled = resolve_session_extensions(root.path(), &run.extensions).expect("extensions");
 
-    let error = match bundled_round_observer(&run.observe, &enabled) {
+    let error = match resolve_round_observer(&run.observe, &enabled) {
         Ok(_) => panic!("expected observer disabled"),
         Err(error) => error,
     };
@@ -1828,7 +1822,7 @@ fn observer_wiring_uses_bundled_command_pair() {
     let run = parse_without_env(["--observe", "causal-dag", "--extensions", "causal-dag"]);
     let root = tempfile::tempdir().expect("root");
     let enabled = resolve_session_extensions(root.path(), &run.extensions).expect("extensions");
-    let (observer, _) = bundled_round_observer(&run.observe, &enabled)
+    let (observer, _) = resolve_round_observer(&run.observe, &enabled)
         .expect("observer")
         .expect("configured");
     let descriptor = bundled_descriptor_by_id("causal-dag")

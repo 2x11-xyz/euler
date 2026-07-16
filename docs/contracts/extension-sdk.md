@@ -5,9 +5,10 @@ Extensions register tools, commands, context slots, and workflows through a stab
 Implementation status: commands, the bounded event feed, bounded diagnostics
 reads, artifact writes, agent task records, checkpoints, context slot updates,
 the local wake primitive, and a generic managed-process adapter exist today.
-The first runnable package surface is explicitly enabled local packages through
-`euler extension run`; native extensions remain the currently wired live-session
-path. Extension-registered tools are roadmap (Phase 2 of the SDK consolidation);
+Explicitly enabled local packages run through offline and live command surfaces
+and may participate in the generic round-observer composition by declaring an
+observer command pair in their manifest. Extension-registered tools are roadmap
+(Phase 2 of the SDK consolidation);
 nothing in core registers them yet, and this contract's mention of them binds
 their eventual shape, not their present existence.
 

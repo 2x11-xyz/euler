@@ -890,6 +890,7 @@ fn extension(
             required_capabilities: capabilities,
             invocation: euler_sdk::Invocation::User,
         }],
+        observer: None,
     };
     ManagedProcessExtension::new(
         package_dir,

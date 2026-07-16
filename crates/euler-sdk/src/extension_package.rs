@@ -37,6 +37,15 @@ pub struct StaticExtensionDescriptor {
     pub runtime_kind: String,
     pub capabilities: Vec<String>,
     pub commands: Vec<StaticCommandDescriptor>,
+    #[serde(default)]
+    pub observer: Option<StaticObserverDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StaticObserverDescriptor {
+    pub brief_command: String,
+    pub apply_command: String,
+    pub default_cadence_rounds: u64,
 }
 
 /// A shell-free argv entrypoint for a managed process extension.
@@ -284,6 +293,7 @@ pub fn parse_extension_manifest_bytes(
             "entrypoint",
             "capabilities",
             "commands",
+            "observer",
         ],
         "manifest",
     )?;
@@ -313,6 +323,7 @@ pub fn parse_extension_manifest_bytes(
     let capabilities = required_string_list(root, "capabilities", "manifest capabilities")?;
     validate_capabilities(&capabilities, "manifest capabilities")?;
     let commands = parse_commands(root)?;
+    let observer = parse_observer(root, &commands)?;
     let envelope = capabilities.iter().cloned().collect::<BTreeSet<_>>();
     for command in &commands {
         for capability in &command.required_capabilities {
@@ -332,6 +343,7 @@ pub fn parse_extension_manifest_bytes(
         runtime_kind,
         capabilities,
         commands,
+        observer,
     })
 }
 
@@ -511,6 +523,51 @@ pub fn encode_link_inventory(
     let mut bytes = serde_json::to_vec_pretty(&inventory)?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+fn parse_observer(
+    root: &Map<String, Value>,
+    commands: &[StaticCommandDescriptor],
+) -> Result<Option<StaticObserverDescriptor>, ExtensionPackageError> {
+    let Some(value) = root.get("observer") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("manifest observer must be an object"))?;
+    validate_fields(
+        object,
+        &["brief_command", "apply_command", "default_cadence_rounds"],
+        "manifest observer",
+    )?;
+    let brief_command =
+        required_identifier(object, "brief_command", "manifest observer brief_command")?;
+    let apply_command =
+        required_identifier(object, "apply_command", "manifest observer apply_command")?;
+    for command in [&brief_command, &apply_command] {
+        if !commands
+            .iter()
+            .any(|descriptor| descriptor.name == *command)
+        {
+            return Err(invalid(format!(
+                "manifest observer command `{command}` is not registered"
+            )));
+        }
+    }
+    let default_cadence_rounds = object
+        .get("default_cadence_rounds")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("manifest observer default_cadence_rounds must be an integer"))?;
+    if default_cadence_rounds == 0 {
+        return Err(invalid(
+            "manifest observer default_cadence_rounds must be greater than zero",
+        ));
+    }
+    Ok(Some(StaticObserverDescriptor {
+        brief_command,
+        apply_command,
+        default_cadence_rounds,
+    }))
 }
 
 fn parse_commands(
