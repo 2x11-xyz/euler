@@ -3,7 +3,7 @@ use euler_core::{AgentBudget, AgentResult, AgentTask, Session};
 use euler_sdk::Capability;
 use serde_json::{Map, Value};
 
-use crate::CliDecider;
+use crate::cli::permission::CliDecider;
 
 pub(crate) fn execute_headless_companion_run(
     session: &mut Session<CliDecider>,

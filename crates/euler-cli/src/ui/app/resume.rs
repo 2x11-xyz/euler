@@ -97,7 +97,7 @@ impl AppCore {
             .ok_or_else(|| anyhow!("no session found with id {session_id}"))?;
         let prefix = read_resume_prefix(record.events_path())?;
         let root = std::env::current_dir().unwrap_or_else(|_| session_root_status_path());
-        let mut seed_config = crate::session_config(
+        let mut seed_config = crate::session_lifecycle::session_config(
             root.clone(),
             self.status.provider.clone(),
             self.status.model.clone(),
@@ -117,7 +117,7 @@ impl AppCore {
             .original_target
             .as_ref()
             .unwrap_or(&folded.active_target);
-        let mut config = crate::session_config(
+        let mut config = crate::session_lifecycle::session_config(
             root,
             original.provider.clone(),
             original.model.clone(),
@@ -129,7 +129,7 @@ impl AppCore {
         config.provider = folded.active_target.provider.clone();
         config.model = folded.active_target.model.clone();
         crate::session_lifecycle::apply_catalog_context_limit(&mut config, &self.model_catalog);
-        let providers = crate::resume_provider_set(
+        let providers = crate::cli::providers::resume_provider_set(
             folded
                 .original_target
                 .as_ref()
@@ -149,7 +149,7 @@ impl AppCore {
         if let Some((_, extension)) = observer {
             session.set_observer_extension(extension);
         }
-        crate::wire_code_swarm(&mut session);
+        crate::cli::extension_run::wire_code_swarm(&mut session);
         let events = session.events().to_vec();
         let events_replayed = outcome.events_folded;
         Ok(TuiResume {

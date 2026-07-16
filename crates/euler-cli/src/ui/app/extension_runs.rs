@@ -161,7 +161,9 @@ impl AppCore {
             crate::extension_cli::resolve_live_linked_process_command(&id, &command)?
         {
             if descriptor.invocation.is_agent_only() {
-                return Err(anyhow!(crate::agent_only_control_line_error(&id, &command)));
+                return Err(anyhow!(
+                    crate::cli::extension_run::agent_only_control_line_error(&id, &command)
+                ));
             }
             if raw_args.is_some() {
                 return Err(anyhow!(
