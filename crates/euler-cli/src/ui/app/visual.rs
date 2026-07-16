@@ -55,7 +55,7 @@ impl AppCore {
         let theme = self.theme.clone();
         let expanded = self.tool_output_expanded;
         let show_ts = self.show_timestamp_gutter;
-        let mut frame = self.visual_canvas.render(snapshot, |items, width| {
+        let mut frame = self.visual_canvas.render(snapshot, |items, render_from, width| {
             crate::ui::text::with_timestamp_gutter(show_ts, || {
                 render_finalized_visual_items_with_offsets(
                     items,
@@ -63,6 +63,7 @@ impl AppCore {
                     width,
                     TOOL_CALL_MAX_LINES,
                     expanded,
+                    render_from,
                 )
             })
         });
@@ -405,6 +406,7 @@ pub(super) fn render_finalized_visual_items_with_offsets(
     width: u16,
     output_limit_lines: usize,
     expanded: bool,
+    render_from: usize,
 ) -> (Vec<CanvasLine>, Vec<usize>) {
     let (lines, item_end_offsets) = transcript::render_entries_for_history_with_offsets(
         entries,
@@ -412,6 +414,7 @@ pub(super) fn render_finalized_visual_items_with_offsets(
         width,
         output_limit_lines,
         expanded,
+        render_from,
     );
     // v2: the renderer already separates every event with one blank line —
     // the old trailing-rhythm row would double it AND desync the live vs

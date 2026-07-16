@@ -92,7 +92,7 @@ pub(super) fn render_projected_entries_with_expansion(
     expanded: bool,
 ) -> Vec<Line<'static>> {
     render_projected_entries_with_expansion_and_offsets(
-        entries, theme, width, limits, expanded, true,
+        entries, theme, width, limits, expanded, true, 0,
     )
     .0
 }
@@ -110,7 +110,19 @@ pub(super) fn render_projected_entries_with_expansion(
 ///
 /// `expanded` is the single global `ctrl+o` fold state (issue #49) — every
 /// foldable item in `entries` shares it; there is no per-item targeting.
+///
+/// `render_from` renders only items `entries[render_from..]`, emitting their
+/// lines and offsets (offsets are relative to the returned segment). Earlier
+/// items are still visible to the loop's cross-item lookups — reasoning
+/// elapsed scans backward for its `ModelCall`, notice-run continuation peeks
+/// forward — so a suffix render is byte-identical to the same items' tail of a
+/// full render. This is the seam the visual canvas's incremental history cache
+/// appends through: only the newly finalized items pay the markdown/highlight
+/// cost, not the whole session (`VisualCanvasState::render_history`).
 #[allow(clippy::too_many_lines)] // ratchet: ledger projection match, refactor target
+// ratchet: render knobs (expanded/footer/render_from) thread as flat args; a
+// params struct is the refactor target alongside the match above.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_projected_entries_with_expansion_and_offsets(
     entries: &[ProjectedEntry],
     theme: &Theme,
@@ -118,11 +130,12 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
     limits: TranscriptRenderLimits,
     expanded: bool,
     show_turn_footer: bool,
+    render_from: usize,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
-    let mut item_end_offsets = Vec::with_capacity(entries.len());
+    let mut item_end_offsets = Vec::with_capacity(entries.len().saturating_sub(render_from));
 
-    for (index, entry) in entries.iter().enumerate() {
+    for (index, entry) in entries.iter().enumerate().skip(render_from) {
         let first_line = lines.len();
         let item = &entry.item;
         let item_expanded = expanded;
@@ -694,11 +707,9 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
         // gets the uniform one-blank separator here. Exception (review v2
         // §3/§6): a run of consecutive `Notice` items stacks directly — no
         // blank line between one notice and the next.
-        let next_is_notice_continuation = matches!(item, TranscriptItem::Notice(_))
-            && matches!(
-                entries.get(index + 1).map(|entry| &entry.item),
-                Some(TranscriptItem::Notice(_))
-            );
+        let next_is_notice_continuation = entries
+            .get(index + 1)
+            .is_some_and(|next| super::consecutive_notices(item, &next.item));
         if first_line < lines.len()
             && !matches!(item, TranscriptItem::Banner { .. })
             && !next_is_notice_continuation

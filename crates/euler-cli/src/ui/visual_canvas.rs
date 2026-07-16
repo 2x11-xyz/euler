@@ -99,7 +99,10 @@ impl VisualCanvasState {
                     if timing.is_some() {
                         *existing_timing = timing;
                     }
-                    self.history_cache = None;
+                    // In-place mutation of the last item: invalidate only its
+                    // cached rows, never the whole session.
+                    let last = self.finalized.len() - 1;
+                    self.mark_history_dirty_from(last);
                     return;
                 }
             }
@@ -107,18 +110,20 @@ impl VisualCanvasState {
                 item: TranscriptItem::Exploration { summaries },
                 timing,
             });
-            self.history_cache = None;
+            // Pure append: the next render appends just this item (below).
             return;
         }
         if let TranscriptItem::Companion { spawn_event_id, .. } = &item {
-            if let Some(entry) = self.finalized[boundary..].iter_mut().rev().find(|entry| {
+            if let Some(pos) = self.finalized[boundary..].iter().rposition(|entry| {
                 entry.item.companion_spawn_event_id() == Some(spawn_event_id.as_str())
             }) {
+                let index = boundary + pos;
+                let entry = &mut self.finalized[index];
                 let _ = super::transcript::merge_companion_item(&mut entry.item, item);
                 if timing.is_some() {
                     entry.timing = timing;
                 }
-                self.history_cache = None;
+                self.mark_history_dirty_from(index);
                 return;
             }
         }
@@ -126,16 +131,53 @@ impl VisualCanvasState {
             if let Some(index) = self.finalized[boundary..].iter().rposition(|entry| {
                 matches!(&entry.item, TranscriptItem::PatchApplied { path: p, .. } if p == path)
             }) {
+                self.mark_history_dirty_from(boundary + index);
                 self.finalized.remove(boundary + index);
             }
             if let Some(index) = self.finalized[boundary..].iter().rposition(|entry| {
                 matches!(&entry.item, TranscriptItem::FileChange { path: p, .. } if p == path)
             }) {
+                self.mark_history_dirty_from(boundary + index);
                 self.finalized.remove(boundary + index);
             }
         }
+        // Pure append (possibly after the removals above, which already
+        // invalidated the cache from their point onward). The cache is not
+        // dropped: the next render re-renders only from the earliest dirty or
+        // newly appended item.
         self.finalized.push(ProjectedEntry { item, timing });
-        self.history_cache = None;
+    }
+
+    /// Invalidate the cached history render from finalized item `index`
+    /// onward: that item (and everything after it) was mutated or removed, so
+    /// its cached rows are stale and re-render on the next `render_history`.
+    /// Items before `index` keep their cached rows byte-for-byte.
+    ///
+    /// The truncation point first walks back over any immediately preceding
+    /// `Notice` run. A notice's trailing blank is suppressed only when the
+    /// item after it is also a notice (the renderer's rhythm rule), so a
+    /// notice adjacent to the mutated region must re-render too — its blank
+    /// may need to reappear or vanish. Callers only ever touch items past the
+    /// committed boundary, so this never disturbs rows already in native
+    /// scrollback.
+    fn mark_history_dirty_from(&mut self, index: usize) {
+        let mut from = index;
+        while from > 0
+            && matches!(
+                self.finalized.get(from - 1).map(|entry| &entry.item),
+                Some(TranscriptItem::Notice(_))
+            )
+        {
+            from -= 1;
+        }
+        if let Some(cache) = &mut self.history_cache {
+            let keep = from.min(cache.item_end_offsets.len());
+            let line_keep = keep
+                .checked_sub(1)
+                .map_or(0, |last| cache.item_end_offsets[last]);
+            cache.lines.truncate(line_keep);
+            cache.item_end_offsets.truncate(keep);
+        }
     }
 
     /// Advance the committed-items boundary (monotonic; from the terminal's
@@ -174,7 +216,7 @@ impl VisualCanvasState {
         render_finalized: R,
     ) -> VisualCanvasFrame
     where
-        R: FnOnce(&[ProjectedEntry], u16) -> (Vec<CanvasLine>, Vec<usize>),
+        R: FnOnce(&[ProjectedEntry], usize, u16) -> (Vec<CanvasLine>, Vec<usize>),
     {
         let (history, offsets) = self.render_history(snapshot.width, render_finalized);
         if !history.is_empty() {
@@ -182,25 +224,72 @@ impl VisualCanvasState {
                 .blocks
                 .insert(0, VisualBlock::new(VisualBlockRole::History, history));
         }
-        let mut frame = derive_frame(&snapshot);
+        let focus = snapshot.focus;
+        let mut frame = derive_frame_owned(snapshot.blocks, focus);
         frame.history_item_offsets = offsets;
         frame
     }
 
+    /// Render the finalized history at `width`, reusing the cache incrementally.
+    ///
+    /// - Width unchanged, nothing appended → serve the cached render.
+    /// - Width unchanged, items appended → render only the new tail (with full
+    ///   cross-item context) and splice it on; previously rendered rows stay
+    ///   byte-identical, and the per-item offsets extend in lockstep.
+    /// - Width changed (or the cache was dropped by a theme/config change) →
+    ///   full re-render; this is the only path that pays the whole session's
+    ///   markdown/highlight cost.
+    ///
+    /// `render_finalized(entries, render_from, width)` renders
+    /// `entries[render_from..]` with offsets relative to that segment.
     fn render_history<R>(
         &mut self,
         width: u16,
         render_finalized: R,
     ) -> (Vec<CanvasLine>, Vec<usize>)
     where
-        R: FnOnce(&[ProjectedEntry], u16) -> (Vec<CanvasLine>, Vec<usize>),
+        R: FnOnce(&[ProjectedEntry], usize, u16) -> (Vec<CanvasLine>, Vec<usize>),
     {
-        if let Some(cache) = &self.history_cache {
-            if cache.width == width {
+        let width_matches = self
+            .history_cache
+            .as_ref()
+            .is_some_and(|cache| cache.width == width);
+        if width_matches {
+            let cached_items = self
+                .history_cache
+                .as_ref()
+                .map_or(0, |cache| cache.item_end_offsets.len());
+            if cached_items >= self.finalized.len() {
+                let cache = self
+                    .history_cache
+                    .as_ref()
+                    .expect("cache present when width matches");
                 return (cache.lines.clone(), cache.item_end_offsets.clone());
             }
+            let (mut new_lines, new_offsets) =
+                render_finalized(&self.finalized, cached_items, width);
+            let retract_seam_blank =
+                seam_retracts_trailing_blank(&self.finalized, cached_items);
+            let cache = self
+                .history_cache
+                .as_mut()
+                .expect("cache present when width matches");
+            if retract_seam_blank {
+                if let Some(last) = cache.item_end_offsets.last_mut() {
+                    if cache.lines.len() == *last && *last > 0 {
+                        cache.lines.pop();
+                        *last -= 1;
+                    }
+                }
+            }
+            let base = cache.lines.len();
+            cache.lines.append(&mut new_lines);
+            cache
+                .item_end_offsets
+                .extend(new_offsets.into_iter().map(|offset| offset + base));
+            return (cache.lines.clone(), cache.item_end_offsets.clone());
         }
-        let (lines, item_end_offsets) = render_finalized(&self.finalized, width);
+        let (lines, item_end_offsets) = render_finalized(&self.finalized, 0, width);
         self.history_cache = Some(RenderedHistoryCache {
             width,
             lines: lines.clone(),
@@ -208,6 +297,20 @@ impl VisualCanvasState {
         });
         (lines, item_end_offsets)
     }
+}
+
+/// True when appending `finalized[boundary..]` onto a cache that already holds
+/// `finalized[..boundary]` must retract the last cached item's trailing blank:
+/// the cached last item and the first new item are both notices, and the
+/// renderer stacks consecutive notices with no blank between them.
+fn seam_retracts_trailing_blank(finalized: &[ProjectedEntry], boundary: usize) -> bool {
+    let (Some(prev), Some(next)) = (
+        boundary.checked_sub(1).and_then(|index| finalized.get(index)),
+        finalized.get(boundary),
+    ) else {
+        return false;
+    };
+    super::transcript::consecutive_notices(&prev.item, &next.item)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,15 +362,26 @@ pub struct VisualCanvasFrame {
     pub history_item_offsets: Vec<usize>,
 }
 
+#[cfg(test)]
 pub fn derive_frame(snapshot: &VisualCanvasSnapshot) -> VisualCanvasFrame {
-    let mut active_frame_lines = Vec::new();
+    derive_frame_owned(snapshot.blocks.clone(), snapshot.focus)
+}
+
+/// Flatten `blocks` into a frame, moving each block's lines into
+/// `active_frame_lines` rather than cloning them. The production render path
+/// hands ownership straight through (the large History block is never copied
+/// a second time); `derive_frame` keeps the borrowing entry point for tests.
+fn derive_frame_owned(blocks: Vec<VisualBlock>, focus: FocusOwner) -> VisualCanvasFrame {
+    let pinned_rows = pinned_suffix_rows(&blocks);
+    let prefer_stable_height = focus == FocusOwner::BottomSurface;
+    let mut active_frame_lines: Vec<CanvasLine> = Vec::new();
     let mut cursor = None;
     let mut history_rows = 0;
     let mut committable_rows = 0;
     let mut committable_prefix_open = true;
 
-    for block in &snapshot.blocks {
-        if cursor.is_none() && snapshot.focus.allows_cursor(block.role) {
+    for block in blocks {
+        if cursor.is_none() && focus.allows_cursor(block.role) {
             cursor = block.cursor.map(|block_cursor| CursorTarget {
                 row: block_cursor
                     .row
@@ -275,25 +389,27 @@ pub fn derive_frame(snapshot: &VisualCanvasSnapshot) -> VisualCanvasFrame {
                 column: block_cursor.column,
             });
         }
-        active_frame_lines.extend(block.lines.clone());
-        if block.role == VisualBlockRole::History {
+        let role = block.role;
+        let block_rows = block.lines.len();
+        active_frame_lines.extend(block.lines);
+        if role == VisualBlockRole::History {
             history_rows = active_row_count(&active_frame_lines);
         }
-        if committable_prefix_open && is_committable_prefix_role(block.role) {
+        if committable_prefix_open && is_committable_prefix_role(role) {
             committable_rows = active_row_count(&active_frame_lines);
-        } else if active_row_count(&block.lines) > 0 {
+        } else if block_rows > 0 {
             committable_prefix_open = false;
         }
     }
 
     VisualCanvasFrame {
         required_height: line_count_u16(&active_frame_lines),
-        pinned_rows: pinned_suffix_rows(&snapshot.blocks),
+        pinned_rows,
         active_frame_lines,
         cursor,
         history_rows,
         committable_rows,
-        prefer_stable_height: snapshot.focus == FocusOwner::BottomSurface,
+        prefer_stable_height,
         history_item_offsets: Vec::new(),
     }
 }
@@ -867,6 +983,334 @@ mod tests {
 
         assert_plain_ui_data::<VisualCanvasSnapshot>();
         assert_plain_ui_data::<VisualCanvasFrame>();
+    }
+
+    // ---- Incremental history cache -------------------------------------
+    //
+    // A deterministic stand-in for the real markdown/highlight renderer. It
+    // honours the same two contracts the cache depends on: it renders only
+    // `entries[render_from..]` (offsets relative to that segment), and it
+    // reproduces the renderer's rhythm rule that a run of consecutive notices
+    // stacks with no blank between them. That is enough to exercise the
+    // append/splice, seam-blank retraction, and dirty-truncation paths against
+    // a full re-render, without pulling markdown into a unit test.
+
+    fn fake_item_text(item: &TranscriptItem) -> String {
+        match item {
+            TranscriptItem::UserMessage(text) => format!("user:{text}"),
+            TranscriptItem::AssistantMessage(text) => format!("assistant:{text}"),
+            TranscriptItem::Notice(text) => format!("notice:{text}"),
+            TranscriptItem::Exploration { summaries } => {
+                format!("explore:{}", summaries.join(","))
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn fake_render(
+        entries: &[ProjectedEntry],
+        render_from: usize,
+        _width: u16,
+    ) -> (Vec<CanvasLine>, Vec<usize>) {
+        let mut lines = Vec::new();
+        let mut offsets = Vec::new();
+        for (index, entry) in entries.iter().enumerate().skip(render_from) {
+            lines.push(CanvasLine::plain(fake_item_text(&entry.item)));
+            let next_is_notice_run = entries.get(index + 1).is_some_and(|next| {
+                crate::ui::transcript::consecutive_notices(&entry.item, &next.item)
+            });
+            if !next_is_notice_run {
+                lines.push(CanvasLine::plain(""));
+            }
+            offsets.push(lines.len());
+        }
+        (lines, offsets)
+    }
+
+    fn bare_snapshot(width: u16) -> VisualCanvasSnapshot {
+        VisualCanvasSnapshot::new(
+            width,
+            Vec::new(),
+            status_snapshot(),
+            composer_snapshot(""),
+            FocusOwner::Modal,
+        )
+    }
+
+    fn render_incremental(state: &mut VisualCanvasState, width: u16) -> VisualCanvasFrame {
+        state.render(bare_snapshot(width), fake_render)
+    }
+
+    /// A from-scratch full render of the same push sequence: a fresh state's
+    /// empty cache always takes the `render_from == 0` path.
+    fn full_render(items: &[TranscriptItem], width: u16) -> VisualCanvasFrame {
+        let mut state = VisualCanvasState::default();
+        for item in items {
+            state.push_finalized(item.clone());
+        }
+        render_incremental(&mut state, width)
+    }
+
+    #[test]
+    fn appending_an_item_only_appends_and_leaves_prior_rows_byte_identical() {
+        let mut state = VisualCanvasState::default();
+        state.push_finalized(TranscriptItem::UserMessage("one".to_owned()));
+        let before = render_incremental(&mut state, 80);
+
+        state.push_finalized(TranscriptItem::AssistantMessage("two".to_owned()));
+        let after = render_incremental(&mut state, 80);
+
+        // Every previously rendered row is byte-identical, and the second
+        // render only extended the buffer — nothing above the seam moved.
+        assert_eq!(
+            after.active_frame_lines[..before.active_frame_lines.len()],
+            before.active_frame_lines[..]
+        );
+        assert!(after.active_frame_lines.len() > before.active_frame_lines.len());
+        assert_eq!(
+            after.history_item_offsets[..before.history_item_offsets.len()],
+            before.history_item_offsets[..]
+        );
+        // And the incremental result matches a from-scratch full render.
+        let full = full_render(
+            &[
+                TranscriptItem::UserMessage("one".to_owned()),
+                TranscriptItem::AssistantMessage("two".to_owned()),
+            ],
+            80,
+        );
+        assert_eq!(after.active_frame_lines, full.active_frame_lines);
+        assert_eq!(after.history_item_offsets, full.history_item_offsets);
+    }
+
+    #[test]
+    fn appending_renders_only_the_new_items_not_the_whole_session() {
+        let mut state = VisualCanvasState::default();
+        for index in 0..64 {
+            state.push_finalized(TranscriptItem::UserMessage(format!("m{index}")));
+        }
+
+        let rendered = std::cell::Cell::new(0usize);
+        // First render at this width: full render of all 64 items.
+        state.render(bare_snapshot(80), |entries, render_from, width| {
+            rendered.set(rendered.get() + (entries.len() - render_from));
+            fake_render(entries, render_from, width)
+        });
+        assert_eq!(rendered.get(), 64, "cold render renders the whole session");
+
+        // Steady state: each subsequent append renders exactly one item —
+        // O(1) per push instead of the O(n) full re-render the old cache did.
+        for index in 64..80 {
+            state.push_finalized(TranscriptItem::UserMessage(format!("m{index}")));
+            rendered.set(0);
+            state.render(bare_snapshot(80), |entries, render_from, width| {
+                rendered.set(rendered.get() + (entries.len() - render_from));
+                fake_render(entries, render_from, width)
+            });
+            assert_eq!(rendered.get(), 1, "append re-renders only the new item");
+        }
+    }
+
+    #[test]
+    fn a_render_with_no_new_items_renders_nothing() {
+        let mut state = VisualCanvasState::default();
+        state.push_finalized(TranscriptItem::UserMessage("only".to_owned()));
+        render_incremental(&mut state, 80);
+
+        let rendered = std::cell::Cell::new(0usize);
+        state.render(bare_snapshot(80), |entries, render_from, width| {
+            rendered.set(rendered.get() + (entries.len() - render_from));
+            fake_render(entries, render_from, width)
+        });
+        assert_eq!(rendered.get(), 0, "an idle frame reuses the cache verbatim");
+    }
+
+    #[test]
+    fn width_change_forces_a_full_re_render() {
+        let mut state = VisualCanvasState::default();
+        for index in 0..8 {
+            state.push_finalized(TranscriptItem::UserMessage(format!("m{index}")));
+        }
+        render_incremental(&mut state, 80);
+
+        let rendered = std::cell::Cell::new(0usize);
+        let narrow = state.render(bare_snapshot(40), |entries, render_from, width| {
+            rendered.set(rendered.get() + (entries.len() - render_from));
+            fake_render(entries, render_from, width)
+        });
+        assert_eq!(
+            rendered.get(),
+            8,
+            "a width change re-renders every finalized item"
+        );
+
+        let items: Vec<_> = (0..8)
+            .map(|index| TranscriptItem::UserMessage(format!("m{index}")))
+            .collect();
+        let full = full_render(&items, 40);
+        assert_eq!(narrow.active_frame_lines, full.active_frame_lines);
+        assert_eq!(narrow.history_item_offsets, full.history_item_offsets);
+    }
+
+    #[test]
+    fn incremental_offsets_stay_consistent_with_terminal_commit_accounting() {
+        let mut state = VisualCanvasState::default();
+        let items = vec![
+            TranscriptItem::UserMessage("hello".to_owned()),
+            TranscriptItem::AssistantMessage("world".to_owned()),
+            TranscriptItem::UserMessage("again".to_owned()),
+        ];
+        for item in &items {
+            state.push_finalized(item.clone());
+            render_incremental(&mut state, 80);
+        }
+        let frame = render_incremental(&mut state, 80);
+
+        // One offset per finalized item, strictly increasing, and the last
+        // offset equals the history row count — the invariant terminal.rs
+        // relies on for `partition_point` commit-boundary remapping.
+        assert_eq!(frame.history_item_offsets.len(), items.len());
+        assert!(frame
+            .history_item_offsets
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            frame.history_item_offsets.last().copied(),
+            Some(frame.history_rows)
+        );
+        assert_eq!(frame.history_rows, frame.active_frame_lines.len());
+
+        // partition_point over the offsets recovers a whole-item boundary for
+        // any committed row count (terminal.rs `set_committed_active_rows`).
+        for committed_rows in 0..=frame.history_rows {
+            let items_covered = frame
+                .history_item_offsets
+                .partition_point(|end| *end <= committed_rows);
+            assert!(items_covered <= items.len());
+        }
+    }
+
+    #[test]
+    fn consecutive_notices_stack_identically_under_incremental_append() {
+        // The renderer suppresses the blank between consecutive notices. When
+        // the second notice arrives as an incremental append, the cache must
+        // retract the first notice's already-emitted trailing blank.
+        let items = vec![
+            TranscriptItem::AssistantMessage("prose".to_owned()),
+            TranscriptItem::Notice("first".to_owned()),
+            TranscriptItem::Notice("second".to_owned()),
+            TranscriptItem::UserMessage("after".to_owned()),
+        ];
+        let mut state = VisualCanvasState::default();
+        for item in &items {
+            state.push_finalized(item.clone());
+            render_incremental(&mut state, 80);
+        }
+        let incremental = render_incremental(&mut state, 80);
+        let full = full_render(&items, 80);
+        assert_eq!(incremental.active_frame_lines, full.active_frame_lines);
+        assert_eq!(incremental.history_item_offsets, full.history_item_offsets);
+        // The two notices really are adjacent (no blank between them).
+        let texts = line_texts(&incremental.active_frame_lines);
+        let first = texts.iter().position(|t| t == "notice:first").expect("first");
+        assert_eq!(texts.get(first + 1).map(String::as_str), Some("notice:second"));
+    }
+
+    #[test]
+    fn in_place_merge_re_renders_only_the_dirtied_tail() {
+        // Exploration items coalesce into the last one in place. That mutation
+        // must invalidate only the merged item's cached rows, and the result
+        // must still match a full re-render.
+        let mut state = VisualCanvasState::default();
+        state.push_finalized(TranscriptItem::UserMessage("lead".to_owned()));
+        state.push_finalized(TranscriptItem::Exploration {
+            summaries: vec!["read a.rs".to_owned()],
+        });
+        render_incremental(&mut state, 80);
+
+        // A second exploration merges into the first (no new item appended).
+        let rendered = std::cell::Cell::new(0usize);
+        state.push_finalized(TranscriptItem::Exploration {
+            summaries: vec!["read b.rs".to_owned()],
+        });
+        state.render(bare_snapshot(80), |entries, render_from, width| {
+            rendered.set(rendered.get() + (entries.len() - render_from));
+            fake_render(entries, render_from, width)
+        });
+        assert_eq!(
+            rendered.get(),
+            1,
+            "merge re-renders only the mutated exploration, not the lead message"
+        );
+
+        let merged = render_incremental(&mut state, 80);
+        let full = full_render(
+            &[
+                TranscriptItem::UserMessage("lead".to_owned()),
+                TranscriptItem::Exploration {
+                    summaries: vec!["read a.rs".to_owned()],
+                },
+                TranscriptItem::Exploration {
+                    summaries: vec!["read b.rs".to_owned()],
+                },
+            ],
+            80,
+        );
+        assert_eq!(merged.active_frame_lines, full.active_frame_lines);
+        assert_eq!(merged.history_item_offsets, full.history_item_offsets);
+    }
+
+    #[test]
+    fn committed_boundary_prefix_is_untouched_by_later_appends() {
+        // Rows already committed to native scrollback must never change. After
+        // advancing the committed boundary, appending more items may only add
+        // rows below it — the committed prefix stays byte-identical.
+        let mut state = VisualCanvasState::default();
+        state.push_finalized(TranscriptItem::UserMessage("committed-1".to_owned()));
+        state.push_finalized(TranscriptItem::UserMessage("committed-2".to_owned()));
+        let committed_frame = render_incremental(&mut state, 80);
+        let committed_items = 2;
+        state.set_committed_items(committed_items);
+        let committed_rows = committed_frame.history_item_offsets[committed_items - 1];
+
+        state.push_finalized(TranscriptItem::AssistantMessage("later".to_owned()));
+        let after = render_incremental(&mut state, 80);
+
+        assert_eq!(
+            after.active_frame_lines[..committed_rows],
+            committed_frame.active_frame_lines[..committed_rows],
+            "committed prefix rows must be byte-identical after later appends"
+        );
+        assert!(after.active_frame_lines.len() > committed_rows);
+    }
+
+    #[test]
+    fn mixed_sequence_incremental_matches_full_render() {
+        // A stronger end-to-end invariant: render after every push and require
+        // the final incremental frame to equal a from-scratch full render of
+        // the same (post-merge) sequence.
+        let pushes = vec![
+            TranscriptItem::UserMessage("start the task".to_owned()),
+            TranscriptItem::AssistantMessage("on it".to_owned()),
+            TranscriptItem::Exploration {
+                summaries: vec!["read main.rs".to_owned()],
+            },
+            TranscriptItem::Exploration {
+                summaries: vec!["read lib.rs".to_owned()],
+            },
+            TranscriptItem::Notice("secret redacted".to_owned()),
+            TranscriptItem::Notice("secret redacted again".to_owned()),
+            TranscriptItem::AssistantMessage("done".to_owned()),
+        ];
+        let mut state = VisualCanvasState::default();
+        for item in &pushes {
+            state.push_finalized(item.clone());
+            render_incremental(&mut state, 72);
+        }
+        let incremental = render_incremental(&mut state, 72);
+        let full = full_render(&pushes, 72);
+        assert_eq!(incremental.active_frame_lines, full.active_frame_lines);
+        assert_eq!(incremental.history_item_offsets, full.history_item_offsets);
     }
 
     fn snapshot_with_blocks(blocks: Vec<VisualBlock>) -> VisualCanvasSnapshot {
