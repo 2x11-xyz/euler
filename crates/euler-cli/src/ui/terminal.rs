@@ -211,6 +211,13 @@ pub fn take_pending_signal() -> Option<PendingSignal> {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct BandMeasurement {
+    band_rows: u16,
+    screen_size: Size,
+    viewport_area: Rect,
+}
+
 pub fn restore_terminal() {
     if TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
         let _ = restore_terminal_session_modes(&mut io::stdout());
@@ -286,6 +293,15 @@ where
     last_drawn_area: Option<Rect>,
     last_drawn_lines: Vec<CanvasLine>,
     review_scroll_offset: usize,
+    /// Rows of the pinned bottom band (composer / footer / HUD chrome) in the
+    /// most recent drawn frame — the region the exit teardown clears — with
+    /// the screen size and viewport rect it was measured against. Everything
+    /// above the band is transcript content that may not have been committed
+    /// to native scrollback yet and must survive quit; the geometry snapshot
+    /// exists so a teardown on stale coordinates (a signal-driven shutdown
+    /// discards the queued resize) refuses to erase rather than clearing the
+    /// wrong rows.
+    last_band_measurement: Option<BandMeasurement>,
     linefeed_history_insert_enabled: bool,
     linefeed_history_insert_suspended_after_resize: bool,
     cursor_position_authoritative: bool,
@@ -324,6 +340,7 @@ where
             last_drawn_area: None,
             last_drawn_lines: Vec::new(),
             review_scroll_offset: 0,
+            last_band_measurement: None,
             linefeed_history_insert_enabled: false,
             linefeed_history_insert_suspended_after_resize: false,
             cursor_position_authoritative: false,
@@ -498,7 +515,20 @@ where
             frame.pinned_rows,
         );
         let cursor = visible_cursor(frame.cursor, &visible);
-        self.draw_canvas_lines(&visible.lines, cursor)
+        self.draw_canvas_lines(&visible.lines, cursor)?;
+        // Measured *after* the draw so the recorded viewport rect is the one
+        // the rows were actually painted at (the draw itself can move it).
+        self.last_band_measurement = Some(BandMeasurement {
+            band_rows: visible
+                .visible_pinned_bottom_band_rows(
+                    &frame.active_frame_lines,
+                    usize::from(self.viewport_area.width).max(1),
+                )
+                .unwrap_or(0),
+            screen_size: self.inner.size()?,
+            viewport_area: self.viewport_area,
+        });
+        Ok(())
     }
 
     fn commit_scrolled_history(
@@ -673,6 +703,60 @@ where
     pub(crate) fn end_synchronized_update(&mut self) -> io::Result<()> {
         let writer = self.inner.backend_mut();
         writer.write_all(SYNC_UPDATE_END)?;
+        flush_terminal_writer(writer)
+    }
+
+    /// Exit teardown (§5.8): clear the pinned bottom band — composer,
+    /// footer, HUD chrome — with the **terminal's own default** attributes,
+    /// and park the cursor at the band's top-left column.
+    ///
+    /// Only the chrome goes, and only when it is safe to erase. Transcript
+    /// rows above the band inside the viewport may never have been committed
+    /// to native scrollback (the bridge commits lazily, as rows scroll out),
+    /// so a wrong-coordinates erase destroys real session content on quit.
+    /// Two situations make the coordinates untrustworthy, and both fall back
+    /// to a non-destructive fresh line instead of erasing anything:
+    ///
+    /// - **No measured band** — nothing was drawn yet, or the frame carried
+    ///   no pinned chrome. There is no known-safe region to clear.
+    /// - **Stale geometry** — a signal-driven shutdown discards the queued
+    ///   resize (`drain_ready` clears `pending_resize` before `Shutdown`),
+    ///   so the band measured at the last draw can name rows that no longer
+    ///   exist on the resized screen.
+    ///
+    /// The SGR reset before the erase is the point on the destructive path:
+    /// the inline viewport paints the theme background into cells (opaque
+    /// mode), and a clear issued with those attributes still active would
+    /// repaint the region in theme colors — on a terminal whose native
+    /// background differs, that is the "inverted band above the shell
+    /// prompt" bug. After this, the exit recap prints as plain text on the
+    /// native background, starting at column 0 of a cleared (or fresh) row.
+    pub(crate) fn clear_live_band_for_exit(&mut self) -> io::Result<()> {
+        let current_size = self.inner.size().ok();
+        let area = self.viewport_area;
+        let safe_band = self.last_band_measurement.and_then(|measured| {
+            let fresh = Some(measured.screen_size) == current_size
+                && measured.viewport_area == area
+                && measured.band_rows > 0;
+            fresh.then_some(measured.band_rows.min(area.height))
+        });
+        let writer = self.inner.backend_mut();
+        writer.write_all(b"\x1b[0m")?;
+        match safe_band {
+            Some(band_rows) => {
+                let band_top = area.bottom().saturating_sub(band_rows);
+                queue!(
+                    writer,
+                    MoveTo(0, band_top),
+                    Clear(ClearType::FromCursorDown)
+                )?;
+            }
+            // Never erase on unknown or stale coordinates: park on a fresh
+            // line and let the recap print below whatever is on screen. A
+            // leftover chrome row in the signal+resize race is cosmetic;
+            // erased transcript content is not.
+            None => writer.write_all(b"\r\n")?,
+        }
         flush_terminal_writer(writer)
     }
 
