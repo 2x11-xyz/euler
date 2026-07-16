@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn recap_formats_files_diffstat_tests_and_ctx() {
+    fn recap_formats_files_diffstat_and_tests() {
         let events = vec![
             event(
                 EventKind::FILE_DIFF,

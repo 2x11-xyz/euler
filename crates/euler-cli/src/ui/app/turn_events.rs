@@ -15,10 +15,10 @@ impl AppCore {
         self.queue_notification(NotifyEvent::Stall);
     }
 
-    /// Review v3 §R5(b): empty-turn suppression. When a turn changed 0
-    /// files AND context moved less than ~1% AND no tests ran, the divider
-    /// still renders (via the caller) but the recap line itself is skipped
-    /// — there's nothing worth summarizing.
+    /// Recap suppression (owner preference, 2026-07-16, superseding review
+    /// v3 §R5(b)): a turn that changed **no files** renders no recap line at
+    /// all — regardless of tests run or context moved. The divider still
+    /// renders via the caller on its own timing rule.
     fn push_turn_recap(&mut self) {
         let recap = super::turn_recap::turn_recap_from_events(
             self.transcript.events(),

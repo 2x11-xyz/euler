@@ -3208,9 +3208,9 @@ fn turn_recap_never_renders_without_its_worked_divider() {
     );
 }
 
-// Review v3 §R5(b): empty-turn suppression. A turn that changed 0 files,
-// moved context by less than ~1%, and ran no tests renders the divider
-// (there was elapsed time worth naming) but not the recap line itself.
+// A turn that changed no files renders the divider (there was elapsed time
+// worth naming) but no recap line — the rule is just "0 files", with no ctx
+// or test conditions (owner preference, superseding review v3 §R5(b)).
 #[test]
 fn zero_file_turn_suppresses_recap_line_but_keeps_the_divider() {
     let mut core = core();
