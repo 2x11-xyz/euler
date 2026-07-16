@@ -1006,15 +1006,20 @@ fn resume_picker_is_list_mode_with_indicator_and_action() {
     first.status = Some("4m ago".to_owned());
     first.preview = Some("s1  /repo".to_owned());
     first.group = Some("tui".to_owned());
-    let context = CommandContext {
-        resume_items: vec![first, ResumeItem::new("s2", "2026-06-18 coding")],
-        ..CommandContext::default()
-    };
-    let mut surface = BottomSurface::new(context);
+    let mut surface = BottomSurface::new(CommandContext::default());
     surface.set_picker_visible_rows(1);
     surface.open_palette();
     surface.palette_insert("resume");
-    assert_eq!(surface.confirm(), SurfaceEvent::None);
+    // `/resume` defers to the app core, which lists the session store at
+    // open time and hands the items back to the picker.
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::OpenResumePicker)
+    );
+    surface.open_picker(PickerSpec::Resume(vec![
+        first,
+        ResumeItem::new("s2", "2026-06-18 coding"),
+    ]));
 
     let BottomOwner::Picker(picker) = surface.owner() else {
         panic!("picker should own surface");
@@ -1054,14 +1059,14 @@ fn resume_picker_searches_label_id_and_root_path() {
     let mut second = ResumeItem::new("s2", "token budget review");
     second.preview = Some("01TOKEN  /repo".to_owned());
     second.group = Some("exec".to_owned());
-    let context = CommandContext {
-        resume_items: vec![first, second],
-        ..CommandContext::default()
-    };
-    let mut surface = BottomSurface::new(context);
+    let mut surface = BottomSurface::new(CommandContext::default());
     surface.open_palette();
     surface.palette_insert("resume");
-    assert_eq!(surface.confirm(), SurfaceEvent::None);
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::OpenResumePicker)
+    );
+    surface.open_picker(PickerSpec::Resume(vec![first, second]));
 
     // Filter is label/id/root only — group label "exec" is not a match key.
     surface.palette_insert("token /repo");
@@ -1083,14 +1088,14 @@ fn resume_picker_accepts_ledger_tail_preview() {
     let mut first = ResumeItem::new("s1", "preview me");
     first.status = Some("just now".to_owned());
     first.group = Some("tui".to_owned());
-    let context = CommandContext {
-        resume_items: vec![first],
-        ..CommandContext::default()
-    };
-    let mut surface = BottomSurface::new(context);
+    let mut surface = BottomSurface::new(CommandContext::default());
     surface.open_palette();
     surface.palette_insert("resume");
-    assert_eq!(surface.confirm(), SurfaceEvent::None);
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::OpenResumePicker)
+    );
+    surface.open_picker(PickerSpec::Resume(vec![first]));
     assert_eq!(
         surface.resume_picker_selected_session_id().as_deref(),
         Some("s1")

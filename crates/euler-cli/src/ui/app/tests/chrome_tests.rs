@@ -561,6 +561,7 @@ fn finalized_wrapped_prompt_uses_continuous_user_rail() {
         28,
         TOOL_CALL_MAX_LINES,
         false,
+        0,
     )
     .0
     .iter()
@@ -595,6 +596,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         44,
         TOOL_CALL_MAX_LINES,
         false,
+        0,
     )
     .0
     .iter()
@@ -632,6 +634,7 @@ fn finalized_multi_column_markdown_tables_render_grid_or_stack_by_width() {
         100,
         TOOL_CALL_MAX_LINES,
         false,
+        0,
     )
     .0
     .iter()
@@ -717,6 +720,7 @@ fn finalized_multi_item_batches_keep_single_internal_and_trailing_rhythm() {
         80,
         TOOL_CALL_MAX_LINES,
         false,
+        0,
     )
     .0
     .iter()
@@ -760,6 +764,7 @@ fn finalized_tool_batches_do_not_get_prompt_answer_trailing_rhythm() {
         80,
         TOOL_CALL_MAX_LINES,
         false,
+        0,
     )
     .0
     .iter()

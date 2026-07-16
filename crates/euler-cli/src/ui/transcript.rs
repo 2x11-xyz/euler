@@ -31,7 +31,7 @@ use file_diff::file_diff_is_foldable;
 use line::render_line_oriented_item;
 #[cfg(test)]
 use render::{bottom_aligned, bottom_aligned_with_offset, render_projected_entries};
-use render::{render_projected_items, TranscriptRenderLimits};
+use render::{render_projected_items, TranscriptRenderLimits, TranscriptRenderParams};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptItem {
@@ -304,6 +304,16 @@ pub(crate) fn item_wants_timestamp(item: &TranscriptItem) -> bool {
             | TranscriptItem::TurnRecap { .. }
             | TranscriptItem::PermissionAsk { .. }
     )
+}
+
+/// A run of consecutive `Notice` items stacks directly, with no blank line
+/// between one notice and the next (review v2 §3/§6). The history renderer
+/// owns this rhythm rule; the visual canvas's incremental history cache
+/// consults the same predicate so that appending a notice can retract the
+/// preceding notice's already-emitted trailing blank — keeping an incremental
+/// append byte-identical to a full re-render.
+pub(crate) fn consecutive_notices(current: &TranscriptItem, next: &TranscriptItem) -> bool {
+    matches!(current, TranscriptItem::Notice(_)) && matches!(next, TranscriptItem::Notice(_))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -845,11 +855,14 @@ pub(crate) fn render_items_for_history_with_offsets(
         .collect();
     render::render_projected_entries_with_expansion_and_offsets(
         &entries,
-        theme,
-        width,
-        TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
-        expanded,
-        true,
+        TranscriptRenderParams {
+            theme,
+            width,
+            limits: TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+            expanded,
+            show_turn_footer: true,
+            render_from: 0,
+        },
     )
 }
 
@@ -859,20 +872,28 @@ pub(crate) fn render_items_for_history_with_offsets(
 /// gutter, since it never discards `entry.timing` to `None`. The trailing
 /// "elapsed since first event" turn footer is suppressed here: the visual
 /// canvas's history is the whole growing session, never one bounded batch.
+///
+/// `render_from` renders only the tail `entries[render_from..]` (offsets
+/// relative to that segment) while still consulting earlier entries for
+/// cross-item context — the incremental history-cache append path.
 pub(crate) fn render_entries_for_history_with_offsets(
     entries: &[ProjectedEntry],
     theme: &Theme,
     width: u16,
     output_limit_lines: usize,
     expanded: bool,
+    render_from: usize,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     render::render_projected_entries_with_expansion_and_offsets(
         entries,
-        theme,
-        width,
-        TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
-        expanded,
-        false,
+        TranscriptRenderParams {
+            theme,
+            width,
+            limits: TranscriptRenderLimits::default().with_output_lines(output_limit_lines),
+            expanded,
+            show_turn_footer: false,
+            render_from,
+        },
     )
 }
 

@@ -265,6 +265,175 @@ fn refresh_preserves_newer_index_timestamp_when_sidecar_is_stale() {
 }
 
 #[test]
+fn listing_backfills_projection_cache_and_reuses_it_without_projecting() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store.name_session(record.id(), "event name").expect("name");
+
+    // First listing projects from events and backfills the cache key.
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.name(), Some("event name"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(sidecar["projected_events_len"].is_u64());
+    assert!(sidecar["projected_events_modified_ns"].is_u64());
+
+    // Hand-edit the cached name while keeping the key. Within a matching
+    // key the cache is served verbatim — the observation here is the proof
+    // that the event log was NOT re-projected on a warm hit. This is the
+    // documented trust boundary (docs/contracts/events.md,
+    // `session.renamed`): event authority is enforced at projection time,
+    // not on every read, and a tampered sidecar is out of the integrity
+    // model until the log next changes (asserted below).
+    let mut edited = sidecar.clone();
+    edited["name"] = serde_json::Value::String("cached name".to_owned());
+    fs::write(
+        record.session_json_path(),
+        serde_json::to_string_pretty(&edited).expect("serialize"),
+    )
+    .expect("edit sidecar");
+    let cached = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(cached.name(), Some("cached name"));
+
+    // Appending an event moves the key: the next listing re-projects and
+    // event-derived truth wins again.
+    store
+        .name_session(record.id(), "newer name")
+        .expect("rename");
+    let reprojected = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(reprojected.name(), Some("newer name"));
+}
+
+#[test]
+fn invalid_projection_is_never_cached_and_can_recover() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    fs::write(record.events_path(), "not json\n").expect("corrupt events");
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.status(), SessionStatus::Invalid);
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(sidecar.get("projected_events_len").is_none());
+
+    // Repairing the log recovers on the next listing — nothing pinned the
+    // Invalid status.
+    fs::write(record.events_path(), "").expect("repair events");
+    let recovered = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(recovered.status(), SessionStatus::Active);
+}
+
+#[test]
+fn touch_preserves_projection_cache_fields() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(sidecar["projected_events_len"].is_u64());
+    assert!(sidecar["projected_events_modified_ns"].is_u64());
+}
+
+#[test]
+fn touch_bumps_updated_at_without_reading_the_event_log() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let stale_metadata = format!(
+        r#"{{"version":1,"id":"{}","created_at_ms":{},"updated_at_ms":{},"status":"active","name":"kept name","events_path":"events.jsonl","blobs_dir":"blobs"}}
+"#,
+        record.id(),
+        record.created_at_ms(),
+        record.created_at_ms()
+    );
+    fs::write(record.session_json_path(), stale_metadata).expect("stale metadata");
+    // A corrupt event log proves the touch never projects events: the
+    // projecting refresh would surface this as an Invalid status rewrite.
+    fs::write(record.events_path(), "not json\n").expect("corrupt events");
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    let metadata = fs::read_to_string(record.session_json_path()).expect("metadata");
+    // Sidecar fields carry forward verbatim; only the recency stamp moves.
+    assert!(metadata.contains("kept name"));
+    let parsed: serde_json::Value = serde_json::from_str(&metadata).expect("json");
+    assert!(parsed["updated_at_ms"].as_u64().expect("updated") > record.created_at_ms());
+}
+
+#[test]
+fn touch_without_sidecar_falls_back_to_projecting_refresh() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store.name_session(record.id(), "event name").expect("name");
+    fs::remove_file(record.session_json_path()).expect("drop sidecar");
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    // The fallback rewrote the sidecar from the event projection, so the
+    // next touch has current fields to carry forward.
+    let metadata = fs::read_to_string(record.session_json_path()).expect("metadata");
+    assert!(metadata.contains("event name"));
+}
+
+#[test]
+fn touch_keeps_event_derived_name_authoritative_in_listings() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store
+        .name_session(record.id(), "canonical name")
+        .expect("name");
+    let stale_metadata = format!(
+        r#"{{"version":1,"id":"{}","created_at_ms":{},"updated_at_ms":{},"status":"active","name":"stale sidecar name","events_path":"events.jsonl","blobs_dir":"blobs"}}
+"#,
+        record.id(),
+        record.created_at_ms(),
+        record.created_at_ms()
+    );
+    fs::write(record.session_json_path(), stale_metadata).expect("stale metadata");
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    // The touch carried the stale sidecar name forward, but projections
+    // still derive the name from events.
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.name(), Some("canonical name"));
+}
+
+#[test]
 fn deleted_tombstone_suppresses_session_and_later_update_does_not_resurrect_it() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");
