@@ -62,6 +62,69 @@ fn causal_dag_surface() -> BottomSurface {
     BottomSurface::new(context)
 }
 
+/// §4.2: a row is caret + one state marker + label + description column, and
+/// it never repeats its own value. `ExtensionManagerItem::label()` used to bake
+/// the marker, id and kind into one string, so the unified picker rendered
+/// `› ● ● causal-dag  (bundled)  causal-dag` — marker twice, kind twice (it is
+/// also the group header), id twice. Nothing covered this path.
+#[test]
+fn extension_picker_row_states_each_fact_once() {
+    let items = vec![
+        ExtensionManagerItem {
+            id: "causal-dag".to_owned(),
+            display_name: "Causal DAG".to_owned(),
+            enabled: true,
+            bundled: true,
+            materialization: None,
+            version: "0.2.0".to_owned(),
+            commands: vec![],
+            capabilities: vec![],
+            audit_status: None,
+        },
+        ExtensionManagerItem {
+            id: "local-thing".to_owned(),
+            display_name: "Local Thing".to_owned(),
+            enabled: false,
+            bundled: false,
+            materialization: Some("copied".to_owned()),
+            version: "0.1.0".to_owned(),
+            commands: vec![],
+            capabilities: vec![],
+            audit_status: None,
+        },
+    ];
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_picker(PickerSpec::Extensions(items));
+    let rendered = surface
+        .surface_lines(80)
+        .expect("extension picker")
+        .join("\n");
+
+    let enabled = rendered
+        .lines()
+        .find(|line| line.contains("causal-dag"))
+        .expect("enabled row");
+    assert_eq!(enabled.matches('●').count(), 1, "row: {enabled:?}");
+    assert_eq!(
+        enabled.matches("causal-dag").count(),
+        1,
+        "id must not repeat: {enabled:?}"
+    );
+    assert!(
+        !enabled.contains("bundled"),
+        "kind belongs to the group header, not the row: {enabled:?}"
+    );
+    assert!(rendered.contains("BUNDLED"), "rendered:\n{rendered}");
+
+    // Disabled + linked: hollow marker, materialization as the group.
+    let disabled = rendered
+        .lines()
+        .find(|line| line.contains("local-thing"))
+        .expect("disabled row");
+    assert_eq!(disabled.matches('○').count(), 1, "row: {disabled:?}");
+    assert!(rendered.contains("COPIED"), "rendered:\n{rendered}");
+}
+
 #[test]
 fn causal_dag_picker_drills_into_formats_and_steps_back() {
     let mut surface = causal_dag_surface();
@@ -72,9 +135,9 @@ fn causal_dag_picker_drills_into_formats_and_steps_back() {
         .surface_lines(100)
         .expect("action picker")
         .join("\n");
-    assert!(actions.contains("CAUSAL DAG · session 01KX8V… · 35 nodes · 7 cross-arcs"));
-    assert!(actions.contains("view      Show current graph"));
-    assert!(actions.contains("refresh   Re-observe recent activity"));
+    assert!(actions.contains("CAUSAL DAG · session 01KX8V… · 35 nodes · 7 cross-arcs · (1/3)"));
+    assert!(actions.contains("› view     Show current graph"));
+    assert!(actions.contains("refresh  Re-observe recent activity"));
 
     surface.move_selection_down();
     assert_eq!(surface.confirm(), SurfaceEvent::None);
@@ -183,9 +246,9 @@ fn compaction_picker_shows_defaults_and_applies_independent_toggles() {
         .surface_lines(100)
         .expect("compaction picker")
         .join("\n");
-    assert!(rendered.contains("COMPACTION · automatic on · stubs on"));
-    assert!(rendered.contains("[✓] automatic compaction"));
-    assert!(rendered.contains("[✓] tool stubs"));
+    assert!(rendered.contains("Compaction · automatic on · stubs on"));
+    assert!(rendered.contains("[x] automatic compaction"));
+    assert!(rendered.contains("[x] tool stubs"));
     assert!(rendered.contains("space toggle"));
 
     surface.move_selection_down();
@@ -485,13 +548,12 @@ fn model_picker_selects_switch_model_action() {
     surface.palette_insert("model");
     assert_eq!(surface.confirm(), SurfaceEvent::None);
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Select Model"));
-    assert!(rendered.contains("→ fixture::echo ✓"));
-    assert!(rendered.contains("  openrouter::glm-5.2"));
-    assert!(rendered.contains("Filter: "));
+    assert!(rendered.contains("Model · configured providers only"));
+    assert!(rendered.contains("› ● fixture::echo"));
+    assert!(rendered.contains("openrouter::glm-5.2"));
     assert!(rendered.contains("(1/2)"));
-    assert!(rendered.contains("Provider: fixture  Model: echo"));
-    assert!(rendered.contains("Press enter to confirm or esc to go back"));
+    assert!(rendered.contains("fixture · echo"));
+    assert!(rendered.contains("↑↓ move · ⏎ select · esc cancel"));
 
     surface.move_selection_down();
 
@@ -524,9 +586,9 @@ fn model_picker_filters_by_provider_model_and_label() {
 
     surface.palette_insert("openrouter gpt");
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Filter: openrouter gpt"));
-    assert!(rendered.contains("→ openrouter::openai/gpt-4.1-mini"));
-    assert!(rendered.contains("Provider: openrouter  Model: openai/gpt-4.1-mini"));
+    assert!(rendered.contains("/openrouter gpt"));
+    assert!(rendered.contains("› ○ openrouter::openai/gpt-4.1-mini"));
+    assert!(rendered.contains("openrouter · openai/gpt-4.1-mini"));
     assert!(rendered.contains("(1/1)"));
     assert!(!rendered.contains("fixture::echo"));
 
@@ -558,9 +620,9 @@ fn model_picker_filters_by_provider_model_and_label() {
         .surface_lines(80)
         .expect("model picker")
         .join("\n");
-    assert!(rendered.contains("Filter: friendly"));
-    assert!(rendered.contains("→ Friendly Alias"));
-    assert!(rendered.contains("Provider: custom-provider  Model: model-a"));
+    assert!(rendered.contains("/friendly"));
+    assert!(rendered.contains("› ○ Friendly Alias"));
+    assert!(rendered.contains("custom-provider · model-a"));
     assert!(!rendered.contains("fixture::echo"));
 
     let mut value_surface = BottomSurface::new(CommandContext {
@@ -580,7 +642,7 @@ fn model_picker_filters_by_provider_model_and_label() {
         .surface_lines(80)
         .expect("model picker")
         .join("\n");
-    assert!(rendered.contains("→ anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
+    assert!(rendered.contains("› ○ anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
 
     let mut metadata_surface = BottomSurface::new(CommandContext {
         model_choices: vec![ModelChoice::with_metadata(
@@ -599,7 +661,7 @@ fn model_picker_filters_by_provider_model_and_label() {
         .surface_lines(80)
         .expect("model picker")
         .join("\n");
-    assert!(rendered.contains("No matching models"));
+    assert!(rendered.contains("no matches"));
 }
 
 #[test]
@@ -614,8 +676,8 @@ fn model_picker_no_match_stays_open() {
 
     surface.palette_insert("missing");
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Filter: missing"));
-    assert!(rendered.contains("No matching models"));
+    assert!(rendered.contains("/missing"));
+    assert!(rendered.contains("no matches"));
     assert!(rendered.contains("(0/0)"));
     assert_eq!(surface.confirm(), SurfaceEvent::None);
     assert!(matches!(surface.owner(), BottomOwner::Picker(_)));
@@ -642,16 +704,15 @@ fn model_picker_query_backspace_delete_and_navigation_are_bounded() {
         panic!("model picker should own surface");
     };
     assert_eq!(picker.position_indicator(), "(2/2)");
-    assert_eq!(picker.visible_rows(80).len(), 1);
+    assert_eq!(picker.visible_row_count(), 1);
 
     surface.palette_backspace();
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Filter: openroute"));
+    assert!(rendered.contains("/openroute"));
     assert!(rendered.contains("(1/2)"));
 
     surface.palette_delete();
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("Filter: "));
     assert!(rendered.contains("(1/3)"));
 }
 
@@ -732,6 +793,103 @@ fn permissions_palette_opens_via_action() {
     );
 }
 
+/// §5.1: the radio fills for the posture actually in effect, and the title
+/// says which. A posture is "in effect" only when every capability's mode
+/// matches it exactly — otherwise the modes were tuned under Advanced and no
+/// posture honestly describes them, so nothing is filled.
+#[test]
+fn permissions_picker_marks_the_posture_actually_in_effect() {
+    for posture in PermissionPosture::ALL {
+        let active = PermissionPosture::active(|capability| Some(posture.mode_for(capability)));
+        assert_eq!(
+            active,
+            Some(posture),
+            "posture {posture:?} should round-trip"
+        );
+
+        let choices = crate::ui::commands::permission_choices_with_state(&[], active);
+        let mut surface = BottomSurface::new(CommandContext::default());
+        surface.open_picker(PickerSpec::Permissions(choices));
+        let rendered = surface
+            .surface_lines(80)
+            .expect("permissions picker")
+            .join("\n");
+        assert!(
+            rendered.contains(&format!("Current: {}", posture.label())),
+            "posture {posture:?}, rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("● {}", posture.label())),
+            "posture {posture:?} should be the filled radio, rendered:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches('●').count(),
+            1,
+            "exactly one posture is in effect, rendered:\n{rendered}"
+        );
+    }
+
+    // A hand-tuned mix matches no posture: deny everything except one allow.
+    let tuned = PermissionPosture::active(|capability| {
+        Some(if capability == Capability::Network {
+            ApprovalMode::SessionAllow
+        } else {
+            ApprovalMode::AlwaysDeny
+        })
+    });
+    assert_eq!(tuned, None, "a hand-tuned mix is not a posture");
+}
+
+/// A state marker is a claim about the row: that it has a state you can be in.
+/// `Advanced capability settings ›` and the unavailable sandbox row are
+/// actions, so marking them `○` says they are postures you have not selected —
+/// a lie about what ⏎ does. The marker follows the row's action, not merely
+/// whether the picker contains any posture.
+#[test]
+fn permissions_picker_gives_no_radio_to_action_rows() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_picker(PickerSpec::Permissions(permission_choices()));
+    let rendered = surface
+        .surface_lines(80)
+        .expect("permissions picker")
+        .join("\n");
+
+    for row in rendered.lines() {
+        if row.contains("Advanced capability settings") || row.contains("Auto in workspace sandbox")
+        {
+            assert!(
+                !row.contains('○') && !row.contains('●'),
+                "action row must not wear a posture marker: {row:?}"
+            );
+        }
+    }
+    // The postures themselves still do.
+    assert!(rendered.contains("○ Read only"), "rendered:\n{rendered}");
+}
+
+/// `compact now` is an action beside two toggles; it must not render a
+/// checkbox implying `space` does something to it.
+#[test]
+fn compaction_picker_gives_no_checkbox_to_the_action_row() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_palette();
+    surface.palette_insert("compaction");
+    assert_eq!(surface.confirm(), SurfaceEvent::None);
+    let rendered = surface
+        .surface_lines(100)
+        .expect("compaction picker")
+        .join("\n");
+
+    let action = rendered
+        .lines()
+        .find(|line| line.contains("compact now"))
+        .expect("action row");
+    assert!(
+        !action.contains('[') && !action.contains(']'),
+        "action row must not wear a checkbox: {action:?}"
+    );
+}
+
 #[test]
 fn permissions_picker_leads_with_honest_session_postures() {
     let mut surface = BottomSurface::new(CommandContext::default());
@@ -740,9 +898,14 @@ fn permissions_picker_leads_with_honest_session_postures() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Permissions (1/40)"));
-    assert!(rendered.contains("Quick settings - Read only"));
-    assert!(rendered.contains("Full access (unsandboxed)"));
+    // §5.1: the title carries the posture in force. `permission_choices()`
+    // builds the list with no session behind it, so nothing is current — and
+    // "custom" is the honest reading of modes no posture describes.
+    assert!(rendered.contains("Permissions · Current: custom · (1/5)"));
+    assert!(rendered.contains("QUICK SETTINGS"));
+    // §5.1 radio variant: postures render ●/○, never a caret-only list.
+    assert!(rendered.contains("○ Read only"));
+    assert!(rendered.contains("○ Full access (unsandboxed)"));
     assert!(rendered.contains("Auto in workspace sandbox (not available)"));
     assert!(!rendered.contains('%'));
 
@@ -754,26 +917,48 @@ fn permissions_picker_leads_with_honest_session_postures() {
     );
 }
 
+/// §5.1: the per-capability controls still exist, but one level down behind
+/// a single nested entry — they are no longer the primary mental model. The
+/// posture list itself is four postures + the unavailable sandbox row +
+/// Advanced, not a wall of forty toggles.
 #[test]
 fn permissions_picker_keeps_per_capability_controls_under_advanced() {
     let mut surface = BottomSurface::new(CommandContext::default());
     surface.open_picker(PickerSpec::Permissions(permission_choices()));
-    for _ in 0..8 {
-        surface.move_selection_down();
-    }
 
-    let rendered = surface
+    let postures = surface
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Advanced · Files: write - Allow file writes this session"));
+    assert!(postures.contains("Advanced capability settings ›"));
+    assert!(
+        !postures.contains("Allow file writes this session"),
+        "per-capability controls must not spill into the posture list: {postures}"
+    );
+
+    // The nested entry drills down; the host rebuilds the rows from the live
+    // session, so the picker asks for them rather than carrying a snapshot.
+    for _ in 0..4 {
+        surface.move_selection_down();
+    }
     assert_eq!(
         surface.confirm(),
-        SurfaceEvent::Action(CommandAction::SetPermissionMode {
-            capability: Capability::FsWrite,
-            mode: ApprovalMode::SessionAllow,
-        })
+        SurfaceEvent::Action(CommandAction::OpenPermissionsAdvanced)
     );
+
+    surface.open_picker(PickerSpec::PermissionsAdvanced(
+        crate::ui::commands::permission_advanced_choices(&[]),
+    ));
+    let advanced = surface
+        .surface_lines(80)
+        .expect("advanced picker")
+        .join("\n");
+    assert!(advanced.contains("Permissions › Advanced"));
+    assert!(advanced.contains("⌫ back"));
+    assert!(advanced.contains("Allow file writes this session"));
+
+    // `⌫` leaves Advanced; the caller re-derives the postures from the session.
+    assert!(surface.picker_backspace_leaves_permissions_advanced());
 }
 
 #[test]
@@ -793,8 +978,10 @@ fn permissions_picker_marks_sandbox_posture_unavailable_instead_of_faking_it() {
 #[test]
 fn permissions_picker_exposes_agent_spawn_controls() {
     let mut surface = BottomSurface::new(CommandContext::default());
-    surface.open_picker(PickerSpec::Permissions(permission_choices()));
-    for _ in 0..22 {
+    surface.open_picker(PickerSpec::PermissionsAdvanced(
+        crate::ui::commands::permission_advanced_choices(&[]),
+    ));
+    for _ in 0..18 {
         surface.move_selection_down();
     }
 
@@ -802,7 +989,8 @@ fn permissions_picker_exposes_agent_spawn_controls() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    assert!(rendered.contains("Advanced · Agents - Ask before spawning agents"));
+    assert!(rendered.contains("AGENTS"), "rendered:\n{rendered}");
+    assert!(rendered.contains("Ask before spawning agents"));
     assert_eq!(
         surface.confirm(),
         SurfaceEvent::Action(CommandAction::SetPermissionMode {
@@ -832,13 +1020,12 @@ fn resume_picker_is_list_mode_with_indicator_and_action() {
         panic!("picker should own surface");
     };
     assert_eq!(picker.position_indicator(), "(1/2)");
-    assert_eq!(picker.visible_rows(80).len(), 1);
+    assert_eq!(picker.visible_row_count(), 1);
     let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
-    assert!(rendered.contains("Resume a previous session"));
-    assert!(rendered.contains("Type to search"));
+    assert!(rendered.contains("Resume · newest first"));
     assert!(rendered.contains("4m ago"));
     assert!(rendered.contains("2026-06-19 research"));
-    assert!(rendered.contains("tui"));
+    assert!(rendered.contains("TUI"));
     // Selected-row preview (id + root), not a footer "Session:" detail.
     assert!(rendered.contains("s1  /repo"));
     assert!(!rendered.contains("Session:"));
@@ -880,7 +1067,7 @@ fn resume_picker_searches_label_id_and_root_path() {
     surface.palette_insert("token /repo");
     let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
 
-    assert!(rendered.contains("Search: token /repo"));
+    assert!(rendered.contains("/token /repo"));
     assert!(rendered.contains("token budget review"));
     assert!(!rendered.contains("backend cleanup"));
     assert_eq!(
@@ -1103,7 +1290,17 @@ fn code_swarm_picker_selected_row_uses_same_select_bar_styling() {
     let lines = surface
         .surface_canvas_lines(&theme, width)
         .expect("picker lines");
-    let selected_line = &lines[1]; // title row, then first checklist row (selected).
+    // Find the bar rather than indexing chrome: the row's position shifts
+    // whenever the §4.2 anatomy above it changes, and this test is about the
+    // styling, not the offset.
+    let selected_line = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.bg == Some(theme.palette.selection))
+        })
+        .expect("selected row carries the select bar");
     assert_eq!(selected_line.spans.len(), 1);
     let span = &selected_line.spans[0];
     assert_eq!(span.style.fg, Some(theme.palette.warning));

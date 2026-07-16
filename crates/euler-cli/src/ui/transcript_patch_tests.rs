@@ -67,7 +67,7 @@ fn vt100_renders_patch_diff_with_line_numbers_and_bounded_preview() {
 
     let contents = rendered_screen(&events, &theme, 80, 32);
 
-    assert!(contents.contains("edit src/lib.rs"));
+    assert!(contents.contains("Edited src/lib.rs"));
     assert!(contents.contains("@@"), "hunk header missing");
     assert!(contents.contains("     2 - b"));
     assert!(contents.contains("     2 + beta"));
@@ -75,7 +75,6 @@ fn vt100_renders_patch_diff_with_line_numbers_and_bounded_preview() {
     assert!(contents.contains("ctrl+o expand"));
     assert!(!contents.contains("extra 14"));
     assert!(contents.contains(""));
-    assert!(!contents.contains("• Edited"));
 }
 
 #[test]

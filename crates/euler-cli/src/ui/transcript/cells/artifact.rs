@@ -1,7 +1,7 @@
 use crate::ui::text::{blank_gutter, display_width, gutter_width, truncate_display};
 use crate::ui::theme::Theme;
 use ratatui::{
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
@@ -141,12 +141,31 @@ fn flat_title_spans(
     suffix_style: Style,
 ) -> Vec<Span<'static>> {
     let mut parts = Vec::new();
-    push_title_part(&mut parts, sanitize_artifact_text(title), title_style);
+    push_title_lead(&mut parts, sanitize_artifact_text(title), title_style);
     if let Some(suffix) = suffix {
         push_title_part(&mut parts, sanitize_artifact_text(suffix), suffix_style);
     }
     push_title_part(&mut parts, sanitize_artifact_text(footer), title_style);
     fit_artifact_spans(&parts, width)
+}
+
+/// §4: an artifact cell opens with a bold capitalized verb (Codex vocabulary
+/// — `Read` / `Search` / `Ran` / `Edited`) followed by its target. The verb
+/// carries the weight; the target and the trailing result cluster do not.
+/// Titles that don't open with a verb render whole, at the row's own style.
+fn push_title_lead(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    let Some(verb_len) = super::leading_verb(&text).map(str::len) else {
+        push_title_part(spans, text, style);
+        return;
+    };
+    let (verb, rest) = text.split_at(verb_len);
+    spans.push(Span::styled(
+        verb.to_owned(),
+        style.add_modifier(Modifier::BOLD),
+    ));
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_owned(), style));
+    }
 }
 
 fn push_title_part(spans: &mut Vec<Span<'static>>, text: String, style: Style) {

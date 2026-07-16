@@ -235,9 +235,6 @@ pub struct Palette {
     pub added: Color,
     pub removed: Color,
     pub changed: Color,
-    pub added_tint: Color,
-    pub removed_tint: Color,
-    pub changed_tint: Color,
     pub muted: Color,
     pub warning: Color,
     pub error: Color,
@@ -277,9 +274,6 @@ struct PaletteSeed {
     added: Color,
     removed: Color,
     changed: Color,
-    added_tint_pct: u8,
-    removed_tint_pct: u8,
-    changed_tint_pct: u8,
     muted: Color,
     warning: Color,
     error: Color,
@@ -310,9 +304,6 @@ impl PaletteSeed {
             added: Color::Rgb(184, 187, 38),
             removed: Color::Rgb(251, 73, 52),
             changed: Color::Rgb(250, 189, 47),
-            added_tint_pct: 28,
-            removed_tint_pct: 28,
-            changed_tint_pct: 24,
             muted: Color::Rgb(168, 153, 132),
             warning: Color::Rgb(254, 128, 25),
             error: Color::Rgb(251, 73, 52),
@@ -343,9 +334,6 @@ impl PaletteSeed {
             added: Color::Rgb(121, 116, 14),
             removed: Color::Rgb(157, 0, 6),
             changed: Color::Rgb(181, 118, 20),
-            added_tint_pct: 28,
-            removed_tint_pct: 28,
-            changed_tint_pct: 24,
             muted: Color::Rgb(124, 111, 100),
             warning: Color::Rgb(175, 58, 3),
             error: Color::Rgb(157, 0, 6),
@@ -377,9 +365,6 @@ impl PaletteSeed {
             added: Color::Rgb(0x9d, 0xb8, 0x77),
             removed: Color::Rgb(0xc1, 0x55, 0x3f),
             changed: Color::Rgb(0xd7, 0xa8, 0x3c),
-            added_tint_pct: 12,
-            removed_tint_pct: 12,
-            changed_tint_pct: 10,
             muted: Color::Rgb(0x8b, 0x85, 0x70),
             warning: Color::Rgb(0xd7, 0xa8, 0x3c),
             error: Color::Rgb(0xc1, 0x55, 0x3f),
@@ -398,7 +383,6 @@ impl PaletteSeed {
 
     fn resolve(self, options: ThemeOptions) -> Palette {
         let background = options.background.resolved(self.background);
-        let tint_base = self.background;
         Palette {
             foreground: self.quantize(self.foreground, options),
             background: options.color_level.quantize(background),
@@ -412,24 +396,6 @@ impl PaletteSeed {
             added: self.quantize(self.added, options),
             removed: self.quantize(self.removed, options),
             changed: self.quantize(self.changed, options),
-            added_tint: tint(
-                tint_base,
-                self.added,
-                self.added_tint_pct,
-                options.color_level,
-            ),
-            removed_tint: tint(
-                tint_base,
-                self.removed,
-                self.removed_tint_pct,
-                options.color_level,
-            ),
-            changed_tint: tint(
-                tint_base,
-                self.changed,
-                self.changed_tint_pct,
-                options.color_level,
-            ),
             muted: self.quantize(self.muted, options),
             warning: self.quantize(self.warning, options),
             error: self.quantize(self.error, options),
@@ -663,27 +629,30 @@ pub struct DiffScopes {
     pub deleted_body: Style,
     pub changed: Style,
     pub context: Style,
+    pub line_number: Style,
     pub hunk: Style,
 }
 
 impl DiffScopes {
+    /// Semantics ride on the sign column and luminance only (spec §4.1) — no
+    /// row-fill background anywhere. A tint has to be re-blended per terminal
+    /// theme to stay legible and fights user palettes; a single dim operation
+    /// works against any background unchanged and still keeps added code the
+    /// star. This supersedes the earlier `added_tint`/`removed_tint` model.
     fn from_palette(palette: &Palette) -> Self {
         Self {
-            inserted: Style::default().fg(palette.added).bg(palette.added_tint),
-            inserted_body: Style::default()
-                .fg(palette.foreground)
-                .bg(palette.added_tint),
+            inserted: Style::default().fg(palette.added),
+            inserted_body: Style::default().fg(palette.foreground),
+            // Removed code is evidence it's gone, not reading material: the
+            // whole row drops to faint and `highlight_diff_body` suppresses
+            // syntax accents for the Delete kind.
             deleted: Style::default()
                 .fg(palette.removed)
-                .bg(palette.removed_tint),
-            deleted_body: Style::default()
-                .fg(palette.muted)
-                .bg(palette.removed_tint)
                 .add_modifier(Modifier::DIM),
-            changed: Style::default()
-                .fg(palette.changed)
-                .bg(palette.changed_tint),
-            context: Style::default().fg(palette.muted),
+            deleted_body: Style::default().fg(palette.gutter),
+            changed: Style::default().fg(palette.changed),
+            context: Style::default().fg(palette.foreground),
+            line_number: Style::default().fg(palette.gutter),
             hunk: Style::default()
                 .fg(palette.gutter)
                 .add_modifier(Modifier::ITALIC),
@@ -804,22 +773,6 @@ fn surface_color(background: Color, fallback: Color, options: ThemeOptions) -> C
     } else {
         options.color_level.quantize(fallback)
     }
-}
-
-fn tint(base: Color, accent: Color, percent: u8, level: ColorLevel) -> Color {
-    let (base_red, base_green, base_blue) = color_rgb(base);
-    let (accent_red, accent_green, accent_blue) = color_rgb(accent);
-    let red = mix_channel(base_red, accent_red, percent);
-    let green = mix_channel(base_green, accent_green, percent);
-    let blue = mix_channel(base_blue, accent_blue, percent);
-    level.quantize(Color::Rgb(red, green, blue))
-}
-
-fn mix_channel(base: u8, accent: u8, percent: u8) -> u8 {
-    let base = u16::from(base);
-    let accent = u16::from(accent);
-    let percent = u16::from(percent);
-    (((base * (100 - percent)) + (accent * percent)) / 100) as u8
 }
 
 fn color_rgb(color: Color) -> (u8, u8, u8) {
@@ -955,9 +908,6 @@ mod tests {
         assert_eq!(theme.palette.user_rail, USER_RAIL_COLOR);
         assert_eq!(theme.palette.queued_rail, Color::Rgb(102, 92, 84));
         assert_eq!(theme.palette.cursor, Color::Rgb(235, 219, 178));
-        assert_eq!(theme.palette.added_tint, Color::Rgb(80, 81, 39));
-        assert_eq!(theme.palette.removed_tint, Color::Rgb(99, 49, 43));
-        assert_eq!(theme.palette.changed_tint, Color::Rgb(90, 75, 41));
         assert_eq!(theme.transcript.added.fg, Some(theme.palette.added));
         assert_eq!(theme.color_level, ColorLevel::TrueColor);
     }
@@ -1024,9 +974,6 @@ mod tests {
         assert_eq!(theme.palette.composer_rule, Color::Rgb(0x45, 0x3e, 0x26));
         assert_eq!(theme.palette.user_rail, Color::Rgb(0xb3, 0xa6, 0x7e));
         assert_eq!(theme.palette.queued_rail, Color::Rgb(0x6b, 0x63, 0x49));
-        assert_eq!(theme.palette.added_tint, Color::Rgb(0x34, 0x34, 0x24));
-        assert_eq!(theme.palette.removed_tint, Color::Rgb(0x38, 0x29, 0x1d));
-        assert_eq!(theme.palette.changed_tint, Color::Rgb(0x37, 0x30, 0x1c));
         assert_eq!(theme.transcript.hairline.fg, Some(theme.palette.hairline));
         assert_eq!(theme.composer.rule.fg, Some(theme.palette.user_rail));
         assert_eq!(
@@ -1048,7 +995,6 @@ mod tests {
         });
 
         assert!(matches!(indexed.palette.foreground, Color::Indexed(_)));
-        assert!(matches!(indexed.palette.added_tint, Color::Indexed(_)));
         assert!(matches!(
             basic.palette.foreground,
             Color::White | Color::Gray
@@ -1129,52 +1075,58 @@ mod tests {
         assert_eq!(dark.scopes.markup.inserted.fg, Some(dark.palette.added));
         assert_eq!(dark.scopes.markup.deleted.fg, Some(dark.palette.removed));
         assert_eq!(dark.scopes.diff.hunk.fg, Some(dark.palette.gutter));
-        assert_eq!(dark.scopes.diff.context.fg, Some(dark.palette.muted));
         assert_eq!(dark.scopes.syntax.comment.fg, Some(dark.palette.gutter));
 
+        // §4.1 luminance ladder: added reads like normal code, context a step
+        // below it, removed dims out to faint. Line numbers stay faint on every
+        // row, and no scope carries a background.
         for theme in [Theme::default_dark(), Theme::default_light()] {
             assert_eq!(theme.scopes.diff.inserted.fg, Some(theme.palette.added));
-            assert_eq!(
-                theme.scopes.diff.inserted.bg,
-                Some(theme.palette.added_tint)
-            );
             assert_eq!(
                 theme.scopes.diff.inserted_body.fg,
                 Some(theme.palette.foreground)
             );
-            assert_eq!(
-                theme.scopes.diff.inserted_body.bg,
-                Some(theme.palette.added_tint)
-            );
             assert_eq!(theme.scopes.diff.deleted.fg, Some(theme.palette.removed));
             assert_eq!(
-                theme.scopes.diff.deleted.bg,
-                Some(theme.palette.removed_tint)
+                theme.scopes.diff.deleted_body.fg,
+                Some(theme.palette.gutter)
             );
-            assert_eq!(theme.scopes.diff.deleted_body.fg, Some(theme.palette.muted));
-            assert_eq!(
-                theme.scopes.diff.deleted_body.bg,
-                Some(theme.palette.removed_tint)
-            );
+            assert_eq!(theme.scopes.diff.context.fg, Some(theme.palette.foreground));
+            assert_eq!(theme.scopes.diff.line_number.fg, Some(theme.palette.gutter));
+            for scope in [
+                theme.scopes.diff.inserted,
+                theme.scopes.diff.inserted_body,
+                theme.scopes.diff.deleted,
+                theme.scopes.diff.deleted_body,
+                theme.scopes.diff.context,
+                theme.scopes.diff.line_number,
+            ] {
+                assert_eq!(scope.bg, None, "diff scopes carry no background: {scope:?}");
+            }
         }
     }
 
+    /// Surface colors are the last background-derived tokens in the palette
+    /// (the diff tints were the others, dropped with the §4.1 sign+luminance
+    /// model). They must resolve once, at palette build, so no renderer has to
+    /// re-derive them per frame: opaque backgrounds get a concrete color,
+    /// transparent ones stay `Reset` so the terminal shows through.
     #[test]
     fn derived_colors_resolve_once_into_palette() {
-        let theme = Theme::default_dark_with(ThemeOptions {
+        let opaque = Theme::default_dark_with(ThemeOptions {
             color_level: ColorLevel::TrueColor,
             background: BackgroundMode::Opaque(Color::Rgb(10, 20, 30)),
         });
+        assert_eq!(opaque.palette.background, Color::Rgb(10, 20, 30));
+        assert!(matches!(opaque.palette.surface, Color::Rgb(_, _, _)));
+        assert!(matches!(opaque.palette.surface_high, Color::Rgb(_, _, _)));
 
-        assert!(matches!(theme.palette.added_tint, Color::Rgb(_, _, _)));
-        assert_eq!(
-            theme.scopes.diff.inserted.bg,
-            Some(theme.palette.added_tint)
-        );
-        assert_eq!(
-            theme.scopes.diff.deleted.bg,
-            Some(theme.palette.removed_tint)
-        );
-        assert_ne!(theme.palette.added_tint, theme.palette.added);
+        let transparent = Theme::default_dark_with(ThemeOptions {
+            color_level: ColorLevel::TrueColor,
+            background: BackgroundMode::Transparent,
+        });
+        assert_eq!(transparent.palette.background, Color::Reset);
+        assert_eq!(transparent.palette.surface, Color::Reset);
+        assert_eq!(transparent.palette.surface_high, Color::Reset);
     }
 }

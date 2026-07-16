@@ -1,7 +1,9 @@
 use super::*;
 use crate::{ToolError, ToolRegistry};
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use std::env;
+#[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::io::{self, Read};
@@ -11,16 +13,22 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+// The sandbox is Linux-only (ADR 0014), so every fixture below it is too:
+// off Linux these are unreachable and `-D dead-code` rejects them.
+#[cfg(target_os = "linux")]
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(target_os = "linux")]
 struct EnvRestore {
     saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
+#[cfg(target_os = "linux")]
 impl EnvRestore {
     fn capture(names: &[&'static str]) -> Self {
         Self {
@@ -32,6 +40,7 @@ impl EnvRestore {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for EnvRestore {
     fn drop(&mut self) {
         for (name, value) in &self.saved {
@@ -52,20 +61,27 @@ fn requested_but_invalid_profile_fails_closed_before_shell_execution() {
         SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork),
     );
 
+    // The sandbox fails closed on every platform — that is what this test
+    // guards. Only the *reason* is platform-specific: off Linux the platform
+    // check short-circuits before the workspace is ever validated (ADR 0014,
+    // `probe_workspace_sandbox`), so the invalid workspace is never reached.
+    #[cfg(target_os = "linux")]
+    let expected = SandboxUnavailableReason::InvalidWorkspace;
+    #[cfg(not(target_os = "linux"))]
+    let expected = SandboxUnavailableReason::UnsupportedPlatform;
+
     assert_eq!(
         registry.sandbox_availability(),
-        Some(SandboxAvailability::Unavailable(
-            SandboxUnavailableReason::InvalidWorkspace
-        ))
+        Some(SandboxAvailability::Unavailable(expected))
     );
     let error = registry
         .execute("run_shell", &json!({"command": "printf should-not-run"}))
         .expect_err("unavailable sandbox must not fall back to host shell");
 
-    assert!(matches!(
-        error,
-        ToolError::SandboxUnavailable(SandboxUnavailableReason::InvalidWorkspace)
-    ));
+    assert!(
+        matches!(error, ToolError::SandboxUnavailable(reason) if reason == expected),
+        "run_shell must refuse with the sandbox's own reason, got: {error:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -57,9 +57,13 @@ pub(in crate::ui::transcript) fn render_tool_run(
     );
 }
 
-const BASH_PREFIX: &str = "bash $ ";
+/// Codex vocabulary (§4): the shell row reads `Ran <normalized cmd>`, with
+/// `Ran` the bold verb the artifact cell splits off. It replaces the older
+/// `Ran ` label — the `$` was chrome, and `bash` named the shell rather
+/// than the action.
+const RAN_PREFIX: &str = "Ran ";
 
-/// Bash header, command text truncated (not the metadata) so the trailing
+/// Shell header, command text truncated (not the metadata) so the trailing
 /// `· exit N · N lines · folded` cluster always renders intact at any width
 /// (design review v3 §R3) — the old width-fit truncated the whole header,
 /// sometimes clipping mid-metadata (`· 61 li`, `· exit` with no code). The
@@ -68,7 +72,7 @@ const BASH_PREFIX: &str = "bash $ ";
 /// tight one, but a corrupted metadata cluster reads as a lost exit code.
 fn tool_run_heading(run: &ToolRunRender<'_>, width: u16, footer: &str) -> String {
     if run.command.is_empty() {
-        return "bash".to_owned();
+        return RAN_PREFIX.trim_end().to_owned();
     }
     // Durable user prefix rules read as `· user rule`, not "user grant".
     let grant_suffix = run.grant_source.map(|source| match source {
@@ -76,7 +80,7 @@ fn tool_run_heading(run: &ToolRunRender<'_>, width: u16, footer: &str) -> String
         _ => format!(" · {source} grant"),
     });
     let available = content_width(width);
-    let reserved = display_width(BASH_PREFIX)
+    let reserved = display_width(RAN_PREFIX)
         + grant_suffix.as_deref().map(display_width).unwrap_or(0)
         + if run.static_safe {
             display_width(" · safe")
@@ -92,7 +96,7 @@ fn tool_run_heading(run: &ToolRunRender<'_>, width: u16, footer: &str) -> String
     } else {
         run.command.to_owned()
     };
-    let mut heading = format!("{BASH_PREFIX}{command}");
+    let mut heading = format!("{RAN_PREFIX}{command}");
     if let Some(suffix) = grant_suffix {
         // Provenance trace of an existing grant lives on the header (dim),
         // not as a standalone decision record (review v2 §8).
@@ -130,10 +134,12 @@ pub(in crate::ui::transcript) fn edit_failure_status(path: &str, error: &str) ->
     };
     let path = path.trim();
     let cross = glyphs::cross();
+    // Same Codex verb as the success row (§4) — a failed edit is still an
+    // edit, and switching case between outcomes reads as two different tools.
     if path.is_empty() {
-        format!("edit {cross} {cause}")
+        format!("Edited {cross} {cause}")
     } else {
-        format!("edit {path} {cross} {cause}")
+        format!("Edited {path} {cross} {cause}")
     }
 }
 

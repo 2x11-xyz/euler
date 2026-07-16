@@ -666,6 +666,18 @@ struct AppCoreBootstrap {
     authenticated_providers: BTreeSet<String>,
 }
 
+/// §5.1: the session's active posture and its envelope, or the custom
+/// envelope when the per-capability modes match no posture. One definition,
+/// because `/status` and the picker title must never disagree about which
+/// boundary is in force.
+pub(super) fn permission_envelope_for(session: &Session<TuiDecider>) -> String {
+    crate::ui::commands::PermissionPosture::active(|capability| session.configured_mode(capability))
+        .map_or_else(
+            || crate::ui::commands::CUSTOM_PERMISSION_ENVELOPE.to_owned(),
+            |posture| posture.envelope().to_owned(),
+        )
+}
+
 fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> AppCoreBootstrap {
     let target = session.active_target().clone();
     let reasoning_effort = session.reasoning_effort();
@@ -1253,6 +1265,9 @@ impl AppCore {
                 CoreEffect::Render
             }
             KeyCode::Backspace => {
+                if self.bottom.picker_backspace_leaves_permissions_advanced() {
+                    return self.open_permissions_picker();
+                }
                 if self.bottom.picker_backspace_steps_back() {
                     return CoreEffect::Render;
                 }
@@ -1774,7 +1789,23 @@ impl AppCore {
         }
     }
 
+    /// §5.1: snapshot the session's permission envelope at the moment we give
+    /// it away.
+    ///
+    /// This is the whole invariant. `/status` derives the envelope live while
+    /// the session is here, so the cache is read in exactly one window — a
+    /// turn in flight — and that window can only be entered through a handoff.
+    /// Snapshotting here therefore covers every way the modes can differ from
+    /// the last cached value: a posture change, a mode change, a revoked
+    /// grant, a grant the previous turn's approval installed, and a wholly
+    /// different session from `/new` or `/resume`. Refreshing at the sites
+    /// that *change* modes instead only covers the ones anyone remembered.
+    fn snapshot_permission_envelope(&mut self, session: &Session<TuiDecider>) {
+        self.status.permission_envelope = Some(permission_envelope_for(session));
+    }
+
     fn spawn_turn(&mut self, prompt: String, mut session: Box<Session<TuiDecider>>) {
+        self.snapshot_permission_envelope(&session);
         let (worker_tx, worker_rx) = mpsc::channel();
         let interrupt_flag = Arc::new(AtomicBool::new(false));
         let worker_interrupt = Arc::clone(&interrupt_flag);
@@ -1855,6 +1886,7 @@ impl AppCore {
                     .to_owned(),
             ),
             CommandAction::OpenPermissions => self.open_permissions_picker(),
+            CommandAction::OpenPermissionsAdvanced => self.open_permissions_advanced_picker(),
             CommandAction::RevokeGrant {
                 capability,
                 pattern,
@@ -2021,6 +2053,7 @@ impl AppCore {
         request: CompanionRunRequest,
         mut session: Box<Session<TuiDecider>>,
     ) {
+        self.snapshot_permission_envelope(&session);
         let (worker_tx, worker_rx) = mpsc::channel();
         let worker_request = request.clone();
         std::thread::spawn(move || {

@@ -1148,6 +1148,29 @@ mod tests {
         assert!(gate.session_grants().is_empty());
     }
 
+    /// An unscoped session grant does not just add a list entry: it flips the
+    /// capability's *mode* to SessionAllow, and revoking it restores Ask. Both
+    /// halves matter — the mode is what stops execution, and it is what any
+    /// surface reporting the session's posture reads. `revoke_session_grant`
+    /// above uses a scoped pattern and never reaches this branch.
+    #[test]
+    fn unscoped_session_grant_moves_the_mode_and_revoking_restores_it() {
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.set_mode(Capability::ShellExec, ApprovalMode::Ask);
+        let unscoped = ScopePattern::unscoped();
+
+        gate.install_grant(Capability::ShellExec, GrantScope::Session(unscoped.clone()))
+            .expect("install");
+        assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::SessionAllow);
+
+        assert_eq!(
+            gate.revoke(Capability::ShellExec, &unscoped, GrantSource::Session)
+                .expect("revoke"),
+            1
+        );
+        assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::Ask);
+    }
+
     #[test]
     fn legacy_verdicts_map_to_grant_scopes() {
         assert_eq!(DeciderVerdict::Allow.grant_scope(), Some(GrantScope::Once));

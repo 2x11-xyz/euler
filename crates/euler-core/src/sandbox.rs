@@ -545,6 +545,7 @@ fn invalid_proc_fd_directory() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::net::TcpListener;
@@ -726,14 +727,22 @@ mod tests {
         let missing = temp.path().join("missing");
         let sandbox = WorkspaceSandbox::new(&missing, SandboxProfile::WorkspaceNoNetwork);
 
+        // Fails closed on every platform — that is the guarantee under test.
+        // The reason is platform-specific: off Linux the platform check
+        // short-circuits before the workspace is validated (ADR 0014).
+        #[cfg(target_os = "linux")]
+        let expected = SandboxUnavailableReason::InvalidWorkspace;
+        #[cfg(not(target_os = "linux"))]
+        let expected = SandboxUnavailableReason::UnsupportedPlatform;
+
         assert_eq!(
             sandbox.availability(),
-            SandboxAvailability::Unavailable(SandboxUnavailableReason::InvalidWorkspace)
+            SandboxAvailability::Unavailable(expected)
         );
-        assert!(matches!(
-            sandbox.command("/bin/sh", ["-c", "true"]),
-            Err(SandboxUnavailableReason::InvalidWorkspace)
-        ));
+        assert_eq!(
+            sandbox.command("/bin/sh", ["-c", "true"]).map(|_| ()),
+            Err(expected)
+        );
     }
 
     #[cfg(target_os = "linux")]

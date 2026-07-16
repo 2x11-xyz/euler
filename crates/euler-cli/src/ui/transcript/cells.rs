@@ -83,13 +83,17 @@ pub(super) fn render_edit_cell(
     width: u16,
     limit: usize,
 ) {
+    // Codex vocabulary (§4): a bold capitalized verb + target. `Wrote` keeps
+    // file creation distinguishable from modification — the spec folds new
+    // files into the `Edited` group when several files change at once, but a
+    // lone created file is not an edit and reads wrong as one.
     let heading = match (
         patch_diff::action(edit.old, edit.new),
         diffstat(edit.old, edit.new),
     ) {
-        ("add", Some((added, _))) => format!("write {} · new · {added} lines", edit.path),
-        (_, Some((added, removed))) => format!("edit {} · +{added} −{removed}", edit.path),
-        _ => format!("edit {}", edit.path),
+        ("add", Some((added, _))) => format!("Wrote {} · new · {added} lines", edit.path),
+        (_, Some((added, removed))) => format!("Edited {} · +{added} −{removed}", edit.path),
+        _ => format!("Edited {}", edit.path),
     };
     render_patch_cell(
         lines,
@@ -294,11 +298,19 @@ pub(super) fn push_cell_parent(
     theme: &Theme,
     width: u16,
 ) {
+    // Reserve the gutter and let the spine own the anchor: the renderer
+    // splices the real `•` glyph over this first span (`stamp_first_line`),
+    // so a literal bullet here is a placeholder that gets thrown away. It has
+    // to be `blank_gutter()` rather than a hardcoded 2-cell `"• "`, because
+    // with `/timestamps` on the gutter is 11 cells wide — a 2-cell prefix is
+    // not recognized as the ledger gutter there, so a blank gutter got
+    // prepended and the splice replaced *that*, leaving the placeholder
+    // behind as a second bullet (`12:00:06 • • Explored`).
     push_wrapped_with_prefix(
         lines,
         CellPrefixes {
-            first: "• ",
-            next: "  ",
+            first: blank_gutter(),
+            next: blank_gutter(),
         },
         text,
         style,
@@ -320,18 +332,41 @@ pub(super) fn push_child_rows(
         } else {
             tree_gutter_mid()
         };
-        push_wrapped_with_prefix(
+        push_wrapped_inner(
             lines,
             CellPrefixes {
                 first: prefix,
                 next: blank_gutter(),
             },
-            row,
-            style,
+            RowText::with_bold_lead(row, style),
             theme,
             width,
         );
     }
+}
+
+/// The Codex tool vocabulary (§4) — the closed set of verbs that may open a
+/// ledger row. Bold is otherwise reserved (user messages, headings, picker and
+/// approval titles), so this list is exactly what earns it.
+///
+/// `Git` is ours, not the spec's: §4 names `Read`/`Search` for group children
+/// and never covers the `git_status`/`git_diff` tools. Leaving it out would
+/// bold one child of an `Explored` group and not its sibling, which reads as a
+/// rendering bug rather than a vocabulary boundary.
+pub(super) const CODEX_VERBS: [&str; 10] = [
+    "Explored", "Read", "Search", "List", "Git", "Ran", "Edited", "Wrote", "Deleted", "Changed",
+];
+
+/// The bold lead for a row, or `None` when it doesn't open with a Codex verb.
+///
+/// Membership, not capitalization: a row can begin with a capital for reasons
+/// that have nothing to do with the vocabulary — an uppercase filename, or a
+/// title like `File added …` / `Patch proposed`. Bolding those spends the
+/// weight on a word that carries no verb meaning and makes the canvas
+/// semantics drift every time a new title is added.
+fn leading_verb(row: &str) -> Option<&str> {
+    let verb = row.split(' ').next()?;
+    CODEX_VERBS.contains(&verb).then_some(verb)
 }
 
 pub(super) fn push_bounded_children(
@@ -473,6 +508,51 @@ fn push_wrapped_with_prefix(
     theme: &Theme,
     width: u16,
 ) {
+    push_wrapped_inner(lines, prefixes, RowText::plain(text, style), theme, width);
+}
+
+/// One row's text and how to weight it.
+#[derive(Clone, Copy)]
+struct RowText<'a> {
+    text: &'a str,
+    style: ratatui::style::Style,
+    /// A leading verb rendered bold ahead of the text (Codex vocabulary, §4):
+    /// the verb carries the weight, the target stays at `style`. It applies
+    /// only to the first wrapped segment, which is where the verb lives.
+    bold_lead: Option<&'a str>,
+}
+
+impl<'a> RowText<'a> {
+    fn plain(text: &'a str, style: ratatui::style::Style) -> Self {
+        Self {
+            text,
+            style,
+            bold_lead: None,
+        }
+    }
+
+    fn with_bold_lead(text: &'a str, style: ratatui::style::Style) -> Self {
+        Self {
+            text,
+            style,
+            bold_lead: leading_verb(text),
+        }
+    }
+}
+
+/// Shared body of [`push_wrapped_with_prefix`].
+fn push_wrapped_inner(
+    lines: &mut Vec<Line<'static>>,
+    prefixes: CellPrefixes,
+    row: RowText<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    let RowText {
+        text,
+        style,
+        bold_lead,
+    } = row;
     let first_is_ledger = is_ledger_gutter(prefixes.first);
     let next_is_ledger = is_ledger_gutter(prefixes.next);
     let first_content = if first_is_ledger {
@@ -507,8 +587,34 @@ fn push_wrapped_with_prefix(
             ));
         }
         spans.push(Span::styled(prefix.to_owned(), theme.transcript.gutter));
-        spans.push(Span::styled(segment, style));
+        let lead = if index == 0 { bold_lead } else { None };
+        push_body_spans(&mut spans, segment, style, lead);
         lines.push(Line::from(spans));
+    }
+}
+
+/// Split a row into `bold verb` + `plain rest` when a lead verb is named and
+/// actually opens the row; otherwise emit the row as one span.
+fn push_body_spans(
+    spans: &mut Vec<Span<'static>>,
+    segment: String,
+    style: ratatui::style::Style,
+    bold_lead: Option<&str>,
+) {
+    let split = bold_lead.and_then(|verb| {
+        segment
+            .strip_prefix(verb)
+            .map(|rest| (verb.to_owned(), rest.to_owned()))
+    });
+    match split {
+        Some((verb, rest)) => {
+            spans.push(Span::styled(
+                verb,
+                style.add_modifier(ratatui::style::Modifier::BOLD),
+            ));
+            spans.push(Span::styled(rest, style));
+        }
+        None => spans.push(Span::styled(segment, style)),
     }
 }
 
@@ -616,15 +722,15 @@ mod tests {
                 "retry.rs",
                 "hunk 2/3 did not apply — file changed on disk since read"
             ),
-            "edit retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"
+            "Edited retry.rs ✗ hunk 2/3 did not apply — file changed on disk since read"
         );
-        assert_eq!(edit_failure_status("", ""), "edit ✗ no cause recorded");
+        assert_eq!(edit_failure_status("", ""), "Edited ✗ no cause recorded");
         assert_eq!(
             edit_failure_status(
                 "lib.rs",
                 "replacement text matched 0 times; expected exactly one"
             ),
-            "edit lib.rs ✗ replacement text matched 0 times; expected exactly one"
+            "Edited lib.rs ✗ replacement text matched 0 times; expected exactly one"
         );
     }
 

@@ -140,6 +140,25 @@ impl AppCore {
             self.theme_choice.label(),
             self.theme_choice.as_str()
         );
+        // §5.1 status indicator: the active posture *and its envelope*, never
+        // just the name — the boundary in force has to be legible without
+        // knowing what each posture means.
+        //
+        // Derive it live whenever the session is in hand. The modes behind it
+        // move for reasons no single caller owns — an unscoped session
+        // approval flips a capability to SessionAllow, revoking one restores
+        // Ask (`PermissionGate::install_grant` / `revoke`) — so a cache that
+        // every mutation site has to remember to refresh is a stale line
+        // waiting to happen. The cache is the fallback for the one window
+        // where the session is unreachable: a turn in flight, where /status is
+        // still answerable but the worker owns the session.
+        let envelope = match &self.state {
+            AppState::Idle { session } => Some(super::permission_envelope_for(session)),
+            _ => self.status.permission_envelope.clone(),
+        };
+        if let Some(envelope) = envelope {
+            status.push_str(&format!("\npermissions: {envelope}"));
+        }
         // ADR 0011 visibility: say so whenever a non-default reviewer
         // resolves permission asks in place of the user.
         if let Some(reviewer) = self.status.permission_reviewer.as_deref() {
@@ -368,9 +387,28 @@ impl AppCore {
             return self.notice_item("permissions wait for the active turn".to_owned());
         };
         let grants = session.list_grants();
-        let choices = crate::ui::commands::permission_choices_with_grants(&grants);
+        let active = crate::ui::commands::PermissionPosture::active(|capability| {
+            session.configured_mode(capability)
+        });
+        let choices = crate::ui::commands::permission_choices_with_state(&grants, active);
         self.bottom
             .open_picker(crate::ui::commands::PickerSpec::Permissions(choices));
+        CoreEffect::Render
+    }
+
+    /// §5.1 Advanced: the per-capability controls, one level down from the
+    /// posture picker. Rebuilt from the live session rather than carried in
+    /// the parent picker, so revoking a grant here can never show a stale set.
+    pub(super) fn open_permissions_advanced_picker(&mut self) -> CoreEffect {
+        let AppState::Idle { session } = &self.state else {
+            return self.notice_item("permissions wait for the active turn".to_owned());
+        };
+        let grants = session.list_grants();
+        let choices = crate::ui::commands::permission_advanced_choices(&grants);
+        self.bottom
+            .open_picker(crate::ui::commands::PickerSpec::PermissionsAdvanced(
+                choices,
+            ));
         CoreEffect::Render
     }
 

@@ -8370,17 +8370,17 @@ fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
     for cmd in ["printf alpha-one", "printf beta-two", "printf gamma-three"] {
         let headers = final_state
             .lines()
-            .filter(|line| line.contains(&format!("bash $ {cmd}")))
+            .filter(|line| line.contains(&format!("Ran {cmd}")))
             .count();
         if headers != 1 {
-            failures.push(format!("`bash $ {cmd}` header appears {headers}× (want 1)"));
+            failures.push(format!("`Ran {cmd}` header appears {headers}× (want 1)"));
         }
     }
     for output in ["alpha-one", "beta-two", "gamma-three"] {
         let occurrences = final_state
             .lines()
             .filter(|line| {
-                line.contains(output) && !line.contains("bash $") && !line.contains("run the three")
+                line.contains(output) && !line.contains("Ran ") && !line.contains("run the three")
             })
             .count();
         if occurrences > 1 {
