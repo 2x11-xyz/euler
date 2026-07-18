@@ -9,6 +9,8 @@ capabilities, and companion-agent patterns without changing the core. Euler
 treats problem solving as a first-class artifact: every session is a
 trustworthy, reconstructable record of what was tried, what died, and what
 survived. Your agent's dead ends are data. Euler keeps them.
+The long-form version of this — mission, wager, and the design principles
+that do not move — lives in [docs/vision.md](docs/vision.md).
 
 ## Why Euler
 
