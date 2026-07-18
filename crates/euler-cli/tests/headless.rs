@@ -7380,7 +7380,9 @@ fn killed_cli_writer_releases_advisory_lock_without_removing_lock_file() {
         .expect("spawn first euler");
 
     let mut lock_ready = false;
-    for _ in 0..100 {
+    // Generous window: nextest runs this beside PTY suites and full builds,
+    // and a loaded runner can delay process start well past a second.
+    for _ in 0..500 {
         if lock.exists() {
             lock_ready = true;
             break;
@@ -9455,6 +9457,7 @@ fn tui_pty_quit_during_turn_unwinds_and_releases_session_lock() {
     {
       "events": [
         { "sleep_ms": 5000 },
+        { "sleep_ms": 5000 },
         { "text_delta": "too late" },
         { "finished": { "stop_reason": "completed" } }
       ]
@@ -9491,8 +9494,11 @@ fn tui_pty_quit_during_turn_unwinds_and_releases_session_lock() {
         "TUI did not unwind after in-flight quit:\n{}",
         tui.screen_text()
     );
+    // The scripted turn takes 10s; an unwind well under that proves /quit
+    // did not wait for it. The margin absorbs loaded-runner scheduling
+    // (issue #145 family) while staying far from the 10s ceiling.
     assert!(
-        quit_started.elapsed() < Duration::from_secs(4),
+        quit_started.elapsed() < Duration::from_secs(8),
         "/quit waited for the scripted provider response instead of interrupting the turn"
     );
     assert!(

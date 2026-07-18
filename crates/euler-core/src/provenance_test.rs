@@ -615,20 +615,37 @@ fn lock_released_on_drop_allows_new_writer() {
 }
 
 #[test]
-fn legacy_pid_lock_file_is_migrated_without_pid_probing() {
+fn legacy_pid_lock_file_is_refused_with_recovery_guidance() {
+    // A bare-PID lock belongs to a pre-advisory-lock Euler that owns the
+    // session by pathname existence and holds no OS lock — it may be live
+    // and unobservable, so claiming the session could put two writers on
+    // one log. The refusal names the recovery.
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
     let lock = lock_path_for(&log);
-    fs::write(&lock, "0\n").expect("stale lock");
+    fs::write(&lock, "12345\n").expect("legacy lock");
 
-    let writer = ProvenanceWriter::new(log).expect("migrate legacy lock");
+    let error = ProvenanceWriter::new(log.clone()).expect_err("legacy lock refuses");
+    assert!(matches!(
+        error,
+        ProvenanceWriterError::LegacySessionLock { ref path, pid: 12345, .. }
+            if *path == lock
+    ));
+    let message = error.to_string();
+    assert!(message.contains("older Euler version"));
+    assert!(message.contains("delete that file and retry"));
 
+    // The refusal released the advisory lock and the documented recovery —
+    // delete the file once no older Euler runs — unblocks the session with
+    // new-format metadata from then on.
+    fs::remove_file(&lock).expect("operator removes legacy lock");
+    let writer = ProvenanceWriter::new(log).expect("post-recovery writer");
     let metadata: LockOwnerMetadata =
         serde_json::from_slice(&fs::read(&lock).expect("read metadata")).expect("owner metadata");
     assert_eq!(metadata.pid, std::process::id());
     assert!(!metadata.authoritative);
     drop(writer);
-    assert!(lock.exists());
+    assert!(lock.exists(), "the advisory lock file is persistent");
 }
 
 #[test]
@@ -674,7 +691,9 @@ fn untrusted_owner_metadata_is_bounded_and_sanitized() {
     let message = error.to_string();
     assert!(message.contains("Owner: PID 42"));
     assert!(!message.contains("attacker"));
-    assert!(message.contains("started 123ms since Unix epoch"));
+    // Raw epoch milliseconds stay out of the human-facing message.
+    assert!(!message.contains("123ms"));
+    assert!(message.contains("Lock: "));
     assert_eq!(message.matches("Close that process and retry.").count(), 1);
 }
 

@@ -688,12 +688,39 @@ impl SessionLock {
             Err(TryLockError::Error(source)) => return Err(ProvenanceWriterError::Io(source)),
         }
 
+        // A bare-PID payload is a lock from a pre-advisory-lock Euler. Those
+        // versions own a session by pathname existence and hold no OS lock,
+        // so the flock this process just took proves nothing about them: an
+        // old writer may be live right now, and claiming the session would
+        // put two writers on one log. Refuse and ask for one manual check —
+        // exactly the recovery the old versions themselves required — rather
+        // than auto-migrating through the only window where corruption is
+        // possible. Dropping `file` releases the flock.
+        if let Some(legacy_pid) = read_legacy_lock_pid(&mut file) {
+            return Err(ProvenanceWriterError::LegacySessionLock {
+                session: session_name_for(log_path),
+                path: path.clone(),
+                pid: legacy_pid,
+            });
+        }
+
         // Metadata is diagnostic only. Failure or stale/malformed contents do
         // not affect ownership once the OS has granted the advisory lock.
         let metadata = LockOwnerMetadata::current();
         let _ = write_lock_owner(&mut file, &metadata);
         Ok(Self { _file: file })
     }
+}
+
+/// Contents left by a pre-advisory-lock Euler: a single decimal PID. New
+/// metadata is JSON and never parses this way, and an empty file (an old
+/// writer interrupted before its PID write) carries no liveness claim, so
+/// only the bare-PID form is treated as a legacy lock.
+fn read_legacy_lock_pid(file: &mut File) -> Option<u32> {
+    file.rewind().ok()?;
+    let mut bytes = Vec::new();
+    file.take(64).read_to_end(&mut bytes).ok()?;
+    std::str::from_utf8(&bytes).ok()?.trim().parse().ok()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -710,10 +737,7 @@ impl LockOwnerMetadata {
     fn current() -> Self {
         Self {
             pid: std::process::id(),
-            host: std::env::var("HOSTNAME")
-                .or_else(|_| std::env::var("COMPUTERNAME"))
-                .ok()
-                .filter(|host| valid_diagnostic_text(host, MAX_LOCK_HOST_BYTES)),
+            host: host_name().filter(|host| valid_diagnostic_text(host, MAX_LOCK_HOST_BYTES)),
             started_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -722,6 +746,26 @@ impl LockOwnerMetadata {
             authoritative: false,
         }
     }
+}
+
+/// `gethostname(2)`: `HOSTNAME` is a shell-internal variable that is rarely
+/// exported to processes, so an env-var probe reports nothing on most real
+/// systems.
+#[cfg(unix)]
+fn host_name() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len() - 1) };
+    if status != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&byte| byte == 0)?;
+    String::from_utf8(buffer[..end].to_vec()).ok()
+}
+
+/// `COMPUTERNAME` is a real environment variable on Windows.
+#[cfg(not(unix))]
+fn host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
 }
 
 const MAX_LOCK_METADATA_BYTES: u64 = 16 * 1024;
@@ -747,6 +791,7 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         // Open a final-component reparse point itself rather than following
         // it. The metadata validation below then rejects it as non-regular.
+        // NOTE: CI does not run Windows; this branch is review-verified only.
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -900,26 +945,34 @@ pub enum ProvenanceWriterError {
         path: PathBuf,
         owner: Option<Box<LockOwnerMetadata>>,
     },
+    #[error(
+        "Session {session} has a lock file from an older Euler version at {} (PID {pid}).\n\
+         Older versions hold no OS lock, so this process cannot tell whether that one is \
+         still running.\nIf no older Euler process is using this session, delete that file \
+         and retry.",
+        path.display()
+    )]
+    LegacySessionLock {
+        session: String,
+        path: PathBuf,
+        pid: u32,
+    },
 }
 
-fn session_locked_message(
-    session: &str,
-    _path: &Path,
-    owner: Option<&LockOwnerMetadata>,
-) -> String {
+fn session_locked_message(session: &str, path: &Path, owner: Option<&LockOwnerMetadata>) -> String {
     let mut message = format!("Session {session} is already open by another Euler process.\n");
     if let Some(owner) = owner {
         message.push_str(&format!("Owner: PID {}", owner.pid));
         if let Some(host) = &owner.host {
             message.push_str(&format!(", host {host}"));
         }
-        if let Some(started) = owner.started_unix_ms {
-            message.push_str(&format!(", started {started}ms since Unix epoch"));
-        }
+        // The raw start timestamp stays in the metadata for tooling; epoch
+        // milliseconds are not actionable in a terminal error.
         message.push('\n');
     } else {
         message.push_str("Owner details are unavailable.\n");
     }
+    message.push_str(&format!("Lock: {}\n", path.display()));
     message.push_str("Close that process and retry.");
     message
 }
