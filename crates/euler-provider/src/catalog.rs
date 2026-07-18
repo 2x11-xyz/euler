@@ -36,6 +36,15 @@ const MAX_REASONING_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::XLarge,
     ReasoningEffort::Max,
 ];
+const MAX_ONLY_REASONING_EFFORTS: &[ReasoningEffort] = &[ReasoningEffort::Max];
+const INKLING_REASONING_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::XSmall,
+    ReasoningEffort::Small,
+    ReasoningEffort::Medium,
+    ReasoningEffort::Large,
+    ReasoningEffort::Max,
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuiltInModelDescriptor {
     pub id: &'static str,
@@ -650,13 +659,6 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         true,
     ),
     built_in_model(
-        "arcee-ai/trinity-mini",
-        "Arcee AI: Trinity Mini",
-        131_072,
-        131_072,
-        true,
-    ),
-    built_in_model(
         "arcee-ai/virtuoso-large",
         "Arcee AI: Virtuoso Large",
         131_072,
@@ -938,6 +940,13 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         true,
     ),
     built_in_model(
+        "kwaipilot/kat-coder-air-v2.5",
+        "Kwaipilot: KAT-Coder-Air V2.5",
+        256_000,
+        80_000,
+        false,
+    ),
+    built_in_model(
         "kwaipilot/kat-coder-pro-v2",
         "Kwaipilot: KAT-Coder-Pro V2",
         256_000,
@@ -945,11 +954,11 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         false,
     ),
     built_in_model(
-        "liquid/lfm-2.5-1.2b-thinking:free",
-        "LiquidAI: LFM2.5-1.2B-Thinking (free)",
-        32_768,
-        4_096,
-        true,
+        "kwaipilot/kat-coder-pro-v2.5",
+        "Kwaipilot: KAT-Coder-Pro V2.5",
+        256_000,
+        80_000,
+        false,
     ),
     built_in_model(
         "meta-llama/llama-3.1-70b-instruct",
@@ -992,6 +1001,13 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         327_680,
         16_384,
         false,
+    ),
+    built_in_model(
+        "meta/muse-spark-1.1",
+        "Meta: Muse Spark 1.1",
+        1_048_576,
+        1_048_576,
+        true,
     ),
     built_in_model(
         "minimax/minimax-m1",
@@ -1197,6 +1213,13 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         true,
     ),
     built_in_model(
+        "moonshotai/kimi-k3",
+        "MoonshotAI: Kimi K3",
+        1_048_576,
+        1_048_576,
+        true,
+    ),
+    built_in_model(
         "nex-agi/nex-n2-mini",
         "Nex AGI: Nex-N2-Mini",
         262_144,
@@ -1208,13 +1231,6 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         "Nex AGI: Nex-N2-Pro",
         262_144,
         262_144,
-        true,
-    ),
-    built_in_model(
-        "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-        "NVIDIA: Llama 3.3 Nemotron Super 49B V1.5",
-        131_072,
-        16_384,
         true,
     ),
     built_in_model(
@@ -1571,13 +1587,6 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         "OpenAI: gpt-oss-120b",
         131_072,
         4_096,
-        true,
-    ),
-    built_in_model(
-        "openai/gpt-oss-120b:free",
-        "OpenAI: gpt-oss-120b (free)",
-        131_072,
-        131_072,
         true,
     ),
     built_in_model(
@@ -2039,6 +2048,13 @@ const OPENROUTER_MODELS: &[BuiltInModelDescriptor] = &[
         32_768,
         32_768,
         false,
+    ),
+    built_in_model(
+        "thinkingmachines/inkling",
+        "Thinking Machines: Inkling",
+        1_048_576,
+        1_048_576,
+        true,
     ),
     built_in_model(
         "upstage/solar-pro-3",
@@ -2712,6 +2728,8 @@ pub fn supported_reasoning_efforts(provider: &str, model: &str) -> &'static [Rea
             CHATGPT_PROVIDER_ID | OPENAI_PROVIDER_ID,
             "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra",
         ) => MAX_REASONING_EFFORTS,
+        (OPENROUTER_PROVIDER_ID, "moonshotai/kimi-k3") => MAX_ONLY_REASONING_EFFORTS,
+        (OPENROUTER_PROVIDER_ID, "thinkingmachines/inkling") => INKLING_REASONING_EFFORTS,
         _ => STANDARD_REASONING_EFFORTS,
     }
 }
@@ -2820,6 +2838,32 @@ mod tests {
             clamp_reasoning_effort("custom", "model", ReasoningEffort::Max),
             ReasoningEffort::Max
         );
+    }
+
+    #[test]
+    fn openrouter_reasoning_efforts_match_route_capabilities() {
+        assert_eq!(
+            supported_reasoning_efforts(OPENROUTER_PROVIDER_ID, "moonshotai/kimi-k3"),
+            &[ReasoningEffort::Max]
+        );
+        assert_eq!(
+            clamp_reasoning_effort(
+                OPENROUTER_PROVIDER_ID,
+                "moonshotai/kimi-k3",
+                ReasoningEffort::Medium
+            ),
+            ReasoningEffort::Max
+        );
+        assert!(!model_supports_reasoning_effort(
+            OPENROUTER_PROVIDER_ID,
+            "thinkingmachines/inkling",
+            ReasoningEffort::XLarge
+        ));
+        assert!(model_supports_reasoning_effort(
+            OPENROUTER_PROVIDER_ID,
+            "thinkingmachines/inkling",
+            ReasoningEffort::Max
+        ));
     }
 
     #[test]
