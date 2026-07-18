@@ -238,7 +238,7 @@ fn status_hints(turn: &TurnStatus, has_foldable: bool) -> String {
     match turn {
         TurnStatus::Idle if has_foldable => "/ commands · ctrl+o expand".to_owned(),
         TurnStatus::Idle => "/ commands".to_owned(),
-        TurnStatus::Running(_) => "⏎ queue · esc interrupt now".to_owned(),
+        TurnStatus::Running(_) => "⏎ steer · esc interrupt now".to_owned(),
     }
 }
 
@@ -612,7 +612,7 @@ mod tests {
             120,
         );
 
-        assert!(rendered.contains("⏎ queue · esc interrupt now"));
+        assert!(rendered.contains("⏎ steer · esc interrupt now"));
         assert!(!rendered.contains("running extension causal-dag.catch-up"));
     }
 

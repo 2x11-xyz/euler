@@ -5,7 +5,8 @@ use euler_core::permissions::{
 use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, AutoCompactionPolicy, CanvasItem,
     CompactionTier, ContextLimitConfig, GrantScope, ModelTarget, ProvenanceWriter, ReasoningEffort,
-    ScopePattern, Session, SessionConfig, SessionError, ToolRegistry, WorkingStateProjection,
+    ScopePattern, Session, SessionConfig, SessionError, SteeringQueue, ToolRegistry,
+    WorkingStateProjection,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{
@@ -4521,6 +4522,238 @@ fn test_projection() -> WorkingStateProjection {
         decisions: vec!["Frontier stays verbatim.".to_owned()],
         working_set: vec!["crates/euler-core/src/compaction.rs".to_owned()],
     }
+}
+
+/// Pushes one steering entry the moment the turn asks for permission —
+/// deterministically mid-round, with no thread timing.
+struct SteeringOnAskDecider {
+    queue: Arc<SteeringQueue>,
+    content: &'static str,
+}
+
+impl PermissionDecider for SteeringOnAskDecider {
+    fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
+        self.queue.push_back(self.content.to_owned());
+        DeciderVerdict::Allow
+    }
+}
+
+fn shell_ask_stream(id: &str) -> Vec<Result<ModelStreamEvent, ProviderError>> {
+    vec![
+        Ok(ModelStreamEvent::ToolCall(ToolCall {
+            id: id.to_owned(),
+            name: "run_shell".to_owned(),
+            // `sort` is deliberately not statically safe (issue #78): the
+            // command must reach the decider, whose ask is this test's
+            // mid-round steering push point.
+            input: json!({"command": "sort note.txt"}),
+        })),
+        finished(StopReason::ToolUse),
+    ]
+}
+
+#[test]
+fn steering_pushed_mid_round_lands_in_the_next_rounds_request() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![shell_ask_stream("call-shell"), text_stream("done")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        SteeringOnAskDecider {
+            queue: Arc::clone(&queue),
+            content: "steer: summarize instead",
+        },
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+
+    session.run_turn("run the sort").expect("turn");
+
+    // The steering user.message lands between round 1's tool result and
+    // round 2's model call — in-turn, not queued for the next turn.
+    let kinds_and_content: Vec<(String, Option<String>)> = session
+        .events()
+        .iter()
+        .map(|event| {
+            (
+                event.kind.as_str().to_owned(),
+                payload_str(event, "content").map(str::to_owned),
+            )
+        })
+        .collect();
+    let steering_index = kinds_and_content
+        .iter()
+        .position(|(kind, content)| {
+            kind == EventKind::USER_MESSAGE
+                && content.as_deref() == Some("steer: summarize instead")
+        })
+        .expect("steering user.message emitted");
+    let tool_result_index = kinds_and_content
+        .iter()
+        .position(|(kind, _)| kind == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    let second_model_call_index = kinds_and_content
+        .iter()
+        .enumerate()
+        .filter(|(_, (kind, _))| kind == EventKind::MODEL_CALL)
+        .map(|(index, _)| index)
+        .nth(1)
+        .expect("second model call");
+    assert!(tool_result_index < steering_index);
+    assert!(steering_index < second_model_call_index);
+
+    // Round 1's request predates the steering; round 2's request carries it.
+    let requests = request_log_guard(&requests);
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0]
+        .prompt_text()
+        .contains("steer: summarize instead"));
+    assert!(requests[1]
+        .prompt_text()
+        .contains("steer: summarize instead"));
+    // Absorbed means gone: nothing left to flush into the next turn.
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn paused_steering_stays_queued_and_out_of_the_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![shell_ask_stream("call-shell"), text_stream("done")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    queue.set_paused(true);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        SteeringOnAskDecider {
+            queue: Arc::clone(&queue),
+            content: "held for the next turn",
+        },
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+
+    session.run_turn("run the sort").expect("turn");
+
+    // Paused: no mid-turn user.message, no request contamination, entry kept.
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::USER_MESSAGE
+            && payload_str(event, "content") == Some("held for the next turn")
+    }));
+    let requests = request_log_guard(&requests);
+    assert!(!requests[1].prompt_text().contains("held for the next turn"));
+    assert_eq!(queue.snapshot(), vec!["held for the next turn"]);
+}
+
+#[test]
+fn steering_queued_before_the_turn_stays_out_of_it_for_its_own_turn() {
+    // Review blocker (PR #147): leftovers queued before a turn must never
+    // fold into that turn's request — each remains for the surface to flush
+    // as its own turn, exactly like pre-steering queued input.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![text_stream("done"), text_stream("done again")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    queue.push_back("leftover b".to_owned());
+    queue.push_back("leftover c".to_owned());
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+
+    session.run_turn("turn a").expect("turn a");
+
+    // Neither leftover was folded into turn a's request; both survived it.
+    {
+        let requests = request_log_guard(&requests);
+        assert_eq!(requests.len(), 1);
+        let prompt = requests[0].prompt_text();
+        assert!(!prompt.contains("leftover b"));
+        assert!(!prompt.contains("leftover c"));
+    }
+    assert_eq!(queue.snapshot(), vec!["leftover b", "leftover c"]);
+
+    // The surface's completion flush then runs one leftover as its own
+    // turn; the remaining leftover still stays out of that turn's request.
+    let prompt_b = queue.pop_front().expect("leftover b");
+    session.run_turn(&prompt_b).expect("turn b");
+    let requests = request_log_guard(&requests);
+    assert_eq!(requests.len(), 2);
+    let prompt = requests[1].prompt_text();
+    assert!(prompt.contains("leftover b"));
+    assert!(!prompt.contains("leftover c"));
+    assert_eq!(queue.snapshot(), vec!["leftover c"]);
+}
+
+/// Pushes steering and immediately publishes cancellation from inside the
+/// permission ask — the interrupt-vs-steering race, made deterministic.
+struct SteerThenCancelDecider {
+    queue: Arc<SteeringQueue>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl PermissionDecider for SteerThenCancelDecider {
+    fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
+        // Surface ordering contract: pause before publishing cancellation.
+        self.queue.set_paused(true);
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        self.queue.push_back("typed just before escape".to_owned());
+        DeciderVerdict::Allow
+    }
+}
+
+#[test]
+fn interrupt_wins_over_absorption_and_keeps_steering_queued() {
+    // Review blocker (PR #147): once cancellation is published, the round
+    // loop must not absorb queued steering — interrupted input stays with
+    // the user. The loop checks the flag before absorbing, and absorption
+    // itself re-checks it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![shell_ask_stream("call-shell"), text_stream("done")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        SteerThenCancelDecider {
+            queue: Arc::clone(&queue),
+            cancel_flag: Arc::clone(&cancel_flag),
+        },
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+
+    let result = session.run_turn_with_sink("run the sort", cancel_flag, |_| {});
+
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    // The steering entry was preserved for the user, never absorbed into
+    // the dying turn.
+    assert_eq!(queue.snapshot(), vec!["typed just before escape"]);
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::USER_MESSAGE
+            && payload_str(event, "content") == Some("typed just before escape")
+    }));
 }
 
 fn read_tool_stream(id: &str) -> Vec<Result<ModelStreamEvent, ProviderError>> {

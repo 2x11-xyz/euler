@@ -189,7 +189,7 @@ impl AppCore {
             }
             return;
         }
-        if auto_flush && !self.queue_auto_flush_paused {
+        if auto_flush && !self.queued_inputs.paused() {
             if let Some(prompt) = self.pop_next_queued_input() {
                 self.bottom.record_submission(&prompt);
                 self.spawn_turn(prompt, session);
@@ -331,7 +331,7 @@ impl AppCore {
                 true
             }
             TurnOutcome::Cancelled => {
-                self.queue_auto_flush_paused = true;
+                self.queued_inputs.set_paused(true);
                 self.transcript.clear_transient_live_tail();
                 self.interrupted_guidance = false;
                 self.in_flight_error = None;
@@ -340,7 +340,7 @@ impl AppCore {
                 false
             }
             TurnOutcome::Failed(message) => {
-                self.queue_auto_flush_paused = true;
+                self.queued_inputs.set_paused(true);
                 self.interrupted_guidance = false;
                 self.in_flight_error = None;
                 self.transcript.clear_transient_live_tail();

@@ -79,7 +79,12 @@ Golden tests freeze these fields. Additive optional fields are allowed
 without a version bump; renames/removals/semantic changes bump the
 envelope `v` per `docs/contracts/persistence.md`.
 
-- `user.message`: `content`.
+- `user.message`: `content`. A turn is not limited to one: mid-turn
+  steering (issue #146) appends additional `user.message` events at round
+  boundaries — after a completed round's tool results, always between
+  rounds, never inside a streamed assistant message. Request assembly
+  positions them like any other event, and readers must not assume a turn
+  has exactly one leading user message.
 - `assistant.message`: `content`.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
