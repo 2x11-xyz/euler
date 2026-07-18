@@ -136,7 +136,7 @@ fn causal_dag_picker_drills_into_formats_and_steps_back() {
         .expect("action picker")
         .join("\n");
     assert!(actions.contains("CAUSAL DAG · session 01KX8V… · 35 nodes · 7 cross-arcs · (1/3)"));
-    assert!(actions.contains("› view     Show current graph"));
+    assert!(actions.contains("→ view     Show current graph"));
     assert!(actions.contains("refresh  Re-observe recent activity"));
 
     surface.move_selection_down();
@@ -549,10 +549,9 @@ fn model_picker_selects_switch_model_action() {
     assert_eq!(surface.confirm(), SurfaceEvent::None);
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
     assert!(rendered.contains("Model · configured providers only"));
-    assert!(rendered.contains("› ● fixture::echo"));
+    assert!(rendered.contains("→ fixture::echo ✓"));
     assert!(rendered.contains("openrouter::glm-5.2"));
     assert!(rendered.contains("(1/2)"));
-    assert!(rendered.contains("fixture · echo"));
     assert!(rendered.contains("↑↓ move · ⏎ select · esc cancel"));
 
     surface.move_selection_down();
@@ -586,9 +585,8 @@ fn model_picker_filters_by_provider_model_and_label() {
 
     surface.palette_insert("openrouter gpt");
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("/openrouter gpt"));
-    assert!(rendered.contains("› ○ openrouter::openai/gpt-4.1-mini"));
-    assert!(rendered.contains("openrouter · openai/gpt-4.1-mini"));
+    assert!(rendered.contains("> openrouter gpt"));
+    assert!(rendered.contains("→ openrouter::openai/gpt-4.1-mini"));
     assert!(rendered.contains("(1/1)"));
     assert!(!rendered.contains("fixture::echo"));
 
@@ -620,9 +618,8 @@ fn model_picker_filters_by_provider_model_and_label() {
         .surface_lines(80)
         .expect("model picker")
         .join("\n");
-    assert!(rendered.contains("/friendly"));
-    assert!(rendered.contains("› ○ Friendly Alias"));
-    assert!(rendered.contains("custom-provider · model-a"));
+    assert!(rendered.contains("> friendly"));
+    assert!(rendered.contains("→ Friendly Alias"));
     assert!(!rendered.contains("fixture::echo"));
 
     let mut value_surface = BottomSurface::new(CommandContext {
@@ -642,7 +639,7 @@ fn model_picker_filters_by_provider_model_and_label() {
         .surface_lines(80)
         .expect("model picker")
         .join("\n");
-    assert!(rendered.contains("› ○ anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
+    assert!(rendered.contains("→ anthropic::claude-sonnet-5 — 1M ctx, reasoning"));
 
     let mut metadata_surface = BottomSurface::new(CommandContext {
         model_choices: vec![ModelChoice::with_metadata(
@@ -676,7 +673,7 @@ fn model_picker_no_match_stays_open() {
 
     surface.palette_insert("missing");
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("/missing"));
+    assert!(rendered.contains("> missing"));
     assert!(rendered.contains("no matches"));
     assert!(rendered.contains("(0/0)"));
     assert_eq!(surface.confirm(), SurfaceEvent::None);
@@ -708,7 +705,7 @@ fn model_picker_query_backspace_delete_and_navigation_are_bounded() {
 
     surface.palette_backspace();
     let rendered = surface.surface_lines(80).expect("model picker").join("\n");
-    assert!(rendered.contains("/openroute"));
+    assert!(rendered.contains("> openroute"));
     assert!(rendered.contains("(1/2)"));
 
     surface.palette_delete();
@@ -1072,7 +1069,7 @@ fn resume_picker_searches_label_id_and_root_path() {
     surface.palette_insert("token /repo");
     let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
 
-    assert!(rendered.contains("/token /repo"));
+    assert!(rendered.contains("> token /repo"));
     assert!(rendered.contains("token budget review"));
     assert!(!rendered.contains("backend cleanup"));
     assert_eq!(
