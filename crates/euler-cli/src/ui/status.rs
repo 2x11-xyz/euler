@@ -94,7 +94,7 @@ pub enum TurnStatus {
 
 /// Footer v2 (Review v2 §15): two hard-edged clusters with empty space
 /// between — left flush-left (contextual hints, then `cwd (branch)`),
-/// right flush-right (`model · ctx N%` [+ session name once named]).
+/// right flush-right (`model(effort) · ctx N%` [+ session name once named]).
 /// Test-only: exercises the same span builder as the production
 /// `status_line_canvas` but flattens to plain text for easy assertions.
 #[cfg(test)]
@@ -242,9 +242,11 @@ fn status_hints(turn: &TurnStatus, has_foldable: bool) -> String {
     }
 }
 
-/// zsh/fish prompt convention: `~/code/euler (branch)`. Non-git directories
-/// render no parens at all. `home` is injected for hermetic testing — the
-/// production caller resolves it from `$HOME`.
+/// Compact prompt convention: paths with an owner/repository pair below
+/// `~/code` replace only that source-root prefix (`~/code/2x11/euler` becomes
+/// `../2x11/euler`). Any path below the repository remains visible. Other
+/// home-relative paths retain the familiar `~` prefix. `home` is injected for
+/// hermetic testing — the production caller resolves it from `$HOME`.
 fn home_relative_path(cwd: &Path, home: Option<&Path>) -> String {
     if cwd.as_os_str().is_empty() {
         return "?".to_owned();
@@ -257,6 +259,15 @@ fn home_relative_path(cwd: &Path, home: Option<&Path>) -> String {
         if let Ok(rest) = cwd.strip_prefix(home) {
             if rest.as_os_str().is_empty() {
                 return "~".to_owned();
+            }
+            if let Ok(project_path) = rest.strip_prefix("code") {
+                let has_owner_and_repository = project_path.components().count() >= 2;
+                let has_only_normal_components = project_path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)));
+                if has_owner_and_repository && has_only_normal_components {
+                    return PathBuf::from("..").join(project_path).display().to_string();
+                }
             }
             return format!("~/{}", rest.display());
         }
@@ -299,9 +310,9 @@ fn identity_context_style(tokens: &TokenUsageSnapshot, theme: &Theme) -> Style {
     }
 }
 
-/// Right cluster, flush-right: `model · ctx N%` [+ session name once named]
-/// [+ demoted-items note]. Branch no longer lives here (#48) — see the left
-/// cluster's `cwd (branch)` instead.
+/// Right cluster, flush-right: `model(effort) · ctx N%` [+ session name once
+/// named] [+ demoted-items note]. Branch no longer lives here (#48) — see the
+/// left cluster's `cwd (branch)` instead.
 fn identity_segment_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
@@ -309,6 +320,14 @@ fn identity_segment_spans(
 ) -> Vec<Span<'static>> {
     let model = compact_model_label(&snapshot.provider, &snapshot.model);
     let model = if model.is_empty() { "?" } else { model };
+    let model = match snapshot
+        .reasoning_effort
+        .as_deref()
+        .filter(|effort| !effort.is_empty())
+    {
+        Some(effort) => format!("{model}({effort})"),
+        None => model.to_owned(),
+    };
     let ctx = identity_context_label(tokens);
     let mut spans = vec![
         Span::styled(format!("{model} · "), theme.status.faint),
@@ -376,7 +395,7 @@ fn join_footer_span_clusters(
 ) -> Vec<Span<'static>> {
     let right_width = spans_width(&right);
     if right_width >= width {
-        // The right cluster (model · ctx N% [· session name]) never yields;
+        // The right cluster (model(effort) · ctx N% [· session name]) never yields;
         // if even it alone can't fit, it gets the whole line.
         return truncate_spans(&right, width);
     }
@@ -386,7 +405,7 @@ fn join_footer_span_clusters(
     // minimum inside `status_left_spans`, but once the right cluster grows
     // (adding session name this round) an exact-fit left cluster used to
     // render with zero gap — `(inte` glued directly against
-    // `z-ai/glm-5.2 · ctx …`. Truncate the left cluster (cwd/branch)
+    // `z-ai/glm-5.2(medium) · ctx …`. Truncate the left cluster (cwd/branch)
     // harder instead of ever letting the gap collapse to nothing.
     let available_for_left = width - right_width;
     let left_budget = available_for_left - 1;
@@ -484,12 +503,11 @@ mod tests {
         assert!(full.contains("/ commands"));
         assert!(!full.contains("ctrl+o expand"));
         assert!(full.contains("/tmp/repo (main)"));
-        assert!(full.contains("z-ai/glm-5.2 · ctx ?%"));
+        assert!(full.contains("z-ai/glm-5.2(extra-high) · ctx ?%"));
         // Branch v2 (#48): lives beside the directory, never on the right.
         assert!(!full.contains("ctx ?% · main"));
         assert!(!full.contains("e???? ·"));
         assert!(!full.contains("openrouter/z-ai/glm-5.2"));
-        assert!(!full.contains("extra-high"));
         assert!(!full.contains("Context ?% used"));
         assert!(!full.contains("idle"));
         assert!(!full.contains("run"));
@@ -563,7 +581,7 @@ mod tests {
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
 
         assert!(rendered.contains("/home/user/projects/euler (fix/warm-spine-anchor)"));
-        assert!(rendered.ends_with("fable-5 · ctx 12%"));
+        assert!(rendered.ends_with("fable-5(medium) · ctx 12%"));
         assert_eq!(snapshot.model, "claude-fable-5");
     }
 
@@ -596,6 +614,27 @@ mod tests {
         assert_eq!(
             home_relative_path(&PathBuf::from("/etc"), Some(Path::new("/"))),
             "/etc"
+        );
+    }
+
+    #[test]
+    fn deep_home_path_keeps_project_and_repository_tail() {
+        let home = PathBuf::from("/Users/eli");
+
+        assert_eq!(
+            home_relative_path(&PathBuf::from("/Users/eli/code/2x11/euler"), Some(&home)),
+            "../2x11/euler"
+        );
+        assert_eq!(
+            home_relative_path(
+                &PathBuf::from("/Users/eli/code/2x11/euler/crates/euler-cli"),
+                Some(&home)
+            ),
+            "../2x11/euler/crates/euler-cli"
+        );
+        assert_eq!(
+            home_relative_path(&PathBuf::from("/Users/eli/work/acme/euler"), Some(&home)),
+            "~/work/acme/euler"
         );
     }
 
@@ -771,12 +810,12 @@ mod tests {
         assert!(display_width(&rendered) < 45);
     }
 
-    /// Footer §4 (v4 dogfood): once the right cluster grows (model · ctx ·
+    /// Footer §4 (v4 dogfood): once the right cluster grows (model(effort) · ctx ·
     /// session name), a width can exist where the clusters still don't fit
     /// even after `status_left_spans` squeezes the path to nothing — the
     /// fallback safety net used to truncate the left cluster to exactly
     /// `width - right_width` with no gap reserved, so `(inte` butted
-    /// directly against `z-ai/glm-5.2 · ctx …` with zero separation. At
+    /// directly against `z-ai/glm-5.2(medium) · ctx …` with zero separation. At
     /// every width where the left cluster still has content left to show,
     /// the clusters must keep at least one column of gap, and the right
     /// cluster's full text must survive intact — the left cluster
@@ -790,8 +829,9 @@ mod tests {
         );
         snapshot.git_branch = Some("integration".to_owned());
         snapshot.session_name = Some("apple-terminal-v4-test".to_owned());
+        snapshot.reasoning_effort = Some("medium".to_owned());
         let tokens = TokenUsageSnapshot::default();
-        let right_cluster = "z-ai/glm-5.2 · ctx ?% · apple-terminal-v4-test";
+        let right_cluster = "z-ai/glm-5.2(medium) · ctx ?% · apple-terminal-v4-test";
 
         // 66 is the exact width from the owner's dogfood screenshot where
         // the fallback collided (`(int` glued to `z-ai/glm-5.2`). Sweep a

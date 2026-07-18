@@ -2182,7 +2182,7 @@ fn name_session_refreshes_metadata_after_durable_rename() {
     // separately below) because it never depended on that refresh.
     assert_eq!(core.status.session_name.as_deref(), Some("clean name"));
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
-    assert!(rendered.ends_with("echo · ctx ?% · clean name"));
+    assert!(rendered.ends_with("echo(medium) · ctx ?% · clean name"));
 }
 
 #[test]
@@ -2210,7 +2210,7 @@ fn name_session_updates_footer_immediately_even_if_metadata_refresh_fails() {
 
     assert_eq!(core.status.session_name.as_deref(), Some("still named"));
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
-    assert!(rendered.ends_with("echo · ctx ?% · still named"));
+    assert!(rendered.ends_with("echo(medium) · ctx ?% · still named"));
 }
 
 #[test]
@@ -2223,6 +2223,11 @@ fn reasoning_effort_action_updates_status_session_and_events() {
     );
 
     assert_eq!(core.status.reasoning_effort.as_deref(), Some("xlarge"));
+    assert!(core
+        .canvas_status_snapshot(120)
+        .line
+        .plain_text()
+        .ends_with("echo(xlarge) · ctx ?%"));
     let AppState::Idle { session } = &core.state else {
         panic!("session should be idle");
     };
@@ -3831,7 +3836,7 @@ fn layout_renders_at_80_by_24_and_after_resize() {
     terminal.backend_mut().resize(120, 40);
     assert!(terminal.draw(|frame| core.render(frame)).is_ok());
     let resized = terminal.backend().screen_contents();
-    assert!(resized.contains("echo · ctx ?%"));
+    assert!(resized.contains("echo(medium) · ctx ?%"));
     assert!(!resized.contains("Context ?% used"));
 }
 
@@ -3883,7 +3888,10 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     // the right (there is none here — non-git fixture cwd) and no `?` fill.
     assert_eq!(
         rendered,
-        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
+        format!(
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
+            " ".repeat(72)
+        )
     );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
@@ -3905,14 +3913,20 @@ fn model_switch_resets_footer_context_until_next_result() {
     }))));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        format!("  / commands · /tmp/euler{}echo · ctx 12%", " ".repeat(80))
+        format!(
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
+            " ".repeat(72)
+        )
     );
 
     core.status.model = "other".to_owned();
     core.handle_turn_event(TurnEvent::Event(model_switched_event("echo", "other")));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        format!("  / commands · /tmp/euler{}other · ctx ?%", " ".repeat(80))
+        format!(
+            "  / commands · /tmp/euler{}other(medium) · ctx ?%",
+            " ".repeat(72)
+        )
     );
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event_for_model(
@@ -3921,7 +3935,10 @@ fn model_switch_resets_footer_context_until_next_result() {
     )));
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
-        format!("  / commands · /tmp/euler{}other · ctx 13%", " ".repeat(79))
+        format!(
+            "  / commands · /tmp/euler{}other(medium) · ctx 13%",
+            " ".repeat(71)
+        )
     );
 }
 
