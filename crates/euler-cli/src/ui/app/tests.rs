@@ -307,8 +307,53 @@ fn queued_inputs_auto_flush_fifo_after_normal_completion() {
 
     wait_for_idle(&mut core);
 
+    // FIFO holds whether the trailing submissions steered the running turn
+    // (absorbed at its first boundary) or flushed as their own turns —
+    // front-only absorption makes overtaking impossible either way. The
+    // strict per-turn interleave is asserted deterministically in
+    // `queued_leftovers_run_as_their_own_turns`.
     assert_eq!(user_messages(&core), ["first", "second", "third"]);
     assert!(core.queued_inputs.is_empty());
+}
+
+#[test]
+fn queued_leftovers_run_as_their_own_turns() {
+    // Review blocker (PR #147): leftovers queued BEFORE a turn spawns must
+    // never fold into that turn's request. Queued directly while idle, the
+    // entries predate the first spawn's steering generation, so each must
+    // flush as its own turn: user → its model.call, three times.
+    let mut core = core_with_provider(SlowEchoProvider);
+    core.queued_inputs.push_back("second".to_owned());
+    core.queued_inputs.push_back("third".to_owned());
+    submit_without_wait(&mut core, "first");
+
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["first", "second", "third"]);
+    assert!(core.queued_inputs.is_empty());
+    let ordered: Vec<&str> = core
+        .transcript
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                EventKind::USER_MESSAGE | EventKind::MODEL_CALL
+            )
+        })
+        .map(|event| event.kind.as_str())
+        .collect();
+    assert_eq!(
+        ordered,
+        [
+            EventKind::USER_MESSAGE,
+            EventKind::MODEL_CALL,
+            EventKind::USER_MESSAGE,
+            EventKind::MODEL_CALL,
+            EventKind::USER_MESSAGE,
+            EventKind::MODEL_CALL,
+        ]
+    );
 }
 
 #[test]

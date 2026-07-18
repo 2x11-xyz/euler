@@ -4656,12 +4656,20 @@ fn paused_steering_stays_queued_and_out_of_the_turn() {
 }
 
 #[test]
-fn steering_queued_before_the_turn_precedes_the_first_request() {
+fn steering_queued_before_the_turn_stays_out_of_it_for_its_own_turn() {
+    // Review blocker (PR #147): leftovers queued before a turn must never
+    // fold into that turn's request — each remains for the surface to flush
+    // as its own turn, exactly like pre-steering queued input.
     let temp = tempfile::tempdir().expect("temp dir");
     let requests = request_log();
-    let provider = CapturingProvider::new("fixture", vec![text_stream("done")], requests.clone());
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![text_stream("done"), text_stream("done again")],
+        requests.clone(),
+    );
     let queue = Arc::new(SteeringQueue::default());
-    queue.push_back("pre-turn note".to_owned());
+    queue.push_back("leftover b".to_owned());
+    queue.push_back("leftover c".to_owned());
     let mut session = Session::new(
         SessionConfig::new(temp.path()),
         provider,
@@ -4669,17 +4677,83 @@ fn steering_queued_before_the_turn_precedes_the_first_request() {
     );
     session.set_steering_queue(Arc::clone(&queue));
 
-    session.run_turn("hello").expect("turn");
+    session.run_turn("turn a").expect("turn a");
 
-    // Absorbed before round 1: both messages are in the only request, the
-    // turn's own user message first.
+    // Neither leftover was folded into turn a's request; both survived it.
+    {
+        let requests = request_log_guard(&requests);
+        assert_eq!(requests.len(), 1);
+        let prompt = requests[0].prompt_text();
+        assert!(!prompt.contains("leftover b"));
+        assert!(!prompt.contains("leftover c"));
+    }
+    assert_eq!(queue.snapshot(), vec!["leftover b", "leftover c"]);
+
+    // The surface's completion flush then runs one leftover as its own
+    // turn; the remaining leftover still stays out of that turn's request.
+    let prompt_b = queue.pop_front().expect("leftover b");
+    session.run_turn(&prompt_b).expect("turn b");
     let requests = request_log_guard(&requests);
-    assert_eq!(requests.len(), 1);
-    let prompt = requests[0].prompt_text();
-    let turn_at = prompt.find("hello").expect("turn message");
-    let steer_at = prompt.find("pre-turn note").expect("steering message");
-    assert!(turn_at < steer_at);
-    assert!(queue.is_empty());
+    assert_eq!(requests.len(), 2);
+    let prompt = requests[1].prompt_text();
+    assert!(prompt.contains("leftover b"));
+    assert!(!prompt.contains("leftover c"));
+    assert_eq!(queue.snapshot(), vec!["leftover c"]);
+}
+
+/// Pushes steering and immediately publishes cancellation from inside the
+/// permission ask — the interrupt-vs-steering race, made deterministic.
+struct SteerThenCancelDecider {
+    queue: Arc<SteeringQueue>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl PermissionDecider for SteerThenCancelDecider {
+    fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
+        // Surface ordering contract: pause before publishing cancellation.
+        self.queue.set_paused(true);
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        self.queue.push_back("typed just before escape".to_owned());
+        DeciderVerdict::Allow
+    }
+}
+
+#[test]
+fn interrupt_wins_over_absorption_and_keeps_steering_queued() {
+    // Review blocker (PR #147): once cancellation is published, the round
+    // loop must not absorb queued steering — interrupted input stays with
+    // the user. The loop checks the flag before absorbing, and absorption
+    // itself re-checks it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![shell_ask_stream("call-shell"), text_stream("done")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        SteerThenCancelDecider {
+            queue: Arc::clone(&queue),
+            cancel_flag: Arc::clone(&cancel_flag),
+        },
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+
+    let result = session.run_turn_with_sink("run the sort", cancel_flag, |_| {});
+
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    // The steering entry was preserved for the user, never absorbed into
+    // the dying turn.
+    assert_eq!(queue.snapshot(), vec!["typed just before escape"]);
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::USER_MESSAGE
+            && payload_str(event, "content") == Some("typed just before escape")
+    }));
 }
 
 fn read_tool_stream(id: &str) -> Vec<Result<ModelStreamEvent, ProviderError>> {

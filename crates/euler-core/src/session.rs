@@ -525,27 +525,46 @@ where
         self.sink.flush(self.session.bus.events());
     }
 
-    fn absorb_steering(&mut self) -> Result<(), SessionError> {
+    fn absorb_steering(&mut self, cancel_flag: &AtomicBool) -> Result<(), SessionError> {
         let Some(queue) = self.session.steering.clone() else {
             return Ok(());
         };
-        let drained = queue.drain_for_round();
-        if drained.is_empty() {
-            return Ok(());
-        }
-        for content in drained {
+        let mut absorbed = false;
+        // Peek → emit → ack: an entry leaves the queue only after its
+        // user.message was durably emitted, so an emission failure keeps the
+        // failed entry and everything behind it queued for the next attempt.
+        while let Some(entry) = queue.next_for_round() {
+            // An interrupt keeps queued input for the user (the surface
+            // pauses the queue before publishing cancellation; this check
+            // closes the remaining race window on the worker side).
+            if cancel_flag.load(Ordering::SeqCst) {
+                break;
+            }
             // Canonical user.message with normal causal chaining: the parent
             // is whatever the turn last emitted (a tool.result, the prior
             // steering message, ...), and the flush below echoes it to the
             // surface immediately. The next prepare_model_request assembles
             // it from the bus like any other event — steering needs no
             // parallel channel into the request.
-            self.session.emit(
+            let result = self.session.emit(
                 EventKind::USER_MESSAGE,
-                object([("content", content.into())]),
-            )?;
+                object([("content", entry.content.into())]),
+            );
+            match result {
+                Ok(_) => {
+                    queue.ack(entry.id);
+                    absorbed = true;
+                }
+                Err(error) => {
+                    // Flush whatever did land before surfacing the failure.
+                    self.sink.flush(self.session.bus.events());
+                    return Err(error);
+                }
+            }
         }
-        self.sink.flush(self.session.bus.events());
+        if absorbed {
+            self.sink.flush(self.session.bus.events());
+        }
         Ok(())
     }
 
@@ -1341,6 +1360,12 @@ impl<D: PermissionDecider> Session<D> {
     {
         if self.context_limit_emitted.as_ref() == Some(&self.active_target) {
             return Ok(Vec::new());
+        }
+        // Open this turn's steering generation: only entries pushed from now
+        // on steer this turn. Anything already queued predates it and stays
+        // for the surface's one-turn-per-entry completion flush.
+        if let Some(queue) = &self.steering {
+            queue.begin_turn();
         }
         self.auto_compact_if_triggered()?;
 

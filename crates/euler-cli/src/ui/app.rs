@@ -1056,9 +1056,14 @@ impl AppCore {
         match &self.state {
             AppState::TurnInFlight { interrupt_flag, .. } => {
                 if self.is_in_flight_cancellable() {
+                    // Pause BEFORE publishing cancellation: once the worker
+                    // observes the flag it must also observe the pause, so an
+                    // interrupt can never race the round loop into absorbing
+                    // input the interrupt was meant to preserve (the worker
+                    // additionally refuses to absorb after the flag is set).
+                    self.queued_inputs.set_paused(true);
                     interrupt_flag.store(true, Ordering::SeqCst);
                     self.interrupted_guidance = true;
-                    self.queued_inputs.set_paused(true);
                 } else {
                     // The interrupt is dropped, not deferred: extension
                     // commands do not observe the flag yet. Say so.
