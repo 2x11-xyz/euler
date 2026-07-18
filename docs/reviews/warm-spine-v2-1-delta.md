@@ -58,6 +58,16 @@ text in a small `PickerChrome`:
 - `●`/`○` and `[x]`/`[ ]` markers; groups as faint uppercase headers that
   carry provenance in the description column while filtering.
 
+Amendment (PR #164): three points of the grammar above are revised. The
+cursor is `→` on every canonical picker — the per-kind `›`/`→`/`>` split is
+gone. Searchable pickers (model, resume, and code-swarm) render a dedicated,
+always-visible `> ` query line under the title instead of echoing the query
+inline as a parameter; non-searchable pickers render no query line at all.
+The model picker also drops its `●`/`○` radio column: the model in use carries
+a trailing `✓` whose width is reserved against truncation, and second-line
+detail renders only for an alias label that hides the canonical
+`provider::model` target.
+
 Two things fell out of having one owner: `line_count` had per-kind arithmetic
 mirroring each layout (a second source of truth) and now counts what the
 renderer emits; and the detail-under-selected-row was echoing the description

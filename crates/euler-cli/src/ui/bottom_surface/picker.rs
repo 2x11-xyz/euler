@@ -133,10 +133,12 @@ impl ReplacementPicker {
             PickerKind::CodeSwarmModels => Some(checkbox),
             PickerKind::Compaction => Some(checkbox),
             PickerKind::Extensions => Some(dot),
-            // §4.2 names the model picker a radio outright — it stays one even
-            // when nothing is current yet (no configured model), because a
-            // caret-only list is exactly the deviation being removed.
-            PickerKind::Model => Some(dot),
+            // The model picker has no state column. An unfilled `○` on every
+            // other row restates the default ("not this one") — non-data ink
+            // that crowds the one fact worth marking. The model in use gets a
+            // trailing `✓` instead (see `canonical_row`); the cursor row
+            // already carries the arrow and the select bar.
+            PickerKind::Model => None,
             // Generic is a catch-all: effort/theme/permission postures are
             // state pickers and carry a current value; a checkpoint or action
             // list does not, and gets no state column. A posture list with no
@@ -266,10 +268,12 @@ impl ReplacementPicker {
     }
 
     /// §4.2 anatomy, top to bottom: title line (scope token · params ·
-    /// counter), rows (caret + state marker + label + aligned description
-    /// column), then one footer hint line. The counter never lives below the
-    /// rows and there is never a separate `Filter:` line — the typed query
-    /// echoes inline as a parameter.
+    /// counter), one query line (`>` prompt plus the typed query) on
+    /// searchable pickers, rows (caret + state marker + label + aligned
+    /// description column), then one footer hint line. The counter never
+    /// lives below the rows. The query line renders even while empty: an
+    /// input you can see is an invitation to type, and a filter you cannot
+    /// see is one nobody finds.
     ///
     /// `row` renders one line; `selected` drives the full-width select bar,
     /// which every picker has (selection is never conveyed by caret alone).
@@ -283,11 +287,22 @@ impl ReplacementPicker {
 
         let mut title_parts = vec![chrome.title];
         title_parts.extend(chrome.params);
-        if !self.query.is_empty() {
-            title_parts.push(format!("/{}", self.query));
-        }
         title_parts.push(self.position_indicator());
         lines.push(row(truncate_display(&title_parts.join(" · "), cols), false));
+
+        // The query line is the picker's input box: a bare `>` prompt while
+        // empty, the typed query echoing after it — never folded into the
+        // title as a parameter. Only searchable pickers render it: on the
+        // others the keys are actions (extensions' `a`/`x`) or dead input,
+        // and a prompt that ignores what you type is a lie.
+        if self.kind.searchable() {
+            let query_line = if self.query.is_empty() {
+                ">".to_owned()
+            } else {
+                format!("> {}", self.query)
+            };
+            lines.push(row(truncate_display(&query_line, cols), false));
+        }
 
         let visible = self.visible_item_indices();
         if self.filtered_indices().is_empty() {
@@ -349,8 +364,8 @@ impl ReplacementPicker {
     /// value repeated at the end of the row.
     fn canonical_row(&self, item_index: usize, layout: &RowLayout) -> String {
         let item = &self.items[item_index];
-        // The selected row is marked `›` — never `→`, never a bare `>`.
-        let caret = if layout.selected { "›" } else { " " };
+        // The cursor row leads with `→`; every other row indents to match.
+        let caret = if layout.selected { "→" } else { " " };
         let mut text = format!("{caret} ");
         if layout.marker_width > 0 {
             let marker = self.state_marker(item).unwrap_or("");
@@ -365,6 +380,21 @@ impl ReplacementPicker {
                 .label_width
                 .saturating_sub(display_width(&item.label));
             text.push_str(&format!("{}{}  {description}", item.label, " ".repeat(pad)));
+        }
+        // The model picker's only state mark: a `✓` rides the right-hand end
+        // of the row for the model in use. Non-current rows get nothing. Its
+        // width is reserved before truncation, so the mark survives narrow
+        // terminals that clip the label itself.
+        if self.kind == PickerKind::Model && item.current {
+            let suffix = " ✓";
+            let suffix_width = display_width(suffix);
+            if layout.width < suffix_width {
+                return truncate_display("✓", layout.width);
+            }
+            let budget = layout.width - suffix_width;
+            let mut truncated = truncate_display(&text, budget);
+            truncated.push_str(suffix);
+            return truncated;
         }
         truncate_display(&text, layout.width)
     }
@@ -545,18 +575,23 @@ impl ReplacementPicker {
     }
 
     /// §4.2: second-line metadata (an id, a root path) renders under the
-    /// selected row only — the resume picker's behavior, applied uniformly.
+    /// selected row only — the resume picker's behavior.
     ///
     /// A row's *description* is not metadata: it belongs in the aligned
     /// column, and echoing it here as well is the "row repeats its own value"
     /// deviation. Only kinds whose `detail` really is metadata answer here;
-    /// see [`Self::detail_is_metadata`].
+    /// see [`Self::detail_is_metadata`]. The model picker answers only for an
+    /// alias label: a canonical label already reads `provider::model`, so a
+    /// second `provider · model` line would restate the row — but an alias
+    /// that hides the canonical target must reveal it somewhere.
     fn selected_detail(&self) -> Option<String> {
         let item = self.selected_item()?;
         match self.kind {
             PickerKind::Model => match &item.action {
                 CommandAction::SwitchModel { provider, model } => {
-                    Some(format!("{provider} · {model}"))
+                    let canonical = format!("{provider}::{model}");
+                    let label_base = display_label_search_text(&item.label);
+                    (label_base != canonical.as_str()).then(|| format!("{provider} · {model}"))
                 }
                 _ => None,
             },
@@ -570,7 +605,7 @@ impl ReplacementPicker {
     /// goes under the selected row; a description goes in the aligned column.
     /// Never both.
     fn detail_is_metadata(&self) -> bool {
-        matches!(self.kind, PickerKind::Resume | PickerKind::Model)
+        matches!(self.kind, PickerKind::Resume)
     }
 
     #[cfg(test)]
