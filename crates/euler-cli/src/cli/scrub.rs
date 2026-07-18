@@ -59,7 +59,7 @@ fn read_values_from_stdin() -> Result<Vec<String>> {
     if io::stdin().is_terminal() {
         return Err(anyhow!(
             "euler scrub reads secret values from stdin; pipe them in, one per line \
-             (e.g. `printf '%s\\n' \"$SECRET\" | euler scrub <session>)"
+             (e.g. `printf '%s\\n' \"$SECRET\" | euler scrub <session>`)"
         ));
     }
     let mut input = String::new();
