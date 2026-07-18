@@ -9429,7 +9429,7 @@ fn tui_pty_submit_fixture_turn_and_quit() {
     );
 
     assert!(
-        tui.wait_for_screen("echo · ctx"),
+        tui.wait_for_screen("echo(medium) · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -9480,7 +9480,11 @@ fn tui_pty_quit_during_turn_unwinds_and_releases_session_lock() {
         ],
     );
 
-    assert!(tui.wait_for_screen("echo · ctx"), "{}", tui.screen_text());
+    assert!(
+        tui.wait_for_screen("echo(medium) · ctx"),
+        "{}",
+        tui.screen_text()
+    );
     tui.write("slow turn\r");
     assert!(
         tui.wait_for_screen_glimpse("esc to interrupt"),
@@ -9569,7 +9573,7 @@ fn fresh_tui_runs_a_persistently_enabled_linked_process() {
     );
 
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
-    assert!(tui.wait_for_screen("echo · ctx"));
+    assert!(tui.wait_for_screen("echo(medium) · ctx"));
     tui.write("/extension run python-fresh-tui.inspect {}\r");
     assert!(
         tui.wait_for_screen("fresh_tui"),
@@ -9630,7 +9634,7 @@ fn tui_pty_without_provenance_writes_home_session_store() {
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
 
     assert!(
-        tui.wait_for_screen("echo · ctx"),
+        tui.wait_for_screen("echo(medium) · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -9654,7 +9658,7 @@ fn tui_name_session_updates_resume_picker_label() {
     let home = isolated_home();
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
     assert!(
-        tui.wait_for_screen("echo · ctx"),
+        tui.wait_for_screen("echo(medium) · ctx"),
         "initial TUI did not render:\n{}",
         tui.screen_text()
     );
@@ -9683,7 +9687,7 @@ fn tui_name_session_updates_resume_picker_label() {
     );
 
     let mut resumed = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
-    assert!(resumed.wait_for_screen("echo · ctx"));
+    assert!(resumed.wait_for_screen("echo(medium) · ctx"));
     resumed.write("/resume\r");
     assert!(
         resumed.wait_for_screen("dogfood session"),
@@ -9722,7 +9726,7 @@ fn tui_resume_picker_lists_home_sessions() {
     let saved_id = only_home_session_id(home.path());
 
     let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
-    assert!(tui.wait_for_screen("echo · ctx"));
+    assert!(tui.wait_for_screen("echo(medium) · ctx"));
     tui.write("/resume\r");
     assert!(
         tui.wait_for_screen("saved for picker"),

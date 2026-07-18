@@ -41,7 +41,7 @@ fn permission_prompt_renders_inline_with_command_body() {
     assert!(!contents.contains("hint: every decision is logged"));
     assert!(!contents.contains("commands that start"));
     assert!(contents.contains("▌"));
-    assert!(contents.contains("echo · ctx ?%"));
+    assert!(contents.contains("echo(medium) · ctx ?%"));
     assert!(!contents.contains("Context ?% used"));
     assert!(!contents.contains("⠧ working"));
 
@@ -203,7 +203,7 @@ fn inline_permission_ask_keeps_all_options_visible_on_short_terminal() {
     let four = row_containing(&rows, "n/esc  Deny");
     let border = row_containing(&rows, "╰");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "echo · ctx");
+    let status = row_containing(&rows, "echo(medium) · ctx");
     assert!(one < two && two < three && three < four, "rows: {rows:?}");
     assert!(four < border && border < prompt, "rows: {rows:?}");
     assert_eq!(
@@ -240,7 +240,7 @@ fn inline_terminal_permission_ask_keeps_options_visible_in_constrained_viewport(
     let three = row_containing(&rows, "n/esc  Deny");
     let border = row_containing(&rows, "╰");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "echo · ctx");
+    let status = row_containing(&rows, "echo(medium) · ctx");
     assert_eq!(terminal.viewport_area().height, 9);
     assert!(three < border && border < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
@@ -277,7 +277,7 @@ fn inline_patch_approval_ask_hides_working_status_and_keeps_options_visible() {
     let three = row_containing(&rows, "p  Allow fs-write");
     let four = row_containing(&rows, "n/esc  Deny");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "echo · ctx");
+    let status = row_containing(&rows, "echo(medium) · ctx");
     assert!(one < two && two < three && three < four, "rows: {rows:?}");
     assert!(four < prompt, "rows: {rows:?}");
     assert_footer_breathing_room(&rows, prompt, status);
@@ -329,7 +329,7 @@ fn permission_inline_ask_esc_denies_and_restores_composer_status() {
     let restored = terminal.backend().screen_contents();
     assert!(!restored.contains("Run command?"));
     assert!(restored.contains("underlying transcript"));
-    assert!(restored.contains("echo · ctx ?%"));
+    assert!(restored.contains("echo(medium) · ctx ?%"));
     assert!(!restored.contains("Context ?% used"));
 }
 

@@ -88,7 +88,7 @@ fn empty_composer_prompt_has_breathing_room_above_statusline() {
     assert!(screen_row(&contents, areas.bottom.y).starts_with("▌ "));
     let status = screen_row(&contents, areas.status.y);
     assert!(status.starts_with("  / commands"));
-    assert!(status.trim_end().ends_with("echo · ctx ?%"));
+    assert!(status.trim_end().ends_with("echo(medium) · ctx ?%"));
     assert!(!status.contains("Context ?% used"));
 }
 
@@ -103,7 +103,7 @@ fn startup_history_sits_immediately_above_prompt_status_in_compact_viewport() {
     let rows = terminal.backend().screen_rows();
     let equation = row_containing(&rows, "e^(iπ) + 1 = 0");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "echo · ctx");
+    let status = row_containing(&rows, "echo(medium) · ctx");
     assert_eq!(status, prompt + 2, "rows: {rows:?}");
     assert!(rows[prompt + 1].trim().is_empty(), "rows: {rows:?}");
     assert!(rows[prompt - 1].trim().is_empty(), "rows: {rows:?}");
@@ -182,7 +182,7 @@ fn transient_notice_composer_and_status_are_separated_by_blank_rows() {
         .expect("prompt row");
     let status = lines
         .iter()
-        .position(|line| line.contains("echo · ctx"))
+        .position(|line| line.contains("echo(medium) · ctx"))
         .expect("status row");
 
     // Spec v2.1 §13.3: the transient/HUD line sits DIRECTLY above the
@@ -215,7 +215,7 @@ fn slash_palette_renders_inside_composer_container_with_nothing_below_footer() {
 
     let status = lines
         .iter()
-        .position(|line| line.contains("echo · ctx"))
+        .position(|line| line.contains("echo(medium) · ctx"))
         .expect("status row");
     assert_eq!(
         status,
@@ -1158,7 +1158,7 @@ fn final_completion_collapses_live_viewport_without_blank_gap() {
     let final_answer = row_containing(&rows, "final answer");
     let worked = row_containing(&rows, "Worked for 41s");
     let prompt = row_containing(&rows, "▌");
-    let status = row_containing(&rows, "echo · ctx");
+    let status = row_containing(&rows, "echo(medium) · ctx");
     assert!(final_answer < worked, "rows: {rows:?}");
     // This turn changed no files, so there is no recap line — the divider is
     // the last content row and the composer must collapse tight against it,
@@ -1231,7 +1231,7 @@ fn finalized_visual_output_renders_in_logical_canvas_without_active_duplicate() 
 
     assert!(text.contains("e^(iπ) + 1 = 0"));
     assert!(text.contains("▌"));
-    assert!(text.contains("echo · ctx"));
+    assert!(text.contains("echo(medium) · ctx"));
 
     let second = core.render_visual_canvas(80);
     let second_text = second
