@@ -68,6 +68,15 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
     assert!(openai.models().any(|model| model.id() == "gpt-4.1"));
 
     let openrouter = catalog.provider("openrouter").expect("openrouter");
+    let kimi_k3 = openrouter
+        .models()
+        .find(|model| model.id() == "moonshotai/kimi-k3")
+        .expect("OpenRouter Kimi K3");
+    assert_eq!(kimi_k3.display_name(), "MoonshotAI: Kimi K3");
+    assert_eq!(kimi_k3.context_window_tokens(), Some(1_048_576));
+    assert_eq!(kimi_k3.max_output_tokens(), Some(1_048_576));
+    assert_eq!(kimi_k3.supports_tools(), Some(true));
+    assert_eq!(kimi_k3.supports_reasoning(), Some(true));
     assert!(openrouter
         .models()
         .any(|model| model.id() == "z-ai/glm-5.2"));
