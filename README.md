@@ -133,6 +133,8 @@ contracts extensions rely on live in [docs/contracts/](docs/contracts/).
 
 ## Documentation
 
+- [Vision](docs/vision.md): what Euler is, the bar it aims for, and the
+  principles that do not move
 - [Quickstart](docs/guides/quickstart.md): install → login → first session
 - [Headless & long-horizon runs](docs/guides/headless.md): fleets, briefs,
   provenance monitoring, auto-compaction policies
