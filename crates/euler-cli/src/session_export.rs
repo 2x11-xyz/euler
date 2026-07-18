@@ -1,5 +1,5 @@
-use super::RawArgs;
 use crate::bundled_extensions::{bundled_descriptor_by_id, bundled_extension_by_id};
+use crate::cli::RawArgs;
 use crate::offline_extension_runner::{execute_offline_extension_run, OfflineExtensionRun};
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
@@ -127,7 +127,7 @@ impl ProvenanceExportArgs {
 }
 
 pub(super) fn build_session_export_args(parsed: &RawArgs) -> Result<ProvenanceExportArgs> {
-    super::ensure_no_extensions(parsed, "session-export")?;
+    crate::cli::ensure_no_extensions(parsed, "session-export")?;
     if parsed.provider_from_cli {
         return Err(anyhow!("--provider is not supported with session-export"));
     }

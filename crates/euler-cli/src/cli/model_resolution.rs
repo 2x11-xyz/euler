@@ -5,7 +5,8 @@ use euler_provider::catalog::{
 use euler_provider::provider_config::ProviderConfigRegistry;
 use std::path::PathBuf;
 
-use crate::{model_preference::ModelPreference, ProviderOptions, RawArgs};
+use super::args::{ProviderOptions, RawArgs};
+use crate::model_preference::ModelPreference;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LiveOptions {
