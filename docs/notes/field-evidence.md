@@ -6,6 +6,14 @@ of every result so far is the record of how it happened. Each entry
 tracks what happened, what the evidence trail actually was, and what
 Euler takes from it.
 
+A standing caveat: this work is moving very fast, and none of it has
+finished the ordinary scientific vetting process. Formal verification,
+where present, certifies that a proof is valid; it does not replace
+peer review, which also asks whether the statement formalized is the
+statement claimed, whether the result matters, and how it sits in the
+literature. Entries here may be revised or retracted as the record
+catches up. Read all of them with that grain of salt.
+
 The vision (`docs/vision.md`) states the bar: a paper cites an
 agent-driven finding, and an independent researcher inspects how the
 system arrived at it. This ledger is where we watch the world approach
