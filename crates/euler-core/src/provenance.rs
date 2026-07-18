@@ -1,12 +1,14 @@
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{event_wake::EventWakeRegistry, EventWakeError, EventWakeRegistration};
+use fs4::TryLockError;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const DEFAULT_BLOB_THRESHOLD: usize = 8 * 1024;
@@ -664,51 +666,71 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[derive(Debug)]
 struct SessionLock {
-    path: PathBuf,
-    pid: u32,
+    // Lock ownership belongs to this open file description, not its pathname.
+    // Keeping it alive makes the OS lock lifetime match the writer lifetime.
+    _file: File,
 }
 
 impl SessionLock {
     fn acquire(log_path: &Path) -> Result<Self, ProvenanceWriterError> {
         let path = lock_path_for(log_path);
         create_dir_all_durable(containing_dir(&path))?;
-        let pid = std::process::id();
-        loop {
-            match Self::create(&path, pid) {
-                Ok(lock) => return Ok(lock),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let holder = read_lock_pid(&path);
-                    let Some(holder_pid) = holder else {
-                        return Err(ProvenanceWriterError::SessionLocked { path, pid: holder });
-                    };
-                    if pid_is_alive(holder_pid) {
-                        return Err(ProvenanceWriterError::SessionLocked { path, pid: holder });
-                    }
-                    reclaim_stale_lock(&path, pid, holder)?;
-                }
-                Err(source) => return Err(ProvenanceWriterError::Io(source)),
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        match <File as fs4::FileExt>::try_lock(&file) {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(ProvenanceWriterError::SessionLocked {
+                    session: session_name_for(log_path),
+                    path: path.clone(),
+                    owner: read_lock_owner(&path).map(Box::new),
+                });
             }
+            Err(TryLockError::Error(source)) => return Err(ProvenanceWriterError::Io(source)),
         }
-    }
 
-    fn create(path: &Path, pid: u32) -> io::Result<Self> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        file.write_all(pid.to_string().as_bytes())?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        file.sync_data()?;
-        sync_dir(containing_dir(path))?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            pid,
-        })
+        // Metadata is diagnostic only. Failure or stale/malformed contents do
+        // not affect ownership once the OS has granted the advisory lock.
+        let metadata = LockOwnerMetadata::current();
+        if let Ok(bytes) = serde_json::to_vec(&metadata) {
+            let _ = file.set_len(0);
+            let _ = file.rewind();
+            let _ = file.write_all(&bytes);
+            let _ = file.write_all(b"\n");
+            let _ = file.flush();
+        }
+        Ok(Self { _file: file })
     }
 }
 
-impl Drop for SessionLock {
-    fn drop(&mut self) {
-        if read_lock_pid(&self.path) == Some(self.pid) {
-            let _ = fs::remove_file(&self.path);
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LockOwnerMetadata {
+    pub pid: u32,
+    pub host: Option<String>,
+    pub started_unix_ms: Option<u128>,
+    pub version: String,
+    /// Metadata is never proof of ownership; only the OS advisory lock is.
+    pub authoritative: bool,
+}
+
+impl LockOwnerMetadata {
+    fn current() -> Self {
+        Self {
+            pid: std::process::id(),
+            host: std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .ok()
+                .filter(|host| !host.is_empty()),
+            started_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_millis()),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            authoritative: false,
         }
     }
 }
@@ -719,52 +741,18 @@ fn lock_path_for(log_path: &Path) -> PathBuf {
     PathBuf::from(lock_path)
 }
 
-fn reclaim_stale_lock(
-    path: &Path,
-    pid: u32,
-    stale_pid: Option<u32>,
-) -> Result<(), ProvenanceWriterError> {
-    let reclaim_path = temp_path_with_suffix(path, &format!(".{pid}.reclaim"));
-    let _ = fs::remove_file(&reclaim_path);
-
-    // Rename claims the specific lock file atomically. This prevents two
-    // reclaimers from both deleting by path after one has already created
-    // a fresh lock for the same session.
-    match fs::rename(path, &reclaim_path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => return Err(ProvenanceWriterError::Io(source)),
-    }
-
-    let reclaimed_pid = read_lock_pid(&reclaim_path);
-    if reclaimed_pid != stale_pid {
-        match fs::rename(&reclaim_path, path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => return Err(ProvenanceWriterError::Io(source)),
-        }
-        return Err(ProvenanceWriterError::SessionLocked {
-            path: path.to_path_buf(),
-            pid: reclaimed_pid,
-        });
-    }
-
-    fs::remove_file(&reclaim_path)?;
-    Ok(())
+fn session_name_for(log_path: &Path) -> String {
+    log_path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| log_path.display().to_string())
 }
 
-fn read_lock_pid(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn pid_is_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pid_is_alive(_pid: u32) -> bool {
-    true
+fn read_lock_owner(path: &Path) -> Option<LockOwnerMetadata> {
+    let owner: LockOwnerMetadata = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (!owner.authoritative).then_some(owner)
 }
 
 fn temp_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -810,8 +798,34 @@ pub enum ProvenanceWriterError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("provenance session is already locked at {}", path.display())]
-    SessionLocked { path: PathBuf, pid: Option<u32> },
+    #[error("{}", session_locked_message(session, path, owner.as_deref()))]
+    SessionLocked {
+        session: String,
+        path: PathBuf,
+        owner: Option<Box<LockOwnerMetadata>>,
+    },
+}
+
+fn session_locked_message(
+    session: &str,
+    _path: &Path,
+    owner: Option<&LockOwnerMetadata>,
+) -> String {
+    let mut message = format!("Session {session} is already open by another Euler process.\n");
+    if let Some(owner) = owner {
+        message.push_str(&format!("Owner: PID {}", owner.pid));
+        if let Some(host) = &owner.host {
+            message.push_str(&format!(", host {host}"));
+        }
+        if let Some(started) = owner.started_unix_ms {
+            message.push_str(&format!(", started {started}ms since Unix epoch"));
+        }
+        message.push('\n');
+    } else {
+        message.push_str("Owner details are unavailable.\n");
+    }
+    message.push_str("Close that process and retry.");
+    message
 }
 
 #[derive(Debug, Error)]

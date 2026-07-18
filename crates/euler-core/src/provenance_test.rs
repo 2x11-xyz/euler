@@ -535,9 +535,12 @@ fn second_writer_on_same_path_fails_with_session_locked() {
 
     assert!(matches!(
         error,
-        ProvenanceWriterError::SessionLocked { path, pid: Some(pid) }
-            if path == lock_path_for(&log) && pid == std::process::id()
+        ProvenanceWriterError::SessionLocked { ref path, owner: Some(ref owner), .. }
+            if *path == lock_path_for(&log)
+                && owner.pid == std::process::id()
+                && !owner.authoritative
     ));
+    assert!(error.to_string().contains("Close that process and retry."));
 }
 
 #[test]
@@ -607,39 +610,42 @@ fn lock_released_on_drop_allows_new_writer() {
 
     drop(writer);
 
-    assert!(!lock.exists());
+    assert!(lock.exists(), "the advisory lock file is persistent");
     let _writer = ProvenanceWriter::new(log).expect("second writer");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn stale_lock_with_dead_pid_is_reclaimed() {
+fn legacy_pid_lock_file_is_migrated_without_pid_probing() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
     let lock = lock_path_for(&log);
     fs::write(&lock, "0\n").expect("stale lock");
 
-    let writer = ProvenanceWriter::new(log).expect("reclaim lock");
+    let writer = ProvenanceWriter::new(log).expect("migrate legacy lock");
 
-    assert_eq!(read_lock_pid(&lock), Some(std::process::id()));
+    let metadata: LockOwnerMetadata =
+        serde_json::from_slice(&fs::read(&lock).expect("read metadata")).expect("owner metadata");
+    assert_eq!(metadata.pid, std::process::id());
+    assert!(!metadata.authoritative);
     drop(writer);
-    assert!(!lock.exists());
+    assert!(lock.exists());
 }
 
 #[test]
-fn stale_reclaim_restores_lock_when_pid_changed() {
+fn malformed_owner_metadata_is_non_authoritative() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
     let lock = lock_path_for(&log);
-    let pid = std::process::id();
-    fs::write(&lock, format!("{pid}\n")).expect("fresh lock");
+    fs::write(&lock, "not owner metadata\n").expect("malformed metadata");
 
-    let error = reclaim_stale_lock(&lock, pid, Some(0)).expect_err("fresh lock wins");
+    let writer = ProvenanceWriter::new(log).expect("metadata does not control ownership");
+    let error = ProvenanceWriter::new(temp.path().join("events.jsonl"))
+        .expect_err("advisory lock controls ownership");
 
     assert!(matches!(
         error,
-        ProvenanceWriterError::SessionLocked { path, pid: Some(holder) }
-            if path == lock && holder == pid
+        ProvenanceWriterError::SessionLocked { owner: Some(owner), .. }
+            if owner.pid == std::process::id()
     ));
-    assert_eq!(read_lock_pid(&lock), Some(pid));
+    drop(writer);
 }

@@ -7355,8 +7355,57 @@ fn concurrent_cli_writer_fails_with_session_locked_message() {
     let second = second.expect("second output");
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(stderr.contains("provenance session is already locked at"));
-    assert!(stderr.contains(&lock.display().to_string()));
+    assert!(stderr.contains("already open by another Euler process"));
+    assert!(stderr.contains("Owner: PID"));
+    assert!(stderr.contains("Close that process and retry."));
+}
+
+#[test]
+fn killed_cli_writer_releases_advisory_lock_without_removing_lock_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+
+    let mut first = command_with_home(exe, &home)
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provenance")
+        .arg(&log)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first euler");
+
+    let mut lock_ready = false;
+    for _ in 0..100 {
+        if lock.exists() {
+            lock_ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(lock_ready, "first euler did not create its lock");
+
+    first.kill().expect("kill first euler");
+    first.wait().expect("reap killed euler");
+    assert!(lock.exists(), "crash leaves the persistent lock file");
+
+    let retried = command_with_home(exe, &home)
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provenance")
+        .arg(&log)
+        .stdin(Stdio::null())
+        .output()
+        .expect("retry after killed owner");
+    assert!(
+        retried.status.success(),
+        "OS should release the advisory lock when its owner is killed: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
 }
 
 #[test]
@@ -7604,10 +7653,7 @@ fn failed_live_resume_preflight_releases_lock_and_preserves_log() {
         stderr.contains("resume requires provider fixture but this invocation configures chatgpt")
     );
     assert_eq!(fs::read(&log).expect("read after failed preflight"), before);
-    assert!(
-        !lock.exists(),
-        "failed preflight should release resume lock"
-    );
+    assert!(lock.exists(), "the advisory lock file remains persistent");
 
     let retried = run_euler_with_input(exe, &["--resume", path_str(&log)], "");
     assert!(retried.status.success());
@@ -7677,8 +7723,9 @@ fn concurrent_cli_resume_fails_with_session_locked_message() {
     let second = second.expect("second output");
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(stderr.contains("provenance session is already locked at"));
-    assert!(stderr.contains(&lock.display().to_string()));
+    assert!(stderr.contains("already open by another Euler process"));
+    assert!(stderr.contains("Owner: PID"));
+    assert!(stderr.contains("Close that process and retry."));
 }
 
 #[test]

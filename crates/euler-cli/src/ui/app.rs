@@ -575,8 +575,7 @@ impl App {
     }
 
     fn shutdown(&mut self) -> Result<bool> {
-        let hard_exit = self.core.turn_in_flight();
-        if hard_exit {
+        if self.core.turn_in_flight() {
             self.core.deny_open_modal();
         }
         let lines = self.core.exit_recap_lines();
@@ -587,9 +586,10 @@ impl App {
         let _ = self.terminal.clear_live_band_for_exit();
         terminal::restore_terminal();
         print_exit_recap_lines(&lines);
-        if hard_exit {
-            std::process::exit(0);
-        }
+        // Return through the normal run loop even with an active turn. This
+        // lets App and all main-thread resources unwind instead of bypassing
+        // destructors with process::exit. Advisory locks remain crash-safe
+        // independently of orderly shutdown.
         Ok(true)
     }
 
