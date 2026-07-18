@@ -9778,6 +9778,185 @@ fn tui_resume_picker_lists_home_sessions() {
 }
 
 #[test]
+fn bare_resume_in_pty_opens_tui_with_restored_transcript() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let mut first = command_with_home(exe, &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn first euler");
+    first
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"direct resume history\n")
+        .expect("write stdin");
+    assert!(first
+        .wait_with_output()
+        .expect("wait first")
+        .status
+        .success());
+    let session_id = only_home_session_id(home.path());
+    append_session_rename_event(
+        &home_session_log(home.path(), &session_id),
+        &session_id,
+        "direct resume named",
+    );
+
+    let mut resumed = PtyHarness::spawn_with_args(
+        home.path(),
+        &["--resume", &session_id, "--provider", "fixture"],
+    );
+    assert!(
+        resumed.wait_for_screen("resumed session direct resume named"),
+        "direct resume did not enter restored TUI:\n{}",
+        resumed.screen_text()
+    );
+    assert!(
+        resumed.wait_for_screen("user: direct resume history"),
+        "direct resume did not restore transcript:\n{}",
+        resumed.screen_text()
+    );
+    assert!(
+        resumed.wait_for_screen("direct resume named"),
+        "direct resume did not restore session display metadata:\n{}",
+        resumed.screen_text()
+    );
+    assert!(
+        !resumed
+            .screen_text()
+            .contains("each input line is sent as a separate turn"),
+        "direct resume entered line-oriented mode:\n{}",
+        resumed.screen_text()
+    );
+    resumed.write("direct resume followup\r");
+    assert!(
+        resumed.wait_for_screen("direct resume followup"),
+        "resumed TUI did not accept a follow-up:\n{}",
+        resumed.screen_text()
+    );
+    resumed.quit();
+
+    let events = read_jsonl(&home_session_log(home.path(), &session_id));
+    assert!(events.iter().all(|event| event.session == session_id));
+    assert!(events.iter().any(|event| {
+        event.kind.as_str() == EventKind::USER_MESSAGE
+            && event
+                .payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                == Some("direct resume followup")
+    }));
+}
+
+#[test]
+fn bare_resume_in_pty_uses_derived_title_without_name() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let mut first = command_with_home(exe, &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn first euler");
+    first
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"derived resume title\n")
+        .expect("write stdin");
+    assert!(first
+        .wait_with_output()
+        .expect("wait first")
+        .status
+        .success());
+    let session_id = only_home_session_id(home.path());
+
+    let mut resumed = PtyHarness::spawn_with_args(
+        home.path(),
+        &["--resume", &session_id, "--provider", "fixture"],
+    );
+    assert!(
+        resumed.wait_for_screen("resumed session derived resume title"),
+        "direct resume did not use the derived session title:\n{}",
+        resumed.screen_text()
+    );
+    resumed.quit();
+}
+
+#[test]
+fn explicit_tui_resume_in_pty_restores_transcript() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let mut first = command_with_home(exe, &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn first euler");
+    first
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"explicit tui history\n")
+        .expect("write stdin");
+    assert!(first
+        .wait_with_output()
+        .expect("wait first")
+        .status
+        .success());
+    let session_id = only_home_session_id(home.path());
+
+    let mut resumed = PtyHarness::spawn_with_args(
+        home.path(),
+        &["tui", "--resume", &session_id, "--provider", "fixture"],
+    );
+    assert!(
+        resumed.wait_for_screen("user: explicit tui history"),
+        "explicit TUI resume did not restore transcript:\n{}",
+        resumed.screen_text()
+    );
+    resumed.quit();
+}
+
+#[test]
+fn explicit_run_resume_in_pty_stays_line_oriented() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let first = command_with_home(exe, &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(b"explicit run history\n")?;
+            child.wait_with_output()
+        })
+        .expect("create saved session");
+    assert!(first.status.success());
+    let session_id = only_home_session_id(home.path());
+
+    let mut resumed = PtyHarness::spawn_with_args(
+        home.path(),
+        &["run", "--resume", &session_id, "--provider", "fixture"],
+    );
+    assert!(
+        resumed.wait_for_screen("each input line is sent as a separate turn"),
+        "explicit run resume did not stay line-oriented:\n{}",
+        resumed.screen_text()
+    );
+    assert!(
+        !resumed.screen_text().contains("echo(medium) · ctx"),
+        "explicit run resume unexpectedly entered TUI:\n{}",
+        resumed.screen_text()
+    );
+    resumed.write("exit\r");
+    assert!(resumed.wait_success());
+}
+
+#[test]
 fn closed_session_scrub_reads_exact_value_from_stdin_and_appends_audit() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();

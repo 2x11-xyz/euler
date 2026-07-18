@@ -1,4 +1,4 @@
-use super::command::{ExecArgs, RunArgs};
+use super::command::{ExecArgs, ResumeLaunch, RunArgs};
 use super::extension_run::{execute_live_extension_run, wire_code_swarm};
 use super::permission::CliDecider;
 use super::providers::{
@@ -27,7 +27,7 @@ use crate::session_lifecycle::{
     HomeSessionRefresh, LiveProvenance, ResumeTarget, SESSION_ID,
 };
 use crate::subagent::{AutoApproveTier, SubagentDecider};
-use crate::ui::app::{App, AppOptions};
+use crate::ui::app::{App, AppOptions, ResumedAppState};
 use crate::ui::banner;
 use crate::ui::transcript::render_line_oriented;
 use crate::ui::tui_decider::TuiDecider;
@@ -349,7 +349,37 @@ fn session_id_from_events(events: &[euler_event::EventEnvelope]) -> Option<&str>
     events.first().map(|event| event.session.as_str())
 }
 
-pub(super) fn resume_interactive(target: ResumeTarget, run: RunArgs) -> Result<()> {
+pub(super) fn resume_interactive_entry(
+    target: ResumeTarget,
+    mut run: RunArgs,
+    launch: ResumeLaunch,
+    no_tty: bool,
+) -> Result<()> {
+    match launch {
+        ResumeLaunch::Tui => {
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                return Err(anyhow!("tui requires terminal stdin and stdout"));
+            }
+            resume_tui(target, run)
+        }
+        ResumeLaunch::LineOriented => resume_line_oriented(target, run),
+        ResumeLaunch::Auto => match decide_interactive_launch(TuiLaunchIntent {
+            default_interactive: true,
+            no_tty_arg: no_tty,
+            env_no_tty: euler_no_tty_env(),
+            stdin_tty: io::stdin().is_terminal(),
+            stdout_tty: io::stdout().is_terminal(),
+        }) {
+            InteractiveLaunch::Tui => {
+                apply_interactive_tui_linefeed_default(&mut run);
+                resume_tui(target, run)
+            }
+            InteractiveLaunch::LineOriented => resume_line_oriented(target, run),
+        },
+    }
+}
+
+fn resume_line_oriented(target: ResumeTarget, run: RunArgs) -> Result<()> {
     let mut outcome = resume_cli_session(target, run, CliDecider, |_| {})?;
     eprintln!(
         "resumed session {}: folded {} events, target {}/{}, recovery closure {}",
@@ -371,12 +401,69 @@ pub(super) fn resume_interactive(target: ResumeTarget, run: RunArgs) -> Result<(
     run_stdin_loop(&mut outcome.session, outcome.refresh.as_ref())
 }
 
+fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
+    let linefeed_history_insert = run.linefeed_history_insert;
+    let model_catalog = run.model_catalog.clone();
+    let extensions = run.extensions.clone();
+    let observe = run.observe.clone();
+    let auth_file = run.auth_file.clone();
+    let (decider, channels) = TuiDecider::new();
+    let mut outcome = resume_cli_session(target, run, decider, |_| {})?;
+    let preference_path = model_preference::default_model_preference_path();
+    let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
+    let show_timestamp_gutter =
+        load_timestamps_preference(preference_path.as_deref()).unwrap_or(false);
+    let notifications_enabled =
+        load_notifications_preference(preference_path.as_deref()).unwrap_or(true);
+    let session_id = outcome.session.session_id().to_owned();
+    let events = outcome.session.events().to_vec();
+    let session_store = outcome
+        .refresh
+        .as_ref()
+        .map(HomeSessionRefresh::session_store);
+    let options = AppOptions {
+        linefeed_history_insert,
+        theme_choice,
+        theme_preference_path: preference_path,
+        show_timestamp_gutter: Some(show_timestamp_gutter),
+        notifications_enabled: Some(notifications_enabled),
+        model_catalog: Some(model_catalog),
+        session_store,
+        extensions,
+        observe,
+        auth_file,
+    };
+    let mut app = App::enter_resumed_with_options(
+        outcome.session,
+        channels,
+        options,
+        ResumedAppState {
+            events,
+            display_label: outcome.display_label.unwrap_or(session_id),
+            session_name: outcome.session_name,
+            recovery_closure_appended: outcome.recovery_closure_appended,
+            warning_count: outcome.warning_count,
+            events_replayed: outcome.events_folded,
+        },
+    )?;
+    let app_result = app.run();
+    if let Some(refresh) = outcome.refresh.take() {
+        if let Err(error) = refresh.refresh() {
+            eprintln!("warning: failed to refresh session metadata: {error}");
+        }
+    }
+    app_result
+}
+
 struct ResumeCliOutcome<D: PermissionDecider> {
     session: Session<D>,
     refresh: Option<HomeSessionRefresh>,
     events_folded: usize,
     active_target: ModelTarget,
     recovery_closure_appended: bool,
+    warning_count: usize,
+    display_label: Option<String>,
+    session_name: Option<String>,
 }
 
 fn resume_cli_session<D>(
@@ -388,7 +475,12 @@ fn resume_cli_session<D>(
 where
     D: PermissionDecider,
 {
-    let ResumeTarget { log_path, refresh } = target;
+    let ResumeTarget {
+        log_path,
+        refresh,
+        display_label,
+        session_name,
+    } = target;
     bind_diagnostics_for_log(&log_path);
     let writer = ProvenanceWriter::new(log_path.clone())?;
     let prefix = read_resume_prefix(&log_path)?;
@@ -438,6 +530,7 @@ where
     apply_catalog_context_limit(&mut config, &run.model_catalog);
 
     let outcome = resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
+    let warning_count = outcome.warnings.len();
     let mut session = outcome.session;
     crate::session_lifecycle::seed_secret_redaction(&mut session, run.auth_file.as_deref());
     if let Some((_, extension)) = observer {
@@ -450,6 +543,9 @@ where
         events_folded: outcome.events_folded,
         active_target: outcome.active_target,
         recovery_closure_appended: outcome.recovery_closure_appended,
+        warning_count,
+        display_label,
+        session_name,
     })
 }
 

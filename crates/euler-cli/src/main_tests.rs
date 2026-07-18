@@ -868,6 +868,25 @@ fn parser_marks_run_no_tty_and_tui_launch_shapes() {
         Command::Run(run) if !run.linefeed_history_insert && run.linefeed_history_insert_from_cli
     ));
 
+    let resumed_optout =
+        parse_args_without_env(["--resume", "events.jsonl", "--no-tui-linefeed-history"]);
+    assert!(matches!(
+        resumed_optout.command,
+        Command::Resume { run, .. }
+            if !run.linefeed_history_insert && run.linefeed_history_insert_from_cli
+    ));
+
+    let resumed_experimental = parse_args_without_env([
+        "--resume",
+        "events.jsonl",
+        "--experimental-tui-linefeed-history",
+    ]);
+    assert!(matches!(
+        resumed_experimental.command,
+        Command::Resume { run, .. }
+            if run.linefeed_history_insert && run.linefeed_history_insert_from_cli
+    ));
+
     let mut implicit_run = parse_without_env([]);
     assert!(!implicit_run.linefeed_history_insert);
     assert!(!implicit_run.linefeed_history_insert_from_cli);
@@ -1038,7 +1057,7 @@ fn model_preference_does_not_override_resume_target() {
 
     assert!(matches!(
         args.command,
-        Command::Resume { path, run }
+        Command::Resume { path, run, .. }
             if path == std::path::Path::new("events.jsonl")
                 && run.provider_id == "fixture"
                 && run.model == DEFAULT_FIXTURE_MODEL
@@ -1913,10 +1932,49 @@ fn resume_parses_path_with_live_provider_defaults() {
 
     assert!(matches!(
         args.command,
-        Command::Resume { path, run }
+        Command::Resume { path, run, .. }
             if path == std::path::Path::new("events.jsonl")
                 && run.provider_id == "chatgpt"
                 && run.model == DEFAULT_CHATGPT_MODEL
+    ));
+}
+
+#[test]
+fn bare_resume_preserves_automatic_interface_selection() {
+    let args = parse_args_without_env(["--resume", "events.jsonl"]);
+
+    assert!(matches!(
+        args.command,
+        Command::Resume {
+            launch: ResumeLaunch::Auto,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn explicit_run_resume_forces_line_oriented_interface() {
+    let args = parse_args_without_env(["run", "--resume", "events.jsonl"]);
+
+    assert!(matches!(
+        args.command,
+        Command::Resume {
+            launch: ResumeLaunch::LineOriented,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn explicit_tui_resume_forces_tui_interface() {
+    let args = parse_args_without_env(["tui", "--resume", "events.jsonl"]);
+
+    assert!(matches!(
+        args.command,
+        Command::Resume {
+            launch: ResumeLaunch::Tui,
+            ..
+        }
     ));
 }
 

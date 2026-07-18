@@ -173,6 +173,15 @@ pub struct AppOptions {
     pub auth_file: Option<PathBuf>,
 }
 
+pub struct ResumedAppState {
+    pub events: Vec<EventEnvelope>,
+    pub display_label: String,
+    pub session_name: Option<String>,
+    pub recovery_closure_appended: bool,
+    pub warning_count: usize,
+    pub events_replayed: usize,
+}
+
 pub struct AppCore {
     state: AppState,
     permission_rx: Receiver<PermissionPrompt>,
@@ -366,6 +375,27 @@ impl App {
             core,
             resize_replay_deadline: None,
         })
+    }
+
+    /// Enter the TUI around an already-folded session, restoring its visible
+    /// ledger before the first frame instead of presenting it as a fresh app.
+    pub fn enter_resumed_with_options(
+        session: Session<TuiDecider>,
+        channels: PermissionChannels,
+        options: AppOptions,
+        resumed: ResumedAppState,
+    ) -> Result<Self> {
+        let mut app = Self::enter_with_options(session, channels, options)?;
+        app.core.status.session_name = resumed.session_name;
+        app.core.rebuild_transcript_from_events(&resumed.events);
+        app.core
+            .push_finalized_visual_item(TranscriptItem::ResumeBoundary {
+                label: resumed.display_label,
+                recovery_closure_appended: resumed.recovery_closure_appended,
+                warning_count: resumed.warning_count,
+                events_replayed: resumed.events_replayed,
+            });
+        Ok(app)
     }
 
     pub fn run(&mut self) -> Result<()> {

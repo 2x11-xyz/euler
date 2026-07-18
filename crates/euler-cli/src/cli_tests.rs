@@ -11,8 +11,8 @@ use cli::providers::{
 use cli::{
     apply_interactive_tui_linefeed_default, decide_interactive_launch, non_empty_exec_prompt,
     parse_scrub_values, resolve_live_options, validate_resume_live_target, Args, Command, EnvArgs,
-    ExecArgs, InteractiveLaunch, LiveOptions, ModelsCommand, ProviderOptions, RawArgs, RunArgs,
-    TuiLaunchIntent,
+    ExecArgs, InteractiveLaunch, LiveOptions, ModelsCommand, ProviderOptions, RawArgs,
+    ResumeLaunch, RunArgs, TuiLaunchIntent,
 };
 use companion_run::execute_headless_companion_run;
 use euler_core::{CompactionTier, ModelTarget, PermissionRequest, ProvenanceWriter, Session};
