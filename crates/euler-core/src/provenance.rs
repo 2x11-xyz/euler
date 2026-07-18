@@ -675,19 +675,14 @@ impl SessionLock {
     fn acquire(log_path: &Path) -> Result<Self, ProvenanceWriterError> {
         let path = lock_path_for(log_path);
         create_dir_all_durable(containing_dir(&path))?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let mut file = open_lock_file(&path)?;
         match <File as fs4::FileExt>::try_lock(&file) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 return Err(ProvenanceWriterError::SessionLocked {
                     session: session_name_for(log_path),
                     path: path.clone(),
-                    owner: read_lock_owner(&path).map(Box::new),
+                    owner: read_lock_owner(&mut file).map(Box::new),
                 });
             }
             Err(TryLockError::Error(source)) => return Err(ProvenanceWriterError::Io(source)),
@@ -696,13 +691,7 @@ impl SessionLock {
         // Metadata is diagnostic only. Failure or stale/malformed contents do
         // not affect ownership once the OS has granted the advisory lock.
         let metadata = LockOwnerMetadata::current();
-        if let Ok(bytes) = serde_json::to_vec(&metadata) {
-            let _ = file.set_len(0);
-            let _ = file.rewind();
-            let _ = file.write_all(&bytes);
-            let _ = file.write_all(b"\n");
-            let _ = file.flush();
-        }
+        let _ = write_lock_owner(&mut file, &metadata);
         Ok(Self { _file: file })
     }
 }
@@ -724,7 +713,7 @@ impl LockOwnerMetadata {
             host: std::env::var("HOSTNAME")
                 .or_else(|_| std::env::var("COMPUTERNAME"))
                 .ok()
-                .filter(|host| !host.is_empty()),
+                .filter(|host| valid_diagnostic_text(host, MAX_LOCK_HOST_BYTES)),
             started_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -735,6 +724,85 @@ impl LockOwnerMetadata {
     }
 }
 
+const MAX_LOCK_METADATA_BYTES: u64 = 16 * 1024;
+const MAX_LOCK_HOST_BYTES: usize = 255;
+const MAX_LOCK_VERSION_BYTES: usize = 64;
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_lock_file_metadata(path, &metadata)?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(source),
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open a final-component reparse point itself rather than following
+        // it. The metadata validation below then rejects it as non-regular.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    validate_lock_file_metadata(path, &file.metadata()?)?;
+    Ok(file)
+}
+
+fn validate_lock_file_metadata(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "provenance lock path must be a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "provenance lock path must not be hard-linked: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.number_of_links() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "provenance lock path must not be hard-linked: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_lock_owner(file: &mut File, owner: &LockOwnerMetadata) -> io::Result<()> {
+    let bytes = serde_json::to_vec(owner).map_err(io::Error::other)?;
+    file.set_len(0)?;
+    file.rewind()?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.flush()
+}
+
 fn lock_path_for(log_path: &Path) -> PathBuf {
     let mut lock_path: OsString = log_path.as_os_str().to_owned();
     lock_path.push(".lock");
@@ -742,17 +810,45 @@ fn lock_path_for(log_path: &Path) -> PathBuf {
 }
 
 fn session_name_for(log_path: &Path) -> String {
-    log_path
+    let name = log_path
         .parent()
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| log_path.display().to_string())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    if valid_diagnostic_text(&name, MAX_LOCK_HOST_BYTES) {
+        name
+    } else {
+        "<unknown>".to_owned()
+    }
 }
 
-fn read_lock_owner(path: &Path) -> Option<LockOwnerMetadata> {
-    let owner: LockOwnerMetadata = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    (!owner.authoritative).then_some(owner)
+fn read_lock_owner(file: &mut File) -> Option<LockOwnerMetadata> {
+    file.rewind().ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOCK_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_LOCK_METADATA_BYTES {
+        return None;
+    }
+    let mut owner: LockOwnerMetadata = serde_json::from_slice(&bytes).ok()?;
+    if owner.authoritative
+        || owner.pid == 0
+        || !valid_diagnostic_text(&owner.version, MAX_LOCK_VERSION_BYTES)
+    {
+        return None;
+    }
+    owner.host = owner
+        .host
+        .filter(|host| valid_diagnostic_text(host, MAX_LOCK_HOST_BYTES));
+    Some(owner)
+}
+
+fn valid_diagnostic_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.chars().all(|character| character.is_ascii_graphic())
 }
 
 fn temp_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {

@@ -18,6 +18,17 @@ error. Background or extension work that needs to append to a live session log
 must use the owning writer through an explicit product-neutral host boundary;
 it must not open another writer as a bypass.
 
+Writer ownership is the non-blocking exclusive OS advisory lock held on the
+persistent `events.jsonl.lock` file descriptor for the writer lifetime. The
+lock pathname's existence and its best-effort diagnostic metadata are never
+authority. A legacy PID-only lock file, malformed metadata, or metadata left by
+a crashed process is overwritten after the OS grants the lock; users must not
+delete the pathname to force access while another writer may be active.
+The session directory is part of the trust boundary: while a writer is live,
+other actors must not unlink, rename, or replace its lock pathname. Advisory
+locks attach to open files rather than names, so replacing that pathname can
+create a different file with an independent lock.
+
 A single `ProvenanceWriter` serializes concurrent append calls from the same
 process. This is an append integrity guarantee, not an observer lifecycle API:
 it does not provide scheduling, cancellation, durable subscriptions, checkpoint

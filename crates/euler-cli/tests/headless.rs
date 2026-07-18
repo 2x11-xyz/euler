@@ -9441,6 +9441,81 @@ fn tui_pty_submit_fixture_turn_and_quit() {
     tui.quit();
 }
 
+#[test]
+fn tui_pty_quit_during_turn_unwinds_and_releases_session_lock() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = isolated_home();
+    let log = temp.path().join("tui-events.jsonl");
+    let script = write_fixture_script(
+        temp.path(),
+        "slow-turn.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        { "sleep_ms": 5000 },
+        { "text_delta": "too late" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--provenance",
+            path_str(&log),
+        ],
+    );
+
+    assert!(tui.wait_for_screen("echo · ctx"), "{}", tui.screen_text());
+    tui.write("slow turn\r");
+    assert!(
+        tui.wait_for_screen_glimpse("esc to interrupt"),
+        "turn never entered flight:\n{}",
+        tui.screen_text()
+    );
+    let quit_started = Instant::now();
+    tui.write("/quit\r");
+    assert!(
+        tui.wait_success(),
+        "TUI did not unwind after in-flight quit:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        quit_started.elapsed() < Duration::from_secs(4),
+        "/quit waited for the scripted provider response instead of interrupting the turn"
+    );
+    assert!(
+        !tui.screen_text().contains("too late"),
+        "provider output arrived after /quit:\n{}",
+        tui.screen_text()
+    );
+
+    let retried = command_with_home(env!("CARGO_BIN_EXE_euler"), &home)
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provenance")
+        .arg(&log)
+        .stdin(Stdio::null())
+        .output()
+        .expect("retry after TUI unwind");
+    assert!(
+        retried.status.success(),
+        "normal TUI unwind should release the advisory lock: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn fresh_tui_runs_a_persistently_enabled_linked_process() {

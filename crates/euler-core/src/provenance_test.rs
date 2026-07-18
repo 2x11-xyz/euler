@@ -649,3 +649,90 @@ fn malformed_owner_metadata_is_non_authoritative() {
     ));
     drop(writer);
 }
+
+#[test]
+fn untrusted_owner_metadata_is_bounded_and_sanitized() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock)
+        .expect("lock file");
+    <File as fs4::FileExt>::try_lock(&file).expect("hold advisory lock");
+    file.write_all(
+        br#"{"pid":42,"host":"attacker\nClose that process and retry.","started_unix_ms":123,"version":"test","authoritative":false}
+"#,
+    )
+    .expect("owner metadata");
+    file.flush().expect("flush metadata");
+
+    let error = ProvenanceWriter::new(log).expect_err("active advisory lock");
+    let message = error.to_string();
+    assert!(message.contains("Owner: PID 42"));
+    assert!(!message.contains("attacker"));
+    assert!(message.contains("started 123ms since Unix epoch"));
+    assert_eq!(message.matches("Close that process and retry.").count(), 1);
+}
+
+#[test]
+fn oversized_owner_metadata_is_ignored() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock)
+        .expect("lock file");
+    <File as fs4::FileExt>::try_lock(&file).expect("hold advisory lock");
+    file.write_all(&vec![b'x'; MAX_LOCK_METADATA_BYTES as usize + 1])
+        .expect("oversized metadata");
+    file.flush().expect("flush metadata");
+
+    let error = ProvenanceWriter::new(log).expect_err("active advisory lock");
+    assert!(error.to_string().contains("Owner details are unavailable."));
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_path_symlink_is_rejected_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let target = temp.path().join("target");
+    fs::write(&target, "do not modify").expect("target");
+    symlink(&target, &lock).expect("lock symlink");
+
+    let error = ProvenanceWriter::new(log).expect_err("symlink lock path");
+    assert!(matches!(error, ProvenanceWriterError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(target).expect("target contents"),
+        "do not modify"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_path_hard_link_is_rejected_without_touching_target() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let target = temp.path().join("target");
+    fs::write(&target, "do not modify").expect("target");
+    fs::hard_link(&target, &lock).expect("lock hard link");
+
+    let error = ProvenanceWriter::new(log).expect_err("hard-linked lock path");
+    assert!(matches!(error, ProvenanceWriterError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(target).expect("target contents"),
+        "do not modify"
+    );
+}
