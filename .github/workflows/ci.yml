@@ -23,9 +23,14 @@ jobs:
             ~/.cargo/git
             target
           key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        with:
+          tool: nextest@0.9.140
       - name: Format
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets
       - name: Test
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
+      - name: Doc tests
+        run: cargo test --workspace --doc
