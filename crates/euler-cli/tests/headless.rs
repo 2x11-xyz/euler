@@ -9798,19 +9798,29 @@ fn bare_resume_in_pty_opens_tui_with_restored_transcript() {
         .status
         .success());
     let session_id = only_home_session_id(home.path());
+    append_session_rename_event(
+        &home_session_log(home.path(), &session_id),
+        &session_id,
+        "direct resume named",
+    );
 
     let mut resumed = PtyHarness::spawn_with_args(
         home.path(),
         &["--resume", &session_id, "--provider", "fixture"],
     );
     assert!(
-        resumed.wait_for_screen("resumed session"),
+        resumed.wait_for_screen("resumed session direct resume named"),
         "direct resume did not enter restored TUI:\n{}",
         resumed.screen_text()
     );
     assert!(
         resumed.wait_for_screen("user: direct resume history"),
         "direct resume did not restore transcript:\n{}",
+        resumed.screen_text()
+    );
+    assert!(
+        resumed.wait_for_screen("direct resume named"),
+        "direct resume did not restore session display metadata:\n{}",
         resumed.screen_text()
     );
     assert!(

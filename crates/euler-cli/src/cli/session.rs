@@ -27,7 +27,7 @@ use crate::session_lifecycle::{
     HomeSessionRefresh, LiveProvenance, ResumeTarget, SESSION_ID,
 };
 use crate::subagent::{AutoApproveTier, SubagentDecider};
-use crate::ui::app::{App, AppOptions};
+use crate::ui::app::{App, AppOptions, ResumedAppState};
 use crate::ui::banner;
 use crate::ui::transcript::render_line_oriented;
 use crate::ui::tui_decider::TuiDecider;
@@ -415,7 +415,7 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
         load_timestamps_preference(preference_path.as_deref()).unwrap_or(false);
     let notifications_enabled =
         load_notifications_preference(preference_path.as_deref()).unwrap_or(true);
-    let events = outcome.session.events().to_vec();
+    let session_id = outcome.session.session_id().to_owned();
     let session_store = outcome
         .refresh
         .as_ref()
@@ -436,10 +436,14 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
         outcome.session,
         channels,
         options,
-        &events,
-        outcome.recovery_closure_appended,
-        outcome.warning_count,
-        outcome.events_folded,
+        ResumedAppState {
+            events: outcome.events,
+            display_label: outcome.display_label.unwrap_or(session_id),
+            session_name: outcome.session_name,
+            recovery_closure_appended: outcome.recovery_closure_appended,
+            warning_count: outcome.warning_count,
+            events_replayed: outcome.events_folded,
+        },
     )?;
     let app_result = app.run();
     if let Some(refresh) = outcome.refresh.take() {
@@ -457,6 +461,9 @@ struct ResumeCliOutcome<D: PermissionDecider> {
     active_target: ModelTarget,
     recovery_closure_appended: bool,
     warning_count: usize,
+    events: Vec<euler_event::EventEnvelope>,
+    display_label: Option<String>,
+    session_name: Option<String>,
 }
 
 fn resume_cli_session<D>(
@@ -468,7 +475,12 @@ fn resume_cli_session<D>(
 where
     D: PermissionDecider,
 {
-    let ResumeTarget { log_path, refresh } = target;
+    let ResumeTarget {
+        log_path,
+        refresh,
+        display_label,
+        session_name,
+    } = target;
     bind_diagnostics_for_log(&log_path);
     let writer = ProvenanceWriter::new(log_path.clone())?;
     let prefix = read_resume_prefix(&log_path)?;
@@ -525,6 +537,7 @@ where
         session.set_observer_extension(extension);
     }
     wire_code_swarm(&mut session);
+    let events = session.events().to_vec();
     Ok(ResumeCliOutcome {
         session,
         refresh,
@@ -532,6 +545,9 @@ where
         active_target: outcome.active_target,
         recovery_closure_appended: outcome.recovery_closure_appended,
         warning_count,
+        events,
+        display_label,
+        session_name,
     })
 }
 

@@ -220,7 +220,6 @@ impl RawArgs {
             && !self.session_export.is_active()
             && self.extension.is_none()
             && self.replay_path.is_none()
-            && self.resume_path.is_none()
             && !self.no_tty
     }
 }

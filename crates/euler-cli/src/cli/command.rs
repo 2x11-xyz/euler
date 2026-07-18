@@ -267,28 +267,7 @@ fn build_command_from_parsed(
         ensure_no_provider_options(parsed, "scrub")?;
         Command::Scrub(scrub.clone())
     } else if parsed.tui {
-        if parsed.no_tty {
-            return Err(anyhow!("tui cannot be combined with --no-tty"));
-        }
-        let preference = load_known_model_preference(paths.preference);
-        let model_catalog = load_known_model_catalog(paths.model_catalog);
-        let custom_providers = load_custom_provider_config(paths.provider_config);
-        let run = build_run_args(
-            parsed,
-            preference.as_ref(),
-            &model_catalog,
-            &custom_providers,
-        )?;
-        if let Some(path) = parsed.resume_path.clone() {
-            ensure_no_provider_options(parsed, "--resume")?;
-            Command::Resume {
-                path,
-                run,
-                launch: ResumeLaunch::Tui,
-            }
-        } else {
-            Command::Tui(run)
-        }
+        build_tui_command(parsed, paths)?
     } else if let Some(path) = parsed.replay_path.clone() {
         ensure_no_provider_options(parsed, "--replay")?;
         ensure_no_extensions(parsed, "--replay")?;
@@ -319,6 +298,30 @@ fn build_command_from_parsed(
         )?)
     };
     Ok(command)
+}
+
+fn build_tui_command(parsed: &RawArgs, paths: CatalogPaths<'_>) -> Result<Command> {
+    if parsed.no_tty {
+        return Err(anyhow!("tui cannot be combined with --no-tty"));
+    }
+    let preference = load_known_model_preference(paths.preference);
+    let model_catalog = load_known_model_catalog(paths.model_catalog);
+    let custom_providers = load_custom_provider_config(paths.provider_config);
+    let run = build_run_args(
+        parsed,
+        preference.as_ref(),
+        &model_catalog,
+        &custom_providers,
+    )?;
+    let Some(path) = parsed.resume_path.clone() else {
+        return Ok(Command::Tui(run));
+    };
+    ensure_no_provider_options(parsed, "--resume")?;
+    Ok(Command::Resume {
+        path,
+        run,
+        launch: ResumeLaunch::Tui,
+    })
 }
 
 fn validate_replay_resume_conflicts(parsed: &RawArgs) -> Result<()> {

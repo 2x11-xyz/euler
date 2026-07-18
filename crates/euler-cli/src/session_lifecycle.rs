@@ -40,6 +40,8 @@ pub(crate) struct LiveSession {
 pub(crate) struct ResumeTarget {
     pub(crate) log_path: PathBuf,
     pub(crate) refresh: Option<HomeSessionRefresh>,
+    pub(crate) display_label: Option<String>,
+    pub(crate) session_name: Option<String>,
 }
 
 pub(crate) fn resolve_resume_target(path_or_id: PathBuf) -> Result<ResumeTarget> {
@@ -47,12 +49,16 @@ pub(crate) fn resolve_resume_target(path_or_id: PathBuf) -> Result<ResumeTarget>
         return Ok(ResumeTarget {
             log_path: path_or_id,
             refresh: None,
+            display_label: None,
+            session_name: None,
         });
     }
     let Some(reference) = path_or_id.to_str() else {
         return Ok(ResumeTarget {
             log_path: path_or_id,
             refresh: None,
+            display_label: None,
+            session_name: None,
         });
     };
     let home = EulerHome::resolve()?;
@@ -62,6 +68,8 @@ pub(crate) fn resolve_resume_target(path_or_id: PathBuf) -> Result<ResumeTarget>
     };
     Ok(ResumeTarget {
         log_path: record.events_path().to_path_buf(),
+        display_label: Some(record.display_label().to_owned()),
+        session_name: record.name().map(str::to_owned),
         refresh: Some(HomeSessionRefresh {
             store,
             session_id: record.id().to_owned(),

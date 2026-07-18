@@ -173,6 +173,15 @@ pub struct AppOptions {
     pub auth_file: Option<PathBuf>,
 }
 
+pub struct ResumedAppState {
+    pub events: Vec<EventEnvelope>,
+    pub display_label: String,
+    pub session_name: Option<String>,
+    pub recovery_closure_appended: bool,
+    pub warning_count: usize,
+    pub events_replayed: usize,
+}
+
 pub struct AppCore {
     state: AppState,
     permission_rx: Receiver<PermissionPrompt>,
@@ -374,20 +383,17 @@ impl App {
         session: Session<TuiDecider>,
         channels: PermissionChannels,
         options: AppOptions,
-        events: &[EventEnvelope],
-        recovery_closure_appended: bool,
-        warning_count: usize,
-        events_replayed: usize,
+        resumed: ResumedAppState,
     ) -> Result<Self> {
-        let label = session.session_id().to_owned();
         let mut app = Self::enter_with_options(session, channels, options)?;
-        app.core.rebuild_transcript_from_events(events);
+        app.core.status.session_name = resumed.session_name;
+        app.core.rebuild_transcript_from_events(&resumed.events);
         app.core
             .push_finalized_visual_item(TranscriptItem::ResumeBoundary {
-                label,
-                recovery_closure_appended,
-                warning_count,
-                events_replayed,
+                label: resumed.display_label,
+                recovery_closure_appended: resumed.recovery_closure_appended,
+                warning_count: resumed.warning_count,
+                events_replayed: resumed.events_replayed,
             });
         Ok(app)
     }

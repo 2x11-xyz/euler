@@ -868,6 +868,25 @@ fn parser_marks_run_no_tty_and_tui_launch_shapes() {
         Command::Run(run) if !run.linefeed_history_insert && run.linefeed_history_insert_from_cli
     ));
 
+    let resumed_optout =
+        parse_args_without_env(["--resume", "events.jsonl", "--no-tui-linefeed-history"]);
+    assert!(matches!(
+        resumed_optout.command,
+        Command::Resume { run, .. }
+            if !run.linefeed_history_insert && run.linefeed_history_insert_from_cli
+    ));
+
+    let resumed_experimental = parse_args_without_env([
+        "--resume",
+        "events.jsonl",
+        "--experimental-tui-linefeed-history",
+    ]);
+    assert!(matches!(
+        resumed_experimental.command,
+        Command::Resume { run, .. }
+            if run.linefeed_history_insert && run.linefeed_history_insert_from_cli
+    ));
+
     let mut implicit_run = parse_without_env([]);
     assert!(!implicit_run.linefeed_history_insert);
     assert!(!implicit_run.linefeed_history_insert_from_cli);
