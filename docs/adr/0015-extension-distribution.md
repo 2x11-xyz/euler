@@ -83,6 +83,14 @@ diagnostics-report) and ending with causal-dag, which gates on host-API
 coverage. Bundled and installed extensions coexist in the registry
 throughout; no flag day.
 
+**Amendment (2026-07-18).** The end state is core-only by default: Euler
+ships no extensions, bundled or pre-installed. The out-of-box experience
+is the install path itself. Curated "bundled" distributions may exist
+later as preset source declarations (configuration over a stock core,
+never separate builds); their shape is deliberately left open. Once the
+last bundled crate is removed, the bundled extension class and its
+machinery are removed with it.
+
 ## Non-goals
 
 - A registry or gallery (sources are git and path for now).
