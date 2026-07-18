@@ -7355,8 +7355,59 @@ fn concurrent_cli_writer_fails_with_session_locked_message() {
     let second = second.expect("second output");
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(stderr.contains("provenance session is already locked at"));
-    assert!(stderr.contains(&lock.display().to_string()));
+    assert!(stderr.contains("already open by another Euler process"));
+    assert!(stderr.contains("Owner: PID"));
+    assert!(stderr.contains("Close that process and retry."));
+}
+
+#[test]
+fn killed_cli_writer_releases_advisory_lock_without_removing_lock_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+
+    let mut first = command_with_home(exe, &home)
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provenance")
+        .arg(&log)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first euler");
+
+    let mut lock_ready = false;
+    // Generous window: nextest runs this beside PTY suites and full builds,
+    // and a loaded runner can delay process start well past a second.
+    for _ in 0..500 {
+        if lock.exists() {
+            lock_ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(lock_ready, "first euler did not create its lock");
+
+    first.kill().expect("kill first euler");
+    first.wait().expect("reap killed euler");
+    assert!(lock.exists(), "crash leaves the persistent lock file");
+
+    let retried = command_with_home(exe, &home)
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provenance")
+        .arg(&log)
+        .stdin(Stdio::null())
+        .output()
+        .expect("retry after killed owner");
+    assert!(
+        retried.status.success(),
+        "OS should release the advisory lock when its owner is killed: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
 }
 
 #[test]
@@ -7604,10 +7655,7 @@ fn failed_live_resume_preflight_releases_lock_and_preserves_log() {
         stderr.contains("resume requires provider fixture but this invocation configures chatgpt")
     );
     assert_eq!(fs::read(&log).expect("read after failed preflight"), before);
-    assert!(
-        !lock.exists(),
-        "failed preflight should release resume lock"
-    );
+    assert!(lock.exists(), "the advisory lock file remains persistent");
 
     let retried = run_euler_with_input(exe, &["--resume", path_str(&log)], "");
     assert!(retried.status.success());
@@ -7677,8 +7725,9 @@ fn concurrent_cli_resume_fails_with_session_locked_message() {
     let second = second.expect("second output");
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(stderr.contains("provenance session is already locked at"));
-    assert!(stderr.contains(&lock.display().to_string()));
+    assert!(stderr.contains("already open by another Euler process"));
+    assert!(stderr.contains("Owner: PID"));
+    assert!(stderr.contains("Close that process and retry."));
 }
 
 #[test]
@@ -9392,6 +9441,85 @@ fn tui_pty_submit_fixture_turn_and_quit() {
     );
 
     tui.quit();
+}
+
+#[test]
+fn tui_pty_quit_during_turn_unwinds_and_releases_session_lock() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = isolated_home();
+    let log = temp.path().join("tui-events.jsonl");
+    let script = write_fixture_script(
+        temp.path(),
+        "slow-turn.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        { "sleep_ms": 5000 },
+        { "sleep_ms": 5000 },
+        { "text_delta": "too late" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--provenance",
+            path_str(&log),
+        ],
+    );
+
+    assert!(tui.wait_for_screen("echo · ctx"), "{}", tui.screen_text());
+    tui.write("slow turn\r");
+    assert!(
+        tui.wait_for_screen_glimpse("esc to interrupt"),
+        "turn never entered flight:\n{}",
+        tui.screen_text()
+    );
+    let quit_started = Instant::now();
+    tui.write("/quit\r");
+    assert!(
+        tui.wait_success(),
+        "TUI did not unwind after in-flight quit:\n{}",
+        tui.screen_text()
+    );
+    // The scripted turn takes 10s; an unwind well under that proves /quit
+    // did not wait for it. The margin absorbs loaded-runner scheduling
+    // (issue #145 family) while staying far from the 10s ceiling.
+    assert!(
+        quit_started.elapsed() < Duration::from_secs(8),
+        "/quit waited for the scripted provider response instead of interrupting the turn"
+    );
+    assert!(
+        !tui.screen_text().contains("too late"),
+        "provider output arrived after /quit:\n{}",
+        tui.screen_text()
+    );
+
+    let retried = command_with_home(env!("CARGO_BIN_EXE_euler"), &home)
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provenance")
+        .arg(&log)
+        .stdin(Stdio::null())
+        .output()
+        .expect("retry after TUI unwind");
+    assert!(
+        retried.status.success(),
+        "normal TUI unwind should release the advisory lock: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
 }
 
 #[cfg(unix)]

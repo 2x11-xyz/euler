@@ -237,7 +237,9 @@ fn session_export_fails_when_session_log_is_locked() {
     })
     .expect_err("locked session");
 
-    assert!(error.to_string().contains("already locked"));
+    let message = error.to_string();
+    assert!(message.contains("already open by another Euler process"));
+    assert!(message.contains("Close that process and retry."));
 }
 
 fn parse_args_without_env<const N: usize>(args: [&str; N]) -> Args {

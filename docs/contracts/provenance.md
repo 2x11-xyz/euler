@@ -18,6 +18,29 @@ error. Background or extension work that needs to append to a live session log
 must use the owning writer through an explicit product-neutral host boundary;
 it must not open another writer as a bypass.
 
+Writer ownership is the non-blocking exclusive OS advisory lock held on the
+persistent `events.jsonl.lock` file descriptor for the writer lifetime. The
+lock pathname's existence and its best-effort diagnostic metadata are never
+authority. A legacy PID-only lock file, malformed metadata, or metadata left by
+a crashed process is overwritten after the OS grants the lock; users must not
+delete the pathname to force access while another writer may be active.
+The session directory is part of the trust boundary: while a writer is live,
+other actors must not unlink, rename, or replace its lock pathname. Advisory
+locks attach to open files rather than names, so replacing that pathname can
+create a different file with an independent lock. On network filesystems
+(NFS, SMB) advisory-lock semantics vary by protocol and mount options; a
+session directory on such a mount weakens the single-writer guarantee to
+whatever the filesystem actually enforces.
+
+Mixed versions: a lock file whose payload is a legacy bare PID belongs to a
+pre-advisory-lock Euler, which owns sessions by pathname existence and holds
+no OS lock. New writers refuse such files instead of claiming them — an old
+writer may be live and unobservable — and recover only by the user deleting
+the file after confirming no older Euler is running. In the other direction,
+older Euler versions cannot parse the persistent lock file this version
+leaves behind: rolling back across this version requires deleting
+`events.jsonl.lock` files while no Euler process is running.
+
 A single `ProvenanceWriter` serializes concurrent append calls from the same
 process. This is an append integrity guarantee, not an observer lifecycle API:
 it does not provide scheduling, cancellation, durable subscriptions, checkpoint

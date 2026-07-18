@@ -535,9 +535,12 @@ fn second_writer_on_same_path_fails_with_session_locked() {
 
     assert!(matches!(
         error,
-        ProvenanceWriterError::SessionLocked { path, pid: Some(pid) }
-            if path == lock_path_for(&log) && pid == std::process::id()
+        ProvenanceWriterError::SessionLocked { ref path, owner: Some(ref owner), .. }
+            if *path == lock_path_for(&log)
+                && owner.pid == std::process::id()
+                && !owner.authoritative
     ));
+    assert!(error.to_string().contains("Close that process and retry."));
 }
 
 #[test]
@@ -607,39 +610,148 @@ fn lock_released_on_drop_allows_new_writer() {
 
     drop(writer);
 
-    assert!(!lock.exists());
+    assert!(lock.exists(), "the advisory lock file is persistent");
     let _writer = ProvenanceWriter::new(log).expect("second writer");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn stale_lock_with_dead_pid_is_reclaimed() {
+fn legacy_pid_lock_file_is_refused_with_recovery_guidance() {
+    // A bare-PID lock belongs to a pre-advisory-lock Euler that owns the
+    // session by pathname existence and holds no OS lock — it may be live
+    // and unobservable, so claiming the session could put two writers on
+    // one log. The refusal names the recovery.
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
     let lock = lock_path_for(&log);
-    fs::write(&lock, "0\n").expect("stale lock");
+    fs::write(&lock, "12345\n").expect("legacy lock");
 
-    let writer = ProvenanceWriter::new(log).expect("reclaim lock");
+    let error = ProvenanceWriter::new(log.clone()).expect_err("legacy lock refuses");
+    assert!(matches!(
+        error,
+        ProvenanceWriterError::LegacySessionLock { ref path, pid: 12345, .. }
+            if *path == lock
+    ));
+    let message = error.to_string();
+    assert!(message.contains("older Euler version"));
+    assert!(message.contains("delete that file and retry"));
 
-    assert_eq!(read_lock_pid(&lock), Some(std::process::id()));
+    // The refusal released the advisory lock and the documented recovery —
+    // delete the file once no older Euler runs — unblocks the session with
+    // new-format metadata from then on.
+    fs::remove_file(&lock).expect("operator removes legacy lock");
+    let writer = ProvenanceWriter::new(log).expect("post-recovery writer");
+    let metadata: LockOwnerMetadata =
+        serde_json::from_slice(&fs::read(&lock).expect("read metadata")).expect("owner metadata");
+    assert_eq!(metadata.pid, std::process::id());
+    assert!(!metadata.authoritative);
     drop(writer);
-    assert!(!lock.exists());
+    assert!(lock.exists(), "the advisory lock file is persistent");
 }
 
 #[test]
-fn stale_reclaim_restores_lock_when_pid_changed() {
+fn malformed_owner_metadata_is_non_authoritative() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
     let lock = lock_path_for(&log);
-    let pid = std::process::id();
-    fs::write(&lock, format!("{pid}\n")).expect("fresh lock");
+    fs::write(&lock, "not owner metadata\n").expect("malformed metadata");
 
-    let error = reclaim_stale_lock(&lock, pid, Some(0)).expect_err("fresh lock wins");
+    let writer = ProvenanceWriter::new(log).expect("metadata does not control ownership");
+    let error = ProvenanceWriter::new(temp.path().join("events.jsonl"))
+        .expect_err("advisory lock controls ownership");
 
     assert!(matches!(
         error,
-        ProvenanceWriterError::SessionLocked { path, pid: Some(holder) }
-            if path == lock && holder == pid
+        ProvenanceWriterError::SessionLocked { owner: Some(owner), .. }
+            if owner.pid == std::process::id()
     ));
-    assert_eq!(read_lock_pid(&lock), Some(pid));
+    drop(writer);
+}
+
+#[test]
+fn untrusted_owner_metadata_is_bounded_and_sanitized() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock)
+        .expect("lock file");
+    <File as fs4::FileExt>::try_lock(&file).expect("hold advisory lock");
+    file.write_all(
+        br#"{"pid":42,"host":"attacker\nClose that process and retry.","started_unix_ms":123,"version":"test","authoritative":false}
+"#,
+    )
+    .expect("owner metadata");
+    file.flush().expect("flush metadata");
+
+    let error = ProvenanceWriter::new(log).expect_err("active advisory lock");
+    let message = error.to_string();
+    assert!(message.contains("Owner: PID 42"));
+    assert!(!message.contains("attacker"));
+    // Raw epoch milliseconds stay out of the human-facing message.
+    assert!(!message.contains("123ms"));
+    assert!(message.contains("Lock: "));
+    assert_eq!(message.matches("Close that process and retry.").count(), 1);
+}
+
+#[test]
+fn oversized_owner_metadata_is_ignored() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock)
+        .expect("lock file");
+    <File as fs4::FileExt>::try_lock(&file).expect("hold advisory lock");
+    file.write_all(&vec![b'x'; MAX_LOCK_METADATA_BYTES as usize + 1])
+        .expect("oversized metadata");
+    file.flush().expect("flush metadata");
+
+    let error = ProvenanceWriter::new(log).expect_err("active advisory lock");
+    assert!(error.to_string().contains("Owner details are unavailable."));
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_path_symlink_is_rejected_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let target = temp.path().join("target");
+    fs::write(&target, "do not modify").expect("target");
+    symlink(&target, &lock).expect("lock symlink");
+
+    let error = ProvenanceWriter::new(log).expect_err("symlink lock path");
+    assert!(matches!(error, ProvenanceWriterError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(target).expect("target contents"),
+        "do not modify"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_path_hard_link_is_rejected_without_touching_target() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let lock = lock_path_for(&log);
+    let target = temp.path().join("target");
+    fs::write(&target, "do not modify").expect("target");
+    fs::hard_link(&target, &lock).expect("lock hard link");
+
+    let error = ProvenanceWriter::new(log).expect_err("hard-linked lock path");
+    assert!(matches!(error, ProvenanceWriterError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(target).expect("target contents"),
+        "do not modify"
+    );
 }
