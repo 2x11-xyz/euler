@@ -11353,34 +11353,47 @@ fn provision_python_venv(extension_dir: &Path) -> PathBuf {
     copy_directory(&sdk_source, &sdk_copy);
     let venv = extension_dir.join(".venv");
     let created = Command::new("python3")
-        // CI must stay offline. This gives the temporary venv access to the
-        // runner's setuptools while still proving that the installed SDK and
-        // `.venv/bin/python` entrypoint work end to end. A user-facing
-        // `pip install -e` can bootstrap its build dependency normally.
-        .args(["-m", "venv", "--system-site-packages"])
+        .args(["-m", "venv"])
         .arg(&venv)
         .status()
         .expect("create Python virtual environment");
     assert!(created.success(), "python3 -m venv failed: {created}");
     let python = venv.join("bin/python");
-    let installed = Command::new(&python)
+    // Editable-install equivalent without pip or a build backend (issue
+    // #142): the SDK is pure Python, so path-linking its src/ through a
+    // .pth file in the venv's site-packages is everything `pip install -e`
+    // would achieve here — while staying offline (CI requirement) and
+    // independent of whether the host Python still bundles setuptools.
+    // Python 3.12+ venvs do not, and modern system interpreters (e.g.
+    // Homebrew 3.14) ship none, which made the previous
+    // `--no-build-isolation` editable install fail with
+    // `Cannot import 'setuptools.build_meta'`.
+    let purelib = Command::new(&python)
         .args([
-            "-m",
-            "pip",
-            "install",
-            "--no-build-isolation",
-            "--disable-pip-version-check",
-            "-e",
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
         ])
-        .arg(&sdk_copy)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
         .output()
-        .expect("install Python SDK into virtual environment");
+        .expect("resolve venv site-packages");
     assert!(
-        installed.status.success(),
-        "editable Python SDK install failed: {}",
-        String::from_utf8_lossy(&installed.stderr)
+        purelib.status.success(),
+        "resolving venv site-packages failed: {}",
+        String::from_utf8_lossy(&purelib.stderr)
+    );
+    let site_packages = PathBuf::from(String::from_utf8_lossy(&purelib.stdout).trim());
+    fs::write(
+        site_packages.join("euler_managed_process_sdk.pth"),
+        format!("{}\n", sdk_copy.join("src").display()),
+    )
+    .expect("write SDK path link");
+    let imports = Command::new(&python)
+        .args(["-B", "-c", "import euler_managed_process_sdk"])
+        .output()
+        .expect("verify SDK import");
+    assert!(
+        imports.status.success(),
+        "venv python cannot import the SDK: {}",
+        String::from_utf8_lossy(&imports.stderr)
     );
     python
 }
