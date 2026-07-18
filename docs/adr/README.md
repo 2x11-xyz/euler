@@ -43,6 +43,6 @@ rather than being backfilled or reused.
 | [0013](0013-operation-scoped-permissions.md) | Operation-scoped permission approval | Accepted 2026-07-14 |
 | [0014](0014-linux-workspace-subprocess-sandbox.md) | Linux workspace subprocess sandbox | Accepted 2026-07-14 |
 | [0015](0015-extension-distribution.md) | Extension distribution | Accepted 2026-07-18 |
-| [0016](0016-github-provider-catalog.md) | GitHub provider catalog distribution | Proposed 2026-07-18 |
+| [0016](0016-github-provider-catalog.md) | GitHub provider catalog distribution | Accepted 2026-07-18 |
 
 Next number: **0017**.
