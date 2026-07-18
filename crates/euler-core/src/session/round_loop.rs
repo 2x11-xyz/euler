@@ -148,6 +148,15 @@ pub(crate) trait RoundLoopIo {
     /// The default no-op keeps non-driver loops (companions) from observing;
     /// that default is the round-observer recursion guard.
     fn round_boundary(&mut self, _cancel_flag: &AtomicBool) {}
+    /// Called before every round's model request: absorb pending mid-turn
+    /// steering into canonical `user.message` events so this round's request
+    /// assembles them (issue #146). The default no-op keeps non-driver loops
+    /// (companions, spawned agents) from consuming the session's steering.
+    /// Implementations must not absorb once `cancel_flag` is set — an
+    /// interrupt keeps queued input for the user.
+    fn absorb_steering(&mut self, _cancel_flag: &AtomicBool) -> Result<(), SessionError> {
+        Ok(())
+    }
     fn round_limit(&mut self) -> Result<Self::Complete, SessionError>;
 }
 
@@ -177,6 +186,7 @@ where
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err(SessionError::Cancelled);
             }
+            self.io.absorb_steering(cancel_flag)?;
             match self.run_round(cancel_flag)? {
                 RoundOutcome::Complete(done) => {
                     self.io.round_completed();

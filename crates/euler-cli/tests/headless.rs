@@ -8327,6 +8327,112 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
 }
 
 #[test]
+fn tui_pty_mid_turn_input_steers_before_the_next_round() {
+    // Issue #146: a message typed while a turn is in flight is absorbed at
+    // the next round boundary as a canonical user.message — the model sees
+    // it in-turn — instead of waiting for the turn to complete. The fixture
+    // holds round 1 open with a sleep so the steering keystrokes land
+    // deterministically mid-round.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let script = write_fixture_script(
+        temp.path(),
+        "steering-transcript.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [
+                {"events": [
+                    {"text_delta": "phase one underway\n"},
+                    {"sleep_ms": 4000},
+                    {"tool_call": {
+                        "id": "call-read",
+                        "name": "read_file",
+                        "input": {"path": "Cargo.toml"}
+                    }},
+                    {"finished": {"stop_reason": "tool_use"}}
+                ]},
+                {"events": [
+                    {"text_delta": "final answer after steering"},
+                    {"finished": {"stop_reason": "completed"}}
+                ]}
+            ]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("/ commands"));
+    // Steering is typed immediately behind the submit: the app processes
+    // serial PTY input in order, so by the time these keystrokes are
+    // handled the turn is in flight and its steering generation is armed
+    // (spawn arms it on the UI thread before the worker exists). The
+    // scripted 4s sleep in round 1 then dwarfs any scheduling jitter, so
+    // the entry is queued long before the turn's next round boundary — no
+    // wall-clock screen-wait involved. (The `⏎ steer` footer copy is
+    // asserted by the status unit test; waiting on that glyph row proved
+    // flaky on CI renderers and is not what this test is about.)
+    tui.write("start the task\r");
+    tui.write("steer toward the tests\r");
+    assert!(
+        tui.wait_for_screen("phase one underway"),
+        "round 1 did not start:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.wait_for_screen("final answer after steering"),
+        "turn did not finish:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    // The durable stream shows the steering user.message inside the turn:
+    // after round 1's tool result, before round 2's model call.
+    let session_id = only_home_session_id(temp.path());
+    let events = read_jsonl(&home_session_log(temp.path(), &session_id));
+    let steering_index = events
+        .iter()
+        .position(|event| {
+            event.kind.as_str() == "user.message"
+                && event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("steer toward the tests")
+        })
+        .expect("steering user.message persisted");
+    let model_call_indexes: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind.as_str() == "model.call")
+        .map(|(index, _)| index)
+        .collect();
+    // Absorbed at whichever round boundary came first after the keystrokes
+    // (round 1's on fast machines, round 2's on slow ones) — and never as
+    // a turn of its own: exactly two model calls proves the pre-steering
+    // failure mode (queue flushed into a third turn after completion) did
+    // not happen.
+    assert_eq!(
+        model_call_indexes.len(),
+        2,
+        "steering must not spawn its own turn"
+    );
+    assert!(
+        steering_index < model_call_indexes[1],
+        "steering was not absorbed in-turn: user.message at {steering_index}, \
+         second model.call at {}",
+        model_call_indexes[1]
+    );
+}
+
+#[test]
 fn tui_pty_tool_round_commits_canonical_narration_without_corruption() {
     let temp = tempfile::tempdir().expect("temp dir");
     let script = write_fixture_script(

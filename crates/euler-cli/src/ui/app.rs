@@ -230,9 +230,14 @@ pub struct AppCore {
     pending_runs: VecDeque<PendingRunRequest>,
     /// Saved /code-swarm reviewer model set (provider::model), session copy.
     code_swarm_models: Vec<String>,
-    queued_inputs: VecDeque<String>,
+    /// Pending user inputs, shared with the running turn's worker (issue
+    /// #146): the worker drains it at round boundaries into `user.message`
+    /// events (mid-turn steering), and whatever it never absorbed is flushed
+    /// into the next turn at TurnDone exactly like the old queue. Pause
+    /// state lives inside the queue so the worker respects queue editing
+    /// and interrupts.
+    queued_inputs: Arc<euler_core::SteeringQueue>,
     queued_selection: Option<usize>,
-    queue_auto_flush_paused: bool,
     in_flight_label: Option<String>,
     /// Persona/name of the in-flight companion run, for approval panel tagging.
     in_flight_companion_name: Option<String>,
@@ -840,9 +845,8 @@ impl AppCore {
             clipboard: Box::<SystemClipboard>::default(),
             pending_runs: VecDeque::new(),
             code_swarm_models: load_code_swarm_models_startup(),
-            queued_inputs: VecDeque::new(),
+            queued_inputs: Arc::new(euler_core::SteeringQueue::default()),
             queued_selection: None,
-            queue_auto_flush_paused: false,
             in_flight_label: None,
             in_flight_companion_name: None,
             in_flight_cancellable: false,
@@ -1014,15 +1018,16 @@ impl AppCore {
     }
 
     fn queued_composer_lines(&self) -> Vec<QueuedComposerLine> {
-        let total = self.queued_inputs.len();
+        let queued = self.queued_inputs.snapshot();
+        let total = queued.len();
         let selected = self.selected_queue_index();
-        self.queued_inputs
-            .iter()
+        queued
+            .into_iter()
             .enumerate()
             .map(|(index, text)| QueuedComposerLine {
                 position: index + 1,
                 total,
-                text: text.clone(),
+                text,
                 selected: Some(index) == selected,
             })
             .collect()
@@ -1051,9 +1056,14 @@ impl AppCore {
         match &self.state {
             AppState::TurnInFlight { interrupt_flag, .. } => {
                 if self.is_in_flight_cancellable() {
+                    // Pause BEFORE publishing cancellation: once the worker
+                    // observes the flag it must also observe the pause, so an
+                    // interrupt can never race the round loop into absorbing
+                    // input the interrupt was meant to preserve (the worker
+                    // additionally refuses to absorb after the flag is set).
+                    self.queued_inputs.set_paused(true);
                     interrupt_flag.store(true, Ordering::SeqCst);
                     self.interrupted_guidance = true;
-                    self.queue_auto_flush_paused = true;
                 } else {
                     // The interrupt is dropped, not deferred: extension
                     // commands do not observe the flag yet. Say so.
@@ -1738,7 +1748,10 @@ impl AppCore {
             self.reply_to_modal(PermissionReply::Deny)
         } else {
             self.bottom.replace_composer_text("");
-            // Front of queue: next user turn after the denied tool turn finishes.
+            // Front of queue. The decision event's `instruction` field is
+            // audit-only — this queue entry is how the guidance reaches the
+            // model: absorbed at the turn's next round boundary (steering),
+            // or flushed as the next turn if the denial ended the turn.
             self.queued_inputs.push_front(draft.clone());
             self.queued_selection = Some(0);
             self.reply_to_modal(PermissionReply::DenyWithInstruction(draft))
@@ -1789,7 +1802,7 @@ impl AppCore {
             return self.queue_composer_input();
         };
         self.visual_scroll_offset = 0;
-        self.queue_auto_flush_paused = false;
+        self.queued_inputs.set_paused(false);
         self.bottom.record_submission(&prompt);
         let session = self.take_idle_session();
         self.rebuild_bottom_surface();
@@ -1816,7 +1829,7 @@ impl AppCore {
         let Some(prompt) = self.pop_next_queued_input() else {
             return CoreEffect::None;
         };
-        self.queue_auto_flush_paused = false;
+        self.queued_inputs.set_paused(false);
         self.visual_scroll_offset = 0;
         self.bottom.record_submission(&prompt);
         let session = self.take_idle_session();
@@ -1851,6 +1864,11 @@ impl AppCore {
 
     fn spawn_turn(&mut self, prompt: String, mut session: Box<Session<TuiDecider>>) {
         self.snapshot_permission_envelope(&session);
+        // Mid-turn steering (issue #146): the worker drains this queue at
+        // round boundaries; we keep pushing into our clone while the turn
+        // is in flight. Re-wired every spawn so /new and /resume sessions
+        // always steer the queue this AppCore renders.
+        session.set_steering_queue(Arc::clone(&self.queued_inputs));
         let (worker_tx, worker_rx) = mpsc::channel();
         let interrupt_flag = Arc::new(AtomicBool::new(false));
         let worker_interrupt = Arc::clone(&interrupt_flag);
@@ -2250,7 +2268,11 @@ impl AppCore {
         let Some(index) = self.selected_queue_index() else {
             return CoreEffect::None;
         };
-        let last = self.queued_inputs.len() - 1;
+        // The worker may have drained the queue between the two reads; treat
+        // an emptied queue as nothing to move.
+        let Some(last) = self.queued_inputs.len().checked_sub(1) else {
+            return CoreEffect::None;
+        };
         self.queued_selection = Some(index.saturating_add_signed(delta).min(last));
         CoreEffect::Render
     }
@@ -2270,7 +2292,7 @@ impl AppCore {
     fn clear_queued_inputs(&mut self) {
         self.queued_inputs.clear();
         self.queued_selection = None;
-        self.queue_auto_flush_paused = false;
+        self.queued_inputs.set_paused(false);
     }
 
     fn edit_palette(&mut self, edit: impl FnOnce(&mut BottomSurface)) -> CoreEffect {

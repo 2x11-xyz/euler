@@ -179,7 +179,12 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
 
 - Composer: left rail + user-role text, no box. Empty ghost:
   `message euler · / commands`. While the agent works, rail dims and shows
-  working/interrupt copy; typing remains accepted (queue when appropriate).
+  working/interrupt copy; typing remains accepted. Mid-turn submits steer:
+  they queue as pending-input rows and the running turn absorbs them at its
+  next round boundary as canonical `user.message` events (the model sees
+  them in-turn; docs/contracts/events.md). Entries the turn never absorbed —
+  paused queue, arrival after the final round — flush into the next turn,
+  as before. The running footer hint reads `⏎ steer`.
 - Footer: **one** line below the composer — key hints left; session identity
   right (`eNNNN · model · ctx N% · branch`). Ctx% uses attention at ≥70% and
   failure at ≥85%. No second status row; detail lives under `/status`.
