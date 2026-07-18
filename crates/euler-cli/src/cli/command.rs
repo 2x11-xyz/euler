@@ -55,11 +55,17 @@ impl Args {
 /// Replay reads an existing log and ignores live-provider arguments entirely,
 /// including their validation.
 pub(crate) enum Command {
-    Replay { path: PathBuf },
+    Replay {
+        path: PathBuf,
+    },
     Run(RunArgs),
     Tui(RunArgs),
     Exec(ExecArgs),
-    Resume { path: PathBuf, run: RunArgs },
+    Resume {
+        path: PathBuf,
+        run: RunArgs,
+        launch: ResumeLaunch,
+    },
     Login(LoginArgs),
     Logout(LogoutArgs),
     AuthStatus,
@@ -68,6 +74,16 @@ pub(crate) enum Command {
     Extension(ExtensionArgs),
     Scrub(ScrubArgs),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumeLaunch {
+    /// Match bare interactive startup: TUI on a usable terminal, otherwise
+    /// the line-oriented interface.
+    Auto,
+    LineOriented,
+    Tui,
+}
+
 pub(crate) struct RunArgs {
     pub(crate) provider_id: String,
     pub(crate) provider: Box<dyn ModelProvider>,
@@ -257,12 +273,22 @@ fn build_command_from_parsed(
         let preference = load_known_model_preference(paths.preference);
         let model_catalog = load_known_model_catalog(paths.model_catalog);
         let custom_providers = load_custom_provider_config(paths.provider_config);
-        Command::Tui(build_run_args(
+        let run = build_run_args(
             parsed,
             preference.as_ref(),
             &model_catalog,
             &custom_providers,
-        )?)
+        )?;
+        if let Some(path) = parsed.resume_path.clone() {
+            ensure_no_provider_options(parsed, "--resume")?;
+            Command::Resume {
+                path,
+                run,
+                launch: ResumeLaunch::Tui,
+            }
+        } else {
+            Command::Tui(run)
+        }
     } else if let Some(path) = parsed.replay_path.clone() {
         ensure_no_provider_options(parsed, "--replay")?;
         ensure_no_extensions(parsed, "--replay")?;
@@ -274,6 +300,11 @@ fn build_command_from_parsed(
         Command::Resume {
             path,
             run: build_run_args(parsed, None, &model_catalog, &custom_providers)?,
+            launch: if parsed.explicit_run {
+                ResumeLaunch::LineOriented
+            } else {
+                ResumeLaunch::Auto
+            },
         }
     } else {
         let preference = load_known_model_preference(paths.preference);

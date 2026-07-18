@@ -368,6 +368,30 @@ impl App {
         })
     }
 
+    /// Enter the TUI around an already-folded session, restoring its visible
+    /// ledger before the first frame instead of presenting it as a fresh app.
+    pub fn enter_resumed_with_options(
+        session: Session<TuiDecider>,
+        channels: PermissionChannels,
+        options: AppOptions,
+        events: &[EventEnvelope],
+        recovery_closure_appended: bool,
+        warning_count: usize,
+        events_replayed: usize,
+    ) -> Result<Self> {
+        let label = session.session_id().to_owned();
+        let mut app = Self::enter_with_options(session, channels, options)?;
+        app.core.rebuild_transcript_from_events(events);
+        app.core
+            .push_finalized_visual_item(TranscriptItem::ResumeBoundary {
+                label,
+                recovery_closure_appended,
+                warning_count,
+                events_replayed,
+            });
+        Ok(app)
+    }
+
     pub fn run(&mut self) -> Result<()> {
         self.request_render(RedrawLevel::Full);
         loop {

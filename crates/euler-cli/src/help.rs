@@ -104,11 +104,16 @@ fn run_help() -> String {
         "Start a line-oriented interactive session.
 
 Usage: euler run [OPTIONS]
+       euler run --resume <path-or-id> [OPTIONS]
 
 Each stdin line is sent as one turn; type 'exit' to quit.
+Resume restores the session and waits for the next input; it does not
+automatically repeat or continue the prior task.
 
 Options:
-{SESSION_OPTIONS}{HELP_LINE}"
+{SESSION_OPTIONS}  \
+--resume <path-or-id>     Resume and wait in the line-oriented interface
+{HELP_LINE}"
     )
 }
 
@@ -117,9 +122,15 @@ fn tui_help() -> String {
         "Start the full-screen terminal UI session.
 
 Usage: euler tui [OPTIONS]
+       euler tui --resume <path-or-id> [OPTIONS]
+
+Resume restores the transcript and waits in the composer; it does not
+automatically repeat or continue the prior task.
 
 Options:
 {SESSION_OPTIONS}  \
+--resume <path-or-id>     Resume directly into the terminal UI
+  \
 --experimental-tui-linefeed-history
                              Commit transcript lines into terminal scrollback
   --no-tui-linefeed-history  Disable linefeed history insertion

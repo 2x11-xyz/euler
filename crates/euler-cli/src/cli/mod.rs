@@ -27,13 +27,13 @@ use anyhow::Result;
 #[cfg(not(test))]
 use command::{Args, Command, ModelsCommand};
 #[cfg(test)]
-pub(crate) use command::{Args, Command, ModelsCommand};
+pub(crate) use command::{Args, Command, ModelsCommand, ResumeLaunch};
 #[cfg(test)]
 pub(crate) use command::{ExecArgs, RunArgs};
 #[cfg(test)]
 pub(crate) use permission::EnvArgs;
 use scrub::run as run_scrub;
-use session::{resume_interactive, run_exec, run_interactive_entry, run_tui};
+use session::{resume_interactive_entry, run_exec, run_interactive_entry, run_tui};
 
 use crate::auth_commands::{logout_chatgpt, print_auth_status};
 use crate::extension_cli::run_extension_command;
@@ -76,7 +76,9 @@ pub(crate) fn run() -> Result<()> {
         }
         Command::Tui(run) => run_tui(live_provenance, run),
         Command::Exec(exec) => run_exec(live_provenance, exec),
-        Command::Resume { path, run } => resume_interactive(resolve_resume_target(path)?, run),
+        Command::Resume { path, run, launch } => {
+            resume_interactive_entry(resolve_resume_target(path)?, run, launch, args.no_tty)
+        }
         Command::SessionExport(export) => run_session_export(export),
         Command::Login(login) => login_chatgpt(login),
         Command::Logout(logout) => logout_chatgpt(logout),
