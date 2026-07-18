@@ -416,6 +416,7 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
     let notifications_enabled =
         load_notifications_preference(preference_path.as_deref()).unwrap_or(true);
     let session_id = outcome.session.session_id().to_owned();
+    let events = outcome.session.events().to_vec();
     let session_store = outcome
         .refresh
         .as_ref()
@@ -437,7 +438,7 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
         channels,
         options,
         ResumedAppState {
-            events: outcome.events,
+            events,
             display_label: outcome.display_label.unwrap_or(session_id),
             session_name: outcome.session_name,
             recovery_closure_appended: outcome.recovery_closure_appended,
@@ -461,7 +462,6 @@ struct ResumeCliOutcome<D: PermissionDecider> {
     active_target: ModelTarget,
     recovery_closure_appended: bool,
     warning_count: usize,
-    events: Vec<euler_event::EventEnvelope>,
     display_label: Option<String>,
     session_name: Option<String>,
 }
@@ -537,7 +537,6 @@ where
         session.set_observer_extension(extension);
     }
     wire_code_swarm(&mut session);
-    let events = session.events().to_vec();
     Ok(ResumeCliOutcome {
         session,
         refresh,
@@ -545,7 +544,6 @@ where
         active_target: outcome.active_target,
         recovery_closure_appended: outcome.recovery_closure_appended,
         warning_count,
-        events,
         display_label,
         session_name,
     })

@@ -66,9 +66,14 @@ pub(crate) fn resolve_resume_target(path_or_id: PathBuf) -> Result<ResumeTarget>
     let Some(record) = store.resolve_session_reference(reference)? else {
         return Err(anyhow!("no session found with id or name {reference}"));
     };
+    let display_label = record
+        .name()
+        .or_else(|| record.title())
+        .unwrap_or_else(|| record.id())
+        .to_owned();
     Ok(ResumeTarget {
         log_path: record.events_path().to_path_buf(),
-        display_label: Some(record.display_label().to_owned()),
+        display_label: Some(display_label),
         session_name: record.name().map(str::to_owned),
         refresh: Some(HomeSessionRefresh {
             store,

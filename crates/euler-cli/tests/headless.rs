@@ -9851,6 +9851,40 @@ fn bare_resume_in_pty_opens_tui_with_restored_transcript() {
 }
 
 #[test]
+fn bare_resume_in_pty_uses_derived_title_without_name() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let mut first = command_with_home(exe, &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn first euler");
+    first
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"derived resume title\n")
+        .expect("write stdin");
+    assert!(first
+        .wait_with_output()
+        .expect("wait first")
+        .status
+        .success());
+    let session_id = only_home_session_id(home.path());
+
+    let mut resumed = PtyHarness::spawn_with_args(
+        home.path(),
+        &["--resume", &session_id, "--provider", "fixture"],
+    );
+    assert!(
+        resumed.wait_for_screen("resumed session derived resume title"),
+        "direct resume did not use the derived session title:\n{}",
+        resumed.screen_text()
+    );
+    resumed.quit();
+}
+
+#[test]
 fn explicit_tui_resume_in_pty_restores_transcript() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
@@ -9914,7 +9948,7 @@ fn explicit_run_resume_in_pty_stays_line_oriented() {
         resumed.screen_text()
     );
     assert!(
-        !resumed.screen_text().contains("echo · ctx"),
+        !resumed.screen_text().contains("echo(medium) · ctx"),
         "explicit run resume unexpectedly entered TUI:\n{}",
         resumed.screen_text()
     );
