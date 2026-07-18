@@ -1,6 +1,12 @@
-# ADR: Companion RoundLoop Adoption + Round-Boundary Observation Hook
+# ADR 0009: Companion RoundLoop Adoption + Round-Boundary Observation Hook
 
-Status: accepted (Eli, 2026-07-06 - "the approved sequence").
+## Status
+
+Accepted (Eli, 2026-07-06 — "the approved sequence"). Implemented.
+
+Numbered 0009 in the 2026-07-18 ADR cleanup; this file was previously
+date-named (`companion-roundloop-and-round-observer-2026-07-06.md`) and cited
+in code as "ADR 2026-07-06".
 
 ## Context
 

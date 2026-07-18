@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for implementation on branch `feat/warm-ledger-tui` (2026-07-09).
+Accepted (2026-07-09). Implemented; `feat/warm-ledger-tui` has merged.
 
 **Partially superseded (2026-07-15).** The decision below — Warm Ledger as the
 layout and interaction system, with `docs/contracts/ui.md` normative over it —

@@ -121,6 +121,7 @@ auth status
 models
 session-export
 extension
+scrub
 ```
 
 `login` and `logout` require `--provider chatgpt`; Anthropic and OpenRouter do

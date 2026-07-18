@@ -6,6 +6,58 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Mid-turn steering (#147)
+
+- Input typed while a turn runs now steers that turn: entries are absorbed
+  at the next round boundary as canonical `user.message` events the model
+  sees in-turn, instead of waiting for turn completion. Order-preserving
+  (steering never overtakes queued input), ack-after-persist (failures keep
+  entries queued), and interrupt-safe (Esc preserves pending input). The
+  running footer hint reads `⏎ steer`.
+
+### Session locking (#151)
+
+- Provenance writer ownership moved from PID files to OS advisory locks
+  held for the writer lifetime: crashes release the lock automatically on
+  every platform, and the persistent `events.jsonl.lock` file carries
+  diagnostic-only owner metadata. Legacy bare-PID lock files are refused
+  with recovery guidance rather than auto-claimed (a pre-lock Euler may
+  still be live). The TUI no longer hard-exits during in-flight quits.
+
+### TUI performance (#137–#141)
+
+- Enter-to-first-paint no longer scans the session store: `/resume` picker
+  items list lazily, turn-end recency updates touch one sidecar, and the
+  extension-registry listing is cached (#137). Session listings cache
+  their projection in the sidecar keyed by the event log's identity (#138).
+- Scrollback commits derive the cursor from tracked state — zero blocking
+  `ESC[6n` round-trips in steady state (#139). The finalized-history
+  render cache is incremental (#140) and the streaming answer's committed
+  prefix is memoized (#141), so long sessions and spinner ticks stop
+  re-rendering the world.
+
+### Warm Spine v2.1 (#132, #134–#136)
+
+- The v2.1 design pass over the Warm Spine sections below: refreshed diff
+  rendering with symbol labels and a markdown code hairline, Codex
+  vocabulary, a single unified picker, permission postures, quit-time
+  chrome cleanup, and turn recaps that report only what a turn changed
+  (suppressed when no files moved).
+
+### Managed-process extensions (#130, #131, #133)
+
+- Out-of-process extension runtime: extensions run as separate processes
+  over stdio JSON-RPC, with a Python SDK
+  (`python/euler_managed_process_sdk`). Linked managed-process extensions
+  run in live sessions, and round observers can be managed processes.
+
+### Permissions, sandbox, compaction (#122, #125–#129)
+
+- Operation-scoped permission approval (#127, ADR 0013) and the
+  fail-closed Linux workspace sandbox (#126/#129 series, ADR 0014).
+- Configurable compaction policy (#122) and causal-DAG durable research
+  records with observer reconciliation hardening (#125, #128).
+
 ### Terminal UI — Warm Spine redesign (#40, #41, #44, #45/#51, #50)
 
 - Anchor-spine transcript: two-cell glyph anchors (`•` prose/tools, `✱`

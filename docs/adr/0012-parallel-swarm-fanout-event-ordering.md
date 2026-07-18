@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for implementation on branch `feat/swarm-v2` (2026-07-11).
+Accepted (2026-07-11). Implemented; `feat/swarm-v2` has merged.
 
 ## Context
 

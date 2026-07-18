@@ -1,5 +1,10 @@
 # ADR 0007: Terminal UI and Reasoning Display
 
+## Status
+
+Accepted. Decided before this repository's v0.1.0 import and brought in with
+its original number on 2026-07-09; amended since (see Amendments).
+
 ## Decision
 
 Euler uses a Ratatui terminal UX as the baseline. The CLI representation is an

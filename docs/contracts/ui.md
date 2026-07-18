@@ -171,23 +171,28 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
 
 - Keep the existing pixel wordmark, stripe mark, and
   `e^(iπ) + 1 = 0 · vN` tagline **exactly**.
-- Add one faint help line with exact copy:
-  `new session eNNNN · resumable with /resume · / for commands`.
+- No orientation/help line under the banner: the wordmark and caption stand
+  alone (startup declutter, #21; `banner_has_no_orientation_line` enforces
+  the absence). Session ids live in `/status` and resume copy, not here.
 - Do not replace the pixel banner with a Concepts-board simplified header.
 
 ### Composer and footer
 
-- Composer: left rail + user-role text, no box. Empty ghost:
-  `message euler · / commands`. While the agent works, rail dims and shows
+- Composer: left rail + user-role text, no box. An empty composer shows the
+  rail and a dim cursor, nothing else — no ghost copy (startup declutter,
+  #21; the deny-with-instruction ghost is separate and stays). While the
+  agent works, the rail dims and shows
   working/interrupt copy; typing remains accepted. Mid-turn submits steer:
   they queue as pending-input rows and the running turn absorbs them at its
   next round boundary as canonical `user.message` events (the model sees
   them in-turn; docs/contracts/events.md). Entries the turn never absorbed —
   paused queue, arrival after the final round — flush into the next turn,
   as before. The running footer hint reads `⏎ steer`.
-- Footer: **one** line below the composer — key hints left; session identity
-  right (`eNNNN · model · ctx N% · branch`). Ctx% uses attention at ≥70% and
-  failure at ≥85%. No second status row; detail lives under `/status`.
+- Footer: **one** line below the composer — two hard-edged clusters:
+  contextual hints then `cwd (branch)` flush-left; `model · ctx N%` (plus
+  the session name once named) flush-right. No session id in the footer —
+  ids live in `/status` and resume copy (#21). Ctx% uses attention at ≥70%
+  and failure at ≥85%. No second status row; detail lives under `/status`.
 
 ### Streaming, scroll, motion
 
