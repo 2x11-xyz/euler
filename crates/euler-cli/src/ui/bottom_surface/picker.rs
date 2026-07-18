@@ -268,11 +268,12 @@ impl ReplacementPicker {
     }
 
     /// §4.2 anatomy, top to bottom: title line (scope token · params ·
-    /// counter), one query line (`>` prompt plus the typed query), rows
-    /// (caret + state marker + label + aligned description column), then one
-    /// footer hint line. The counter never lives below the rows. The query
-    /// line renders even while empty: an input you can see is an invitation
-    /// to type, and a filter you cannot see is one nobody finds.
+    /// counter), one query line (`>` prompt plus the typed query) on
+    /// searchable pickers, rows (caret + state marker + label + aligned
+    /// description column), then one footer hint line. The counter never
+    /// lives below the rows. The query line renders even while empty: an
+    /// input you can see is an invitation to type, and a filter you cannot
+    /// see is one nobody finds.
     ///
     /// `row` renders one line; `selected` drives the full-width select bar,
     /// which every picker has (selection is never conveyed by caret alone).
@@ -291,13 +292,17 @@ impl ReplacementPicker {
 
         // The query line is the picker's input box: a bare `>` prompt while
         // empty, the typed query echoing after it — never folded into the
-        // title as a parameter.
-        let query_line = if self.query.is_empty() {
-            ">".to_owned()
-        } else {
-            format!("> {}", self.query)
-        };
-        lines.push(row(truncate_display(&query_line, cols), false));
+        // title as a parameter. Only searchable pickers render it: on the
+        // others the keys are actions (extensions' `a`/`x`) or dead input,
+        // and a prompt that ignores what you type is a lie.
+        if self.kind.searchable() {
+            let query_line = if self.query.is_empty() {
+                ">".to_owned()
+            } else {
+                format!("> {}", self.query)
+            };
+            lines.push(row(truncate_display(&query_line, cols), false));
+        }
 
         let visible = self.visible_item_indices();
         if self.filtered_indices().is_empty() {
@@ -377,9 +382,19 @@ impl ReplacementPicker {
             text.push_str(&format!("{}{}  {description}", item.label, " ".repeat(pad)));
         }
         // The model picker's only state mark: a `✓` rides the right-hand end
-        // of the row for the model in use. Non-current rows get nothing.
+        // of the row for the model in use. Non-current rows get nothing. Its
+        // width is reserved before truncation, so the mark survives narrow
+        // terminals that clip the label itself.
         if self.kind == PickerKind::Model && item.current {
-            text.push_str(" ✓");
+            let suffix = " ✓";
+            let suffix_width = display_width(suffix);
+            if layout.width < suffix_width {
+                return truncate_display("✓", layout.width);
+            }
+            let budget = layout.width - suffix_width;
+            let mut truncated = truncate_display(&text, budget);
+            truncated.push_str(suffix);
+            return truncated;
         }
         truncate_display(&text, layout.width)
     }
@@ -565,13 +580,21 @@ impl ReplacementPicker {
     /// A row's *description* is not metadata: it belongs in the aligned
     /// column, and echoing it here as well is the "row repeats its own value"
     /// deviation. Only kinds whose `detail` really is metadata answer here;
-    /// see [`Self::detail_is_metadata`]. The model picker used to answer with
-    /// `provider · model`, but both fields already appear verbatim in the
-    /// row's label (`provider::model`), so the second line restated the first
-    /// instead of adding information.
+    /// see [`Self::detail_is_metadata`]. The model picker answers only for an
+    /// alias label: a canonical label already reads `provider::model`, so a
+    /// second `provider · model` line would restate the row — but an alias
+    /// that hides the canonical target must reveal it somewhere.
     fn selected_detail(&self) -> Option<String> {
         let item = self.selected_item()?;
         match self.kind {
+            PickerKind::Model => match &item.action {
+                CommandAction::SwitchModel { provider, model } => {
+                    let canonical = format!("{provider}::{model}");
+                    let label_base = display_label_search_text(&item.label);
+                    (label_base != canonical.as_str()).then(|| format!("{provider} · {model}"))
+                }
+                _ => None,
+            },
             PickerKind::Resume => item.detail.clone(),
             _ => None,
         }
