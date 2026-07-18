@@ -8370,18 +8370,22 @@ fn tui_pty_mid_turn_input_steers_before_the_next_round() {
         ],
     );
     assert!(tui.wait_for_screen("/ commands"));
+    // Steering is typed immediately behind the submit: the app processes
+    // serial PTY input in order, so by the time these keystrokes are
+    // handled the turn is in flight and its steering generation is armed
+    // (spawn arms it on the UI thread before the worker exists). The
+    // scripted 4s sleep in round 1 then dwarfs any scheduling jitter, so
+    // the entry is queued long before the turn's next round boundary — no
+    // wall-clock screen-wait involved. (The `⏎ steer` footer copy is
+    // asserted by the status unit test; waiting on that glyph row proved
+    // flaky on CI renderers and is not what this test is about.)
     tui.write("start the task\r");
+    tui.write("steer toward the tests\r");
     assert!(
         tui.wait_for_screen("phase one underway"),
         "round 1 did not start:\n{}",
         tui.screen_text()
     );
-    // Round 1 is now inside its scripted 4s sleep: the delta above is
-    // emitted immediately before the sleep starts, so typing now lands
-    // deterministically mid-round. (The `⏎ steer` footer copy is asserted
-    // by the status unit test — the screen-level wait for that glyph proved
-    // flaky on CI renderers and is not what this test is about.)
-    tui.write("steer toward the tests\r");
     assert!(
         tui.wait_for_screen("final answer after steering"),
         "turn did not finish:\n{}",
@@ -8404,21 +8408,27 @@ fn tui_pty_mid_turn_input_steers_before_the_next_round() {
                     == Some("steer toward the tests")
         })
         .expect("steering user.message persisted");
-    let tool_result_index = events
-        .iter()
-        .position(|event| event.kind.as_str() == "tool.result")
-        .expect("tool result persisted");
-    let second_model_call_index = events
+    let model_call_indexes: Vec<usize> = events
         .iter()
         .enumerate()
         .filter(|(_, event)| event.kind.as_str() == "model.call")
         .map(|(index, _)| index)
-        .nth(1)
-        .expect("second model call persisted");
+        .collect();
+    // Absorbed at whichever round boundary came first after the keystrokes
+    // (round 1's on fast machines, round 2's on slow ones) — and never as
+    // a turn of its own: exactly two model calls proves the pre-steering
+    // failure mode (queue flushed into a third turn after completion) did
+    // not happen.
+    assert_eq!(
+        model_call_indexes.len(),
+        2,
+        "steering must not spawn its own turn"
+    );
     assert!(
-        tool_result_index < steering_index && steering_index < second_model_call_index,
-        "steering was not absorbed at the round boundary: tool.result at {tool_result_index}, \
-         user.message at {steering_index}, second model.call at {second_model_call_index}"
+        steering_index < model_call_indexes[1],
+        "steering was not absorbed in-turn: user.message at {steering_index}, \
+         second model.call at {}",
+        model_call_indexes[1]
     );
 }
 

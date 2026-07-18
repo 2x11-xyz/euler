@@ -722,12 +722,20 @@ impl<D> Session<D> {
         self.observer_extension = Some(extension);
     }
 
-    /// Wire the shared mid-turn steering queue (issue #146). The interactive
-    /// surface keeps a clone and pushes while a turn is in flight; the round
-    /// loop drains it at each round boundary into `user.message` events, so
-    /// the next model call sees steering in-turn. Idempotent per turn —
-    /// surfaces re-wire it on every spawn.
+    /// Wire the shared mid-turn steering queue and arm it for the next turn
+    /// (issue #146). The interactive surface keeps a clone and pushes while
+    /// a turn is in flight; the round loop absorbs it at round boundaries
+    /// into `user.message` events, so the next model call sees steering
+    /// in-turn.
+    ///
+    /// Arming opens a new steering generation ON THE CALLER'S THREAD,
+    /// before the turn's worker exists: everything pushed after this call
+    /// steers the upcoming turn, everything pushed before it is a leftover
+    /// that flushes as its own turn. Ordering the generation with the
+    /// surface's own pushes (same thread) is what makes that boundary
+    /// race-free — re-wire the queue on every spawn.
     pub fn set_steering_queue(&mut self, queue: Arc<steering::SteeringQueue>) {
+        queue.begin_turn();
         self.steering = Some(queue);
     }
 
@@ -1360,12 +1368,6 @@ impl<D: PermissionDecider> Session<D> {
     {
         if self.context_limit_emitted.as_ref() == Some(&self.active_target) {
             return Ok(Vec::new());
-        }
-        // Open this turn's steering generation: only entries pushed from now
-        // on steer this turn. Anything already queued predates it and stays
-        // for the surface's one-turn-per-entry completion flush.
-        if let Some(queue) = &self.steering {
-            queue.begin_turn();
         }
         self.auto_compact_if_triggered()?;
 
