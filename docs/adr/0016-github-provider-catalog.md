@@ -1,4 +1,4 @@
-# ADR 0015: GitHub-first provider catalog distribution
+# ADR 0016: GitHub provider catalog distribution
 
 ## Status
 
@@ -52,12 +52,8 @@ GitHub is the bootstrap trust and availability boundary:
 - Euler's stable bootstrap URL points directly to the repository's latest
   GitHub release, not to a separately operated service.
 
-Cloudflare is not part of the first implementation. It may later mirror the
-immutable catalog bytes for bandwidth or latency, but it is never the catalog
-authority. On first use Euler obtains the manifest and artifact from GitHub.
-A future mirror is acceptable only when its bytes match a digest obtained from
-the GitHub-hosted manifest; mirror failure falls back to GitHub or the local
-last-known-good snapshot.
+GitHub Releases are the sole remote publication and download channel for this
+design.
 
 ### What the repository owns
 
@@ -165,7 +161,7 @@ Each changed release contains:
 - `provenance-v1.json`: provider source URLs, observation times, source
   digests, generator revision, and normalized diff summary.
 
-The digest detects corrupt, truncated, mismatched, or untrusted mirror bytes.
+The digest detects corrupt, truncated, or mismatched artifact bytes.
 Authenticity comes from the pinned GitHub repository/release channel and its
 protected publication workflow; a digest served beside an artifact is not by
 itself a signature.
@@ -174,7 +170,7 @@ itself a signature.
 
 Euler ships an embedded catalog snapshot produced by the same schema and
 generator. First launch therefore remains usable offline and does not block on
-GitHub, Cloudflare, or any provider.
+GitHub or any provider.
 
 On first interactive launch, after the usable UI is available, Euler performs
 one bounded best-effort refresh from the GitHub release channel and reports the
@@ -212,8 +208,8 @@ ChatGPT effective-context handling remains code.
 
 - New routable models can reach users independently of an Euler binary
   release, while first launch remains offline-safe.
-- GitHub provides a public audit trail, immutable versions, rollback, and the
-  initial endpoint without introducing a service to operate.
+- GitHub provides the sole remote distribution channel, a public audit trail,
+  immutable versions, and rollback without introducing a service to operate.
 - Provider-specific discovery stays outside Euler runtime and its model
   canvas.
 - Machine-managed state no longer competes with user-owned `models.json`.
@@ -237,8 +233,6 @@ ChatGPT effective-context handling remains code.
    ChatGPT section.
 6. Add first-launch/background UX only after offline, timeout,
    last-known-good, and headless-no-network tests enforce the stop conditions.
-7. Consider a Cloudflare mirror only after measured GitHub bandwidth,
-   reliability, or latency justifies the extra operational surface.
 
 ## Verification gates
 
