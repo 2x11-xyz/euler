@@ -678,7 +678,7 @@ fn companion_uses_inline_system_prompt() {
 
 #[test]
 fn companion_transport_error_at_invoke_retries_silently_and_recovers() {
-    // ADR 2026-07-06: companions inherit the RoundLoop transport retry, so a
+    // ADR 0009: companions inherit the RoundLoop transport retry, so a
     // transient failure before any stream output no longer kills the spawn.
     let invokes = Arc::new(AtomicUsize::new(0));
     let provider = FlakyThenScriptedProvider::new(

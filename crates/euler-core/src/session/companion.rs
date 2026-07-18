@@ -242,7 +242,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     }
 
     /// Companion rounds run through the shared [`RoundLoop`] seam, so
-    /// companions inherit its transport retry (ADR 2026-07-06). max_turns
+    /// companions inherit its transport retry (ADR 0009). max_turns
     /// maps onto the loop's round limit: it counts companion model rounds,
     /// and max_turns = 1 means at most one model round total.
     fn run(&mut self, cancel_flag: &AtomicBool) -> AgentResult {
