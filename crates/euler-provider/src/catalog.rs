@@ -3,6 +3,7 @@
 mod official;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
@@ -24,6 +25,135 @@ pub const DEFAULT_OPENAI_MODEL: &str = crate::openai::DEFAULT_MODEL;
 pub const DEFAULT_ANTHROPIC_MODEL: &str = crate::anthropic::DEFAULT_MODEL;
 pub const DEFAULT_OPENROUTER_MODEL: &str = crate::openrouter::DEFAULT_MODEL;
 pub const DEFAULT_XAI_MODEL: &str = crate::xai::DEFAULT_MODEL;
+
+/// Millionths of a USD per one million tokens. One rate unit is exactly one
+/// pico-dollar per token, so a quote needs no floating-point arithmetic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelCostRates {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: Option<u64>,
+    pub cache_write_5m: Option<u64>,
+    pub cache_write_1h: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelCostTier {
+    pub input_tokens_above: u64,
+    pub rates: ModelCostRates,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCost {
+    pub rates: ModelCostRates,
+    tiers: Vec<ModelCostTier>,
+}
+
+impl ModelCost {
+    pub fn new(rates: ModelCostRates) -> Self {
+        Self {
+            rates,
+            tiers: Vec::new(),
+        }
+    }
+
+    pub fn with_tiers(rates: ModelCostRates, tiers: Vec<ModelCostTier>) -> Option<Self> {
+        let mut previous = None;
+        for tier in &tiers {
+            if tier.input_tokens_above == 0
+                || previous.is_some_and(|threshold| threshold >= tier.input_tokens_above)
+            {
+                return None;
+            }
+            previous = Some(tier.input_tokens_above);
+        }
+        Some(Self { rates, tiers })
+    }
+
+    pub fn tiers(&self) -> &[ModelCostTier] {
+        &self.tiers
+    }
+
+    pub fn quote(&self, usage: &crate::Usage) -> Option<ModelUsageCost> {
+        let uncached = usage.uncached_input_tokens?;
+        let cache_read = usage.cached_tokens?;
+        let cache_write_5m = usage.cache_write_5m_tokens?;
+        let cache_write_1h = usage.cache_write_1h_tokens?;
+        let input_total = uncached
+            .checked_add(cache_read)?
+            .checked_add(cache_write_5m)?
+            .checked_add(cache_write_1h)?;
+        if input_total != usage.input_tokens {
+            return None;
+        }
+        let (tier_input_tokens_above, rates) = self.rates_for_input(input_total);
+        let input_picos = uncached.checked_mul(rates.input)?;
+        let output_picos = usage.output_tokens.checked_mul(rates.output)?;
+        let cache_read_picos = component_cost(cache_read, rates.cache_read)?;
+        let cache_write_5m_picos = component_cost(cache_write_5m, rates.cache_write_5m)?;
+        let cache_write_1h_picos = component_cost(cache_write_1h, rates.cache_write_1h)?;
+        let total_picos = input_picos
+            .checked_add(output_picos)?
+            .checked_add(cache_read_picos)?
+            .checked_add(cache_write_5m_picos)?
+            .checked_add(cache_write_1h_picos)?;
+        Some(ModelUsageCost {
+            input_picos,
+            output_picos,
+            cache_read_picos,
+            cache_write_5m_picos,
+            cache_write_1h_picos,
+            total_picos,
+            rates,
+            tier_input_tokens_above,
+        })
+    }
+
+    fn rates_for_input(&self, input_tokens: u64) -> (Option<u64>, ModelCostRates) {
+        self.tiers
+            .iter()
+            .rev()
+            .find(|tier| input_tokens > tier.input_tokens_above)
+            .map_or((None, self.rates), |tier| {
+                (Some(tier.input_tokens_above), tier.rates)
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelUsageCost {
+    pub input_picos: u64,
+    pub output_picos: u64,
+    pub cache_read_picos: u64,
+    pub cache_write_5m_picos: u64,
+    pub cache_write_1h_picos: u64,
+    pub total_picos: u64,
+    pub rates: ModelCostRates,
+    pub tier_input_tokens_above: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelCostSource {
+    Official { release_id: String },
+    Local { cost_sha256: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedModelCost {
+    pub provider: String,
+    pub model: String,
+    pub cost: ModelCost,
+    pub source: ModelCostSource,
+}
+
+fn component_cost(tokens: u64, rate: Option<u64>) -> Option<u64> {
+    if tokens == 0 {
+        Some(0)
+    } else {
+        tokens.checked_mul(rate?)
+    }
+}
+
 const STANDARD_REASONING_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::XSmall,
     ReasoningEffort::Small,
@@ -68,6 +198,8 @@ pub struct ModelDescriptor {
     official_route: bool,
     effective_context_window_percent: Option<u8>,
     auto_compact_token_limit: Option<u64>,
+    cost: Option<ModelCost>,
+    local_cost_sha256: Option<String>,
 }
 
 impl ModelDescriptor {
@@ -114,6 +246,10 @@ impl ModelDescriptor {
     pub fn reasoning_efforts(&self) -> &[ReasoningEffort] {
         &self.reasoning_efforts
     }
+
+    pub fn cost(&self) -> Option<&ModelCost> {
+        self.cost.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,6 +286,7 @@ impl MergedProviderDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergedModelCatalog {
     providers: BTreeMap<&'static str, MergedProviderDescriptor>,
+    official_release_id: Option<String>,
 }
 
 pub const BUILTIN_PROVIDERS: &[ProviderDescriptor] = &[
@@ -226,6 +363,11 @@ impl MergedModelCatalog {
                 if model.status == official::OfficialModelStatus::Removed {
                     continue;
                 }
+                let cost = model
+                    .cost
+                    .as_ref()
+                    .map(|cost| parse_official_model_cost(cost, &provider_id, &model.id))
+                    .transpose()?;
                 let reasoning_efforts = model.reasoning_efforts();
                 let (effective_context_window_percent, auto_compact_token_limit) =
                     if provider_id == CHATGPT_PROVIDER_ID {
@@ -247,6 +389,8 @@ impl MergedModelCatalog {
                         official_route: true,
                         effective_context_window_percent,
                         auto_compact_token_limit,
+                        cost,
+                        local_cost_sha256: None,
                     },
                 );
             }
@@ -265,6 +409,8 @@ impl MergedModelCatalog {
                         official_route: true,
                         effective_context_window_percent: None,
                         auto_compact_token_limit: None,
+                        cost: None,
+                        local_cost_sha256: None,
                     },
                 );
             }
@@ -279,7 +425,15 @@ impl MergedModelCatalog {
                 },
             );
         }
-        Ok(Self { providers })
+        Ok(Self {
+            providers,
+            official_release_id: None,
+        })
+    }
+
+    pub fn with_official_release_id(mut self, release_id: impl Into<String>) -> Self {
+        self.official_release_id = Some(release_id.into());
+        self
     }
 
     pub fn with_local_json(contents: &str) -> (Self, Vec<String>) {
@@ -350,6 +504,26 @@ impl MergedModelCatalog {
 
     pub fn model(&self, provider: &str, model: &str) -> Option<&ModelDescriptor> {
         self.provider(provider)?.models.get(model)
+    }
+
+    pub fn resolved_model_cost(&self, provider: &str, model: &str) -> Option<ResolvedModelCost> {
+        let provider = canonical_provider_id(provider)?;
+        let descriptor = self.model(provider, model)?;
+        let cost = descriptor.cost.clone()?;
+        let source = match descriptor.source {
+            ModelDescriptorSource::BuiltIn => ModelCostSource::Official {
+                release_id: self.official_release_id.clone()?,
+            },
+            ModelDescriptorSource::Local => ModelCostSource::Local {
+                cost_sha256: descriptor.local_cost_sha256.clone()?,
+            },
+        };
+        Some(ResolvedModelCost {
+            provider: provider.to_owned(),
+            model: descriptor.id.clone(),
+            cost,
+            source,
+        })
     }
 
     pub fn supported_reasoning_efforts(&self, provider: &str, model: &str) -> &[ReasoningEffort] {
@@ -450,6 +624,7 @@ fn embedded_catalog() -> &'static MergedModelCatalog {
     CATALOG.get_or_init(|| {
         MergedModelCatalog::from_official_json(EMBEDDED_CATALOG_JSON)
             .expect("packaged provider catalog must be valid")
+            .with_official_release_id(official::embedded_release_id())
     })
 }
 
@@ -473,6 +648,8 @@ fn fixture_provider() -> MergedProviderDescriptor {
                 official_route: true,
                 effective_context_window_percent: None,
                 auto_compact_token_limit: None,
+                cost: None,
+                local_cost_sha256: None,
             },
         )]),
     }
@@ -504,50 +681,12 @@ fn merge_models(
     };
     for (index, model) in models.iter().enumerate() {
         let scope = format!("provider `{provider_key}` model #{index}");
-        let Some(object) = model.as_object() else {
-            warnings.push(format!("ignored {scope} because it is not an object"));
+        let Some(descriptor) =
+            local_model_descriptor(provider, provider_key, model, &scope, warnings)
+        else {
             continue;
         };
-        warn_unknown_fields(
-            object.keys(),
-            &[
-                "id",
-                "display_name",
-                "context_window_tokens",
-                "max_output_tokens",
-                "supports_tools",
-                "supports_reasoning",
-            ],
-            &scope,
-            warnings,
-        );
-        let Some(id) = object.get("id").and_then(Value::as_str) else {
-            warnings.push(format!(
-                "ignored {scope} because id is missing or not a string"
-            ));
-            continue;
-        };
-        let Some(id) = valid_local_model_id(id, &scope, warnings) else {
-            continue;
-        };
-        let display_name = local_display_name(object, &id, &scope, warnings);
-        let context_window_tokens =
-            optional_positive_u64(object, "context_window_tokens", &scope, warnings);
-        let max_output_tokens =
-            optional_positive_u64(object, "max_output_tokens", &scope, warnings);
-        let supports_tools = optional_bool(object, "supports_tools", &scope, warnings);
-        let supports_reasoning = optional_bool(object, "supports_reasoning", &scope, warnings);
-        let (effective_context_window_percent, auto_compact_token_limit) =
-            if provider_key == CHATGPT_PROVIDER_ID {
-                chatgpt_context_policy(context_window_tokens)
-            } else {
-                (None, None)
-            };
-        let (reasoning_efforts, official_route) = provider
-            .models
-            .get(&id)
-            .map(|model| (model.reasoning_efforts.clone(), model.official_route))
-            .unwrap_or_default();
+        let id = descriptor.id.clone();
         if provider
             .models
             .get(&id)
@@ -557,23 +696,73 @@ fn merge_models(
                 "provider `{provider_key}` model `{id}` appeared more than once; last valid descriptor wins"
             ));
         }
-        provider.models.insert(
-            id.clone(),
-            ModelDescriptor {
-                id,
-                display_name,
-                source: ModelDescriptorSource::Local,
-                context_window_tokens,
-                max_output_tokens,
-                supports_tools,
-                supports_reasoning,
-                reasoning_efforts,
-                official_route,
-                effective_context_window_percent,
-                auto_compact_token_limit,
-            },
-        );
+        provider.models.insert(id, descriptor);
     }
+}
+
+fn local_model_descriptor(
+    provider: &MergedProviderDescriptor,
+    provider_key: &str,
+    model: &Value,
+    scope: &str,
+    warnings: &mut Vec<String>,
+) -> Option<ModelDescriptor> {
+    let Some(object) = model.as_object() else {
+        warnings.push(format!("ignored {scope} because it is not an object"));
+        return None;
+    };
+    warn_unknown_fields(
+        object.keys(),
+        &[
+            "id",
+            "display_name",
+            "context_window_tokens",
+            "max_output_tokens",
+            "supports_tools",
+            "supports_reasoning",
+            "cost",
+        ],
+        scope,
+        warnings,
+    );
+    let Some(id) = object.get("id").and_then(Value::as_str) else {
+        warnings.push(format!(
+            "ignored {scope} because id is missing or not a string"
+        ));
+        return None;
+    };
+    let id = valid_local_model_id(id, scope, warnings)?;
+    let context_window_tokens =
+        optional_positive_u64(object, "context_window_tokens", scope, warnings);
+    let (reasoning_efforts, official_route) = provider
+        .models
+        .get(&id)
+        .map(|model| (model.reasoning_efforts.clone(), model.official_route))
+        .unwrap_or_default();
+    let (cost, local_cost_sha256) = parse_model_cost(object, scope, warnings)
+        .map(|(cost, digest)| (Some(cost), Some(digest)))
+        .unwrap_or_default();
+    let (effective_context_window_percent, auto_compact_token_limit) =
+        if provider_key == CHATGPT_PROVIDER_ID {
+            chatgpt_context_policy(context_window_tokens)
+        } else {
+            (None, None)
+        };
+    Some(ModelDescriptor {
+        display_name: local_display_name(object, &id, scope, warnings),
+        max_output_tokens: optional_positive_u64(object, "max_output_tokens", scope, warnings),
+        supports_tools: optional_bool(object, "supports_tools", scope, warnings),
+        supports_reasoning: optional_bool(object, "supports_reasoning", scope, warnings),
+        source: ModelDescriptorSource::Local,
+        context_window_tokens,
+        reasoning_efforts,
+        official_route,
+        effective_context_window_percent,
+        auto_compact_token_limit,
+        local_cost_sha256,
+        cost,
+        id,
+    })
 }
 
 fn local_display_name(
@@ -614,6 +803,174 @@ fn optional_positive_u64(
         return None;
     }
     Some(number)
+}
+
+fn parse_model_cost(
+    object: &serde_json::Map<String, Value>,
+    scope: &str,
+    warnings: &mut Vec<String>,
+) -> Option<(ModelCost, String)> {
+    let value = object.get("cost")?;
+    match parse_cost_value(value) {
+        Ok(cost) => {
+            let digest = model_cost_sha256(&cost);
+            Some((cost, digest))
+        }
+        Err(error) => {
+            warnings.push(format!("ignored {scope} cost because {error}"));
+            None
+        }
+    }
+}
+
+pub(super) fn parse_official_model_cost(
+    value: &Value,
+    provider: &str,
+    model: &str,
+) -> Result<ModelCost, OfficialCatalogError> {
+    parse_cost_value(value).map_err(|error| {
+        OfficialCatalogError::new(format!(
+            "provider `{provider}` model `{model}` cost is invalid: {error}"
+        ))
+    })
+}
+
+fn parse_cost_value(value: &Value) -> Result<ModelCost, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "it must be an object".to_owned())?;
+    reject_unknown_cost_fields(object, false)?;
+    let rates = parse_cost_rates(object)?;
+    let Some(value) = object.get("tiers") else {
+        return Ok(ModelCost::new(rates));
+    };
+    let values = value
+        .as_array()
+        .filter(|tiers| tiers.len() <= 16)
+        .ok_or_else(|| "tiers must be an array with at most 16 entries".to_owned())?;
+    let mut tiers = Vec::with_capacity(values.len());
+    for value in values {
+        let tier = value
+            .as_object()
+            .ok_or_else(|| "every tier must be an object".to_owned())?;
+        reject_unknown_cost_fields(tier, true)?;
+        let input_tokens_above = tier
+            .get("input_tokens_above")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "every tier needs an integer input_tokens_above".to_owned())?;
+        tiers.push(ModelCostTier {
+            input_tokens_above,
+            rates: parse_cost_rates(tier)?,
+        });
+    }
+    ModelCost::with_tiers(rates, tiers)
+        .ok_or_else(|| "tier thresholds must be positive, unique, and ascending".to_owned())
+}
+
+fn reject_unknown_cost_fields(
+    object: &serde_json::Map<String, Value>,
+    tier: bool,
+) -> Result<(), String> {
+    const RATE_FIELDS: [&str; 5] = [
+        "input",
+        "output",
+        "cache_read",
+        "cache_write_5m",
+        "cache_write_1h",
+    ];
+    for field in object.keys() {
+        let allowed = RATE_FIELDS.contains(&field.as_str())
+            || (!tier && field == "tiers")
+            || (tier && field == "input_tokens_above");
+        if !allowed {
+            return Err(format!("unknown field `{field}`"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_cost_rates(object: &serde_json::Map<String, Value>) -> Result<ModelCostRates, String> {
+    Ok(ModelCostRates {
+        input: required_cost_rate(object, "input")?,
+        output: required_cost_rate(object, "output")?,
+        cache_read: optional_cost_rate(object, "cache_read")?,
+        cache_write_5m: optional_cost_rate(object, "cache_write_5m")?,
+        cache_write_1h: optional_cost_rate(object, "cache_write_1h")?,
+    })
+}
+
+fn required_cost_rate(object: &serde_json::Map<String, Value>, field: &str) -> Result<u64, String> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| format!("{field} is required"))?;
+    parse_cost_rate(value).map_err(|error| format!("{field} {error}"))
+}
+
+fn optional_cost_rate(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    object
+        .get(field)
+        .map(parse_cost_rate)
+        .transpose()
+        .map_err(|error| format!("{field} {error}"))
+}
+
+fn parse_cost_rate(value: &Value) -> Result<u64, String> {
+    const SCALE: u64 = 1_000_000;
+    const MAX_RATE: u64 = 1_000_000 * SCALE;
+    let text = value
+        .as_number()
+        .map(ToString::to_string)
+        .ok_or_else(|| "must be a non-negative number".to_owned())?;
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, ""));
+    if whole.starts_with('-') || whole.is_empty() || fraction.len() > 6 {
+        return Err("must be non-negative with at most six decimal places".to_owned());
+    }
+    let whole = whole
+        .parse::<u64>()
+        .map_err(|_| "is out of bounds".to_owned())?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        let digits = fraction
+            .parse::<u64>()
+            .map_err(|_| "must be an ordinary decimal".to_owned())?;
+        digits
+            .checked_mul(10_u64.pow(6 - fraction.len() as u32))
+            .ok_or_else(|| "is out of bounds".to_owned())?
+    };
+    whole
+        .checked_mul(SCALE)
+        .and_then(|value| value.checked_add(fraction))
+        .filter(|value| *value <= MAX_RATE)
+        .ok_or_else(|| "is out of bounds".to_owned())
+}
+
+fn model_cost_sha256(cost: &ModelCost) -> String {
+    let mut digest = Sha256::new();
+    update_cost_digest(&mut digest, None, cost.rates);
+    for tier in cost.tiers() {
+        update_cost_digest(&mut digest, Some(tier.input_tokens_above), tier.rates);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn update_cost_digest(digest: &mut Sha256, threshold: Option<u64>, rates: ModelCostRates) {
+    for value in [
+        threshold,
+        Some(rates.input),
+        Some(rates.output),
+        rates.cache_read,
+        rates.cache_write_5m,
+        rates.cache_write_1h,
+    ] {
+        digest.update([u8::from(value.is_some())]);
+        if let Some(value) = value {
+            digest.update(value.to_be_bytes());
+        }
+    }
 }
 
 fn optional_bool(
@@ -1182,5 +1539,185 @@ mod tests {
             ),
             ReasoningEffort::Max
         );
+    }
+
+    #[test]
+    fn local_pricing_quotes_disjoint_usage_with_exact_decimal_rates() {
+        let (catalog, warnings) = MergedModelCatalog::with_local_json(
+            r#"{
+              "version": 1,
+              "providers": {"openrouter": {"models": [{
+                "id": "z-ai/glm-5.2",
+                "cost": {
+                  "input": 0.532,
+                  "output": 1.672,
+                  "cache_read": 0.0988,
+                  "cache_write_5m": 0.665
+                }
+              }]}}
+            }"#,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let resolved = catalog
+            .resolved_model_cost("openrouter", "z-ai/glm-5.2")
+            .expect("local price");
+        assert!(matches!(
+            resolved.source,
+            ModelCostSource::Local { ref cost_sha256 } if cost_sha256.len() == 64
+        ));
+        let usage = crate::Usage {
+            input_tokens: 10,
+            output_tokens: 3,
+            uncached_input_tokens: Some(7),
+            cached_tokens: Some(2),
+            cache_write_5m_tokens: Some(1),
+            cache_write_1h_tokens: Some(0),
+            reasoning_tokens: None,
+        };
+
+        let quote = resolved.cost.quote(&usage).expect("quote");
+
+        assert_eq!(quote.input_picos, 3_724_000);
+        assert_eq!(quote.output_picos, 5_016_000);
+        assert_eq!(quote.cache_read_picos, 197_600);
+        assert_eq!(quote.cache_write_5m_picos, 665_000);
+        assert_eq!(quote.total_picos, 9_602_600);
+    }
+
+    #[test]
+    fn pricing_tiers_select_one_request_wide_schedule_above_each_threshold() {
+        let cost = parse_cost_value(&serde_json::json!({
+            "input": 1,
+            "output": 1,
+            "tiers": [
+                {"input_tokens_above": 10, "input": 2, "output": 2},
+                {"input_tokens_above": 20, "input": 3, "output": 3}
+            ]
+        }))
+        .expect("cost");
+
+        assert_eq!(quote_input(&cost, 10), 10_000_000);
+        assert_eq!(quote_input(&cost, 11), 22_000_000);
+        assert_eq!(quote_input(&cost, 20), 40_000_000);
+        assert_eq!(quote_input(&cost, 21), 63_000_000);
+    }
+
+    #[test]
+    fn malformed_local_pricing_disables_pricing_without_falling_back() {
+        let (catalog, warnings) = MergedModelCatalog::with_local_json(
+            r#"{
+              "version": 1,
+              "providers": {"openai": {"models": [{
+                "id": "gpt-5.5",
+                "cost": {
+                  "input": 5,
+                  "output": 30,
+                  "tiers": [
+                    {"input_tokens_above": 20, "input": 10, "output": 45},
+                    {"input_tokens_above": 20, "input": 11, "output": 46}
+                  ]
+                }
+              }]}}
+            }"#,
+        );
+
+        assert!(warnings
+            .iter()
+            .any(|warning| warning
+                .contains("tier thresholds must be positive, unique, and ascending")));
+        assert!(catalog.resolved_model_cost("openai", "gpt-5.5").is_none());
+    }
+
+    #[test]
+    fn pricing_rejects_unknown_fields_and_excess_precision() {
+        for cost in [
+            serde_json::json!({"input": 1, "output": 2, "surprise": 3}),
+            serde_json::json!({"input": 0.1234567, "output": 2}),
+        ] {
+            assert!(parse_cost_value(&cost).is_err());
+        }
+    }
+
+    #[test]
+    fn quote_fails_closed_for_inconsistent_usage_missing_rates_and_overflow() {
+        let cost = ModelCost::new(ModelCostRates {
+            input: u64::MAX,
+            output: 1,
+            cache_read: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+        });
+        let inconsistent = priced_usage(3, 2, 0, 0, 0);
+        let missing_cache_rate = priced_usage(3, 2, 1, 0, 0);
+        let overflow = priced_usage(2, 2, 0, 0, 0);
+
+        assert!(cost.quote(&inconsistent).is_none());
+        assert!(cost.quote(&missing_cache_rate).is_none());
+        assert!(cost.quote(&overflow).is_none());
+    }
+
+    #[test]
+    fn quote_distinguishes_known_zero_from_unpriced() {
+        let cost = ModelCost::new(ModelCostRates {
+            input: 1,
+            output: 1,
+            cache_read: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+        });
+
+        let quote = cost
+            .quote(&priced_usage(0, 0, 0, 0, 0))
+            .expect("zero-token call is priced");
+
+        assert_eq!(quote.total_picos, 0);
+    }
+
+    #[test]
+    fn local_price_identity_is_stable_and_schedule_sensitive() {
+        let first = ModelCost::new(ModelCostRates {
+            input: 1,
+            output: 2,
+            cache_read: Some(3),
+            cache_write_5m: Some(4),
+            cache_write_1h: None,
+        });
+        let changed = ModelCost::new(ModelCostRates {
+            input: 2,
+            ..first.rates
+        });
+
+        let digest = model_cost_sha256(&first);
+
+        assert_eq!(digest, model_cost_sha256(&first));
+        assert_eq!(digest.len(), 64);
+        assert!(digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert_ne!(digest, model_cost_sha256(&changed));
+    }
+
+    fn quote_input(cost: &ModelCost, tokens: u64) -> u64 {
+        cost.quote(&priced_usage(tokens, tokens, 0, 0, 0))
+            .expect("quote")
+            .total_picos
+    }
+
+    fn priced_usage(
+        input_tokens: u64,
+        uncached_input_tokens: u64,
+        cached_tokens: u64,
+        cache_write_5m_tokens: u64,
+        cache_write_1h_tokens: u64,
+    ) -> crate::Usage {
+        crate::Usage {
+            input_tokens,
+            output_tokens: 0,
+            uncached_input_tokens: Some(uncached_input_tokens),
+            cached_tokens: Some(cached_tokens),
+            cache_write_5m_tokens: Some(cache_write_5m_tokens),
+            cache_write_1h_tokens: Some(cache_write_1h_tokens),
+            reasoning_tokens: None,
+        }
     }
 }

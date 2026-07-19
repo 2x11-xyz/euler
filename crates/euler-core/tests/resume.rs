@@ -28,7 +28,10 @@ fn fold_reproduces_live_target_usage_and_context_limit_fields() {
                 usage: Some(Usage {
                     input_tokens: 90,
                     output_tokens: 5,
+                    uncached_input_tokens: None,
                     cached_tokens: None,
+                    cache_write_5m_tokens: None,
+                    cache_write_1h_tokens: None,
                     reasoning_tokens: None,
                 }),
             }),

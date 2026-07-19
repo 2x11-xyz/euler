@@ -402,7 +402,8 @@ fn validate_release(manifest: ReleaseManifest, catalog_bytes: Vec<u8>) -> Result
     let catalog_json =
         String::from_utf8(catalog_bytes).context("provider catalog artifact is not valid UTF-8")?;
     let catalog = MergedModelCatalog::from_official_json(&catalog_json)
-        .context("provider catalog artifact failed strict validation")?;
+        .context("provider catalog artifact failed strict validation")?
+        .with_official_release_id(manifest.release_id.clone());
     let generated_at = parse_generated_at(&manifest.generated_at)?;
     Ok(ValidatedRelease {
         manifest,
@@ -909,6 +910,7 @@ mod tests {
     #[test]
     fn embedded_release_authenticates_and_contains_kimi_k3() {
         let release = embedded_release();
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.2");
         assert_eq!(
             release.manifest.release_id,
             "catalog-v1-20260718t221617z-d619088f6e7778720898f59eb19ef903bbbd712d8ebe24e66c668490ce26e5d9"
@@ -919,6 +921,17 @@ mod tests {
             .expect("openrouter")
             .models()
             .any(|model| model.id() == "moonshotai/kimi-k3"));
+    }
+
+    #[test]
+    fn newer_catalog_protocol_is_rejected_before_artifact_use() {
+        let mut manifest = embedded_release().manifest;
+        manifest.minimum_euler_version = "0.1.3".to_owned();
+
+        let error = ensure_compatible(&manifest).expect_err("future protocol must fail");
+
+        assert!(error.to_string().contains("requires Euler 0.1.3"));
+        assert!(error.to_string().contains("this binary is 0.1.2"));
     }
 
     #[test]

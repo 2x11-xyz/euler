@@ -440,7 +440,10 @@ data: [DONE]
                 usage: Some(Usage {
                     input_tokens: 10,
                     output_tokens: 4,
+                    uncached_input_tokens: None,
                     cached_tokens: None,
+                    cache_write_5m_tokens: None,
+                    cache_write_1h_tokens: None,
                     reasoning_tokens: Some(2),
                 })
             }),
@@ -505,7 +508,10 @@ fn custom_provider_accepts_usage_even_when_stream_usage_not_requested() {
                 usage: Some(Usage {
                     input_tokens: 3,
                     output_tokens: 2,
+                    uncached_input_tokens: None,
                     cached_tokens: None,
+                    cache_write_5m_tokens: None,
+                    cache_write_1h_tokens: None,
                     reasoning_tokens: None,
                 })
             },

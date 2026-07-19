@@ -69,6 +69,8 @@ Euler:
 - Euler's curated default model for each built-in provider;
 - lifecycle state needed to distinguish active, deprecated, and removed
   observations.
+- optional USD-equivalent token-price schedules, with explicit cache-read,
+  short cache-write, one-hour cache-write, and request-wide input-tier rates.
 
 It does not own provider transport, base URLs, authentication, secret
 references, headers, wire-format compatibility, session behavior, or custom
@@ -94,6 +96,15 @@ values. Each published provider section records source URLs, observation time,
 input digests, and generator version in a separate provenance artifact. The
 runtime catalog stays compact and does not expose source machinery to model
 selection.
+
+Pricing follows the same precedence but is field-owned independently from
+capabilities: official provider pricing APIs or documentation are primary;
+router-published prices are primary for router routes; a named, pinned
+secondary catalog may fill only documented gaps. Subscription routes may use
+the corresponding public API schedule as an explicitly labeled equivalent
+estimate. Missing cache or tier rates stay absent rather than becoming zero.
+Every published price record carries its observation/source evidence in the
+provenance artifact.
 
 Only documented machine-readable endpoints may drive unattended catalog
 changes. Human-readable documentation backs reviewed structured overrides;
@@ -160,6 +171,10 @@ At minimum, validation enforces:
 - all published models satisfy Euler's adapter support policy, including tool
   use where required;
 - positive, sane token limits and valid canonical reasoning-effort sets;
+- exact non-negative price decimals with at most six fractional digits;
+  explicit cache-write TTL buckets; and positive, uniquely ascending tier
+  thresholds whose selected schedule applies to the whole request only when
+  total input is strictly above the threshold;
 - minimum per-provider counts and bounded shrink thresholds;
 - a strict schema and artifact-size ceiling;
 - absence of transport, auth, secret, prompt, and executable fields.
@@ -178,6 +193,19 @@ The digest detects corrupt, truncated, or mismatched artifact bytes.
 Authenticity comes from the pinned GitHub repository/release channel and its
 protected publication workflow; a digest served beside an artifact is not by
 itself a signature.
+
+Price schedules are optional model metadata. A catalog release that first
+adds them must raise `minimum_euler_version` to a client that understands the
+strict field and its invariants. Euler computes a quote only when every
+non-zero usage bucket has a rate and checked integer arithmetic succeeds; the
+session persists that quote with its release/local price identity so later
+catalog updates never rewrite historical estimates.
+
+User-owned `models.json` may carry the same strict schedule as advisory
+metadata. Its complete descriptor-replacement semantics still apply: an
+explicit malformed or omitted local schedule does not silently recover a
+different price owner. Valid local schedules are identified in result events
+by a SHA-256 digest of their canonical fixed-point rates and tiers.
 
 ### Euler bootstrap and local ownership
 

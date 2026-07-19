@@ -115,7 +115,12 @@ impl AppCore {
 
     fn update_token_usage_from_event(&mut self, event: &EventEnvelope) {
         let context_window_tokens = self.active_context_window_tokens();
-        update_token_usage(&mut self.token_usage, event, context_window_tokens);
+        update_token_usage(
+            &mut self.token_usage,
+            event,
+            context_window_tokens,
+            self.primary_agent_id.as_deref(),
+        );
     }
 
     /// Working HUD phase verb (issue #27, #62): thinking / exploring /

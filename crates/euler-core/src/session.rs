@@ -26,7 +26,7 @@ use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{
     ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent, ProviderError,
     ProviderSet, ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason,
-    ToolCall, Usage,
+    Usage,
 };
 use euler_sdk::{Capability, EventWakeError, EventWakeRegistration, Extension};
 use round_loop::{
@@ -436,14 +436,16 @@ where
                 .emit_model_reasoning(item, &target, model_call_id.clone())?;
             self.sink.flush(self.session.bus.events());
         }
-        let model_result_id = self.session.emit_model_result(
-            &data.content,
-            &data.tool_calls,
-            stop_reason,
-            data.usage.as_ref(),
-            &target,
-            model_call_id,
-        )?;
+        let model_result_id = self
+            .session
+            .emit_model_result(companion::ModelResultRecord {
+                content: &data.content,
+                tool_calls: &data.tool_calls,
+                stop_reason,
+                usage: data.usage.as_ref(),
+                target: &target,
+                parent: model_call_id,
+            })?;
         self.sink.flush(self.session.bus.events());
         self.session.record_latest_usage(data.usage.as_ref());
         self.session.auto_compact_if_triggered()?;
@@ -1721,38 +1723,12 @@ impl<D: PermissionDecider> Session<D> {
         .map(Some)
     }
 
-    #[allow(clippy::too_many_arguments)] // ratchet: 7 args, refactor target
     fn emit_model_result(
         &mut self,
-        content: &str,
-        tool_calls: &[ToolCall],
-        stop_reason: &StopReason,
-        usage: Option<&Usage>,
-        target: &ModelTarget,
-        parent: String,
+        record: companion::ModelResultRecord<'_>,
     ) -> Result<String, SessionError> {
-        let calls = tool_calls
-            .iter()
-            .map(|call| {
-                json!({
-                    "id": call.id,
-                    "name": call.name,
-                    "input": call.input,
-                })
-            })
-            .collect::<Vec<_>>();
-        self.emit_with_parent(
-            EventKind::MODEL_RESULT,
-            object([
-                ("provider", target.provider.clone().into()),
-                ("model", target.model.clone().into()),
-                ("content", content.to_owned().into()),
-                ("tool_calls", calls.into()),
-                ("stop_reason", stop_reason.as_str().into()),
-                ("usage", companion::usage_payload(usage)),
-            ]),
-            Some(parent),
-        )
+        let payload = companion::model_result_payload(&record, &self.providers);
+        self.emit_with_parent(EventKind::MODEL_RESULT, payload, Some(record.parent))
     }
 
     fn emit_model_delta(

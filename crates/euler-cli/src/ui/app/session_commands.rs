@@ -318,10 +318,13 @@ impl AppCore {
         self.status.provider = provider.clone();
         self.status.model = model.clone();
         if switched {
-            self.token_usage = TokenUsageSnapshot {
-                context_window_tokens: self.active_context_window_tokens(),
-                ..TokenUsageSnapshot::default()
+            let events = match &self.state {
+                AppState::Idle { session } => session.events().to_vec(),
+                _ => Vec::new(),
             };
+            if !events.is_empty() {
+                self.rebuild_transcript_from_events(&events);
+            }
         }
         self.rebuild_bottom_surface();
         match model_preference::save_model_preference_to_default(&provider, &model) {

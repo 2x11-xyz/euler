@@ -2068,7 +2068,10 @@ impl ModelProvider for CapturingProvider {
                     usage: Some(Usage {
                         input_tokens: 1,
                         output_tokens: 1,
+                        uncached_input_tokens: None,
                         cached_tokens: Some(0),
+                        cache_write_5m_tokens: None,
+                        cache_write_1h_tokens: None,
                         reasoning_tokens: Some(0),
                     }),
                 }),

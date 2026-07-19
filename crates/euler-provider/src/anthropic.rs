@@ -734,6 +734,10 @@ struct PartialUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    cache_creation_details_seen: bool,
+    cache_write_5m_tokens: Option<u64>,
+    cache_write_1h_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
 }
 
@@ -751,6 +755,29 @@ impl PartialUsage {
         if let Some(cached_tokens) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
             self.cached_tokens = Some(cached_tokens);
         }
+        if let Some(cache_write_tokens) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.cache_write_tokens = Some(cache_write_tokens);
+        }
+        if usage.get("cache_creation").is_some_and(Value::is_object) {
+            self.cache_creation_details_seen = true;
+        }
+        if let Some(cache_write_5m_tokens) = usage
+            .get("cache_creation")
+            .and_then(|creation| creation.get("ephemeral_5m_input_tokens"))
+            .and_then(Value::as_u64)
+        {
+            self.cache_write_5m_tokens = Some(cache_write_5m_tokens);
+        }
+        if let Some(cache_write_1h_tokens) = usage
+            .get("cache_creation")
+            .and_then(|creation| creation.get("ephemeral_1h_input_tokens"))
+            .and_then(Value::as_u64)
+        {
+            self.cache_write_1h_tokens = Some(cache_write_1h_tokens);
+        }
         if let Some(reasoning_tokens) = usage
             .get("output_tokens_details")
             .and_then(|details| details.get("thinking_tokens"))
@@ -761,10 +788,37 @@ impl PartialUsage {
     }
 
     fn finish(&self) -> Option<Usage> {
+        let uncached = self.input_tokens?;
+        let cache_read = self.cached_tokens.unwrap_or(0);
+        let detailed_write = self
+            .cache_write_5m_tokens
+            .unwrap_or(0)
+            .checked_add(self.cache_write_1h_tokens.unwrap_or(0))?;
+        let cache_write = self.cache_write_tokens.unwrap_or(detailed_write);
+        let input_tokens = uncached.checked_add(cache_read)?.checked_add(cache_write)?;
+        let cache_write_5m = self.cache_write_5m_tokens.unwrap_or(0);
+        let cache_write_1h = self.cache_write_1h_tokens.unwrap_or(0);
+        let split_sum = cache_write_5m.checked_add(cache_write_1h);
+        let valid_breakdown = cache_write == 0
+            || (self.cache_creation_details_seen && split_sum == Some(cache_write));
+        let (uncached_input_tokens, cached_tokens, cache_write_5m_tokens, cache_write_1h_tokens) =
+            if valid_breakdown {
+                (
+                    Some(uncached),
+                    Some(cache_read),
+                    Some(cache_write_5m),
+                    Some(cache_write_1h),
+                )
+            } else {
+                (None, None, None, None)
+            };
         Some(Usage {
-            input_tokens: self.input_tokens?,
+            input_tokens,
             output_tokens: self.output_tokens?,
-            cached_tokens: self.cached_tokens,
+            uncached_input_tokens,
+            cached_tokens,
+            cache_write_5m_tokens,
+            cache_write_1h_tokens,
             reasoning_tokens: self.reasoning_tokens,
         })
     }
