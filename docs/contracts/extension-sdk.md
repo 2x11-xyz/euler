@@ -313,7 +313,8 @@ otherwise carry their own explicit runtime configuration.
 in `needs-review`; `validate`, `link`, and `info` expose its exact argv, and
 `enable` echoes that argv while recording explicit local launch consent.
 `disable` and `reload` return it to `needs-review`. Installed packages remain
-inert in this slice. This consent is separate from capabilities: each
+inert in this slice (Extension Distribution v1 below binds the flow that will
+make them enableable). This consent is separate from capabilities: each
 invocation is still checked against its command's declared capability subset.
 
 This runtime is a process-management boundary, not OS-level containment. It is
@@ -326,6 +327,92 @@ child—it never signals a process group after reaping its leader, because that
 numeric id could be reused. A successful package must therefore clean up its
 own children. Sandboxing untrusted third-party code, including filesystem or
 network isolation, remains a separate security milestone.
+
+## Extension Distribution v1 (binding shape)
+
+ADR 0015 governs distribution; this section binds its concrete shape.
+Implementation status: the link lane is complete (link, review, enable with
+launch consent, run). `extension install <path>` records an `installed-inert`
+entry that `enable` refuses because the install consent flow below does not
+exist yet. Git sources, the store reconciler, materialization, update, and the
+project tier are unimplemented; this section binds their eventual shape, not
+their present existence (issue #159).
+
+### Sources and pins
+
+A source names where extension content comes from:
+
+- `git:<host>/<path>@<ref>` — cloned into the store. `<ref>` may be a tag,
+  a commit, or a branch name.
+- `path:<dir>` — referenced in place, for local development. `extension link`
+  remains sugar for a single-extension `path:` source.
+
+Every install resolves the ref to an exact commit — the **pin** — and records
+it. A tag or commit ref is a *pinned spec*: `update` skips it entirely. A
+branch ref is a *tracking spec*: it is an update candidate, but only under the
+explicit `update` verb. Nothing in Euler ever moves a pin without an explicit
+user command; reproducibility of installed extensions is a contract property,
+not a configuration option.
+
+One source may provide several extensions. A source-level manifest
+(`Euler.source.json`) lists provided extension directories, themes, and
+templates; absent that manifest, discovery is conventional:
+`extensions/*/Euler.extension.json`. Extension identity remains the extension
+manifest id. The same id offered by two sources is a surfaced conflict, never
+a silent override; ids reserved by bundled extensions stay refused until the
+bundled crate is removed (ADR 0015 amendment).
+
+### Store
+
+`~/.euler/extensions/` holds installed content, source-addressed: one
+directory per (source, pin), immutable after materialization. Reinstalling
+the same (source, pin) reuses the directory; `remove` deletes it and its
+registry entry. The registry (enablement log, fingerprints, consent records)
+remains the single authority over what is enabled; store presence alone
+grants nothing.
+
+### Materialization
+
+A source declares how its entrypoints are built (bounded argv steps, e.g.
+`cargo build --release`) and which toolchains those steps require. Install
+verifies the toolchains first and fails naming the missing tool. Builds run
+at install time only — never at load, enable, or session start — and only
+after install consent (capability contract). A failed build fails the
+install; nothing is registered or enabled. Entrypoints remain argv; the
+managed-process protocol stays the only load boundary.
+
+### Update semantics
+
+`extension update` is always explicit and interactive. It skips pinned specs,
+and for tracking specs it presents what would move — old pin, new pin, and a
+manifest diff when the manifest changed — before touching anything. Consent is
+keyed to the pinned content fingerprint (ADR 0015 decision 4), so any content
+movement requires re-consent: an unchanged manifest does not make new code
+safe, because declared builds execute source-controlled build logic. A moved
+pin whose manifest also changed must render the manifest diff prominently in
+the consent card.
+
+### Project tier
+
+`.euler/` in a workspace may declare sources and activation deltas
+(`.euler/extensions.json`). The file is repo-controlled content and is never
+authority on its own — the same two-party rule as project grants: entering a
+directory never fetches, builds, or runs anything. In a trusted project,
+startup reconciles declarations against the store and *offers* missing
+installs through the ordinary install consent flow; there is no silent
+auto-install. Project deltas apply over the user's global set; the project
+entry wins on conflict, and conflicts are surfaced.
+
+### Dev lane and provenance honesty
+
+Linked (`path:`) extensions run unpinned working-tree code. Their lightweight
+grant is the existing launch consent: `enable` echoes the exact argv and
+records consent for that path once; rebuilds and re-runs never re-prompt.
+Extension-attributed events and artifacts must record distribution identity:
+source and pin for installed extensions, and an explicit linked-path marker
+(never a fabricated pin) for linked ones, so a reader can always distinguish
+a result produced by a released extension from one produced by a dev tree.
+Exact event field names bind with the implementing slice.
 
 ## Command Invocation v0
 
