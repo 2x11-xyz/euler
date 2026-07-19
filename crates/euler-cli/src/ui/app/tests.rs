@@ -2403,7 +2403,7 @@ fn new_session_reuses_target_and_purges_visual_history() {
         core.status.session_id.as_deref(),
         Some(session.session_id())
     );
-    assert_eq!(core.token_usage.session_cost_nanos, 0);
+    assert_eq!(core.token_usage.session_cost_picos, 0);
     assert_eq!(core.token_usage.priced_calls, 0);
     assert_eq!(core.token_usage.unpriced_calls, 0);
 }
@@ -4053,7 +4053,7 @@ fn persisted_model_results_rebuild_footer_cost_on_resume() {
 
     core.rebuild_transcript_from_events(&events);
 
-    assert_eq!(core.token_usage.session_cost_nanos, 6_200_000);
+    assert_eq!(core.token_usage.session_cost_picos, 6_200_000_000);
     assert_eq!(core.token_usage.priced_calls, 1);
     assert!(core
         .canvas_status_snapshot(120)

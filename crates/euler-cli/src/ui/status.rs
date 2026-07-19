@@ -40,9 +40,9 @@ pub struct TokenUsageSnapshot {
     pub canvas_retained_bytes: Option<u64>,
     pub canvas_budget_bytes: Option<u64>,
     pub compaction_tier: Option<String>,
-    /// Cumulative USD in billionths (nano-dollars), computed from the model
+    /// Cumulative USD in trillionths (pico-dollars), computed from the model
     /// metadata attached to each persisted model result.
-    pub session_cost_nanos: u64,
+    pub session_cost_picos: u64,
     pub priced_calls: u64,
     pub unpriced_calls: u64,
 }
@@ -320,13 +320,13 @@ fn identity_cost_label(tokens: &TokenUsageSnapshot) -> Option<String> {
     match (tokens.priced_calls, tokens.unpriced_calls) {
         (0, 0) => None,
         (0, _) => Some("$?".to_owned()),
-        (_, 0) => Some(format_cost(tokens.session_cost_nanos)),
-        (_, _) => Some(format!("{}+", format_cost(tokens.session_cost_nanos))),
+        (_, 0) => Some(format_cost(tokens.session_cost_picos)),
+        (_, _) => Some(format!("{}+", format_cost(tokens.session_cost_picos))),
     }
 }
 
-fn format_cost(nanos: u64) -> String {
-    format!("${:.3}", nanos as f64 / 1_000_000_000.0)
+fn format_cost(picos: u64) -> String {
+    format!("${:.3}", picos as f64 / 1_000_000_000_000.0)
 }
 
 /// Right cluster, flush-right: `model(effort) · ctx N%` [· `$N.NNN`] [+ session
@@ -725,7 +725,7 @@ mod tests {
     fn statusline_shows_pi_style_cumulative_dollar_cost() {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
         let tokens = TokenUsageSnapshot {
-            session_cost_nanos: 12_345_600_000,
+            session_cost_picos: 12_345_600_000_000,
             priced_calls: 3,
             ..TokenUsageSnapshot::default()
         };
@@ -748,7 +748,7 @@ mod tests {
         );
 
         let partial = TokenUsageSnapshot {
-            session_cost_nanos: 1_250_000_000,
+            session_cost_picos: 1_250_000_000_000,
             priced_calls: 1,
             unpriced_calls: 2,
             ..TokenUsageSnapshot::default()

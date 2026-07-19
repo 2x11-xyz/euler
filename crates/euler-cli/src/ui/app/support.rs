@@ -101,7 +101,7 @@ pub(super) fn update_token_usage(
         tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1);
         return;
     };
-    let nanos = model_result_cost_nanos(
+    let picos = model_result_cost_picos(
         provider,
         cost,
         input_tokens,
@@ -110,7 +110,7 @@ pub(super) fn update_token_usage(
         cache_write_tokens,
         cache_write_1h_tokens,
     );
-    tokens.session_cost_nanos = tokens.session_cost_nanos.saturating_add(nanos);
+    tokens.session_cost_picos = tokens.session_cost_picos.saturating_add(picos);
     tokens.priced_calls = tokens.priced_calls.saturating_add(1);
 }
 
@@ -123,7 +123,7 @@ fn model_cost(catalog: &MergedModelCatalog, provider: &str, model: &str) -> Opti
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors pi's four usage counters plus target
-fn model_result_cost_nanos(
+fn model_result_cost_picos(
     provider: &str,
     cost: ModelCost,
     input_tokens: u64,
@@ -147,9 +147,9 @@ fn model_result_cost_nanos(
     );
     let long_write = cache_write_1h_tokens.min(cache_write_tokens);
     let short_write = cache_write_tokens.saturating_sub(long_write);
-    // A rate unit is $0.001 per million tokens, which is exactly one
-    // nano-dollar per token. Integer arithmetic therefore preserves every
-    // catalog rate without floating-point drift.
+    // A rate unit is $0.000001 per million tokens, which is exactly one
+    // pico-dollar per token. Integer arithmetic therefore preserves all six
+    // decimal places accepted from models.dev without accumulation drift.
     ordinary_input
         .saturating_mul(rates.input)
         .saturating_add(output_tokens.saturating_mul(rates.output))
@@ -509,35 +509,44 @@ mod tests {
     fn pi_cost_math_prices_cached_input_at_the_cache_rate() {
         let cost = ModelCost::new(5.0, 30.0, 0.5, 6.25);
 
-        let openai = model_result_cost_nanos("openai", cost, 1_000, 100, 400, 0, 0);
-        let anthropic = model_result_cost_nanos("anthropic", cost, 600, 100, 400, 0, 0);
+        let openai = model_result_cost_picos("openai", cost, 1_000, 100, 400, 0, 0);
+        let anthropic = model_result_cost_picos("anthropic", cost, 600, 100, 400, 0, 0);
 
-        // 600 ordinary input * 5000 nanos + 100 output * 30000 nanos
-        // + 400 cached input * 500 nanos = $0.0062.
-        assert_eq!(openai, 6_200_000);
-        assert_eq!(anthropic, 6_200_000);
+        // 600 ordinary input * 5000000 picos + 100 output * 30000000 picos
+        // + 400 cached input * 500000 picos = $0.0062.
+        assert_eq!(openai, 6_200_000_000);
+        assert_eq!(anthropic, 6_200_000_000);
     }
 
     #[test]
     fn pi_cost_math_prices_anthropic_cache_writes() {
         let cost = ModelCost::new(2.0, 10.0, 0.2, 2.5);
 
-        let nanos = model_result_cost_nanos("anthropic", cost, 100, 10, 20, 40, 10);
+        let picos = model_result_cost_picos("anthropic", cost, 100, 10, 20, 40, 10);
 
         // $0.0002 input + $0.0001 output + $0.000004 read + $0.000075
         // short write + $0.00004 one-hour write (2x input rate).
-        assert_eq!(nanos, 419_000);
+        assert_eq!(picos, 419_000_000);
     }
 
     #[test]
     fn pi_cost_math_uses_request_wide_long_context_tier() {
         let cost = ModelCost::with_tier(2.5, 15.0, 0.25, 0.0, 272_000, 5.0, 22.5, 0.5, 0.0);
 
-        let at_threshold = model_result_cost_nanos("openai", cost, 272_000, 10, 0, 0, 0);
-        let over_threshold = model_result_cost_nanos("openai", cost, 272_001, 10, 0, 0, 0);
+        let at_threshold = model_result_cost_picos("openai", cost, 272_000, 10, 0, 0, 0);
+        let over_threshold = model_result_cost_picos("openai", cost, 272_001, 10, 0, 0, 0);
 
-        assert_eq!(at_threshold, 680_150_000);
-        assert_eq!(over_threshold, 1_360_230_000);
+        assert_eq!(at_threshold, 680_150_000_000);
+        assert_eq!(over_threshold, 1_360_230_000_000);
+    }
+
+    #[test]
+    fn cost_math_preserves_six_decimal_model_rates() {
+        let cost = ModelCost::new(0.07696, 0.0, 0.0, 0.0);
+
+        let picos = model_result_cost_picos("openrouter", cost, 1, 0, 0, 0, 0);
+
+        assert_eq!(picos, 76_960);
     }
 
     #[test]
@@ -580,7 +589,7 @@ mod tests {
         update_token_usage(&mut tokens, &priced, Some(1_000_000), &catalog);
         update_token_usage(&mut tokens, &unpriced, None, &catalog);
 
-        assert_eq!(tokens.session_cost_nanos, 6_200_000);
+        assert_eq!(tokens.session_cost_picos, 6_200_000_000);
         assert_eq!(tokens.priced_calls, 1);
         assert_eq!(tokens.unpriced_calls, 1);
     }

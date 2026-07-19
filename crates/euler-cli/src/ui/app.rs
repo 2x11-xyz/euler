@@ -2975,7 +2975,7 @@ fn format_usage_from_snapshot(tokens: &TokenUsageSnapshot, status: &StatusSnapsh
     lines.push(format!(
         "  cost:      {}",
         usage_cost_text(
-            tokens.session_cost_nanos,
+            tokens.session_cost_picos,
             tokens.priced_calls,
             tokens.unpriced_calls
         )
@@ -3038,7 +3038,7 @@ fn format_session_usage(
     let mut lines = vec![format!(
         "usage · session totals · {}",
         usage_cost_text(
-            live.session_cost_nanos,
+            live.session_cost_picos,
             live.priced_calls,
             live.unpriced_calls
         )
@@ -3054,8 +3054,8 @@ fn format_session_usage(
     lines.join("\n")
 }
 
-fn usage_cost_text(nanos: u64, priced_calls: u64, unpriced_calls: u64) -> String {
-    let dollars = nanos as f64 / 1_000_000_000.0;
+fn usage_cost_text(picos: u64, priced_calls: u64, unpriced_calls: u64) -> String {
+    let dollars = picos as f64 / 1_000_000_000_000.0;
     match (priced_calls, unpriced_calls) {
         (0, 0) => "cost unavailable".to_owned(),
         (0, _) => "cost $?".to_owned(),
