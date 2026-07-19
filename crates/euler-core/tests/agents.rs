@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[test]
 fn spawn_agent_records_parent_authored_event() {
@@ -984,19 +985,27 @@ fn event_index(events: &[EventEnvelope], event_id: &str) -> usize {
 // duration proxy, not synchronization: under load the worker can be slow to
 // first schedule, and the main thread would burn through all 10_000 near-free
 // yields before the worker ever ran, panicking on a report that was merely
-// late (issue #4). Looping until the state itself changes removes
-// the false deadline; nextest's per-test timeout remains the backstop against
-// a genuine hang, and an early `Closed`/disconnect still fails loudly.
+// late (issue #4). Looping on the state itself removes the false deadline;
+// the 30s liveness deadline below is a hang detector, orders of magnitude
+// past healthy in-process delivery, so a regression fails loudly instead of
+// wedging the job. An early `Closed`/disconnect still fails loudly too.
 fn poll_until_recorded(
     session: &mut Session<ScriptedDecider>,
     background: &mut euler_core::BackgroundAgent,
 ) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match session
             .poll_background_agent(background)
             .expect("poll background")
         {
-            BackgroundAgentPoll::Pending => thread::yield_now(),
+            BackgroundAgentPoll::Pending => {
+                assert!(
+                    Instant::now() < deadline,
+                    "background result was not recorded within 30s"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
             BackgroundAgentPoll::Recorded { result_event_id }
             | BackgroundAgentPoll::AlreadyRecorded { result_event_id } => return result_event_id,
         }
@@ -1007,13 +1016,20 @@ fn drain_until_drained(
     session: &mut Session<ScriptedDecider>,
     background: &mut euler_core::BackgroundAgent,
 ) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match session
             .drain_background_agent_report(background)
             .expect("drain background report")
         {
             BackgroundAgentReportDrain::Drained { message_event_id } => return message_event_id,
-            BackgroundAgentReportDrain::Empty => thread::yield_now(),
+            BackgroundAgentReportDrain::Empty => {
+                assert!(
+                    Instant::now() < deadline,
+                    "background report was not drained within 30s"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
             BackgroundAgentReportDrain::Closed => panic!("report queue closed before message"),
         }
     }

@@ -11446,21 +11446,32 @@ fn lock_owner_pid(lock: &Path) -> Option<u32> {
 /// The old tests polled `lock.exists()` under a fixed 1s window, which raced
 /// first-process startup under load (issue #145: "first euler did not create
 /// its lock") and also admitted the window between lock-file creation and flock
-/// acquisition. Waiting for the owner record closes both gaps. There is no time
-/// bound: either the lock becomes held, or `first` exits before acquiring it
-/// (surfaced here so the failure is attributed to the writer, not to a
-/// downstream contention miss); nextest's per-test timeout backstops a hang.
+/// acquisition. Waiting for the owner record closes both gaps. The record must
+/// carry `first`'s own PID: core writes the metadata best-effort and calls it
+/// non-authoritative, so equality is what ties the observed record to the
+/// process this test spawned rather than to any stale or foreign writer. The
+/// 60s liveness deadline is a hang detector, not a duration proxy — healthy
+/// startup is under a second even on a loaded runner — and it keeps a
+/// regression a clear failure instead of a stuck job.
 fn wait_until_session_lock_held(lock: &Path, first: &mut std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if lock_owner_pid(lock).is_some() {
+        let observed = lock_owner_pid(lock);
+        if observed == Some(first.id()) {
             return;
         }
         if let Some(status) = first.try_wait().expect("poll first euler for lock") {
             panic!("first euler exited before acquiring its session lock: {status}");
         }
+        assert!(
+            Instant::now() < deadline,
+            "first euler (pid {}) did not hold its session lock within 60s; \
+             observed owner record: {observed:?}",
+            first.id()
+        );
         // Polite poll: a sleep genuinely deschedules (yield_now need not, per
         // the drain-helper rationale) so this loop cannot compete with the
-        // very process startup it is waiting on. Still no deadline.
+        // very process startup it is waiting on.
         thread::sleep(Duration::from_millis(5));
     }
 }

@@ -1,0 +1,8 @@
+# Hang backstop. Nextest's DEFAULT slow-timeout only warns at 60s and never
+# terminates, so an accidentally unbounded wait would wedge CI instead of
+# failing it. Warn at 60s, terminate after 4 periods (240s). Individual test
+# waits carry their own tighter liveness deadlines; this is the last line of
+# defense, generous enough for the heaviest legitimate suites (PTY, spawned
+# full-binary integration runs).
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 4 }
