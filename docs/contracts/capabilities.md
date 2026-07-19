@@ -107,6 +107,45 @@ is the command protocol): there, explicitly invoking a named command grants
 its declared capabilities for that run, announced on stderr — visible, never
 silent.
 
+## Install consent (extension distribution)
+
+Installing an extension involves three distinct consents that must never be
+merged into one record:
+
+1. **Install consent** (this section): agreeing to fetch a pinned source and
+   run its declared build steps. An install-time build is arbitrary code
+   execution and is treated as such (ADR 0015).
+2. **Launch consent**: the existing per-extension enable step that echoes the
+   exact argv (managed-process runtime contract).
+3. **Capability approval**: the per-command operation prompts above, at use
+   time.
+
+Install consent is recorded against the pinned content fingerprint of the
+source. A changed fingerprint — any content movement, not only a manifest
+change — requires fresh consent, because declared builds execute
+source-controlled build logic. Consent for one fingerprint never covers
+another.
+
+The consent card must show, before anything runs: the source and resolved
+pin, every declared build argv, the toolchains it requires, the extension
+ids provided with their capability envelopes, and (on update) the manifest
+diff when the manifest changed. Consent decisions are recorded as provenance
+events like every other permission decision.
+
+Presentation has two profiles, a user-level setting:
+
+- `standard` (default): one combined card covering fetch, build, and
+  execution grant; a single approval completes the install.
+- `granular`: separate confirmation at each stage (fetch, build, grant) for
+  users who want to inspect intermediate results.
+
+Both profiles gather the same consents; the profile changes prompt
+granularity, never authority. **First contact is never automatic**: no
+profile, tier, posture, or project trust may skip consent for a fingerprint
+the user has not approved on this machine. Automation is permissible only
+for re-materializing an already-consented fingerprint (for example,
+reinstalling on a store wipe).
+
 ## Scoped Grants
 
 Capability modes are the coarse gate. **Scoped grants** sit above `ask`: when a
