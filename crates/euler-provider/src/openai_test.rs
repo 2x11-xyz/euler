@@ -105,6 +105,7 @@ data: [DONE]
                     input_tokens: 10,
                     output_tokens: 4,
                     cached_tokens: Some(3),
+                    cache_write_tokens: None,
                     reasoning_tokens: Some(1),
                 }),
             }),

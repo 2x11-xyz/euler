@@ -9,9 +9,9 @@ pull requests that landed them; deeper design rationale lives in
 ### Footer cost
 
 - The TUI footer now shows cumulative model cost in USD beside context usage,
-  using pi-compatible per-model input, output, cache-read, and long-context
-  pricing. Totals include companion calls, survive model switches and resume,
-  and explicitly mark sessions containing unpriced calls.
+  using pi-compatible per-model input, output, cache-read, cache-write, and
+  long-context pricing. Totals include companion calls, survive model switches
+  and resume, and explicitly mark sessions containing unpriced calls.
 
 ### Mid-turn steering (#147)
 

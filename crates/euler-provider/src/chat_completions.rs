@@ -797,6 +797,7 @@ fn usage(value: Option<&Value>) -> Option<Usage> {
                     .and_then(|details| details.get("cached_tokens"))
                     .and_then(Value::as_u64)
             }),
+        cache_write_tokens: None,
         reasoning_tokens: usage
             .get("reasoning_tokens")
             .and_then(Value::as_u64)

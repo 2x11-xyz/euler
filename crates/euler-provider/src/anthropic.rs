@@ -734,6 +734,7 @@ struct PartialUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
 }
 
@@ -751,6 +752,12 @@ impl PartialUsage {
         if let Some(cached_tokens) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
             self.cached_tokens = Some(cached_tokens);
         }
+        if let Some(cache_write_tokens) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.cache_write_tokens = Some(cache_write_tokens);
+        }
         if let Some(reasoning_tokens) = usage
             .get("output_tokens_details")
             .and_then(|details| details.get("thinking_tokens"))
@@ -765,6 +772,7 @@ impl PartialUsage {
             input_tokens: self.input_tokens?,
             output_tokens: self.output_tokens?,
             cached_tokens: self.cached_tokens,
+            cache_write_tokens: self.cache_write_tokens,
             reasoning_tokens: self.reasoning_tokens,
         })
     }

@@ -93,13 +93,21 @@ pub(super) fn update_token_usage(
     let provider = event.payload.get("provider").and_then(Value::as_str);
     let model = event.payload.get("model").and_then(Value::as_str);
     let cached_tokens = usage_u64(usage, "cached_tokens").unwrap_or(0);
+    let cache_write_tokens = usage_u64(usage, "cache_write_tokens").unwrap_or(0);
     let Some((provider, cost)) = provider.zip(model).and_then(|(provider, model)| {
         model_cost(model_catalog, provider, model).map(|cost| (provider, cost))
     }) else {
         tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1);
         return;
     };
-    let nanos = model_result_cost_nanos(provider, cost, input_tokens, output_tokens, cached_tokens);
+    let nanos = model_result_cost_nanos(
+        provider,
+        cost,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        cache_write_tokens,
+    );
     tokens.session_cost_nanos = tokens.session_cost_nanos.saturating_add(nanos);
     tokens.priced_calls = tokens.priced_calls.saturating_add(1);
 }
@@ -118,6 +126,7 @@ fn model_result_cost_nanos(
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    cache_write_tokens: u64,
 ) -> u64 {
     let (ordinary_input, cache_read) = if provider == "anthropic" {
         (input_tokens, cached_tokens)
@@ -135,6 +144,7 @@ fn model_result_cost_nanos(
         .saturating_mul(rates.input)
         .saturating_add(output_tokens.saturating_mul(rates.output))
         .saturating_add(cache_read.saturating_mul(rates.cache_read))
+        .saturating_add(cache_write_tokens.saturating_mul(rates.cache_write))
 }
 
 pub(super) fn read_terminal_event() -> Result<Option<UiEvent>> {
@@ -486,10 +496,10 @@ mod tests {
 
     #[test]
     fn pi_cost_math_prices_cached_input_at_the_cache_rate() {
-        let cost = ModelCost::new(5.0, 30.0, 0.5);
+        let cost = ModelCost::new(5.0, 30.0, 0.5, 6.25);
 
-        let openai = model_result_cost_nanos("openai", cost, 1_000, 100, 400);
-        let anthropic = model_result_cost_nanos("anthropic", cost, 600, 100, 400);
+        let openai = model_result_cost_nanos("openai", cost, 1_000, 100, 400, 0);
+        let anthropic = model_result_cost_nanos("anthropic", cost, 600, 100, 400, 0);
 
         // 600 ordinary input * 5000 nanos + 100 output * 30000 nanos
         // + 400 cached input * 500 nanos = $0.0062.
@@ -498,11 +508,21 @@ mod tests {
     }
 
     #[test]
-    fn pi_cost_math_uses_request_wide_long_context_tier() {
-        let cost = ModelCost::with_tier(2.5, 15.0, 0.25, 272_000, 5.0, 22.5, 0.5);
+    fn pi_cost_math_prices_anthropic_cache_writes() {
+        let cost = ModelCost::new(2.0, 10.0, 0.2, 2.5);
 
-        let at_threshold = model_result_cost_nanos("openai", cost, 272_000, 10, 0);
-        let over_threshold = model_result_cost_nanos("openai", cost, 272_001, 10, 0);
+        let nanos = model_result_cost_nanos("anthropic", cost, 100, 10, 20, 40);
+
+        // $0.0002 input + $0.0001 output + $0.000004 read + $0.0001 write.
+        assert_eq!(nanos, 404_000);
+    }
+
+    #[test]
+    fn pi_cost_math_uses_request_wide_long_context_tier() {
+        let cost = ModelCost::with_tier(2.5, 15.0, 0.25, 0.0, 272_000, 5.0, 22.5, 0.5, 0.0);
+
+        let at_threshold = model_result_cost_nanos("openai", cost, 272_000, 10, 0, 0);
+        let over_threshold = model_result_cost_nanos("openai", cost, 272_001, 10, 0, 0);
 
         assert_eq!(at_threshold, 680_150_000);
         assert_eq!(over_threshold, 1_360_230_000);

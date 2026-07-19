@@ -353,6 +353,9 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: Option<u64>,
+    /// Provider-reported prompt-cache creation tokens. Anthropic exposes this
+    /// separately from ordinary and cache-read input; most providers omit it.
+    pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -764,6 +767,7 @@ fn synthetic_usage(input: &str, output: &str) -> Usage {
         input_tokens: input.split_whitespace().count() as u64,
         output_tokens: output.split_whitespace().count() as u64,
         cached_tokens: Some(0),
+        cache_write_tokens: Some(0),
         reasoning_tokens: Some(0),
     }
 }

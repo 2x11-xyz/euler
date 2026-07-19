@@ -180,6 +180,10 @@ fn model_json(model: &ModelDescriptor, is_default: bool) -> Value {
             "cache_read".to_owned(),
             json!(cost_rate_dollars_per_million(cost.rates.cache_read)),
         );
+        value.insert(
+            "cache_write".to_owned(),
+            json!(cost_rate_dollars_per_million(cost.rates.cache_write)),
+        );
         if let Some(tier) = cost.tier {
             value.insert(
                 "tiers".to_owned(),
@@ -188,6 +192,7 @@ fn model_json(model: &ModelDescriptor, is_default: bool) -> Value {
                     "input": cost_rate_dollars_per_million(tier.rates.input),
                     "output": cost_rate_dollars_per_million(tier.rates.output),
                     "cache_read": cost_rate_dollars_per_million(tier.rates.cache_read),
+                    "cache_write": cost_rate_dollars_per_million(tier.rates.cache_write),
                 }]),
             );
         }

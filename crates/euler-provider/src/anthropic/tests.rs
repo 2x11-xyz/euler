@@ -363,7 +363,7 @@ fn same_model_tool_loop_request_matches_probe_shape() {
 fn stream_parses_text_usage_and_completion() {
     let mut parser = AnthropicSseParser::new();
     let events = parser.feed(
-        br#"data: {"type":"message_start","message":{"usage":{"input_tokens":8,"cache_read_input_tokens":3}}}
+        br#"data: {"type":"message_start","message":{"usage":{"input_tokens":8,"cache_read_input_tokens":3,"cache_creation_input_tokens":4}}}
 
 data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
 
@@ -391,6 +391,7 @@ data: {"type":"message_stop"}
                     input_tokens: 8,
                     output_tokens: 2,
                     cached_tokens: Some(3),
+                    cache_write_tokens: Some(4),
                     reasoning_tokens: Some(1),
                 }),
             }),
@@ -431,6 +432,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
                     input_tokens: 4,
                     output_tokens: 3,
                     cached_tokens: None,
+                    cache_write_tokens: None,
                     reasoning_tokens: None,
                 }),
             }),
@@ -491,6 +493,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"outpu
                     input_tokens: 10,
                     output_tokens: 8,
                     cached_tokens: None,
+                    cache_write_tokens: None,
                     reasoning_tokens: None,
                 }),
             }),
@@ -545,6 +548,7 @@ fn stream_maps_stop_reasons() {
                     input_tokens: 1,
                     output_tokens: 1,
                     cached_tokens: None,
+                    cache_write_tokens: None,
                     reasoning_tokens: None,
                 }),
             })]

@@ -2069,6 +2069,7 @@ impl ModelProvider for CapturingProvider {
                         input_tokens: 1,
                         output_tokens: 1,
                         cached_tokens: Some(0),
+                        cache_write_tokens: None,
                         reasoning_tokens: Some(0),
                     }),
                 }),
