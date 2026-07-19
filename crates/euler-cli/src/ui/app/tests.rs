@@ -117,19 +117,7 @@ fn installed_catalog_reaches_idle_session_reasoning_policy() {
         ReasoningEffort::XLarge
     );
 
-    let mut document: serde_json::Value =
-        serde_json::from_str(EMBEDDED_CATALOG_JSON).expect("embedded catalog");
-    let model = document["providers"]["chatgpt"]["models"]
-        .as_array_mut()
-        .expect("ChatGPT models")
-        .iter_mut()
-        .find(|model| model["id"] == "gpt-5.5")
-        .expect("GPT-5.5");
-    model["reasoning_efforts"] = json!(["max"]);
-    let updated = MergedModelCatalog::from_official_json(
-        &serde_json::to_string(&document).expect("updated catalog JSON"),
-    )
-    .expect("updated catalog");
+    let updated = catalog_with_reasoning_efforts("chatgpt", "gpt-5.5", &["max"]);
 
     core.install_model_catalog(updated);
 
@@ -147,6 +135,67 @@ fn installed_catalog_reaches_idle_session_reasoning_policy() {
             .supported_reasoning_efforts("chatgpt", "gpt-5.5"),
         &[ReasoningEffort::Max]
     );
+}
+
+#[test]
+fn installed_catalog_reaches_worker_session_at_the_turn_boundary() {
+    let mut core = core_with_provider_model_at(ChatGptEchoProvider, "gpt-5.5", ".");
+    let session = core.take_idle_session();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.install_model_catalog(catalog_with_reasoning_efforts(
+        "chatgpt",
+        "gpt-5.5",
+        &["max"],
+    ));
+
+    // The worker keeps one coherent policy for its active turn.
+    assert_eq!(
+        session
+            .providers()
+            .clamp_reasoning_effort("chatgpt", "gpt-5.5", ReasoningEffort::Max,),
+        ReasoningEffort::XLarge
+    );
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("returned worker session must be idle");
+    };
+    assert_eq!(
+        session
+            .providers()
+            .clamp_reasoning_effort("chatgpt", "gpt-5.5", ReasoningEffort::Max,),
+        ReasoningEffort::Max
+    );
+}
+
+fn catalog_with_reasoning_efforts(
+    provider: &str,
+    model_id: &str,
+    efforts: &[&str],
+) -> MergedModelCatalog {
+    let mut document: serde_json::Value =
+        serde_json::from_str(EMBEDDED_CATALOG_JSON).expect("embedded catalog");
+    let model = document["providers"][provider]["models"]
+        .as_array_mut()
+        .expect("provider models")
+        .iter_mut()
+        .find(|model| model["id"] == model_id)
+        .expect("catalog model");
+    model["reasoning_efforts"] = json!(efforts);
+    MergedModelCatalog::from_official_json(
+        &serde_json::to_string(&document).expect("updated catalog JSON"),
+    )
+    .expect("updated catalog")
 }
 
 fn fixture_catalog_with_windows(models: &[(&str, u64)]) -> MergedModelCatalog {

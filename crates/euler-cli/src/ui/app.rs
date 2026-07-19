@@ -1227,6 +1227,9 @@ impl AppCore {
         if let AppState::Idle { session } = &mut self.state {
             session.set_model_catalog(self.model_catalog.clone());
         }
+        // A worker owns the session while a turn is in flight. Keep that
+        // turn's routing policy coherent; `accept_worker_session_or_continue`
+        // installs the latest catalog before any queued or subsequent turn starts.
         self.token_usage.context_window_tokens = self.active_context_window_tokens();
         self.rebuild_bottom_surface();
     }
