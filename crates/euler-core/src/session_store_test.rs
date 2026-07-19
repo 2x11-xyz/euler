@@ -1218,7 +1218,10 @@ fn submit_path_touch_never_projects_event_logs_regardless_of_store_size() {
     let sessions = seed_sessions_with_events(&store, 24);
     let active = &sessions[0];
     // Realistic open/resume: warm the active session's sidecar once.
-    store.find_session(active.id()).expect("find").expect("record");
+    store
+        .find_session(active.id())
+        .expect("find")
+        .expect("record");
 
     reset_event_log_projections();
     for _ in 0..5 {
@@ -1244,7 +1247,10 @@ fn find_session_projects_only_the_requested_session_not_the_whole_store() {
     let target = &sessions[12];
 
     reset_event_log_projections();
-    store.find_session(target.id()).expect("find").expect("record");
+    store
+        .find_session(target.id())
+        .expect("find")
+        .expect("record");
     assert_eq!(
         event_log_projections(),
         1,
@@ -1252,7 +1258,10 @@ fn find_session_projects_only_the_requested_session_not_the_whole_store() {
     );
 
     reset_event_log_projections();
-    store.find_session(target.id()).expect("find").expect("record");
+    store
+        .find_session(target.id())
+        .expect("find")
+        .expect("record");
     assert_eq!(
         event_log_projections(),
         0,
