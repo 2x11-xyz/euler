@@ -2401,6 +2401,9 @@ fn new_session_reuses_target_and_purges_visual_history() {
         core.status.session_id.as_deref(),
         Some(session.session_id())
     );
+    assert_eq!(core.token_usage.session_cost_nanos, 0);
+    assert_eq!(core.token_usage.priced_calls, 0);
+    assert_eq!(core.token_usage.unpriced_calls, 0);
 }
 
 #[test]
@@ -4014,13 +4017,47 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     assert_eq!(
         rendered,
         format!(
-            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
-            " ".repeat(72)
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12% · $?",
+            " ".repeat(67)
         )
     );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
     assert_eq!(core.token_usage.reasoning_tokens, Some(500));
+}
+
+#[test]
+fn persisted_model_results_rebuild_footer_cost_on_resume() {
+    let (catalog, warnings) = MergedModelCatalog::with_local_json(
+        r#"{
+          "providers": {
+            "fixture": {
+              "models": [{
+                "id": "echo",
+                "context_window_tokens": 1000,
+                "cost": {"input": 5, "output": 30, "cache_read": 0.5}
+              }]
+            }
+          }
+        }"#,
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut core = core_with_fixture_catalog(EchoProvider, "echo", catalog);
+    let events = vec![model_result_usage_event(json!({
+        "input_tokens": 1_000,
+        "output_tokens": 100,
+        "cached_tokens": 400
+    }))];
+
+    core.rebuild_transcript_from_events(&events);
+
+    assert_eq!(core.token_usage.session_cost_nanos, 6_200_000);
+    assert_eq!(core.token_usage.priced_calls, 1);
+    assert!(core
+        .canvas_status_snapshot(120)
+        .line
+        .plain_text()
+        .ends_with("echo(medium) · ctx 99% · $0.006"));
 }
 
 #[test]
@@ -4039,8 +4076,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
-            " ".repeat(72)
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12% · $?",
+            " ".repeat(67)
         )
     );
 
@@ -4049,8 +4086,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}other(medium) · ctx ?%",
-            " ".repeat(72)
+            "  / commands · /tmp/euler{}other(medium) · ctx 0% · $?",
+            " ".repeat(67)
         )
     );
 
@@ -4061,8 +4098,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}other(medium) · ctx 13%",
-            " ".repeat(71)
+            "  / commands · /tmp/euler{}other(medium) · ctx 13% · $?",
+            " ".repeat(66)
         )
     );
 }

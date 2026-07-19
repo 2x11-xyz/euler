@@ -15,7 +15,7 @@ use euler_core::{EulerHome, ReasoningEffort, SessionRecord, SessionStore};
 #[cfg(test)]
 use euler_event::object;
 use euler_event::{EventEnvelope, EventKind};
-use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
+use euler_provider::catalog::{MergedModelCatalog, ModelCost, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -41,9 +41,19 @@ pub(super) fn update_token_usage(
     tokens: &mut TokenUsageSnapshot,
     event: &EventEnvelope,
     context_window_tokens: Option<u64>,
+    model_catalog: &MergedModelCatalog,
 ) {
     if event.kind.as_str() == EventKind::MODEL_SWITCHED {
-        *tokens = TokenUsageSnapshot::default();
+        // Switching models clears the active context reading, but cost is a
+        // session-lifetime total just as it is in pi's footer.
+        tokens.input_tokens = 0;
+        tokens.output_tokens = 0;
+        tokens.reasoning_tokens = None;
+        tokens.context_window_tokens = context_window_tokens;
+        tokens.demoted_items = 0;
+        tokens.canvas_retained_bytes = None;
+        tokens.canvas_budget_bytes = None;
+        tokens.compaction_tier = None;
         return;
     }
     if event.kind.as_str() == EventKind::CANVAS_SNAPSHOT {
@@ -65,14 +75,66 @@ pub(super) fn update_token_usage(
         return;
     }
     let Some(usage) = event.payload.get("usage").and_then(Value::as_object) else {
+        tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1);
         return;
     };
-    let input_tokens = usage_u64(usage, "input_tokens").unwrap_or(0);
-    let output_tokens = usage_u64(usage, "output_tokens").unwrap_or(0);
+    let (Some(input_tokens), Some(output_tokens)) = (
+        usage_u64(usage, "input_tokens"),
+        usage_u64(usage, "output_tokens"),
+    ) else {
+        tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1);
+        return;
+    };
     tokens.input_tokens = input_tokens;
     tokens.output_tokens = output_tokens;
     tokens.reasoning_tokens = usage_u64(usage, "reasoning_tokens");
     tokens.context_window_tokens = context_window_tokens;
+
+    let provider = event.payload.get("provider").and_then(Value::as_str);
+    let model = event.payload.get("model").and_then(Value::as_str);
+    let cached_tokens = usage_u64(usage, "cached_tokens").unwrap_or(0);
+    let Some((provider, cost)) = provider.zip(model).and_then(|(provider, model)| {
+        model_cost(model_catalog, provider, model).map(|cost| (provider, cost))
+    }) else {
+        tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1);
+        return;
+    };
+    let nanos = model_result_cost_nanos(provider, cost, input_tokens, output_tokens, cached_tokens);
+    tokens.session_cost_nanos = tokens.session_cost_nanos.saturating_add(nanos);
+    tokens.priced_calls = tokens.priced_calls.saturating_add(1);
+}
+
+fn model_cost(catalog: &MergedModelCatalog, provider: &str, model: &str) -> Option<ModelCost> {
+    catalog
+        .provider(provider)?
+        .models()
+        .find(|candidate| candidate.id() == model)?
+        .cost()
+}
+
+fn model_result_cost_nanos(
+    provider: &str,
+    cost: ModelCost,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+) -> u64 {
+    let (ordinary_input, cache_read) = if provider == "anthropic" {
+        (input_tokens, cached_tokens)
+    } else {
+        (
+            input_tokens.saturating_sub(cached_tokens),
+            cached_tokens.min(input_tokens),
+        )
+    };
+    let rates = cost.rates_for_input(ordinary_input.saturating_add(cache_read));
+    // A rate unit is $0.001 per million tokens, which is exactly one
+    // nano-dollar per token. Integer arithmetic therefore preserves every
+    // catalog rate without floating-point drift.
+    ordinary_input
+        .saturating_mul(rates.input)
+        .saturating_add(output_tokens.saturating_mul(rates.output))
+        .saturating_add(cache_read.saturating_mul(rates.cache_read))
 }
 
 pub(super) fn read_terminal_event() -> Result<Option<UiEvent>> {
@@ -421,6 +483,97 @@ fn usage_u64(usage: &serde_json::Map<String, Value>, field: &str) -> Option<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_cost_math_prices_cached_input_at_the_cache_rate() {
+        let cost = ModelCost::new(5.0, 30.0, 0.5);
+
+        let openai = model_result_cost_nanos("openai", cost, 1_000, 100, 400);
+        let anthropic = model_result_cost_nanos("anthropic", cost, 600, 100, 400);
+
+        // 600 ordinary input * 5000 nanos + 100 output * 30000 nanos
+        // + 400 cached input * 500 nanos = $0.0062.
+        assert_eq!(openai, 6_200_000);
+        assert_eq!(anthropic, 6_200_000);
+    }
+
+    #[test]
+    fn pi_cost_math_uses_request_wide_long_context_tier() {
+        let cost = ModelCost::with_tier(2.5, 15.0, 0.25, 272_000, 5.0, 22.5, 0.5);
+
+        let at_threshold = model_result_cost_nanos("openai", cost, 272_000, 10, 0);
+        let over_threshold = model_result_cost_nanos("openai", cost, 272_001, 10, 0);
+
+        assert_eq!(at_threshold, 680_150_000);
+        assert_eq!(over_threshold, 1_360_230_000);
+    }
+
+    #[test]
+    fn token_usage_accumulates_priced_calls_and_marks_unknown_models() {
+        let catalog = MergedModelCatalog::built_in();
+        let mut tokens = TokenUsageSnapshot::default();
+        let priced = EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::MODEL_RESULT,
+            object([
+                ("provider", "openai".into()),
+                ("model", "gpt-5.5".into()),
+                (
+                    "usage",
+                    serde_json::json!({
+                        "input_tokens": 1_000,
+                        "output_tokens": 100,
+                        "cached_tokens": 400
+                    }),
+                ),
+            ]),
+        );
+        let unpriced = EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::MODEL_RESULT,
+            object([
+                ("provider", "fixture".into()),
+                ("model", "echo".into()),
+                (
+                    "usage",
+                    serde_json::json!({"input_tokens": 5, "output_tokens": 2}),
+                ),
+            ]),
+        );
+
+        update_token_usage(&mut tokens, &priced, Some(1_000_000), &catalog);
+        update_token_usage(&mut tokens, &unpriced, None, &catalog);
+
+        assert_eq!(tokens.session_cost_nanos, 6_200_000);
+        assert_eq!(tokens.priced_calls, 1);
+        assert_eq!(tokens.unpriced_calls, 1);
+    }
+
+    #[test]
+    fn token_usage_marks_missing_provider_usage_as_unpriced() {
+        let catalog = MergedModelCatalog::built_in();
+        let mut tokens = TokenUsageSnapshot::default();
+        let event = EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::MODEL_RESULT,
+            object([
+                ("provider", "openai".into()),
+                ("model", "gpt-5.5".into()),
+                ("usage", Value::Null),
+            ]),
+        );
+
+        update_token_usage(&mut tokens, &event, Some(1_000_000), &catalog);
+
+        assert_eq!(tokens.priced_calls, 0);
+        assert_eq!(tokens.unpriced_calls, 1);
+    }
 
     #[test]
     fn causal_dag_stats_read_the_latest_graph_artifact_not_a_derived_export() {

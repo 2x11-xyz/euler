@@ -24,6 +24,80 @@ pub const DEFAULT_OPENAI_MODEL: &str = crate::openai::DEFAULT_MODEL;
 pub const DEFAULT_ANTHROPIC_MODEL: &str = crate::anthropic::DEFAULT_MODEL;
 pub const DEFAULT_OPENROUTER_MODEL: &str = crate::openrouter::DEFAULT_MODEL;
 pub const DEFAULT_XAI_MODEL: &str = crate::xai::DEFAULT_MODEL;
+
+/// Millionths of a USD per one million tokens. One rate unit therefore
+/// becomes one pico-dollar per token, preserving six-decimal catalog rates
+/// while keeping session accumulation deterministic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelCostRates {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelCostTier {
+    pub input_tokens_above: u64,
+    pub rates: ModelCostRates,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelCost {
+    pub rates: ModelCostRates,
+    pub tier: Option<ModelCostTier>,
+}
+
+impl ModelCost {
+    pub const fn new(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Self {
+        Self {
+            rates: ModelCostRates {
+                input: (input * 1_000_000.0 + 0.5) as u64,
+                output: (output * 1_000_000.0 + 0.5) as u64,
+                cache_read: (cache_read * 1_000_000.0 + 0.5) as u64,
+                cache_write: (cache_write * 1_000_000.0 + 0.5) as u64,
+            },
+            tier: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub const fn with_tier(
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_write: f64,
+        input_tokens_above: u64,
+        tier_input: f64,
+        tier_output: f64,
+        tier_cache_read: f64,
+        tier_cache_write: f64,
+    ) -> Self {
+        Self {
+            rates: Self::new(input, output, cache_read, cache_write).rates,
+            tier: Some(ModelCostTier {
+                input_tokens_above,
+                rates: Self::new(
+                    tier_input,
+                    tier_output,
+                    tier_cache_read,
+                    tier_cache_write,
+                )
+                .rates,
+            }),
+        }
+    }
+
+    pub fn rates_for_input(self, input_tokens: u64) -> ModelCostRates {
+        self.tier
+            .filter(|tier| input_tokens > tier.input_tokens_above)
+            .map_or(self.rates, |tier| tier.rates)
+    }
+}
+
+pub fn cost_rate_dollars_per_million(rate: u64) -> f64 {
+    rate as f64 / 1_000_000.0
+}
 const STANDARD_REASONING_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::XSmall,
     ReasoningEffort::Small,
@@ -68,6 +142,7 @@ pub struct ModelDescriptor {
     official_route: bool,
     effective_context_window_percent: Option<u8>,
     auto_compact_token_limit: Option<u64>,
+    cost: Option<ModelCost>,
 }
 
 impl ModelDescriptor {
@@ -113,6 +188,10 @@ impl ModelDescriptor {
 
     pub fn reasoning_efforts(&self) -> &[ReasoningEffort] {
         &self.reasoning_efforts
+    }
+
+    pub fn cost(&self) -> Option<ModelCost> {
+        self.cost
     }
 }
 
@@ -209,6 +288,128 @@ const fn chatgpt_context_policy(context_window_tokens: Option<u64>) -> (Option<u
     }
 }
 
+#[allow(clippy::too_many_lines)] // auditable static transcription of pi's catalog
+fn pi_catalog_cost(provider: &str, model: &str) -> Option<ModelCost> {
+    let simple = |input, output, cache_read, cache_write| {
+        ModelCost::new(input, output, cache_read, cache_write)
+    };
+    let tiered = |input, output, cache_read, tier_input, tier_output, tier_cache_read| {
+        ModelCost::with_tier(
+            input,
+            output,
+            cache_read,
+            0.0,
+            272_000,
+            tier_input,
+            tier_output,
+            tier_cache_read,
+            0.0,
+        )
+    };
+    match (provider, model) {
+        (ANTHROPIC_PROVIDER_ID, "claude-fable-5") => Some(simple(10.0, 50.0, 1.0, 12.5)),
+        (ANTHROPIC_PROVIDER_ID, "claude-haiku-4-5" | "claude-haiku-4-5-20251001") => {
+            Some(simple(1.0, 5.0, 0.1, 1.25))
+        }
+        (ANTHROPIC_PROVIDER_ID, "claude-opus-4-1" | "claude-opus-4-1-20250805") => {
+            Some(simple(15.0, 75.0, 1.5, 18.75))
+        }
+        (
+            ANTHROPIC_PROVIDER_ID,
+            "claude-opus-4-5"
+            | "claude-opus-4-5-20251101"
+            | "claude-opus-4-6"
+            | "claude-opus-4-7"
+            | "claude-opus-4-8",
+        ) => Some(simple(5.0, 25.0, 0.5, 6.25)),
+        (
+            ANTHROPIC_PROVIDER_ID,
+            "claude-sonnet-4-5" | "claude-sonnet-4-5-20250929" | "claude-sonnet-4-6",
+        ) => Some(simple(3.0, 15.0, 0.3, 3.75)),
+        (ANTHROPIC_PROVIDER_ID, "claude-sonnet-5") => Some(simple(2.0, 10.0, 0.2, 2.5)),
+
+        (OPENAI_PROVIDER_ID, "gpt-4") => Some(simple(30.0, 60.0, 0.0, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-4-turbo") => Some(simple(10.0, 30.0, 0.0, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-4.1") => Some(simple(2.0, 8.0, 0.5, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-4.1-mini") => Some(simple(0.4, 1.6, 0.1, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-4.1-nano") => Some(simple(0.1, 0.4, 0.025, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-4o") => Some(simple(2.5, 10.0, 1.25, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-4o-2024-05-13") => Some(simple(5.0, 15.0, 0.0, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-4o-2024-08-06" | "gpt-4o-2024-11-20") => {
+            Some(simple(2.5, 10.0, 1.25, 0.0))
+        }
+        (OPENAI_PROVIDER_ID, "gpt-4o-mini") => Some(simple(0.15, 0.6, 0.075, 0.0)),
+        (
+            OPENAI_PROVIDER_ID,
+            "gpt-5"
+            | "gpt-5-chat-latest"
+            | "gpt-5-codex"
+            | "gpt-5.1"
+            | "gpt-5.1-chat-latest"
+            | "gpt-5.1-codex"
+            | "gpt-5.1-codex-max",
+        ) => Some(simple(1.25, 10.0, 0.125, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-5-mini" | "gpt-5.1-codex-mini") => {
+            Some(simple(0.25, 2.0, 0.025, 0.0))
+        }
+        (OPENAI_PROVIDER_ID, "gpt-5-nano") => Some(simple(0.05, 0.4, 0.005, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-5-pro") => Some(simple(15.0, 120.0, 0.0, 0.0)),
+        (
+            OPENAI_PROVIDER_ID,
+            "gpt-5.2"
+            | "gpt-5.2-chat-latest"
+            | "gpt-5.2-codex"
+            | "gpt-5.3-chat-latest"
+            | "gpt-5.3-codex"
+            | "gpt-5.3-codex-spark",
+        ) => Some(simple(1.75, 14.0, 0.175, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-5.2-pro") => Some(simple(21.0, 168.0, 0.0, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-5.4") => Some(tiered(2.5, 15.0, 0.25, 5.0, 22.5, 0.5)),
+        (OPENAI_PROVIDER_ID, "gpt-5.4-mini") => Some(simple(0.75, 4.5, 0.075, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-5.4-nano") => Some(simple(0.2, 1.25, 0.02, 0.0)),
+        (OPENAI_PROVIDER_ID, "gpt-5.4-pro" | "gpt-5.5-pro") => {
+            Some(tiered(30.0, 180.0, 0.0, 60.0, 270.0, 0.0))
+        }
+        (OPENAI_PROVIDER_ID, "gpt-5.5") => Some(tiered(5.0, 30.0, 0.5, 10.0, 45.0, 1.0)),
+        (OPENAI_PROVIDER_ID, "gpt-5.6-luna") => Some(tiered(1.0, 6.0, 0.1, 2.0, 9.0, 0.2)),
+        (OPENAI_PROVIDER_ID, "gpt-5.6-sol") => Some(tiered(5.0, 30.0, 0.5, 10.0, 45.0, 1.0)),
+        (OPENAI_PROVIDER_ID, "gpt-5.6-terra") => Some(tiered(2.5, 15.0, 0.25, 5.0, 22.5, 0.5)),
+        (OPENAI_PROVIDER_ID, "o1") => Some(simple(15.0, 60.0, 7.5, 0.0)),
+        (OPENAI_PROVIDER_ID, "o1-pro") => Some(simple(150.0, 600.0, 0.0, 0.0)),
+        (OPENAI_PROVIDER_ID, "o3") => Some(simple(2.0, 8.0, 0.5, 0.0)),
+        (OPENAI_PROVIDER_ID, "o3-deep-research") => Some(simple(10.0, 40.0, 2.5, 0.0)),
+        (OPENAI_PROVIDER_ID, "o3-mini") => Some(simple(1.1, 4.4, 0.55, 0.0)),
+        (OPENAI_PROVIDER_ID, "o3-pro") => Some(simple(20.0, 80.0, 0.0, 0.0)),
+        (OPENAI_PROVIDER_ID, "o4-mini") => Some(simple(1.1, 4.4, 0.275, 0.0)),
+        (OPENAI_PROVIDER_ID, "o4-mini-deep-research") => Some(simple(2.0, 8.0, 0.5, 0.0)),
+
+        (CHATGPT_PROVIDER_ID, "gpt-5.3-codex-spark") => Some(simple(1.75, 14.0, 0.175, 0.0)),
+        (CHATGPT_PROVIDER_ID, "gpt-5.4") => Some(tiered(2.5, 15.0, 0.25, 5.0, 22.5, 0.5)),
+        (CHATGPT_PROVIDER_ID, "gpt-5.4-mini") => Some(simple(0.75, 4.5, 0.075, 0.0)),
+        (CHATGPT_PROVIDER_ID, "gpt-5.5") => Some(tiered(5.0, 30.0, 0.5, 10.0, 45.0, 1.0)),
+        (CHATGPT_PROVIDER_ID, "gpt-5.6-luna") => Some(tiered(1.0, 6.0, 0.1, 2.0, 9.0, 0.2)),
+        (CHATGPT_PROVIDER_ID, "gpt-5.6-sol") => Some(tiered(5.0, 30.0, 0.5, 10.0, 45.0, 1.0)),
+        (CHATGPT_PROVIDER_ID, "gpt-5.6-terra") => Some(tiered(2.5, 15.0, 0.25, 5.0, 22.5, 0.5)),
+
+        (OPENROUTER_PROVIDER_ID, "openai/gpt-4.1-mini") => Some(simple(0.4, 1.6, 0.1, 0.0)),
+        (OPENROUTER_PROVIDER_ID, "openai/gpt-5.5") => Some(simple(5.0, 30.0, 0.5, 0.0)),
+        (OPENROUTER_PROVIDER_ID, "anthropic/claude-sonnet-5") => Some(simple(2.0, 10.0, 0.2, 0.0)),
+        (OPENROUTER_PROVIDER_ID, "z-ai/glm-5.2") => Some(simple(0.4144, 1.3024, 0.07696, 0.0)),
+
+        (XAI_PROVIDER_ID, "grok-3") => Some(simple(3.0, 15.0, 0.75, 0.0)),
+        (XAI_PROVIDER_ID, "grok-3-fast") => Some(simple(5.0, 25.0, 1.25, 0.0)),
+        (
+            XAI_PROVIDER_ID,
+            "grok-4.20-0309-non-reasoning" | "grok-4.20-0309-reasoning" | "grok-4.3",
+        ) => Some(simple(1.25, 2.5, 0.2, 0.0)),
+        (XAI_PROVIDER_ID, "grok-4.5") => Some(simple(2.0, 6.0, 0.5, 0.0)),
+        (XAI_PROVIDER_ID, "grok-build-0.1") => Some(simple(1.0, 2.0, 0.2, 0.0)),
+        (XAI_PROVIDER_ID, "grok-code-fast-1") => Some(simple(0.2, 1.5, 0.02, 0.0)),
+        _ => None,
+    }
+}
+
+
 impl MergedModelCatalog {
     pub fn built_in() -> Self {
         embedded_catalog().clone()
@@ -226,6 +427,7 @@ impl MergedModelCatalog {
                 if model.status == official::OfficialModelStatus::Removed {
                     continue;
                 }
+                let cost = pi_catalog_cost(&provider_id, &model.id);
                 let reasoning_efforts = model.reasoning_efforts();
                 let (effective_context_window_percent, auto_compact_token_limit) =
                     if provider_id == CHATGPT_PROVIDER_ID {
@@ -247,6 +449,7 @@ impl MergedModelCatalog {
                         official_route: true,
                         effective_context_window_percent,
                         auto_compact_token_limit,
+                        cost,
                     },
                 );
             }
@@ -265,6 +468,7 @@ impl MergedModelCatalog {
                         official_route: true,
                         effective_context_window_percent: None,
                         auto_compact_token_limit: None,
+                        cost: None,
                     },
                 );
             }
@@ -473,6 +677,7 @@ fn fixture_provider() -> MergedProviderDescriptor {
                 official_route: true,
                 effective_context_window_percent: None,
                 auto_compact_token_limit: None,
+                cost: None,
             },
         )]),
     }
@@ -517,6 +722,7 @@ fn merge_models(
                 "max_output_tokens",
                 "supports_tools",
                 "supports_reasoning",
+                "cost",
             ],
             &scope,
             warnings,
@@ -537,6 +743,7 @@ fn merge_models(
             optional_positive_u64(object, "max_output_tokens", &scope, warnings);
         let supports_tools = optional_bool(object, "supports_tools", &scope, warnings);
         let supports_reasoning = optional_bool(object, "supports_reasoning", &scope, warnings);
+        let cost = parse_model_cost(object, &scope, warnings);
         let (effective_context_window_percent, auto_compact_token_limit) =
             if provider_key == CHATGPT_PROVIDER_ID {
                 chatgpt_context_policy(context_window_tokens)
@@ -571,6 +778,7 @@ fn merge_models(
                 official_route,
                 effective_context_window_percent,
                 auto_compact_token_limit,
+                cost,
             },
         );
     }
@@ -614,6 +822,77 @@ fn optional_positive_u64(
         return None;
     }
     Some(number)
+}
+
+fn parse_model_cost(
+    object: &serde_json::Map<String, Value>,
+    scope: &str,
+    warnings: &mut Vec<String>,
+) -> Option<ModelCost> {
+    let value = object.get("cost")?;
+    let Some(cost) = value.as_object() else {
+        warnings.push(format!("ignored {scope} cost because it must be an object"));
+        return None;
+    };
+    let input = cost_rate(cost, "input", scope, warnings)?;
+    let output = cost_rate(cost, "output", scope, warnings)?;
+    let cache_read = optional_cost_rate(cost, "cache_read", scope, warnings)?;
+    let cache_write = optional_cost_rate(cost, "cache_write", scope, warnings)?;
+    let base = ModelCost::new(input, output, cache_read, cache_write);
+    let Some(tier) = cost
+        .get("tiers")
+        .and_then(Value::as_array)
+        .and_then(|tiers| tiers.first())
+        .and_then(Value::as_object)
+    else {
+        return Some(base);
+    };
+    let threshold = tier.get("input_tokens_above").and_then(Value::as_u64)?;
+    let tier_input = cost_rate(tier, "input", scope, warnings)?;
+    let tier_output = cost_rate(tier, "output", scope, warnings)?;
+    let tier_cache_read = optional_cost_rate(tier, "cache_read", scope, warnings)?;
+    let tier_cache_write = optional_cost_rate(tier, "cache_write", scope, warnings)?;
+    Some(ModelCost::with_tier(
+        input,
+        output,
+        cache_read,
+        cache_write,
+        threshold,
+        tier_input,
+        tier_output,
+        tier_cache_read,
+        tier_cache_write,
+    ))
+}
+
+fn cost_rate(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    scope: &str,
+    warnings: &mut Vec<String>,
+) -> Option<f64> {
+    let rate = object
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|rate| rate.is_finite() && *rate >= 0.0);
+    if rate.is_none() {
+        warnings.push(format!(
+            "ignored {scope} cost because {field} must be a non-negative number"
+        ));
+    }
+    rate
+}
+
+fn optional_cost_rate(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    scope: &str,
+    warnings: &mut Vec<String>,
+) -> Option<f64> {
+    object
+        .contains_key(field)
+        .then(|| cost_rate(object, field, scope, warnings))
+        .unwrap_or(Some(0.0))
 }
 
 fn optional_bool(

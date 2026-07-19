@@ -2210,7 +2210,6 @@ impl AppCore {
         self.replace_bottom_surface_for_session();
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
-        self.token_usage.context_window_tokens = self.active_context_window_tokens();
         self.tool_output_expanded = false;
         self.modal = None;
         self.quit_armed = None;
@@ -2298,7 +2297,12 @@ impl AppCore {
         let mut transcript = TranscriptState::default();
         let mut token_usage = TokenUsageSnapshot::default();
         for event in events {
-            update_token_usage(&mut token_usage, event, self.active_context_window_tokens());
+            update_token_usage(
+                &mut token_usage,
+                event,
+                self.active_context_window_tokens(),
+                &self.model_catalog,
+            );
             transcript.push_event(event.clone());
         }
         transcript.scroll_to_bottom();
@@ -2968,7 +2972,14 @@ fn format_usage_from_snapshot(tokens: &TokenUsageSnapshot, status: &StatusSnapsh
     if let Some(reasoning) = tokens.reasoning_tokens {
         lines.push(format!("  reasoning: {reasoning} tokens"));
     }
-    lines.push("  cost:      (catalog prices unavailable — tokens only)".to_owned());
+    lines.push(format!(
+        "  cost:      {}",
+        usage_cost_text(
+            tokens.session_cost_nanos,
+            tokens.priced_calls,
+            tokens.unpriced_calls
+        )
+    ));
     lines.join("\n")
 }
 
@@ -3024,7 +3035,14 @@ fn format_session_usage(
     if by_model.is_empty() {
         return format_usage_from_snapshot(live, status);
     }
-    let mut lines = vec!["usage · session totals (no catalog prices)".to_owned()];
+    let mut lines = vec![format!(
+        "usage · session totals · {}",
+        usage_cost_text(
+            live.session_cost_nanos,
+            live.priced_calls,
+            live.unpriced_calls
+        )
+    )];
     for ((provider, model), bucket) in by_model {
         lines.push(format!("{provider}::{model} · {} call(s)", bucket.calls));
         lines.push(format!("  input:     {} tokens", bucket.input));
@@ -3034,6 +3052,16 @@ fn format_session_usage(
         }
     }
     lines.join("\n")
+}
+
+fn usage_cost_text(nanos: u64, priced_calls: u64, unpriced_calls: u64) -> String {
+    let dollars = nanos as f64 / 1_000_000_000.0;
+    match (priced_calls, unpriced_calls) {
+        (0, 0) => "cost unavailable".to_owned(),
+        (0, _) => "cost $?".to_owned(),
+        (_, 0) => format!("cost ${dollars:.6}"),
+        (_, _) => format!("cost ${dollars:.6}+ ({unpriced_calls} unpriced call(s))"),
+    }
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

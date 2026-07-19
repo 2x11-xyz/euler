@@ -189,10 +189,19 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   paused queue, arrival after the final round — flush into the next turn,
   as before. The running footer hint reads `⏎ steer`.
 - Footer: **one** line below the composer — two hard-edged clusters:
-  contextual hints then `cwd (branch)` flush-left; `model · ctx N%` (plus
-  the session name once named) flush-right. No session id in the footer —
-  ids live in `/status` and resume copy (#21). Ctx% uses attention at ≥70%
-  and failure at ≥85%. No second status row; detail lives under `/status`.
+  contextual hints then `cwd (branch)` flush-left; `model · ctx N% · $N.NNN`
+  (plus the session name once named) flush-right. Cost is cumulative USD over
+  every persisted `model.result` in the session, including companion calls,
+  using that result's provider/model rate and cache-read discount from the
+  model catalog. The calculation follows pi: uncached input, output, and cache
+  reads are charged separately, and request-wide long-context tiers apply to
+  the whole call. The segment is omitted before the first result; `$?` means
+  no result had pricing, and a trailing `+` marks a known subtotal when some
+  calls were unpriced. Subscription-backed ChatGPT still shows the equivalent
+  API cost; it is not a claim about an incremental invoice. No session id in
+  the footer — ids live in `/status` and resume copy (#21). Ctx% uses attention
+  at ≥70% and failure at ≥85%. No second status row; detail lives under
+  `/status`.
 
 ### Streaming, scroll, motion
 

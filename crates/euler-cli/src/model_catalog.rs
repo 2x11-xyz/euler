@@ -1,5 +1,5 @@
 use anyhow::Result;
-use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
+use euler_provider::catalog::{cost_rate_dollars_per_million, MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{
     ApiFamily, CustomModelConfig, CustomProviderConfig, ProviderConfigRegistry,
 };
@@ -165,6 +165,33 @@ fn model_json(model: &ModelDescriptor, is_default: bool) -> Value {
     }
     if let Some(value) = model.supports_reasoning() {
         object.insert("supports_reasoning".to_owned(), json!(value));
+    }
+    if let Some(cost) = model.cost() {
+        let mut value = Map::new();
+        value.insert(
+            "input".to_owned(),
+            json!(cost_rate_dollars_per_million(cost.rates.input)),
+        );
+        value.insert(
+            "output".to_owned(),
+            json!(cost_rate_dollars_per_million(cost.rates.output)),
+        );
+        value.insert(
+            "cache_read".to_owned(),
+            json!(cost_rate_dollars_per_million(cost.rates.cache_read)),
+        );
+        if let Some(tier) = cost.tier {
+            value.insert(
+                "tiers".to_owned(),
+                json!([{
+                    "input_tokens_above": tier.input_tokens_above,
+                    "input": cost_rate_dollars_per_million(tier.rates.input),
+                    "output": cost_rate_dollars_per_million(tier.rates.output),
+                    "cache_read": cost_rate_dollars_per_million(tier.rates.cache_read),
+                }]),
+            );
+        }
+        object.insert("cost".to_owned(), Value::Object(value));
     }
     Value::Object(object)
 }

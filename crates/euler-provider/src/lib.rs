@@ -346,6 +346,10 @@ impl StopReason {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Usage {
+    /// Total input tokens reported by the provider. For OpenAI-compatible
+    /// APIs this includes cached input; callers that price usage must charge
+    /// `cached_tokens` at the cache-read rate and only the remainder at the
+    /// ordinary input rate. Anthropic reports uncached input separately.
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: Option<u64>,
