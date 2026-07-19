@@ -37,6 +37,7 @@ pub(crate) struct ChatCompletionsOptions {
     readable_reasoning: bool,
     reasoning_request: Option<ReasoningRequest>,
     max_tokens_field: MaxTokensField,
+    cache_usage: CacheUsagePolicy,
 }
 
 impl Default for ChatCompletionsOptions {
@@ -46,11 +47,24 @@ impl Default for ChatCompletionsOptions {
             readable_reasoning: false,
             reasoning_request: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            cache_usage: CacheUsagePolicy::ExactTtlBuckets,
         }
     }
 }
 
 impl ChatCompletionsOptions {
+    pub(crate) fn first_party_five_minute_cache() -> Self {
+        Self {
+            cache_usage: CacheUsagePolicy::FiveMinuteWrites,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_openrouter_cache_usage(mut self) -> Self {
+        self.cache_usage = CacheUsagePolicy::OpenRouter;
+        self
+    }
+
     pub(crate) fn from_compat(compat: Option<&Value>) -> Self {
         let mut options = Self::default();
         let Some(compat) = compat.and_then(Value::as_object) else {
@@ -96,6 +110,18 @@ impl ChatCompletionsOptions {
             .as_ref()
             .is_some_and(|request| request.format == ReasoningRequestFormat::OpenRouterReasoning)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheUsagePolicy {
+    /// A custom compatible endpoint must identify every disjoint TTL bucket.
+    ExactTtlBuckets,
+    /// The first-party route defines its aggregate write counter as the
+    /// short-lived bucket and does not expose one-hour writes.
+    FiveMinuteWrites,
+    /// OpenRouter reports an aggregate write counter whose TTL is not
+    /// identified. Non-zero aggregate writes therefore remain unpriced.
+    OpenRouter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -517,7 +543,7 @@ impl ChatCompletionsSseParser {
             events.push(Err(stream_error(&self.provider_label, error)));
             return;
         }
-        let payload_usage = usage(value.get("usage"));
+        let payload_usage = usage(value.get("usage"), self.options.cache_usage);
         for choice in value
             .get("choices")
             .and_then(Value::as_array)
@@ -771,48 +797,119 @@ fn reasoning_delta(delta: Option<&Value>, enabled: bool) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn usage(value: Option<&Value>) -> Option<Usage> {
+fn usage(value: Option<&Value>, cache_policy: CacheUsagePolicy) -> Option<Usage> {
     let usage = value?;
-    Some(Usage {
-        input_tokens: usage
-            .get("input_tokens")
-            .or_else(|| usage.get("prompt_tokens"))?
-            .as_u64()?,
-        output_tokens: usage
-            .get("output_tokens")
-            .or_else(|| usage.get("completion_tokens"))?
-            .as_u64()?,
-        cached_tokens: usage
-            .get("cached_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                usage
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-            })
-            .or_else(|| {
-                usage
-                    .get("input_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-            }),
-        reasoning_tokens: usage
-            .get("reasoning_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                usage
-                    .get("completion_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens"))
-                    .and_then(Value::as_u64)
-            })
-            .or_else(|| {
-                usage
-                    .get("output_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens"))
-                    .and_then(Value::as_u64)
-            }),
-    })
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))?
+        .as_u64()?;
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))?
+        .as_u64()?;
+    let (cache_read, cache_write_5m, cache_write_1h) = cache_breakdown(usage, cache_policy);
+    let reasoning_tokens = usage
+        .get("reasoning_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .get("output_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+        });
+    Some(Usage::from_inclusive_input(
+        input_tokens,
+        output_tokens,
+        cache_read,
+        cache_write_5m,
+        cache_write_1h,
+        reasoning_tokens,
+    ))
+}
+
+fn cache_breakdown(
+    usage: &Value,
+    policy: CacheUsagePolicy,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let read = usage_detail(usage, "cached_tokens");
+    let aggregate_write = usage_detail(usage, "cache_write_tokens");
+    let short_write = usage_detail(usage, "cache_write_5m_tokens");
+    let long_write = usage_detail(usage, "cache_write_1h_tokens");
+    match policy {
+        CacheUsagePolicy::ExactTtlBuckets => (read, short_write, long_write),
+        CacheUsagePolicy::FiveMinuteWrites => {
+            first_party_cache_breakdown(read, aggregate_write, short_write, long_write)
+        }
+        CacheUsagePolicy::OpenRouter => {
+            openrouter_cache_breakdown(read, aggregate_write, short_write, long_write)
+        }
+    }
+}
+
+fn first_party_cache_breakdown(
+    read: Option<u64>,
+    aggregate_write: Option<u64>,
+    short_write: Option<u64>,
+    long_write: Option<u64>,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    if short_write.is_some() || long_write.is_some() {
+        let split = short_write.zip(long_write);
+        let consistent = split.is_some_and(|(short, long)| {
+            aggregate_write.is_none_or(|aggregate| short.checked_add(long) == Some(aggregate))
+        });
+        return if consistent {
+            (read.or(Some(0)), short_write, long_write)
+        } else {
+            (None, None, None)
+        };
+    }
+    (read.or(Some(0)), aggregate_write.or(Some(0)), Some(0))
+}
+
+fn openrouter_cache_breakdown(
+    read: Option<u64>,
+    aggregate_write: Option<u64>,
+    short_write: Option<u64>,
+    long_write: Option<u64>,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    if let Some((short, long)) = short_write.zip(long_write) {
+        let consistent =
+            aggregate_write.is_none_or(|aggregate| short.checked_add(long) == Some(aggregate));
+        return if consistent {
+            (read, Some(short), Some(long))
+        } else {
+            (None, None, None)
+        };
+    }
+    if aggregate_write.unwrap_or(0) == 0 && short_write.is_none() && long_write.is_none() {
+        (read, Some(0), Some(0))
+    } else {
+        (None, None, None)
+    }
+}
+
+fn usage_detail(usage: &Value, field: &str) -> Option<u64> {
+    usage
+        .get(field)
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get(field))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get(field))
+                .and_then(Value::as_u64)
+        })
 }
 
 fn stop_reason(reason: &str) -> StopReason {

@@ -8,6 +8,7 @@ include = ["src/**", "tests/**", "catalog/**"]
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 ureq.workspace = true
 url.workspace = true
 tungstenite.workspace = true

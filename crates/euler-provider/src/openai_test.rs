@@ -82,7 +82,7 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"funct
 
 data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"Cargo.toml\"}"}}]},"finish_reason":"tool_calls"}]}
 
-data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":1}}}
+data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3,"cache_write_tokens":2},"completion_tokens_details":{"reasoning_tokens":1}}}
 
 data: [DONE]
 
@@ -104,11 +104,43 @@ data: [DONE]
                 usage: Some(Usage {
                     input_tokens: 10,
                     output_tokens: 4,
+                    uncached_input_tokens: Some(5),
                     cached_tokens: Some(3),
+                    cache_write_5m_tokens: Some(2),
+                    cache_write_1h_tokens: Some(0),
                     reasoning_tokens: Some(1),
                 }),
             }),
         ]
+    );
+}
+
+#[test]
+fn stream_preserves_total_but_refuses_an_overlapping_usage_breakdown() {
+    let events = parse_conformance_sse(
+        br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":3,"cache_write_tokens":2}}}
+
+data: [DONE]
+
+"#,
+    );
+
+    assert_eq!(
+        events,
+        vec![Ok(ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: Some(Usage {
+                input_tokens: 4,
+                output_tokens: 1,
+                uncached_input_tokens: None,
+                cached_tokens: None,
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
+            }),
+        })]
     );
 }
 

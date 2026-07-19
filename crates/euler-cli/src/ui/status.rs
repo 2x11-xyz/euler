@@ -40,6 +40,11 @@ pub struct TokenUsageSnapshot {
     pub canvas_retained_bytes: Option<u64>,
     pub canvas_budget_bytes: Option<u64>,
     pub compaction_tier: Option<String>,
+    /// Cumulative USD in trillionths (pico-dollars), computed from the model
+    /// metadata attached to each persisted model result.
+    pub session_cost_picos: u128,
+    pub priced_calls: u64,
+    pub unpriced_calls: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,7 +99,8 @@ pub enum TurnStatus {
 
 /// Footer v2 (Review v2 §15): two hard-edged clusters with empty space
 /// between — left flush-left (contextual hints, then `cwd (branch)`),
-/// right flush-right (`model(effort) · ctx N%` [+ session name once named]).
+/// right flush-right (`model(effort) · ctx N%` [· `$N.NNN`] [+ session name
+/// once named]).
 /// Test-only: exercises the same span builder as the production
 /// `status_line_canvas` but flattens to plain text for easy assertions.
 #[cfg(test)]
@@ -310,9 +316,34 @@ fn identity_context_style(tokens: &TokenUsageSnapshot, theme: &Theme) -> Style {
     }
 }
 
-/// Right cluster, flush-right: `model(effort) · ctx N%` [+ session name once
-/// named] [+ demoted-items note]. Branch no longer lives here (#48) — see the
-/// left cluster's `cwd (branch)` instead.
+fn identity_cost_label(tokens: &TokenUsageSnapshot) -> Option<String> {
+    match (tokens.priced_calls, tokens.unpriced_calls) {
+        (0, 0) => None,
+        (0, _) => Some("$?".to_owned()),
+        (_, 0) => Some(format_cost_picos(tokens.session_cost_picos, 3)),
+        (_, _) => Some(format!(
+            "{}+",
+            format_cost_picos(tokens.session_cost_picos, 3)
+        )),
+    }
+}
+
+pub(super) fn format_cost_picos(picos: u128, decimals: u32) -> String {
+    debug_assert!(decimals <= 12);
+    let divisor = 10_u128.pow(12 - decimals);
+    let rounded = picos / divisor + u128::from(picos % divisor >= divisor.div_ceil(2));
+    if decimals == 0 {
+        return format!("${rounded}");
+    }
+    let scale = 10_u128.pow(decimals);
+    let whole = rounded / scale;
+    let fraction = rounded % scale;
+    format!("${whole}.{fraction:0width$}", width = decimals as usize)
+}
+
+/// Right cluster, flush-right: `model(effort) · ctx N%` [· `$N.NNN`] [+ session
+/// name once named] [+ demoted-items note]. Branch no longer lives here (#48)
+/// — see the left cluster's `cwd (branch)` instead.
 fn identity_segment_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
@@ -333,6 +364,12 @@ fn identity_segment_spans(
         Span::styled(format!("{model} · "), theme.status.faint),
         Span::styled(ctx, identity_context_style(tokens, theme)),
     ];
+    if let Some(cost) = identity_cost_label(tokens) {
+        spans.push(Span::styled(
+            format!("{SEGMENT_GAP}{cost}"),
+            theme.status.cost,
+        ));
+    }
     if let Some(name) = snapshot
         .session_name
         .as_deref()
@@ -576,6 +613,7 @@ mod tests {
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
             compaction_tier: None,
+            ..TokenUsageSnapshot::default()
         };
 
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
@@ -695,6 +733,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn statusline_shows_pi_style_cumulative_dollar_cost() {
+        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
+        let tokens = TokenUsageSnapshot {
+            session_cost_picos: 12_345_600_000_000,
+            priced_calls: 3,
+            ..TokenUsageSnapshot::default()
+        };
+
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
+
+        assert!(rendered.ends_with("echo · ctx ?% · $12.346"));
+    }
+
+    #[test]
+    fn statusline_marks_unknown_and_partial_costs() {
+        let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
+        let unknown = TokenUsageSnapshot {
+            unpriced_calls: 1,
+            ..TokenUsageSnapshot::default()
+        };
+        assert!(
+            status_line_text(&snapshot, &unknown, TurnStatus::Idle, false, 120)
+                .ends_with("echo · ctx ?% · $?")
+        );
+
+        let partial = TokenUsageSnapshot {
+            session_cost_picos: 1_250_000_000_000,
+            priced_calls: 1,
+            unpriced_calls: 2,
+            ..TokenUsageSnapshot::default()
+        };
+        assert!(
+            status_line_text(&snapshot, &partial, TurnStatus::Idle, false, 120)
+                .ends_with("echo · ctx ?% · $1.250+")
+        );
+    }
+
+    #[test]
+    fn fixed_point_cost_format_rounds_without_floating_point() {
+        assert_eq!(format_cost_picos(0, 3), "$0.000");
+        assert_eq!(format_cost_picos(499_999_999, 3), "$0.000");
+        assert_eq!(format_cost_picos(500_000_000, 3), "$0.001");
+        assert_eq!(format_cost_picos(12_345_678_499_999, 6), "$12.345678");
+        assert_eq!(format_cost_picos(12_345_678_500_000, 6), "$12.345679");
+    }
+
     fn ctx_span_style(snapshot: &StatusSnapshot, theme: &Theme, percent: u64) -> Style {
         let tokens = TokenUsageSnapshot {
             input_tokens: percent,
@@ -705,6 +790,7 @@ mod tests {
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
             compaction_tier: None,
+            ..TokenUsageSnapshot::default()
         };
         let label = format!("ctx {percent}%");
         status_line_spans(snapshot, &tokens, TurnStatus::Idle, false, theme, 120)
@@ -864,12 +950,7 @@ mod tests {
         let snapshot = TokenUsageSnapshot {
             input_tokens: 100,
             output_tokens: 25,
-            reasoning_tokens: None,
-            context_window_tokens: None,
-            demoted_items: 0,
-            canvas_retained_bytes: None,
-            canvas_budget_bytes: None,
-            compaction_tier: None,
+            ..TokenUsageSnapshot::default()
         };
 
         assert_eq!(context_segment(&snapshot), "Context ?% used");
@@ -886,6 +967,7 @@ mod tests {
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
             compaction_tier: None,
+            ..TokenUsageSnapshot::default()
         };
 
         assert!(context_segment(&snapshot).contains("Context "));
@@ -903,6 +985,7 @@ mod tests {
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
             compaction_tier: None,
+            ..TokenUsageSnapshot::default()
         };
 
         assert_eq!(context_segment(&snapshot), "Context 13% used");
@@ -916,6 +999,7 @@ mod tests {
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
             compaction_tier: None,
+            ..TokenUsageSnapshot::default()
         };
 
         assert_eq!(context_segment(&clamped), "Context 99% used");
@@ -931,6 +1015,7 @@ mod tests {
             canvas_retained_bytes: Some(600_000),
             canvas_budget_bytes: Some(640_000),
             compaction_tier: Some("stubs".to_owned()),
+            ..TokenUsageSnapshot::default()
         };
         assert_eq!(
             context_segment(&snapshot),

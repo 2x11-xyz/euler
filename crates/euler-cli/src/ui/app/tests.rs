@@ -217,7 +217,10 @@ fn scripted_usage(input_tokens: u64) -> FixtureResponse {
             usage: Some(Usage {
                 input_tokens,
                 output_tokens: 999,
+                uncached_input_tokens: Some(input_tokens),
                 cached_tokens: Some(0),
+                cache_write_5m_tokens: Some(0),
+                cache_write_1h_tokens: Some(0),
                 reasoning_tokens: Some(500),
             }),
         },
@@ -2372,8 +2375,13 @@ fn new_session_reuses_target_and_purges_visual_history() {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
     let store = SessionStore::new(home).expect("store");
-    let mut core = core();
+    let mut core = core_with_fixture_catalog(
+        EchoProvider,
+        "echo",
+        fixture_catalog_with_windows(&[("echo", 1_000)]),
+    );
     core.session_store = Some(store.clone());
+    core.primary_agent_id = Some("stale-owner".to_owned());
     core.transcript.push_event(event(
         EventKind::ASSISTANT_MESSAGE,
         object([("content", "old content".into())]),
@@ -2401,6 +2409,17 @@ fn new_session_reuses_target_and_purges_visual_history() {
         core.status.session_id.as_deref(),
         Some(session.session_id())
     );
+    assert_eq!(core.token_usage.session_cost_picos, 0);
+    assert_eq!(core.token_usage.priced_calls, 0);
+    assert_eq!(core.token_usage.unpriced_calls, 0);
+    assert_eq!(core.token_usage.input_tokens, 0);
+    assert_eq!(core.token_usage.context_window_tokens, Some(1_000));
+    assert_eq!(core.primary_agent_id.as_deref(), Some("root"));
+    assert!(core
+        .canvas_status_snapshot(120)
+        .line
+        .plain_text()
+        .ends_with("echo(medium) · ctx 0%"));
 }
 
 #[test]
@@ -2922,6 +2941,7 @@ fn accepting_resume_purges_prior_native_scrollback() {
     let mut config = euler_core::SessionConfig::new(".");
     config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
     config.model = "echo".to_owned();
+    config.agent_id = "resumed-owner".to_owned();
     let session = Session::new(config, EchoProvider, decider);
     let events = vec![event(
         EventKind::ASSISTANT_MESSAGE,
@@ -2944,6 +2964,7 @@ fn accepting_resume_purges_prior_native_scrollback() {
     );
 
     assert_eq!(effect, CoreEffect::ReplayHistoryWithScrollbackPurge);
+    assert_eq!(core.primary_agent_id.as_deref(), Some("resumed-owner"));
     assert!(core.notice.is_none());
     let text = drain_finalized_visual_text(&mut core, 80);
     assert!(text.contains("resumed content"), "text: {text}");
@@ -4014,13 +4035,70 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     assert_eq!(
         rendered,
         format!(
-            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
-            " ".repeat(72)
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12% · $?",
+            " ".repeat(67)
         )
     );
     assert_eq!(core.token_usage.input_tokens, 123);
     assert_eq!(core.token_usage.output_tokens, 999);
     assert_eq!(core.token_usage.reasoning_tokens, Some(500));
+}
+
+#[test]
+fn persisted_model_results_rebuild_footer_cost_on_resume() {
+    let (catalog, warnings) = MergedModelCatalog::with_local_json(
+        r#"{
+          "providers": {"fixture": {"models": [{
+            "id": "echo",
+            "context_window_tokens": 1000,
+            "cost": {"input": 999, "output": 999}
+          }]}}
+        }"#,
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut core = core_with_fixture_catalog(EchoProvider, "echo", catalog);
+    let events = vec![model_result_usage_and_cost_event(
+        json!({
+            "input_tokens": 1_000,
+            "output_tokens": 100,
+            "cached_tokens": 400
+        }),
+        6_200_000_000,
+    )];
+
+    core.rebuild_transcript_from_events(&events);
+
+    assert_eq!(core.token_usage.session_cost_picos, 6_200_000_000);
+    assert_eq!(core.token_usage.priced_calls, 1);
+    assert!(core
+        .canvas_status_snapshot(120)
+        .line
+        .plain_text()
+        .ends_with("echo(medium) · ctx 99% · $0.006"));
+}
+
+#[test]
+fn persisted_cost_rebuild_marks_mixed_vintage_history_as_partial() {
+    let catalog = fixture_catalog_with_windows(&[("echo", 1_000)]);
+    let mut core = core_with_fixture_catalog(EchoProvider, "echo", catalog);
+    let events = vec![
+        model_result_usage_and_cost_event(
+            json!({"input_tokens": 100, "output_tokens": 10}),
+            6_200_000_000,
+        ),
+        model_result_usage_event(json!({"input_tokens": 200, "output_tokens": 20})),
+    ];
+
+    core.rebuild_transcript_from_events(&events);
+
+    assert_eq!(core.token_usage.session_cost_picos, 6_200_000_000);
+    assert_eq!(core.token_usage.priced_calls, 1);
+    assert_eq!(core.token_usage.unpriced_calls, 1);
+    assert!(core
+        .canvas_status_snapshot(120)
+        .line
+        .plain_text()
+        .ends_with("echo(medium) · ctx 20% · $0.006+"));
 }
 
 #[test]
@@ -4039,8 +4117,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
-            " ".repeat(72)
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12% · $?",
+            " ".repeat(67)
         )
     );
 
@@ -4049,8 +4127,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}other(medium) · ctx ?%",
-            " ".repeat(72)
+            "  / commands · /tmp/euler{}other(medium) · ctx 0% · $?",
+            " ".repeat(67)
         )
     );
 
@@ -4061,8 +4139,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}other(medium) · ctx 13%",
-            " ".repeat(71)
+            "  / commands · /tmp/euler{}other(medium) · ctx 13% · $?",
+            " ".repeat(66)
         )
     );
 }
@@ -4507,8 +4585,58 @@ fn model_result_usage_event(usage: serde_json::Value) -> EventEnvelope {
     model_result_usage_event_for_model("echo", usage)
 }
 
+fn model_result_usage_and_cost_event(usage: serde_json::Value, total_picos: u64) -> EventEnvelope {
+    let mut usage = usage;
+    let usage = usage.as_object_mut().expect("usage object");
+    let input_tokens = usage["input_tokens"].as_u64().expect("input tokens");
+    let output_tokens = usage["output_tokens"].as_u64().expect("output tokens");
+    let cached_tokens = usage
+        .get("cached_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let uncached_input_tokens = input_tokens
+        .checked_sub(cached_tokens)
+        .expect("disjoint usage");
+    usage.insert(
+        "uncached_input_tokens".to_owned(),
+        uncached_input_tokens.into(),
+    );
+    usage.insert("cached_tokens".to_owned(), cached_tokens.into());
+    usage.insert("cache_write_5m_tokens".to_owned(), 0.into());
+    usage.insert("cache_write_1h_tokens".to_owned(), 0.into());
+    let output_rate = total_picos.checked_div(output_tokens).expect("output rate");
+    assert_eq!(output_rate * output_tokens, total_picos);
+    let mut event = model_result_usage_event(serde_json::Value::Object(usage.clone()));
+    event.payload.insert(
+        "cost".to_owned(),
+        json!({
+            "schema_version": 1,
+            "currency": "USD",
+            "unit": "picodollar",
+            "input_picos": 0,
+            "output_picos": total_picos,
+            "cache_read_picos": 0,
+            "cache_write_5m_picos": 0,
+            "cache_write_1h_picos": 0,
+            "total_picos": total_picos,
+            "pricing": {
+                "provider": "fixture",
+                "model": "echo",
+                "source": "local",
+                "source_id": "0000000000000000000000000000000000000000000000000000000000000000",
+                "rates": {
+                    "input_picos_per_token": 0,
+                    "output_picos_per_token": output_rate,
+                    "cache_read_picos_per_token": 0
+                }
+            }
+        }),
+    );
+    event
+}
+
 fn model_result_usage_event_for_model(model: &str, usage: serde_json::Value) -> EventEnvelope {
-    event(
+    primary_event(
         EventKind::MODEL_RESULT,
         object([
             ("provider", "fixture".into()),
@@ -4522,7 +4650,7 @@ fn model_result_usage_event_for_model(model: &str, usage: serde_json::Value) -> 
 }
 
 fn model_switched_event(from_model: &str, to_model: &str) -> EventEnvelope {
-    event(
+    primary_event(
         EventKind::MODEL_SWITCHED,
         object([
             ("from_provider", "fixture".into()),
@@ -4532,6 +4660,10 @@ fn model_switched_event(from_model: &str, to_model: &str) -> EventEnvelope {
             ("reason", "user".into()),
         ]),
     )
+}
+
+fn primary_event(kind: &'static str, payload: euler_event::JsonObject) -> EventEnvelope {
+    EventEnvelope::new("session", "root", None, kind, payload)
 }
 
 fn drain_finalized_visual_text(core: &mut AppCore, width: u16) -> String {

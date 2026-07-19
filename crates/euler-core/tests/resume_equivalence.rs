@@ -1097,7 +1097,10 @@ fn finished(input_tokens: u64, output_tokens: u64) -> ModelStreamEvent {
         usage: Some(Usage {
             input_tokens,
             output_tokens,
+            uncached_input_tokens: Some(input_tokens),
             cached_tokens: Some(0),
+            cache_write_5m_tokens: Some(0),
+            cache_write_1h_tokens: Some(0),
             reasoning_tokens: Some(0),
         }),
     }

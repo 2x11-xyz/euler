@@ -187,28 +187,35 @@ fn usage(value: &Value) -> Option<Usage> {
         .get("response")
         .and_then(|response| response.get("usage"))
         .or_else(|| value.get("usage"))?;
-    Some(Usage {
-        input_tokens: usage.get("input_tokens")?.as_u64()?,
-        output_tokens: usage.get("output_tokens")?.as_u64()?,
-        cached_tokens: usage
-            .get("cached_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                usage
-                    .get("input_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-            }),
-        reasoning_tokens: usage
-            .get("reasoning_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                usage
-                    .get("output_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens"))
-                    .and_then(Value::as_u64)
-            }),
-    })
+    let input_tokens = usage.get("input_tokens")?.as_u64()?;
+    let output_tokens = usage.get("output_tokens")?.as_u64()?;
+    let input_details = usage.get("input_tokens_details");
+    let cache_read = input_details
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let cache_write = input_details
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("reasoning_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("output_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+        });
+    Some(Usage::from_inclusive_input(
+        input_tokens,
+        output_tokens,
+        Some(cache_read),
+        Some(cache_write),
+        Some(0),
+        reasoning_tokens,
+    ))
 }
 
 fn response_failed_error(value: &Value) -> ProviderError {
@@ -448,7 +455,7 @@ data: {"type":"response.completed"}
         let events = parser.feed(
             br#"data: {"type":"response.reasoning_summary.delta","delta":"thinking"}
 
-data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}}}
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2},"output_tokens_details":{"reasoning_tokens":2}}}}
 
 "#,
         );
@@ -464,11 +471,39 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                     usage: Some(Usage {
                         input_tokens: 10,
                         output_tokens: 4,
+                        uncached_input_tokens: Some(5),
                         cached_tokens: Some(3),
+                        cache_write_5m_tokens: Some(2),
+                        cache_write_1h_tokens: Some(0),
                         reasoning_tokens: Some(2),
                     }),
                 }),
             ]
+        );
+    }
+
+    #[test]
+    fn usage_preserves_total_but_refuses_overlapping_cache_subtotals() {
+        assert_eq!(
+            usage(&json!({
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 1,
+                    "input_tokens_details": {
+                        "cached_tokens": 3,
+                        "cache_write_tokens": 2
+                    }
+                }
+            })),
+            Some(Usage {
+                input_tokens: 4,
+                output_tokens: 1,
+                uncached_input_tokens: None,
+                cached_tokens: None,
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
+            })
         );
     }
 
