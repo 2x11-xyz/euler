@@ -18,7 +18,7 @@ static SPEC: ChatCompletionsSpec = ChatCompletionsSpec {
     display: "xAI",
     endpoint: "https://api.x.ai/v1/chat/completions",
     env_key: API_KEY_ENV,
-    options: ChatCompletionsOptions::default,
+    options: ChatCompletionsOptions::first_party_five_minute_cache,
     extract_rejection_detail: false,
 };
 
@@ -81,7 +81,7 @@ fn classify_http_error(status: u16) -> ProviderError {
 pub(crate) fn parse_conformance_sse(
     sse: &[u8],
 ) -> Vec<Result<crate::ModelStreamEvent, ProviderError>> {
-    crate::chat_completions::parse_conformance_sse(SPEC.display, sse)
+    crate::chat_completions::parse_conformance_sse_with_options(SPEC.display, sse, (SPEC.options)())
 }
 
 #[cfg(test)]

@@ -24,7 +24,9 @@ use super::metrics;
 use super::patch_approval::{self, ApprovalOption, PatchApprovalModal, PatchPreview};
 #[cfg(test)]
 use super::status::status_widget;
-use super::status::{status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus};
+use super::status::{
+    format_cost_picos, status_line_canvas, StatusSnapshot, TokenUsageSnapshot, TurnStatus,
+};
 use super::terminal::{self, PendingSignal, TerminalSession};
 use super::theme::{ColorLevel, Theme, ThemeChoice};
 #[cfg(test)]
@@ -203,6 +205,9 @@ pub struct AppCore {
     /// Whether the session loaded a durable user grant store; gates the
     /// `u  Allow <prefix> * always` approval option (absent = store inert).
     user_rules_enabled: bool,
+    /// Actor recorded on `session.start`. Session cost includes every model
+    /// actor, but only this actor owns the footer's active-context reading.
+    primary_agent_id: Option<String>,
     token_usage: TokenUsageSnapshot,
     transcript: TranscriptState,
     visual_canvas: VisualCanvasState,
@@ -748,6 +753,7 @@ struct AppCoreBootstrap {
     auth_file: Option<PathBuf>,
     active_session_home_managed: bool,
     user_rules_enabled: bool,
+    primary_agent_id: Option<String>,
     theme: Theme,
     status: StatusSnapshot,
     initial_token_usage: TokenUsageSnapshot,
@@ -772,6 +778,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
     let reasoning_effort = session.reasoning_effort();
     let session_id = session.session_id().to_owned();
     let user_rules_enabled = session.user_rules_enabled();
+    let primary_agent_id = session_primary_agent_id(session);
     let cwd = session_root_status_path();
     let AppOptions {
         theme_choice,
@@ -846,12 +853,21 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         auth_file,
         active_session_home_managed,
         user_rules_enabled,
+        primary_agent_id,
         theme,
         status,
         initial_token_usage,
         initial_context,
         authenticated_providers,
     }
+}
+
+fn session_primary_agent_id(session: &Session<TuiDecider>) -> Option<String> {
+    session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+        .map(|event| event.agent.clone())
 }
 
 impl AppCore {
@@ -881,6 +897,7 @@ impl AppCore {
             session_store: boot.session_store,
             active_session_home_managed: boot.active_session_home_managed,
             user_rules_enabled: boot.user_rules_enabled,
+            primary_agent_id: boot.primary_agent_id,
             token_usage: boot.initial_token_usage,
             transcript: TranscriptState::default(),
             visual_canvas: VisualCanvasState::new(vec![TranscriptItem::Banner {
@@ -2195,9 +2212,11 @@ impl AppCore {
             .into_fresh_session(session_id.clone(), decider)
             .with_provenance(writer);
         let events = session.events().to_vec();
+        let primary_agent_id = session_primary_agent_id(&session);
 
         self.permission_rx = channels.request_rx;
         self.reply_tx = channels.reply_tx;
+        self.primary_agent_id = primary_agent_id;
         self.state = AppState::Idle {
             session: Box::new(session),
         };
@@ -2210,6 +2229,7 @@ impl AppCore {
         self.replace_bottom_surface_for_session();
         self.rebuild_transcript_from_events(&events);
         self.visual_scroll_offset = 0;
+        self.token_usage.context_window_tokens = self.active_context_window_tokens();
         self.tool_output_expanded = false;
         self.modal = None;
         self.quit_armed = None;
@@ -2301,7 +2321,7 @@ impl AppCore {
                 &mut token_usage,
                 event,
                 self.active_context_window_tokens(),
-                &self.model_catalog,
+                self.primary_agent_id.as_deref(),
             );
             transcript.push_event(event.clone());
         }
@@ -3054,13 +3074,15 @@ fn format_session_usage(
     lines.join("\n")
 }
 
-fn usage_cost_text(picos: u64, priced_calls: u64, unpriced_calls: u64) -> String {
-    let dollars = picos as f64 / 1_000_000_000_000.0;
+fn usage_cost_text(picos: u128, priced_calls: u64, unpriced_calls: u64) -> String {
     match (priced_calls, unpriced_calls) {
-        (0, 0) => "cost unavailable".to_owned(),
-        (0, _) => "cost $?".to_owned(),
-        (_, 0) => format!("cost ${dollars:.6}"),
-        (_, _) => format!("cost ${dollars:.6}+ ({unpriced_calls} unpriced call(s))"),
+        (0, 0) => "unavailable".to_owned(),
+        (0, _) => format!("$? ({unpriced_calls} unpriced call(s))"),
+        (_, 0) => format_cost_picos(picos, 6),
+        (_, _) => format!(
+            "{}+ ({unpriced_calls} unpriced call(s))",
+            format_cost_picos(picos, 6)
+        ),
     }
 }
 

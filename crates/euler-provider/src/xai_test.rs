@@ -105,9 +105,10 @@ data: [DONE]
                 usage: Some(crate::Usage {
                     input_tokens: 3,
                     output_tokens: 2,
-                    cached_tokens: None,
-                    cache_write_tokens: None,
-                    cache_write_1h_tokens: None,
+                    uncached_input_tokens: Some(3),
+                    cached_tokens: Some(0),
+                    cache_write_5m_tokens: Some(0),
+                    cache_write_1h_tokens: Some(0),
                     reasoning_tokens: None,
                 }),
             }),

@@ -12,7 +12,7 @@ static SPEC: ChatCompletionsSpec = ChatCompletionsSpec {
     display: "OpenAI",
     endpoint: "https://api.openai.com/v1/chat/completions",
     env_key: API_KEY_ENV,
-    options: ChatCompletionsOptions::default,
+    options: ChatCompletionsOptions::first_party_five_minute_cache,
     // OpenAI surfaces the `error.type`/`code` of a 4xx rejection in the message.
     extract_rejection_detail: true,
 };
@@ -76,7 +76,7 @@ fn classify_http_error(status: u16, body: &str) -> ProviderError {
 pub(crate) fn parse_conformance_sse(
     sse: &[u8],
 ) -> Vec<Result<crate::ModelStreamEvent, ProviderError>> {
-    crate::chat_completions::parse_conformance_sse(SPEC.display, sse)
+    crate::chat_completions::parse_conformance_sse_with_options(SPEC.display, sse, (SPEC.options)())
 }
 
 #[cfg(test)]

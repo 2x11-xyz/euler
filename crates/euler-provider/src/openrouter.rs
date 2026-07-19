@@ -69,6 +69,7 @@ fn chat_completions_options() -> ChatCompletionsOptions {
             "capture": "readable_or_summary",
         },
     })))
+    .with_openrouter_cache_usage()
 }
 
 #[cfg(test)]
@@ -80,7 +81,11 @@ fn request_body(request: &ModelRequest) -> serde_json::Value {
 pub(crate) fn parse_conformance_sse(
     sse: &[u8],
 ) -> Vec<Result<crate::ModelStreamEvent, ProviderError>> {
-    crate::chat_completions::parse_conformance_sse(SPEC.display, sse)
+    crate::chat_completions::parse_conformance_sse_with_options(
+        SPEC.display,
+        sse,
+        chat_completions_options(),
+    )
 }
 
 #[cfg(test)]

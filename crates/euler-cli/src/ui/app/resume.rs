@@ -171,8 +171,10 @@ impl AppCore {
         resume: TuiResume,
     ) -> CoreEffect {
         let reasoning_effort = resume.session.reasoning_effort();
+        let primary_agent_id = session_primary_agent_id(&resume.session);
         self.permission_rx = resume.channels.request_rx;
         self.reply_tx = resume.channels.reply_tx;
+        self.primary_agent_id = primary_agent_id;
         self.state = AppState::Idle {
             session: Box::new(resume.session),
         };

@@ -191,19 +191,21 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
 - Footer: **one** line below the composer — two hard-edged clusters:
   contextual hints then `cwd (branch)` flush-left; `model · ctx N% · $N.NNN`
   (plus the session name once named) flush-right. Cost is cumulative USD over
-  every persisted `model.result` in the session, including companion calls,
-  using that result's provider/model rate and cache-read discount from the
-  model catalog. The calculation follows pi: uncached input, output, cache
-  reads, and cache writes are charged separately, and request-wide
-  long-context tiers apply to the whole call. Anthropic one-hour cache writes
-  use pi's `2 × input` rate. The segment is omitted before the first result;
-  `$?` means
-  no result had pricing, and a trailing `+` marks a known subtotal when some
-  calls were unpriced. Subscription-backed ChatGPT still shows the equivalent
-  API cost; it is not a claim about an incremental invoice. No session id in
-  the footer — ids live in `/status` and resume copy (#21). Ctx% uses attention
-  at ≥70% and failure at ≥85%. No second status row; detail lives under
-  `/status`.
+  persisted `model.result.cost` snapshots in the session, including companion
+  calls. The model-result emission boundary computes each snapshot once from
+  disjoint usage buckets and the exact resolved catalog schedule; live display,
+  resume, and replay validate the saved component arithmetic against the saved
+  usage and selected rates, then sum the persisted integer components. Only
+  the primary session actor updates the active `ctx` counters; companion and
+  reviewer calls contribute cost without replacing that reading.
+  Catalog refresh never reprices history. The segment is omitted before the
+  first result; `$?` means no result had a valid persisted quote, and a trailing
+  `+` marks a known subtotal when any result was unpriced. Subscription-backed
+  ChatGPT shows an equivalent API-price estimate when its catalog entry has a
+  quote; this is neither an invoice nor a claim about incremental spend. No
+  session id in the footer — ids live in `/status` and resume copy (#21). Ctx%
+  uses attention at ≥70% and failure at ≥85%. No second status row; detail
+  lives under `/status`.
 
 ### Streaming, scroll, motion
 

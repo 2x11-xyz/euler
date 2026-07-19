@@ -42,7 +42,7 @@ pub struct TokenUsageSnapshot {
     pub compaction_tier: Option<String>,
     /// Cumulative USD in trillionths (pico-dollars), computed from the model
     /// metadata attached to each persisted model result.
-    pub session_cost_picos: u64,
+    pub session_cost_picos: u128,
     pub priced_calls: u64,
     pub unpriced_calls: u64,
 }
@@ -320,13 +320,25 @@ fn identity_cost_label(tokens: &TokenUsageSnapshot) -> Option<String> {
     match (tokens.priced_calls, tokens.unpriced_calls) {
         (0, 0) => None,
         (0, _) => Some("$?".to_owned()),
-        (_, 0) => Some(format_cost(tokens.session_cost_picos)),
-        (_, _) => Some(format!("{}+", format_cost(tokens.session_cost_picos))),
+        (_, 0) => Some(format_cost_picos(tokens.session_cost_picos, 3)),
+        (_, _) => Some(format!(
+            "{}+",
+            format_cost_picos(tokens.session_cost_picos, 3)
+        )),
     }
 }
 
-fn format_cost(picos: u64) -> String {
-    format!("${:.3}", picos as f64 / 1_000_000_000_000.0)
+pub(super) fn format_cost_picos(picos: u128, decimals: u32) -> String {
+    debug_assert!(decimals <= 12);
+    let divisor = 10_u128.pow(12 - decimals);
+    let rounded = picos / divisor + u128::from(picos % divisor >= divisor.div_ceil(2));
+    if decimals == 0 {
+        return format!("${rounded}");
+    }
+    let scale = 10_u128.pow(decimals);
+    let whole = rounded / scale;
+    let fraction = rounded % scale;
+    format!("${whole}.{fraction:0width$}", width = decimals as usize)
 }
 
 /// Right cluster, flush-right: `model(effort) · ctx N%` [· `$N.NNN`] [+ session
@@ -757,6 +769,15 @@ mod tests {
             status_line_text(&snapshot, &partial, TurnStatus::Idle, false, 120)
                 .ends_with("echo · ctx ?% · $1.250+")
         );
+    }
+
+    #[test]
+    fn fixed_point_cost_format_rounds_without_floating_point() {
+        assert_eq!(format_cost_picos(0, 3), "$0.000");
+        assert_eq!(format_cost_picos(499_999_999, 3), "$0.000");
+        assert_eq!(format_cost_picos(500_000_000, 3), "$0.001");
+        assert_eq!(format_cost_picos(12_345_678_499_999, 6), "$12.345678");
+        assert_eq!(format_cost_picos(12_345_678_500_000, 6), "$12.345679");
     }
 
     fn ctx_span_style(snapshot: &StatusSnapshot, theme: &Theme, percent: u64) -> Style {

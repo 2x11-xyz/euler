@@ -10,8 +10,9 @@ use euler_core::{
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{
-    FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ProviderSet,
-    ProviderStream, ReasoningChunk, ScriptedProvider, StopReason, ToolCall, Usage,
+    catalog::MergedModelCatalog, FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent,
+    ProviderError, ProviderSet, ProviderStream, ReasoningChunk, ScriptedProvider, StopReason,
+    ToolCall, Usage,
 };
 use euler_sdk::Capability;
 use serde_json::json;
@@ -2911,6 +2912,66 @@ fn fixture_finished_metadata_is_recorded_in_model_result() {
 }
 
 #[test]
+fn model_result_persists_authoritative_cost_breakdown_and_local_price_identity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let stream = vec![
+        Ok(ModelStreamEvent::TextDelta("done".to_owned())),
+        Ok(ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 3,
+                uncached_input_tokens: Some(7),
+                cached_tokens: Some(2),
+                cache_write_5m_tokens: Some(1),
+                cache_write_1h_tokens: Some(0),
+                reasoning_tokens: None,
+            }),
+        }),
+    ];
+    let provider = CapturingProvider::new("openai", vec![stream], request_log());
+    let (catalog, warnings) = MergedModelCatalog::with_local_json(
+        r#"{
+          "version": 1,
+          "providers": {"openai": {"models": [{
+            "id": "priced-test",
+            "cost": {
+              "input": 0.532,
+              "output": 1.672,
+              "cache_read": 0.0988,
+              "cache_write_5m": 0.665
+            }
+          }]}}
+        }"#,
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let providers = ProviderSet::single_named("openai", provider).with_model_catalog(catalog);
+    let mut config = SessionConfig::new(temp.path());
+    config.provider = "openai".to_owned();
+    config.model = "priced-test".to_owned();
+    let mut session = Session::new_with_providers(config, providers, ScriptedDecider::new(vec![]));
+
+    session.run_turn("price this").expect("turn");
+
+    let cost = &find_kind(session.events(), EventKind::MODEL_RESULT).payload["cost"];
+    assert_eq!(cost["schema_version"], json!(1));
+    assert_eq!(cost["currency"], json!("USD"));
+    assert_eq!(cost["unit"], json!("picodollar"));
+    assert_eq!(cost["input_picos"], json!(3_724_000));
+    assert_eq!(cost["output_picos"], json!(5_016_000));
+    assert_eq!(cost["cache_read_picos"], json!(197_600));
+    assert_eq!(cost["cache_write_5m_picos"], json!(665_000));
+    assert_eq!(cost["total_picos"], json!(9_602_600));
+    assert_eq!(cost["pricing"]["provider"], json!("openai"));
+    assert_eq!(cost["pricing"]["model"], json!("priced-test"));
+    assert_eq!(cost["pricing"]["source"], json!("local"));
+    assert_eq!(
+        cost["pricing"]["source_id"].as_str().map(str::len),
+        Some(64)
+    );
+}
+
+#[test]
 fn reasoning_delta_yields_reasoning_event_before_model_result() {
     let temp = tempfile::tempdir().expect("temp dir");
     let provider = ScriptedProvider::new(vec![FixtureResponse::ReasoningThenAssistant {
@@ -3213,8 +3274,9 @@ fn accepted_model_switch_is_persisted_before_next_user_and_next_call_uses_target
                 usage: Some(Usage {
                     input_tokens: 1,
                     output_tokens: 1,
+                    uncached_input_tokens: None,
                     cached_tokens: None,
-                    cache_write_tokens: None,
+                    cache_write_5m_tokens: None,
                     cache_write_1h_tokens: None,
                     reasoning_tokens: None,
                 }),
@@ -3234,8 +3296,9 @@ fn accepted_model_switch_is_persisted_before_next_user_and_next_call_uses_target
                 usage: Some(Usage {
                     input_tokens: 2,
                     output_tokens: 3,
+                    uncached_input_tokens: None,
                     cached_tokens: None,
-                    cache_write_tokens: None,
+                    cache_write_5m_tokens: None,
                     cache_write_1h_tokens: None,
                     reasoning_tokens: Some(1),
                 }),
@@ -3738,8 +3801,9 @@ fn context_limit_after_switch_uses_new_target_before_provider_call() {
                 usage: Some(Usage {
                     input_tokens: 90,
                     output_tokens: 5,
+                    uncached_input_tokens: None,
                     cached_tokens: None,
-                    cache_write_tokens: None,
+                    cache_write_5m_tokens: None,
                     cache_write_1h_tokens: None,
                     reasoning_tokens: None,
                 }),
@@ -4156,8 +4220,9 @@ fn context_limit_after_final_result_records_payload_and_clean_stop_message() {
             usage: Some(Usage {
                 input_tokens: 40,
                 output_tokens: 5,
+                uncached_input_tokens: None,
                 cached_tokens: Some(4),
-                cache_write_tokens: None,
+                cache_write_5m_tokens: None,
                 cache_write_1h_tokens: None,
                 reasoning_tokens: Some(1),
             }),
@@ -4268,8 +4333,9 @@ fn context_limit_exact_threshold_boundary_emits_limit_event() {
             usage: Some(Usage {
                 input_tokens: 4,
                 output_tokens: 1,
+                uncached_input_tokens: None,
                 cached_tokens: None,
-                cache_write_tokens: None,
+                cache_write_5m_tokens: None,
                 cache_write_1h_tokens: None,
                 reasoning_tokens: None,
             }),
@@ -4298,8 +4364,9 @@ fn context_limit_after_tool_use_stops_before_tool_execution_or_next_model_call()
             usage: Some(Usage {
                 input_tokens: 90,
                 output_tokens: 5,
+                uncached_input_tokens: None,
                 cached_tokens: None,
-                cache_write_tokens: None,
+                cache_write_5m_tokens: None,
                 cache_write_1h_tokens: None,
                 reasoning_tokens: None,
             }),
@@ -4333,8 +4400,9 @@ fn context_limit_usage_below_threshold_does_not_emit_limit_event() {
             usage: Some(Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+                uncached_input_tokens: None,
                 cached_tokens: None,
-                cache_write_tokens: None,
+                cache_write_5m_tokens: None,
                 cache_write_1h_tokens: None,
                 reasoning_tokens: None,
             }),
@@ -4386,8 +4454,9 @@ fn context_limit_is_emitted_only_once_after_session_stops() {
                     usage: Some(Usage {
                         input_tokens: 10,
                         output_tokens: 0,
+                        uncached_input_tokens: None,
                         cached_tokens: None,
-                        cache_write_tokens: None,
+                        cache_write_5m_tokens: None,
                         cache_write_1h_tokens: None,
                         reasoning_tokens: None,
                     }),
@@ -4400,8 +4469,9 @@ fn context_limit_is_emitted_only_once_after_session_stops() {
                     usage: Some(Usage {
                         input_tokens: 10,
                         output_tokens: 0,
+                        uncached_input_tokens: None,
                         cached_tokens: None,
-                        cache_write_tokens: None,
+                        cache_write_5m_tokens: None,
                         cache_write_1h_tokens: None,
                         reasoning_tokens: None,
                     }),
@@ -4804,9 +4874,10 @@ fn text_stream_with_usage(
             usage: Some(Usage {
                 input_tokens,
                 output_tokens,
-                cached_tokens: None,
-                cache_write_tokens: None,
-                cache_write_1h_tokens: None,
+                uncached_input_tokens: Some(input_tokens),
+                cached_tokens: Some(0),
+                cache_write_5m_tokens: Some(0),
+                cache_write_1h_tokens: Some(0),
                 reasoning_tokens: None,
             }),
         }),

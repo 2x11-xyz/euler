@@ -1,6 +1,7 @@
 use super::ReasoningEffort;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -109,6 +110,7 @@ pub(super) struct OfficialModel {
     pub(super) supports_tools: bool,
     pub(super) supports_reasoning: bool,
     reasoning_efforts: Vec<OfficialReasoningEffort>,
+    pub(super) cost: Option<Value>,
 }
 
 impl OfficialModel {
@@ -258,8 +260,18 @@ impl OfficialModel {
             }
             previous_rank = Some(rank);
         }
+        if let Some(cost) = &self.cost {
+            super::parse_official_model_cost(cost, provider_id, &self.id)?;
+        }
         Ok(())
     }
+}
+
+pub(super) fn embedded_release_id() -> String {
+    serde_json::from_str::<Value>(EMBEDDED_MANIFEST_JSON)
+        .ok()
+        .and_then(|manifest| manifest.get("release_id")?.as_str().map(str::to_owned))
+        .expect("packaged provider catalog manifest must contain release_id")
 }
 
 fn validate_provider_id(value: &str, scope: &str) -> Result<(), OfficialCatalogError> {
@@ -417,5 +429,44 @@ mod tests {
             .expect("anthropic")
             .models()
             .all(|model| model.id() != "claude-fable-5"));
+    }
+
+    #[test]
+    fn official_price_metadata_is_strict_and_resolves_with_release_identity() {
+        let mut document: Value = serde_json::from_str(EMBEDDED_CATALOG_JSON).expect("catalog");
+        document["providers"]["anthropic"]["models"][0]["cost"] = serde_json::json!({
+            "input": 10,
+            "output": 50,
+            "cache_read": 1,
+            "cache_write_5m": 12.5,
+            "cache_write_1h": 20
+        });
+        let catalog = super::super::MergedModelCatalog::from_official_json(
+            &serde_json::to_string(&document).expect("json"),
+        )
+        .expect("official price")
+        .with_official_release_id("catalog-v1-test");
+
+        let resolved = catalog
+            .resolved_model_cost("anthropic", "claude-fable-5")
+            .expect("resolved price");
+        assert_eq!(resolved.cost.rates.input, 10_000_000);
+        assert!(matches!(
+            resolved.source,
+            super::super::ModelCostSource::Official { ref release_id }
+                if release_id == "catalog-v1-test"
+        ));
+    }
+
+    #[test]
+    fn malformed_official_price_rejects_the_entire_catalog() {
+        let mut document: Value = serde_json::from_str(EMBEDDED_CATALOG_JSON).expect("catalog");
+        document["providers"]["anthropic"]["models"][0]["cost"] =
+            serde_json::json!({"input": 0.1234567, "output": 50});
+
+        let error = parse(&serde_json::to_string(&document).expect("json"))
+            .expect_err("excess precision must fail closed");
+
+        assert!(error.to_string().contains("at most six decimal places"));
     }
 }

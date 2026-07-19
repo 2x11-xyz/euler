@@ -165,9 +165,10 @@ data: [DONE]
                 usage: Some(Usage {
                     input_tokens: 10,
                     output_tokens: 4,
+                    uncached_input_tokens: Some(7),
                     cached_tokens: Some(3),
-                    cache_write_tokens: None,
-                    cache_write_1h_tokens: None,
+                    cache_write_5m_tokens: Some(0),
+                    cache_write_1h_tokens: Some(0),
                     reasoning_tokens: Some(1),
                 }),
             }),
@@ -193,13 +194,40 @@ fn stream_processes_choices_and_usage_in_same_payload() {
                 usage: Some(Usage {
                     input_tokens: 7,
                     output_tokens: 2,
+                    uncached_input_tokens: None,
                     cached_tokens: None,
-                    cache_write_tokens: None,
+                    cache_write_5m_tokens: None,
                     cache_write_1h_tokens: None,
                     reasoning_tokens: None,
                 }),
             }),
         ]
+    );
+}
+
+#[test]
+fn stream_does_not_assign_an_openrouter_cache_write_to_a_ttl() {
+    let mut parser = OpenRouterSseParser::new();
+    let events = parser.feed(
+        br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}}
+
+"#,
+    );
+
+    assert_eq!(
+        events,
+        vec![Ok(ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                uncached_input_tokens: None,
+                cached_tokens: None,
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
+            }),
+        })]
     );
 }
 

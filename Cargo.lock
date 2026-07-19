@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "euler-agents"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "euler-event",
  "euler-sdk",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "euler-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "euler-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "diffy",
  "euler-agents",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "euler-event"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "serde",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "euler-extension-autoresearch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "euler-agents",
  "euler-event",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "euler-extension-causal-dag"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "euler-agents",
  "euler-core",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "euler-extension-code-swarm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "euler-sdk",
  "serde_json",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "euler-extension-diagnostics-report"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "euler-sdk",
  "serde",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "euler-extension-maxproof"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "euler-event",
  "euler-sdk",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "euler-extension-session-export"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "euler-core",
  "euler-event",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "euler-managed-process"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "euler-sdk",
@@ -604,10 +604,11 @@ dependencies = [
 
 [[package]]
 name = "euler-provider"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "tungstenite",
  "ulid",
  "ureq",
@@ -616,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "euler-sdk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "euler-event",
  "serde",
@@ -628,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "euler-tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "euler-event",

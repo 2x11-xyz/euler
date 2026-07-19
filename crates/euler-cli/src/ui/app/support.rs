@@ -15,7 +15,7 @@ use euler_core::{EulerHome, ReasoningEffort, SessionRecord, SessionStore};
 #[cfg(test)]
 use euler_event::object;
 use euler_event::{EventEnvelope, EventKind};
-use euler_provider::catalog::{MergedModelCatalog, ModelCost, ModelDescriptor};
+use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{CustomModelConfig, ProviderConfigRegistry};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -41,9 +41,10 @@ pub(super) fn update_token_usage(
     tokens: &mut TokenUsageSnapshot,
     event: &EventEnvelope,
     context_window_tokens: Option<u64>,
-    model_catalog: &MergedModelCatalog,
+    primary_agent_id: Option<&str>,
 ) {
-    if event.kind.as_str() == EventKind::MODEL_SWITCHED {
+    let is_primary = primary_agent_id == Some(event.agent.as_str());
+    if event.kind.as_str() == EventKind::MODEL_SWITCHED && is_primary {
         // Switching models clears the active context reading, but cost is a
         // session-lifetime total just as it is in pi's footer.
         tokens.input_tokens = 0;
@@ -56,7 +57,7 @@ pub(super) fn update_token_usage(
         tokens.compaction_tier = None;
         return;
     }
-    if event.kind.as_str() == EventKind::CANVAS_SNAPSHOT {
+    if event.kind.as_str() == EventKind::CANVAS_SNAPSHOT && is_primary {
         tokens.demoted_items = event
             .payload
             .get("demoted_items")
@@ -74,88 +75,301 @@ pub(super) fn update_token_usage(
     if event.kind.as_str() != EventKind::MODEL_RESULT {
         return;
     }
-    let Some(usage) = event.payload.get("usage").and_then(Value::as_object) else {
-        tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1);
+    let Some(usage) = model_result_usage(event) else {
         return;
     };
-    let (Some(input_tokens), Some(output_tokens)) = (
-        usage_u64(usage, "input_tokens"),
-        usage_u64(usage, "output_tokens"),
-    ) else {
-        tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1);
-        return;
-    };
-    tokens.input_tokens = input_tokens;
-    tokens.output_tokens = output_tokens;
-    tokens.reasoning_tokens = usage_u64(usage, "reasoning_tokens");
-    tokens.context_window_tokens = context_window_tokens;
-
-    let provider = event.payload.get("provider").and_then(Value::as_str);
-    let model = event.payload.get("model").and_then(Value::as_str);
-    let cached_tokens = usage_u64(usage, "cached_tokens").unwrap_or(0);
-    let cache_write_tokens = usage_u64(usage, "cache_write_tokens").unwrap_or(0);
-    let cache_write_1h_tokens = usage_u64(usage, "cache_write_1h_tokens").unwrap_or(0);
-    let Some((provider, cost)) = provider.zip(model).and_then(|(provider, model)| {
-        model_cost(model_catalog, provider, model).map(|cost| (provider, cost))
-    }) else {
-        tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1);
-        return;
-    };
-    let picos = model_result_cost_picos(
-        provider,
-        cost,
-        input_tokens,
-        output_tokens,
-        cached_tokens,
-        cache_write_tokens,
-        cache_write_1h_tokens,
-    );
-    tokens.session_cost_picos = tokens.session_cost_picos.saturating_add(picos);
-    tokens.priced_calls = tokens.priced_calls.saturating_add(1);
+    if is_primary {
+        if let ModelResultUsage::Reported {
+            input_tokens,
+            output_tokens,
+            reasoning_tokens,
+        } = usage
+        {
+            tokens.input_tokens = input_tokens;
+            tokens.output_tokens = output_tokens;
+            tokens.reasoning_tokens = reasoning_tokens;
+            tokens.context_window_tokens = context_window_tokens;
+        }
+    }
+    match persisted_model_cost_picos(event) {
+        Some(picos) => {
+            tokens.session_cost_picos += u128::from(picos);
+            tokens.priced_calls = tokens.priced_calls.saturating_add(1);
+        }
+        None => tokens.unpriced_calls = tokens.unpriced_calls.saturating_add(1),
+    }
 }
 
-fn model_cost(catalog: &MergedModelCatalog, provider: &str, model: &str) -> Option<ModelCost> {
-    catalog
-        .provider(provider)?
-        .models()
-        .find(|candidate| candidate.id() == model)?
-        .cost()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelResultUsage {
+    Unavailable,
+    Reported {
+        input_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: Option<u64>,
+    },
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors pi's four usage counters plus target
-fn model_result_cost_picos(
-    provider: &str,
-    cost: ModelCost,
+fn model_result_usage(event: &EventEnvelope) -> Option<ModelResultUsage> {
+    event
+        .payload
+        .get("provider")?
+        .as_str()
+        .filter(|value| !value.is_empty())?;
+    event
+        .payload
+        .get("model")?
+        .as_str()
+        .filter(|value| !value.is_empty())?;
+    match event.payload.get("usage")? {
+        Value::Null => Some(ModelResultUsage::Unavailable),
+        Value::Object(usage) => Some(ModelResultUsage::Reported {
+            input_tokens: usage_u64(usage, "input_tokens")?,
+            output_tokens: usage_u64(usage, "output_tokens")?,
+            reasoning_tokens: optional_usage_u64(usage, "reasoning_tokens")?,
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PricedUsage {
     input_tokens: u64,
     output_tokens: u64,
-    cached_tokens: u64,
-    cache_write_tokens: u64,
+    uncached_input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_5m_tokens: u64,
     cache_write_1h_tokens: u64,
-) -> u64 {
-    let (ordinary_input, cache_read) = if provider == "anthropic" {
-        (input_tokens, cached_tokens)
-    } else {
+}
+
+impl PricedUsage {
+    fn from_event(event: &EventEnvelope) -> Option<Self> {
+        let usage = event.payload.get("usage")?.as_object()?;
+        let value = Self {
+            input_tokens: usage_u64(usage, "input_tokens")?,
+            output_tokens: usage_u64(usage, "output_tokens")?,
+            uncached_input_tokens: usage_u64(usage, "uncached_input_tokens")?,
+            cache_read_tokens: usage_u64(usage, "cached_tokens")?,
+            cache_write_5m_tokens: usage_u64(usage, "cache_write_5m_tokens")?,
+            cache_write_1h_tokens: usage_u64(usage, "cache_write_1h_tokens")?,
+        };
+        (value.input_bucket_sum()? == value.input_tokens).then_some(value)
+    }
+
+    fn input_bucket_sum(self) -> Option<u64> {
+        self.uncached_input_tokens
+            .checked_add(self.cache_read_tokens)?
+            .checked_add(self.cache_write_5m_tokens)?
+            .checked_add(self.cache_write_1h_tokens)
+    }
+}
+
+fn persisted_model_cost_picos(event: &EventEnvelope) -> Option<u64> {
+    let cost = event.payload.get("cost")?.as_object()?;
+    const COST_FIELDS: [&str; 10] = [
+        "schema_version",
+        "currency",
+        "unit",
+        "input_picos",
+        "output_picos",
+        "cache_read_picos",
+        "cache_write_5m_picos",
+        "cache_write_1h_picos",
+        "total_picos",
+        "pricing",
+    ];
+    if !has_exact_fields(cost, &COST_FIELDS) {
+        return None;
+    }
+    if cost.get("schema_version")?.as_u64()? != 1
+        || cost.get("currency")?.as_str()? != "USD"
+        || cost.get("unit")?.as_str()? != "picodollar"
+    {
+        return None;
+    }
+    let usage = PricedUsage::from_event(event)?;
+    let pricing = validate_persisted_pricing(event, cost.get("pricing")?.as_object()?)?;
+    if pricing
+        .tier_input_tokens_above
+        .is_some_and(|threshold| usage.input_tokens <= threshold)
+    {
+        return None;
+    }
+    let sum = validate_cost_components(cost, usage, pricing.rates)?;
+    if sum != cost.get("total_picos")?.as_u64()? {
+        return None;
+    }
+    Some(sum)
+}
+
+#[derive(Clone, Copy)]
+struct PersistedRates {
+    input: u64,
+    output: u64,
+    cache_read: Option<u64>,
+    cache_write_5m: Option<u64>,
+    cache_write_1h: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct PersistedPricing {
+    rates: PersistedRates,
+    tier_input_tokens_above: Option<u64>,
+}
+
+fn validate_persisted_pricing(
+    event: &EventEnvelope,
+    pricing: &serde_json::Map<String, Value>,
+) -> Option<PersistedPricing> {
+    let provider = event.payload.get("provider")?.as_str()?;
+    let model = event.payload.get("model")?.as_str()?;
+    let source = pricing.get("source")?.as_str()?;
+    let source_id = pricing.get("source_id")?.as_str()?;
+    const PRICING_FIELDS: [&str; 6] = [
+        "provider",
+        "model",
+        "source",
+        "source_id",
+        "rates",
+        "tier_input_tokens_above",
+    ];
+    if has_unknown_fields(pricing, &PRICING_FIELDS) || !matches!(pricing.len(), 5 | 6) {
+        return None;
+    }
+    let tier_input_tokens_above = optional_positive_u64(pricing, "tier_input_tokens_above")?;
+    let rates = pricing.get("rates")?.as_object()?;
+    const RATE_FIELDS: [&str; 5] = [
+        "input_picos_per_token",
+        "output_picos_per_token",
+        "cache_read_picos_per_token",
+        "cache_write_5m_picos_per_token",
+        "cache_write_1h_picos_per_token",
+    ];
+    if has_unknown_fields(rates, &RATE_FIELDS)
+        || rates.values().any(|value| value.as_u64().is_none())
+    {
+        return None;
+    }
+    if pricing.get("provider")?.as_str()? != provider
+        || pricing.get("model")?.as_str()? != model
+        || !valid_pricing_source(source, source_id)
+    {
+        return None;
+    }
+    Some(PersistedPricing {
+        rates: PersistedRates {
+            input: rates.get("input_picos_per_token")?.as_u64()?,
+            output: rates.get("output_picos_per_token")?.as_u64()?,
+            cache_read: optional_rate(rates, "cache_read_picos_per_token")?,
+            cache_write_5m: optional_rate(rates, "cache_write_5m_picos_per_token")?,
+            cache_write_1h: optional_rate(rates, "cache_write_1h_picos_per_token")?,
+        },
+        tier_input_tokens_above,
+    })
+}
+
+fn validate_cost_components(
+    cost: &serde_json::Map<String, Value>,
+    usage: PricedUsage,
+    rates: PersistedRates,
+) -> Option<u64> {
+    let components = [
         (
-            input_tokens.saturating_sub(cached_tokens),
-            cached_tokens.min(input_tokens),
-        )
+            "input_picos",
+            usage.uncached_input_tokens,
+            Some(rates.input),
+        ),
+        ("output_picos", usage.output_tokens, Some(rates.output)),
+        (
+            "cache_read_picos",
+            usage.cache_read_tokens,
+            rates.cache_read,
+        ),
+        (
+            "cache_write_5m_picos",
+            usage.cache_write_5m_tokens,
+            rates.cache_write_5m,
+        ),
+        (
+            "cache_write_1h_picos",
+            usage.cache_write_1h_tokens,
+            rates.cache_write_1h,
+        ),
+    ];
+    components
+        .into_iter()
+        .try_fold(0_u64, |total, (field, tokens, rate)| {
+            let expected = component_cost(tokens, rate)?;
+            (cost.get(field)?.as_u64()? == expected).then(|| total.checked_add(expected))?
+        })
+}
+
+fn component_cost(tokens: u64, rate: Option<u64>) -> Option<u64> {
+    if tokens == 0 {
+        Some(0)
+    } else {
+        tokens.checked_mul(rate?)
+    }
+}
+
+fn optional_rate(object: &serde_json::Map<String, Value>, field: &str) -> Option<Option<u64>> {
+    match object.get(field) {
+        Some(value) => Some(Some(value.as_u64()?)),
+        None => Some(None),
+    }
+}
+
+fn optional_positive_u64(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Option<Option<u64>> {
+    match object.get(field) {
+        Some(value) => Some(Some(value.as_u64().filter(|value| *value > 0)?)),
+        None => Some(None),
+    }
+}
+
+fn optional_usage_u64(object: &serde_json::Map<String, Value>, field: &str) -> Option<Option<u64>> {
+    optional_rate(object, field)
+}
+
+fn valid_pricing_source(source: &str, source_id: &str) -> bool {
+    match source {
+        "local" => is_lower_hex_digest(source_id),
+        "official" => is_catalog_release_id(source_id),
+        _ => false,
+    }
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_catalog_release_id(value: &str) -> bool {
+    let Some(value) = value.strip_prefix("catalog-v1-") else {
+        return false;
     };
-    let rates = cost.rates_for_input(
-        ordinary_input
-            .saturating_add(cache_read)
-            .saturating_add(cache_write_tokens),
-    );
-    let long_write = cache_write_1h_tokens.min(cache_write_tokens);
-    let short_write = cache_write_tokens.saturating_sub(long_write);
-    // A rate unit is $0.000001 per million tokens, which is exactly one
-    // pico-dollar per token. Integer arithmetic therefore preserves all six
-    // decimal places accepted from models.dev without accumulation drift.
-    ordinary_input
-        .saturating_mul(rates.input)
-        .saturating_add(output_tokens.saturating_mul(rates.output))
-        .saturating_add(cache_read.saturating_mul(rates.cache_read))
-        .saturating_add(short_write.saturating_mul(rates.cache_write))
-        .saturating_add(long_write.saturating_mul(rates.input.saturating_mul(2)))
+    let Some((timestamp, digest)) = value.split_once('-') else {
+        return false;
+    };
+    let timestamp = timestamp.as_bytes();
+    timestamp.len() == 16
+        && timestamp[..8].iter().all(u8::is_ascii_digit)
+        && timestamp[8] == b't'
+        && timestamp[9..15].iter().all(u8::is_ascii_digit)
+        && timestamp[15] == b'z'
+        && is_lower_hex_digest(digest)
+}
+
+fn has_exact_fields(object: &serde_json::Map<String, Value>, fields: &[&str]) -> bool {
+    object.len() == fields.len() && !has_unknown_fields(object, fields)
+}
+
+fn has_unknown_fields(object: &serde_json::Map<String, Value>, fields: &[&str]) -> bool {
+    object.keys().any(|field| !fields.contains(&field.as_str()))
 }
 
 pub(super) fn read_terminal_event() -> Result<Option<UiEvent>> {
@@ -506,53 +720,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pi_cost_math_prices_cached_input_at_the_cache_rate() {
-        let cost = ModelCost::new(5.0, 30.0, 0.5, 6.25);
-
-        let openai = model_result_cost_picos("openai", cost, 1_000, 100, 400, 0, 0);
-        let anthropic = model_result_cost_picos("anthropic", cost, 600, 100, 400, 0, 0);
-
-        // 600 ordinary input * 5000000 picos + 100 output * 30000000 picos
-        // + 400 cached input * 500000 picos = $0.0062.
-        assert_eq!(openai, 6_200_000_000);
-        assert_eq!(anthropic, 6_200_000_000);
-    }
-
-    #[test]
-    fn pi_cost_math_prices_anthropic_cache_writes() {
-        let cost = ModelCost::new(2.0, 10.0, 0.2, 2.5);
-
-        let picos = model_result_cost_picos("anthropic", cost, 100, 10, 20, 40, 10);
-
-        // $0.0002 input + $0.0001 output + $0.000004 read + $0.000075
-        // short write + $0.00004 one-hour write (2x input rate).
-        assert_eq!(picos, 419_000_000);
-    }
-
-    #[test]
-    fn pi_cost_math_uses_request_wide_long_context_tier() {
-        let cost = ModelCost::with_tier(2.5, 15.0, 0.25, 0.0, 272_000, 5.0, 22.5, 0.5, 0.0);
-
-        let at_threshold = model_result_cost_picos("openai", cost, 272_000, 10, 0, 0, 0);
-        let over_threshold = model_result_cost_picos("openai", cost, 272_001, 10, 0, 0, 0);
-
-        assert_eq!(at_threshold, 680_150_000_000);
-        assert_eq!(over_threshold, 1_360_230_000_000);
-    }
-
-    #[test]
-    fn cost_math_preserves_six_decimal_model_rates() {
-        let cost = ModelCost::new(0.07696, 0.0, 0.0, 0.0);
-
-        let picos = model_result_cost_picos("openrouter", cost, 1, 0, 0, 0, 0);
-
-        assert_eq!(picos, 76_960);
-    }
-
-    #[test]
-    fn token_usage_accumulates_priced_calls_and_marks_unknown_models() {
-        let catalog = MergedModelCatalog::built_in();
+    fn token_usage_accumulates_persisted_cost_and_marks_unpriced_history() {
         let mut tokens = TokenUsageSnapshot::default();
+        let usage = TestUsage::plain(1_000, 100);
         let priced = EventEnvelope::new(
             "session",
             "root",
@@ -561,14 +731,8 @@ mod tests {
             object([
                 ("provider", "openai".into()),
                 ("model", "gpt-5.5".into()),
-                (
-                    "usage",
-                    serde_json::json!({
-                        "input_tokens": 1_000,
-                        "output_tokens": 100,
-                        "cached_tokens": 400
-                    }),
-                ),
+                ("usage", test_usage(usage)),
+                ("cost", test_cost("openai", "gpt-5.5", usage)),
             ]),
         );
         let unpriced = EventEnvelope::new(
@@ -586,17 +750,16 @@ mod tests {
             ]),
         );
 
-        update_token_usage(&mut tokens, &priced, Some(1_000_000), &catalog);
-        update_token_usage(&mut tokens, &unpriced, None, &catalog);
+        update_token_usage(&mut tokens, &priced, Some(1_000_000), Some("root"));
+        update_token_usage(&mut tokens, &unpriced, None, Some("root"));
 
-        assert_eq!(tokens.session_cost_picos, 6_200_000_000);
+        assert_eq!(tokens.session_cost_picos, 2_300);
         assert_eq!(tokens.priced_calls, 1);
         assert_eq!(tokens.unpriced_calls, 1);
     }
 
     #[test]
     fn token_usage_marks_missing_provider_usage_as_unpriced() {
-        let catalog = MergedModelCatalog::built_in();
         let mut tokens = TokenUsageSnapshot::default();
         let event = EventEnvelope::new(
             "session",
@@ -610,10 +773,233 @@ mod tests {
             ]),
         );
 
-        update_token_usage(&mut tokens, &event, Some(1_000_000), &catalog);
+        update_token_usage(&mut tokens, &event, Some(1_000_000), Some("root"));
 
         assert_eq!(tokens.priced_calls, 0);
         assert_eq!(tokens.unpriced_calls, 1);
+    }
+
+    #[test]
+    fn token_usage_rejects_cost_for_a_different_model() {
+        let mut tokens = TokenUsageSnapshot::default();
+        let usage = TestUsage::plain(5, 2);
+        let event = EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::MODEL_RESULT,
+            object([
+                ("provider", "openai".into()),
+                ("model", "gpt-5.5".into()),
+                ("usage", test_usage(usage)),
+                ("cost", test_cost("openai", "gpt-other", usage)),
+            ]),
+        );
+
+        update_token_usage(&mut tokens, &event, Some(1_000_000), Some("root"));
+
+        assert_eq!(tokens.session_cost_picos, 0);
+        assert_eq!(tokens.priced_calls, 0);
+        assert_eq!(tokens.unpriced_calls, 1);
+    }
+
+    #[test]
+    fn companion_cost_counts_without_replacing_primary_context() {
+        let mut tokens = TokenUsageSnapshot::default();
+        let root_usage = TestUsage::plain(10, 1);
+        let child_usage = TestUsage::plain(4, 2);
+        for (agent, usage, context_window) in [
+            ("root", root_usage, 1_000_000),
+            ("agent-child", child_usage, 200_000),
+        ] {
+            let event = EventEnvelope::new(
+                "session",
+                agent,
+                None,
+                EventKind::MODEL_RESULT,
+                object([
+                    ("provider", "openai".into()),
+                    ("model", "gpt-5.5".into()),
+                    ("usage", test_usage(usage)),
+                    ("cost", test_cost("openai", "gpt-5.5", usage)),
+                ]),
+            );
+            update_token_usage(&mut tokens, &event, Some(context_window), Some("root"));
+        }
+
+        assert_eq!(tokens.input_tokens, 10);
+        assert_eq!(tokens.output_tokens, 1);
+        assert_eq!(tokens.context_window_tokens, Some(1_000_000));
+        assert_eq!(tokens.session_cost_picos, 37);
+        assert_eq!(tokens.priced_calls, 2);
+    }
+
+    #[test]
+    fn malformed_model_result_does_not_create_an_unpriced_call() {
+        let mut tokens = TokenUsageSnapshot::default();
+        let event = EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::MODEL_RESULT,
+            object([
+                ("provider", "openai".into()),
+                ("model", "gpt-5.5".into()),
+                ("usage", serde_json::json!({"input_tokens": 5})),
+            ]),
+        );
+
+        update_token_usage(&mut tokens, &event, None, Some("root"));
+
+        assert_eq!(tokens.unpriced_calls, 0);
+    }
+
+    #[test]
+    fn persisted_cost_must_match_usage_rates_and_selected_tier() {
+        let usage = TestUsage::plain(5, 2);
+        let mut corrupted_component = priced_event(usage);
+        corrupted_component.payload["cost"]["input_picos"] = 11.into();
+        let mut impossible_tier = priced_event(usage);
+        impossible_tier.payload["cost"]["pricing"]["tier_input_tokens_above"] = 5.into();
+
+        for event in [corrupted_component, impossible_tier] {
+            let mut tokens = TokenUsageSnapshot::default();
+            update_token_usage(&mut tokens, &event, None, Some("root"));
+            assert_eq!(tokens.priced_calls, 0);
+            assert_eq!(tokens.unpriced_calls, 1);
+        }
+    }
+
+    #[test]
+    fn nonzero_cache_bucket_requires_its_persisted_rate() {
+        let usage = TestUsage {
+            uncached: 4,
+            output: 2,
+            cache_read: 1,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+        };
+        let mut event = priced_event(usage);
+        event.payload["cost"]["pricing"]["rates"]
+            .as_object_mut()
+            .expect("rates")
+            .remove("cache_read_picos_per_token");
+        let mut tokens = TokenUsageSnapshot::default();
+
+        update_token_usage(&mut tokens, &event, None, Some("root"));
+
+        assert_eq!(tokens.priced_calls, 0);
+        assert_eq!(tokens.unpriced_calls, 1);
+    }
+
+    #[test]
+    fn persisted_price_identity_must_match_its_source_wire_format() {
+        let usage = TestUsage::plain(5, 2);
+        let mut malformed_official = priced_event(usage);
+        malformed_official.payload["cost"]["pricing"]["source_id"] = "catalog-v1-test".into();
+        let mut malformed_local = priced_event(usage);
+        malformed_local.payload["cost"]["pricing"]["source"] = "local".into();
+        malformed_local.payload["cost"]["pricing"]["source_id"] = "ABC123".into();
+        let mut valid_local = priced_event(usage);
+        valid_local.payload["cost"]["pricing"]["source"] = "local".into();
+        valid_local.payload["cost"]["pricing"]["source_id"] = "0".repeat(64).into();
+
+        for event in [malformed_official, malformed_local] {
+            let mut tokens = TokenUsageSnapshot::default();
+            update_token_usage(&mut tokens, &event, None, Some("root"));
+            assert_eq!(tokens.unpriced_calls, 1);
+        }
+        let mut tokens = TokenUsageSnapshot::default();
+        update_token_usage(&mut tokens, &valid_local, None, Some("root"));
+        assert_eq!(tokens.priced_calls, 1);
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestUsage {
+        uncached: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write_5m: u64,
+        cache_write_1h: u64,
+    }
+
+    impl TestUsage {
+        fn plain(input: u64, output: u64) -> Self {
+            Self {
+                uncached: input,
+                output,
+                cache_read: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+            }
+        }
+
+        fn input(self) -> u64 {
+            self.uncached + self.cache_read + self.cache_write_5m + self.cache_write_1h
+        }
+    }
+
+    fn test_usage(usage: TestUsage) -> Value {
+        serde_json::json!({
+            "input_tokens": usage.input(),
+            "output_tokens": usage.output,
+            "uncached_input_tokens": usage.uncached,
+            "cached_tokens": usage.cache_read,
+            "cache_write_5m_tokens": usage.cache_write_5m,
+            "cache_write_1h_tokens": usage.cache_write_1h
+        })
+    }
+
+    fn priced_event(usage: TestUsage) -> EventEnvelope {
+        EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::MODEL_RESULT,
+            object([
+                ("provider", "openai".into()),
+                ("model", "gpt-5.5".into()),
+                ("usage", test_usage(usage)),
+                ("cost", test_cost("openai", "gpt-5.5", usage)),
+            ]),
+        )
+    }
+
+    fn test_cost(provider: &str, model: &str, usage: TestUsage) -> Value {
+        let input_picos = usage.uncached * 2;
+        let output_picos = usage.output * 3;
+        let cache_read_picos = usage.cache_read * 5;
+        let cache_write_5m_picos = usage.cache_write_5m * 7;
+        let cache_write_1h_picos = usage.cache_write_1h * 11;
+        let total_picos = input_picos
+            + output_picos
+            + cache_read_picos
+            + cache_write_5m_picos
+            + cache_write_1h_picos;
+        serde_json::json!({
+            "schema_version": 1,
+            "currency": "USD",
+            "unit": "picodollar",
+            "input_picos": input_picos,
+            "output_picos": output_picos,
+            "cache_read_picos": cache_read_picos,
+            "cache_write_5m_picos": cache_write_5m_picos,
+            "cache_write_1h_picos": cache_write_1h_picos,
+            "total_picos": total_picos,
+            "pricing": {
+                "provider": provider,
+                "model": model,
+                "source": "official",
+                "source_id": "catalog-v1-20260718t000000z-218346974a6da9255e39f79e4a59912de5d344d7144c1dee597424b173c7f73f",
+                "rates": {
+                    "input_picos_per_token": 2,
+                    "output_picos_per_token": 3,
+                    "cache_read_picos_per_token": 5,
+                    "cache_write_5m_picos_per_token": 7,
+                    "cache_write_1h_picos_per_token": 11
+                }
+            }
+        })
     }
 
     #[test]

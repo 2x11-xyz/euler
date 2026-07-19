@@ -346,20 +346,55 @@ impl StopReason {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Usage {
-    /// Total input tokens reported by the provider. For OpenAI-compatible
-    /// APIs this includes cached input; callers that price usage must charge
-    /// `cached_tokens` at the cache-read rate and only the remainder at the
-    /// ordinary input rate. Anthropic reports uncached input separately.
+    /// Total input tokens consumed by the request, including every cache-read
+    /// and cache-write bucket. Adapters normalize provider-native counters to
+    /// this common total so context accounting never depends on a provider id.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Ordinary input tokens after removing every cache bucket. Pricing is
+    /// available only when this and the three cache counters form a disjoint
+    /// breakdown whose checked sum equals `input_tokens`.
+    pub uncached_input_tokens: Option<u64>,
+    /// Input tokens served from a prompt cache.
     pub cached_tokens: Option<u64>,
-    /// Provider-reported prompt-cache creation tokens. Anthropic exposes this
-    /// separately from ordinary and cache-read input; most providers omit it.
-    pub cache_write_tokens: Option<u64>,
-    /// Subset of `cache_write_tokens` created with Anthropic's one-hour TTL,
-    /// which pi prices at twice the ordinary input rate.
+    /// Prompt-cache creation tokens with the provider's short-lived TTL.
+    pub cache_write_5m_tokens: Option<u64>,
+    /// Prompt-cache creation tokens with a one-hour TTL. This is disjoint from
+    /// `cache_write_5m_tokens`, not a subset of it.
     pub cache_write_1h_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// Normalize APIs whose top-level input count includes cache reads and
+    /// writes. Inconsistent subtotals preserve the provider's total for
+    /// context accounting but deliberately leave the charge buckets absent.
+    pub(crate) fn from_inclusive_input(
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: Option<u64>,
+        cache_write_5m_tokens: Option<u64>,
+        cache_write_1h_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+    ) -> Self {
+        let uncached_input_tokens = cache_read_tokens
+            .zip(cache_write_5m_tokens)
+            .zip(cache_write_1h_tokens)
+            .and_then(|((read, short_write), long_write)| {
+                read.checked_add(short_write)?.checked_add(long_write)
+            })
+            .and_then(|cached| input_tokens.checked_sub(cached));
+        let valid = uncached_input_tokens.is_some();
+        Self {
+            input_tokens,
+            output_tokens,
+            uncached_input_tokens,
+            cached_tokens: valid.then_some(cache_read_tokens).flatten(),
+            cache_write_5m_tokens: valid.then_some(cache_write_5m_tokens).flatten(),
+            cache_write_1h_tokens: valid.then_some(cache_write_1h_tokens).flatten(),
+            reasoning_tokens,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -541,6 +576,14 @@ impl ProviderSet {
 
     pub fn set_model_catalog(&mut self, catalog: catalog::MergedModelCatalog) {
         self.model_catalog = catalog;
+    }
+
+    pub fn resolved_model_cost(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<catalog::ResolvedModelCost> {
+        self.model_catalog.resolved_model_cost(provider, model)
     }
 
     pub fn insert<P>(&mut self, provider: P) -> bool
@@ -766,14 +809,14 @@ impl Iterator for ScriptedStream {
 }
 
 fn synthetic_usage(input: &str, output: &str) -> Usage {
-    Usage {
-        input_tokens: input.split_whitespace().count() as u64,
-        output_tokens: output.split_whitespace().count() as u64,
-        cached_tokens: Some(0),
-        cache_write_tokens: Some(0),
-        cache_write_1h_tokens: Some(0),
-        reasoning_tokens: Some(0),
-    }
+    Usage::from_inclusive_input(
+        input.split_whitespace().count() as u64,
+        output.split_whitespace().count() as u64,
+        Some(0),
+        Some(0),
+        Some(0),
+        Some(0),
+    )
 }
 
 #[cfg(test)]

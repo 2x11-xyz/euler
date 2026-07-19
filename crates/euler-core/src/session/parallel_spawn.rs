@@ -6,7 +6,9 @@
 //! provider completion timing, so fixture-driven logs replay
 //! deterministically.
 
-use super::companion::{companion_failure, companion_success, usage_payload, ParentedAppender};
+use super::companion::{
+    companion_failure, companion_success, model_result_payload, ModelResultRecord, ParentedAppender,
+};
 use super::{
     canvas_snapshot_payload, context_budget_exhausted, model_input_item, AgentResultSummary,
     ContextLimitConfig, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo,
@@ -20,7 +22,6 @@ use euler_provider::{
     ModelInputItem, ModelRequest, ModelRole, ModelStreamEvent, ProviderError, ProviderSet,
     ProviderStream, ReasoningChunk, StopReason,
 };
-use serde_json::json;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -319,8 +320,29 @@ impl<D: PermissionDecider> Session<D> {
             // output) are model cognition and stay faithful.
             Err(error) => companion_failure(self.redactor.redact(&error.to_string())),
             Ok(data) => {
+                let model_result = model_result_payload(
+                    &ModelResultRecord {
+                        content: &data.content,
+                        tool_calls: &data.tool_calls,
+                        stop_reason: data
+                            .stop_reason
+                            .as_ref()
+                            .expect("validated finished stream"),
+                        usage: data.usage.as_ref(),
+                        target: &target,
+                        parent: model_call_id.clone(),
+                    },
+                    &self.providers,
+                );
                 let mut appender = self.appender_as(writer, &child_agent_id);
-                record_reviewer_round(&mut appender, &target, &model_call_id, &data, &task)?
+                record_reviewer_round(
+                    &mut appender,
+                    &target,
+                    &model_call_id,
+                    &data,
+                    &task,
+                    model_result,
+                )?
             }
         };
         let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
@@ -343,6 +365,7 @@ fn record_reviewer_round(
     model_call_id: &str,
     data: &ModelRoundData,
     task: &AgentTask,
+    model_result: JsonObject,
 ) -> Result<AgentResult, SessionError> {
     let stop_reason = data
         .stop_reason
@@ -355,21 +378,9 @@ fn record_reviewer_round(
             Some(model_call_id.to_owned()),
         )?;
     }
-    let calls = data
-        .tool_calls
-        .iter()
-        .map(|call| json!({"id": call.id, "name": call.name, "input": call.input}))
-        .collect::<Vec<_>>();
     appender.append(
         EventKind::MODEL_RESULT,
-        object([
-            ("provider", target.provider.clone().into()),
-            ("model", target.model.clone().into()),
-            ("content", data.content.clone().into()),
-            ("tool_calls", calls.into()),
-            ("stop_reason", stop_reason.as_str().into()),
-            ("usage", usage_payload(data.usage.as_ref())),
-        ]),
+        model_result,
         Some(model_call_id.to_owned()),
     )?;
 

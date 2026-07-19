@@ -1,5 +1,5 @@
 use anyhow::Result;
-use euler_provider::catalog::{cost_rate_dollars_per_million, MergedModelCatalog, ModelDescriptor};
+use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{
     ApiFamily, CustomModelConfig, CustomProviderConfig, ProviderConfigRegistry,
 };
@@ -168,37 +168,52 @@ fn model_json(model: &ModelDescriptor, is_default: bool) -> Value {
     }
     if let Some(cost) = model.cost() {
         let mut value = Map::new();
-        value.insert(
-            "input".to_owned(),
-            json!(cost_rate_dollars_per_million(cost.rates.input)),
-        );
-        value.insert(
-            "output".to_owned(),
-            json!(cost_rate_dollars_per_million(cost.rates.output)),
-        );
-        value.insert(
-            "cache_read".to_owned(),
-            json!(cost_rate_dollars_per_million(cost.rates.cache_read)),
-        );
-        value.insert(
-            "cache_write".to_owned(),
-            json!(cost_rate_dollars_per_million(cost.rates.cache_write)),
-        );
-        if let Some(tier) = cost.tier {
+        value.insert("input".to_owned(), cost_rate_json(cost.rates.input));
+        value.insert("output".to_owned(), cost_rate_json(cost.rates.output));
+        insert_optional_cost_rate(&mut value, "cache_read", cost.rates.cache_read);
+        insert_optional_cost_rate(&mut value, "cache_write_5m", cost.rates.cache_write_5m);
+        insert_optional_cost_rate(&mut value, "cache_write_1h", cost.rates.cache_write_1h);
+        if !cost.tiers().is_empty() {
             value.insert(
                 "tiers".to_owned(),
-                json!([{
-                    "input_tokens_above": tier.input_tokens_above,
-                    "input": cost_rate_dollars_per_million(tier.rates.input),
-                    "output": cost_rate_dollars_per_million(tier.rates.output),
-                    "cache_read": cost_rate_dollars_per_million(tier.rates.cache_read),
-                    "cache_write": cost_rate_dollars_per_million(tier.rates.cache_write),
-                }]),
+                Value::Array(cost.tiers().iter().map(cost_tier_json).collect()),
             );
         }
         object.insert("cost".to_owned(), Value::Object(value));
     }
     Value::Object(object)
+}
+
+fn insert_optional_cost_rate(value: &mut Map<String, Value>, field: &str, rate: Option<u64>) {
+    if let Some(rate) = rate {
+        value.insert(field.to_owned(), cost_rate_json(rate));
+    }
+}
+
+fn cost_rate_json(rate: u64) -> Value {
+    let whole = rate / 1_000_000;
+    let fraction = rate % 1_000_000;
+    if fraction == 0 {
+        return whole.into();
+    }
+    let text = format!("{whole}.{fraction:06}")
+        .trim_end_matches('0')
+        .to_owned();
+    serde_json::from_str(&text).expect("fixed-point catalog rate must be a JSON number")
+}
+
+fn cost_tier_json(tier: &euler_provider::catalog::ModelCostTier) -> Value {
+    let mut value = Map::new();
+    value.insert(
+        "input_tokens_above".to_owned(),
+        json!(tier.input_tokens_above),
+    );
+    value.insert("input".to_owned(), cost_rate_json(tier.rates.input));
+    value.insert("output".to_owned(), cost_rate_json(tier.rates.output));
+    insert_optional_cost_rate(&mut value, "cache_read", tier.rates.cache_read);
+    insert_optional_cost_rate(&mut value, "cache_write_5m", tier.rates.cache_write_5m);
+    insert_optional_cost_rate(&mut value, "cache_write_1h", tier.rates.cache_write_1h);
+    Value::Object(value)
 }
 
 fn custom_provider_json(provider: &CustomProviderConfig) -> Value {
@@ -477,7 +492,18 @@ mod tests {
                     "context_window_tokens": 200000,
                     "max_output_tokens": 8192,
                     "supports_tools": true,
-                    "supports_reasoning": true
+                    "supports_reasoning": true,
+                    "cost": {
+                      "input": 0.532,
+                      "output": 1.672,
+                      "cache_read": 0.0988,
+                      "tiers": [{
+                        "input_tokens_above": 272000,
+                        "input": 1.064,
+                        "output": 3.344,
+                        "cache_read": 0.1976
+                      }]
+                    }
                   }]
                 }
               }
@@ -510,6 +536,13 @@ mod tests {
         assert_eq!(model["max_output_tokens"], 8192);
         assert_eq!(model["supports_tools"], true);
         assert_eq!(model["supports_reasoning"], true);
+        assert_eq!(model["cost"]["input"], serde_json::json!(0.532));
+        assert_eq!(model["cost"]["output"], serde_json::json!(1.672));
+        assert_eq!(model["cost"]["cache_read"], serde_json::json!(0.0988));
+        assert_eq!(
+            model["cost"]["tiers"][0]["cache_read"],
+            serde_json::json!(0.1976)
+        );
     }
 
     #[test]

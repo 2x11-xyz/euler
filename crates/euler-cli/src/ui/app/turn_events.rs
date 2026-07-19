@@ -119,7 +119,7 @@ impl AppCore {
             &mut self.token_usage,
             event,
             context_window_tokens,
-            &self.model_catalog,
+            self.primary_agent_id.as_deref(),
         );
     }
 

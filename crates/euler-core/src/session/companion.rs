@@ -12,8 +12,9 @@ use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
 use euler_agents::{generated_agent_id, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{
-    ModelInputItem, ModelRequest, ModelRole, ModelStreamEvent, ProviderError, ProviderStream,
-    ReasoningChunk, ReasoningEffort, StopReason, ToolCall, Usage,
+    catalog::{ModelCostRates, ModelCostSource, ModelUsageCost},
+    ModelInputItem, ModelRequest, ModelRole, ModelStreamEvent, ProviderError, ProviderSet,
+    ProviderStream, ReasoningChunk, ReasoningEffort, StopReason, ToolCall, Usage,
 };
 use euler_sdk::Capability;
 use serde_json::{json, Value};
@@ -98,13 +99,13 @@ impl<D> Session<D> {
     }
 }
 
-struct ModelResultRecord<'a> {
-    content: &'a str,
-    tool_calls: &'a [ToolCall],
-    stop_reason: &'a StopReason,
-    usage: Option<&'a Usage>,
-    target: &'a ModelTarget,
-    parent: String,
+pub(super) struct ModelResultRecord<'a> {
+    pub(super) content: &'a str,
+    pub(super) tool_calls: &'a [ToolCall],
+    pub(super) stop_reason: &'a StopReason,
+    pub(super) usage: Option<&'a Usage>,
+    pub(super) target: &'a ModelTarget,
+    pub(super) parent: String,
 }
 
 impl<D: PermissionDecider> Session<D> {
@@ -528,30 +529,9 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     }
 
     fn emit_model_result(&mut self, record: ModelResultRecord<'_>) -> Result<String, SessionError> {
-        let calls = record
-            .tool_calls
-            .iter()
-            .map(|call| {
-                json!({
-                    "id": call.id,
-                    "name": call.name,
-                    "input": call.input,
-                })
-            })
-            .collect::<Vec<_>>();
+        let payload = model_result_payload(&record, self.providers);
         Ok(self
-            .append(
-                EventKind::MODEL_RESULT,
-                object([
-                    ("provider", record.target.provider.clone().into()),
-                    ("model", record.target.model.clone().into()),
-                    ("content", record.content.to_owned().into()),
-                    ("tool_calls", calls.into()),
-                    ("stop_reason", record.stop_reason.as_str().into()),
-                    ("usage", usage_payload(record.usage)),
-                ]),
-                Some(record.parent),
-            )?
+            .append(EventKind::MODEL_RESULT, payload, Some(record.parent))?
             .id)
     }
 
@@ -941,11 +921,20 @@ pub(super) fn usage_payload(usage: Option<&Usage>) -> Value {
                 ("input_tokens", usage.input_tokens.into()),
                 ("output_tokens", usage.output_tokens.into()),
             ]);
+            if let Some(uncached_input_tokens) = usage.uncached_input_tokens {
+                value.insert(
+                    "uncached_input_tokens".to_owned(),
+                    uncached_input_tokens.into(),
+                );
+            }
             if let Some(cached_tokens) = usage.cached_tokens {
                 value.insert("cached_tokens".to_owned(), cached_tokens.into());
             }
-            if let Some(cache_write_tokens) = usage.cache_write_tokens {
-                value.insert("cache_write_tokens".to_owned(), cache_write_tokens.into());
+            if let Some(cache_write_5m_tokens) = usage.cache_write_5m_tokens {
+                value.insert(
+                    "cache_write_5m_tokens".to_owned(),
+                    cache_write_5m_tokens.into(),
+                );
             }
             if let Some(cache_write_1h_tokens) = usage.cache_write_1h_tokens {
                 value.insert(
@@ -959,6 +948,94 @@ pub(super) fn usage_payload(usage: Option<&Usage>) -> Value {
             Value::Object(value)
         }
         None => Value::Null,
+    }
+}
+
+pub(super) fn model_result_payload(
+    record: &ModelResultRecord<'_>,
+    providers: &ProviderSet,
+) -> JsonObject {
+    let calls = record
+        .tool_calls
+        .iter()
+        .map(|call| json!({"id": call.id, "name": call.name, "input": call.input}))
+        .collect::<Vec<_>>();
+    let mut payload = object([
+        ("provider", record.target.provider.clone().into()),
+        ("model", record.target.model.clone().into()),
+        ("content", record.content.to_owned().into()),
+        ("tool_calls", calls.into()),
+        ("stop_reason", record.stop_reason.as_str().into()),
+        ("usage", usage_payload(record.usage)),
+    ]);
+    if let Some(cost) = model_cost_payload(providers, record.target, record.usage) {
+        payload.insert("cost".to_owned(), cost);
+    }
+    payload
+}
+
+fn model_cost_payload(
+    providers: &ProviderSet,
+    target: &ModelTarget,
+    usage: Option<&Usage>,
+) -> Option<Value> {
+    let usage = usage?;
+    let resolved = providers.resolved_model_cost(&target.provider, &target.model)?;
+    let quote = resolved.cost.quote(usage)?;
+    let (source, source_id) = match resolved.source {
+        ModelCostSource::Official { release_id } => ("official", release_id),
+        ModelCostSource::Local { cost_sha256 } => ("local", cost_sha256),
+    };
+    let mut pricing = object([
+        ("provider", resolved.provider.into()),
+        ("model", resolved.model.into()),
+        ("source", source.into()),
+        ("source_id", source_id.into()),
+        ("rates", cost_rates_payload(quote.rates)),
+    ]);
+    if let Some(threshold) = quote.tier_input_tokens_above {
+        pricing.insert("tier_input_tokens_above".to_owned(), threshold.into());
+    }
+    Some(cost_snapshot_payload(quote, pricing))
+}
+
+fn cost_snapshot_payload(cost: ModelUsageCost, pricing: JsonObject) -> Value {
+    Value::Object(object([
+        ("schema_version", 1_u64.into()),
+        ("currency", "USD".into()),
+        ("unit", "picodollar".into()),
+        ("input_picos", cost.input_picos.into()),
+        ("output_picos", cost.output_picos.into()),
+        ("cache_read_picos", cost.cache_read_picos.into()),
+        ("cache_write_5m_picos", cost.cache_write_5m_picos.into()),
+        ("cache_write_1h_picos", cost.cache_write_1h_picos.into()),
+        ("total_picos", cost.total_picos.into()),
+        ("pricing", Value::Object(pricing)),
+    ]))
+}
+
+fn cost_rates_payload(rates: ModelCostRates) -> Value {
+    let mut value = object([
+        ("input_picos_per_token", rates.input.into()),
+        ("output_picos_per_token", rates.output.into()),
+    ]);
+    insert_rate(&mut value, "cache_read_picos_per_token", rates.cache_read);
+    insert_rate(
+        &mut value,
+        "cache_write_5m_picos_per_token",
+        rates.cache_write_5m,
+    );
+    insert_rate(
+        &mut value,
+        "cache_write_1h_picos_per_token",
+        rates.cache_write_1h,
+    );
+    Value::Object(value)
+}
+
+fn insert_rate(value: &mut JsonObject, field: &str, rate: Option<u64>) {
+    if let Some(rate) = rate {
+        value.insert(field.to_owned(), rate.into());
     }
 }
 

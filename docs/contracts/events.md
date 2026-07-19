@@ -206,8 +206,26 @@ envelope `v` per `docs/contracts/persistence.md`.
   target model; persisted, see ADR 0008).
 - `model.result`: `provider`, `model`, `content`, `tool_calls`,
   `stop_reason`, `usage` (object: `input_tokens`, `output_tokens`,
-  optional `cached_tokens`, `cache_write_tokens`, `cache_write_1h_tokens`,
-  `reasoning_tokens`). `tool_calls` (each:
+  optional `uncached_input_tokens`, `cached_tokens`,
+  `cache_write_5m_tokens`, `cache_write_1h_tokens`, `reasoning_tokens`).
+  `input_tokens` is the total request input; when the four input buckets are
+  present they are disjoint and their checked sum equals that total. An adapter
+  leaves all four buckets absent when the provider reports only an aggregate
+  cache-write count whose TTL cannot be established; it must not assign that
+  count to a cheaper bucket. Optional
+  `cost` is a V1 persisted quote with `schema_version: 1`, `currency: "USD"`,
+  `unit: "picodollar"`, exact integer `input_picos`, `output_picos`,
+  `cache_read_picos`, `cache_write_5m_picos`, `cache_write_1h_picos`, and
+  `total_picos`, plus `pricing` provenance (`provider`, `model`, `source`,
+  `source_id`, the selected pico-dollar-per-token rates, and the optional tier
+  threshold). `source` is `official` for a release-backed catalog or `local`
+  for a user-owned schedule; `source_id` is respectively the catalog release
+  id or a SHA-256 identity of the exact schedule. The component breakdown is
+  authoritative and must sum exactly to `total_picos`; selected rates are
+  audit evidence used to validate that saved arithmetic, not instructions to
+  price against a live catalog. An absent or invalid `cost` means
+  unpriced, while a present all-zero breakdown means known zero. Replay never
+  prices an old event from the current catalog. `tool_calls` (each:
   `id`, `name`, `input`) is a denormalized record of what the provider
   returned; the canonical execution truth is the subsequent `tool.call` /
   `tool.result` events, and replay request-building reads those, never

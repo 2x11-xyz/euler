@@ -9,9 +9,12 @@ pull requests that landed them; deeper design rationale lives in
 ### Footer cost
 
 - The TUI footer now shows cumulative model cost in USD beside context usage,
-  using pi-compatible per-model input, output, cache-read, cache-write, and
-  long-context pricing. Totals include companion calls, survive model switches
-  and resume, and explicitly mark sessions containing unpriced calls.
+  using persisted per-result quotes from verified provider-catalog schedules.
+  Quotes cover input, output, cache-read, cache-write, and long-context pricing;
+  totals include companion calls, survive model switches and resume without
+  repricing history, and explicitly mark sessions containing unpriced calls.
+  Ambiguous cache-write TTLs fail closed instead of being assigned a guessed
+  rate, and price-bearing catalogs require Euler 0.1.2 or newer.
 
 ### Mid-turn steering (#147)
 
