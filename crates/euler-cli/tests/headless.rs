@@ -11458,7 +11458,10 @@ fn wait_until_session_lock_held(lock: &Path, first: &mut std::process::Child) {
         if let Some(status) = first.try_wait().expect("poll first euler for lock") {
             panic!("first euler exited before acquiring its session lock: {status}");
         }
-        thread::yield_now();
+        // Polite poll: a sleep genuinely deschedules (yield_now need not, per
+        // the drain-helper rationale) so this loop cannot compete with the
+        // very process startup it is waiting on. Still no deadline.
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
