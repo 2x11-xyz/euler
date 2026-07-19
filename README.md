@@ -79,7 +79,14 @@ export OPENROUTER_API_KEY=...
 
 euler auth status
 euler models
+# Explicitly check the verified public GitHub catalog
+euler models refresh
 ```
+
+The binary includes a complete offline provider/model catalog. Interactive TUI
+launches check the public GitHub release channel in the background once per
+day after a successful check (failed checks may retry after one hour);
+headless commands never acquire an implicit network dependency.
 
 Any OpenAI-compatible endpoint can be added as a custom provider in
 `~/.euler/providers.json`, including a local model behind ollama or vLLM, or a

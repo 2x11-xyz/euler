@@ -130,7 +130,7 @@ pub(super) fn command_context(
     CommandContext {
         model_choices,
         code_swarm_model_choices,
-        effort_choices: effort_choices(parts.current_effort, provider, model),
+        effort_choices: effort_choices(model_catalog, parts.current_effort, provider, model),
         theme_choices: theme_choices(parts.current_theme),
         checkpoint_items: parts.checkpoint_items,
         extension_items: parts.extension_items,
@@ -174,8 +174,14 @@ pub(super) fn causal_dag_stats_from_events(
     }
 }
 
-fn effort_choices(current: ReasoningEffort, provider: &str, model: &str) -> Vec<EffortChoice> {
-    euler_provider::catalog::supported_reasoning_efforts(provider, model)
+fn effort_choices(
+    catalog: &MergedModelCatalog,
+    current: ReasoningEffort,
+    provider: &str,
+    model: &str,
+) -> Vec<EffortChoice> {
+    catalog
+        .supported_reasoning_efforts(provider, model)
         .iter()
         .copied()
         .map(|effort| EffortChoice::new(effort, current))
@@ -571,8 +577,9 @@ mod tests {
 
     #[test]
     fn effort_choices_expose_max_only_for_supported_models() {
-        let standard = effort_choices(ReasoningEffort::Medium, "chatgpt", "gpt-5.5");
-        let gpt_5_6 = effort_choices(ReasoningEffort::Max, "chatgpt", "gpt-5.6-sol");
+        let catalog = MergedModelCatalog::built_in();
+        let standard = effort_choices(&catalog, ReasoningEffort::Medium, "chatgpt", "gpt-5.5");
+        let gpt_5_6 = effort_choices(&catalog, ReasoningEffort::Max, "chatgpt", "gpt-5.6-sol");
 
         assert_eq!(
             standard

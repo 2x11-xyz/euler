@@ -85,7 +85,7 @@ Subcommands:
   login           Store provider credentials (--provider chatgpt)
   logout          Remove stored provider credentials (--provider chatgpt)
   auth status     Show stored credential status
-  models          List the model catalog; `models refresh` updates it
+  models          List the offline catalog; `models refresh` checks GitHub
   session-export  Export session events as JSON
   extension       Manage and run extensions
   help            Show help for a subcommand
@@ -185,14 +185,12 @@ Options:
 ";
 
 const MODELS_HELP: &str = "\
-List the model catalog, or refresh it.
+List the offline provider catalog, or verify and cache the latest GitHub release.
 
 Usage: euler models
-       euler models refresh [--force]
+       euler models refresh
 
 Options:
-  --force                    Overwrite a models.json that was not generated
-                             by `euler models refresh` (refresh only)
   -h, --help                 Show this help
 ";
 

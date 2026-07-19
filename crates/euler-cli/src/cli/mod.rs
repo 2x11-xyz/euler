@@ -89,14 +89,11 @@ pub(crate) fn run() -> Result<()> {
             io::stdout(),
             io::stderr(),
         ),
-        Command::Models(ModelsCommand::Refresh { force }) => {
-            model_catalog_refresh::refresh_model_catalog(
-                model_catalog::default_model_catalog_path().as_deref(),
-                force,
-                io::stdout(),
-                io::stderr(),
-            )
-        }
+        Command::Models(ModelsCommand::Refresh) => model_catalog_refresh::refresh_model_catalog(
+            model_catalog::default_model_catalog_path().as_deref(),
+            io::stdout(),
+            io::stderr(),
+        ),
         Command::Extension(extension) => run_extension_command(extension),
         Command::Scrub(scrub) => run_scrub(scrub),
     }

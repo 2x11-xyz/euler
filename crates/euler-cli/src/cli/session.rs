@@ -81,7 +81,8 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         }
     }
     bind_diagnostics_for_log(&live_session.log_path);
-    let providers = ProviderSet::single_named(run.provider_id.clone(), run.provider);
+    let providers = ProviderSet::single_named(run.provider_id.clone(), run.provider)
+        .with_model_catalog(run.model_catalog.clone());
     let mut session = Session::new_with_providers(live_session.config, providers, CliDecider)
         .with_provenance(ProvenanceWriter::new(live_session.log_path)?);
     crate::session_lifecycle::seed_secret_redaction(&mut session, run.auth_file.as_deref());
@@ -114,7 +115,8 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     }
     bind_diagnostics_for_log(&live_session.log_path);
     let (decider, channels) = TuiDecider::new();
-    let providers = tui_provider_set(run.provider_id.clone(), run.provider, &run.custom_providers);
+    let providers = tui_provider_set(run.provider_id.clone(), run.provider, &run.custom_providers)
+        .with_model_catalog(run.model_catalog.clone());
     let preference_path = model_preference::default_model_preference_path();
     let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
     // v2 Warm Spine: timestamps are opt-in (§5.5); the anchor spine carries
@@ -149,6 +151,9 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             auth_file: run.auth_file.clone(),
         },
     )?;
+    if let Some(path) = crate::model_catalog::default_model_catalog_path() {
+        app.schedule_provider_catalog_refresh(path);
+    }
     app.run()
 }
 
@@ -229,7 +234,8 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
         }
     }
     let tier = exec.auto_approve;
-    let providers = ProviderSet::single_named(exec.run.provider_id.clone(), exec.run.provider);
+    let providers = ProviderSet::single_named(exec.run.provider_id.clone(), exec.run.provider)
+        .with_model_catalog(exec.run.model_catalog.clone());
     let log_path = live_session.log_path.clone();
     let refresh = live_session.refresh.clone();
     bind_diagnostics_for_log(&live_session.log_path);
@@ -446,6 +452,9 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
             events_replayed: outcome.events_folded,
         },
     )?;
+    if let Some(path) = crate::model_catalog::default_model_catalog_path() {
+        app.schedule_provider_catalog_refresh(path);
+    }
     let app_result = app.run();
     if let Some(refresh) = outcome.refresh.take() {
         if let Err(error) = refresh.refresh() {
@@ -500,7 +509,7 @@ where
         }
     }
     let folded = fold_session(&config, prefix)?;
-    let providers = if let Some(original) = &folded.original_target {
+    let providers = (if let Some(original) = &folded.original_target {
         if invocation_target(&run) != *original {
             eprintln!(
                 "warning: resume invocation target {}/{} differs from original session target {}/{}; using original target",
@@ -523,7 +532,8 @@ where
             || run.provider.validate_auth(),
         )?;
         ProviderSet::single(run.provider)
-    };
+    })
+    .with_model_catalog(run.model_catalog.clone());
     // Limit tracks the active model after fold (may differ from launch if switched).
     config.provider = folded.active_target.provider.clone();
     config.model = folded.active_target.model.clone();

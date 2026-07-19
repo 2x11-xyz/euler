@@ -3,6 +3,7 @@ name = "euler-provider"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+include = ["src/**", "tests/**", "catalog/**"]
 
 [dependencies]
 serde.workspace = true

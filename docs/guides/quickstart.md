@@ -44,6 +44,30 @@ Check the offline model catalog:
 euler models
 ```
 
+Euler ships a verified provider catalog in the binary, so this works on a
+fresh offline install. The TUI checks the public
+[`euler-provider-catalog`](https://github.com/2x11-xyz/euler-provider-catalog)
+GitHub release channel in the background once per day after a successful
+check. A failed check may retry after one hour. To check on demand without
+starting a session:
+
+```sh
+euler models refresh
+```
+
+Refresh does not use provider API keys. It downloads only the public release
+manifest and catalog, verifies their identity, digest, schema, compatibility,
+and monotonic release time, then keeps the last-known-good catalog on any
+failure.
+
+The catalog contains only public model metadata. Provider credentials are
+never downloaded into, copied into, or resolved by the catalog client.
+
+If an older Euler generated `~/.euler/models.json`, the new loader recognizes
+its exact `"generated_by": "euler models refresh"` marker and ignores that
+obsolete machine-owned overlay. It leaves the file in place in case it was
+hand-edited; remove it after reviewing any local changes.
+
 ## First interactive session
 
 Start the full-screen TUI:
@@ -103,6 +127,10 @@ Default local state is under `~/.euler`:
 - `~/.euler/sessions/<session-id>/blobs/` — large payload blobs for that session.
 - `~/.euler/sessions/<session-id>/session.json` — session sidecar metadata.
 - `~/.euler/sessions/index.jsonl` — session index.
+- `~/.euler/catalogs/provider-v1/` — verified, machine-managed catalog releases
+  downloaded from GitHub.
+- `~/.euler/models.json` — optional user-owned metadata/default overrides,
+  applied after the official catalog.
 
 `exec --provenance <path>` writes the event log at that path instead of the home
 session store.

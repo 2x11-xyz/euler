@@ -968,6 +968,10 @@ impl<D> Session<D> {
         &self.providers
     }
 
+    pub fn set_model_catalog(&mut self, catalog: euler_provider::catalog::MergedModelCatalog) {
+        self.providers.set_model_catalog(catalog);
+    }
+
     pub fn reasoning_effort(&self) -> ReasoningEffort {
         self.config.reasoning_effort
     }

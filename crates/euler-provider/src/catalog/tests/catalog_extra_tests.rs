@@ -95,59 +95,6 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
 }
 
 #[test]
-fn generated_refresh_catalog_cannot_override_chatgpt_route_metadata() {
-    let (catalog, warnings) = MergedModelCatalog::with_local_json(
-        r#"{
-          "version": 1,
-          "generated_by": "euler models refresh",
-          "providers": {
-            "chatgpt": {
-              "default_model": "gpt-5.6-sol",
-              "models": [{
-                "id": "gpt-5.6-sol",
-                "context_window_tokens": 1050000
-              }]
-            },
-            "openai": {
-              "models": [{
-                "id": "gpt-5.6-sol",
-                "context_window_tokens": 1050000
-              }]
-            }
-          }
-        }"#,
-    );
-
-    let chatgpt = catalog.provider("chatgpt").expect("chatgpt");
-    let sol = chatgpt
-        .models()
-        .find(|model| model.id() == "gpt-5.6-sol")
-        .expect("ChatGPT Sol");
-    assert_eq!(chatgpt.default_model(), DEFAULT_CHATGPT_MODEL);
-    assert_eq!(sol.source(), ModelDescriptorSource::BuiltIn);
-    assert_eq!(sol.context_window_tokens(), Some(372_000));
-    assert_eq!(sol.effective_context_window_tokens(), Some(353_400));
-    assert_eq!(sol.auto_compact_token_limit(), Some(334_800));
-
-    let openai_sol = catalog
-        .provider("openai")
-        .expect("openai")
-        .models()
-        .find(|model| model.id() == "gpt-5.6-sol")
-        .expect("OpenAI Sol");
-    assert_eq!(openai_sol.source(), ModelDescriptorSource::Local);
-    assert_eq!(openai_sol.context_window_tokens(), Some(1_050_000));
-    assert_eq!(
-        openai_sol.effective_context_window_tokens(),
-        Some(1_050_000)
-    );
-    assert_eq!(openai_sol.auto_compact_token_limit(), None);
-    assert!(warnings
-        .iter()
-        .any(|warning| warning.contains("ignored stale ChatGPT metadata")));
-}
-
-#[test]
 fn persisted_anthropic_sonnet_4_6_route_survives_default_change() {
     assert_ne!(DEFAULT_ANTHROPIC_MODEL, "claude-sonnet-4-6");
     let ModelSpec::Routed(route) = parse_model_spec("anthropic::claude-sonnet-4-6").expect("route")

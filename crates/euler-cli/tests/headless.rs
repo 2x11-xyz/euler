@@ -1133,6 +1133,37 @@ fn models_command_prints_merged_catalog_with_isolated_home() {
 }
 
 #[test]
+fn headless_exec_and_offline_listing_do_not_start_catalog_refresh() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let exec = command_with_home(exe, &home)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--extensions",
+            "none",
+            "offline catalog check",
+        ])
+        .output()
+        .expect("run exec");
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    let listed = command_with_home(exe, &home)
+        .arg("models")
+        .output()
+        .expect("list models");
+    assert!(listed.status.success());
+    assert!(
+        !home.path().join(".euler").join("catalogs").exists(),
+        "headless commands must not create catalog refresh state"
+    );
+}
+
+#[test]
 fn models_command_without_local_catalog_prints_built_ins_without_session_store() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
@@ -1158,6 +1189,23 @@ fn models_command_without_local_catalog_prints_built_ins_without_session_store()
         .iter()
         .map(|provider| provider["id"].as_str().expect("id").to_owned())
         .collect::<Vec<_>>();
+
+    assert_eq!(catalog["official_catalog"]["source"], "embedded");
+    assert_eq!(
+        catalog["official_catalog"]["release_id"],
+        "catalog-v1-20260718t221617z-d619088f6e7778720898f59eb19ef903bbbd712d8ebe24e66c668490ce26e5d9"
+    );
+    let openrouter = catalog["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["id"] == "openrouter")
+        .expect("OpenRouter provider");
+    assert!(openrouter["models"]
+        .as_array()
+        .expect("OpenRouter models")
+        .iter()
+        .any(|model| model["id"] == "moonshotai/kimi-k3"));
 
     assert_eq!(
         provider_ids,
@@ -10088,6 +10136,7 @@ const PTY_QUIET_INTERVAL: Duration = Duration::from_millis(100);
 
 impl PtyHarness {
     fn spawn_with_args(home: &Path, args: &[&str]) -> Self {
+        record_recent_catalog_refresh_for_test(home);
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -10685,6 +10734,23 @@ fn replay_transcript(exe: &str, log: &Path) -> String {
 
 fn isolated_home() -> tempfile::TempDir {
     tempfile::tempdir().expect("isolated HOME")
+}
+
+fn record_recent_catalog_refresh_for_test(home: &Path) {
+    let directory = home.join(".euler").join("catalogs").join("provider-v1");
+    fs::create_dir_all(&directory).expect("catalog state directory");
+    let attempted_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    fs::write(
+        directory.join(".refresh-state-v1.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "attempted_at": attempted_at,
+            "outcome": "succeeded",
+            "release_id": null,
+        }))
+        .expect("catalog state JSON"),
+    )
+    .expect("catalog state");
 }
 
 fn command_with_home(exe: &str, home: &tempfile::TempDir) -> Command {

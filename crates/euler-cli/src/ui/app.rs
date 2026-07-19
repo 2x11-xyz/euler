@@ -144,6 +144,7 @@ pub struct App {
     _terminal_session: TerminalSession,
     event_loop: EventLoop,
     core: AppCore,
+    pending_catalog_refresh: Option<PathBuf>,
     /// Trailing-debounce deadline for the post-resize history replay: every
     /// resize event pushes it out, so a drag settles into exactly ONE
     /// purge+replay at the final width instead of appending a fossil copy of
@@ -195,6 +196,8 @@ pub struct AppCore {
     /// empty because of turn state.
     authenticated_providers: BTreeSet<String>,
     model_catalog: MergedModelCatalog,
+    catalog_refresh_rx: Option<Receiver<Result<crate::provider_catalog::RefreshReport>>>,
+    model_catalog_path: Option<PathBuf>,
     session_store: Option<SessionStore>,
     active_session_home_managed: bool,
     /// Whether the session loaded a durable user grant store; gates the
@@ -373,6 +376,7 @@ impl App {
             _terminal_session: terminal_session,
             event_loop,
             core,
+            pending_catalog_refresh: None,
             resize_replay_deadline: None,
         })
     }
@@ -407,8 +411,35 @@ impl App {
             if self.drain_actions()? {
                 return Ok(());
             }
+            self.start_pending_provider_catalog_refresh();
             self.flush_resize_replay()?;
         }
+    }
+
+    pub fn schedule_provider_catalog_refresh(&mut self, model_catalog_path: PathBuf) {
+        if self.pending_catalog_refresh.is_some() || self.core.catalog_refresh_rx.is_some() {
+            return;
+        }
+        let cache_dir =
+            crate::provider_catalog::managed_catalog_dir_for_model_path(&model_catalog_path);
+        if !crate::provider_catalog::automatic_refresh_due(&cache_dir) {
+            return;
+        }
+        self.core.model_catalog_path = Some(model_catalog_path.clone());
+        self.pending_catalog_refresh = Some(model_catalog_path);
+    }
+
+    fn start_pending_provider_catalog_refresh(&mut self) {
+        let Some(model_catalog_path) = self.pending_catalog_refresh.take() else {
+            return;
+        };
+        let cache_dir =
+            crate::provider_catalog::managed_catalog_dir_for_model_path(&model_catalog_path);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::provider_catalog::refresh_managed_catalog(&cache_dir));
+        });
+        self.core.catalog_refresh_rx = Some(receiver);
     }
 
     /// Run the debounced post-resize replay once the deadline passes with no
@@ -845,6 +876,8 @@ impl AppCore {
             status: boot.status,
             authenticated_providers: boot.authenticated_providers,
             model_catalog: boot.model_catalog,
+            catalog_refresh_rx: None,
+            model_catalog_path: None,
             session_store: boot.session_store,
             active_session_home_managed: boot.active_session_home_managed,
             user_rules_enabled: boot.user_rules_enabled,
@@ -1125,13 +1158,77 @@ impl AppCore {
     }
 
     pub fn drain_background(&mut self) -> bool {
-        let mut changed = self.drain_permissions();
+        let mut changed = self.drain_catalog_refresh();
+        changed |= self.drain_permissions();
         while let Some(event) = self.next_turn_event() {
             changed = true;
             self.handle_turn_event(event);
         }
         self.check_stall_notification();
         changed
+    }
+
+    fn drain_catalog_refresh(&mut self) -> bool {
+        let Some(receiver) = &self.catalog_refresh_rx else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.catalog_refresh_rx = None;
+                self.push_notice_item(
+                    "provider catalog refresh stopped · using last-known-good models".to_owned(),
+                );
+                return true;
+            }
+        };
+        self.catalog_refresh_rx = None;
+        match result {
+            Ok(report) => self.accept_catalog_refresh(report),
+            Err(error) => self.push_notice_item(format!(
+                "provider catalog refresh unavailable · using last-known-good models ({error})"
+            )),
+        }
+        true
+    }
+
+    fn accept_catalog_refresh(&mut self, report: crate::provider_catalog::RefreshReport) {
+        if report.outcome.was_updated() {
+            self.reload_model_catalog();
+            self.push_notice_item("provider catalog updated · latest models available".to_owned());
+        } else {
+            self.push_notice_item("provider catalog is current".to_owned());
+        }
+        if !report.warnings.is_empty() {
+            self.push_notice_item(format!(
+                "provider catalog ignored {} invalid cached release file(s)",
+                report.warnings.len()
+            ));
+        }
+    }
+
+    fn reload_model_catalog(&mut self) {
+        let Some(path) = self.model_catalog_path.clone() else {
+            return;
+        };
+        let load = crate::model_catalog::load_model_catalog(Some(&path));
+        self.install_model_catalog(load.catalog);
+        if !load.warnings.is_empty() {
+            self.push_notice_item(format!(
+                "provider catalog loaded with {} local warning(s)",
+                load.warnings.len()
+            ));
+        }
+    }
+
+    fn install_model_catalog(&mut self, catalog: MergedModelCatalog) {
+        self.model_catalog = catalog;
+        if let AppState::Idle { session } = &mut self.state {
+            session.set_model_catalog(self.model_catalog.clone());
+        }
+        self.token_usage.context_window_tokens = self.active_context_window_tokens();
+        self.rebuild_bottom_surface();
     }
 
     pub fn set_terminal_focused(&mut self, focused: bool) {
