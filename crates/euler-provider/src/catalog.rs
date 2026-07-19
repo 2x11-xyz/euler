@@ -77,13 +77,7 @@ impl ModelCost {
             rates: Self::new(input, output, cache_read, cache_write).rates,
             tier: Some(ModelCostTier {
                 input_tokens_above,
-                rates: Self::new(
-                    tier_input,
-                    tier_output,
-                    tier_cache_read,
-                    tier_cache_write,
-                )
-                .rates,
+                rates: Self::new(tier_input, tier_output, tier_cache_read, tier_cache_write).rates,
             }),
         }
     }
@@ -409,7 +403,6 @@ fn pi_catalog_cost(provider: &str, model: &str) -> Option<ModelCost> {
     }
 }
 
-
 impl MergedModelCatalog {
     pub fn built_in() -> Self {
         embedded_catalog().clone()
@@ -695,6 +688,7 @@ fn valid_config_version(version: Option<&Value>, warnings: &mut Vec<String>) -> 
     }
 }
 
+#[allow(clippy::too_many_lines)] // pricing adds one validated metadata branch
 fn merge_models(
     provider: &mut MergedProviderDescriptor,
     provider_key: &str,
@@ -889,10 +883,11 @@ fn optional_cost_rate(
     scope: &str,
     warnings: &mut Vec<String>,
 ) -> Option<f64> {
-    object
-        .contains_key(field)
-        .then(|| cost_rate(object, field, scope, warnings))
-        .unwrap_or(Some(0.0))
+    if object.contains_key(field) {
+        cost_rate(object, field, scope, warnings)
+    } else {
+        Some(0.0)
+    }
 }
 
 fn optional_bool(
