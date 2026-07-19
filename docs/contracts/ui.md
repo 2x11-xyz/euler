@@ -362,6 +362,15 @@ deny. The corresponding ledger entries remain separate per-capability
 decisions. Project and durable-user choices are absent from this panel because
 the grouped operation has no single narrow subject for those scopes.
 
+The extension install consent card (capabilities contract, "Install consent")
+uses this same bordered approval treatment, in the TUI and in the CLI verbs
+alike: source and pin, declared build argvs, required toolchains, and provided
+extension ids with capability envelopes, shown before anything fetches or
+builds. Extension listing surfaces must show distribution provenance —
+source and pin for installed extensions, an explicit linked-path marker for
+linked ones — so a released extension and a dev tree are never visually
+interchangeable.
+
 `/permissions` offers session-local postures before its advanced
 per-capability controls: **Read only** permits `fs-read`, `provenance-read`,
 and `diagnostics-read`; **Ask every time** puts every capability in `ask`; and
