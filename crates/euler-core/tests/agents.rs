@@ -976,11 +976,22 @@ fn event_index(events: &[EventEnvelope], event_id: &str) -> usize {
         .expect("event id present")
 }
 
+// Both helpers below wait on an observed state transition, not a fixed spin
+// count. The worker thread is guaranteed to deliver exactly one result (and,
+// for the reporter path, one report) before it exits, and mpsc hands buffered
+// messages to `try_recv` ahead of the disconnect, so the terminal state always
+// arrives. The previous `for _ in 0..10_000 { yield_now }` bound was a
+// duration proxy, not synchronization: under load the worker can be slow to
+// first schedule, and the main thread would burn through all 10_000 near-free
+// yields before the worker ever ran, panicking on a report that was merely
+// late (issue #4). Looping until the state itself changes removes
+// the false deadline; nextest's per-test timeout remains the backstop against
+// a genuine hang, and an early `Closed`/disconnect still fails loudly.
 fn poll_until_recorded(
     session: &mut Session<ScriptedDecider>,
     background: &mut euler_core::BackgroundAgent,
 ) -> String {
-    for _ in 0..10_000 {
+    loop {
         match session
             .poll_background_agent(background)
             .expect("poll background")
@@ -990,14 +1001,13 @@ fn poll_until_recorded(
             | BackgroundAgentPoll::AlreadyRecorded { result_event_id } => return result_event_id,
         }
     }
-    panic!("background result was not recorded");
 }
 
 fn drain_until_drained(
     session: &mut Session<ScriptedDecider>,
     background: &mut euler_core::BackgroundAgent,
 ) -> String {
-    for _ in 0..10_000 {
+    loop {
         match session
             .drain_background_agent_report(background)
             .expect("drain background report")
@@ -1007,7 +1017,6 @@ fn drain_until_drained(
             BackgroundAgentReportDrain::Closed => panic!("report queue closed before message"),
         }
     }
-    panic!("background report was not drained");
 }
 
 fn payload_str<'a>(event: &'a EventEnvelope, key: &str) -> Option<&'a str> {
