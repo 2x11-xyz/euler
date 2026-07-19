@@ -150,6 +150,12 @@ fn model_request_prefers_apply_patch_for_file_edits() {
     assert!(request
         .instructions
         .contains("To create a new file, prefer write_file"));
+    assert!(request
+        .instructions
+        .contains("do not end your turn after announcing the next step"));
+    assert!(request
+        .instructions
+        .contains("until the requested work is complete or you are genuinely blocked"));
     assert!(request.instructions.contains("updates, prefer apply_patch"));
     assert!(request.instructions.contains("deletes, and renames"));
     assert!(request
