@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use euler_provider::catalog::{MergedModelCatalog, EMBEDDED_CATALOG_JSON, EMBEDDED_MANIFEST_JSON};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 
 const LATEST_MANIFEST_URL: &str =
@@ -25,6 +25,8 @@ const MAX_RELEASE_CLOCK_SKEW: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_REDIRECTS: usize = 5;
 const HTTP_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_CACHE_FILES: usize = 128;
+const RETAINED_CACHE_RELEASES: usize = 3;
+const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -169,7 +171,13 @@ fn refresh_managed_catalog_with<F>(
 where
     F: FnMut(&str, u64) -> Result<Vec<u8>>,
 {
-    let result = refresh_inner(cache_dir, now, &mut fetch);
+    let mut result = refresh_inner(cache_dir, now, &mut fetch);
+    if let Ok(report) = &mut result {
+        let release_id = report.outcome.release_id().to_owned();
+        report
+            .warnings
+            .extend(maintain_cache(cache_dir, &release_id));
+    }
     let (outcome, release_id) = match &result {
         Ok(report) => (
             RefreshStateOutcome::Succeeded,
@@ -364,6 +372,12 @@ fn validate_artifact_metadata(metadata: &ArtifactMetadata, name: &str) -> Result
 }
 
 fn release_id(manifest: &ReleaseManifest, generated_at: DateTime<Utc>) -> Result<String> {
+    // Wire-format invariant shared with
+    // euler-provider-catalog/catalog_pipeline/common.py::catalog_release_id:
+    // identity keys (including nested artifact keys) are lexicographically
+    // ordered, JSON uses two-space pretty indentation, and one trailing LF is
+    // hashed. Changing this encoding is a catalog protocol change and must be
+    // coordinated across both repositories; the embedded release test pins it.
     let identity = ManifestIdentity {
         artifacts: &manifest.artifacts,
         generated_at: &manifest.generated_at,
@@ -474,7 +488,7 @@ fn load_best_cached_release(
             return (None, warnings);
         }
     };
-    paths.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    sort_cache_release_paths(&mut paths);
     if paths.len() > MAX_CACHE_FILES {
         warnings.push(format!(
             "managed provider catalog contains more than {MAX_CACHE_FILES} release files; checking the newest names only"
@@ -499,14 +513,166 @@ fn cache_release_paths(cache_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         .filter_map(|entry| match entry {
             Ok(entry) => {
                 let path = entry.path();
-                let is_release = path.extension().and_then(|value| value.to_str()) == Some("json")
-                    && path.file_name().and_then(|value| value.to_str())
-                        != Some(REFRESH_STATE_FILE);
-                is_release.then_some(Ok(path))
+                cached_release_time(&path)?;
+                match entry.file_type() {
+                    Ok(file_type) if file_type.is_file() => Some(Ok(path)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
             }
             Err(error) => Some(Err(error)),
         })
         .collect()
+}
+
+fn cached_release_time(path: &Path) -> Option<DateTime<Utc>> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".json")?;
+    let (timestamp, digest) = name.strip_prefix("catalog-v1-")?.split_once('-')?;
+    if timestamp.len() != 16
+        || timestamp.as_bytes().get(8) != Some(&b't')
+        || timestamp.as_bytes().get(15) != Some(&b'z')
+        || !is_lower_hex_digest(digest)
+    {
+        return None;
+    }
+    NaiveDateTime::parse_from_str(timestamp, "%Y%m%dt%H%M%Sz")
+        .ok()
+        .map(|value| value.and_utc())
+}
+
+fn sort_cache_release_paths(paths: &mut [PathBuf]) {
+    paths.sort_by(|left, right| {
+        cached_release_time(right)
+            .cmp(&cached_release_time(left))
+            .then_with(|| right.file_name().cmp(&left.file_name()))
+    });
+}
+
+fn maintain_cache(cache_dir: &Path, protected_release_id: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Err(error) = prune_cached_releases(cache_dir, protected_release_id, &mut warnings) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warnings.push(format!(
+                "could not inspect managed provider catalog cache for pruning: {error}"
+            ));
+        }
+    }
+    if let Err(error) = sweep_stale_temp_files(cache_dir, SystemTime::now(), &mut warnings) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warnings.push(format!(
+                "could not inspect managed provider catalog temporary files: {error}"
+            ));
+        }
+    }
+    warnings
+}
+
+fn prune_cached_releases(
+    cache_dir: &Path,
+    protected_release_id: &str,
+    warnings: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let mut paths = cache_release_paths(cache_dir)?;
+    sort_cache_release_paths(&mut paths);
+    let protected_name = format!("{protected_release_id}.json");
+    let protected_present = paths.iter().any(|path| {
+        path.file_name().and_then(|name| name.to_str()) == Some(protected_name.as_str())
+    });
+    let mut other_slots = RETAINED_CACHE_RELEASES.saturating_sub(usize::from(protected_present));
+    for path in paths {
+        let is_protected =
+            path.file_name().and_then(|name| name.to_str()) == Some(protected_name.as_str());
+        if is_protected {
+            continue;
+        }
+        if other_slots > 0 {
+            other_slots -= 1;
+            continue;
+        }
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warnings.push(format!(
+                    "could not prune managed provider catalog {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sweep_stale_temp_files(
+    cache_dir: &Path,
+    now: SystemTime,
+    warnings: &mut Vec<String>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_catalog_temp_name(name) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warnings.push(format!(
+                    "could not inspect managed provider catalog temporary file {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(error) => {
+                warnings.push(format!(
+                    "could not inspect managed provider catalog temporary file {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let is_stale = now
+            .duration_since(modified)
+            .is_ok_and(|age| age >= STALE_TEMP_FILE_AGE);
+        if is_stale {
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warnings.push(format!(
+                        "could not remove stale managed provider catalog temporary file {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_catalog_temp_name(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix(".provider-catalog-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((pid, sequence)) = body.split_once('-') else {
+        return false;
+    };
+    let is_canonical_decimal = |value: &str| {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value == "0" || !value.starts_with('0'))
+    };
+    is_canonical_decimal(pid)
+        && is_canonical_decimal(sequence)
+        && pid.parse::<u32>().is_ok()
+        && sequence.parse::<u64>().is_ok()
 }
 
 fn consider_cached_release(
@@ -768,8 +934,11 @@ mod tests {
     #[test]
     fn corrupt_cached_release_falls_back_to_embedded() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let path = temp.path().join("catalog-v1-20260719t000000z-");
-        fs::write(path.with_extension("json"), b"not json").expect("write");
+        let release = release_at("2026-07-19T00:00:00Z");
+        let path = temp
+            .path()
+            .join(format!("{}.json", release.manifest.release_id));
+        fs::write(path, b"not json").expect("write");
 
         let load = load_managed_catalog(Some(temp.path()));
 
@@ -818,6 +987,139 @@ mod tests {
         assert!(report.outcome.was_updated());
         assert!(responses.is_empty());
         assert!(load_managed_catalog(Some(&cache_dir)).from_cache);
+    }
+
+    #[test]
+    fn successful_refresh_bounds_cache_and_sweeps_only_stale_owned_temps() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let releases = [
+            "2026-07-19T00:00:00Z",
+            "2026-07-19T01:00:00Z",
+            "2026-07-19T02:00:00Z",
+            "2026-07-19T03:00:00Z",
+            "2026-07-19T04:00:00Z",
+        ]
+        .map(release_at);
+        for release in &releases {
+            write_cached_release(temp.path(), release).expect("cached release");
+        }
+        let current = releases.last().expect("current release");
+        let manifest = canonical_manifest_bytes(&current.manifest);
+
+        let stale_temp = temp.path().join(".provider-catalog-100-0.tmp");
+        fs::write(&stale_temp, b"stale").expect("stale temp");
+        let stale_time = SystemTime::now()
+            .checked_sub(STALE_TEMP_FILE_AGE + Duration::from_secs(1))
+            .expect("stale time");
+        File::options()
+            .write(true)
+            .open(&stale_temp)
+            .expect("open stale temp")
+            .set_times(std::fs::FileTimes::new().set_modified(stale_time))
+            .expect("age stale temp");
+        let active_temp = temp.path().join(".provider-catalog-100-1.tmp");
+        fs::write(&active_temp, b"active").expect("active temp");
+        let malformed_temp = temp.path().join(".provider-catalog-not-ours.tmp");
+        fs::write(&malformed_temp, b"malformed").expect("malformed temp");
+        File::options()
+            .write(true)
+            .open(&malformed_temp)
+            .expect("open malformed temp")
+            .set_times(std::fs::FileTimes::new().set_modified(stale_time))
+            .expect("age malformed temp");
+        let unrelated_temp = temp.path().join("unrelated.tmp");
+        fs::write(&unrelated_temp, b"unrelated").expect("unrelated temp");
+
+        let mut calls = 0;
+        let report = refresh_managed_catalog_with(temp.path(), test_now(), |url, _| {
+            calls += 1;
+            assert_eq!(url, LATEST_MANIFEST_URL);
+            Ok(manifest.clone())
+        })
+        .expect("current refresh");
+
+        assert_eq!(calls, 1);
+        assert!(!report.outcome.was_updated());
+        assert!(report.warnings.is_empty());
+        let retained = cache_release_paths(temp.path()).expect("retained releases");
+        assert_eq!(retained.len(), RETAINED_CACHE_RELEASES);
+        for release in &releases[2..] {
+            assert!(retained.contains(
+                &temp
+                    .path()
+                    .join(format!("{}.json", release.manifest.release_id))
+            ));
+        }
+        assert!(!stale_temp.exists());
+        assert!(active_temp.exists());
+        assert!(malformed_temp.exists());
+        assert!(unrelated_temp.exists());
+    }
+
+    #[test]
+    fn pruning_preserves_an_older_selected_release_and_the_two_newest_others() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let releases = [
+            "2026-07-19T00:00:00Z",
+            "2026-07-19T01:00:00Z",
+            "2026-07-19T02:00:00Z",
+            "2026-07-19T03:00:00Z",
+            "2026-07-19T04:00:00Z",
+        ]
+        .map(release_at);
+        for release in &releases {
+            write_cached_release(temp.path(), release).expect("cached release");
+        }
+        let protected = releases.first().expect("protected release");
+        let mut warnings = Vec::new();
+
+        prune_cached_releases(temp.path(), &protected.manifest.release_id, &mut warnings)
+            .expect("prune");
+
+        assert!(warnings.is_empty());
+        let retained = cache_release_paths(temp.path()).expect("retained releases");
+        assert_eq!(retained.len(), RETAINED_CACHE_RELEASES);
+        for release in [&releases[0], &releases[3], &releases[4]] {
+            assert!(retained.contains(
+                &temp
+                    .path()
+                    .join(format!("{}.json", release.manifest.release_id))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_maintenance_does_not_treat_symlinks_or_directories_as_bundles() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let target = temp.path().join("target");
+        fs::write(&target, b"keep").expect("target");
+        let symlink_release = release_at("2026-07-19T00:00:00Z");
+        let symlink_path = temp
+            .path()
+            .join(format!("{}.json", symlink_release.manifest.release_id));
+        symlink(&target, &symlink_path).expect("symlink");
+        let directory_release = release_at("2026-07-19T01:00:00Z");
+        let directory_path = temp
+            .path()
+            .join(format!("{}.json", directory_release.manifest.release_id));
+        fs::create_dir(&directory_path).expect("directory");
+
+        let mut warnings = Vec::new();
+        prune_cached_releases(temp.path(), "embedded", &mut warnings).expect("prune");
+
+        assert!(warnings.is_empty());
+        assert!(cache_release_paths(temp.path())
+            .expect("release paths")
+            .is_empty());
+        assert!(fs::symlink_metadata(&symlink_path)
+            .expect("symlink remains")
+            .file_type()
+            .is_symlink());
+        assert!(directory_path.is_dir());
+        assert_eq!(fs::read(target).expect("target remains"), b"keep");
     }
 
     #[test]
@@ -1020,6 +1322,20 @@ mod tests {
     fn bounded_reader_rejects_one_byte_over_limit() {
         let error = read_bounded(&b"12345"[..], 4, "test").expect_err("oversize");
         assert!(error.to_string().contains("exceeds 4 byte limit"));
+    }
+
+    #[test]
+    fn temporary_file_matcher_accepts_only_the_atomic_writer_shape() {
+        assert!(is_catalog_temp_name(".provider-catalog-123-0.tmp"));
+        for name in [
+            ".provider-catalog-anything.tmp",
+            ".provider-catalog-123.tmp",
+            ".provider-catalog-0123-0.tmp",
+            ".provider-catalog-123-00.tmp",
+            ".provider-catalog-123-0.tmp.extra",
+        ] {
+            assert!(!is_catalog_temp_name(name), "{name}");
+        }
     }
 
     fn release_at(generated_at: &str) -> ValidatedRelease {

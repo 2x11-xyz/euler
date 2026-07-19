@@ -197,6 +197,12 @@ remains the explicit on-demand path, and bare `euler models` remains offline.
 Downloaded state moves to the distinct machine-managed directory
 `~/.euler/catalogs/provider-v1/`, with one immutable validated bundle per
 release so concurrent writers cannot produce a torn manifest/catalog pair.
+After each successful refresh check, Euler best-effort retains up to three
+downloaded bundles, always including the selected bundle when it is downloaded.
+Every retained bundle is still fully validated at load; the refresh-state file
+is scheduling state, not a validation bypass. The same maintenance pass removes
+only regular files matching Euler's exact atomic-write temporary-name format
+that have been abandoned for at least 48 hours.
 `~/.euler/models.json` remains the
 user-owned advisory override surface. Effective precedence is:
 

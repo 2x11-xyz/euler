@@ -1202,7 +1202,7 @@ impl AppCore {
         }
         if !report.warnings.is_empty() {
             self.push_notice_item(format!(
-                "provider catalog ignored {} invalid cached release file(s)",
+                "provider catalog cache reported {} warning(s)",
                 report.warnings.len()
             ));
         }
