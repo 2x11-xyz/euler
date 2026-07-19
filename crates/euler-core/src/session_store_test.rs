@@ -1173,6 +1173,138 @@ fn provenance_writer_can_open_created_events_path() {
     let _writer = ProvenanceWriter::new(record.events_path()).expect("writer");
 }
 
+// --- Performance regression guards ------------------------------------------
+//
+// These assert *work counts*, never wall-clock time: they observe how many
+// full event-log projections (the expensive per-session read the sidecar
+// cache elides) each hot path performs, so they are immune to CI load. The
+// motivating incident is the ~500ms enter-key stall — `list_sessions`
+// projecting every session's event log on the UI thread on every submit and
+// turn-end. That regression would have shown up here as a nonzero (and
+// store-size-scaling) projection count on the submit path.
+
+/// Seeds `count` sessions, each with a real, projectable event log, and
+/// returns their records in creation order. A projectable log makes every
+/// projection the store performs — or avoids — observable via the work
+/// counter.
+fn seed_sessions_with_events(store: &SessionStore, count: usize) -> Vec<SessionRecord> {
+    (0..count)
+        .map(|_| {
+            let record = store.create_session().expect("session");
+            append_session_start(&record, None);
+            record
+        })
+        .collect()
+}
+
+/// Projections performed by a single cold listing of a fresh store of `count`
+/// sessions. Used by the complexity-shaped scaling guard.
+fn cold_listing_projections(count: usize) -> u64 {
+    let (_temp, store) = test_store();
+    seed_sessions_with_events(&store, count);
+    reset_event_log_projections();
+    store.list_sessions().expect("list");
+    event_log_projections()
+}
+
+#[test]
+fn submit_path_touch_never_projects_event_logs_regardless_of_store_size() {
+    // Enter-stall guard. The submit/turn-end hot path bumps the active
+    // session's recency via `touch_session_updated_at`, which must read only
+    // the sidecar — never project any event log, not the active session's and
+    // certainly not all N. A regression that reintroduces a projecting refresh
+    // (or a stray `list_sessions`) on this path trips this assertion.
+    let (_temp, store) = test_store();
+    let sessions = seed_sessions_with_events(&store, 24);
+    let active = &sessions[0];
+    // Realistic open/resume: warm the active session's sidecar once.
+    store.find_session(active.id()).expect("find").expect("record");
+
+    reset_event_log_projections();
+    for _ in 0..5 {
+        store
+            .touch_session_updated_at(active.id())
+            .expect("touch metadata");
+    }
+
+    assert_eq!(
+        event_log_projections(),
+        0,
+        "submit-path touch must never project an event log (enter-stall guard)"
+    );
+}
+
+#[test]
+fn find_session_projects_only_the_requested_session_not_the_whole_store() {
+    // Single-id resolution must be O(1) in projections, independent of store
+    // size: the targeted `find_session` fix that replaced a `list_sessions`
+    // scan on the resume path.
+    let (_temp, store) = test_store();
+    let sessions = seed_sessions_with_events(&store, 24);
+    let target = &sessions[12];
+
+    reset_event_log_projections();
+    store.find_session(target.id()).expect("find").expect("record");
+    assert_eq!(
+        event_log_projections(),
+        1,
+        "cold single-id find must project exactly the one requested session"
+    );
+
+    reset_event_log_projections();
+    store.find_session(target.id()).expect("find").expect("record");
+    assert_eq!(
+        event_log_projections(),
+        0,
+        "warm single-id find must serve the sidecar cache without projecting"
+    );
+}
+
+#[test]
+fn listing_projects_each_session_once_when_cold_and_nothing_when_warm() {
+    // The listing (session picker) path: a cold listing projects each session
+    // exactly once and fills the sidecar cache; a subsequent warm listing
+    // projects nothing. This is the cached behavior the enter-stall lacked.
+    let (_temp, store) = test_store();
+    let count = 16;
+    seed_sessions_with_events(&store, count);
+
+    reset_event_log_projections();
+    let listed = store.list_sessions().expect("list");
+    assert_eq!(listed.len(), count);
+    assert_eq!(
+        event_log_projections(),
+        count as u64,
+        "cold listing must project each session exactly once"
+    );
+
+    reset_event_log_projections();
+    store.list_sessions().expect("list");
+    assert_eq!(
+        event_log_projections(),
+        0,
+        "warm listing must serve every session from the sidecar cache"
+    );
+}
+
+#[test]
+fn cold_listing_work_scales_linearly_not_quadratically_with_store_size() {
+    // Complexity-shaped guard: run the listing at size N and 10N and assert
+    // the projection count tracks the size ratio (linear), never its square.
+    // The enter-stall's danger was super-linear cost accumulating across a
+    // run; pinning the shape catches a re-scan reintroduced behind the cache.
+    let small = cold_listing_projections(8);
+    let large = cold_listing_projections(80);
+
+    assert_eq!(small, 8, "one projection per session at N");
+    assert_eq!(large, 80, "one projection per session at 10N");
+    assert_eq!(
+        large,
+        small * 10,
+        "cold-listing work scales with the size ratio (linear), not its square"
+    );
+}
+
 fn project_root(parent: &Path, name: &str) -> PathBuf {
     let root = parent.join(name);
     fs::create_dir_all(&root).expect("project root");

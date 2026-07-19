@@ -22,6 +22,38 @@ use ulid::Ulid;
 const SESSION_METADATA_VERSION: u64 = 1;
 const INDEX_ENTRY_VERSION: u64 = 1;
 
+// Performance regression instrumentation (test builds only, zero-cost in
+// production). Counts full event-log projections — the expensive per-session
+// read (`read_resume_prefix` plus the status/name/title/root/kind scans) that
+// the sidecar projection cache exists to elide. The ~500ms enter-key stall
+// (list_sessions projecting every session's event log on the UI thread on
+// every submit/turn-end) was a regression in exactly this counter's value.
+// Work-counting guards in session_store_test.rs assert it stays O(1) on the
+// submit and single-lookup hot paths and scales linearly (never quadratically)
+// across a listing. See the perf guards section of that file.
+#[cfg(test)]
+thread_local! {
+    static EVENT_LOG_PROJECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of full event-log projections performed on the current thread since
+/// the last [`reset_event_log_projections`]. Test-only work counter.
+#[cfg(test)]
+pub(crate) fn event_log_projections() -> u64 {
+    EVENT_LOG_PROJECTIONS.with(std::cell::Cell::get)
+}
+
+/// Resets the full-event-log-projection work counter for the current thread.
+#[cfg(test)]
+pub(crate) fn reset_event_log_projections() {
+    EVENT_LOG_PROJECTIONS.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+fn note_event_log_projection() {
+    EVENT_LOG_PROJECTIONS.with(|counter| counter.set(counter.get().saturating_add(1)));
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionStore {
     home: EulerHome,
@@ -855,6 +887,11 @@ fn session_projection_from_events_or_sidecar(
     sidecar_root: Option<PathBuf>,
     sidecar_kind: Option<SessionKind>,
 ) -> SessionProjection {
+    // Work-counter tick: this is the single expensive per-session projection
+    // the sidecar cache elides. Guards assert how many times hot paths reach
+    // here (see EVENT_LOG_PROJECTIONS).
+    #[cfg(test)]
+    note_event_log_projection();
     // `read_resume_prefix` reads the complete accepted prefix. Status depends
     // on seeing the latest terminal status event in that durable prefix.
     let Ok(events) = read_resume_prefix(path) else {
