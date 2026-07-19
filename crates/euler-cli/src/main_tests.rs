@@ -723,11 +723,18 @@ fn models_command_is_top_level_and_rejects_live_run_flags() {
     let args = parse_args_without_env(["models"]);
     assert!(matches!(args.command, Command::Models(ModelsCommand::List)));
 
-    let refresh = parse_args_without_env(["models", "refresh", "--force"]);
+    let refresh = parse_args_without_env(["models", "refresh"]);
     assert!(matches!(
         refresh.command,
-        Command::Models(ModelsCommand::Refresh { force: true })
+        Command::Models(ModelsCommand::Refresh)
     ));
+    assert!(
+        parse_args_without_env_result(["models", "refresh", "--force"])
+            .err()
+            .expect("obsolete force flag")
+            .to_string()
+            .contains("unknown models argument")
+    );
 
     for (args, expected) in [
         (

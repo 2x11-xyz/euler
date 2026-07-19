@@ -487,9 +487,18 @@ impl ModelProvider for Box<dyn ModelProvider> {
     }
 }
 
-#[derive(Default)]
 pub struct ProviderSet {
     providers: BTreeMap<String, Box<dyn ModelProvider>>,
+    model_catalog: catalog::MergedModelCatalog,
+}
+
+impl Default for ProviderSet {
+    fn default() -> Self {
+        Self {
+            providers: BTreeMap::new(),
+            model_catalog: catalog::MergedModelCatalog::built_in(),
+        }
+    }
 }
 
 impl ProviderSet {
@@ -513,6 +522,15 @@ impl ProviderSet {
         let mut set = Self::new();
         set.insert_named(provider_id, provider);
         set
+    }
+
+    pub fn with_model_catalog(mut self, catalog: catalog::MergedModelCatalog) -> Self {
+        self.model_catalog = catalog;
+        self
+    }
+
+    pub fn set_model_catalog(&mut self, catalog: catalog::MergedModelCatalog) {
+        self.model_catalog = catalog;
     }
 
     pub fn insert<P>(&mut self, provider: P) -> bool
@@ -573,7 +591,8 @@ impl ProviderSet {
         requested: ReasoningEffort,
     ) -> ReasoningEffort {
         if self.providers.contains_key(provider) {
-            catalog::clamp_reasoning_effort(provider, model, requested)
+            self.model_catalog
+                .clamp_reasoning_effort(provider, model, requested)
         } else {
             requested
         }

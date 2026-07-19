@@ -10,10 +10,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MODEL_CATALOG_FILE: &str = "models.json";
+const LEGACY_MODELS_REFRESH_GENERATOR: &str = "euler models refresh";
 
 pub(crate) struct ModelCatalogLoad {
     pub(crate) catalog: MergedModelCatalog,
     pub(crate) warnings: Vec<String>,
+    pub(crate) release_id: String,
+    pub(crate) managed: bool,
 }
 
 pub(crate) fn default_model_catalog_path() -> Option<PathBuf> {
@@ -30,32 +33,47 @@ fn model_catalog_path_from_home_vars(
 }
 
 pub(crate) fn load_model_catalog(path: Option<&Path>) -> ModelCatalogLoad {
+    let cache_dir = path.map(crate::provider_catalog::managed_catalog_dir_for_model_path);
+    let managed = crate::provider_catalog::load_managed_catalog(cache_dir.as_deref());
+    let mut load = ModelCatalogLoad {
+        catalog: managed.catalog,
+        warnings: managed.warnings,
+        release_id: managed.release_id,
+        managed: managed.from_cache,
+    };
     let Some(path) = path else {
-        return ModelCatalogLoad {
-            catalog: MergedModelCatalog::built_in(),
-            warnings: Vec::new(),
-        };
+        return load;
     };
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ModelCatalogLoad {
-                catalog: MergedModelCatalog::built_in(),
-                warnings: Vec::new(),
-            };
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return load,
         Err(error) => {
-            return ModelCatalogLoad {
-                catalog: MergedModelCatalog::built_in(),
-                warnings: vec![format!(
-                    "could not read {}: {error}; using built-in model catalog",
-                    path.display()
-                )],
-            };
+            load.warnings.push(format!(
+                "could not read {}: {error}; using official model catalog",
+                path.display()
+            ));
+            return load;
         }
     };
-    let (catalog, warnings) = MergedModelCatalog::with_local_json(&contents);
-    ModelCatalogLoad { catalog, warnings }
+    if legacy_generated_overlay(&contents) {
+        load.warnings.push(format!(
+            "ignored legacy machine-generated {}; `euler models refresh` now uses the managed GitHub catalog",
+            path.display()
+        ));
+        return load;
+    }
+    let (catalog, warnings) = MergedModelCatalog::with_base_and_local_json(load.catalog, &contents);
+    load.catalog = catalog;
+    load.warnings.extend(warnings);
+    load
+}
+
+fn legacy_generated_overlay(contents: &str) -> bool {
+    serde_json::from_str::<Value>(contents)
+        .ok()
+        .and_then(|value| value.get("generated_by")?.as_str().map(str::to_owned))
+        .as_deref()
+        == Some(LEGACY_MODELS_REFRESH_GENERATOR)
 }
 
 pub(crate) fn print_model_catalog(
@@ -72,12 +90,29 @@ pub(crate) fn print_model_catalog(
     for warning in &provider_load.warnings {
         writeln!(stderr, "warning: ignored provider config: {warning}")?;
     }
-    write_model_catalog_json_with_custom(&load.catalog, &provider_load.registry, &mut stdout)
+    write_model_catalog_json(
+        &load.catalog,
+        &provider_load.registry,
+        &load.release_id,
+        load.managed,
+        &mut stdout,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn write_model_catalog_json_with_custom(
     catalog: &MergedModelCatalog,
     custom_providers: &ProviderConfigRegistry,
+    output: impl Write,
+) -> Result<()> {
+    write_model_catalog_json(catalog, custom_providers, "embedded", false, output)
+}
+
+fn write_model_catalog_json(
+    catalog: &MergedModelCatalog,
+    custom_providers: &ProviderConfigRegistry,
+    release_id: &str,
+    managed: bool,
     mut output: impl Write,
 ) -> Result<()> {
     let mut custom = custom_providers.providers().collect::<Vec<_>>();
@@ -99,7 +134,16 @@ pub(crate) fn write_model_catalog_json_with_custom(
         })
         .chain(custom.into_iter().map(custom_provider_json))
         .collect::<Vec<_>>();
-    serde_json::to_writer_pretty(&mut output, &json!({ "providers": providers }))?;
+    serde_json::to_writer_pretty(
+        &mut output,
+        &json!({
+            "official_catalog": {
+                "release_id": release_id,
+                "source": if managed { "managed" } else { "embedded" },
+            },
+            "providers": providers,
+        }),
+    )?;
     writeln!(output)?;
     Ok(())
 }

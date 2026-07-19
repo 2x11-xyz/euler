@@ -124,20 +124,33 @@ and on `workflow_dispatch`:
 3. normalize deterministically from recorded inputs;
 4. validate schema and catalog invariants;
 5. compare the candidate with the current stable catalog;
-6. open or update one bot pull request when the normalized catalog changed;
-7. auto-merge routine additive or metadata-only changes after all gates pass;
+6. update one automation branch with the exact validated candidate and run CI
+   against that commit;
+7. open or update one tracking issue linking the branch comparison, evidence
+   run, decision class, and release identity, then let a maintainer open the
+   pull request from that branch;
 8. require human review for defaults, built-in provider membership, source
    policy, suspicious count changes, and removals;
 9. publish a versioned GitHub Release only from merged `main`.
+
+The tracking-issue handoff is intentional for the current one-maintainer
+project: organization policy does not let GitHub Actions create pull requests,
+and upstream observations should not auto-merge into a release without a
+human promotion decision. It needs no bot personal-access token and can move
+to bot-authored pull requests later without changing the artifact or client
+contracts.
 
 The generator never converts a fetch failure into an empty provider list.
 Removals require repeated observation or explicit review so a transient API or
 account-entitlement change cannot erase the stable catalog. Git history and
 release artifacts provide the audit and rollback path.
 
-Credentials needed by official list endpoints are narrow GitHub Actions
-secrets used only for discovery requests. The workflow never performs paid
-inference and never logs request headers or secret values.
+Where an official list endpoint requires credentials, values live only in
+GitHub Actions encrypted secrets and are injected ephemerally into the
+scheduled observation job. They are not workflow-dispatch inputs or catalog
+data, are never published or downloaded by Euler, and are never resolved by
+the catalog generator. The workflow never performs paid inference and never
+logs request headers or credential values.
 
 At minimum, validation enforces:
 
@@ -176,11 +189,15 @@ On first interactive launch, after the usable UI is available, Euler performs
 one bounded best-effort refresh from the GitHub release channel and reports the
 result visibly. Failure retains the embedded snapshot. Headless commands do
 not acquire this implicit network dependency. Later interactive sessions may
-offer an update when the managed snapshot is stale; `euler models refresh`
+offer an update when the managed snapshot is stale. A failed automatic check
+may retry after one hour; a successful check is not repeated for 24 hours.
+`euler models refresh`
 remains the explicit on-demand path, and bare `euler models` remains offline.
 
-Downloaded state moves to a distinct machine-managed path, for example
-`~/.euler/catalogs/provider-v1.json`. `~/.euler/models.json` remains the
+Downloaded state moves to the distinct machine-managed directory
+`~/.euler/catalogs/provider-v1/`, with one immutable validated bundle per
+release so concurrent writers cannot produce a torn manifest/catalog pair.
+`~/.euler/models.json` remains the
 user-owned advisory override surface. Effective precedence is:
 
 1. embedded release snapshot;
@@ -191,12 +208,15 @@ user-owned advisory override surface. Effective precedence is:
 This replacement boundary allows a new stable catalog to remove stale models
 without allowing local config to hide built-ins accidentally. A legacy
 `models.json` bearing the exact `euler models refresh` generator marker is
-recognized once at the load boundary and ignored when a new managed snapshot
-exists; user-authored files keep their existing semantics.
+recognized once at the load boundary and ignored whether the effective
+official snapshot is embedded or managed; user-authored files without that
+exact legacy marker keep their existing semantics. Euler does not delete the
+old file automatically because it may contain later hand edits.
 
 Refresh validates the manifest and catalog before an atomic write. Unsupported
-schema, digest mismatch, timeout, malformed content, suspicious catalog shape,
-or write failure leaves the last-known-good file untouched. Catalog fetching
+schema, digest mismatch, timeout, implausibly future release time, malformed
+content, suspicious catalog shape, or write failure leaves the last-known-good
+file untouched. Catalog fetching
 does not resolve provider secrets and does not create session or provenance
 state.
 
@@ -223,8 +243,8 @@ ChatGPT effective-context handling remains code.
 
 1. Create the public catalog repository with schema, source-policy files,
    deterministic fixtures, and an OpenRouter generator.
-2. Add daily candidate generation, guarded bot PRs, and GitHub Release
-   publication.
+2. Add daily candidate generation, guarded change tracking, reviewed
+   promotion, and GitHub Release publication.
 3. Add the managed-snapshot loader and GitHub refresh client to Euler while
    retaining the embedded fallback and manual override contract.
 4. Generate Euler's embedded snapshot from the release artifact and delete the
@@ -252,3 +272,20 @@ Mechanically checkable client behavior must prove:
 Publication tests must prove deterministic generation, fail-closed source
 handling, guarded removals/defaults, schema validity, and byte-for-byte digest
 agreement with every published artifact.
+
+## Rollback and supersession
+
+Published releases are immutable. If a bad release is promoted, repair the
+catalog source or policy, generate and review a corrected candidate, and
+publish it as a newer release. Do not replace assets, retag an existing
+release, or move the latest channel backward: clients reject downgrades and
+same-timestamp identity changes while retaining their last-known-good bundle.
+
+GitHub repository identity and HTTPS are the V1 authenticity root; the
+content-authenticated manifest prevents asset mix-ups or mutation but is not
+an independent maintainer signature. Release immutability is enabled. A GitHub
+repository or maintainer-account compromise therefore requires disabling
+refresh through a new Euler build if repository control cannot be recovered;
+adding a second signing system operated by the same single maintainer would
+not create meaningful independence. This is an accepted V1 operational risk,
+not a property hidden behind the digest check.

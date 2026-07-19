@@ -31,7 +31,7 @@ use crate::{model_catalog, provider_config_runtime};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ModelsCommand {
     List,
-    Refresh { force: bool },
+    Refresh,
 }
 
 pub(crate) struct Args {
@@ -382,21 +382,12 @@ pub(super) fn parse_models_command(
     args: &mut impl Iterator<Item = String>,
 ) -> Result<ModelsCommand> {
     let mut command = ModelsCommand::List;
-    let mut force = false;
     for arg in args.by_ref() {
         match arg.as_str() {
             "refresh" if command == ModelsCommand::List => {
-                command = ModelsCommand::Refresh { force };
+                command = ModelsCommand::Refresh;
             }
             "refresh" => return Err(anyhow!("models refresh was provided more than once")),
-            "--force" if matches!(command, ModelsCommand::Refresh { .. }) => {
-                if force {
-                    return Err(anyhow!("--force was provided more than once"));
-                }
-                force = true;
-                command = ModelsCommand::Refresh { force };
-            }
-            "--force" => return Err(anyhow!("--force is only supported with models refresh")),
             "--provider" => return Err(anyhow!("--provider is not supported with models")),
             "--model" => return Err(anyhow!("--model is not supported with models")),
             "--provenance" => return Err(anyhow!("--provenance is not supported with models")),

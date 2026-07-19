@@ -1,5 +1,5 @@
 use super::*;
-use crate::catalog::{ANTHROPIC_MODELS, DEFAULT_ANTHROPIC_MODEL};
+use crate::catalog::{MergedModelCatalog, DEFAULT_ANTHROPIC_MODEL};
 
 fn anthropic_reasoning(content: &str, artifact: Option<&str>) -> ModelInputItem {
     ModelInputItem::Reasoning {
@@ -216,11 +216,17 @@ fn request_effort_follows_requested_reasoning_effort() {
 #[test]
 fn adaptive_thinking_is_enabled_for_anthropic_reasoning_builtins_only() {
     assert!(model_supports_adaptive_thinking(DEFAULT_ANTHROPIC_MODEL));
-    for model in ANTHROPIC_MODELS
-        .iter()
-        .filter(|model| model.supports_reasoning == Some(true))
+    let catalog = MergedModelCatalog::built_in();
+    let anthropic = catalog.provider("anthropic").expect("anthropic catalog");
+    for model in anthropic
+        .models()
+        .filter(|model| model.supports_reasoning() == Some(true))
     {
-        assert!(model_supports_adaptive_thinking(model.id), "{}", model.id);
+        assert!(
+            model_supports_adaptive_thinking(model.id()),
+            "{}",
+            model.id()
+        );
     }
     assert!(!model_supports_adaptive_thinking("claude-custom-future"));
 }

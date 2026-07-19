@@ -168,9 +168,10 @@ impl AppCore {
 
     fn accept_worker_session_or_continue(
         &mut self,
-        session: Box<Session<TuiDecider>>,
+        mut session: Box<Session<TuiDecider>>,
         auto_flush: bool,
     ) {
+        session.set_model_catalog(self.model_catalog.clone());
         self.bottom
             .set_causal_dag_stats(Some(causal_dag_stats_from_events(
                 session.events(),

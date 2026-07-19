@@ -3,9 +3,10 @@ use crate::ui::patch_approval::PatchPreview;
 use crate::ui::test_backend::VT100Backend;
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
-    catalog::MergedModelCatalog, EchoProvider, FixtureResponse, ModelProvider, ModelRequest,
-    ModelStreamEvent, ProviderError, ProviderStream, ScriptedProvider, ScriptedStreamStep,
-    StopReason, ToolCall, Usage,
+    catalog::{MergedModelCatalog, EMBEDDED_CATALOG_JSON},
+    EchoProvider, FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError,
+    ProviderStream, ReasoningEffort, ScriptedProvider, ScriptedStreamStep, StopReason, ToolCall,
+    Usage,
 };
 use ratatui::{
     layout::Rect,
@@ -71,6 +72,130 @@ fn core_with_fixture_catalog(
             ..AppOptions::default()
         },
     )
+}
+
+#[test]
+fn background_catalog_refresh_reports_success_and_failure_without_blocking_ui() {
+    let mut core = core();
+    core.drain_finalized_visual_lines(80);
+    let (success_tx, success_rx) = mpsc::channel();
+    success_tx
+        .send(Ok(crate::provider_catalog::RefreshReport {
+            outcome: crate::provider_catalog::RefreshOutcome::Current {
+                release_id: "catalog-v1-test".to_owned(),
+            },
+            warnings: Vec::new(),
+        }))
+        .expect("send success");
+    core.catalog_refresh_rx = Some(success_rx);
+
+    assert!(core.drain_background());
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("provider catalog is current"));
+
+    let (failure_tx, failure_rx) = mpsc::channel();
+    failure_tx
+        .send(Err(anyhow!("offline")))
+        .expect("send failure");
+    core.catalog_refresh_rx = Some(failure_rx);
+
+    assert!(core.drain_background());
+    let text = drain_finalized_visual_text(&mut core, 80);
+    assert!(text.contains("refresh unavailable"));
+    assert!(text.contains("last-known-good models"));
+}
+
+#[test]
+fn installed_catalog_reaches_idle_session_reasoning_policy() {
+    let mut core = core_with_provider_model_at(ChatGptEchoProvider, "gpt-5.5", ".");
+    let AppState::Idle { session } = &core.state else {
+        panic!("test session must be idle");
+    };
+    assert_eq!(
+        session
+            .providers()
+            .clamp_reasoning_effort("chatgpt", "gpt-5.5", ReasoningEffort::Max,),
+        ReasoningEffort::XLarge
+    );
+
+    let updated = catalog_with_reasoning_efforts("chatgpt", "gpt-5.5", &["max"]);
+
+    core.install_model_catalog(updated);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("test session must remain idle");
+    };
+    assert_eq!(
+        session
+            .providers()
+            .clamp_reasoning_effort("chatgpt", "gpt-5.5", ReasoningEffort::Max,),
+        ReasoningEffort::Max
+    );
+    assert_eq!(
+        core.model_catalog
+            .supported_reasoning_efforts("chatgpt", "gpt-5.5"),
+        &[ReasoningEffort::Max]
+    );
+}
+
+#[test]
+fn installed_catalog_reaches_worker_session_at_the_turn_boundary() {
+    let mut core = core_with_provider_model_at(ChatGptEchoProvider, "gpt-5.5", ".");
+    let session = core.take_idle_session();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.install_model_catalog(catalog_with_reasoning_efforts(
+        "chatgpt",
+        "gpt-5.5",
+        &["max"],
+    ));
+
+    // The worker keeps one coherent policy for its active turn.
+    assert_eq!(
+        session
+            .providers()
+            .clamp_reasoning_effort("chatgpt", "gpt-5.5", ReasoningEffort::Max,),
+        ReasoningEffort::XLarge
+    );
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("returned worker session must be idle");
+    };
+    assert_eq!(
+        session
+            .providers()
+            .clamp_reasoning_effort("chatgpt", "gpt-5.5", ReasoningEffort::Max,),
+        ReasoningEffort::Max
+    );
+}
+
+fn catalog_with_reasoning_efforts(
+    provider: &str,
+    model_id: &str,
+    efforts: &[&str],
+) -> MergedModelCatalog {
+    let mut document: serde_json::Value =
+        serde_json::from_str(EMBEDDED_CATALOG_JSON).expect("embedded catalog");
+    let model = document["providers"][provider]["models"]
+        .as_array_mut()
+        .expect("provider models")
+        .iter_mut()
+        .find(|model| model["id"] == model_id)
+        .expect("catalog model");
+    model["reasoning_efforts"] = json!(efforts);
+    MergedModelCatalog::from_official_json(
+        &serde_json::to_string(&document).expect("updated catalog JSON"),
+    )
+    .expect("updated catalog")
 }
 
 fn fixture_catalog_with_windows(models: &[(&str, u64)]) -> MergedModelCatalog {
