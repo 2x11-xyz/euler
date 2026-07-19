@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[test]
 fn spawn_agent_records_parent_authored_event() {
@@ -976,38 +977,62 @@ fn event_index(events: &[EventEnvelope], event_id: &str) -> usize {
         .expect("event id present")
 }
 
+// Both helpers below wait on an observed state transition, not a fixed spin
+// count. The worker thread is guaranteed to deliver exactly one result (and,
+// for the reporter path, one report) before it exits, and mpsc hands buffered
+// messages to `try_recv` ahead of the disconnect, so the terminal state always
+// arrives. The previous `for _ in 0..10_000 { yield_now }` bound was a
+// duration proxy, not synchronization: under load the worker can be slow to
+// first schedule, and the main thread would burn through all 10_000 near-free
+// yields before the worker ever ran, panicking on a report that was merely
+// late (issue #4). Looping on the state itself removes the false deadline;
+// the 30s liveness deadline below is a hang detector, orders of magnitude
+// past healthy in-process delivery, so a regression fails loudly instead of
+// wedging the job. An early `Closed`/disconnect still fails loudly too.
 fn poll_until_recorded(
     session: &mut Session<ScriptedDecider>,
     background: &mut euler_core::BackgroundAgent,
 ) -> String {
-    for _ in 0..10_000 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
         match session
             .poll_background_agent(background)
             .expect("poll background")
         {
-            BackgroundAgentPoll::Pending => thread::yield_now(),
+            BackgroundAgentPoll::Pending => {
+                assert!(
+                    Instant::now() < deadline,
+                    "background result was not recorded within 30s"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
             BackgroundAgentPoll::Recorded { result_event_id }
             | BackgroundAgentPoll::AlreadyRecorded { result_event_id } => return result_event_id,
         }
     }
-    panic!("background result was not recorded");
 }
 
 fn drain_until_drained(
     session: &mut Session<ScriptedDecider>,
     background: &mut euler_core::BackgroundAgent,
 ) -> String {
-    for _ in 0..10_000 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
         match session
             .drain_background_agent_report(background)
             .expect("drain background report")
         {
             BackgroundAgentReportDrain::Drained { message_event_id } => return message_event_id,
-            BackgroundAgentReportDrain::Empty => thread::yield_now(),
+            BackgroundAgentReportDrain::Empty => {
+                assert!(
+                    Instant::now() < deadline,
+                    "background report was not drained within 30s"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
             BackgroundAgentReportDrain::Closed => panic!("report queue closed before message"),
         }
     }
-    panic!("background report was not drained");
 }
 
 fn payload_str<'a>(event: &'a EventEnvelope, key: &str) -> Option<&'a str> {

@@ -7364,31 +7364,18 @@ fn concurrent_cli_writer_fails_with_session_locked_message() {
         .spawn()
         .expect("spawn first euler");
 
-    let mut lock_ready = false;
-    for _ in 0..100 {
-        if lock.exists() {
-            lock_ready = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_until_session_lock_held(&lock, &mut first);
 
-    let second = if lock_ready {
-        Some(
-            command_with_home(exe, &home)
-                .arg("--provider")
-                .arg("fixture")
-                .arg("--provenance")
-                .arg(&log)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("run second euler"),
-        )
-    } else {
-        None
-    };
+    let second = command_with_home(exe, &home)
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provenance")
+        .arg(&log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run second euler");
 
     first
         .stdin
@@ -7398,9 +7385,7 @@ fn concurrent_cli_writer_fails_with_session_locked_message() {
         .expect("stop first euler");
     let first = first.wait_with_output().expect("wait first euler");
 
-    assert!(lock_ready, "first euler did not create its lock");
     assert!(first.status.success());
-    let second = second.expect("second output");
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(stderr.contains("already open by another Euler process"));
@@ -7427,17 +7412,7 @@ fn killed_cli_writer_releases_advisory_lock_without_removing_lock_file() {
         .spawn()
         .expect("spawn first euler");
 
-    let mut lock_ready = false;
-    // Generous window: nextest runs this beside PTY suites and full builds,
-    // and a loaded runner can delay process start well past a second.
-    for _ in 0..500 {
-        if lock.exists() {
-            lock_ready = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(lock_ready, "first euler did not create its lock");
+    wait_until_session_lock_held(&lock, &mut first);
 
     first.kill().expect("kill first euler");
     first.wait().expect("reap killed euler");
@@ -7736,29 +7711,16 @@ fn concurrent_cli_resume_fails_with_session_locked_message() {
         .spawn()
         .expect("spawn first resume");
 
-    let mut lock_ready = false;
-    for _ in 0..100 {
-        if lock.exists() {
-            lock_ready = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_until_session_lock_held(&lock, &mut first);
 
-    let second = if lock_ready {
-        Some(
-            command_with_home(exe, &home)
-                .arg("--resume")
-                .arg(&log)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("run second resume"),
-        )
-    } else {
-        None
-    };
+    let second = command_with_home(exe, &home)
+        .arg("--resume")
+        .arg(&log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run second resume");
 
     first
         .stdin
@@ -7768,9 +7730,7 @@ fn concurrent_cli_resume_fails_with_session_locked_message() {
         .expect("stop first resume");
     let first = first.wait_with_output().expect("wait first resume");
 
-    assert!(lock_ready, "first resume did not create its lock");
     assert!(first.status.success());
-    let second = second.expect("second output");
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(stderr.contains("already open by another Euler process"));
@@ -11467,6 +11427,53 @@ fn lock_path_for(log: &Path) -> std::path::PathBuf {
         "{}.lock",
         log.file_name().expect("log filename").to_string_lossy()
     ))
+}
+
+/// The session writer records its `LockOwnerMetadata` (a JSON object carrying
+/// `pid`) into the lock file *after* the OS advisory lock is granted, so a
+/// readable owner record proves the flock is held — not merely that the lock
+/// file was created. Returns the owning PID once that record is present.
+fn lock_owner_pid(lock: &Path) -> Option<u32> {
+    let bytes = std::fs::read(lock).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("pid")?.as_u64().map(|pid| pid as u32)
+}
+
+/// Block until `first` provably *holds* the session advisory lock, then return.
+///
+/// Synchronizes on an observed state transition (the owner record the writer
+/// persists once the flock is granted), not on a wall-clock startup deadline.
+/// The old tests polled `lock.exists()` under a fixed 1s window, which raced
+/// first-process startup under load (issue #145: "first euler did not create
+/// its lock") and also admitted the window between lock-file creation and flock
+/// acquisition. Waiting for the owner record closes both gaps. The record must
+/// carry `first`'s own PID: core writes the metadata best-effort and calls it
+/// non-authoritative, so equality is what ties the observed record to the
+/// process this test spawned rather than to any stale or foreign writer. The
+/// 60s liveness deadline is a hang detector, not a duration proxy — healthy
+/// startup is under a second even on a loaded runner — and it keeps a
+/// regression a clear failure instead of a stuck job.
+fn wait_until_session_lock_held(lock: &Path, first: &mut std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = lock_owner_pid(lock);
+        if observed == Some(first.id()) {
+            return;
+        }
+        if let Some(status) = first.try_wait().expect("poll first euler for lock") {
+            panic!("first euler exited before acquiring its session lock: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first euler (pid {}) did not hold its session lock within 60s; \
+             observed owner record: {observed:?}",
+            first.id()
+        );
+        // Polite poll: a sleep genuinely deschedules (yield_now need not, per
+        // the drain-helper rationale) so this loop cannot compete with the
+        // very process startup it is waiting on.
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn path_str(path: &Path) -> &str {
