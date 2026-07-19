@@ -30,6 +30,7 @@ fn fold_reproduces_live_target_usage_and_context_limit_fields() {
                     output_tokens: 5,
                     cached_tokens: None,
                     cache_write_tokens: None,
+                    cache_write_1h_tokens: None,
                     reasoning_tokens: None,
                 }),
             }),

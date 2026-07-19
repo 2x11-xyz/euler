@@ -94,6 +94,7 @@ pub(super) fn update_token_usage(
     let model = event.payload.get("model").and_then(Value::as_str);
     let cached_tokens = usage_u64(usage, "cached_tokens").unwrap_or(0);
     let cache_write_tokens = usage_u64(usage, "cache_write_tokens").unwrap_or(0);
+    let cache_write_1h_tokens = usage_u64(usage, "cache_write_1h_tokens").unwrap_or(0);
     let Some((provider, cost)) = provider.zip(model).and_then(|(provider, model)| {
         model_cost(model_catalog, provider, model).map(|cost| (provider, cost))
     }) else {
@@ -107,6 +108,7 @@ pub(super) fn update_token_usage(
         output_tokens,
         cached_tokens,
         cache_write_tokens,
+        cache_write_1h_tokens,
     );
     tokens.session_cost_nanos = tokens.session_cost_nanos.saturating_add(nanos);
     tokens.priced_calls = tokens.priced_calls.saturating_add(1);
@@ -120,6 +122,7 @@ fn model_cost(catalog: &MergedModelCatalog, provider: &str, model: &str) -> Opti
         .cost()
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors pi's four usage counters plus target
 fn model_result_cost_nanos(
     provider: &str,
     cost: ModelCost,
@@ -127,6 +130,7 @@ fn model_result_cost_nanos(
     output_tokens: u64,
     cached_tokens: u64,
     cache_write_tokens: u64,
+    cache_write_1h_tokens: u64,
 ) -> u64 {
     let (ordinary_input, cache_read) = if provider == "anthropic" {
         (input_tokens, cached_tokens)
@@ -136,7 +140,13 @@ fn model_result_cost_nanos(
             cached_tokens.min(input_tokens),
         )
     };
-    let rates = cost.rates_for_input(ordinary_input.saturating_add(cache_read));
+    let rates = cost.rates_for_input(
+        ordinary_input
+            .saturating_add(cache_read)
+            .saturating_add(cache_write_tokens),
+    );
+    let long_write = cache_write_1h_tokens.min(cache_write_tokens);
+    let short_write = cache_write_tokens.saturating_sub(long_write);
     // A rate unit is $0.001 per million tokens, which is exactly one
     // nano-dollar per token. Integer arithmetic therefore preserves every
     // catalog rate without floating-point drift.
@@ -144,7 +154,8 @@ fn model_result_cost_nanos(
         .saturating_mul(rates.input)
         .saturating_add(output_tokens.saturating_mul(rates.output))
         .saturating_add(cache_read.saturating_mul(rates.cache_read))
-        .saturating_add(cache_write_tokens.saturating_mul(rates.cache_write))
+        .saturating_add(short_write.saturating_mul(rates.cache_write))
+        .saturating_add(long_write.saturating_mul(rates.input.saturating_mul(2)))
 }
 
 pub(super) fn read_terminal_event() -> Result<Option<UiEvent>> {
@@ -498,8 +509,8 @@ mod tests {
     fn pi_cost_math_prices_cached_input_at_the_cache_rate() {
         let cost = ModelCost::new(5.0, 30.0, 0.5, 6.25);
 
-        let openai = model_result_cost_nanos("openai", cost, 1_000, 100, 400, 0);
-        let anthropic = model_result_cost_nanos("anthropic", cost, 600, 100, 400, 0);
+        let openai = model_result_cost_nanos("openai", cost, 1_000, 100, 400, 0, 0);
+        let anthropic = model_result_cost_nanos("anthropic", cost, 600, 100, 400, 0, 0);
 
         // 600 ordinary input * 5000 nanos + 100 output * 30000 nanos
         // + 400 cached input * 500 nanos = $0.0062.
@@ -511,18 +522,19 @@ mod tests {
     fn pi_cost_math_prices_anthropic_cache_writes() {
         let cost = ModelCost::new(2.0, 10.0, 0.2, 2.5);
 
-        let nanos = model_result_cost_nanos("anthropic", cost, 100, 10, 20, 40);
+        let nanos = model_result_cost_nanos("anthropic", cost, 100, 10, 20, 40, 10);
 
-        // $0.0002 input + $0.0001 output + $0.000004 read + $0.0001 write.
-        assert_eq!(nanos, 404_000);
+        // $0.0002 input + $0.0001 output + $0.000004 read + $0.000075
+        // short write + $0.00004 one-hour write (2x input rate).
+        assert_eq!(nanos, 419_000);
     }
 
     #[test]
     fn pi_cost_math_uses_request_wide_long_context_tier() {
         let cost = ModelCost::with_tier(2.5, 15.0, 0.25, 0.0, 272_000, 5.0, 22.5, 0.5, 0.0);
 
-        let at_threshold = model_result_cost_nanos("openai", cost, 272_000, 10, 0, 0);
-        let over_threshold = model_result_cost_nanos("openai", cost, 272_001, 10, 0, 0);
+        let at_threshold = model_result_cost_nanos("openai", cost, 272_000, 10, 0, 0, 0);
+        let over_threshold = model_result_cost_nanos("openai", cost, 272_001, 10, 0, 0, 0);
 
         assert_eq!(at_threshold, 680_150_000);
         assert_eq!(over_threshold, 1_360_230_000);

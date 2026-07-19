@@ -40,6 +40,7 @@ fn provider_secret_state_is_absent_when_sanitized_surfaces_are_recorded() {
                     output_tokens: 1,
                     cached_tokens: None,
                     cache_write_tokens: None,
+                    cache_write_1h_tokens: None,
                     reasoning_tokens: Some(1),
                 }),
             }),

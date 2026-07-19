@@ -107,6 +107,7 @@ data: [DONE]
                     output_tokens: 2,
                     cached_tokens: None,
                     cache_write_tokens: None,
+                    cache_write_1h_tokens: None,
                     reasoning_tokens: None,
                 }),
             }),

@@ -356,6 +356,9 @@ pub struct Usage {
     /// Provider-reported prompt-cache creation tokens. Anthropic exposes this
     /// separately from ordinary and cache-read input; most providers omit it.
     pub cache_write_tokens: Option<u64>,
+    /// Subset of `cache_write_tokens` created with Anthropic's one-hour TTL,
+    /// which pi prices at twice the ordinary input rate.
+    pub cache_write_1h_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -768,6 +771,7 @@ fn synthetic_usage(input: &str, output: &str) -> Usage {
         output_tokens: output.split_whitespace().count() as u64,
         cached_tokens: Some(0),
         cache_write_tokens: Some(0),
+        cache_write_1h_tokens: Some(0),
         reasoning_tokens: Some(0),
     }
 }

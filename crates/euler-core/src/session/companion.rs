@@ -947,6 +947,12 @@ pub(super) fn usage_payload(usage: Option<&Usage>) -> Value {
             if let Some(cache_write_tokens) = usage.cache_write_tokens {
                 value.insert("cache_write_tokens".to_owned(), cache_write_tokens.into());
             }
+            if let Some(cache_write_1h_tokens) = usage.cache_write_1h_tokens {
+                value.insert(
+                    "cache_write_1h_tokens".to_owned(),
+                    cache_write_1h_tokens.into(),
+                );
+            }
             if let Some(reasoning_tokens) = usage.reasoning_tokens {
                 value.insert("reasoning_tokens".to_owned(), reasoning_tokens.into());
             }

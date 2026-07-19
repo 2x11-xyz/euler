@@ -206,8 +206,8 @@ envelope `v` per `docs/contracts/persistence.md`.
   target model; persisted, see ADR 0008).
 - `model.result`: `provider`, `model`, `content`, `tool_calls`,
   `stop_reason`, `usage` (object: `input_tokens`, `output_tokens`,
-  optional `cached_tokens`, `cache_write_tokens`, `reasoning_tokens`).
-  `tool_calls` (each:
+  optional `cached_tokens`, `cache_write_tokens`, `cache_write_1h_tokens`,
+  `reasoning_tokens`). `tool_calls` (each:
   `id`, `name`, `input`) is a denormalized record of what the provider
   returned; the canonical execution truth is the subsequent `tool.call` /
   `tool.result` events, and replay request-building reads those, never

@@ -219,6 +219,7 @@ fn scripted_usage(input_tokens: u64) -> FixtureResponse {
                 output_tokens: 999,
                 cached_tokens: Some(0),
                 cache_write_tokens: None,
+                cache_write_1h_tokens: None,
                 reasoning_tokens: Some(500),
             }),
         },

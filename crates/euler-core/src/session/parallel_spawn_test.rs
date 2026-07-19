@@ -578,6 +578,7 @@ impl ModelProvider for UsageScriptProvider {
                         output_tokens: self.output_tokens,
                         cached_tokens: Some(0),
                         cache_write_tokens: None,
+                        cache_write_1h_tokens: None,
                         reasoning_tokens: Some(0),
                     }),
                 }),

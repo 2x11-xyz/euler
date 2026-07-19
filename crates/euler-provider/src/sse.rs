@@ -200,6 +200,7 @@ fn usage(value: &Value) -> Option<Usage> {
                     .and_then(Value::as_u64)
             }),
         cache_write_tokens: None,
+        cache_write_1h_tokens: None,
         reasoning_tokens: usage
             .get("reasoning_tokens")
             .and_then(Value::as_u64)
@@ -467,6 +468,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                         output_tokens: 4,
                         cached_tokens: Some(3),
                         cache_write_tokens: None,
+                        cache_write_1h_tokens: None,
                         reasoning_tokens: Some(2),
                     }),
                 }),

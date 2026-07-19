@@ -195,8 +195,9 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   using that result's provider/model rate and cache-read discount from the
   model catalog. The calculation follows pi: uncached input, output, cache
   reads, and cache writes are charged separately, and request-wide
-  long-context tiers apply to the whole call. The segment is omitted before
-  the first result; `$?` means
+  long-context tiers apply to the whole call. Anthropic one-hour cache writes
+  use pi's `2 × input` rate. The segment is omitted before the first result;
+  `$?` means
   no result had pricing, and a trailing `+` marks a known subtotal when some
   calls were unpriced. Subscription-backed ChatGPT still shows the equivalent
   API cost; it is not a claim about an incremental invoice. No session id in
