@@ -154,6 +154,77 @@ mod composer_tests {
         }
     }
 
+    #[test]
+    fn queued_preview_hard_cuts_a_first_word_wider_than_the_budget() {
+        let draft = ComposerDraft::new();
+        // One unbroken word wider than the preview budget: there is no
+        // whitespace to back off to, so the fallback hard-cuts mid-word and
+        // still appends the ` ...` suffix.
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: "supercalifragilisticexpialidocious".to_owned(),
+            selected: false,
+        }]);
+
+        // width 16 → prefix `▌ 1/1 ` (6 cells) leaves a 10-cell budget.
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 16, 2);
+        let Some(ComposerLine::Queued(line)) = lines.first() else {
+            panic!("missing queued preview");
+        };
+        assert_eq!(line.text, "superc ...");
+        assert!(display_width(&line.text) <= 10);
+    }
+
+    #[test]
+    fn queued_preview_drops_the_suffix_when_the_budget_is_four_or_fewer_cells() {
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: "hello world".to_owned(),
+            selected: false,
+        }]);
+
+        // width 10 → prefix 6 leaves a 4-cell budget, at the ` ...` suffix
+        // width, so the preview is a bare hard cut with no ellipsis.
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 10, 2);
+        let Some(ComposerLine::Queued(line)) = lines.first() else {
+            panic!("missing queued preview");
+        };
+        assert_eq!(line.text, "hell");
+        assert!(!line.text.contains("..."));
+    }
+
+    #[test]
+    fn queued_preview_never_splits_a_multibyte_grapheme_mid_byte() {
+        let draft = ComposerDraft::new();
+        // A ZWJ family emoji repeated well past the budget.
+        let family = "👨‍👩‍👧‍👦";
+        let text = family.repeat(6);
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: text.clone(),
+            selected: false,
+        }]);
+
+        // Reaching here at all proves the truncation did not panic on a
+        // multibyte boundary. The preview's non-suffix core must be a
+        // char-boundary prefix of the input, never a mid-byte cut. The exact
+        // cell count follows `truncate_display` (grapheme clusters may split).
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 20, 2);
+        let Some(ComposerLine::Queued(line)) = lines.first() else {
+            panic!("missing queued preview");
+        };
+        let core = line.text.strip_suffix(" ...").unwrap_or(&line.text);
+        assert!(
+            text.starts_with(core),
+            "core {core:?} is not a char-boundary prefix of the input"
+        );
+        assert!(display_width(&line.text) <= 64);
+    }
+
     /// Spec v2.1 §13.4/§13.8: the composer's default scroll cap is 12 lines
     /// (raised from a prior 6) so the 8-row slash palette, which shares the
     /// composer's rail-bounded container, never clips against the footer.

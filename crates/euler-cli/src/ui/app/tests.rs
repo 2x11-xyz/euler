@@ -2337,7 +2337,7 @@ fn name_session_refreshes_metadata_after_durable_rename() {
     // separately below) because it never depended on that refresh.
     assert_eq!(core.status.session_name.as_deref(), Some("clean name"));
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
-    assert!(rendered.ends_with("echo(medium) · ctx ?% · $0 · clean name"));
+    assert!(rendered.ends_with("echo(medium) · ctx ?% · clean name"));
 }
 
 #[test]
@@ -2365,7 +2365,7 @@ fn name_session_updates_footer_immediately_even_if_metadata_refresh_fails() {
 
     assert_eq!(core.status.session_name.as_deref(), Some("still named"));
     let rendered = core.canvas_status_snapshot(120).line.plain_text();
-    assert!(rendered.ends_with("echo(medium) · ctx ?% · $0 · still named"));
+    assert!(rendered.ends_with("echo(medium) · ctx ?% · still named"));
 }
 
 #[test]
@@ -2382,7 +2382,7 @@ fn reasoning_effort_action_updates_status_session_and_events() {
         .canvas_status_snapshot(120)
         .line
         .plain_text()
-        .ends_with("echo(xlarge) · ctx ?% · $0"));
+        .ends_with("echo(xlarge) · ctx ?%"));
     let AppState::Idle { session } = &core.state else {
         panic!("session should be idle");
     };
@@ -2446,7 +2446,7 @@ fn new_session_reuses_target_and_purges_visual_history() {
         .canvas_status_snapshot(120)
         .line
         .plain_text()
-        .ends_with("echo(medium) · ctx 0% · $0"));
+        .ends_with("echo(medium) · ctx 0%"));
 }
 
 #[test]
@@ -4062,8 +4062,8 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     assert_eq!(
         rendered,
         format!(
-            "  / commands · /tmp/euler{}echo(medium) · ctx 12% · $0",
-            " ".repeat(67)
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
+            " ".repeat(72)
         )
     );
     assert_eq!(core.token_usage.input_tokens, 123);
@@ -4157,8 +4157,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}echo(medium) · ctx 12% · $0",
-            " ".repeat(67)
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
+            " ".repeat(72)
         )
     );
 
@@ -4167,8 +4167,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}other(medium) · ctx 0% · $0",
-            " ".repeat(67)
+            "  / commands · /tmp/euler{}other(medium) · ctx 0%",
+            " ".repeat(72)
         )
     );
 
@@ -4179,8 +4179,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}other(medium) · ctx 13% · $0",
-            " ".repeat(66)
+            "  / commands · /tmp/euler{}other(medium) · ctx 13%",
+            " ".repeat(71)
         )
     );
 }

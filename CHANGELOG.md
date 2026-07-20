@@ -13,7 +13,12 @@ pull requests that landed them; deeper design rationale lives in
   Quotes cover input, output, cache-read, cache-write, and long-context pricing;
   totals include companion calls, survive model switches and resume without
   repricing history, and `/usage` explicitly reports any unpriced calls. The
-  footer stays numeric and begins at `$0`.
+  footer cost chip follows absence over punctuation: it appears only when the
+  priced subtotal exceeds zero, as the plain `$N.NNN`. A zero subtotal (free,
+  no calls yet, or only unpriced calls) shows no chip at all, with no `$0` or
+  `$?` placeholder; the mixed case (nonzero priced plus some unpriced calls)
+  shows the plain subtotal unmarked. The full completeness detail
+  (`$? (N unpriced calls)` and `$N.NNN+ (N unpriced calls)`) stays in `/usage`.
   Ambiguous cache-write TTLs fail closed instead of being assigned a guessed
   rate, and price-bearing catalogs require Euler 0.1.2 or newer.
 

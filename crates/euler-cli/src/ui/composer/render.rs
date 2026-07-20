@@ -665,8 +665,11 @@ fn render_line(line: ComposerLine, x: u16, y: u16, width: u16, buf: &mut Buffer,
 
 #[cfg(test)]
 fn queued_spans(line: QueuedComposerLine, width: u16, theme: &Theme) -> Vec<Span<'static>> {
-    let marker = if line.selected { "•" } else { " " };
-    let prefix = format!("▌ {marker}{}/{} ", line.position, line.total);
+    // Mirror the production prefix (`composer_line_to_canvas` / `render_lines`
+    // both use `queued_line_prefix`) so the test render computes the same
+    // truncation budget. A wider marker prefix here re-truncated the preview
+    // by one cell, turning ` ...` into ` ..` at tight widths (commit 4424869).
+    let prefix = queued_line_prefix(line.position, line.total);
     let prefix_width = display_width(&prefix);
     vec![
         Span::styled(prefix, theme.composer.token_bar),

@@ -306,11 +306,18 @@ fn identity_context_style(tokens: &TokenUsageSnapshot, theme: &Theme) -> Style {
     }
 }
 
-fn identity_cost_label(tokens: &TokenUsageSnapshot) -> String {
+/// The footer cost chip follows the "absence over punctuation" rule: it is
+/// present only when the priced cost subtotal is greater than zero, rendered
+/// as the plain `$N.NNN`. A zero subtotal (genuinely free, no calls made, or
+/// only unpriced calls) yields no chip at all: no `$0`, no `$?`, no marker.
+/// The mixed case (nonzero priced plus some unpriced) shows the plain subtotal
+/// unmarked; the complete honesty (`$?` / `$N.NNN+ (N unpriced calls)`) lives
+/// in `/usage`, not the footer.
+fn identity_cost_label(tokens: &TokenUsageSnapshot) -> Option<String> {
     if tokens.session_cost_picos == 0 {
-        "$0".to_owned()
+        None
     } else {
-        format_cost_picos(tokens.session_cost_picos, 3)
+        Some(format_cost_picos(tokens.session_cost_picos, 3))
     }
 }
 
@@ -327,9 +334,10 @@ pub(super) fn format_cost_picos(picos: u128, decimals: u32) -> String {
     format!("${whole}.{fraction:0width$}", width = decimals as usize)
 }
 
-/// Right cluster, flush-right: `model(effort) · ctx N% · $N.NNN` [+ session
-/// name once named]. Branch no longer lives here (#48) — see the left
-/// cluster's `cwd (branch)` instead.
+/// Right cluster, flush-right: `model(effort) · ctx N%` [· `$N.NNN`] [· session
+/// name once named]. The cost chip appears only for a nonzero priced subtotal
+/// (see `identity_cost_label`). Branch no longer lives here (#48) — see the
+/// left cluster's `cwd (branch)` instead.
 fn identity_segment_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
@@ -350,10 +358,12 @@ fn identity_segment_spans(
         Span::styled(format!("{model} · "), theme.status.faint),
         Span::styled(ctx, identity_context_style(tokens, theme)),
     ];
-    spans.push(Span::styled(
-        format!("{SEGMENT_GAP}{}", identity_cost_label(tokens)),
-        theme.status.cost,
-    ));
+    if let Some(cost) = identity_cost_label(tokens) {
+        spans.push(Span::styled(
+            format!("{SEGMENT_GAP}{cost}"),
+            theme.status.cost,
+        ));
+    }
     if let Some(name) = snapshot
         .session_name
         .as_deref()
@@ -518,7 +528,9 @@ mod tests {
         assert!(full.contains("/ commands"));
         assert!(!full.contains("ctrl+o expand"));
         assert!(full.contains("/tmp/repo (main)"));
-        assert!(full.contains("z-ai/glm-5.2(extra-high) · ctx ?% · $0"));
+        assert!(full.contains("z-ai/glm-5.2(extra-high) · ctx ?%"));
+        // Zero priced subtotal: the cost chip is absent, no orphaned separator.
+        assert!(!full.contains("ctx ?% · $"));
         // Branch v2 (#48): lives beside the directory, never on the right.
         assert!(!full.contains("ctx ?% · main"));
         assert!(!full.contains("e???? ·"));
@@ -543,12 +555,12 @@ mod tests {
         let tokens = TokenUsageSnapshot::default();
 
         let unnamed = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
-        assert!(unnamed.ends_with("echo · ctx ?% · $0"));
+        assert!(unnamed.ends_with("echo · ctx ?%"));
         assert!(!unnamed.contains("01KW3Q6NN5A9R6E2EWZ7M3QW9T"));
 
         snapshot.session_name = Some("research-branch".to_owned());
         let named = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
-        assert!(named.ends_with("echo · ctx ?% · $0 · research-branch"));
+        assert!(named.ends_with("echo · ctx ?% · research-branch"));
         assert!(!named.contains("01KW3Q6NN5A9R6E2EWZ7M3QW9T"));
     }
 
@@ -560,7 +572,7 @@ mod tests {
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 80);
         assert!(rendered.starts_with("  / commands · /tmp/repo"));
         assert!(!rendered.contains('('));
-        assert!(rendered.ends_with("echo · ctx ?% · $0"));
+        assert!(rendered.ends_with("echo · ctx ?%"));
     }
 
     #[test]
@@ -570,7 +582,7 @@ mod tests {
 
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, true, 80);
         assert!(rendered.starts_with("  / commands · ctrl+o expand · /tmp/repo"));
-        assert!(rendered.ends_with("echo · ctx ?% · $0"));
+        assert!(rendered.ends_with("echo · ctx ?%"));
     }
 
     #[test]
@@ -595,7 +607,7 @@ mod tests {
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 120);
 
         assert!(rendered.contains("/home/user/projects/euler (fix/warm-spine-anchor)"));
-        assert!(rendered.ends_with("fable-5(medium) · ctx 12% · $0"));
+        assert!(rendered.ends_with("fable-5(medium) · ctx 12%"));
         assert_eq!(snapshot.model, "claude-fable-5");
     }
 
@@ -607,7 +619,7 @@ mod tests {
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 80);
 
         assert!(rendered.starts_with("  / commands · /"));
-        assert!(rendered.ends_with("echo · ctx ?% · $0"));
+        assert!(rendered.ends_with("echo · ctx ?%"));
     }
 
     #[test]
@@ -723,17 +735,21 @@ mod tests {
         assert!(rendered.ends_with("echo · ctx ?% · $12.346"));
     }
 
+    /// Absence over punctuation: a zero priced subtotal shows no cost chip at
+    /// all (even when unpriced calls were made) and never orphans the ` · `
+    /// separator. A nonzero subtotal that also has unpriced calls shows the
+    /// plain numeric subtotal, unmarked (no `+`); the `$?` / `$N.NNN+` honesty
+    /// lives in `/usage`, not the footer.
     #[test]
-    fn statusline_cost_stays_numeric_when_calls_are_unpriced() {
+    fn statusline_cost_chip_absent_at_zero_subtotal_and_unmarked_when_partial() {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
         let unknown = TokenUsageSnapshot {
             unpriced_calls: 1,
             ..TokenUsageSnapshot::default()
         };
-        assert!(
-            status_line_text(&snapshot, &unknown, TurnStatus::Idle, false, 120)
-                .ends_with("echo · ctx ?% · $0")
-        );
+        let rendered = status_line_text(&snapshot, &unknown, TurnStatus::Idle, false, 120);
+        assert!(rendered.ends_with("echo · ctx ?%"));
+        assert!(!rendered.contains('$'));
 
         let partial = TokenUsageSnapshot {
             session_cost_picos: 1_250_000_000_000,
@@ -741,10 +757,9 @@ mod tests {
             unpriced_calls: 2,
             ..TokenUsageSnapshot::default()
         };
-        assert!(
-            status_line_text(&snapshot, &partial, TurnStatus::Idle, false, 120)
-                .ends_with("echo · ctx ?% · $1.250")
-        );
+        let partial_rendered = status_line_text(&snapshot, &partial, TurnStatus::Idle, false, 120);
+        assert!(partial_rendered.ends_with("echo · ctx ?% · $1.250"));
+        assert!(!partial_rendered.contains('+'));
     }
 
     #[test]
@@ -842,12 +857,13 @@ mod tests {
 
         // Sized so the directory's budget is exactly 12 cells — enough for
         // `…/2x11/euler` (the ellipsis plus the last 11 characters) and not
-        // one cell more.
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 54);
+        // one cell more. At zero cost the right cluster is `echo · ctx ?%`
+        // (no cost chip), so the width that leaves a 12-cell path budget is 49.
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 49);
 
         assert!(rendered.contains("/ commands · …/2x11/euler (main)"));
-        assert!(rendered.ends_with("echo · ctx ?% · $0"));
-        assert!(display_width(&rendered) < 54);
+        assert!(rendered.ends_with("echo · ctx ?%"));
+        assert!(display_width(&rendered) < 49);
     }
 
     /// Issue #59: a narrower budget that no longer fits the `2x11` component
@@ -860,14 +876,14 @@ mod tests {
         snapshot.git_branch = Some("main".to_owned());
         let tokens = TokenUsageSnapshot::default();
 
-        // 4 cells narrower than the `…/2x11/euler` case above — exactly
-        // enough budget for the pre-fix raw cut to land inside "2x11"
+        // 4 cells narrower than the `…/2x11/euler` case above (49 → 45),
+        // exactly enough budget for the pre-fix raw cut to land inside "2x11"
         // ("11/euler"); the fix must sacrifice the whole component instead.
-        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 50);
+        let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 45);
 
         assert!(rendered.contains("/ commands · …/euler (main)"));
         assert!(!rendered.contains("11/euler"));
-        assert!(display_width(&rendered) < 50);
+        assert!(display_width(&rendered) < 45);
     }
 
     /// Footer §4 (v4 dogfood): once the right cluster grows (model(effort) · ctx ·
@@ -891,7 +907,8 @@ mod tests {
         snapshot.session_name = Some("apple-terminal-v4-test".to_owned());
         snapshot.reasoning_effort = Some("medium".to_owned());
         let tokens = TokenUsageSnapshot::default();
-        let right_cluster = "z-ai/glm-5.2(medium) · ctx ?% · $0 · apple-terminal-v4-test";
+        // Zero cost: no chip, so the right cluster carries no `$0` segment.
+        let right_cluster = "z-ai/glm-5.2(medium) · ctx ?% · apple-terminal-v4-test";
 
         // 66 is the exact width from the owner's dogfood screenshot where
         // the fallback collided (`(int` glued to `z-ai/glm-5.2`). Sweep a

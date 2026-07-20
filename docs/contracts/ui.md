@@ -189,13 +189,24 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   paused queue, arrival after the final round — flush into the next turn,
   as before. Pending rows show one visual line: the message body is capped at
   64 terminal display cells, truncates at a word boundary with an ASCII
-  ` ...` suffix, and never alters the full queued input. The running footer
-  hint reads `⏎ steer`.
+  ` ...` suffix, and never alters the full queued input. Two fallbacks apply at
+  tight widths: when the first word alone exceeds the budget there is no word
+  boundary to keep, so the preview hard-cuts mid-word before appending the
+  suffix; and when the budget is four cells or fewer (at or below the suffix
+  width) the ` ...` suffix is dropped and the body is a bare hard cut. The
+  running footer hint reads `⏎ steer`.
 - Footer: **one** line below the composer — two hard-edged clusters:
-  contextual hints then `cwd (branch)` flush-left; `model · ctx N% · $N.NNN`
-  (plus the session name once named) flush-right. Cost is always a numeric
-  running priced subtotal, beginning at `$0`; quote completeness and unpriced
-  call counts remain explicit in `/usage`. The subtotal is cumulative USD over
+  contextual hints then `cwd (branch)` flush-left; `model · ctx N%` with an
+  optional `· $N.NNN` (plus the session name once named) flush-right. The cost
+  chip follows absence over punctuation: it renders only when the priced cost
+  subtotal is greater than zero, as the plain `$N.NNN`. A zero subtotal (a
+  genuinely free session, no calls yet, or only unpriced calls) shows no chip at
+  all: no `$0`, no `$?`, no placeholder, and the ` · ` separator never orphans.
+  The mixed case (a nonzero priced subtotal alongside some unpriced calls) shows
+  that plain subtotal, unmarked. The footer carries no unknown or partial
+  markers; quote completeness and unpriced call counts stay explicit in
+  `/usage`, which keeps `$? (N unpriced calls)` for the all-unpriced history and
+  `$N.NNN+ (N unpriced calls)` for the partial one. The subtotal is cumulative USD over
   valid persisted `model.result.cost` snapshots in the session, including
   companion calls. The model-result emission boundary computes each snapshot
   once from disjoint usage buckets and the exact resolved catalog schedule;
