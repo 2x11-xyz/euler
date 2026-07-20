@@ -14,6 +14,10 @@ use ratatui::{
 const QUEUED_PREVIEW_MAX_WIDTH: usize = 64;
 const QUEUED_PREVIEW_SUFFIX: &str = " ...";
 
+pub(crate) fn queued_line_prefix(position: usize, total: usize) -> String {
+    format!("▌ {position}/{total} ")
+}
+
 pub struct ComposerSnapshot<'a> {
     pub draft: &'a ComposerDraft,
     pub queued: Vec<QueuedComposerLine>,
@@ -168,7 +172,7 @@ pub fn render_lines(
         .iter()
         .map(|line| {
             let mut line = line.clone();
-            let prefix = format!("▌ •{}/{} ", line.position, line.total);
+            let prefix = queued_line_prefix(line.position, line.total);
             let available = usize::from(width).saturating_sub(display_width(&prefix));
             line.text = queued_preview(&line.text, available.min(QUEUED_PREVIEW_MAX_WIDTH));
             ComposerLine::Queued(line)

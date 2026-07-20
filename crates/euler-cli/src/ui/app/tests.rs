@@ -4126,6 +4126,19 @@ fn persisted_cost_rebuild_keeps_footer_subtotal_numeric_for_mixed_history() {
         .line
         .plain_text()
         .ends_with("echo(medium) · ctx 20% · $0.006"));
+    assert!(
+        format_session_usage(&events, &core.status, &core.token_usage)
+            .starts_with("usage · session totals · $0.006200+ (1 unpriced call(s))")
+    );
+}
+
+#[test]
+fn detailed_usage_distinguishes_unpriced_history_from_zero_cost() {
+    assert_eq!(usage_cost_text(0, 0, 1), "$? (1 unpriced call(s))");
+    assert_eq!(
+        usage_cost_text(6_200_000_000, 1, 2),
+        "$0.006200+ (2 unpriced call(s))"
+    );
 }
 
 #[test]

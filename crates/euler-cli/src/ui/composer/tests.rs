@@ -144,7 +144,7 @@ mod composer_tests {
             let Some(ComposerLine::Queued(line)) = lines.first() else {
                 panic!("missing queued preview at width {width}");
             };
-            let prefix = format!("▌ •{}/{} ", line.position, line.total);
+            let prefix = queued_line_prefix(line.position, line.total);
             assert!(
                 display_width(&prefix) + display_width(&line.text) <= usize::from(width),
                 "width {width} rendered {prefix:?} + {:?}",

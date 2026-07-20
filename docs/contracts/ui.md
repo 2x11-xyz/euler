@@ -207,7 +207,9 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   equivalent API-price estimate when its catalog entry has a quote; this is
   neither an invoice nor a claim about incremental spend. No session id in the
   footer — ids live in `/status` and resume copy (#21). Ctx% uses attention at
-  ≥70% and failure at ≥85%. No second status row; detail lives under `/status`.
+  ≥70% and failure at ≥85%. Canvas compaction data, including demotion counts
+  and tier, remains canonical `canvas.snapshot` provenance (events contract),
+  not footer state. No second status row; detail lives under `/status`.
 
 ### Streaming, scroll, motion
 
