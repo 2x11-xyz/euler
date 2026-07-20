@@ -93,6 +93,15 @@ exposition layered over an autonomous solution: two artifacts with
 different authorship and different trust properties, distinguishable
 here only because the authors chose to say so.
 
+*Update (2026-07).* The social verification has since produced named,
+durable artifacts: a human-verified companion note by Alon, Bloom,
+Gowers, Litt, Sawin, Shankar, Tsimerman, Wang, and Wood
+(https://arxiv.org/abs/2605.20695) and an explanatory digestion by Tao
+(https://terrytao.wordpress.com/2026/07/03/a-digestion-of-unit-distance-constructions/).
+The trail improved after the fact, which is itself the pattern worth
+noting: the community backfilled the evidence the pipeline did not
+record.
+
 **What Euler takes from it.**
 
 - Publishing prompt and raw output verbatim is provenance done by hand.
@@ -232,3 +241,112 @@ revised as the record catches up.
   no formal proof at all. Euler's substrate is meant to make the whole
   spectrum legible, so that "what was actually verified" is a property
   of the record rather than a matter of trusting the narrator.
+
+## 2026-03/04: eight Erdős questions, proofs "due entirely to an internal model"
+
+Two short papers by Alexeev, Putterman, Sawhney, Sellke, and Valiant
+present natural-language proofs answering eight questions of Erdős
+across combinatorics, probability, and number theory. Each abstract
+attributes the mathematics the same way: the proof is due entirely to
+an internal model at OpenAI. The human authors verified, edited, and
+wrote up; no model is named, and no formal verification is involved.
+
+- https://arxiv.org/abs/2603.29961 (I: three questions, 6 pages)
+- https://arxiv.org/abs/2604.06609 (II: five questions, 28 pages)
+
+**What it shows.** Real open questions (not benchmark items) now fall
+to natural-language model proofs often enough to publish in batches:
+eight results in five weeks, with five working mathematicians in the
+role of checkers and scribes. The checking role has quietly inverted;
+the humans are the gate, not the source.
+
+**What it exposes.** The entire provenance is one sentence in an
+abstract. No model identity, no transcripts, no record of attempts or
+failures, no verification artifact beyond the authors' word. This is
+the thinnest evidence trail in this ledger attached to some of its
+most credible results (the authors' reputations are doing the work the
+record should do). Attribution-by-footnote was a caveat in the
+unit-distance entry; here it is the entire trail.
+
+**What Euler takes from it.**
+
+- Reputation-as-provenance does not scale and does not transfer: a
+  reader who trusts these papers is trusting five names, not a record.
+  The substrate's job is to make the checkable version cheaper than
+  the vouched version.
+- The manual role the authors played (independent check before
+  publication) is the verification-gate and critic pattern once more,
+  performed offline and unrecorded. Every entry in this ledger now
+  contains this shape; none of them record it.
+
+## 2026-06: Lean-gated proof search industrializes, and accounts for its costs
+
+Tsoukalas and twenty coauthors report large-scale LLM proof search
+with Lean verification at the center: their strongest agent
+autonomously resolved 9 of 353 open Erdős problems and proved 44 of
+492 OEIS conjectures, at a stated per-problem cost of a few hundred
+dollars. The framework coordinates subagents with an evolutionary
+loop over a formal verification gate.
+
+- https://arxiv.org/abs/2605.22763
+
+**What it shows.** Proof search is becoming an engineering discipline
+with a budget line: solve rates over problem corpora, cost per
+result, and a formal gate that makes the solve rate mean something.
+Reporting cost per theorem is provenance for economics, and this is
+the first entry in this ledger to do it.
+
+**What it exposes.** It is another bespoke harness: subagent
+coordination, evolutionary scheduling, a verification gate, exactly
+the starship shape from the Star Fleet entry, rebuilt independently
+by a different group at twenty-one-author scale. The proliferation
+this ledger flagged as a pattern is now systemic, and each harness's
+search process (the dead ends across 353 problems, what the
+evolutionary loop actually learned) remains private to its builders.
+
+**What Euler takes from it.**
+
+- Coordination-plus-gate is a workflow shape, and workflow shapes are
+  extensions over one provenance substrate; the alternative on
+  display is every group rebuilding session management, verification
+  gating, and memory from scratch and keeping the search record
+  private by default because recording it was never structural.
+- Cost accounting belongs in the record: tokens and dollars per
+  artifact are provenance, and a substrate that already records every
+  model call can emit them for free.
+
+## 2026-06: a niche Ramsey number with the best evidence trail yet
+
+Kalfus and Lidický settle the book Ramsey number R(B8, B10) = 37. The
+result is narrow; the provenance is not: the paper states that both
+the choice of problem and the proof were found with AutoMath (an
+AI-assisted discovery workflow built by the first author), says
+explicitly what the workflow found and what humans edited, and ships
+a Lean formalization of the upper-bound argument in an accompanying
+repository.
+
+- https://arxiv.org/abs/2606.05629
+
+**What it shows.** Found-by, edited-by, and verified-by, stated
+separately and honestly, with a formal artifact attached: this is the
+closest any published AI-found theorem has come to the bar the vision
+states, and a solo-plus-advisor team did it for a niche result. The
+transparency did not require an institution; it required deciding to
+write it down.
+
+**What it exposes.** The transparency is prose. A paragraph the
+authors chose to write is not a record a reader can traverse, query,
+or verify independently of the authors' framing, and hand-written
+provenance will not survive scale: it worked here because the result
+is paper-sized. Nothing enforces that the next AutoMath paper, or
+anyone else's, says as much.
+
+**What Euler takes from it.**
+
+- This is the manual version of the product: found-by, edited-by, and
+  verified-by as separate, separately-trusted events in one causal
+  chain is exactly what the substrate makes structural, so that the
+  honesty in this paper's provenance paragraph stops being a choice.
+- Small results are the right first market for verified provenance.
+  A niche Ramsey number with a traversable record beats a famous
+  conjecture with a footnote, and the former is buildable now.
