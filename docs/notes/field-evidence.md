@@ -173,3 +173,62 @@ persistence cannot compound an error past the checker, observers and
 honest caps that can call a stall, and independent review roles rather
 than self-declared completion (the guardian model). Persistence plus a
 verification gate is a tool; persistence alone is variance.
+
+## 2026-07: a claimed Jacobian-conjecture counterexample, arithmetic-checkable in minutes
+
+Posted by @__alpoge__ (July 2026): an explicit polynomial map from C^3
+to C^3, credited to the model Fable, claimed to disprove the Jacobian
+conjecture (open since 1939). The map is
+
+`((1+xy)^3 z + y^2(1+xy)(4+3xy), y + 3x(1+xy)^2 z + 3xy^2(4+3xy), 2x - 3x^2 y - x^3 z)`
+
+with Jacobian determinant a constant -2, and the three distinct points
+(0,0,-1/4), (1,-3/2,13/2), (-1,3/2,13/2) all sent to (-1/4,0,0). A
+polynomial map with nonzero constant Jacobian that is not injective is
+exactly what the conjecture says cannot exist. The stated verification
+was Wolfram Alpha links and a second model (Grok) agreeing.
+
+- https://xcancel.com/__alpoge__/status/2079028340955197566
+
+**What it shows.** The checkable core of this claim is arithmetic, not a
+proof, so we checked it ourselves rather than transcribe it: a symbolic
+algebra pass confirms the Jacobian determinant is identically -2, and
+exact rational evaluation confirms all three distinct points land on
+(-1/4,0,0). Both facts hold. Unlike a Lean proof of a hard theorem, a
+counterexample of this shape reduces to two finite computations, and a
+verification gate settles them in minutes.
+
+**What it exposes.** Verified arithmetic is not a disproven conjecture,
+and the distance between the two is the whole point of this ledger.
+Certifying that det J = -2 and that three points collide answers the
+mechanical question ("do these identities hold") and is silent on the
+mathematical one ("is this a valid counterexample to the conjecture as
+the field states it, or a known artifact, or a subtly mis-stated
+hypothesis"). That second question is peer review, and this result has
+had none: its evidence trail is a social-media post, calculator links,
+and one model agreeing with another (agreement is not verification, and
+two systems concurring is not two independent checks). An 85-year-old
+conjecture falling to a map that fits on one line is precisely the
+claim the standing caveat exists for. We record the arithmetic as
+confirmed and the disproof as unverified, and expect this entry to be
+revised as the record catches up.
+
+**What Euler takes from it.**
+
+- This is the cleanest case yet for provenance honesty in verified
+  artifacts. An arithmetic (or Lean) verifier extension could attach a
+  verified artifact to this map automatically, but the artifact's honest
+  label is "det J is the constant -2 and F collides these three points,"
+  never "the Jacobian conjecture is false." A verified artifact must
+  claim exactly what was checked, not what someone concluded from it,
+  and the causal chain must keep the check and the conclusion as
+  separate, separately-trusted events.
+- Cheap gates are worth wiring in precisely because they are cheap: the
+  checkable part here cost one tool call. The verification-gate pattern
+  does not require a hard proof to earn its place, it requires a
+  claimant willing to state the checkable core.
+- The contrast across this ledger sharpens: earlier entries had formal
+  proofs and private processes, this one has a fully public process and
+  no formal proof at all. Euler's substrate is meant to make the whole
+  spectrum legible, so that "what was actually verified" is a property
+  of the record rather than a matter of trusting the narrator.
