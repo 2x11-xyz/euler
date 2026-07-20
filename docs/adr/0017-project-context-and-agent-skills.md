@@ -4,9 +4,14 @@
 
 Proposed (2026-07-20). Not implemented.
 
-This ADR records the intended architecture. The contracts in `docs/contracts/`
-describe current implemented behavior and will be amended with the first
-implementation slice, not ahead of it.
+This ADR records the intended architecture. Its normative shape is bound now
+in `docs/contracts/project-context.md`, marked binding shape ahead of
+implementation, following the discipline the extension distribution contract
+established: a contract may bind an eventual shape explicitly before code
+exists, with honest implementation-status lines distinguishing what runs
+today from what is bound. The neighboring contracts (events, canvas,
+capabilities, secrets, tools, multi-agent, boundaries, extension-SDK, ui) are
+amended with the slices that make each statement true.
 
 Implementation is tracked in [issue #180](https://github.com/2x11-xyz/euler/issues/180).
 
@@ -39,11 +44,12 @@ A repository can commit an ignored path deliberately, and users can choose a
 different ignore policy. Therefore `.gitignore` is convenience, never an
 authorization boundary. This decision does not redesign `.euler/`.
 
-Codex and Pi both discover the cross-agent `.agents/skills/` convention as well
-as product-specific skill directories. Both use `SKILL.md` packages and
-progressive disclosure: compact name/description metadata is always available,
-while the complete procedure is loaded on demand. Using the shared convention
-lets one committed skill work across Euler, Codex, and Pi.
+Multiple coding agents already discover the cross-agent `.agents/skills/`
+convention alongside their own product-specific skill directories, using
+`SKILL.md` packages and progressive disclosure: compact name/description
+metadata is always available, while the complete procedure is loaded on
+demand. Using the shared convention lets one committed skill work across every
+tool that follows it.
 
 Euler has stronger replay requirements than a conventional prompt loader. The
 next model request should be reconstructable from the canonical session event
@@ -116,7 +122,7 @@ EULER.md
 The first release will not discover:
 
 - `.euler/skills/`;
-- `.pi/skills/`, `.codex/skills/`, or other product-native roots;
+- other tools' product-native skill roots;
 - `AGENTS.md` or `CLAUDE.md` as instruction fallbacks;
 - a user-global `EULER.md`;
 - user-global `~/.agents/skills/`.
@@ -188,6 +194,14 @@ moving.
 Malformed, unsafe, and over-limit sources are omitted whole. Startup continues
 with visible typed diagnostics; content is never silently truncated because a
 partial instruction can invert meaning.
+
+Discovery reads the working tree and is independent of version-control state:
+admission does not depend on whether a file is tracked, ignored, or
+uncommitted. An ignored `EULER.md` or an ignored skill directory loads exactly
+like a tracked one. This is the supported mechanism for private per-project
+guidance and skills that never leave the machine; the snapshot records and
+frames such sources identically, so provenance stays honest about what the
+model saw.
 
 ### 5. Keep repository content out of provider system instructions
 
@@ -332,6 +346,16 @@ identity through ordinary `tool.call` and `tool.result` events. It does not
 re-read the filesystem, grant a capability, execute a script, install a
 dependency, or automatically read references and assets.
 
+A `skill_read` result is repository-authored text entering the canvas
+mid-session, so the returned body receives the same core-generated framing and
+repository-guidance classification as startup sources: a core-framed header
+carrying the skill's name and source identity, content indented so body text
+can never occupy a core marker position, and the same adversarial
+fake-framing tests. `skill_read` itself is permission-ungated: it returns
+already-admitted frozen snapshot bytes and reads nothing from the filesystem,
+so there is no new authority to gate; the call and result remain ordinary
+provenance events.
+
 Supporting files remain ordinary workspace files and are governed by existing
 tools and permissions. Project-context discovery does not grant general access
 to a skill's sibling files above `SessionConfig.root`; a skill that depends on
@@ -388,9 +412,24 @@ child receives the skill catalog and `skill_read` only when this policy is
 
 The default for existing and generic child tasks is `none`, avoiding an ambient
 behavior change. A coding-worker workflow may deliberately request `inherit`.
-Guardian tasks always use `none`. CodeSwarm reviewers always use `none` and see
-only their explicit bounded review packet. Observers and other companions do
-not inherit unless their future protocol explicitly opts in.
+CodeSwarm reviewers always use `none` and see only their explicit bounded
+review packet. Observers and other companions do not inherit unless their
+future protocol explicitly opts in.
+
+Guardian tasks use `inherit`. This preserves ADR 0011's guarantee that the
+guardian reviews the same assembled canvas the main model saw, and it is a
+deliberate choice of evidence over isolation: a reviewer that cannot see the
+repository-authored text that induced a permission ask cannot attribute the
+ask to untrusted content, which is precisely the strongest signal a reviewer
+has. The poisoning risk runs through the same core framing (repository text is
+labeled and indented, and never occupies a core marker position), the
+guardian's empty capability envelope, and the deny-biased verdict thresholds:
+a misled guardian fails toward deny or human review, never toward silent
+allow.
+
+This paragraph amends ADR 0011. Its statement that the guardian "sees the
+same assembled canvas the main model sees" now includes project-context items
+under their untrusted framing; no other part of ADR 0011 changes.
 
 Even when `include_parent_canvas` is true, project-context canvas items are
 filtered unless `project_context` is `inherit`. This makes agent isolation an
@@ -400,7 +439,7 @@ Parallel children that inherit receive one shared immutable parent snapshot,
 assembled before fan-out. They cannot diverge because a file changed during the
 batch.
 
-### 13. Disclose and control project-context loading
+### 13. Gate first exposure on a per-project acknowledgment
 
 Fresh sessions gain a policy control, provisionally:
 
@@ -408,26 +447,51 @@ Fresh sessions gain a policy control, provisionally:
 --project-context auto|on|off
 ```
 
-`auto` resolves as follows:
+Under `auto`, admission requires a recorded **project acknowledgment**: a
+one-time, user-owned record that this user chose to admit this project's
+guidance on this machine. The first interactive session in a workspace with
+discoverable project context presents an acknowledgment card before the first
+model request: the source list, skill count, diagnostic count, and snapshot
+digest. Accepting records the acknowledgment; declining starts the session
+with project context disabled and records that decision too. There is no
+admission by disclosure alone: a cloned repository's prose reaches a model
+only after its user has seen what was discovered and said yes once.
 
-- enabled for interactive `run` and `tui` sessions;
-- enabled for ordinary headless/read-only `exec`;
-- disabled for `exec --auto-approve trusted-local`.
+The acknowledgment is keyed to the canonical workspace root and the portable
+snapshot digest, and stored under the user-owned Euler home, outside
+repository control, in the same two-party shape as project permission grants:
+the repository supplies content, the user-side record supplies the decision,
+and neither alone admits anything. A changed digest (changed guidance
+content) requires a fresh acknowledgment at the next fresh session; unchanged
+content never re-prompts. Acknowledgment admits guidance into model context
+and nothing else: it grants no capability, installs no permission, and must
+never be conflated with capability approval.
 
-A user may explicitly choose `on` with trusted-local auto-approval, but Euler
-must disclose that repository-authored instructions are being paired with
-pre-approved write and shell capabilities. The policy, resolution reason,
-loaded source list, skill count, diagnostic count, and digest are visible at
-startup and recorded in provenance.
+Resolution under `auto`:
 
-This policy does not imply that enabled project context is trusted or that
-disabled project context makes an otherwise hostile repository safe. It only
-controls automatic model exposure. Resume uses the frozen original decision;
-project-context flags do not mutate an existing session.
+- interactive `run` and `tui` sessions: acknowledged content loads; without a
+  matching acknowledgment, the session prompts before the first model request;
+- ordinary headless/read-only `exec`: acknowledged content loads; without a
+  matching acknowledgment, project context is disabled for that run and the
+  startup summary says so (headless runs never prompt);
+- `exec --auto-approve trusted-local`: disabled regardless of acknowledgment.
 
-A durable per-project trust store may be considered later. It is not required
-for the first interactive slice and must not be conflated with capability
-approval if added.
+Explicit `on` is a per-session override recorded in provenance; combined with
+trusted-local auto-approval, Euler must disclose that repository-authored
+instructions are being paired with pre-approved write and shell capabilities.
+Explicit `off` disables admission without touching stored acknowledgments.
+The policy, resolution reason, acknowledgment basis, loaded source list,
+skill count, diagnostic count, and digest are visible at startup and recorded
+in provenance. Resume uses the frozen original decision; project-context
+flags do not mutate an existing session.
+
+Acknowledged project context is still not trusted content, and disabling it
+does not make a hostile repository safe; the acknowledgment controls model
+exposure, never authority. A later general project-trust surface, if added,
+must unify with this acknowledgment store and with the extension project
+tier's per-project install consent (extension distribution contract) rather
+than introducing a third per-project trust store, and must remain separate
+from capability approval.
 
 ### 14. Implement the substrate in core
 
@@ -452,11 +516,12 @@ Implementation proceeds in independently reviewable vertical slices.
 
 1. **Architecture and contract**
    - ratify this ADR;
-   - add `docs/contracts/project-context.md` with exact event schemas,
-     diagnostics, limits, and failure semantics;
+   - `docs/contracts/project-context.md` (binding shape) lands with this ADR:
+     discovery and precedence, bounds, event and diagnostic schemas, the
+     acknowledgment record, framing rules, and failure semantics;
    - update the events, canvas, capabilities, secrets, tools, multi-agent,
-     boundaries, and extension-SDK contracts with the implementation that makes
-     each statement true.
+     boundaries, extension-SDK, and ui contracts with the implementation that
+     makes each statement true.
 2. **`EULER.md` vertical slice**
    - secure Git/worktree discovery and stable reads;
    - typed snapshot and diagnostic events;
@@ -478,9 +543,9 @@ Implementation proceeds in independently reviewable vertical slices.
    - one or more useful shared development skills where they provide real
      progressive-disclosure value.
 
-The project-context contract is intentionally not added by this ADR-only
-change. Euler contracts state current truth; it lands with the first code slice
-that enforces it.
+The project-context contract lands with this ADR as binding shape; each
+implementation slice replaces bound-shape statements with implemented truth
+and updates the neighboring contracts it touches.
 
 ## Required validation
 
@@ -510,6 +575,10 @@ The implementation is not complete without tests covering:
 - independent sessions receiving independent snapshots;
 - child `none | inherit` behavior at the final provider-request seam;
 - guardian, CodeSwarm reviewer, and observer prompt isolation;
+- acknowledgment gating: no admission without a matching user-side record, a
+  changed digest requiring fresh acknowledgment, declining recording and
+  disabling, headless runs without acknowledgment disabling with an honest
+  startup summary, and repository content never able to fabricate a record;
 - trusted-local headless default-off behavior, explicit opt-in, disclosure, and
   permission events naming the real policy basis;
 - regression that repository `.euler/grants.json` remains inert without
@@ -579,12 +648,16 @@ Rejected. Ambient inheritance contaminates independent reviewers and guardians
 and couples child behavior to context it did not request. Explicit snapshot
 inheritance preserves isolation and remains auditable.
 
-### Add a mandatory project-trust prompt first
+### Load automatically with disclosure only, deferring any trust decision
 
-Deferred. Interactive disclosure plus non-system framing and unchanged
-mechanical permissions provide a coherent first slice. Broadly auto-approved
-headless runs default project context off. A future trust decision must be
-separate from authority and stored outside repository control.
+Rejected after review. Disclosure-only admission means cloning a hostile
+repository and opening an interactive session admits attacker-authored
+instructions into a model holding live session grants and statically-safe
+command approval, with no user decision anywhere in the path. Mechanical
+permissions remain the authority boundary, but the ask stream itself becomes
+steerable by untrusted text. The one-time acknowledgment in decision 13 keeps
+the first slice small while putting a user decision before first exposure,
+and reuses the two-party shape project grants already established.
 
 ### Redesign `.euler/` and its ignore policy in this work
 
@@ -603,5 +676,6 @@ This feature neither relies on nor changes repository ignore rules.
 - automatic dependency installation or helper-script execution;
 - a bounded skill-resource API for supporting files outside the tool root;
 - extension-provided skill roots;
-- a general project-trust store;
+- a general project-trust surface (must unify the acknowledgment store with
+  the extension project tier's install consent);
 - workspace transactions or cross-session edit coordination.
