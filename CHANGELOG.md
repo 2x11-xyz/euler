@@ -12,7 +12,8 @@ pull requests that landed them; deeper design rationale lives in
   using persisted per-result quotes from verified provider-catalog schedules.
   Quotes cover input, output, cache-read, cache-write, and long-context pricing;
   totals include companion calls, survive model switches and resume without
-  repricing history, and explicitly mark sessions containing unpriced calls.
+  repricing history, and `/usage` explicitly reports any unpriced calls. The
+  footer stays numeric and begins at `$0`.
   Ambiguous cache-write TTLs fail closed instead of being assigned a guessed
   rate, and price-bearing catalogs require Euler 0.1.2 or newer.
 
@@ -23,7 +24,8 @@ pull requests that landed them; deeper design rationale lives in
   sees in-turn, instead of waiting for turn completion. Order-preserving
   (steering never overtakes queued input), ack-after-persist (failures keep
   entries queued), and interrupt-safe (Esc preserves pending input). The
-  running footer hint reads `⏎ steer`.
+  running footer hint reads `⏎ steer`; pending messages use a one-line,
+  word-bounded preview while their full text remains queued unchanged.
 
 ### Session locking (#151)
 

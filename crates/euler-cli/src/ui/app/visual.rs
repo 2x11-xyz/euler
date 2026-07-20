@@ -551,7 +551,7 @@ fn composer_line_to_canvas(line: ComposerLine) -> CanvasLine {
                     format!("▌ {}/{} ", line.position, line.total),
                     TextRole::Status,
                 ),
-                CanvasSpan::new_lossy(line.text.replace('\n', " ↵ "), TextRole::Plain),
+                CanvasSpan::new_lossy(line.text, TextRole::Plain),
             ],
         },
         ComposerLine::Draft {

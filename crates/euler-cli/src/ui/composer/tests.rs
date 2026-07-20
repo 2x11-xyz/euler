@@ -89,6 +89,71 @@ mod composer_tests {
         ));
     }
 
+    #[test]
+    fn queued_input_preview_is_one_line_and_word_bounded() {
+        let full = "Right but don't mention anywhere in any doc that we're not mentioning other services or other products.";
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: full.to_owned(),
+            selected: true,
+        }]);
+
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 120, 2);
+
+        assert!(matches!(
+            lines.first(),
+            Some(ComposerLine::Queued(line))
+                if line.text
+                    == "Right but don't mention anywhere in any doc that we're not ..."
+        ));
+        assert_eq!(snapshot.queued[0].text, full);
+    }
+
+    #[test]
+    fn queued_input_preview_preserves_short_text_and_marks_newlines() {
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: "keep this\non one row".to_owned(),
+            selected: false,
+        }]);
+
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 120, 2);
+
+        assert!(matches!(
+            lines.first(),
+            Some(ComposerLine::Queued(line)) if line.text == "keep this ↵ on one row"
+        ));
+    }
+
+    #[test]
+    fn queued_input_preview_respects_terminal_and_unicode_display_widths() {
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 12,
+            total: 12,
+            text: "界".repeat(80),
+            selected: true,
+        }]);
+
+        for width in [12, 40, 120] {
+            let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), width, 2);
+            let Some(ComposerLine::Queued(line)) = lines.first() else {
+                panic!("missing queued preview at width {width}");
+            };
+            let prefix = format!("▌ •{}/{} ", line.position, line.total);
+            assert!(
+                display_width(&prefix) + display_width(&line.text) <= usize::from(width),
+                "width {width} rendered {prefix:?} + {:?}",
+                line.text
+            );
+            assert!(display_width(&line.text) <= 64);
+        }
+    }
+
     /// Spec v2.1 §13.4/§13.8: the composer's default scroll cap is 12 lines
     /// (raised from a prior 6) so the 8-row slash palette, which shares the
     /// composer's rail-bounded container, never clips against the footer.

@@ -1,5 +1,6 @@
+use super::super::text::truncate_display;
 #[cfg(test)]
-use super::super::{text::truncate_display, theme::Theme};
+use super::super::theme::Theme;
 use super::*;
 use crate::ui::glyphs::user_line_prefix;
 #[cfg(test)]
@@ -9,6 +10,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
+
+const QUEUED_PREVIEW_MAX_WIDTH: usize = 64;
+const QUEUED_PREVIEW_SUFFIX: &str = " ...";
 
 pub struct ComposerSnapshot<'a> {
     pub draft: &'a ComposerDraft,
@@ -162,8 +166,13 @@ pub fn render_lines(
     let start = snapshot.queued.len().saturating_sub(queue_len);
     let mut lines = snapshot.queued[start..]
         .iter()
-        .cloned()
-        .map(ComposerLine::Queued)
+        .map(|line| {
+            let mut line = line.clone();
+            let prefix = format!("▌ •{}/{} ", line.position, line.total);
+            let available = usize::from(width).saturating_sub(display_width(&prefix));
+            line.text = queued_preview(&line.text, available.min(QUEUED_PREVIEW_MAX_WIDTH));
+            ComposerLine::Queued(line)
+        })
         .collect::<Vec<_>>();
     let draft_height = visible_height(snapshot, options, width, area_height - queue_len);
     lines.extend(visible_draft_lines(
@@ -173,6 +182,40 @@ pub fn render_lines(
         true,
     ));
     lines
+}
+
+fn queued_preview(text: &str, max_width: usize) -> String {
+    let normalized = text.replace('\n', " ↵ ");
+    if display_width(&normalized) <= max_width {
+        return normalized;
+    }
+
+    let suffix_width = display_width(QUEUED_PREVIEW_SUFFIX);
+    if max_width <= suffix_width {
+        return truncate_display(&normalized, max_width);
+    }
+
+    let hard_cut = truncate_display(&normalized, max_width - suffix_width);
+    let cut_inside_word = normalized
+        .get(hard_cut.len()..)
+        .and_then(|tail| tail.chars().next())
+        .is_some_and(|next| !next.is_whitespace())
+        && hard_cut
+            .chars()
+            .last()
+            .is_some_and(|last| !last.is_whitespace());
+    let preview = if cut_inside_word {
+        hard_cut
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(index, _)| hard_cut[..index].trim_end())
+            .filter(|prefix| !prefix.is_empty())
+            .unwrap_or_else(|| hard_cut.trim_end())
+    } else {
+        hard_cut.trim_end()
+    };
+    format!("{preview}{QUEUED_PREVIEW_SUFFIX}")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -621,11 +664,10 @@ fn queued_spans(line: QueuedComposerLine, width: u16, theme: &Theme) -> Vec<Span
     let marker = if line.selected { "•" } else { " " };
     let prefix = format!("▌ {marker}{}/{} ", line.position, line.total);
     let prefix_width = display_width(&prefix);
-    let text = line.text.replace('\n', " ↵ ");
     vec![
         Span::styled(prefix, theme.composer.token_bar),
         Span::styled(
-            truncate_display(&text, usize::from(width).saturating_sub(prefix_width)),
+            truncate_display(&line.text, usize::from(width).saturating_sub(prefix_width)),
             theme.composer.text,
         ),
     ]

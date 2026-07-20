@@ -187,25 +187,27 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   next round boundary as canonical `user.message` events (the model sees
   them in-turn; docs/contracts/events.md). Entries the turn never absorbed —
   paused queue, arrival after the final round — flush into the next turn,
-  as before. The running footer hint reads `⏎ steer`.
+  as before. Pending rows show one visual line: the message body is capped at
+  64 terminal display cells, truncates at a word boundary with an ASCII
+  ` ...` suffix, and never alters the full queued input. The running footer
+  hint reads `⏎ steer`.
 - Footer: **one** line below the composer — two hard-edged clusters:
   contextual hints then `cwd (branch)` flush-left; `model · ctx N% · $N.NNN`
-  (plus the session name once named) flush-right. Cost is cumulative USD over
-  persisted `model.result.cost` snapshots in the session, including companion
-  calls. The model-result emission boundary computes each snapshot once from
-  disjoint usage buckets and the exact resolved catalog schedule; live display,
-  resume, and replay validate the saved component arithmetic against the saved
-  usage and selected rates, then sum the persisted integer components. Only
-  the primary session actor updates the active `ctx` counters; companion and
-  reviewer calls contribute cost without replacing that reading.
-  Catalog refresh never reprices history. The segment is omitted before the
-  first result; `$?` means no result had a valid persisted quote, and a trailing
-  `+` marks a known subtotal when any result was unpriced. Subscription-backed
-  ChatGPT shows an equivalent API-price estimate when its catalog entry has a
-  quote; this is neither an invoice nor a claim about incremental spend. No
-  session id in the footer — ids live in `/status` and resume copy (#21). Ctx%
-  uses attention at ≥70% and failure at ≥85%. No second status row; detail
-  lives under `/status`.
+  (plus the session name once named) flush-right. Cost is always a numeric
+  running priced subtotal, beginning at `$0`; quote completeness and unpriced
+  call counts remain explicit in `/usage`. The subtotal is cumulative USD over
+  valid persisted `model.result.cost` snapshots in the session, including
+  companion calls. The model-result emission boundary computes each snapshot
+  once from disjoint usage buckets and the exact resolved catalog schedule;
+  live display, resume, and replay validate the saved component arithmetic
+  against the saved usage and selected rates, then sum the persisted integer
+  components. Only the primary session actor updates the active `ctx` counters;
+  companion and reviewer calls contribute cost without replacing that reading.
+  Catalog refresh never reprices history. Subscription-backed ChatGPT shows an
+  equivalent API-price estimate when its catalog entry has a quote; this is
+  neither an invoice nor a claim about incremental spend. No session id in the
+  footer — ids live in `/status` and resume copy (#21). Ctx% uses attention at
+  ≥70% and failure at ≥85%. No second status row; detail lives under `/status`.
 
 ### Streaming, scroll, motion
 
