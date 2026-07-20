@@ -203,6 +203,18 @@ guidance and skills that never leave the machine; the snapshot records and
 frames such sources identically, so provenance stays honest about what the
 model saw.
 
+Discovery and hashing necessarily occur before acknowledgment because the
+acknowledgment names the resulting digest. This preflight remains a bounded
+local operation and exposes nothing to a provider. The CLI constructs and
+seeds one startup redactor with every value available under the existing
+startup rules before discovery, and the session inherits that same redactor;
+candidate bytes are read once, frozen, and redacted before they can contribute
+to a digest, event, diagnostic, acknowledgment record, or model input. Values
+resolved only at request time retain the secrets contract's existing
+token-shape and request-time tainting limits. Diagnostics are typed and
+content-free, never parser excerpts or raw error strings containing repository
+text.
+
 ### 5. Keep repository content out of provider system instructions
 
 Repository-authored bytes will not be concatenated into
@@ -214,6 +226,12 @@ pinned canvas projection. Provider adapters render it below system/developer
 policy as attributed context, before the conversational frontier. It is not
 presented as an ordinary human-authored transcript message.
 
+The provider-neutral item is ordered immediately after fixed Euler
+instructions and before every existing conversation, reasoning, and tool item.
+Adapters may wrap it in provider-specific envelope data but cannot trim,
+normalize, combine, reorder, or silently omit its core-rendered bytes. An
+adapter that cannot represent it fails before dispatch.
+
 Core owns framing. Every source has a core-generated header carrying its
 normalized path and repository-guidance classification, and every content line
 is indented or otherwise escaped so source text cannot occupy the same framing
@@ -224,7 +242,9 @@ Project instructions and the rendered skill catalog count against the context
 budget. They are pinned while their session snapshot is active, rather than
 silently disappearing during ordinary compaction. If pinned context plus the
 minimum request cannot fit, Euler fails before provider invocation with an
-honest context-budget error.
+honest context-budget error. The contract freezes the conservative byte-to-token
+proxy and output reserve used for this check; pinned content is never truncated
+or demoted to make a request fit.
 
 ### 6. Freeze one replayable snapshot per fresh session
 
@@ -236,31 +256,46 @@ The implementation will add a durable `project.context.snapshot` event. Its
 versioned canonical snapshot contains at least:
 
 - load policy and the reason it resolved enabled or disabled;
-- accepted `EULER.md` sources with relative paths, effective byte lengths,
-  SHA-256 digests, and effective content;
-- accepted skills with names, descriptions, relative `SKILL.md` paths, body
-  lengths, body digests, and frozen bodies;
-- deterministic ordering and schema version.
+- acknowledgment basis, portable candidate digest, local workspace identity,
+  deterministic ordering, diagnostic counts, and schema version;
+- when admitted, accepted `EULER.md` sources with relative paths, effective
+  byte lengths, domain-separated SHA-256 digests, and effective content;
+- when admitted, accepted skills with names, descriptions, relative
+  `SKILL.md` paths, body lengths, body digests, and frozen bodies.
 
-Large canonical snapshot content is stored through the session provenance blob
-store. Digests cover the effective redacted bytes that can reach a model, not a
-raw secret-bearing pre-image. Project context is external input, so it passes
+The admitted manifest is serialized once as canonical snapshot JSON. Large
+content is stored as one string through the session provenance blob store;
+resume verifies and uses those exact bytes rather than regenerating them.
+Disabled, declined, and unacknowledged sessions persist the candidate digest,
+bounded source identities, counts, and content-free reason codes, but no body,
+per-source content hash, exact content length, or parser excerpt.
+
+Digests cover the effective redacted bytes that can reach a model, not a raw
+secret-bearing pre-image. Project context is external input, so it passes
 through the same known-value and token-shape redaction boundary as tool results
 and context slots before persistence or provider exposure. Redaction is
 heuristic for unknown secret formats, as documented by the secrets contract.
+Candidate, per-source, rendered-context, and workspace-identity digests have
+separate versioned domains; the blob address covers the exact blob bytes.
 
 Typed `project.context.diagnostic` events record omissions without embedding
 unsafe content. `session.start` records a compact policy/count/digest summary,
 and every root-driver `model.call` records the digest of the exact rendered
 project context included in that request.
 
-A snapshot digest is based on canonical project-relative identities and
-effective contents, not absolute checkout paths. Two worktrees or two users can
-therefore obtain the same digest when their selected and redacted project
-content is identical.
+The durable startup order is `session.start`, one snapshot, then the declared
+diagnostic events. The entire bootstrap must persist before provider dispatch;
+partial or inconsistent bootstrap state fails closed on startup or resume.
+
+The portable candidate digest is based on canonical project-relative
+identities and effective contents, not absolute checkout paths. Two worktrees
+or two users can therefore obtain the same digest when their selected and
+redacted project content is identical.
 
 There is no implicit reload in the first release. A future explicit reload may
 append a new snapshot event; it must never rewrite the earlier snapshot.
+The latest snapshot event is authoritative: a disabled snapshot is a tombstone
+and cannot resurrect an older admitted snapshot after compaction or resume.
 
 ### 7. Resume from provenance, never from current project files
 
@@ -285,11 +320,17 @@ Moving or forking a historical session into another worktree requires a future
 explicit operation with new workspace and project-context events. Starting a
 new session is the first-release remediation.
 
+This comparison uses a versioned, platform-local digest of the exact
+canonicalized path representation, not a lossy display string. It deliberately
+rejects cross-platform relocation and detects location mismatch rather than
+authenticating filesystem contents. Legacy behavior applies only when both the
+project-context summary and snapshot are absent; mixed shapes fail closed.
+
 ### 8. Give independent sessions independent snapshots
 
 Two top-level Euler sessions may use the same checkout concurrently. Each has
 its own event stream, project-context snapshot, model canvas, permission state,
-and snapshot digest. There is no process-global or workspace-global mutable
+and candidate digest. There is no process-global or workspace-global mutable
 project-context cache.
 
 If sessions A and B start from identical context, their portable content
@@ -312,7 +353,7 @@ walks into a sibling worktree.
 
 Worktrees can intentionally have different project context on different
 branches. Their local canonical workspace paths remain distinct for permission
-consent and resume ownership even when their portable project-context digests
+consent and resume ownership even when their portable candidate digests
 match. Consent associated with one canonical worktree path does not become
 consent for another worktree merely because both share a Git object database.
 
@@ -406,9 +447,12 @@ project_context: none | inherit
 ```
 
 `inherit` gives the child the parent's exact frozen snapshot and digest. It
-does not produce a new snapshot, widen capabilities, or re-read files. The
-child receives the skill catalog and `skill_read` only when this policy is
-`inherit`.
+does not produce a new snapshot, widen declared capabilities, or re-read files.
+The child receives the skill catalog and becomes eligible for `skill_read` only
+when this policy is `inherit`; ordinary tool-call budgets still decide whether
+the definition is advertised. Inheritance supplies the project snapshot even
+when `include_parent_canvas` is false; that existing flag controls only
+non-project parent items.
 
 The default for existing and generic child tasks is `none`, avoiding an ambient
 behavior change. A coding-worker workflow may deliberately request `inherit`.
@@ -425,14 +469,18 @@ has. The poisoning risk runs through the same core framing (repository text is
 labeled and indented, and never occupies a core marker position), the
 guardian's empty capability envelope, and the deny-biased verdict thresholds:
 a misled guardian fails toward deny or human review, never toward silent
-allow.
+allow. Guardians retain their zero-tool budget, so they see any `skill_read`
+result already in the parent canvas but cannot invoke the tool themselves.
 
 This paragraph amends ADR 0011. Its statement that the guardian "sees the
 same assembled canvas the main model sees" now includes project-context items
 under their untrusted framing; no other part of ADR 0011 changes.
 
 Even when `include_parent_canvas` is true, project-context canvas items are
-filtered unless `project_context` is `inherit`. This makes agent isolation an
+filtered unless `project_context` is `inherit`. The classified set includes
+startup instruction items, catalog items, and every `skill_read` result, each
+carrying its source snapshot digest. A missing policy field from older events
+means `none`, while an unknown value is invalid. This makes agent isolation an
 enforced data-flow property rather than a prompt convention.
 
 Parallel children that inherit receive one shared immutable parent snapshot,
@@ -451,14 +499,14 @@ Under `auto`, admission requires a recorded **project acknowledgment**: a
 one-time, user-owned record that this user chose to admit this project's
 guidance on this machine. The first interactive session in a workspace with
 discoverable project context presents an acknowledgment card before the first
-model request: the source list, skill count, diagnostic count, and snapshot
+model request: the source list, skill count, diagnostic count, and candidate
 digest. Accepting records the acknowledgment; declining starts the session
 with project context disabled and records that decision too. There is no
 admission by disclosure alone: a cloned repository's prose reaches a model
 only after its user has seen what was discovered and said yes once.
 
 The acknowledgment is keyed to the canonical workspace root and the portable
-snapshot digest, and stored under the user-owned Euler home, outside
+candidate digest, and stored under the user-owned Euler home, outside
 repository control, in the same two-party shape as project permission grants:
 the repository supplies content, the user-side record supplies the decision,
 and neither alone admits anything. A changed digest (changed guidance
@@ -466,6 +514,14 @@ content) requires a fresh acknowledgment at the next fresh session; unchanged
 content never re-prompts. Acknowledgment admits guidance into model context
 and nothing else: it grants no capability, installs no permission, and must
 never be conflated with capability approval.
+
+Only affirmative acceptance through the interactive acknowledgment surface is
+durable. Decline is recorded for the current session and prompts again on a
+later fresh interactive session; explicit `on` is also session-only. The
+private acknowledgment record contains only its format version, workspace
+identity, candidate digest, and minimal acceptance metadata, and is written
+with no-follow, ownership/mode validation, and atomic replacement. It never
+contains source bodies, diagnostics, per-source hashes, or permission state.
 
 Resolution under `auto`:
 
@@ -476,10 +532,15 @@ Resolution under `auto`:
   startup summary says so (headless runs never prompt);
 - `exec --auto-approve trusted-local`: disabled regardless of acknowledgment.
 
-Explicit `on` is a per-session override recorded in provenance; combined with
-trusted-local auto-approval, Euler must disclose that repository-authored
-instructions are being paired with pre-approved write and shell capabilities.
-Explicit `off` disables admission without touching stored acknowledgments.
+This last rule governs automatic resolution. Explicit `on` supplied by the
+current invocation is a separate per-session dual opt-in recorded in
+provenance; it never writes durable acknowledgment and cannot come from
+repository configuration or resumed state. Combined with trusted-local
+auto-approval, Euler must disclose before the first provider request that
+repository-authored instructions are being paired with pre-approved write and
+shell capabilities. Explicit `off` disables admission without touching stored
+acknowledgments.
+
 The policy, resolution reason, acknowledgment basis, loaded source list,
 skill count, diagnostic count, and digest are visible at startup and recorded
 in provenance. Resume uses the frozen original decision; project-context
@@ -522,22 +583,30 @@ Implementation proceeds in independently reviewable vertical slices.
    - update the events, canvas, capabilities, secrets, tools, multi-agent,
      boundaries, extension-SDK, and ui contracts with the implementation that
      makes each statement true.
-2. **`EULER.md` vertical slice**
+2. **Dormant project-context substrate**
    - secure Git/worktree discovery and stable reads;
    - typed snapshot and diagnostic events;
-   - core-framed pinned model input and context accounting;
-   - fresh-session policy/disclosure;
-   - provenance-only resume and same-workspace enforcement.
-3. **`.agents/skills/` vertical slice**
+   - core-framed pinned model input, provider adaptation, and context
+     accounting while effective exposure remains forced off;
+   - provenance-only resume and same-workspace enforcement;
+   - explicit child policy with fail-closed `none` default and provider-boundary
+     filtering for every project-context-classified item.
+3. **`EULER.md` exposure**
+   - user-owned acknowledgment store and pre-session interaction;
+   - fresh-session policy, CLI controls, and disclosure;
+   - enable the already-filtered root-driver model input across launch,
+     headless, resume, and `/new` composition paths.
+4. **`.agents/skills/` vertical slice**
    - bounded deterministic discovery and validation;
    - frozen bodies and compact catalog;
-   - duplicate exclusion;
-   - core `skill_read` tool and provenance.
-4. **Multi-agent inheritance**
-   - explicit `none | inherit` task field;
-   - child canvas filtering and inherited skill-tool wiring;
-   - guardian, observer, and reviewer isolation tests.
-5. **Documentation and dogfooding**
+   - duplicate exclusion and project-context classification of catalog/body
+     evidence;
+   - core `skill_read` tool and root-driver provenance.
+5. **Multi-agent opt-in**
+   - guardian `inherit` and selected coding-worker opt-in;
+   - inherited skill-tool wiring under ordinary tool budgets;
+   - observer and reviewer `none` enforcement tests.
+6. **Documentation and dogfooding**
    - user guide and security guidance;
    - tracked Euler-repository `EULER.md`;
    - one or more useful shared development skills where they provide real
@@ -598,7 +667,7 @@ The implementation is not complete without tests covering:
 - Project context consumes measurable model context and may prevent a request
   when it cannot fit; it is never hidden outside budget accounting.
 - Worktrees isolate both source edits and checked-out project guidance, while
-  portable snapshot digests still permit comparison.
+  portable candidate digests still permit comparison.
 - Same-checkout agents remain capable of filesystem races. This ADR documents
   worktrees as the recommendation rather than pretending project context is a
   workspace transaction system.

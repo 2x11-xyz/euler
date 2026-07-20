@@ -60,25 +60,70 @@ normalized relative paths, no dependence on filesystem iteration order,
 duplicate detection before catalog admission, and more-specific sources win
 admission priority when the aggregate instruction budget forces a choice.
 
+## Preflight and redaction
+
+Project-context preflight is local and occurs before acknowledgment because
+Euler must compute the digest the acknowledgment names. That preflight is not
+general filesystem authority: it uses only the discovery paths and bounds
+above, reads each attempt from one verified handle, retries an unstable source
+at most once as specified above, and freezes only the stable bytes so
+acknowledgment, persistence, and prompt assembly cannot observe different
+versions of a file.
+
+The host constructs one startup redactor before preflight, seeds it with the
+environment, the selected auth store, and every other credential value known
+at startup, and gives that same redactor to the session. Values that do not
+exist until request time remain subject to the secrets contract's token-shape
+and request-time tainting rules; this contract does not claim to detect an
+unknown value retroactively. Raw candidate bytes and pre-redaction digests
+never enter events, logs, diagnostics, the acknowledgment store, or provider
+requests.
+
+The **candidate manifest** is the complete bounded preflight result: accepted
+normalized relative source identities and their frozen post-redaction bytes,
+plus ordered content-free diagnostic records and per-reason total counts. The
+portable candidate digest commits to a versioned, domain-separated,
+length-prefixed encoding of that manifest. Files and directory entries that
+the frozen scan limits prevent Euler from examining cannot reach a model and
+are outside the manifest; a limit diagnostic and its observed count are
+inside it. Any change to content that could be admitted, or to deterministic
+selection among examined candidates, changes the digest.
+
 ## Acknowledgment record
 
 Admission under `--project-context auto` requires a recorded project
 acknowledgment: user-owned, stored under the user Euler home outside
 repository control, keyed to the canonical workspace root and the portable
-snapshot digest. Two-party rule, exactly as project grants: the repository
+candidate digest. Two-party rule, exactly as project grants: the repository
 supplies content, the user-side record supplies the decision, and neither
 alone admits anything. A changed digest requires a fresh acknowledgment at
 the next fresh session; unchanged content never re-prompts. Declining is
-recorded and disables admission for that session. Headless runs never
+recorded in that session and disables admission for that session; it does not
+write a durable refusal. Only affirmative acceptance through the interactive
+acknowledgment surface writes durable acknowledgment. Explicit `on` is
+session-only and never writes one. Headless runs never
 prompt: without a matching acknowledgment they run with project context
-disabled and say so in the startup summary. `exec --auto-approve
-trusted-local` disables admission regardless. Explicit `--project-context on`
-is a per-session override recorded in provenance; explicit `off` disables
-without touching stored acknowledgments. Acknowledgment admits guidance into
-model context and nothing else; it is never capability approval. Any future
-general project-trust surface must unify this store with the extension
-project tier's install consent (extension SDK contract) rather than adding a
-third per-project trust store.
+disabled and say so in the startup summary. Under `auto`, `exec --auto-approve
+trusted-local` disables admission regardless of acknowledgment. Explicit
+`--project-context on` supplied by the current invocation is a separate,
+session-only dual opt-in and may override that automatic resolution; the
+combination is disclosed before the first provider request and recorded in
+provenance. It cannot come from repository configuration, stored
+acknowledgment, or resumed state. Explicit `off` disables without touching
+stored acknowledgments.
+
+The acknowledgment store contains only a format version, canonical workspace
+identity, portable candidate digest, and minimal acceptance metadata. It
+contains no source bodies, diagnostics, per-source hashes, or permission
+state. The host accesses it through user-owned private directories, rejects
+symlinks and non-regular files, validates ownership and non-public
+writability where the platform exposes them, and replaces records atomically.
+Failure to verify or write durable acceptance fails closed; it never enables
+an unrecorded `auto` admission. Acknowledgment admits guidance into model
+context and nothing else; it is never capability approval. Any future general
+project-trust surface must unify this store with the extension project tier's
+install consent (extension SDK contract) rather than adding a third
+per-project trust store.
 
 ## Snapshot, events, and replay
 
@@ -87,27 +132,72 @@ third per-project trust store.
   reload. A future explicit reload appends a new snapshot event and never
   rewrites the old one.
 - `project.context.snapshot` (durable, versioned) carries at least: load
-  policy and resolution reason, acknowledgment basis, accepted `EULER.md`
-  sources (relative path, effective byte length, SHA-256 digest, effective
-  content), accepted skills (name, description, relative path, body length,
-  body digest, frozen body), deterministic ordering, and schema version.
-  Large content goes through the provenance blob store. Digests cover
-  effective redacted bytes (the same known-value and token-shape redaction
-  boundary as tool results), never a raw pre-image.
+  policy and resolution reason, acknowledgment basis, portable candidate
+  digest, local workspace identity, deterministic ordering, diagnostic counts,
+  and schema version. An admitted snapshot additionally carries accepted
+  `EULER.md` sources (relative path, effective byte length, domain-separated
+  SHA-256 digest, effective content) and accepted skills (name, description,
+  relative path, body length, body digest, frozen body). A disabled, declined,
+  or unacknowledged snapshot persists no candidate body, per-source content
+  hash, exact content length, parser excerpt, or other reversible content;
+  only the portable candidate digest, bounded normalized identities, counts,
+  and content-free reason codes remain.
+- The admitted manifest is serialized once as versioned UTF-8 snapshot JSON in
+  one top-level payload string. When it exceeds the provenance threshold that
+  complete string is one content-addressed blob; individual bodies are not
+  externalized independently. The persisted bytes are authoritative and are
+  not regenerated during resume. Rehydration verifies the blob address and
+  length, rejects invalid UTF-8, duplicate keys, trailing data, unsupported
+  versions, limit violations, and internal digest mismatches, and never falls
+  back to current project files.
 - `project.context.diagnostic` events record omissions without embedding
-  unsafe content. `session.start` records a compact policy/count/digest
-  summary. Every root-driver `model.call` records the digest of the exact
-  rendered project context in that request (no TOCTOU between snapshot and
-  prompt assembly).
-- Snapshot digests are portable: canonical project-relative identities and
-  effective contents, not absolute paths.
+  unsafe content. Their payload is limited to a stable reason code, bounded
+  normalized relative identity when one exists, and non-content numeric
+  metadata such as an offset or observed count. It contains no excerpts, raw
+  parser errors, outside-workspace paths, or exception strings derived from a
+  candidate.
+- The durable bootstrap order is exactly `session.start`, one
+  `project.context.snapshot`, then the snapshot's declared number of
+  `project.context.diagnostic` events. `session.start` records that a snapshot
+  is expected and a compact policy/count/digest summary; each diagnostic cites
+  the snapshot event. The complete sequence must persist before any provider
+  dispatch. Append or blob failure is session-fatal and cannot fall through to
+  a provider call. Resume rejects a missing, partial, duplicated, or
+  inconsistent bootstrap rather than silently disabling context.
+- Every root-driver `model.call` records the rendered-context digest only when
+  those exact bytes occur in the provider-neutral request (no TOCTOU between
+  snapshot and prompt assembly). Candidate, source-content,
+  rendered-context, and workspace-identity digests use distinct versioned
+  domain tags and length-prefixed fields; the provenance blob address remains
+  SHA-256 over the exact blob bytes.
+- Candidate digests are portable: canonical project-relative identities and
+  effective contents, not absolute paths. The local workspace identity is
+  deliberately not portable.
 - Resume folds the snapshot from the accepted event prefix and performs no
   filesystem discovery; legacy sessions resume with project context disabled;
   resume verifies the canonical live workspace root against the recorded one
   and fails mismatches with remediation. Older Euler versions fail safe on
   the unknown event kind and cannot resume such sessions.
+- The latest snapshot event in durable sequence is authoritative. An admitted
+  latest snapshot yields exactly one pinned item; a later disabled or declined
+  snapshot is a tombstone and yields none. A malformed latest snapshot rejects
+  resume or request assembly and never resurrects an older admitted snapshot.
 - Independent sessions get independent snapshots; there is no process-global
   or workspace-global mutable project-context cache.
+
+The workspace identity payload carries an algorithm and platform version. It
+hashes a domain tag plus the length-prefixed exact platform representation
+returned by canonicalizing `SessionConfig.root`. The first implementation
+targets Euler's supported Unix hosts and hashes raw `OsStr` bytes with no lossy
+display conversion or Unicode normalization. A future host requires a distinct
+algorithm version and test vectors before it can resume project-context
+sessions. Canonicalization failure and unknown algorithms reject.
+Cross-platform resume, path relocation, and a different worktree therefore
+reject; false rejection is preferred to merging distinct roots. This identity
+detects location mismatch, not replacement of content at the same path, and is
+not workspace authentication. Legacy fallback applies only when both the
+project-context summary and snapshot are absent; a mixed shape with context
+events but no identity is invalid.
 
 ## Framing and canvas admission
 
@@ -126,10 +216,27 @@ three admission paths, and the rules are identical for each:
    `tool.call`/`tool.result` events with the same core-framed header (skill
    name, source identity) and indentation rules as startup sources.
 
-Pinned project context counts against the context budget and does not
-silently vanish under compaction; if the pinned context plus a minimum
-request cannot fit, the session fails before provider invocation with an
-honest budget error.
+The provider-neutral order is fixed Euler instructions, at most one
+`ProjectContext` item, then every existing input item in its original relative
+order. Adapters may wrap the item in provider-specific role or envelope data
+but must not trim, normalize, combine, silently omit, or reorder its content.
+An adapter unable to represent the item fails before dispatch. Core framing is
+versioned and performed once before the rendered-context digest is computed.
+
+Pinned project context counts against both the canvas byte budget and a known
+model context limit and does not silently vanish under compaction. The
+deterministic context-limit proxy is four rendered UTF-8 bytes per token. At
+snapshot admission, required tokens are
+`ceil((fixed_instruction_bytes + framed_project_context_bytes) / 4) + 1024 +
+output_reserve`, where `output_reserve` is configured `max_output_tokens` or,
+when absent, `compaction_reserve_tokens`. At request time the same checked
+proxy includes fixed instructions, every provider-neutral input item, and
+serialized tool definitions, plus `output_reserve`. Equality with the known
+limit fits; one token over does not. Unknown context limits still enforce the
+canvas byte budget. Arithmetic overflow, an unrepresentable configured value,
+or a project-context item larger than the byte budget fails before provider
+invocation with an honest context-budget event. Pinned context is never
+truncated or demoted to make either equation pass.
 
 ## Skills
 
@@ -152,13 +259,26 @@ honest budget error.
 `project_context: none | inherit` is recorded on `agent.spawn`, distinct from
 `include_parent_canvas`; the default is `none`. `inherit` shares the parent's
 exact frozen snapshot and digest (no new snapshot, no file reads, no widened
-capabilities) and is the only path to the child receiving the catalog and
-`skill_read`. Even with `include_parent_canvas: true`, project-context canvas
-items are filtered unless `project_context` is `inherit`. Parallel inheriting
-children share one immutable pre-fan-out snapshot.
+declared capabilities) and is the only path to the child receiving the catalog
+or being eligible for `skill_read`. `project_context: inherit` supplies that
+snapshot even when `include_parent_canvas` is false; the latter controls only
+non-project parent items. Tool advertisement remains subject to the child's
+ordinary tool-call budget: `skill_read` is advertised only to the root driver
+or an inheriting child with a nonzero tool budget, while a zero-tool child
+receives the inherited framed evidence but no definition.
+
+Every startup instruction item, catalog item, and `skill_read` result carries
+a project-context classification and snapshot digest through its event and
+canvas projection. Child request assembly filters that complete class unless
+`project_context` is `inherit`, even when `include_parent_canvas` is true. A
+missing policy field in an event written before this field existed decodes as
+`none`; an unknown value is invalid and never falls through to inheritance.
+Parallel inheriting children share one immutable pre-fan-out snapshot.
 
 Guardian tasks use `inherit`, preserving ADR 0011's same-canvas guarantee so
 the reviewer can attribute permission asks to repository-authored text; the
 framing rules above, the guardian's empty capability envelope, and its
-deny-biased thresholds bound the poisoning risk (ADR 0017 amends ADR 0011
+deny-biased thresholds bound the poisoning risk. Guardians retain their
+zero-tool budget, so they see any `skill_read` result already present in the
+parent canvas but cannot invoke the tool themselves (ADR 0017 amends ADR 0011
 accordingly). CodeSwarm reviewers and observers use `none`.
