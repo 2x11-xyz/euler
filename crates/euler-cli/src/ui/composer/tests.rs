@@ -89,6 +89,142 @@ mod composer_tests {
         ));
     }
 
+    #[test]
+    fn queued_input_preview_is_one_line_and_word_bounded() {
+        let full = "Right but don't mention anywhere in any doc that we're not mentioning other services or other products.";
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: full.to_owned(),
+            selected: true,
+        }]);
+
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 120, 2);
+
+        assert!(matches!(
+            lines.first(),
+            Some(ComposerLine::Queued(line))
+                if line.text
+                    == "Right but don't mention anywhere in any doc that we're not ..."
+        ));
+        assert_eq!(snapshot.queued[0].text, full);
+    }
+
+    #[test]
+    fn queued_input_preview_preserves_short_text_and_marks_newlines() {
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: "keep this\non one row".to_owned(),
+            selected: false,
+        }]);
+
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 120, 2);
+
+        assert!(matches!(
+            lines.first(),
+            Some(ComposerLine::Queued(line)) if line.text == "keep this ↵ on one row"
+        ));
+    }
+
+    #[test]
+    fn queued_input_preview_respects_terminal_and_unicode_display_widths() {
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 12,
+            total: 12,
+            text: "界".repeat(80),
+            selected: true,
+        }]);
+
+        for width in [12, 40, 120] {
+            let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), width, 2);
+            let Some(ComposerLine::Queued(line)) = lines.first() else {
+                panic!("missing queued preview at width {width}");
+            };
+            let prefix = queued_line_prefix(line.position, line.total);
+            assert!(
+                display_width(&prefix) + display_width(&line.text) <= usize::from(width),
+                "width {width} rendered {prefix:?} + {:?}",
+                line.text
+            );
+            assert!(display_width(&line.text) <= 64);
+        }
+    }
+
+    #[test]
+    fn queued_preview_hard_cuts_a_first_word_wider_than_the_budget() {
+        let draft = ComposerDraft::new();
+        // One unbroken word wider than the preview budget: there is no
+        // whitespace to back off to, so the fallback hard-cuts mid-word and
+        // still appends the ` ...` suffix.
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: "supercalifragilisticexpialidocious".to_owned(),
+            selected: false,
+        }]);
+
+        // width 16 → prefix `▌ 1/1 ` (6 cells) leaves a 10-cell budget.
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 16, 2);
+        let Some(ComposerLine::Queued(line)) = lines.first() else {
+            panic!("missing queued preview");
+        };
+        assert_eq!(line.text, "superc ...");
+        assert!(display_width(&line.text) <= 10);
+    }
+
+    #[test]
+    fn queued_preview_drops_the_suffix_when_the_budget_is_four_or_fewer_cells() {
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: "hello world".to_owned(),
+            selected: false,
+        }]);
+
+        // width 10 → prefix 6 leaves a 4-cell budget, at the ` ...` suffix
+        // width, so the preview is a bare hard cut with no ellipsis.
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 10, 2);
+        let Some(ComposerLine::Queued(line)) = lines.first() else {
+            panic!("missing queued preview");
+        };
+        assert_eq!(line.text, "hell");
+        assert!(!line.text.contains("..."));
+    }
+
+    #[test]
+    fn queued_preview_never_splits_a_multibyte_grapheme_mid_byte() {
+        let draft = ComposerDraft::new();
+        // A ZWJ family emoji repeated well past the budget.
+        let family = "👨‍👩‍👧‍👦";
+        let text = family.repeat(6);
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: text.clone(),
+            selected: false,
+        }]);
+
+        // Reaching here at all proves the truncation did not panic on a
+        // multibyte boundary. The preview's non-suffix core must be a
+        // char-boundary prefix of the input, never a mid-byte cut. The exact
+        // cell count follows `truncate_display` (grapheme clusters may split).
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 20, 2);
+        let Some(ComposerLine::Queued(line)) = lines.first() else {
+            panic!("missing queued preview");
+        };
+        let core = line.text.strip_suffix(" ...").unwrap_or(&line.text);
+        assert!(
+            text.starts_with(core),
+            "core {core:?} is not a char-boundary prefix of the input"
+        );
+        assert!(display_width(&line.text) <= 64);
+    }
+
     /// Spec v2.1 §13.4/§13.8: the composer's default scroll cap is 12 lines
     /// (raised from a prior 6) so the 8-row slash palette, which shares the
     /// composer's rail-bounded container, never clips against the footer.

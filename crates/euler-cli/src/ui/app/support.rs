@@ -51,25 +51,13 @@ pub(super) fn update_token_usage(
         tokens.output_tokens = 0;
         tokens.reasoning_tokens = None;
         tokens.context_window_tokens = context_window_tokens;
-        tokens.demoted_items = 0;
         tokens.canvas_retained_bytes = None;
         tokens.canvas_budget_bytes = None;
-        tokens.compaction_tier = None;
         return;
     }
     if event.kind.as_str() == EventKind::CANVAS_SNAPSHOT && is_primary {
-        tokens.demoted_items = event
-            .payload
-            .get("demoted_items")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
         tokens.canvas_retained_bytes = event.payload.get("retained_bytes").and_then(Value::as_u64);
         tokens.canvas_budget_bytes = event.payload.get("budget_bytes").and_then(Value::as_u64);
-        tokens.compaction_tier = event
-            .payload
-            .get("tier")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         return;
     }
     if event.kind.as_str() != EventKind::MODEL_RESULT {

@@ -427,6 +427,33 @@ fn submit_starts_in_flight_and_second_submit_queues() {
 }
 
 #[test]
+fn queued_steer_preview_is_visual_only() {
+    let full = "Right but don't mention anywhere in any doc that we're not mentioning other services or other products.";
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.queued_inputs.push_back(full.to_owned());
+
+    let queued_line = core
+        .visual_canvas_frame(120)
+        .active_frame_lines
+        .iter()
+        .map(crate::ui::visual_canvas::CanvasLine::plain_text)
+        .find(|line| line.starts_with("▌ 1/1 "))
+        .expect("queued steer row");
+
+    assert_eq!(
+        queued_line,
+        "▌ 1/1 Right but don't mention anywhere in any doc that we're not ..."
+    );
+    assert_eq!(core.queued_inputs.snapshot(), [full]);
+}
+
+#[test]
 fn queued_inputs_auto_flush_fifo_after_normal_completion() {
     let mut core = core_with_provider(SlowEchoProvider);
     submit_without_wait(&mut core, "first");
@@ -4035,8 +4062,8 @@ fn scripted_model_result_usage_updates_footer_context_percent() {
     assert_eq!(
         rendered,
         format!(
-            "  / commands · /tmp/euler{}echo(medium) · ctx 12% · $?",
-            " ".repeat(67)
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
+            " ".repeat(72)
         )
     );
     assert_eq!(core.token_usage.input_tokens, 123);
@@ -4078,7 +4105,7 @@ fn persisted_model_results_rebuild_footer_cost_on_resume() {
 }
 
 #[test]
-fn persisted_cost_rebuild_marks_mixed_vintage_history_as_partial() {
+fn persisted_cost_rebuild_keeps_footer_subtotal_numeric_for_mixed_history() {
     let catalog = fixture_catalog_with_windows(&[("echo", 1_000)]);
     let mut core = core_with_fixture_catalog(EchoProvider, "echo", catalog);
     let events = vec![
@@ -4098,7 +4125,20 @@ fn persisted_cost_rebuild_marks_mixed_vintage_history_as_partial() {
         .canvas_status_snapshot(120)
         .line
         .plain_text()
-        .ends_with("echo(medium) · ctx 20% · $0.006+"));
+        .ends_with("echo(medium) · ctx 20% · $0.006"));
+    assert!(
+        format_session_usage(&events, &core.status, &core.token_usage)
+            .starts_with("usage · session totals · $0.006200+ (1 unpriced call(s))")
+    );
+}
+
+#[test]
+fn detailed_usage_distinguishes_unpriced_history_from_zero_cost() {
+    assert_eq!(usage_cost_text(0, 0, 1), "$? (1 unpriced call(s))");
+    assert_eq!(
+        usage_cost_text(6_200_000_000, 1, 2),
+        "$0.006200+ (2 unpriced call(s))"
+    );
 }
 
 #[test]
@@ -4117,8 +4157,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}echo(medium) · ctx 12% · $?",
-            " ".repeat(67)
+            "  / commands · /tmp/euler{}echo(medium) · ctx 12%",
+            " ".repeat(72)
         )
     );
 
@@ -4127,8 +4167,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}other(medium) · ctx 0% · $?",
-            " ".repeat(67)
+            "  / commands · /tmp/euler{}other(medium) · ctx 0%",
+            " ".repeat(72)
         )
     );
 
@@ -4139,8 +4179,8 @@ fn model_switch_resets_footer_context_until_next_result() {
     assert_eq!(
         core.canvas_status_snapshot(120).line.plain_text(),
         format!(
-            "  / commands · /tmp/euler{}other(medium) · ctx 13% · $?",
-            " ".repeat(66)
+            "  / commands · /tmp/euler{}other(medium) · ctx 13%",
+            " ".repeat(71)
         )
     );
 }
