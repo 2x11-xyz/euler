@@ -83,8 +83,10 @@ pub use permissions::{
     ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,
 };
 pub use project_context::{
-    ProjectContextBootstrap, ProjectContextError, ProjectContextStatus,
-    MAX_COMBINED_EULER_MD_BYTES, MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES,
+    AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError, AdmissionBudget,
+    PendingAcknowledgment, ProjectContextBootstrap, ProjectContextBudgetError, ProjectContextError,
+    ProjectContextPolicy, ProjectContextResolution, ProjectContextResolveOptions,
+    ProjectContextStatus, MAX_COMBINED_EULER_MD_BYTES, MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES,
     SNAPSHOT_SCHEMA_VERSION as PROJECT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use provenance::{

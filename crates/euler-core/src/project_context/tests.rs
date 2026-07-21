@@ -1401,9 +1401,388 @@ fn contradictory_policy_tuple_rejects() {
     assert_fold_rejects(disabled_snapshot_event(|payload| {
         payload.insert("resolution_reason".to_owned(), "test_hook".into());
     }));
-    // Phase-3 statuses have no permitted tuple yet and fail closed until
-    // their slice defines them.
+    // A phase-3 status carried on a phase-2 tombstone tuple is still forged:
+    // `declined` is only permitted with `(auto, declined_this_session, none)`,
+    // never with the dormant `(off, exposure_forced_off, none)` fields here.
     assert_fold_rejects(disabled_snapshot_event(|payload| {
         payload.insert("status".to_owned(), "declined".into());
     }));
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("status".to_owned(), "unacknowledged".into());
+    }));
+}
+
+// --- Phase-3 policy resolution ---
+
+use crate::session_kind::SessionKind;
+
+fn generous_budget() -> AdmissionBudget {
+    AdmissionBudget {
+        fixed_instruction_bytes: 100,
+        context_limit_tokens: Some(1_000_000),
+        output_reserve_tokens: 1024,
+        canvas_budget_bytes: 1_000_000,
+    }
+}
+
+/// A workspace with a Git marker and a root EULER.md, plus an isolated consent
+/// directory. Returns (temp, canonical workspace root, consent dir).
+fn resolve_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("workspace");
+    git_dir(&root);
+    write(&root.join("EULER.md"), "project rules");
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let consent = temp.path().join("home");
+    (temp, canonical, consent)
+}
+
+fn resolve(
+    root: &Path,
+    policy: ProjectContextPolicy,
+    kind: SessionKind,
+    trusted_local: bool,
+    consent: Option<&Path>,
+) -> ProjectContextResolution {
+    ProjectContextBootstrap::resolve(
+        root,
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy,
+            session_kind: kind,
+            trusted_local,
+        },
+        consent,
+        generous_budget(),
+    )
+    .expect("resolve")
+}
+
+fn expect_resolved(resolution: ProjectContextResolution) -> ProjectContextBootstrap {
+    match resolution {
+        ProjectContextResolution::Resolved(bootstrap) => *bootstrap,
+        ProjectContextResolution::NeedsAcknowledgment(_) => panic!("unexpected pending card"),
+        ProjectContextResolution::Budget(error) => panic!("unexpected budget failure: {error}"),
+    }
+}
+
+fn tuple_of(bootstrap: &ProjectContextBootstrap) -> (String, String, String, String) {
+    let payload = bootstrap.snapshot_payload();
+    (
+        payload["status"].as_str().unwrap().to_owned(),
+        payload["policy"].as_str().unwrap().to_owned(),
+        payload["resolution_reason"].as_str().unwrap().to_owned(),
+        payload["acknowledgment_basis"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[test]
+fn auto_interactive_without_acknowledgment_needs_the_card() {
+    let (_temp, root, consent) = resolve_workspace();
+    match resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::Interactive,
+        false,
+        Some(&consent),
+    ) {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => {
+            assert_eq!(pending.source_identities(), ["EULER.md"]);
+            assert_eq!(pending.skill_count(), 0);
+            assert!(!pending.content_changed(), "first contact is not a change");
+        }
+        other => panic!(
+            "expected a card, got a resolved/budget outcome: {}",
+            matches!(other, ProjectContextResolution::Resolved(_))
+        ),
+    }
+}
+
+#[test]
+fn auto_headless_without_acknowledgment_runs_unacknowledged() {
+    let (_temp, root, consent) = resolve_workspace();
+    let bootstrap = expect_resolved(resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::NonInteractive,
+        false,
+        Some(&consent),
+    ));
+    assert_eq!(bootstrap.status(), ProjectContextStatus::Unacknowledged);
+    assert_eq!(
+        tuple_of(&bootstrap),
+        (
+            "unacknowledged".to_owned(),
+            "auto".to_owned(),
+            "no_acknowledgment".to_owned(),
+            "none".to_owned()
+        )
+    );
+    // A tombstone never carries a body.
+    assert!(bootstrap.manifest.is_none());
+}
+
+#[test]
+fn accept_records_acknowledgment_and_next_auto_admits() {
+    let (_temp, root, consent) = resolve_workspace();
+    let pending = match resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::Interactive,
+        false,
+        Some(&consent),
+    ) {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => pending,
+        _ => panic!("expected a card"),
+    };
+    let admitted = pending.accept().expect("write acknowledgment");
+    assert_eq!(admitted.status(), ProjectContextStatus::Admitted);
+    assert_eq!(
+        tuple_of(&admitted),
+        (
+            "admitted".to_owned(),
+            "auto".to_owned(),
+            "acknowledged".to_owned(),
+            "acknowledged".to_owned()
+        )
+    );
+    // A fresh auto resolution now admits without a card (interactive) and
+    // headless too.
+    let again = expect_resolved(resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::Interactive,
+        false,
+        Some(&consent),
+    ));
+    assert_eq!(again.status(), ProjectContextStatus::Admitted);
+    let headless = expect_resolved(resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::NonInteractive,
+        false,
+        Some(&consent),
+    ));
+    assert_eq!(headless.status(), ProjectContextStatus::Admitted);
+}
+
+#[test]
+fn decline_is_session_only_and_writes_no_durable_record() {
+    let (_temp, root, consent) = resolve_workspace();
+    let pending = match resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::Interactive,
+        false,
+        Some(&consent),
+    ) {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => pending,
+        _ => panic!("expected a card"),
+    };
+    let declined = pending.decline();
+    assert_eq!(declined.status(), ProjectContextStatus::Declined);
+    assert_eq!(
+        tuple_of(&declined),
+        (
+            "declined".to_owned(),
+            "auto".to_owned(),
+            "declined_this_session".to_owned(),
+            "none".to_owned()
+        )
+    );
+    // The next interactive session prompts again: decline wrote nothing.
+    assert!(matches!(
+        resolve(
+            &root,
+            ProjectContextPolicy::Auto,
+            SessionKind::Interactive,
+            false,
+            Some(&consent),
+        ),
+        ProjectContextResolution::NeedsAcknowledgment(_)
+    ));
+}
+
+#[test]
+fn changed_guidance_reasks_after_a_prior_acceptance() {
+    let (_temp, root, consent) = resolve_workspace();
+    // Accept the current guidance.
+    let pending = match resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::Interactive,
+        false,
+        Some(&consent),
+    ) {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => pending,
+        _ => panic!("expected a card"),
+    };
+    pending.accept().expect("record");
+    // Change the guidance content: the digest changes, so auto re-asks.
+    write(&root.join("EULER.md"), "project rules, revised");
+    match resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::Interactive,
+        false,
+        Some(&consent),
+    ) {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => {
+            assert!(
+                pending.content_changed(),
+                "a changed digest re-asks with the changed headline"
+            );
+        }
+        _ => panic!("expected a re-ask card"),
+    }
+}
+
+#[test]
+fn explicit_on_admits_without_writing_acknowledgment() {
+    let (_temp, root, consent) = resolve_workspace();
+    let bootstrap = expect_resolved(resolve(
+        &root,
+        ProjectContextPolicy::On,
+        SessionKind::NonInteractive,
+        false,
+        Some(&consent),
+    ));
+    assert_eq!(bootstrap.status(), ProjectContextStatus::Admitted);
+    assert_eq!(
+        tuple_of(&bootstrap),
+        (
+            "admitted".to_owned(),
+            "on".to_owned(),
+            "explicit_opt_in".to_owned(),
+            "explicit_on".to_owned()
+        )
+    );
+    // `on` never writes a durable acknowledgment: a later auto still re-asks.
+    let store = AcknowledgmentStore::new(&consent);
+    assert!(matches!(
+        store.lookup(
+            &root,
+            &bootstrap.workspace_identity_digest,
+            bootstrap.candidate_digest()
+        ),
+        AcknowledgmentLookup::None {
+            previously_acknowledged: false
+        }
+    ));
+}
+
+#[test]
+fn trusted_local_auto_stays_off_even_with_acknowledgment() {
+    let (_temp, root, consent) = resolve_workspace();
+    // Record an acknowledgment first.
+    AcknowledgmentStore::new(&consent)
+        .record(
+            &root,
+            &dormant(&root).workspace_identity_digest,
+            dormant(&root).candidate_digest(),
+        )
+        .expect("record");
+    let bootstrap = expect_resolved(resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::NonInteractive,
+        true, // trusted-local
+        Some(&consent),
+    ));
+    assert_eq!(bootstrap.status(), ProjectContextStatus::Disabled);
+    assert_eq!(tuple_of(&bootstrap).2, "trusted_local_auto_off".to_owned());
+}
+
+#[test]
+fn explicit_off_disables_without_touching_stored_acknowledgment() {
+    let (_temp, root, consent) = resolve_workspace();
+    let store = AcknowledgmentStore::new(&consent);
+    store
+        .record(
+            &root,
+            &dormant(&root).workspace_identity_digest,
+            dormant(&root).candidate_digest(),
+        )
+        .expect("record");
+    let bootstrap = expect_resolved(resolve(
+        &root,
+        ProjectContextPolicy::Off,
+        SessionKind::Interactive,
+        false,
+        Some(&consent),
+    ));
+    assert_eq!(tuple_of(&bootstrap).2, "disabled_by_flag".to_owned());
+    // The stored acknowledgment is untouched.
+    assert!(matches!(
+        store.lookup(
+            &root,
+            &bootstrap.workspace_identity_digest,
+            bootstrap.candidate_digest()
+        ),
+        AcknowledgmentLookup::Match
+    ));
+}
+
+#[test]
+fn auto_without_consent_directory_fails_closed_to_unacknowledged() {
+    let (_temp, root, _consent) = resolve_workspace();
+    let bootstrap = expect_resolved(resolve(
+        &root,
+        ProjectContextPolicy::Auto,
+        SessionKind::Interactive,
+        false,
+        None, // no resolvable home
+    ));
+    assert_eq!(bootstrap.status(), ProjectContextStatus::Unacknowledged);
+}
+
+#[test]
+fn no_discoverable_context_disables_without_a_card() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("empty");
+    git_dir(&root); // marker, but no EULER.md
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let consent = temp.path().join("home");
+    let bootstrap = expect_resolved(resolve(
+        &canonical,
+        ProjectContextPolicy::Auto,
+        SessionKind::Interactive,
+        false,
+        Some(&consent),
+    ));
+    assert_eq!(tuple_of(&bootstrap).2, "no_project_context".to_owned());
+}
+
+#[test]
+fn oversized_guidance_fails_the_admission_budget_before_any_card() {
+    let (_temp, root, consent) = resolve_workspace();
+    // A tiny context window the framed guidance cannot fit under.
+    let budget = AdmissionBudget {
+        fixed_instruction_bytes: 100,
+        context_limit_tokens: Some(8), // far below required tokens
+        output_reserve_tokens: 1024,
+        canvas_budget_bytes: 1_000_000,
+    };
+    let resolution = ProjectContextBootstrap::resolve(
+        &root,
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy: ProjectContextPolicy::Auto,
+            session_kind: SessionKind::Interactive,
+            trusted_local: false,
+        },
+        Some(&consent),
+        budget,
+    )
+    .expect("resolve");
+    match resolution {
+        ProjectContextResolution::Budget(error) => {
+            assert!(matches!(
+                error,
+                ProjectContextBudgetError::OverTokenBudget { .. }
+            ));
+            assert!(error.user_message().contains("too large"));
+        }
+        _ => panic!("expected a budget failure before any card"),
+    }
 }

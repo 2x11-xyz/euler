@@ -160,12 +160,12 @@ fn validate_snapshot_payload(
         ));
     }
     let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
-    // Phase 2 produces exactly two statuses. Phase 3 adds the
-    // `declined`/`unacknowledged` tombstones together with their permitted
-    // policy tuples; until those tuples exist, the statuses reject.
+    // Phase 3 recognizes four statuses. `admitted` yields a pinned item;
+    // `disabled`, `declined`, and `unacknowledged` are tombstones that yield
+    // none. Each combination is still gated by the permitted-tuple table below.
     let admitted = match status {
         "admitted" => true,
-        "disabled" => false,
+        "disabled" | "declined" | "unacknowledged" => false,
         _ => {
             return Err(ProjectContextFoldError::new(
                 "its status field is not one this Euler version knows",
@@ -291,12 +291,23 @@ fn validate_admitted_manifest(
 /// table (acknowledged/declined/unacknowledged tuples) rather than
 /// rediscovering it.
 const PERMITTED_POLICY_TUPLES: &[(&str, &str, &str, &str)] = &[
+    // Phase-2 tuples, retained so sessions recorded before phase 3 still
+    // resume. `exposure_forced_off` is the dormant substrate's disabled
+    // tombstone; the collapse/boundary tombstones are policy-independent.
     ("disabled", "off", "exposure_forced_off", "none"),
     ("disabled", "off", "preflight_collapsed", "none"),
     ("disabled", "off", "boundary_indeterminate", "none"),
-    // The only admitted producer in phase 2 is the crate-internal test
-    // hook; no public path can write this tuple.
+    // The crate-internal admitted test hook; no public path can write it.
     ("admitted", "on", "test_hook", "none"),
+    // Phase-3 acknowledgment-side tuples.
+    ("admitted", "auto", "acknowledged", "acknowledged"),
+    ("admitted", "on", "explicit_opt_in", "explicit_on"),
+    ("declined", "auto", "declined_this_session", "none"),
+    ("unacknowledged", "auto", "no_acknowledgment", "none"),
+    ("disabled", "off", "disabled_by_flag", "none"),
+    ("disabled", "auto", "trusted_local_auto_off", "none"),
+    ("disabled", "auto", "no_project_context", "none"),
+    ("disabled", "on", "no_project_context", "none"),
 ];
 
 fn validate_policy_tuple(
