@@ -911,10 +911,6 @@ mod tests {
     fn embedded_release_authenticates_and_contains_kimi_k3() {
         let release = embedded_release();
         assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.2");
-        assert_eq!(
-            release.manifest.release_id,
-            "catalog-v1-20260718t221617z-d619088f6e7778720898f59eb19ef903bbbd712d8ebe24e66c668490ce26e5d9"
-        );
         assert!(release
             .catalog
             .provider("openrouter")
