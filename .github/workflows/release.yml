@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and upload assets for"
+        description: "Existing published release tag whose assets should be rebuilt"
         required: true
 
 permissions:
@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.commit.outputs.sha }}
     steps:
       - id: tag
         name: Validate release tag
@@ -30,6 +31,37 @@ jobs:
             exit 1
           fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Require an existing release for a manual rebuild
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+
+      - id: commit
+        name: Pin the release commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Require the latest embedded provider catalog
+        if: github.event_name == 'push'
+        run: python3 scripts/sync_provider_catalog.py --check
+
+      - name: Validate the tag's committed provider catalog
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          # workflow_dispatch only rebuilds an existing release. This check is
+          # deliberately offline so the tag remains reproducible even if the
+          # catalog repository changes or an old release asset disappears.
+          if [[ -f scripts/sync_provider_catalog.py ]]; then
+            python3 scripts/sync_provider_catalog.py --check-pinned
+          else
+            echo "This legacy tag predates provider catalog sync tooling; preserving its committed snapshot."
+          fi
 
   build:
     name: ${{ matrix.target }}
@@ -52,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: refs/tags/${{ needs.validate.outputs.tag }}
+          ref: ${{ needs.validate.outputs.commit }}
 
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
@@ -90,6 +122,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+
+      - name: Refuse a tag moved after validation
+        env:
+          VALIDATED_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$VALIDATED_COMMIT" ]]; then
+            echo "Release tag moved after catalog validation; refusing to publish mismatched binaries." >&2
+            exit 1
+          fi
+
       - name: Download release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:

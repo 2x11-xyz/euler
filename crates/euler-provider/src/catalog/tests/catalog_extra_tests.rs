@@ -20,7 +20,7 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
         .models()
         .find(|model| model.id() == "gpt-5.5")
         .expect("gpt-5.5");
-    assert_eq!(gpt55.context_window_tokens(), Some(272_000));
+    assert_eq!(gpt55.context_window_tokens(), Some(1_050_000));
     assert!(openai.models().any(|model| model.id() == "gpt-5.3-codex"));
 
     // The ChatGPT-subscription backend exposes a different model set than
@@ -32,9 +32,9 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
         ("gpt-5.4", 272_000),
         ("gpt-5.4-mini", 272_000),
         ("gpt-5.5", 272_000),
-        ("gpt-5.6-luna", 372_000),
-        ("gpt-5.6-sol", 372_000),
-        ("gpt-5.6-terra", 372_000),
+        ("gpt-5.6-luna", 272_000),
+        ("gpt-5.6-sol", 272_000),
+        ("gpt-5.6-terra", 272_000),
     ] {
         let model = chatgpt
             .models()
@@ -56,11 +56,11 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
             .models()
             .find(|model| model.id() == model_id)
             .expect("OpenAI GPT-5.6 model");
-        assert_eq!(chatgpt_model.context_window_tokens(), Some(372_000));
-        assert_eq!(openai_model.context_window_tokens(), Some(272_000));
+        assert_eq!(chatgpt_model.context_window_tokens(), Some(272_000));
+        assert_eq!(openai_model.context_window_tokens(), Some(1_050_000));
         assert_eq!(
             openai_model.effective_context_window_tokens(),
-            Some(272_000)
+            Some(1_050_000)
         );
         assert_eq!(openai_model.auto_compact_token_limit(), None);
     }
@@ -74,7 +74,7 @@ fn built_in_catalog_lists_curated_models_with_metadata() {
         .expect("OpenRouter Kimi K3");
     assert_eq!(kimi_k3.display_name(), "MoonshotAI: Kimi K3");
     assert_eq!(kimi_k3.context_window_tokens(), Some(1_048_576));
-    assert_eq!(kimi_k3.max_output_tokens(), Some(1_048_576));
+    assert_eq!(kimi_k3.max_output_tokens(), None);
     assert_eq!(kimi_k3.supports_tools(), Some(true));
     assert_eq!(kimi_k3.supports_reasoning(), Some(true));
     assert!(openrouter

@@ -1189,11 +1189,14 @@ fn models_command_without_local_catalog_prints_built_ins_without_session_store()
         .iter()
         .map(|provider| provider["id"].as_str().expect("id").to_owned())
         .collect::<Vec<_>>();
+    let embedded_manifest: serde_json::Value =
+        serde_json::from_str(euler_provider::catalog::EMBEDDED_MANIFEST_JSON)
+            .expect("embedded manifest json");
 
     assert_eq!(catalog["official_catalog"]["source"], "embedded");
     assert_eq!(
         catalog["official_catalog"]["release_id"],
-        "catalog-v1-20260718t221617z-d619088f6e7778720898f59eb19ef903bbbd712d8ebe24e66c668490ce26e5d9"
+        embedded_manifest["release_id"]
     );
     let openrouter = catalog["providers"]
         .as_array()

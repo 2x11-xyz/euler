@@ -1237,7 +1237,11 @@ mod tests {
     fn openrouter_reasoning_efforts_match_route_capabilities() {
         assert_eq!(
             supported_reasoning_efforts(OPENROUTER_PROVIDER_ID, "moonshotai/kimi-k3"),
-            &[ReasoningEffort::Max]
+            &[
+                ReasoningEffort::Small,
+                ReasoningEffort::Large,
+                ReasoningEffort::Max
+            ]
         );
         assert_eq!(
             clamp_reasoning_effort(
@@ -1282,10 +1286,9 @@ mod tests {
     }
 
     #[test]
-    fn xai_built_in_models_pin_pi_reference_and_routable_default() {
+    fn xai_built_in_models_include_routable_default_and_aliases() {
         let catalog = MergedModelCatalog::built_in();
         let xai = catalog.provider(XAI_PROVIDER_ID).expect("xai provider");
-        assert_eq!(xai.models().count(), 8);
         let default = xai
             .models()
             .find(|model| model.id() == DEFAULT_XAI_MODEL)
@@ -1293,6 +1296,8 @@ mod tests {
         assert_eq!(default.display_name(), "Grok 4.3");
         assert_eq!(default.supports_reasoning(), Some(true));
         assert!(built_in_model_supports_reasoning("xai", DEFAULT_XAI_MODEL));
+        assert!(xai.models().any(|model| model.id() == "grok-latest"));
+        assert!(xai.models().any(|model| model.id() == "grok-code-fast-1"));
 
         assert_eq!(
             parse_model_spec("xai::grok-4.3").expect("route"),
