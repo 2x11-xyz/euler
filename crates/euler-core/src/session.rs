@@ -70,6 +70,14 @@ const CONTEXT_LIMIT_MESSAGE: &str =
 const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
 const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. To create a new file, prefer write_file. For code and text file updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff. Write plain prose without emoji or decorative symbols; the terminal ledger renders a fixed glyph vocabulary only.";
+
+/// The byte length of the fixed Euler instructions the root driver sends. This
+/// is the `fixed_instruction_bytes` term of the project-context admission-time
+/// budget formula, exposed so the admission check can run before a session is
+/// even constructed (project-context contract, "Framing and canvas admission").
+pub fn system_instruction_bytes() -> usize {
+    SYSTEM_INSTRUCTIONS.len()
+}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContextLimitConfig {
     limit_tokens: u64,
@@ -674,18 +682,53 @@ impl<D> Session<D> {
             }));
     }
 
-    /// Preflight for the session a `/new` will create: the dormant
-    /// project-context scan of the live workspace, seeded by this session's
+    /// Preflight for the session a `/new` will create: the project-context
+    /// policy resolution for the live workspace, seeded by this session's
     /// carried redactor so every startup-known secret is registered before
     /// discovery reads a byte. Borrowing (not consuming) lets a caller fail
-    /// the `/new` operation honestly while keeping the current session
-    /// alive; the only error is a workspace root that no longer resolves.
-    pub fn prepare_fresh_project_context(&self) -> Result<ProjectContextBootstrap, SessionError> {
-        ProjectContextBootstrap::dormant(&self.config.root, &self.redactor).map_err(|error| {
+    /// the `/new` operation honestly while keeping the current session alive.
+    ///
+    /// The full resolution is surfaced (not swallowed): when the fresh session
+    /// finds unacknowledged guidance, an interactive caller MUST present the
+    /// acknowledgment card and resolve the returned pending decision before
+    /// composing the fresh session (ADR 0017 decision 13). A headless caller
+    /// that cannot prompt resolves it unprompted (fail closed).
+    pub fn prepare_fresh_project_context(
+        &self,
+    ) -> Result<crate::project_context::ProjectContextResolution, SessionError> {
+        let options = crate::project_context::ProjectContextResolveOptions {
+            // `/new` is always an interactive fresh session under `auto`; it is
+            // never a trusted-local run.
+            policy: crate::project_context::ProjectContextPolicy::Auto,
+            session_kind: self.config.session_kind,
+            trusted_local: false,
+        };
+        let budget = crate::project_context::AdmissionBudget {
+            fixed_instruction_bytes: system_instruction_bytes(),
+            context_limit_tokens: self.config.context_limit.map(|limit| limit.limit_tokens()),
+            output_reserve_tokens: self
+                .config
+                .max_output_tokens
+                .unwrap_or(self.config.compaction_reserve_tokens as u64),
+            canvas_budget_bytes: self.config.auto_compaction.budget_bytes,
+        };
+        ProjectContextBootstrap::resolve(
+            &self.config.root,
+            &self.redactor,
+            options,
+            self.config.project_grant_consent_dir.as_deref(),
+            budget,
+        )
+        .map_err(|error| {
             SessionError::ProjectContextInvalid(format!(
                 "cannot start a new session here: {error}; check that the folder still exists"
             ))
         })
+    }
+
+    /// The live workspace root, for a `/new` acknowledgment card's folder label.
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.config.root
     }
 
     /// Build the fresh session `/new` composes, with the bootstrap obtained

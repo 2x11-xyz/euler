@@ -150,32 +150,71 @@ fn stored_credential_values(auth_file: Option<&std::path::Path>) -> Vec<String> 
     values
 }
 
-/// Fresh-session project-context startup (ADR 0017, phase 2 — dormant).
+/// Fresh-session project-context startup (ADR 0017, phase 3 exposure).
 ///
 /// Builds ONE startup redactor, seeds it with the environment and every
-/// stored credential known at startup, and only then runs the bounded
-/// project-context preflight, so candidate bytes are redacted before they
-/// can contribute to any digest, event, or diagnostic. The returned
-/// bootstrap carries that same redactor into the session. Exposure is
-/// forced off: the preflight records what was discovered but no repository
-/// text is admitted, persisted, or shown to a model.
+/// stored credential known at startup, and only then resolves the
+/// `--project-context` policy against the acknowledgment store, so candidate
+/// bytes are redacted before they can contribute to any digest, event, or
+/// diagnostic. The returned bootstrap carries that same redactor into the
+/// session. The admission-time budget check runs inside the resolver, before
+/// any card or dispatch.
 ///
 /// A preflight problem never silently degrades to a bootstrap-less session:
 /// recoverable problems collapse into a disabled bootstrap inside the
-/// preflight itself, and the one unrecoverable case — a workspace root that
-/// cannot be resolved — fails session start honestly, because a session
-/// whose root cannot be resolved cannot enforce any path-keyed rule.
-pub(crate) fn startup_project_context(
-    root: &std::path::Path,
+/// preflight itself, and the one unrecoverable case (a workspace root that
+/// cannot be resolved) fails session start honestly, because a session whose
+/// root cannot be resolved cannot enforce any path-keyed rule.
+pub(crate) fn resolve_startup_project_context(
+    config: &SessionConfig,
     auth_file: Option<&std::path::Path>,
-) -> Result<euler_core::ProjectContextBootstrap> {
+    policy: Option<euler_core::ProjectContextPolicy>,
+    trusted_local: bool,
+) -> Result<euler_core::ProjectContextResolution> {
     let redactor = euler_core::redaction::SecretRedactor::from_env();
     for value in stored_credential_values(auth_file) {
         redactor.add_value(value);
     }
-    euler_core::ProjectContextBootstrap::dormant(root, &redactor).map_err(|error| {
+    let options = euler_core::ProjectContextResolveOptions {
+        policy: policy.unwrap_or(euler_core::ProjectContextPolicy::DEFAULT),
+        session_kind: config.session_kind,
+        trusted_local,
+    };
+    let budget = euler_core::AdmissionBudget {
+        fixed_instruction_bytes: euler_core::system_instruction_bytes(),
+        context_limit_tokens: config.context_limit.map(|limit| limit.limit_tokens()),
+        output_reserve_tokens: config
+            .max_output_tokens
+            .unwrap_or(config.compaction_reserve_tokens as u64),
+        canvas_budget_bytes: config.auto_compaction.budget_bytes,
+    };
+    euler_core::ProjectContextBootstrap::resolve(
+        &config.root,
+        &redactor,
+        options,
+        config.project_grant_consent_dir.as_deref(),
+        budget,
+    )
+    .map_err(|error| {
         anyhow!("cannot start a session in this folder: {error}; check that the folder exists and is accessible")
     })
+}
+
+/// Finalize a resolution for a run that never prompts (headless `exec`). A
+/// budget failure fails honestly before any provider dispatch. Discoverable
+/// but unacknowledged guidance runs unprompted (fail closed, no exposure).
+pub(crate) fn finalize_project_context_headless(
+    resolution: euler_core::ProjectContextResolution,
+) -> Result<euler_core::ProjectContextBootstrap> {
+    match resolution {
+        euler_core::ProjectContextResolution::Resolved(bootstrap) => Ok(*bootstrap),
+        euler_core::ProjectContextResolution::Budget(error) => {
+            Err(anyhow!("{}", error.user_message()))
+        }
+        euler_core::ProjectContextResolution::NeedsAcknowledgment(pending) => {
+            Ok(pending.unprompted())
+        }
+    }
 }
 
 pub(crate) fn session_config(

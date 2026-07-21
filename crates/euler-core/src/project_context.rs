@@ -1,20 +1,30 @@
 //! Project-context substrate (ADR 0017, docs/contracts/project-context.md).
 //!
-//! Phase 2 delivery: the complete dormant substrate — secure discovery,
-//! candidate manifest and digests, snapshot/diagnostic events, core-framed
-//! pinned model input, budget accounting, provenance-only resume, and child
-//! filtering — with effective exposure forced off. There is no public way to
-//! build an admitted snapshot: [`ProjectContextBootstrap::dormant`] is the
-//! only exported constructor and always resolves disabled, so no root
-//! session can see repository text through this module yet. Phase 3 adds the
-//! acknowledgment store and the exposure policy that can admit content.
+//! Phase 2 delivered the dormant substrate (secure discovery, candidate
+//! manifest and digests, snapshot/diagnostic events, core-framed pinned model
+//! input, budget accounting, provenance-only resume, and child filtering) with
+//! effective exposure forced off. Phase 3 flips exposure on: the acknowledgment
+//! store, the `--project-context auto|on|off` policy, and
+//! [`ProjectContextBootstrap::resolve`] gate whether discovered repository text
+//! is admitted. Admission still requires the two-party rule (repository content
+//! plus a user-side decision), and the admission-time budget check refuses an
+//! oversized item before any card acceptance or provider dispatch is wasted.
 
+mod acknowledgment;
 mod budget;
 mod digest;
 mod discovery;
 mod fold;
 mod framing;
 mod manifest;
+mod relocation;
+
+pub(crate) use relocation::{
+    build_relocated_payload, governing_identity_value, projected_new_root,
+    validate_candidate_relocation,
+};
+
+pub use acknowledgment::{AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError};
 
 pub(crate) use budget::{admission_required_tokens, fits_context_limit, request_required_tokens};
 pub(crate) use digest::{
@@ -26,13 +36,15 @@ pub(crate) use fold::{
 };
 
 use crate::redaction::SecretRedactor;
+use crate::session_kind::SessionKind;
 use digest::candidate_digest_v1;
 use euler_event::JsonObject;
+use framing::render_project_context;
 use manifest::{CandidateManifest, ManifestDiagnostic, MANIFEST_VERSION};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Frozen contract bounds (project-context contract; changing one is a
@@ -61,8 +73,17 @@ const ORDERING_V1: &str = "lexicographic-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectContextStatus {
+    /// Repository guidance is admitted into model context for this session.
     Admitted,
+    /// Project context is off for this session (policy `off`, trusted-local,
+    /// a collapsed preflight, or nothing discoverable).
     Disabled,
+    /// The user was asked this session and chose not to load the guidance.
+    /// A session-only tombstone; it writes no durable refusal.
+    Declined,
+    /// A headless `auto` run found guidance but no matching acknowledgment, so
+    /// it ran without it (headless never prompts). A tombstone.
+    Unacknowledged,
 }
 
 impl ProjectContextStatus {
@@ -70,6 +91,321 @@ impl ProjectContextStatus {
         match self {
             Self::Admitted => "admitted",
             Self::Disabled => "disabled",
+            Self::Declined => "declined",
+            Self::Unacknowledged => "unacknowledged",
+        }
+    }
+}
+
+/// The fresh-session exposure policy (`--project-context auto|on|off`). Resume
+/// never consults it: a resumed session keeps the decision it started with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectContextPolicy {
+    /// Load acknowledged guidance; prompt interactively when unacknowledged;
+    /// stay off (without prompting) when headless or trusted-local.
+    Auto,
+    /// A session-only dual opt-in supplied by this invocation. Loads guidance
+    /// without a durable acknowledgment and never writes one.
+    On,
+    /// Do not load guidance; leave any stored acknowledgment untouched.
+    Off,
+}
+
+impl ProjectContextPolicy {
+    pub const DEFAULT: Self = Self::Auto;
+    pub const SUPPORTED: &'static str = "auto, on, off";
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Deterministic budget inputs the admission-time check needs. Assembled by the
+/// caller from the resolved session/model config: fixed instruction bytes, the
+/// known model context window (if any), the output reserve, and the canvas byte
+/// budget. Mirrors the request-time inputs so the two checks agree.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionBudget {
+    pub fixed_instruction_bytes: usize,
+    pub context_limit_tokens: Option<u64>,
+    pub output_reserve_tokens: u64,
+    pub canvas_budget_bytes: usize,
+}
+
+/// Why an otherwise-admissible item cannot be admitted: it does not fit the
+/// budget. Surfaced with a plain-language message before any card or dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectContextBudgetError {
+    OverByteBudget {
+        rendered_bytes: usize,
+        budget_bytes: usize,
+    },
+    OverTokenBudget {
+        required_tokens: u64,
+        limit_tokens: u64,
+    },
+    Overflow,
+}
+
+impl ProjectContextBudgetError {
+    /// The one user-facing line. It never names a digest or token proxy.
+    pub fn user_message(&self) -> String {
+        "This folder's EULER.md is too large to load alongside everything else the model \
+         needs, so it wasn't loaded. Trim the EULER.md files and start again."
+            .to_owned()
+    }
+}
+
+impl std::fmt::Display for ProjectContextBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.user_message())
+    }
+}
+
+impl std::error::Error for ProjectContextBudgetError {}
+
+/// The outcome of policy resolution for a fresh session.
+pub enum ProjectContextResolution {
+    /// A finished bootstrap ready to seed the session: admitted, or a tombstone
+    /// (disabled / declined / unacknowledged).
+    Resolved(Box<ProjectContextBootstrap>),
+    /// Interactive `auto` with discoverable guidance and no matching
+    /// acknowledgment. The UI presents the acknowledgment card and then calls
+    /// [`PendingAcknowledgment::accept`] or [`PendingAcknowledgment::decline`].
+    NeedsAcknowledgment(Box<PendingAcknowledgment>),
+    /// The admissible item does not fit the budget. Fail before any card or
+    /// dispatch.
+    Budget(ProjectContextBudgetError),
+}
+
+/// The fresh-session inputs to policy resolution beyond the workspace root and
+/// redactor: the requested policy, how the session was launched, and whether
+/// this is a trusted-local auto-approve run.
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectContextResolveOptions {
+    pub policy: ProjectContextPolicy,
+    pub session_kind: SessionKind,
+    pub trusted_local: bool,
+}
+
+/// A resolved-but-undecided admission awaiting the user's card answer. Carries
+/// exactly the display facts the card needs and the machinery to finalize the
+/// decision, so the UI never reaches into preflight internals.
+pub struct PendingAcknowledgment {
+    preflight: Preflight,
+    store: Option<AcknowledgmentStore>,
+    previously_acknowledged: bool,
+}
+
+impl PendingAcknowledgment {
+    /// The accepted `EULER.md` source identities, general to specific, for the
+    /// card's file list.
+    pub fn source_identities(&self) -> &[String] {
+        &self.preflight.source_identities
+    }
+
+    /// How many files were discovered but skipped (the diagnostic count). The
+    /// card shows this only when non-zero.
+    pub fn skipped_count(&self) -> usize {
+        self.preflight.diagnostics.len()
+    }
+
+    /// Skills are not part of this phase; always zero. Present so the card's
+    /// contract stays honest as skills land.
+    pub fn skill_count(&self) -> usize {
+        0
+    }
+
+    /// True when a prior acknowledgment for this folder exists but its guidance
+    /// changed. The card leads with the changed headline in that case.
+    pub fn content_changed(&self) -> bool {
+        self.previously_acknowledged
+    }
+
+    /// The user chose to load the guidance. Writes the durable acknowledgment
+    /// and returns the admitted bootstrap. On a write failure this fails closed:
+    /// it returns the write error, and the caller must fall back to
+    /// [`PendingAcknowledgment::decline`] so nothing is admitted without a
+    /// recorded acceptance.
+    pub fn accept(&self) -> Result<ProjectContextBootstrap, AcknowledgmentWriteError> {
+        match &self.store {
+            Some(store) => store.record(
+                &self.preflight.canonical_root,
+                &self.preflight.workspace_identity_digest,
+                &self.preflight.candidate_digest,
+            )?,
+            // No resolvable consent directory: fail closed, exactly like the
+            // grant stores. Never admit without a durable record.
+            None => {
+                return Err(AcknowledgmentWriteError::Unsafe(
+                    "no user home is available to save your approval, so project guidance \
+                     wasn't loaded"
+                        .to_owned(),
+                ))
+            }
+        }
+        Ok(self
+            .preflight
+            .clone()
+            .into_bootstrap(Admission::acknowledged()))
+    }
+
+    /// The user chose not to load the guidance this session. A session-only
+    /// tombstone; no durable refusal is written.
+    pub fn decline(&self) -> ProjectContextBootstrap {
+        self.preflight.clone().into_bootstrap(Admission::declined())
+    }
+
+    /// Resolve to the unacknowledged tombstone without prompting. Used when a
+    /// caller cannot present the card (the interactive acknowledgment surface
+    /// lands in a later slice, issue #180): the session runs without the
+    /// guidance and records that it found context but did not prompt, exactly
+    /// like a headless `auto` run. Fail closed; nothing is admitted.
+    pub fn unprompted(&self) -> ProjectContextBootstrap {
+        self.preflight
+            .clone()
+            .into_bootstrap(Admission::unacknowledged())
+    }
+}
+
+/// The resolved admission decision that turns a preflight into a bootstrap.
+#[derive(Clone, Copy)]
+struct Admission {
+    status: ProjectContextStatus,
+    policy: &'static str,
+    resolution_reason: &'static str,
+    acknowledgment_basis: &'static str,
+    admit_manifest: bool,
+}
+
+impl Admission {
+    fn acknowledged() -> Self {
+        Self {
+            status: ProjectContextStatus::Admitted,
+            policy: "auto",
+            resolution_reason: "acknowledged",
+            acknowledgment_basis: "acknowledged",
+            admit_manifest: true,
+        }
+    }
+
+    fn explicit_on() -> Self {
+        Self {
+            status: ProjectContextStatus::Admitted,
+            policy: "on",
+            resolution_reason: "explicit_opt_in",
+            acknowledgment_basis: "explicit_on",
+            admit_manifest: true,
+        }
+    }
+
+    fn declined() -> Self {
+        Self {
+            status: ProjectContextStatus::Declined,
+            policy: "auto",
+            resolution_reason: "declined_this_session",
+            acknowledgment_basis: "none",
+            admit_manifest: false,
+        }
+    }
+
+    fn unacknowledged() -> Self {
+        Self {
+            status: ProjectContextStatus::Unacknowledged,
+            policy: "auto",
+            resolution_reason: "no_acknowledgment",
+            acknowledgment_basis: "none",
+            admit_manifest: false,
+        }
+    }
+
+    fn disabled_by_flag() -> Self {
+        Self {
+            status: ProjectContextStatus::Disabled,
+            policy: "off",
+            resolution_reason: "disabled_by_flag",
+            acknowledgment_basis: "none",
+            admit_manifest: false,
+        }
+    }
+
+    fn trusted_local_off() -> Self {
+        Self {
+            status: ProjectContextStatus::Disabled,
+            policy: "auto",
+            resolution_reason: "trusted_local_auto_off",
+            acknowledgment_basis: "none",
+            admit_manifest: false,
+        }
+    }
+
+    fn nothing_discoverable(policy: ProjectContextPolicy) -> Self {
+        Self {
+            status: ProjectContextStatus::Disabled,
+            policy: policy.as_str(),
+            resolution_reason: "no_project_context",
+            acknowledgment_basis: "none",
+            admit_manifest: false,
+        }
+    }
+
+    /// A collapsed or boundary-indeterminate preflight can never be admitted,
+    /// whatever policy asked for. These keep the phase-2 `off` tuples so
+    /// sessions recorded before phase 3 still resume.
+    fn collapsed() -> Self {
+        Self {
+            status: ProjectContextStatus::Disabled,
+            policy: "off",
+            resolution_reason: "preflight_collapsed",
+            acknowledgment_basis: "none",
+            admit_manifest: false,
+        }
+    }
+
+    fn boundary_indeterminate() -> Self {
+        Self {
+            status: ProjectContextStatus::Disabled,
+            policy: "off",
+            resolution_reason: "boundary_indeterminate",
+            acknowledgment_basis: "none",
+            admit_manifest: false,
+        }
+    }
+
+    /// The phase-2 dormant tombstone. Retained so sessions recorded before
+    /// phase 3, and the substrate's own dormant tests, still resume and pass.
+    fn exposure_forced_off() -> Self {
+        Self {
+            status: ProjectContextStatus::Disabled,
+            policy: "off",
+            resolution_reason: "exposure_forced_off",
+            acknowledgment_basis: "none",
+            admit_manifest: false,
+        }
+    }
+
+    /// The crate-internal admitted test hook (no public path produces it).
+    #[cfg(test)]
+    fn test_hook() -> Self {
+        Self {
+            status: ProjectContextStatus::Admitted,
+            policy: "on",
+            resolution_reason: "test_hook",
+            acknowledgment_basis: "none",
+            admit_manifest: true,
         }
     }
 }
@@ -85,64 +421,32 @@ pub enum ProjectContextError {
     Workspace(io::Error),
 }
 
-/// The complete preflight result a fresh session boots from: the seeded
-/// startup redactor plus everything the `session.start` summary, the
-/// `project.context.snapshot` event, and its diagnostics record.
-///
-/// Constructed before the session so the redactor demonstrably exists before
-/// discovery and the session inherits the same instance.
+/// The bounded, digest-committed preflight of a workspace: everything policy
+/// resolution needs to decide admission, independent of the decision itself.
+/// Built once per fresh session, before any acknowledgment or card.
 #[derive(Clone, Debug)]
-pub struct ProjectContextBootstrap {
+struct Preflight {
     redactor: SecretRedactor,
-    status: ProjectContextStatus,
-    policy: &'static str,
-    resolution_reason: &'static str,
+    canonical_root: PathBuf,
+    manifest: CandidateManifest,
     candidate_digest: String,
     workspace_identity_digest: String,
     source_identities: Vec<String>,
     diagnostics: Vec<ManifestDiagnostic>,
-    /// Present only when admitted. A disabled bootstrap drops every frozen
-    /// body immediately after the candidate digest is computed, so nothing
-    /// content-bearing survives in memory, events, or provenance.
-    manifest: Option<CandidateManifest>,
+    collapsed: bool,
+    boundary_indeterminate: bool,
 }
 
-impl ProjectContextBootstrap {
-    /// Phase-2 dormant preflight: run the full bounded discovery and digest
-    /// pipeline, then resolve disabled unconditionally. This is the only
-    /// public constructor; effective exposure is forced off with no
-    /// user-facing way to enable it.
-    pub fn dormant(
-        workspace_root: &Path,
-        redactor: &SecretRedactor,
-    ) -> Result<Self, ProjectContextError> {
-        Self::preflight(workspace_root, redactor, false)
-    }
-
-    /// Crate-internal test hook exercising the admitted path end to end.
-    /// Deliberately not exported: phase 3 replaces this with the
-    /// acknowledgment-gated policy resolution.
-    #[cfg(test)]
-    pub(crate) fn admitted_for_tests(
-        workspace_root: &Path,
-        redactor: &SecretRedactor,
-    ) -> Result<Self, ProjectContextError> {
-        Self::preflight(workspace_root, redactor, true)
-    }
-
-    fn preflight(
-        workspace_root: &Path,
-        redactor: &SecretRedactor,
-        admit: bool,
-    ) -> Result<Self, ProjectContextError> {
+impl Preflight {
+    fn run(workspace_root: &Path, redactor: &SecretRedactor) -> Result<Self, ProjectContextError> {
         let canonical =
             std::fs::canonicalize(workspace_root).map_err(ProjectContextError::Workspace)?;
         let outcome = discovery::discover(&canonical, redactor);
         let (manifest, collapsed) = sanitize_preflight(outcome);
-        // An indeterminate repository boundary (a level between the
-        // workspace and the nearest determinable marker that could not be
-        // enumerated) failed the whole discovery closed; like a collapse,
-        // it can never resolve admitted.
+        // An indeterminate repository boundary (a level between the workspace
+        // and the nearest determinable marker that could not be enumerated)
+        // failed the whole discovery closed; like a collapse, it can never
+        // resolve admitted.
         let boundary_indeterminate = manifest
             .diagnostics
             .iter()
@@ -155,41 +459,253 @@ impl ProjectContextBootstrap {
             .map(|source| source.path.clone())
             .collect();
         let diagnostics = manifest.diagnostics.clone();
-        // A collapsed or boundary-indeterminate preflight can never be
-        // admitted, whatever policy asked for: the bounded scan could not
-        // produce a trustworthy manifest, so exposure resolves disabled.
-        let (status, policy, resolution_reason, manifest) =
-            if admit && !collapsed && !boundary_indeterminate {
-                (
-                    ProjectContextStatus::Admitted,
-                    "on",
-                    "test_hook",
-                    Some(manifest),
-                )
-            } else {
-                // Dormant build: repository content can never reach a model,
-                // so the frozen bodies are dropped here and only
-                // content-free data survives.
-                let reason = if collapsed {
-                    "preflight_collapsed"
-                } else if boundary_indeterminate {
-                    "boundary_indeterminate"
-                } else {
-                    "exposure_forced_off"
-                };
-                (ProjectContextStatus::Disabled, "off", reason, None)
-            };
         Ok(Self {
             redactor: redactor.clone(),
-            status,
-            policy,
-            resolution_reason,
+            canonical_root: canonical,
+            manifest,
             candidate_digest,
             workspace_identity_digest,
             source_identities,
             diagnostics,
-            manifest,
+            collapsed,
+            boundary_indeterminate,
         })
+    }
+
+    /// True when the preflight produced a trustworthy, non-empty manifest that
+    /// could be admitted. A collapse, an indeterminate boundary, or the total
+    /// absence of `EULER.md` all make admission impossible.
+    fn admissible(&self) -> bool {
+        !self.collapsed && !self.boundary_indeterminate && !self.source_identities.is_empty()
+    }
+
+    /// The exact core-framed bytes an admitted item would carry, for the
+    /// admission-time budget check.
+    fn framed_bytes(&self) -> usize {
+        render_project_context(&self.manifest).len()
+    }
+
+    /// Run the admission-time budget formula (project-context contract,
+    /// "Framing and canvas admission"). Returns the honest error to surface
+    /// before any card acceptance or provider dispatch is wasted, or `None`
+    /// when the item fits.
+    fn budget_error(&self, budget: &AdmissionBudget) -> Option<ProjectContextBudgetError> {
+        let framed = self.framed_bytes();
+        if framed > budget.canvas_budget_bytes {
+            return Some(ProjectContextBudgetError::OverByteBudget {
+                rendered_bytes: framed,
+                budget_bytes: budget.canvas_budget_bytes,
+            });
+        }
+        let limit_tokens = budget.context_limit_tokens?;
+        match admission_required_tokens(
+            budget.fixed_instruction_bytes,
+            framed,
+            budget.output_reserve_tokens,
+        ) {
+            Some(required) if fits_context_limit(required, limit_tokens) => None,
+            Some(required) => Some(ProjectContextBudgetError::OverTokenBudget {
+                required_tokens: required,
+                limit_tokens,
+            }),
+            None => Some(ProjectContextBudgetError::Overflow),
+        }
+    }
+
+    fn into_bootstrap(self, admission: Admission) -> ProjectContextBootstrap {
+        let manifest = admission.admit_manifest.then_some(self.manifest);
+        ProjectContextBootstrap {
+            redactor: self.redactor,
+            status: admission.status,
+            policy: admission.policy,
+            resolution_reason: admission.resolution_reason,
+            acknowledgment_basis: admission.acknowledgment_basis,
+            candidate_digest: self.candidate_digest,
+            workspace_identity_digest: self.workspace_identity_digest,
+            source_identities: self.source_identities,
+            diagnostics: self.diagnostics,
+            manifest,
+        }
+    }
+
+    /// The disabled tombstone matching whichever preflight problem made
+    /// admission impossible (used for the non-admissible fresh-session paths).
+    fn unadmissible_admission(&self, policy: ProjectContextPolicy) -> Admission {
+        if self.collapsed {
+            Admission::collapsed()
+        } else if self.boundary_indeterminate {
+            Admission::boundary_indeterminate()
+        } else if policy == ProjectContextPolicy::Off {
+            Admission::disabled_by_flag()
+        } else {
+            Admission::nothing_discoverable(policy)
+        }
+    }
+}
+
+/// The complete preflight result a fresh session boots from: the seeded
+/// startup redactor plus everything the `session.start` summary, the
+/// `project.context.snapshot` event, and its diagnostics record.
+///
+/// Constructed before the session so the redactor demonstrably exists before
+/// discovery and the session inherits the same instance.
+#[derive(Clone, Debug)]
+pub struct ProjectContextBootstrap {
+    redactor: SecretRedactor,
+    status: ProjectContextStatus,
+    policy: &'static str,
+    resolution_reason: &'static str,
+    acknowledgment_basis: &'static str,
+    candidate_digest: String,
+    workspace_identity_digest: String,
+    source_identities: Vec<String>,
+    diagnostics: Vec<ManifestDiagnostic>,
+    /// Present only when admitted. A disabled/declined/unacknowledged bootstrap
+    /// drops every frozen body immediately, so nothing content-bearing survives
+    /// in memory, events, or provenance.
+    manifest: Option<CandidateManifest>,
+}
+
+impl ProjectContextBootstrap {
+    /// Resolve the fresh-session exposure policy into a bootstrap, or into a
+    /// pending acknowledgment the UI must decide. This is the phase-3 entry
+    /// point that replaces the dormant force-off.
+    ///
+    /// - `Off` disables without touching stored acknowledgments.
+    /// - `On` is a session-only opt-in: it admits admissible guidance without a
+    ///   durable acknowledgment and never writes one.
+    /// - `Auto` loads acknowledged guidance, prompts interactively when
+    ///   unacknowledged, and stays off (without prompting) for headless runs,
+    ///   trusted-local runs, or a session with no resolvable consent directory.
+    ///
+    /// The admission-time budget check runs before an admitted result is built
+    /// and before an interactive card is offered, so an oversized item fails
+    /// honestly instead of wasting a card answer or reaching a provider.
+    pub fn resolve(
+        workspace_root: &Path,
+        redactor: &SecretRedactor,
+        options: ProjectContextResolveOptions,
+        consent_dir: Option<&Path>,
+        budget: AdmissionBudget,
+    ) -> Result<ProjectContextResolution, ProjectContextError> {
+        let ProjectContextResolveOptions {
+            policy,
+            session_kind,
+            trusted_local,
+        } = options;
+        let preflight = Preflight::run(workspace_root, redactor)?;
+        if !preflight.admissible() {
+            let admission = preflight.unadmissible_admission(policy);
+            return Ok(ProjectContextResolution::Resolved(Box::new(
+                preflight.into_bootstrap(admission),
+            )));
+        }
+        match policy {
+            ProjectContextPolicy::Off => Ok(ProjectContextResolution::Resolved(Box::new(
+                preflight.into_bootstrap(Admission::disabled_by_flag()),
+            ))),
+            ProjectContextPolicy::On => {
+                if let Some(error) = preflight.budget_error(&budget) {
+                    return Ok(ProjectContextResolution::Budget(error));
+                }
+                Ok(ProjectContextResolution::Resolved(Box::new(
+                    preflight.into_bootstrap(Admission::explicit_on()),
+                )))
+            }
+            ProjectContextPolicy::Auto => {
+                if trusted_local {
+                    return Ok(ProjectContextResolution::Resolved(Box::new(
+                        preflight.into_bootstrap(Admission::trusted_local_off()),
+                    )));
+                }
+                let store = consent_dir.map(AcknowledgmentStore::new);
+                let lookup = store.as_ref().map(|store| {
+                    store.lookup(
+                        &preflight.canonical_root,
+                        &preflight.workspace_identity_digest,
+                        &preflight.candidate_digest,
+                    )
+                });
+                match lookup {
+                    Some(AcknowledgmentLookup::Match) => {
+                        if let Some(error) = preflight.budget_error(&budget) {
+                            return Ok(ProjectContextResolution::Budget(error));
+                        }
+                        Ok(ProjectContextResolution::Resolved(Box::new(
+                            preflight.into_bootstrap(Admission::acknowledged()),
+                        )))
+                    }
+                    // Not acknowledged (absent, changed, or an untrustworthy
+                    // record we refuse to trust): headless never prompts;
+                    // interactive offers the card once the item is known to fit.
+                    other => {
+                        let previously_acknowledged = matches!(
+                            other,
+                            Some(AcknowledgmentLookup::None {
+                                previously_acknowledged: true,
+                            }) | Some(AcknowledgmentLookup::Unsafe(_))
+                        );
+                        // Without a resolvable consent directory we cannot
+                        // record a decision, so auto admission is disabled and
+                        // no card is offered (fail closed, like project grants).
+                        if store.is_none() || session_kind != SessionKind::Interactive {
+                            return Ok(ProjectContextResolution::Resolved(Box::new(
+                                preflight.into_bootstrap(Admission::unacknowledged()),
+                            )));
+                        }
+                        if let Some(error) = preflight.budget_error(&budget) {
+                            return Ok(ProjectContextResolution::Budget(error));
+                        }
+                        Ok(ProjectContextResolution::NeedsAcknowledgment(Box::new(
+                            PendingAcknowledgment {
+                                preflight,
+                                store,
+                                previously_acknowledged,
+                            },
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Phase-2 dormant preflight kept for the substrate's own tests and any
+    /// caller that wants discovery without exposure: run the full bounded
+    /// pipeline, then resolve disabled. Effective exposure is forced off.
+    pub fn dormant(
+        workspace_root: &Path,
+        redactor: &SecretRedactor,
+    ) -> Result<Self, ProjectContextError> {
+        let preflight = Preflight::run(workspace_root, redactor)?;
+        let admission = if preflight.collapsed {
+            Admission::collapsed()
+        } else if preflight.boundary_indeterminate {
+            Admission::boundary_indeterminate()
+        } else {
+            Admission::exposure_forced_off()
+        };
+        Ok(preflight.into_bootstrap(admission))
+    }
+
+    /// Crate-internal test hook exercising the admitted path end to end without
+    /// the acknowledgment store.
+    #[cfg(test)]
+    pub(crate) fn admitted_for_tests(
+        workspace_root: &Path,
+        redactor: &SecretRedactor,
+    ) -> Result<Self, ProjectContextError> {
+        let preflight = Preflight::run(workspace_root, redactor)?;
+        // A collapsed or boundary-indeterminate preflight can never be
+        // admitted, even by the test hook: the bounded scan could not produce
+        // a trustworthy manifest.
+        let admission = if preflight.collapsed {
+            Admission::collapsed()
+        } else if preflight.boundary_indeterminate {
+            Admission::boundary_indeterminate()
+        } else {
+            Admission::test_hook()
+        };
+        Ok(preflight.into_bootstrap(admission))
     }
 
     /// The startup redactor the session must inherit.
@@ -215,7 +731,7 @@ impl ProjectContextBootstrap {
             "status": self.status.as_str(),
             "policy": self.policy,
             "resolution_reason": self.resolution_reason,
-            "acknowledgment_basis": "none",
+            "acknowledgment_basis": self.acknowledgment_basis,
             "candidate_digest": self.candidate_digest,
             "source_count": self.source_identities.len(),
             "diagnostic_count": self.diagnostics.len(),
@@ -234,7 +750,7 @@ impl ProjectContextBootstrap {
             ("status", self.status.as_str().into()),
             ("policy", self.policy.into()),
             ("resolution_reason", self.resolution_reason.into()),
-            ("acknowledgment_basis", "none".into()),
+            ("acknowledgment_basis", self.acknowledgment_basis.into()),
             ("candidate_digest", self.candidate_digest.clone().into()),
             (
                 "workspace_identity",

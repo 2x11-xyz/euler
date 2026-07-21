@@ -42,6 +42,9 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         | super::TranscriptItem::PermissionAsk { .. }
         | super::TranscriptItem::PermissionBatchAsk { .. }
         | super::TranscriptItem::PermissionDecision { .. } => line_oriented_permission(item),
+        // The acknowledgment card is TUI-only live chrome, never a line-mode
+        // ledger row.
+        super::TranscriptItem::ProjectContextAck { .. } => String::new(),
         super::TranscriptItem::PatchProposed { path, old, new } => {
             line_oriented_patch("patch.proposed", path, old.as_deref(), new.as_deref())
         }

@@ -27,6 +27,9 @@ use cells::{
     file_change_action_label, file_change_path_label, normalize_tool_run_output,
     tool_output_is_foldable,
 };
+pub(crate) use cells::{
+    render_acknowledgment_card, render_relocation_card, AcknowledgmentCardView, RelocationCardView,
+};
 use file_diff::file_diff_is_foldable;
 use line::render_line_oriented_item;
 #[cfg(test)]
@@ -123,6 +126,16 @@ pub enum TranscriptItem {
         operation: String,
         capabilities: Vec<String>,
         selected_option: ApprovalOption,
+    },
+    /// The project-context acknowledgment card shown for an in-app `/new`
+    /// (ADR 0017 phase 3). At launch the same card renders on the pre-session
+    /// surface instead.
+    ProjectContextAck {
+        folder_label: String,
+        content_changed: bool,
+        sources: Vec<String>,
+        skipped_count: usize,
+        load_selected: bool,
     },
     PermissionDecision {
         capability: String,
@@ -303,6 +316,7 @@ pub(crate) fn item_wants_timestamp(item: &TranscriptItem) -> bool {
             | TranscriptItem::WorkedDuration(_)
             | TranscriptItem::TurnRecap { .. }
             | TranscriptItem::PermissionAsk { .. }
+            | TranscriptItem::ProjectContextAck { .. }
     )
 }
 

@@ -1373,3 +1373,107 @@ fn index_entries(store: &SessionStore) -> Vec<IndexEntry> {
         .map(|line| serde_json::from_str(line).expect("index entry"))
         .collect()
 }
+
+#[test]
+fn relocation_new_root_supersedes_the_session_start_root_projection() {
+    // The projected root is what listing, grouping, and resume checks use. An
+    // accepted relocation moves that projection to the new folder (ADR 0017).
+    let temp = tempfile::tempdir().expect("temp");
+    let old = temp.path().join("old");
+    let new = temp.path().join("new");
+    fs::create_dir_all(&old).expect("old");
+    fs::create_dir_all(&new).expect("new");
+    let old = fs::canonicalize(&old).expect("canonical old");
+    let new = fs::canonicalize(&new).expect("canonical new");
+    let redactor = crate::redaction::SecretRedactor::new();
+    let bootstrap =
+        crate::project_context::ProjectContextBootstrap::dormant(&old, &redactor).expect("boot");
+    let mut start_payload = object([
+        ("provider", "fixture".into()),
+        ("model", "echo".into()),
+        (
+            "root",
+            crate::session_root::session_root_for_event(&old).into(),
+        ),
+    ]);
+    start_payload.insert(
+        "project_context".to_owned(),
+        bootstrap.session_start_summary(),
+    );
+    let start = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::SESSION_START,
+        start_payload,
+    );
+    let snapshot = EventEnvelope::new(
+        "session",
+        "root",
+        Some(start.id.clone()),
+        EventKind::PROJECT_CONTEXT_SNAPSHOT,
+        bootstrap.snapshot_payload(),
+    );
+    assert_eq!(
+        root_from_events(std::slice::from_ref(&start)).expect("root"),
+        Some(old.clone()),
+    );
+    let prior_identity =
+        crate::project_context::governing_identity_value(&[start.clone(), snapshot.clone()])
+            .expect("governing")
+            .expect("identity");
+    let relocated = EventEnvelope::new(
+        "session",
+        "root",
+        Some(snapshot.id.clone()),
+        EventKind::PROJECT_CONTEXT_RELOCATED,
+        crate::project_context::build_relocated_payload(
+            &prior_identity,
+            &new,
+            crate::session_root::session_root_for_event(&new),
+            "2026-07-21T00:00:00Z".to_owned(),
+        ),
+    );
+    assert_eq!(
+        root_from_events(&[start, snapshot, relocated]).expect("root"),
+        Some(new),
+        "the latest relocation's new_root governs the projected root",
+    );
+}
+
+#[test]
+fn malformed_relocation_root_projection_is_invalid_not_projected() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id(),
+        "root",
+        None,
+        EventKind::SESSION_START,
+        object([("root", "/home/ada/projects/euler".into())]),
+    );
+    let forged = EventEnvelope::new(
+        record.id(),
+        "root",
+        Some(start.id.clone()),
+        EventKind::PROJECT_CONTEXT_RELOCATED,
+        object([("new_root", "/home/ada/projects/euler-fork".into())]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(&[start, forged]).expect("append");
+    drop(writer);
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.status(), SessionStatus::Invalid);
+    assert_eq!(listed.root(), None);
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(
+        sidecar.get("projected_events_len").is_none(),
+        "invalid relocation projections must not be cached"
+    );
+}

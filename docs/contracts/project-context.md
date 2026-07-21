@@ -1,23 +1,26 @@
 # Project Context Contract (binding shape)
 
 ADR 0017 governs project context; this contract binds its concrete shape.
-Implementation status: the phase-2 dormant substrate is implemented (issue
-#180, delivery slice 2) with effective exposure forced off. Implemented
-truth: `EULER.md` discovery/containment/bounds, preflight redaction
-ordering, the candidate manifest and all four digest domains, the
-`project.context.snapshot`/`project.context.diagnostic` events and durable
-bootstrap, core framing and the pinned provider-neutral input with its
-budget accounting, provenance-only resume with workspace-identity
-enforcement, and child `none | inherit` filtering at request assembly. NOT
-yet implemented (still bound shape): every statement about `--project-context`
-policy resolution, the acknowledgment record and store ("Acknowledgment
-record" section in full), skills and `skill_read` ("Skills" section, the
-skill rows of the bounds table, and skill fields of the snapshot), the
-always-on catalog, explicit reload, and guardian/worker `inherit` wiring
-(today every child uses the `none` default). In phase 2 the only public
-bootstrap constructor resolves disabled, so no root session can expose
-repository text; issue #180 tracks the remaining slices, and this paragraph
-shrinks as they land.
+Implementation status: the phase-2 dormant substrate and the phase-3
+`EULER.md` exposure are implemented (issue #180). Implemented truth:
+`EULER.md` discovery/containment/bounds, preflight redaction ordering, the
+candidate manifest and all four digest domains, the
+`project.context.snapshot`/`project.context.diagnostic`/`project.context.relocated`
+events and durable bootstrap, core framing and the pinned provider-neutral
+input with its budget accounting at both admission and request time,
+provenance-only resume with workspace-identity enforcement, child
+`none | inherit` filtering at request assembly, the `--project-context
+auto|on|off` policy resolution, the user-owned acknowledgment record and
+store ("Acknowledgment record" section in full), the interactive
+acknowledgment card and non-interactive fail-closed behavior, and resume
+relocation consent ("Resume relocation and consent" in full: the relocation
+card, `--accept-relocation`, the `project.context.relocated` event, the
+permission epoch, and the `new_root` projection). NOT yet implemented (still
+bound shape): skills and `skill_read` ("Skills" section, the skill rows of
+the bounds table, and skill fields of the snapshot), the always-on catalog,
+explicit reload, and guardian/worker `inherit` wiring (the child policy
+field exists, but today every child uses the `none` default). Issue #180
+tracks the remaining slices, and this paragraph shrinks as they land.
 
 ## Definition and non-authority
 
@@ -277,18 +280,13 @@ context events but no identity is invalid.
 
 ## Resume relocation and consent
 
-Implementation status: unimplemented; ships with issue #180 phase 3 (the
-`EULER.md` exposure phase), alongside the acknowledgment store and its
-interactive surface. Until then a same-host workspace mismatch is the phase-2
-interim hard failure described above: interactive and headless resume both fail
-closed with the plain-language remediation, and starting a new session is the
-only remediation. This is exposure-adjacent interactive machinery and does not
-land before exposure.
+Implementation status: implemented (issue #180 phase 3), alongside the
+acknowledgment store and its interactive surface.
 
-When phase 3 lands, an interactive resume whose live canonical workspace does
-not match the recorded workspace identity neither fails closed nor silently
-adopts the new location. Euler shows a relocation-consent card and asks one
-question: resume this session here, or not.
+An interactive resume whose live canonical workspace does not match the
+recorded workspace identity neither fails closed nor silently adopts the new
+location. Euler shows a relocation-consent card and asks one question: resume
+this session here, or not.
 
 The card states facts and never a guessed reason. Euler cannot know why a path
 changed (a rename, a move, a fresh clone at a new location, a different
@@ -367,9 +365,17 @@ requires.
 Validation (any breach fails closed and rejects the resume): `prior_identity`
 MUST equal the identity folded at the accepted prefix; `new_identity` MUST equal
 the live canonical root's identity at decision time; `new_root` MUST re-derive
-to `new_identity` under the identity algorithm; and a relocation whose
-`prior_identity` does not match the current governing identity (a stale fold or
-a branched acceptance) is rejected and never supersedes.
+to `new_identity` under the identity algorithm; the event MUST parent the
+accepted tail event (the durable event immediately preceding it), so a missing
+or wrong parent rejects; and a relocation whose `prior_identity` does not match
+the current governing identity (a stale fold or a branched acceptance) is
+rejected and never supersedes. The acceptance path validates the candidate event
+against the folded prefix with this exact check before appending it, so nothing
+the fold would reject can ever reach the log. Because the workspace identity
+hashes the raw canonical path bytes while `new_root` is a lossy display string,
+a workspace root whose canonical path bytes are not valid UTF-8 cannot relocate
+in v1: it is refused with a plain-language error rather than recorded, because
+the display form could never re-derive to its identity.
 `docs/contracts/events.md` carries the same field, parentage, and validation
 rules for the event kind.
 

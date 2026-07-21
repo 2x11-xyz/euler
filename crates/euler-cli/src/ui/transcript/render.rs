@@ -1,11 +1,11 @@
 use super::cells::{
     edit_failure_status, output_rows_without_trailing_blanks, push_bounded_children,
-    push_bounded_failure_children, push_cell_parent, push_child_rows, render_companion_block,
-    render_edit_cell, render_extension_result, render_file_change_cell, render_interrupted,
-    render_patch_cell, render_permission_ask, render_permission_batch_ask,
+    push_bounded_failure_children, push_cell_parent, push_child_rows, render_acknowledgment_card,
+    render_companion_block, render_edit_cell, render_extension_result, render_file_change_cell,
+    render_interrupted, render_patch_cell, render_permission_ask, render_permission_batch_ask,
     render_permission_decision, render_resume_boundary, render_tool_run, render_turn_recap,
-    render_worked_duration, tool_failure_status, CompanionRender, EditRender,
-    ExtensionResultRender, FileChangeRender, PatchRender, PermissionAskView,
+    render_worked_duration, tool_failure_status, AcknowledgmentCardView, CompanionRender,
+    EditRender, ExtensionResultRender, FileChangeRender, PatchRender, PermissionAskView,
     PermissionBatchAskView, PermissionDecisionView, ResumeBoundaryRender, ToolRunRender,
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
@@ -444,6 +444,25 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     theme,
                     width,
                 );
+            }
+            TranscriptItem::ProjectContextAck {
+                folder_label,
+                content_changed,
+                sources,
+                skipped_count,
+                load_selected,
+            } => {
+                lines.extend(render_acknowledgment_card(
+                    &AcknowledgmentCardView {
+                        folder_label,
+                        content_changed: *content_changed,
+                        sources,
+                        skipped_count: *skipped_count,
+                        load_selected: *load_selected,
+                    },
+                    theme,
+                    width,
+                ));
             }
             TranscriptItem::PermissionDecision {
                 capability,

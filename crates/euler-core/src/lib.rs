@@ -83,8 +83,10 @@ pub use permissions::{
     ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,
 };
 pub use project_context::{
-    ProjectContextBootstrap, ProjectContextError, ProjectContextStatus,
-    MAX_COMBINED_EULER_MD_BYTES, MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES,
+    AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError, AdmissionBudget,
+    PendingAcknowledgment, ProjectContextBootstrap, ProjectContextBudgetError, ProjectContextError,
+    ProjectContextPolicy, ProjectContextResolution, ProjectContextResolveOptions,
+    ProjectContextStatus, MAX_COMBINED_EULER_MD_BYTES, MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES,
     SNAPSHOT_SCHEMA_VERSION as PROJECT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use provenance::{
@@ -94,19 +96,20 @@ pub use provenance::{
     DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT,
 };
 pub use resume::{
-    fold_session, read_resume_prefix, resume_session, resume_session_from_folded_prefix,
-    resume_session_from_prefix, resume_session_from_prefix_with_outcome,
-    resume_session_with_outcome, FoldedSession, ResumeError, ResumeOutcome, ResumeWarning,
+    fold_session, plan_relocation, read_resume_prefix, resume_session,
+    resume_session_from_folded_prefix, resume_session_from_prefix,
+    resume_session_from_prefix_with_outcome, resume_session_with_outcome, FoldedSession,
+    RelocationRequired, ResumeError, ResumeOutcome, ResumeWarning,
 };
 pub use sandbox::{
     probe_workspace_sandbox, SandboxAvailability, SandboxProfile, SandboxUnavailableReason,
     SubprocessSandbox,
 };
 pub use session::{
-    fold_model_target, fold_reasoning_effort, AgentReporter, AgentResultSummary, BackgroundAgent,
-    BackgroundAgentPoll, BackgroundAgentReportDrain, ContextLimitConfig, ExtensionExecutionError,
-    ModelTarget, RoundObserverConfig, Session, SessionConfig, SessionError, SteeringQueue,
-    WorkspaceRestoreOutcome,
+    fold_model_target, fold_reasoning_effort, system_instruction_bytes, AgentReporter,
+    AgentResultSummary, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
+    ContextLimitConfig, ExtensionExecutionError, ModelTarget, RoundObserverConfig, Session,
+    SessionConfig, SessionError, SteeringQueue, WorkspaceRestoreOutcome,
 };
 pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};

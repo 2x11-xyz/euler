@@ -10115,6 +10115,13 @@ const PTY_QUIET_INTERVAL: Duration = Duration::from_millis(100);
 
 impl PtyHarness {
     fn spawn_with_args(home: &Path, args: &[&str]) -> Self {
+        Self::spawn_with_args_in_dir(home, None, args)
+    }
+
+    /// Like `spawn_with_args` but runs the process in `workspace` when given,
+    /// so project-context discovery scans a controlled folder rather than the
+    /// test's own CWD.
+    fn spawn_with_args_in_dir(home: &Path, workspace: Option<&Path>, args: &[&str]) -> Self {
         record_recent_catalog_refresh_for_test(home);
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -10127,6 +10134,9 @@ impl PtyHarness {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_euler"));
         cmd.args(args);
         cmd.env("HOME", home.as_os_str());
+        if let Some(workspace) = workspace {
+            cmd.cwd(workspace.as_os_str());
+        }
 
         let child = pty.slave.spawn_command(cmd).expect("spawn euler tui");
         drop(pty.slave);
@@ -11846,4 +11856,444 @@ fn run_euler_with_input_from(
         .write_all(input.as_bytes())
         .expect("write stdin");
     child.wait_with_output().expect("wait for euler")
+}
+
+/// The acknowledgment card (ADR 0017 phase 3) is presented before the session
+/// starts when a fresh interactive `auto` session finds unacknowledged
+/// EULER.md guidance. A single keypress accepts it and writes a durable
+/// acknowledgment under the user home.
+#[test]
+fn tui_pty_acknowledgment_card_accept_loads_and_records() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    std::fs::write(workspace.join("EULER.md"), "Prefer small commits.").expect("euler md");
+
+    let script = write_fixture_script(
+        temp.path(),
+        "ack-card-accept.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "hello"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+
+    assert!(
+        tui.wait_for_screen("Load this project's guidance?"),
+        "acknowledgment card did not render:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.screen_text().contains("EULER.md"),
+        "the card must list the discovered file:\n{}",
+        tui.screen_text()
+    );
+    tui.write("y");
+    assert!(
+        tui.wait_for_screen("/ commands"),
+        "the app did not start after accepting:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let ack_dir = home.join(".euler").join("project-context");
+    let recorded = std::fs::read_dir(&ack_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recorded, 1,
+        "accepting must write one durable acknowledgment"
+    );
+}
+
+/// Skipping the acknowledgment card starts the session without the guidance
+/// and writes no durable record (decline is session-only).
+#[test]
+fn tui_pty_acknowledgment_card_skip_writes_no_record() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    std::fs::write(workspace.join("EULER.md"), "Prefer small commits.").expect("euler md");
+
+    let script = write_fixture_script(
+        temp.path(),
+        "ack-card-skip.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "hello"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+
+    assert!(
+        tui.wait_for_screen("Load this project's guidance?"),
+        "acknowledgment card did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("n");
+    assert!(
+        tui.wait_for_screen("/ commands"),
+        "the app did not start after skipping:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let ack_dir = home.join(".euler").join("project-context");
+    let recorded = std::fs::read_dir(&ack_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recorded, 0,
+        "skipping must not write a durable acknowledgment"
+    );
+}
+
+/// Headless resume into a different folder fails closed with a plain-language
+/// remediation, and `--accept-relocation` is the scripted yes that moves the
+/// session and records a durable `project.context.relocated` event
+/// (ADR 0017 phase 3).
+#[test]
+fn exec_resume_relocation_requires_accept_relocation_flag() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let temp = tempfile::tempdir().expect("temp");
+    let workspace_a = temp.path().join("a");
+    let workspace_b = temp.path().join("b");
+    std::fs::create_dir_all(&workspace_a).expect("a");
+    std::fs::create_dir_all(&workspace_b).expect("b");
+    let log = temp.path().join("session.jsonl");
+    let script = write_fixture_script(
+        temp.path(),
+        "reloc.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "ok"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+
+    // Create the session in workspace A.
+    let create = command_with_home(exe, &home)
+        .current_dir(&workspace_a)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--provenance",
+            path_str(&log),
+            "--auto-approve",
+            "read-only",
+            "first prompt",
+        ])
+        .output()
+        .expect("create session");
+    assert!(
+        create.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // Resume from workspace B WITHOUT the flag: fails closed with remediation.
+    let denied = command_with_home(exe, &home)
+        .current_dir(&workspace_b)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--resume",
+            path_str(&log),
+            "--auto-approve",
+            "read-only",
+            "second prompt",
+        ])
+        .output()
+        .expect("denied resume");
+    assert!(
+        !denied.status.success(),
+        "resume from a new folder must fail without the flag"
+    );
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        stderr.contains("--accept-relocation"),
+        "remediation must mention the flag:\n{stderr}"
+    );
+    // Nothing was appended.
+    assert!(!read_jsonl(&log)
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_RELOCATED));
+
+    // Resume from workspace B WITH the flag: succeeds and records the event.
+    let moved = command_with_home(exe, &home)
+        .current_dir(&workspace_b)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--resume",
+            path_str(&log),
+            "--accept-relocation",
+            "--auto-approve",
+            "read-only",
+            "second prompt",
+        ])
+        .output()
+        .expect("moved resume");
+    assert!(
+        moved.status.success(),
+        "accepted relocation: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let events = read_jsonl(&log);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_RELOCATED),
+        "an accepted relocation must record a durable project.context.relocated event"
+    );
+}
+
+/// The relocation-consent card (ADR 0017 phase 3) is presented before a
+/// resumed session is rebuilt when the live folder differs from where the
+/// session last ran. Accepting moves the session and records the event.
+#[test]
+fn tui_pty_relocation_card_accept_resumes_and_records() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let temp = tempfile::tempdir().expect("temp");
+    let home = temp.path().join("home");
+    let workspace_a = temp.path().join("a");
+    let workspace_b = temp.path().join("b");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&workspace_a).expect("a");
+    std::fs::create_dir_all(&workspace_b).expect("b");
+    let log = temp.path().join("session.jsonl");
+    let script = write_fixture_script(
+        temp.path(),
+        "reloc-tui.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "ok"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+
+    // Create the session in workspace A.
+    let create = std::process::Command::new(exe)
+        .env("HOME", &home)
+        .current_dir(&workspace_a)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--provenance",
+            path_str(&log),
+            "--auto-approve",
+            "read-only",
+            "first prompt",
+        ])
+        .output()
+        .expect("create session");
+    assert!(
+        create.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // Resume via TUI from workspace B: the relocation card appears first.
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace_b),
+        &["--resume", path_str(&log)],
+    );
+    assert!(
+        tui.wait_for_screen("This session last ran in a different folder"),
+        "relocation card did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("r");
+    assert!(
+        tui.wait_for_screen("/ commands"),
+        "resumed app did not start after accepting relocation:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let events = read_jsonl(&log);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_RELOCATED),
+        "accepting the card must record a durable project.context.relocated event"
+    );
+}
+
+/// An in-app `/new` after EULER.md appears (or changes) must present the
+/// acknowledgment card before composing the fresh session (ADR 0017 decision
+/// 13, blocker 4). Accepting loads it and records a durable acknowledgment.
+#[test]
+fn tui_pty_new_session_acknowledgment_card_accept_records() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    // No EULER.md at launch, so there is no launch card.
+    let script = write_fixture_script(
+        temp.path(),
+        "new-card-accept.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "ok"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
+    // The project gains guidance while the session runs.
+    std::fs::write(workspace.join("EULER.md"), "Prefer small commits.").expect("euler md");
+    tui.write("/new\r");
+    assert!(
+        tui.wait_for_screen("Load this project's guidance?"),
+        "/new did not present the acknowledgment card:\n{}",
+        tui.screen_text()
+    );
+    tui.write("y");
+    assert!(
+        tui.wait_for_screen("new session"),
+        "new session did not start after accepting:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let ack_dir = home.join(".euler").join("project-context");
+    let recorded = std::fs::read_dir(&ack_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recorded, 1,
+        "accepting the /new card must record one acknowledgment"
+    );
+}
+
+/// Skipping the `/new` acknowledgment card starts the fresh session without the
+/// guidance and writes no durable record (decline is session-only).
+#[test]
+fn tui_pty_new_session_acknowledgment_card_skip_writes_no_record() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    let script = write_fixture_script(
+        temp.path(),
+        "new-card-skip.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "ok"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
+    std::fs::write(workspace.join("EULER.md"), "Prefer small commits.").expect("euler md");
+    tui.write("/new\r");
+    assert!(
+        tui.wait_for_screen("Load this project's guidance?"),
+        "/new did not present the acknowledgment card:\n{}",
+        tui.screen_text()
+    );
+    tui.write("n");
+    assert!(
+        tui.wait_for_screen("new session"),
+        "new session did not start after skipping:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let ack_dir = home.join(".euler").join("project-context");
+    let recorded = std::fs::read_dir(&ack_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recorded, 0,
+        "skipping the /new card must not record an acknowledgment"
+    );
 }

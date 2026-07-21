@@ -61,6 +61,8 @@ impl RawArgsParser {
                 scrub: None,
                 no_tty: false,
                 linefeed_history_insert: None,
+                project_context: None,
+                accept_relocation: false,
             },
             top_level_command: None,
             saw_any_arg: false,
@@ -125,6 +127,11 @@ impl RawArgsParser {
             "--compaction-budget-bytes" => self.parse_compaction_budget_bytes(args),
             "--reasoning-effort" => self.parse_reasoning_effort(args),
             "--permission-reviewer" => self.parse_permission_reviewer(args),
+            "--project-context" => self.parse_project_context(args),
+            "--accept-relocation" => {
+                self.parsed.accept_relocation = true;
+                Ok(ArgParseFlow::Continue)
+            }
             "--extensions" => self.parse_extensions(args),
             "--observe" => self.parse_observe(args),
             "--observe-cadence" => self.parse_observe_cadence(args),
@@ -480,6 +487,26 @@ impl RawArgsParser {
         let reviewer = PermissionReviewer::parse(&value)
             .ok_or_else(|| anyhow!("--permission-reviewer must be one of user|guardian"))?;
         self.parsed.permission_reviewer = Some(reviewer);
+        Ok(ArgParseFlow::Continue)
+    }
+
+    fn parse_project_context(
+        &mut self,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<ArgParseFlow> {
+        if self.parsed.project_context.is_some() {
+            return Err(anyhow!("--project-context was provided more than once"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| anyhow!("--project-context requires a value"))?;
+        let policy = euler_core::ProjectContextPolicy::parse(&value).ok_or_else(|| {
+            anyhow!(
+                "--project-context must be one of {}",
+                euler_core::ProjectContextPolicy::SUPPORTED
+            )
+        })?;
+        self.parsed.project_context = Some(policy);
         Ok(ArgParseFlow::Continue)
     }
 

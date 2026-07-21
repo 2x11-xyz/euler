@@ -7,10 +7,7 @@
 //! snapshot rejects resume or request assembly and never resurrects an
 //! older admitted snapshot.
 
-use super::digest::{
-    candidate_digest_v1, rendered_digest_v1, workspace_identity_digest_v1,
-    WORKSPACE_IDENTITY_ALGORITHM, WORKSPACE_IDENTITY_VERSION,
-};
+use super::digest::{candidate_digest_v1, rendered_digest_v1, workspace_identity_digest_v1};
 use super::framing::{render_project_context, FRAMING_VERSION};
 use super::manifest::{validate_identity, validate_reason_code, CandidateManifest};
 use super::{MAX_EULER_MD_SOURCES, MAX_MANIFEST_DIAGNOSTICS, SNAPSHOT_SCHEMA_VERSION};
@@ -160,12 +157,12 @@ fn validate_snapshot_payload(
         ));
     }
     let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
-    // Phase 2 produces exactly two statuses. Phase 3 adds the
-    // `declined`/`unacknowledged` tombstones together with their permitted
-    // policy tuples; until those tuples exist, the statuses reject.
+    // Phase 3 recognizes four statuses. `admitted` yields a pinned item;
+    // `disabled`, `declined`, and `unacknowledged` are tombstones that yield
+    // none. Each combination is still gated by the permitted-tuple table below.
     let admitted = match status {
         "admitted" => true,
-        "disabled" => false,
+        "disabled" | "declined" | "unacknowledged" => false,
         _ => {
             return Err(ProjectContextFoldError::new(
                 "its status field is not one this Euler version knows",
@@ -291,12 +288,23 @@ fn validate_admitted_manifest(
 /// table (acknowledged/declined/unacknowledged tuples) rather than
 /// rediscovering it.
 const PERMITTED_POLICY_TUPLES: &[(&str, &str, &str, &str)] = &[
+    // Phase-2 tuples, retained so sessions recorded before phase 3 still
+    // resume. `exposure_forced_off` is the dormant substrate's disabled
+    // tombstone; the collapse/boundary tombstones are policy-independent.
     ("disabled", "off", "exposure_forced_off", "none"),
     ("disabled", "off", "preflight_collapsed", "none"),
     ("disabled", "off", "boundary_indeterminate", "none"),
-    // The only admitted producer in phase 2 is the crate-internal test
-    // hook; no public path can write this tuple.
+    // The crate-internal admitted test hook; no public path can write it.
     ("admitted", "on", "test_hook", "none"),
+    // Phase-3 acknowledgment-side tuples.
+    ("admitted", "auto", "acknowledged", "acknowledged"),
+    ("admitted", "on", "explicit_opt_in", "explicit_on"),
+    ("declined", "auto", "declined_this_session", "none"),
+    ("unacknowledged", "auto", "no_acknowledgment", "none"),
+    ("disabled", "off", "disabled_by_flag", "none"),
+    ("disabled", "auto", "trusted_local_auto_off", "none"),
+    ("disabled", "auto", "no_project_context", "none"),
+    ("disabled", "on", "no_project_context", "none"),
 ];
 
 fn validate_policy_tuple(
@@ -688,38 +696,28 @@ pub(crate) enum WorkspaceIdentityIssue {
 /// Verify that the live workspace root is the workspace this session's
 /// snapshots were recorded in. Sessions without snapshots (legacy) verify
 /// trivially; false rejection is preferred to merging distinct roots.
+///
+/// The governing identity is relocation-aware: after an accepted
+/// `project.context.relocated` event, the latest relocation's `new_identity`
+/// governs, so a resume at the new path succeeds and a resume back at the old
+/// path is itself a mismatch. Any malformed or stale relocation in the chain
+/// makes the record unusable rather than falling back to an older identity.
 pub(crate) fn verify_workspace_identity(
     events: &[EventEnvelope],
     live_root: &Path,
 ) -> Result<(), WorkspaceIdentityIssue> {
-    let Some(snapshot) = events
-        .iter()
-        .rev()
-        .find(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_SNAPSHOT)
-    else {
-        return Ok(());
+    let snapshot_identity = match super::relocation::snapshot_identity(events) {
+        Ok(Some(identity)) => identity,
+        // Legacy session with no snapshot: nothing to compare against.
+        Ok(None) => return Ok(()),
+        Err(_) => return Err(WorkspaceIdentityIssue::Unusable),
     };
-    let Some(identity) = snapshot
-        .payload
-        .get("workspace_identity")
-        .and_then(Value::as_object)
-    else {
-        return Err(WorkspaceIdentityIssue::Unusable);
-    };
-    let algorithm = identity.get("algorithm").and_then(Value::as_str);
-    let version = identity.get("version").and_then(Value::as_u64);
-    let recorded_digest = identity.get("digest").and_then(Value::as_str);
-    if algorithm != Some(WORKSPACE_IDENTITY_ALGORITHM)
-        || version != Some(u64::from(WORKSPACE_IDENTITY_VERSION))
-    {
-        return Err(WorkspaceIdentityIssue::Unusable);
-    }
-    let Some(recorded_digest) = recorded_digest.filter(|digest| !digest.is_empty()) else {
-        return Err(WorkspaceIdentityIssue::Unusable);
-    };
+    let governing = super::relocation::fold_governing_identity(events, Some(snapshot_identity))
+        .map_err(|_| WorkspaceIdentityIssue::Unusable)?
+        .ok_or(WorkspaceIdentityIssue::Unusable)?;
     let canonical =
         std::fs::canonicalize(live_root).map_err(|_| WorkspaceIdentityIssue::Unresolvable)?;
-    if workspace_identity_digest_v1(&canonical) != recorded_digest {
+    if workspace_identity_digest_v1(&canonical) != governing.digest {
         return Err(WorkspaceIdentityIssue::Mismatch);
     }
     Ok(())

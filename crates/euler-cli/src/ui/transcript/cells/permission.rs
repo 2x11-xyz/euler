@@ -255,6 +255,135 @@ pub(in crate::ui::transcript) fn render_permission_batch_ask(
     push_bordered_permission_panel(lines, &rows, theme, width);
 }
 
+/// The project-context acknowledgment card (ADR 0017 phase 3). Presented
+/// before the first model request when a fresh interactive `auto` session
+/// finds unacknowledged repository guidance. Same bordered approval treatment
+/// as the permission panels; single-keypress. Plain language throughout, no
+/// digest on the face (the changed-content signal is the headline on a
+/// re-ask).
+pub(crate) struct AcknowledgmentCardView<'a> {
+    /// A short folder label shown faint in the title corner.
+    pub(crate) folder_label: &'a str,
+    /// True when this folder was acknowledged before but its guidance changed.
+    pub(crate) content_changed: bool,
+    /// The accepted `EULER.md` source identities, general to specific.
+    pub(crate) sources: &'a [String],
+    /// How many discovered files were skipped (shown only when non-zero).
+    pub(crate) skipped_count: usize,
+    /// Whether the Load option is highlighted (default: Skip, the safe bias).
+    pub(crate) load_selected: bool,
+}
+
+pub(crate) fn render_acknowledgment_card(
+    view: &AcknowledgmentCardView<'_>,
+    theme: &Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let title = if view.content_changed {
+        "This project's guidance changed. Load it?"
+    } else {
+        "Load this project's guidance?"
+    };
+    let mut rows = vec![
+        PermissionPanelRow::title_with_corner(title, view.folder_label.to_owned()),
+        PermissionPanelRow::body(String::new()),
+    ];
+    if view.content_changed {
+        rows.push(PermissionPanelRow::body(
+            "The EULER.md guidance in this folder changed since you last loaded it.",
+        ));
+    } else {
+        rows.push(PermissionPanelRow::body(
+            "This folder ships an EULER.md with instructions for how Euler should work here.",
+        ));
+    }
+    rows.push(PermissionPanelRow::body(
+        "It's guidance for the model only. It can't grant permissions, run commands, or change \
+         what Euler is allowed to do.",
+    ));
+    rows.push(PermissionPanelRow::body(String::new()));
+    rows.push(PermissionPanelRow::body("Files:"));
+    for source in view.sources {
+        rows.push(PermissionPanelRow::body(format!("  {source}")));
+    }
+    if view.skipped_count > 0 {
+        rows.push(PermissionPanelRow::body(String::new()));
+        let (files, were) = if view.skipped_count == 1 {
+            ("file", "was")
+        } else {
+            ("files", "were")
+        };
+        rows.push(PermissionPanelRow::metadata(format!(
+            "{} {files} here couldn't be read and {were} skipped.",
+            view.skipped_count
+        )));
+    }
+    rows.push(PermissionPanelRow::body(String::new()));
+    let load = "y  Load it (won't ask again unless it changes)";
+    let skip = "n  Skip for now";
+    rows.push(selectable_row(load, view.load_selected));
+    rows.push(selectable_row(skip, !view.load_selected));
+    let mut lines = Vec::new();
+    push_bordered_permission_panel(&mut lines, &rows, theme, width);
+    lines
+}
+
+/// The resume relocation-consent card (ADR 0017 phase 3, project-context
+/// contract "Resume relocation and consent"). Facts only, never a guessed
+/// reason. Adapted to the real stacked single-key idiom (no horizontal button
+/// row exists in this system).
+pub(crate) struct RelocationCardView<'a> {
+    pub(crate) recorded_folder: &'a str,
+    pub(crate) current_folder: &'a str,
+    pub(crate) last_active: &'a str,
+    /// Whether Resume is highlighted (default: Cancel, the safe bias).
+    pub(crate) resume_selected: bool,
+}
+
+pub(crate) fn render_relocation_card(
+    view: &RelocationCardView<'_>,
+    theme: &Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let rows = vec![
+        PermissionPanelRow::title_with_corner(
+            "This session last ran in a different folder",
+            String::new(),
+        ),
+        PermissionPanelRow::body(String::new()),
+        PermissionPanelRow::metadata(format!("  Last ran in:   {}", view.recorded_folder)),
+        PermissionPanelRow::metadata(format!("  Now opening:   {}", view.current_folder)),
+        PermissionPanelRow::metadata(format!("  Last active:   {}", view.last_active)),
+        PermissionPanelRow::body(String::new()),
+        PermissionPanelRow::body("Resuming here makes this folder the session's home from now on."),
+        PermissionPanelRow::body(
+            "Approvals from the old folder don't carry over: this folder keeps its own \
+             permissions and its own answer about loading project guidance.",
+        ),
+        PermissionPanelRow::body(
+            "The session keeps the guidance it already loaded. The new folder's EULER.md isn't \
+             read until you start a new session here.",
+        ),
+        PermissionPanelRow::body(String::new()),
+        selectable_row("r  Resume here", view.resume_selected),
+        selectable_row(
+            "n  Cancel (leave the session where it was)",
+            !view.resume_selected,
+        ),
+    ];
+    let mut lines = Vec::new();
+    push_bordered_permission_panel(&mut lines, &rows, theme, width);
+    lines
+}
+
+fn selectable_row(text: &str, selected: bool) -> PermissionPanelRow {
+    if selected {
+        PermissionPanelRow::selected(text)
+    } else {
+        PermissionPanelRow::body(text)
+    }
+}
+
 fn push_bordered_permission_panel(
     lines: &mut Vec<Line<'static>>,
     rows: &[PermissionPanelRow],
@@ -406,4 +535,80 @@ fn consequences_row(
         return None;
     }
     Some(format!("consequences: {}", parts.join(" · ")))
+}
+
+#[cfg(test)]
+mod acknowledgment_card_tests {
+    use super::*;
+    use crate::ui::theme::Theme;
+
+    fn text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn acknowledgment_card_shows_plain_language_and_files() {
+        let sources = vec!["EULER.md".to_owned(), "crates/EULER.md".to_owned()];
+        let view = AcknowledgmentCardView {
+            folder_label: "euler",
+            content_changed: false,
+            sources: &sources,
+            skipped_count: 2,
+            load_selected: false,
+        };
+        let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));
+        assert!(rendered.contains("Load this project's guidance?"));
+        assert!(rendered.contains("guidance for the model only"));
+        assert!(rendered.contains("EULER.md"));
+        assert!(rendered.contains("crates/EULER.md"));
+        assert!(rendered.contains("2 files here couldn't be read"));
+        assert!(rendered.contains("y  Load it"));
+        assert!(rendered.contains("n  Skip"));
+        // No digest or other contract vocabulary on the face (criterion 4).
+        assert!(!rendered.to_lowercase().contains("digest"));
+        assert!(!rendered.contains('\u{2014}'), "no em dashes in card copy");
+    }
+
+    #[test]
+    fn changed_content_leads_with_the_change_headline() {
+        let sources = vec!["EULER.md".to_owned()];
+        let view = AcknowledgmentCardView {
+            folder_label: "euler",
+            content_changed: true,
+            sources: &sources,
+            skipped_count: 0,
+            load_selected: true,
+        };
+        let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));
+        assert!(rendered.contains("This project's guidance changed. Load it?"));
+        assert!(rendered.contains("changed since you last loaded it"));
+    }
+
+    #[test]
+    fn relocation_card_states_facts_and_the_no_carry_over_line() {
+        let view = RelocationCardView {
+            recorded_folder: "/home/ada/projects/euler",
+            current_folder: "/home/ada/projects/euler-fork",
+            last_active: "2026-07-19 14:32",
+            resume_selected: false,
+        };
+        let rendered = text(&render_relocation_card(&view, &Theme::default(), 96));
+        assert!(rendered.contains("This session last ran in a different folder"));
+        assert!(rendered.contains("/home/ada/projects/euler"));
+        assert!(rendered.contains("/home/ada/projects/euler-fork"));
+        assert!(rendered.contains("Last active:"));
+        assert!(rendered.contains("don't carry over"));
+        assert!(rendered.contains("r  Resume here"));
+        assert!(rendered.contains("n  Cancel"));
+        assert!(!rendered.contains('\u{2014}'), "no em dashes in card copy");
+    }
 }

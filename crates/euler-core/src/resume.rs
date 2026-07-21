@@ -145,6 +145,15 @@ pub fn fold_session(
             EventKind::PERMISSION_PROMPT => {
                 warn_if_permission_prompt_unresolved(event, &events, &mut warnings)
             }
+            // Permission epoch (ADR 0017 phase 3): accepting a relocation
+            // invalidates every session-scoped grant recorded before it, so an
+            // earlier shell-exec or fs-write session grant cannot silently
+            // authorize an operation in the newly adopted folder. The ordered
+            // fold clears the accumulator here; only grants recorded after the
+            // latest relocation survive. Project grants reload from the new
+            // root's own consent intersection, and durable user rules (which
+            // are workspace-independent) are unaffected.
+            EventKind::PROJECT_CONTEXT_RELOCATED => session_allowed_capabilities.clear(),
             _ => {}
         }
     }
@@ -184,7 +193,8 @@ fn preflight_project_context(
         let message = match issue {
             WorkspaceIdentityIssue::Mismatch => {
                 "this session was started in a different folder (or that folder has moved); \
-                 open the original folder to resume it, or start a new session here"
+                 open the original folder to resume it, start a new session here, or pass \
+                 --accept-relocation to move this session to the current folder"
             }
             WorkspaceIdentityIssue::Unresolvable => {
                 "the current folder cannot be resolved, so this session cannot be resumed \
@@ -200,6 +210,162 @@ fn preflight_project_context(
         });
     }
     Ok(())
+}
+
+/// Facts for the relocation-consent card and the durable event an accepted
+/// relocation appends (ADR 0017 phase 3).
+pub struct RelocationRequired {
+    recorded_root: String,
+    current_root: String,
+    last_active: Option<String>,
+    relocated_event: EventEnvelope,
+}
+
+impl RelocationRequired {
+    /// Where the session last ran (the recorded/ projected workspace root).
+    pub fn recorded_root(&self) -> &str {
+        &self.recorded_root
+    }
+
+    /// Where the resume is being attempted (the live workspace root).
+    pub fn current_root(&self) -> &str {
+        &self.current_root
+    }
+
+    /// When the session was last active (the tail event's timestamp).
+    pub fn last_active(&self) -> Option<&str> {
+        self.last_active.as_deref()
+    }
+
+    /// The durable `project.context.relocated` event to append on acceptance.
+    pub fn relocated_event(&self) -> &EventEnvelope {
+        &self.relocated_event
+    }
+
+    pub fn into_relocated_event(self) -> EventEnvelope {
+        self.relocated_event
+    }
+}
+
+/// Determine whether resuming a session here requires relocation consent.
+///
+/// - `Ok(None)`: the live root already matches the recorded workspace (or a
+///   prior accepted relocation), so resume proceeds normally.
+/// - `Ok(Some(required))`: a same-host mismatch that can be relocated. The
+///   caller obtains consent (the relocation card, or `--accept-relocation`),
+///   appends `required.relocated_event()` durably, and folds the extended
+///   prefix. Declining resumes nothing.
+/// - `Err`: the workspace record is unusable or the live root is unresolvable.
+///
+/// The returned event parents the accepted tail, carries the identity folded
+/// at the prefix as `prior_identity`, and the live root's identity as
+/// `new_identity`, exactly as the fold-time validation requires.
+pub fn plan_relocation(
+    prefix: &[EventEnvelope],
+    live_root: &Path,
+) -> Result<Option<RelocationRequired>, ResumeError> {
+    use crate::project_context::WorkspaceIdentityIssue;
+    match crate::project_context::verify_workspace_identity(prefix, live_root) {
+        Ok(()) => Ok(None),
+        Err(WorkspaceIdentityIssue::Unresolvable) => Err(ResumeError::WorkspaceMismatch {
+            message: "the current folder cannot be resolved, so this session cannot be resumed \
+                      here; start a new session"
+                .to_owned(),
+        }),
+        Err(WorkspaceIdentityIssue::Unusable) => Err(ResumeError::WorkspaceMismatch {
+            message: "this session's workspace record cannot be read by this version of Euler; \
+                      start a new session"
+                .to_owned(),
+        }),
+        Err(WorkspaceIdentityIssue::Mismatch) => {
+            let prior_identity = crate::project_context::governing_identity_value(prefix)
+                .map_err(|reason| ResumeError::ProjectContextBootstrap { reason })?
+                .ok_or_else(|| ResumeError::WorkspaceMismatch {
+                    message: "this session has no workspace record to move; start a new session"
+                        .to_owned(),
+                })?;
+            let canonical =
+                std::fs::canonicalize(live_root).map_err(|_| ResumeError::WorkspaceMismatch {
+                    message: "the current folder cannot be resolved, so this session cannot be \
+                              resumed here; start a new session"
+                        .to_owned(),
+                })?;
+            // The workspace identity hashes the raw canonical path bytes, but
+            // the recorded `new_root` is a lossy display string. For a root
+            // whose canonical bytes are not valid UTF-8 the display form cannot
+            // faithfully represent the folder, so it can never re-derive to the
+            // identity. Refuse relocation for such roots rather than append an
+            // event the fold would reject (v1 behavior).
+            if !canonical_root_is_representable(&canonical) {
+                return Err(ResumeError::WorkspaceMismatch {
+                    message: "this folder's path can't be represented safely, so this session \
+                              can't be moved here; start a new session in this folder"
+                        .to_owned(),
+                });
+            }
+            let current_root = crate::session_root::session_root_for_event(live_root);
+            let recorded_root = crate::project_context::projected_new_root(prefix)
+                .map_err(|reason| ResumeError::ProjectContextBootstrap { reason })?
+                .or_else(|| session_start_root(prefix))
+                .unwrap_or_else(|| "(unknown folder)".to_owned());
+            let last_active = prefix.last().map(|event| event.ts.clone());
+            let tail = prefix
+                .last()
+                .ok_or_else(|| ResumeError::WorkspaceMismatch {
+                    message: "this session has no events to resume; start a new session".to_owned(),
+                })?;
+            let (session, agent) = prefix
+                .iter()
+                .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+                .map_or_else(
+                    || (tail.session.clone(), tail.agent.clone()),
+                    |start| (start.session.clone(), start.agent.clone()),
+                );
+            let payload = crate::project_context::build_relocated_payload(
+                &prior_identity,
+                &canonical,
+                current_root.clone(),
+                euler_event::now_rfc3339_millis(),
+            );
+            let relocated_event = EventEnvelope::new(
+                session,
+                agent,
+                Some(tail.id.clone()),
+                EventKind::PROJECT_CONTEXT_RELOCATED,
+                payload,
+            );
+            // Validation before append (mandatory): run the exact fold
+            // acceptance check the resume will apply, against the candidate
+            // event on the folded prefix. Never hand back an event the fold
+            // would reject, so a bad candidate can never reach the log.
+            crate::project_context::validate_candidate_relocation(prefix, &relocated_event)
+                .map_err(|reason| ResumeError::ProjectContextBootstrap { reason })?;
+            Ok(Some(RelocationRequired {
+                recorded_root,
+                current_root,
+                last_active,
+                relocated_event,
+            }))
+        }
+    }
+}
+
+/// Whether a canonical workspace root's path can be faithfully represented by
+/// the lossy display string the relocation event records. Only UTF-8-clean
+/// canonical paths can relocate in v1 (project-context contract, "The
+/// workspace identity payload"); a path with non-UTF-8 bytes would lose
+/// information under lossy display and could never re-derive to its identity.
+fn canonical_root_is_representable(canonical: &Path) -> bool {
+    canonical.as_os_str().to_str().is_some()
+}
+
+fn session_start_root(events: &[EventEnvelope]) -> Option<String> {
+    events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+        .and_then(|event| event.payload.get("root"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn fold_session_permission_decision(
@@ -709,4 +875,208 @@ fn hash_bytes(bytes: &[u8]) -> String {
 
 fn is_known_kind(kind: &str) -> bool {
     EventKind::ALL.contains(&kind)
+}
+
+#[cfg(test)]
+mod relocation_epoch_tests {
+    use super::*;
+    use crate::project_context::ProjectContextBootstrap;
+    use crate::redaction::SecretRedactor;
+    use crate::session_root::session_root_for_event;
+
+    fn session_start(root_display: &str, summary: Value) -> EventEnvelope {
+        EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::SESSION_START,
+            object([
+                ("provider", "fixture".into()),
+                ("model", "m".into()),
+                ("root", root_display.into()),
+                ("project_context", summary),
+            ]),
+        )
+    }
+
+    fn config_for(root: &Path) -> SessionConfig {
+        let mut config = SessionConfig::new(root.to_path_buf());
+        config.agent_id = "root".to_owned();
+        config.provider = "fixture".to_owned();
+        config.model = "m".to_owned();
+        config
+    }
+
+    fn session_grant(parent: &str) -> EventEnvelope {
+        EventEnvelope::new(
+            "session",
+            "root",
+            Some(parent.to_owned()),
+            EventKind::PERMISSION_DECISION,
+            object([
+                ("scope", "session".into()),
+                ("decision", "allowed".into()),
+                ("capability", Capability::ShellExec.as_str().into()),
+            ]),
+        )
+    }
+
+    fn old_new_prefix() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<EventEnvelope>) {
+        let temp = tempfile::tempdir().expect("temp");
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        std::fs::create_dir_all(&old).expect("old");
+        std::fs::create_dir_all(&new).expect("new");
+        let redactor = SecretRedactor::new();
+        let old_boot = ProjectContextBootstrap::dormant(&old, &redactor).expect("old boot");
+        let old_snap = old_boot.snapshot_payload();
+        let start = session_start(
+            &crate::session_root::session_root_for_event(&old),
+            old_boot.session_start_summary(),
+        );
+        let snap = EventEnvelope::new(
+            "session",
+            "root",
+            Some(start.id.clone()),
+            EventKind::PROJECT_CONTEXT_SNAPSHOT,
+            old_snap,
+        );
+        (temp, old, new, vec![start, snap])
+    }
+
+    #[test]
+    fn plan_relocation_at_recorded_root_needs_nothing() {
+        let (_temp, old, _new, prefix) = old_new_prefix();
+        assert!(plan_relocation(&prefix, &old).expect("plan").is_none());
+    }
+
+    #[test]
+    fn plan_relocation_builds_an_event_that_folds_at_the_new_root() {
+        let (_temp, old, new, prefix) = old_new_prefix();
+        let plan = plan_relocation(&prefix, &new)
+            .expect("plan")
+            .expect("relocation needed at a different root");
+        assert_eq!(
+            plan.current_root(),
+            crate::session_root::session_root_for_event(&new)
+        );
+        assert!(plan.last_active().is_some());
+        // Appending the event makes resume fold succeed at the new root, and a
+        // further plan there needs nothing.
+        let mut extended = prefix.clone();
+        extended.push(plan.into_relocated_event());
+        fold_session(&config_for(&new), extended.clone()).expect("fold after relocation");
+        assert!(plan_relocation(&extended, &new).expect("plan").is_none());
+        // A resume back at the old root is now itself a mismatch.
+        assert!(plan_relocation(&extended, &old).expect("plan").is_some());
+    }
+
+    // Attack (blocker 2): a workspace whose canonical path bytes are not valid
+    // UTF-8 cannot be faithfully represented by the lossy `new_root` display
+    // string, so relocation is refused (rather than appending a durable event
+    // the fold would then reject). Tested at the representability gate so it is
+    // deterministic across platforms (macOS refuses to even create a non-UTF-8
+    // directory name).
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_canonical_root_is_not_representable() {
+        use std::os::unix::ffi::OsStrExt;
+        let good = std::path::Path::new("/home/ada/projects/euler");
+        assert!(canonical_root_is_representable(good));
+        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/ada/bad-\xff-name"));
+        assert!(
+            !canonical_root_is_representable(&bad),
+            "a non-UTF8 canonical root must be refused so no relocation event is appended"
+        );
+    }
+
+    // The end-to-end refusal (requires creating a non-UTF-8 directory, which
+    // only some Unix filesystems allow) runs on Linux; macOS enforces UTF-8
+    // names and cannot host the fixture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_root_refuses_relocation_without_appending() {
+        use std::os::unix::ffi::OsStrExt;
+        let (temp, _old, _new, prefix) = old_new_prefix();
+        let bad = temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"bad-\xff-name"));
+        if std::fs::create_dir_all(&bad).is_err() {
+            return; // filesystem rejects non-UTF-8 names; the gate test covers it
+        }
+        match plan_relocation(&prefix, &bad) {
+            Err(ResumeError::WorkspaceMismatch { .. }) => {}
+            Err(other) => panic!("non-UTF8 root must refuse with a mismatch, got {other:?}"),
+            Ok(_) => panic!("non-UTF8 root must refuse relocation, not return a plan"),
+        }
+    }
+
+    // Attack: a session-scoped grant recorded before an accepted relocation
+    // must not silently authorize an operation in the newly adopted folder.
+    #[test]
+    fn session_grants_before_a_relocation_are_invalidated() {
+        let temp = tempfile::tempdir().expect("temp");
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        std::fs::create_dir_all(&old).expect("old");
+        std::fs::create_dir_all(&new).expect("new");
+        let redactor = SecretRedactor::new();
+        let old_boot = ProjectContextBootstrap::dormant(&old, &redactor).expect("old boot");
+        let new_boot = ProjectContextBootstrap::dormant(&new, &redactor).expect("new boot");
+        let old_snap = old_boot.snapshot_payload();
+        let prior_identity = old_snap
+            .get("workspace_identity")
+            .expect("identity")
+            .clone();
+        let new_identity = new_boot
+            .snapshot_payload()
+            .get("workspace_identity")
+            .expect("identity")
+            .clone();
+        let old_root_display = session_root_for_event(&old);
+        let new_root_display = session_root_for_event(&new);
+
+        // Control: no relocation, resumed at the recorded root; the grant folds.
+        let start = session_start(&old_root_display, old_boot.session_start_summary());
+        let snap = EventEnvelope::new(
+            "session",
+            "root",
+            Some(start.id.clone()),
+            EventKind::PROJECT_CONTEXT_SNAPSHOT,
+            old_snap.clone(),
+        );
+        let grant = session_grant(&snap.id);
+        let folded = fold_session(
+            &config_for(&old),
+            vec![start.clone(), snap.clone(), grant.clone()],
+        )
+        .expect("fold at recorded root");
+        assert!(
+            folded
+                .session_allowed_capabilities
+                .contains(&Capability::ShellExec),
+            "without a relocation the session grant folds normally"
+        );
+
+        // Relocation: the pre-relocation grant is invalidated by the epoch.
+        let reloc = EventEnvelope::new(
+            "session",
+            "root",
+            Some(grant.id.clone()),
+            EventKind::PROJECT_CONTEXT_RELOCATED,
+            object([
+                ("schema_version", 1u64.into()),
+                ("prior_identity", prior_identity),
+                ("new_identity", new_identity),
+                ("new_root", new_root_display.into()),
+                ("decided_at", "2026-07-21T00:00:00Z".into()),
+            ]),
+        );
+        let folded = fold_session(&config_for(&new), vec![start, snap, grant, reloc])
+            .expect("fold at relocated root");
+        assert!(
+            folded.session_allowed_capabilities.is_empty(),
+            "the epoch must invalidate the pre-relocation session grant"
+        );
+    }
 }
