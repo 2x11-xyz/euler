@@ -306,6 +306,13 @@ fn reasoning_details_from_item(item: &ModelInputItem) -> Option<Vec<Value>> {
 
 fn chat_message(item: &ModelInputItem) -> Option<Value> {
     match item {
+        // Project context is wrapped in a user-role envelope; the core-framed
+        // rendered bytes pass through verbatim (never trimmed, normalized,
+        // combined, or omitted — project-context contract).
+        ModelInputItem::ProjectContext { rendered } => Some(json!({
+            "role": "user",
+            "content": rendered,
+        })),
         ModelInputItem::Message { role, content } => Some(json!({
             "role": match role {
                 ModelRole::User => "user",

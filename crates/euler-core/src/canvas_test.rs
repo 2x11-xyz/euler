@@ -607,6 +607,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
         canvas
             .iter()
             .map(|item| match item {
+                CanvasItem::ProjectContext { .. } => "project.context",
                 CanvasItem::Message { role, .. } => role.as_str(),
                 CanvasItem::Projection { .. } => "projection",
                 CanvasItem::Slot { .. } => "slot",

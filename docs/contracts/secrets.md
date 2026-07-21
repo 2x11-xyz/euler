@@ -123,6 +123,19 @@ Redactor handles share one value set: a value registered on any thread
 (e.g. during a parallel-reviewer provider call) is visible to every
 emission site immediately.
 
+### Project-context preflight ordering (ADR 0017)
+
+Fresh-session startup constructs ONE redactor and seeds it with the
+environment and every stored credential known at startup BEFORE
+project-context discovery runs; the same instance rides the bootstrap into
+the session, so the session inherits it rather than building a second one.
+Candidate `EULER.md` bytes are read once, frozen, and redacted before they
+can contribute to any digest, event, diagnostic, or model input; raw
+candidate bytes and pre-redaction digests never persist anywhere. Values
+that do not exist until request time remain covered only by the token-shape
+and request-time tainting rules above — this contract does not claim to
+detect an unknown value retroactively.
+
 ### Emission chokepoints
 
 Redaction applies where text that arrived from OUTSIDE the model is

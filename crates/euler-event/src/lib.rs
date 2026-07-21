@@ -66,6 +66,16 @@ impl EventKind {
     pub const SESSION_RESUMED: &'static str = "session.resumed";
     pub const SESSION_RENAMED: &'static str = "session.renamed";
     pub const SESSION_SUMMARY: &'static str = "session.summary";
+    /// Durable, versioned record of the effective project context for a
+    /// fresh session (ADR 0017; docs/contracts/project-context.md). An
+    /// admitted snapshot carries the canonical manifest as one top-level
+    /// payload string; a disabled snapshot carries only the candidate
+    /// digest, bounded identities, counts, and content-free reason codes.
+    pub const PROJECT_CONTEXT_SNAPSHOT: &'static str = "project.context.snapshot";
+    /// Typed, content-free record of one omitted or rejected project-context
+    /// source: stable reason code, bounded relative identity when one
+    /// exists, and non-content numeric metadata only.
+    pub const PROJECT_CONTEXT_DIAGNOSTIC: &'static str = "project.context.diagnostic";
     pub const ERROR: &'static str = "error";
     pub const ALL: &[&str] = &[
         Self::USER_MESSAGE,
@@ -106,6 +116,8 @@ impl EventKind {
         Self::SESSION_RESUMED,
         Self::SESSION_RENAMED,
         Self::SESSION_SUMMARY,
+        Self::PROJECT_CONTEXT_SNAPSHOT,
+        Self::PROJECT_CONTEXT_DIAGNOSTIC,
         Self::ERROR,
     ];
 
@@ -405,6 +417,24 @@ mod tests {
             EventKind::SESSION_SUMMARY,
             object([("summary", "done".into())]),
         );
+        assert_round_trip(
+            EventKind::PROJECT_CONTEXT_SNAPSHOT,
+            object([
+                ("schema_version", 1.into()),
+                ("status", "disabled".into()),
+                ("policy", "off".into()),
+                ("resolution_reason", "exposure_forced_off".into()),
+                ("candidate_digest", "abc".into()),
+            ]),
+        );
+        assert_round_trip(
+            EventKind::PROJECT_CONTEXT_DIAGNOSTIC,
+            object([
+                ("schema_version", 1.into()),
+                ("snapshot_event_id", "01J00000000000000000000001".into()),
+                ("reason", "source_too_large".into()),
+            ]),
+        );
         assert_round_trip(EventKind::ERROR, object([("message", "failed".into())]));
     }
 
@@ -449,6 +479,8 @@ mod tests {
             EventKind::SESSION_RESUMED,
             EventKind::SESSION_RENAMED,
             EventKind::SESSION_SUMMARY,
+            EventKind::PROJECT_CONTEXT_SNAPSHOT,
+            EventKind::PROJECT_CONTEXT_DIAGNOSTIC,
             EventKind::ERROR,
         ];
 
@@ -678,6 +710,36 @@ mod tests {
             ),
             base(EventKind::SESSION_SUMMARY, json!({"summary": "done"})),
             base(
+                EventKind::PROJECT_CONTEXT_SNAPSHOT,
+                json!({
+                    "schema_version": 1,
+                    "status": "disabled",
+                    "policy": "off",
+                    "resolution_reason": "exposure_forced_off",
+                    "acknowledgment_basis": "none",
+                    "candidate_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "workspace_identity": {
+                        "algorithm": "unix-raw-osstr",
+                        "version": 1,
+                        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+                    },
+                    "ordering": "lexicographic-v1",
+                    "source_identities": ["EULER.md"],
+                    "diagnostic_count": 1,
+                    "diagnostic_reason_counts": {"source_too_large": 1}
+                }),
+            ),
+            base(
+                EventKind::PROJECT_CONTEXT_DIAGNOSTIC,
+                json!({
+                    "schema_version": 1,
+                    "snapshot_event_id": "01J00000000000000000000001",
+                    "reason": "source_too_large",
+                    "path": "crates/EULER.md",
+                    "observed": 40000
+                }),
+            ),
+            base(
                 EventKind::ERROR,
                 json!({"source": "provider", "message": "failed", "category": "transport"}),
             ),
@@ -793,6 +855,16 @@ mod tests {
                 ]
             }
             EventKind::MODEL_EFFORT_CHANGED => vec!["from_effort", "to_effort", "reason"],
+            EventKind::PROJECT_CONTEXT_SNAPSHOT => vec![
+                "schema_version",
+                "status",
+                "policy",
+                "resolution_reason",
+                "candidate_digest",
+            ],
+            EventKind::PROJECT_CONTEXT_DIAGNOSTIC => {
+                vec!["schema_version", "snapshot_event_id", "reason"]
+            }
             EventKind::SESSION_START => vec!["provider", "model"],
             EventKind::SESSION_RENAMED => vec!["name"],
             EventKind::ERROR => vec!["source", "message"],

@@ -46,6 +46,27 @@ rendered under core-generated `[slot <extension-id>:<slot>]` headers with every
 content line indented, so extension text cannot spoof canvas section markers.
 Raw provenance must not be dumped into the canvas.
 
+## Pinned Project Context
+
+An admitted `project.context.snapshot` (ADR 0017,
+`docs/contracts/project-context.md`) yields exactly one pinned
+project-context item, folded from the latest snapshot event over the full
+event slice — like context slots, it survives compaction frontiers by
+construction. The item is always first in canvas order, mapping to the
+provider-neutral position immediately after fixed Euler instructions and
+before every other input item. It carries a repository-guidance
+classification and its snapshot digest so child request assembly can filter
+the whole class (`project_context: none`) or supply it (`inherit`)
+independently of `include_parent_canvas`. Its rendered bytes are
+core-framed once, versioned, with every content line indented under
+`[euler.project-context.v1]` markers so repository text can never occupy a
+core marker position. Pinned content counts against the canvas byte budget
+and the token-proxy context check, and is never truncated, demoted to a
+stub, or silently dropped: when it cannot fit, request assembly fails
+before provider invocation with an honest context-budget event. In phase 2
+(dormant substrate) no public path produces an admitted snapshot, so live
+canvases carry no such item yet.
+
 Model/provider switches are session control events, not canvas content.
 `model.switched` events, switch reasons, provider debug metadata, and
 provenance diagnostics must not be rendered into model-facing

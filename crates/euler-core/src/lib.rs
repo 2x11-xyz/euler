@@ -17,6 +17,7 @@ pub mod grants;
 pub mod guardian;
 pub mod home;
 pub mod permissions;
+pub mod project_context;
 pub mod provenance;
 pub mod redaction;
 pub mod resume;
@@ -80,6 +81,11 @@ pub use guardian::PermissionReviewer;
 pub use home::{EulerHome, EulerHomeError};
 pub use permissions::{
     ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,
+};
+pub use project_context::{
+    ProjectContextBootstrap, ProjectContextError, ProjectContextStatus,
+    MAX_COMBINED_EULER_MD_BYTES, MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES,
+    SNAPSHOT_SCHEMA_VERSION as PROJECT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use provenance::{
     event_is_runtime_only, query_provenance, read_provenance, ProvenancePage, ProvenanceQuery,

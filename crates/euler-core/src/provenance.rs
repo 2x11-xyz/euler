@@ -258,6 +258,11 @@ fn externalized_payload_fields(kind: &str) -> &'static [&'static str] {
     match kind {
         EventKind::TOOL_RESULT => &["output"],
         EventKind::PATCH_PROPOSED | EventKind::PATCH_APPLIED => &["old", "new"],
+        // The admitted manifest is one top-level payload string; above the
+        // threshold that complete string becomes one content-addressed blob
+        // (project-context contract: individual bodies are never
+        // externalized independently).
+        EventKind::PROJECT_CONTEXT_SNAPSHOT => &["manifest"],
         _ => &[],
     }
 }

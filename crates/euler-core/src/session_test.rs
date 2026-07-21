@@ -391,7 +391,10 @@ fn into_fresh_session_carries_registered_secret_values() {
     let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
     session.add_redacted_secret("carried-secret-value-xyz");
 
-    let fresh = session.into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()));
+    let bootstrap = session
+        .prepare_fresh_project_context()
+        .expect("fresh preflight");
+    let fresh = session.into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()), bootstrap);
 
     let out = fresh
         .redactor
@@ -2632,7 +2635,10 @@ fn resume_starts_the_reteach_streak_empty() {
     // into_fresh_session (the /new path, same code path resume rebuilds
     // through) starts the tracker empty — the next failure would be rung 1.
     let _ = &temp;
-    let fresh = session.into_fresh_session("resumed", ScriptedDecider::new(vec![]));
+    let bootstrap = session
+        .prepare_fresh_project_context()
+        .expect("fresh preflight");
+    let fresh = session.into_fresh_session("resumed", ScriptedDecider::new(vec![]), bootstrap);
     assert!(
         fresh.reteach_streak_is_empty(),
         "resume/new must start the reteach tracker empty (process-local)"
@@ -2646,4 +2652,605 @@ fn reteach_escalation_is_deterministic_across_sessions() {
         run_two_bad_patches(),
         "same failure sequence must produce identical error strings"
     );
+}
+
+// ===========================================================================
+// Project-context substrate at the session seam (ADR 0017, phase 2 dormant)
+// ===========================================================================
+
+mod project_context_seam {
+    use super::*;
+    use crate::project_context::ProjectContextBootstrap;
+    use crate::redaction::SecretRedactor;
+    use crate::resume::{fold_session, read_resume_prefix, resume_session_with_outcome};
+    use euler_agents::{AgentBudget, ProjectContextPolicy};
+    use euler_provider::ProviderSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+
+    const REPO_TEXT: &str = "always run cargo nextest before pushing";
+
+    fn repo_with_euler_md(temp: &tempfile::TempDir, content: &str) -> PathBuf {
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::write(repo.join("EULER.md"), content).expect("write EULER.md");
+        repo
+    }
+
+    fn dormant_config(root: &Path) -> SessionConfig {
+        let mut config = SessionConfig::new(root);
+        config.provider = "capture".to_owned();
+        config.model = "test-model".to_owned();
+        config.project_context = Some(
+            ProjectContextBootstrap::dormant(root, &SecretRedactor::new()).expect("preflight"),
+        );
+        config
+    }
+
+    fn admitted_config(root: &Path) -> SessionConfig {
+        let mut config = SessionConfig::new(root);
+        config.provider = "capture".to_owned();
+        config.model = "test-model".to_owned();
+        config.project_context = Some(
+            ProjectContextBootstrap::admitted_for_tests(root, &SecretRedactor::new())
+                .expect("preflight"),
+        );
+        config
+    }
+
+    fn captured_session(
+        config: SessionConfig,
+    ) -> (Session<ScriptedDecider>, Arc<Mutex<Option<ModelRequest>>>) {
+        let captured = Arc::new(Mutex::new(None));
+        let provider = CapturingProvider::new(Arc::clone(&captured));
+        let session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+        (session, captured)
+    }
+
+    fn captured_request(captured: &Arc<Mutex<Option<ModelRequest>>>) -> ModelRequest {
+        captured
+            .lock()
+            .expect("captured request lock")
+            .clone()
+            .expect("captured request")
+    }
+
+    fn project_context_items(request: &ModelRequest) -> Vec<String> {
+        request
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::ProjectContext { rendered } => Some(rendered.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[derive(Debug)]
+    struct MultiCapturingProvider {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    impl euler_provider::ModelProvider for MultiCapturingProvider {
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+
+        fn invoke(
+            &self,
+            request: ModelRequest,
+        ) -> Result<euler_provider::ProviderStream, ProviderError> {
+            self.requests
+                .lock()
+                .expect("captured requests lock")
+                .push(request);
+            Ok(Box::new(
+                vec![
+                    Ok(ModelStreamEvent::TextDelta("ok".to_owned())),
+                    Ok(ModelStreamEvent::Finished {
+                        stop_reason: StopReason::Completed,
+                        usage: None,
+                    }),
+                ]
+                .into_iter(),
+            ))
+        }
+    }
+
+    #[test]
+    fn dormant_bootstrap_writes_ordered_events_and_no_repository_bytes_reach_the_provider() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let log_dir = temp.path().join("provenance");
+        std::fs::create_dir_all(&log_dir).expect("log dir");
+        let log_path = log_dir.join("events.jsonl");
+        let (session, captured) = captured_session(dormant_config(&root));
+        let mut session =
+            session.with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+
+        session.run_turn("hello").expect("turn");
+
+        // Durable bootstrap order precedes everything else.
+        let persisted = crate::read_provenance(&log_path).expect("read log");
+        let kinds: Vec<&str> = persisted
+            .iter()
+            .map(|event| event.kind.as_str())
+            .take(3)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::SESSION_START,
+                EventKind::PROJECT_CONTEXT_SNAPSHOT,
+                EventKind::USER_MESSAGE
+            ]
+        );
+        assert!(persisted[0].payload["project_context"]["expected"]
+            .as_bool()
+            .unwrap_or(false));
+        assert_eq!(persisted[1].payload["status"], json!("disabled"));
+        // Nothing content-bearing persists anywhere in the log.
+        for event in &persisted {
+            let line = event.to_json_line().expect("line");
+            assert!(!line.contains(REPO_TEXT), "leak in {}", event.kind);
+        }
+        // The provider request carries no repository bytes and no pinned item;
+        // the fixed instructions are byte-identical to a context-free session.
+        let request = captured_request(&captured);
+        assert!(project_context_items(&request).is_empty());
+        assert!(!format!("{request:?}").contains(REPO_TEXT));
+        assert_eq!(request.instructions, SYSTEM_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn admitted_snapshot_pins_the_item_first_and_instructions_stay_byte_identical() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let (mut session, captured) = captured_session(admitted_config(&root));
+
+        let events = session.run_turn("hello").expect("turn");
+
+        let request = captured_request(&captured);
+        // Exactly one pinned item, ordered before every other input item.
+        let items = project_context_items(&request);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            request.input.first(),
+            Some(ModelInputItem::ProjectContext { .. })
+        ));
+        assert!(items[0].contains(REPO_TEXT));
+        // Repository bytes never enter ModelRequest.instructions.
+        assert_eq!(request.instructions, SYSTEM_INSTRUCTIONS);
+        // model.call records the rendered-context digest.
+        let model_call = events
+            .iter()
+            .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+            .expect("model.call");
+        let digest = model_call.payload["project_context_digest"]
+            .as_str()
+            .expect("digest recorded");
+        assert_eq!(digest.len(), 64);
+    }
+
+    #[test]
+    fn mid_session_file_mutation_and_deletion_never_change_live_requests() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let (mut session, captured) = captured_session(admitted_config(&root));
+
+        session.run_turn("one").expect("turn one");
+        let first = captured_request(&captured);
+        std::fs::write(root.join("EULER.md"), "mutated after startup").expect("mutate");
+        session.run_turn("two").expect("turn two");
+        let second = captured_request(&captured);
+        std::fs::remove_file(root.join("EULER.md")).expect("delete");
+        session.run_turn("three").expect("turn three");
+        let third = captured_request(&captured);
+
+        assert_eq!(
+            project_context_items(&first),
+            project_context_items(&second)
+        );
+        assert_eq!(project_context_items(&first), project_context_items(&third));
+        assert!(!format!("{third:?}").contains("mutated after startup"));
+    }
+
+    #[test]
+    fn independent_sessions_get_independent_snapshots() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let (mut a, captured_a) = captured_session(admitted_config(&root));
+        // Session C starts after the file changes; A keeps its snapshot.
+        a.run_turn("one").expect("a turn");
+        std::fs::write(root.join("EULER.md"), "new guidance for later sessions").expect("mutate");
+        let (mut c, captured_c) = captured_session(admitted_config(&root));
+        c.run_turn("one").expect("c turn");
+        a.run_turn("two").expect("a turn two");
+
+        let a_items = project_context_items(&captured_request(&captured_a));
+        let c_items = project_context_items(&captured_request(&captured_c));
+        assert!(a_items[0].contains(REPO_TEXT));
+        assert!(c_items[0].contains("new guidance for later sessions"));
+    }
+
+    #[test]
+    fn child_default_none_filters_project_context_even_with_parent_canvas() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = MultiCapturingProvider {
+            requests: Arc::clone(&requests),
+        };
+        let mut session = Session::new(
+            admitted_config(&root),
+            provider,
+            ScriptedDecider::new(Vec::new()),
+        )
+        .with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+
+        let task = AgentTask::new("summarize", "default", "capture", "test-model").expect("task");
+        assert!(task.includes_parent_canvas());
+        let summary = session.spawn_companion(task).expect("companion");
+        assert!(summary.result.ok());
+
+        let child_requests = requests.lock().expect("requests lock");
+        assert_eq!(child_requests.len(), 1);
+        assert!(project_context_items(&child_requests[0]).is_empty());
+        assert!(!format!("{:?}", child_requests[0]).contains(REPO_TEXT));
+        // The spawn event records the explicit default policy.
+        let spawn = session
+            .events()
+            .iter()
+            .find(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
+            .expect("agent.spawn");
+        assert_eq!(spawn.payload["project_context"], json!("none"));
+    }
+
+    #[test]
+    fn child_inherit_supplies_the_snapshot_even_without_parent_canvas() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = MultiCapturingProvider {
+            requests: Arc::clone(&requests),
+        };
+        let mut session = Session::new(
+            admitted_config(&root),
+            provider,
+            ScriptedDecider::new(Vec::new()),
+        )
+        .with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+        // Run one root turn so the parent canvas has non-project items.
+        session.run_turn("root turn").expect("root turn");
+
+        let task = AgentTask::new("summarize", "default", "capture", "test-model")
+            .expect("task")
+            .with_parent_canvas(false)
+            .with_project_context(ProjectContextPolicy::Inherit);
+        let summary = session.spawn_companion(task).expect("companion");
+        assert!(summary.result.ok());
+
+        let child_requests = requests.lock().expect("requests lock");
+        let child = child_requests.last().expect("child request");
+        let items = project_context_items(child);
+        assert_eq!(items.len(), 1, "inherit supplies exactly the snapshot");
+        assert!(items[0].contains(REPO_TEXT));
+        assert!(matches!(
+            child.input.first(),
+            Some(ModelInputItem::ProjectContext { .. })
+        ));
+        // include_parent_canvas=false still holds for non-project items.
+        assert!(!format!("{child:?}").contains("root turn"));
+        let spawn = session
+            .events()
+            .iter()
+            .find(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
+            .expect("agent.spawn");
+        assert_eq!(spawn.payload["project_context"], json!("inherit"));
+    }
+
+    #[test]
+    fn parallel_inheriting_reviewers_share_one_pre_fanout_snapshot() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = MultiCapturingProvider {
+            requests: Arc::clone(&requests),
+        };
+        let mut session = Session::new(
+            admitted_config(&root),
+            provider,
+            ScriptedDecider::new(Vec::new()),
+        )
+        .with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+
+        let brief = |name: &str, policy: ProjectContextPolicy| {
+            AgentTask::new(name, "default", "capture", "test-model")
+                .expect("task")
+                .with_parent_canvas(false)
+                .with_project_context(policy)
+                .with_budget(AgentBudget::new(Some(1), Some(0), None).expect("budget"))
+        };
+        let summaries = session
+            .spawn_reviewers_parallel(
+                vec![
+                    brief("inheriting one", ProjectContextPolicy::Inherit),
+                    brief("inheriting two", ProjectContextPolicy::Inherit),
+                    brief("isolated", ProjectContextPolicy::None),
+                ],
+                &AtomicBool::new(false),
+            )
+            .expect("batch");
+        assert!(summaries.iter().all(|summary| summary.result.ok()));
+
+        let batch = requests.lock().expect("requests lock");
+        let rendered: Vec<Vec<String>> = batch.iter().map(project_context_items).collect();
+        let inheriting: Vec<&Vec<String>> =
+            rendered.iter().filter(|items| !items.is_empty()).collect();
+        assert_eq!(inheriting.len(), 2);
+        assert_eq!(
+            inheriting[0], inheriting[1],
+            "one shared immutable snapshot"
+        );
+        assert!(
+            rendered.iter().any(Vec::is_empty),
+            "none-policy child is clean"
+        );
+    }
+
+    #[test]
+    fn pinned_context_budget_equality_fits_and_one_token_over_fails() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+
+        // Discover the exact requirement from a real request.
+        let mut config = admitted_config(&root);
+        config.max_output_tokens = Some(100);
+        let (mut session, captured) = captured_session(config);
+        session.run_turn("hello").expect("turn");
+        let request = captured_request(&captured);
+        let pinned_bytes = project_context_items(&request)[0].len();
+        let admission = crate::project_context::admission_required_tokens(
+            request.instructions.len(),
+            pinned_bytes,
+            100,
+        )
+        .expect("no overflow");
+        let request_time =
+            crate::project_context::request_required_tokens(&request, 100).expect("no overflow");
+        let required = admission.max(request_time);
+
+        // Equality with the known limit fits.
+        let mut config = admitted_config(&root);
+        config.max_output_tokens = Some(100);
+        config.context_limit = ContextLimitConfig::from_catalog_window(required);
+        let (mut session, captured) = captured_session(config);
+        session.run_turn("hello").expect("fits at equality");
+        assert!(captured.lock().expect("lock").is_some());
+
+        // One token over does not, and it fails before provider invocation.
+        let mut config = admitted_config(&root);
+        config.max_output_tokens = Some(100);
+        config.context_limit = ContextLimitConfig::from_catalog_window(required - 1);
+        let (mut session, captured) = captured_session(config);
+        let error = session.run_turn("hello").expect_err("over budget");
+        assert!(matches!(
+            error,
+            SessionError::ProjectContextOverTokenBudget { .. }
+        ));
+        assert!(captured.lock().expect("lock").is_none(), "no provider call");
+        let error_event = session
+            .events()
+            .iter()
+            .find(|event| event.kind.as_str() == EventKind::ERROR)
+            .expect("honest context-budget event");
+        assert!(error_event.payload["message"]
+            .as_str()
+            .expect("message")
+            .contains("does not fit"));
+    }
+
+    #[test]
+    fn resume_is_byte_equivalent_from_provenance_and_ignores_filesystem_changes() {
+        let temp = tempfile::tempdir().expect("temp");
+        // Large enough to force the manifest into a content-addressed blob
+        // (provenance threshold is 8 KiB), proving rehydration verifies and
+        // reuses the exact persisted bytes.
+        let large = format!("{REPO_TEXT}\n{}", "x".repeat(12 * 1024));
+        let root = repo_with_euler_md(&temp, &large);
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+
+        let (session, captured) = captured_session(admitted_config(&root));
+        let mut session =
+            session.with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+        session.run_turn("hello").expect("turn");
+        let original_items = project_context_items(&captured_request(&captured));
+        drop(session);
+
+        // The blob actually exists on disk (externalized manifest).
+        let persisted = std::fs::read_to_string(&log_path).expect("raw log");
+        assert!(persisted.contains("blob:"), "manifest was externalized");
+        assert!(
+            !persisted.contains(REPO_TEXT),
+            "log line has no inline body"
+        );
+
+        // Change the working tree after the fact; resume must not care.
+        std::fs::write(root.join("EULER.md"), "completely different now").expect("mutate");
+
+        let captured_resume = Arc::new(Mutex::new(None));
+        let provider = CapturingProvider::new(Arc::clone(&captured_resume));
+        let mut config = SessionConfig::new(&root);
+        config.provider = "capture".to_owned();
+        config.model = "test-model".to_owned();
+        let outcome = resume_session_with_outcome(
+            config,
+            ProviderSet::single(provider),
+            ScriptedDecider::new(Vec::new()),
+            &log_path,
+        )
+        .expect("resume");
+        let mut resumed = outcome.session;
+        resumed.run_turn("again").expect("resumed turn");
+        let resumed_items = project_context_items(&captured_request(&captured_resume));
+        assert_eq!(
+            original_items, resumed_items,
+            "byte-equivalent after resume"
+        );
+        assert!(resumed_items[0].contains(REPO_TEXT));
+    }
+
+    #[test]
+    fn resume_from_a_different_workspace_fails_with_plain_remediation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let other = temp.path().join("other-workspace");
+        std::fs::create_dir_all(&other).expect("other");
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+
+        let (session, _captured) = captured_session(dormant_config(&root));
+        let mut session =
+            session.with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+        session.run_turn("hello").expect("turn");
+        drop(session);
+
+        let prefix = read_resume_prefix(&log_path).expect("prefix");
+        // Same workspace folds fine.
+        let mut same = SessionConfig::new(&root);
+        same.provider = "capture".to_owned();
+        fold_session(&same, prefix.clone()).expect("same workspace resumes");
+        // A different workspace is rejected with a human next step.
+        let mut moved = SessionConfig::new(&other);
+        moved.provider = "capture".to_owned();
+        let error = fold_session(&moved, prefix).expect_err("workspace mismatch");
+        let message = error.to_string();
+        assert!(message.contains("different folder"), "got: {message}");
+        assert!(message.contains("start a new session"), "got: {message}");
+        assert!(
+            !message.contains("digest"),
+            "remediation speaks user, not contract: {message}"
+        );
+    }
+
+    #[test]
+    fn legacy_sessions_resume_with_project_context_disabled() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+
+        // A legacy session: no bootstrap configured, no snapshot events.
+        let mut config = SessionConfig::new(&root);
+        config.provider = "capture".to_owned();
+        config.model = "test-model".to_owned();
+        let captured = Arc::new(Mutex::new(None));
+        let provider = CapturingProvider::new(Arc::clone(&captured));
+        let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+            .with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+        session.run_turn("hello").expect("turn");
+        drop(session);
+
+        let captured_resume = Arc::new(Mutex::new(None));
+        let provider = CapturingProvider::new(Arc::clone(&captured_resume));
+        let mut config = SessionConfig::new(&root);
+        config.provider = "capture".to_owned();
+        config.model = "test-model".to_owned();
+        let outcome = resume_session_with_outcome(
+            config,
+            ProviderSet::single(provider),
+            ScriptedDecider::new(Vec::new()),
+            &log_path,
+        )
+        .expect("legacy resume");
+        let mut resumed = outcome.session;
+        resumed.run_turn("again").expect("resumed turn");
+        let request = captured_request(&captured_resume);
+        assert!(project_context_items(&request).is_empty());
+        assert!(!format!("{request:?}").contains(REPO_TEXT));
+    }
+
+    #[test]
+    fn new_after_resume_rebuilds_the_bootstrap() {
+        // Reviewer attack (blocker 3): a resumed session carries no
+        // bootstrap in config (its snapshot folds from events), so a /new
+        // gated on config presence silently produced a legacy-shaped fresh
+        // session with no summary and no snapshot. The fresh session must
+        // always run its own preflight.
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+        let (session, _captured) = captured_session(dormant_config(&root));
+        let mut session =
+            session.with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+        session.run_turn("hello").expect("turn");
+        drop(session);
+
+        let captured_resume = Arc::new(Mutex::new(None));
+        let provider = CapturingProvider::new(Arc::clone(&captured_resume));
+        let mut config = SessionConfig::new(&root);
+        config.provider = "capture".to_owned();
+        config.model = "test-model".to_owned();
+        let resumed = resume_session_with_outcome(
+            config,
+            ProviderSet::single(provider),
+            ScriptedDecider::new(Vec::new()),
+            &log_path,
+        )
+        .expect("resume")
+        .session;
+
+        let bootstrap = resumed
+            .prepare_fresh_project_context()
+            .expect("fresh preflight");
+        let fresh = resumed.into_fresh_session(
+            "fresh-after-resume",
+            ScriptedDecider::new(Vec::new()),
+            bootstrap,
+        );
+        let events = fresh.events();
+        assert_eq!(events[0].kind.as_str(), EventKind::SESSION_START);
+        assert!(
+            events[0].payload.get("project_context").is_some(),
+            "fresh session announces its bootstrap"
+        );
+        assert_eq!(
+            events[1].kind.as_str(),
+            EventKind::PROJECT_CONTEXT_SNAPSHOT,
+            "fresh session records its snapshot"
+        );
+        crate::project_context::validate_bootstrap_shape(events).expect("bootstrap shape");
+    }
+
+    #[test]
+    fn mixed_bootstrap_shapes_fail_resume_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+        let (session, _captured) = captured_session(dormant_config(&root));
+        let mut session =
+            session.with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+        session.run_turn("hello").expect("turn");
+        drop(session);
+
+        let prefix = read_resume_prefix(&log_path).expect("prefix");
+        let mut config = SessionConfig::new(&root);
+        config.provider = "capture".to_owned();
+        // Drop the snapshot event: summary without snapshot fails closed.
+        let mutilated: Vec<_> = prefix
+            .iter()
+            .filter(|event| event.kind.as_str() != EventKind::PROJECT_CONTEXT_SNAPSHOT)
+            .cloned()
+            .collect();
+        assert!(fold_session(&config, mutilated).is_err());
+    }
 }

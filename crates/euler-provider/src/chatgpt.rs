@@ -272,6 +272,13 @@ fn request_body(request: &ModelRequest) -> Value {
 
 fn input_item(item: &ModelInputItem) -> Option<Value> {
     match item {
+        // Project context is wrapped in a user-role envelope; the core-framed
+        // rendered bytes pass through verbatim (never trimmed, normalized,
+        // combined, or omitted — project-context contract).
+        ModelInputItem::ProjectContext { rendered } => Some(json!({
+            "role": "user",
+            "content": rendered,
+        })),
         ModelInputItem::Message { role, content } => Some(json!({
             "role": role.as_str(),
             "content": content,

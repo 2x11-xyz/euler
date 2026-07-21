@@ -1,10 +1,23 @@
 # Project Context Contract (binding shape)
 
 ADR 0017 governs project context; this contract binds its concrete shape.
-Implementation status: NOTHING in this contract is implemented. Every section
-binds the eventual shape, not present behavior; issue #180 tracks the slices.
-As each slice lands, its statements convert from bound shape to implemented
-truth, and this line shrinks accordingly.
+Implementation status: the phase-2 dormant substrate is implemented (issue
+#180, delivery slice 2) with effective exposure forced off. Implemented
+truth: `EULER.md` discovery/containment/bounds, preflight redaction
+ordering, the candidate manifest and all four digest domains, the
+`project.context.snapshot`/`project.context.diagnostic` events and durable
+bootstrap, core framing and the pinned provider-neutral input with its
+budget accounting, provenance-only resume with workspace-identity
+enforcement, and child `none | inherit` filtering at request assembly. NOT
+yet implemented (still bound shape): every statement about `--project-context`
+policy resolution, the acknowledgment record and store ("Acknowledgment
+record" section in full), skills and `skill_read` ("Skills" section, the
+skill rows of the bounds table, and skill fields of the snapshot), the
+always-on catalog, explicit reload, and guardian/worker `inherit` wiring
+(today every child uses the `none` default). In phase 2 the only public
+bootstrap constructor resolves disabled, so no root session can expose
+repository text; issue #180 tracks the remaining slices, and this paragraph
+shrinks as they land.
 
 ## Definition and non-authority
 
@@ -33,12 +46,31 @@ permission machinery as one suggested by an ordinary user message.
   state: tracked, untracked, and ignored files are admitted identically. An
   ignored `EULER.md` or skill directory is the supported private per-project
   overlay; snapshots record and frame it like any other source.
-- Containment: sources open relative to held root handles with
-  no-follow/beneath semantics; symlinks, reparse points, and non-regular
-  files are rejected; a platform that cannot no-follow-read omits the source.
-  Unstable reads retry once, then omit with a `changed_during_read`
-  diagnostic. Malformed, unsafe, or over-limit sources are omitted whole with
-  typed diagnostics, never truncated.
+- Containment: the workspace anchor is established by a component-wise
+  no-follow `openat` walk from the filesystem root (a check-then-open of an
+  absolute path is not sufficient); a component that resolves to a symlink
+  fails discovery closed with a typed diagnostic. Sources then open relative
+  to those held handles with no-follow/beneath semantics; symlinks, reparse
+  points, and non-regular files are rejected; a platform that cannot
+  no-follow-read omits the source. Directory enumeration is bounded: a level
+  with more entries than the frozen cap is unknowable — its `.git` presence
+  and its contents equally — so the boundary search may neither claim it as
+  a marker nor continue past it, because an indeterminate level must never
+  widen discovery upward across a possible nested-repository boundary. The
+  whole preflight fails closed instead: zero sources, a typed
+  `dir_entries_exceeded` diagnostic with the observed count plus a
+  `marker_indeterminate` record, and a disabled snapshot
+  (`resolution_reason: boundary_indeterminate`). A level whose enumeration
+  fails outright during the boundary search closes the preflight the same
+  way (`io_error` plus `marker_indeterminate`). These records carry no path:
+  no discovery root exists yet to relativize against, and ancestor path
+  fragments are outside-workspace data the manifest must not carry.
+  Admission requires two bounded reads from
+  independently verified handles with byte-identical results (per-handle
+  stable-metadata comparison is only a fast-path reject); an unstable
+  verification retries once, then omits with a `changed_during_read`
+  diagnostic. Malformed, unsafe, or over-limit sources are omitted whole
+  with typed diagnostics, never truncated.
 
 Bounds (frozen by this contract; changing one is a contract change):
 
@@ -48,6 +80,7 @@ Bounds (frozen by this contract; changing one is a contract change):
 | Accepted `EULER.md` sources | 16 |
 | One `EULER.md` | 32 KiB |
 | Combined accepted `EULER.md` content | 64 KiB |
+| Directory entries examined per directory level | 4096 |
 | Skill traversal depth below each skills root | 6 |
 | Skill directories examined across all roots | 512 |
 | Accepted skills | 64 |
@@ -65,10 +98,22 @@ admission priority when the aggregate instruction budget forces a choice.
 Project-context preflight is local and occurs before acknowledgment because
 Euler must compute the digest the acknowledgment names. That preflight is not
 general filesystem authority: it uses only the discovery paths and bounds
-above, reads each attempt from one verified handle, retries an unstable source
-at most once as specified above, and freezes only the stable bytes so
-acknowledgment, persistence, and prompt assembly cannot observe different
-versions of a file.
+above, reads each verification from independently verified handles, retries
+an unstable source at most once as specified above, and freezes only the
+byte-stable result so acknowledgment, persistence, and prompt assembly
+cannot observe different versions of a file.
+
+Preflight failure is never silent degradation. A fresh session is never
+composed without its bootstrap: a preflight whose diagnostics exceed the
+manifest bound, or that cannot assemble a valid manifest for any other
+reason, collapses into a disabled result whose manifest contains exactly one
+typed record (`diagnostic_overflow` with the observed count, or
+`preflight_invalid`) and admits nothing — the collapse participates in the
+candidate digest like any other manifest content. The one unrecoverable
+case is a workspace root that cannot be canonicalized: a session whose root
+cannot be resolved cannot enforce any path-keyed rule, so fresh session
+start fails with a plain-language error instead of inventing an
+identity-less snapshot or starting a legacy-shaped session.
 
 The host constructs one startup redactor before preflight, seeds it with the
 environment, the selected auth store, and every other credential value known
@@ -149,7 +194,34 @@ per-project trust store.
   not regenerated during resume. Rehydration verifies the blob address and
   length, rejects invalid UTF-8, duplicate keys, trailing data, unsupported
   versions, limit violations, and internal digest mismatches, and never falls
-  back to current project files.
+  back to current project files. Recorded snapshot and diagnostic payloads
+  are untrusted input on fold: every field of both the admitted and the
+  disabled shapes is re-validated against the rules the encoder obeys —
+  unknown payload fields, malformed digest shapes, non-normalized or
+  traversal identities, unknown workspace-identity algorithm/version pairs,
+  reason codes outside the stable grammar, and per-reason counts that do not
+  match the recorded diagnostics all reject. Field-by-field validity is not
+  sufficient: the (status, policy, resolution_reason, acknowledgment_basis)
+  combination must be one this Euler version can produce. The permitted
+  tuples are frozen per phase and extended — never rediscovered — by later
+  slices:
+
+  | status | policy | resolution_reason | acknowledgment_basis |
+  |---|---|---|---|
+  | disabled | off | exposure_forced_off | none |
+  | disabled | off | preflight_collapsed | none |
+  | disabled | off | boundary_indeterminate | none |
+  | admitted | on | test_hook | none |
+
+  (`test_hook` is writable only by the crate-internal phase-2 test hook; no
+  public path produces an admitted tuple. Phase 3 replaces it with the
+  acknowledgment-side tuples and adds the `declined`/`unacknowledged`
+  statuses with theirs; until a status has a permitted tuple it rejects.)
+  The `session.start` project-context summary is validated with the same
+  rigor — key whitelist and grammar — and every overlapping field (status,
+  policy, resolution reason, acknowledgment basis, candidate digest, source
+  and diagnostic counts) must agree exactly with the snapshot it announces;
+  any mismatch fails the bootstrap shape.
 - `project.context.diagnostic` events record omissions without embedding
   unsafe content. Their payload is limited to a stable reason code, bounded
   normalized relative identity when one exists, and non-content numeric
