@@ -25,17 +25,18 @@ from intent to shipped; details in `CHANGELOG.md`.
   from its provenance log instead of re-exploring from scratch.
 - **Honest cap summaries.** When a session hits its round limit, report what
   was done and where it stopped, not a canned line.
-- **Causal-DAG ergonomics.** Friendlier paging for long logs, remaining
-  non-mutating read affordances, degrade-instead-of-fail on stale hint
-  pointers.
+- **Causal-DAG redesign.** The extension is paused for a behavior-first
+  redesign in euler-extensions (its schemas and golden fixtures are the
+  spec); the old ergonomics issues fold into that redesign as inputs.
 
 ## After that
 
 - **Richer retention tiers.** Auto-compaction beyond `off`/`stubs`:
   structured indexes over demoted content, and extension-owned compactors
   that summarize with domain knowledge (the causal DAG as the first one).
-- **More bundled extensions.** Literature review and writing/synthesis
-  workflows on the same SDK.
+- **More first-party extensions.** Literature review and writing/synthesis
+  workflows on the same SDK, distributed through euler-extensions rather
+  than bundled into the binary.
 
 ## Principles that shape all of it
 

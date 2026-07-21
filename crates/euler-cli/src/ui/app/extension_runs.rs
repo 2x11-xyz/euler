@@ -185,7 +185,7 @@ impl AppCore {
                 &worker_request.command,
             ) {
                 Ok(Some((extension, descriptor))) => {
-                    worker_request.extension = Box::new(extension);
+                    *worker_request.extension = extension;
                     worker_request.capabilities = descriptor.required_capabilities;
                 }
                 Ok(None) => {

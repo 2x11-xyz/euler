@@ -1847,6 +1847,59 @@ fn observe_unlinked_extension_id_is_an_honest_error() {
 }
 
 #[test]
+fn linked_launch_consent_joins_the_session_extension_set() {
+    // `extension enable` records linked launch consent only; a fresh session
+    // must still see the extension in its enabled set (tool advertisement,
+    // e.g. code-swarm) without a separate --extensions opt-in.
+    let home = tempfile::tempdir().expect("home");
+    std::env::set_var("EULER_HOME", home.path());
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    std::fs::write(
+        extension_dir.path().join(euler_core::EXTENSION_MANIFEST_FILE),
+        r#"{
+  "version": 1,
+  "id": "example-extension",
+  "display_name": "Example Extension",
+  "extension_version": "0.1.0",
+  "runtime_kind": "managed-process",
+  "entrypoint": {"command": ["./run.sh"]},
+  "capabilities": ["provenance-read"],
+  "commands": [
+    {
+      "name": "inspect",
+      "display_name": "Inspect",
+      "summary": "Inspect provenance.",
+      "required_capabilities": ["provenance-read"]
+    }
+  ]
+}"#,
+    )
+    .expect("write extension manifest");
+    let registry = euler_core::ExtensionRegistry::new(
+        euler_core::EulerHome::resolve().expect("euler home"),
+    )
+    .expect("registry");
+    let package =
+        euler_sdk::load_extension_package(extension_dir.path()).expect("load package");
+    registry.link_package(package).expect("link package");
+    registry
+        .set_linked_execution_enabled("example-extension", true)
+        .expect("enable launch consent");
+
+    let root = tempfile::tempdir().expect("root");
+    let enabled = crate::extension_enablement::resolve_session_extensions(
+        root.path(),
+        &crate::extension_enablement::ExtensionSelection::default(),
+    )
+    .expect("resolve session extensions");
+
+    assert!(
+        enabled.contains("example-extension"),
+        "launch consent must join the session set, got: {enabled:?}"
+    );
+}
+
+#[test]
 fn chatgpt_56_catalog_limit_uses_effective_window_and_provider_compaction_threshold() {
     let root = tempfile::tempdir().expect("root");
     let mut config = session_config(

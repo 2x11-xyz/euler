@@ -21,9 +21,10 @@ survived. Your agent's dead ends are data. Euler keeps them.
 
 - **Runtime-extensible core.** A small provenance-bearing core powers extensions
   via `euler-sdk`: commands, context slots, artifacts, checkpoints, and
-  capabilities behind one host API. Extensions can be enabled, disabled, and
-  selected per run. Bundled extensions include causal DAG, autoresearch,
-  maxproof, code-swarm, session-export, and diagnostics-report.
+  capabilities behind one host API. Euler ships core-only: extensions are
+  linked or installed packages, and the first-party set (session-export,
+  code-swarm, diagnostics-report, autoresearch, maxproof) lives in
+  [euler-extensions](https://github.com/2x11-xyz/euler-extensions).
 
 - **Multi-model, multi-agent, trust-aware.** Supports OpenAI, Anthropic, and
   OpenRouter, with companion agents spawned inside sessions. Local-first by
@@ -33,7 +34,9 @@ survived. Your agent's dead ends are data. Euler keeps them.
 The signature extension is the **causal DAG**: your session rendered as a
 branching tree of attempts (open, blocked, inconclusive, successful, verified,
 dead end, superseded, or abandoned) queryable by you *and by the agent itself*, so runs compound
-instead of restarting.
+instead of restarting. It is currently being redesigned as a standalone
+extension; its schemas and golden fixtures live in euler-extensions, and the
+rendering below is from a real session run with the previous implementation.
 
 <p align="center"><img src="docs/assets/knuth-gpt55-xhigh.png" alt="Causal DAG of a GPT-5.5 session implementing Knuth's up-arrow, rendered as a 3D constellation against a time axis" width="760"></p>
 
@@ -117,18 +120,19 @@ extensions.
 
 ## Extensions
 
-Euler is designed as a platform, not a fixed agent. Bundled native extensions run
-today and can be enabled, disabled, or selected per session. Local packages can
-be validated, linked, installed, searched, and audited. Explicitly enabled,
-linked `managed-process` packages can also run through the language-neutral
-JSON-RPC stdio runtime via explicit headless `extension run` on macOS and
-Linux; Python is the first SDK, not a special runtime kind.
+Euler is designed as a platform, not a fixed agent, and it ships core-only:
+every extension is an explicit local decision. Packages can be validated,
+linked, installed, searched, and audited; explicitly enabled `managed-process`
+packages run through the language-neutral JSON-RPC stdio runtime on macOS and
+Linux; Python is the first SDK, not a special runtime kind. First-party
+extensions live in
+[euler-extensions](https://github.com/2x11-xyz/euler-extensions):
 
 ```sh
-euler extension list
-euler extension enable causal-dag
+git clone https://github.com/2x11-xyz/euler-extensions
+cargo build --release --manifest-path euler-extensions/extensions/session-export/Cargo.toml
+euler extension link euler-extensions/extensions/session-export
 euler extension enable session-export
-euler extension run causal-dag.export ./session.jsonl   # your session as a DAG
 euler extension run session-export.session-export ./session.jsonl
 ```
 
@@ -151,8 +155,8 @@ contracts extensions rely on live in [docs/contracts/](docs/contracts/).
   provenance monitoring, auto-compaction policies
 - [Building extensions](docs/guides/extensions.md): SDK traits, commands,
   context slots, and Python/managed-process packages
-- [The causal DAG](docs/guides/causal-dag.md): observations, hints schema,
-  export, rendering
+- [First-party extensions](https://github.com/2x11-xyz/euler-extensions):
+  the converted extension set and the causal-DAG spec package
 - [Design contracts](docs/contracts/): canvas, provenance, tools,
   capabilities, multi-agent, secrets
 - [Roadmap](docs/roadmap.md): where this is going
@@ -160,8 +164,8 @@ contracts extensions rely on live in [docs/contracts/](docs/contracts/).
 ## Status
 
 v0.1.0 is nascent and moving fast. The core loop, providers, permissions,
-provenance, and bundled extensions work today and are exercised daily by fleets
-of Euler agents building Euler. Interfaces may still shift; the provenance
+provenance, and the linked-extension runtime work today and are exercised
+daily by fleets of Euler agents building Euler. Interfaces may still shift; the provenance
 schema is versioned. Rough edges are tracked as
 [GitHub issues](https://github.com/2x11-xyz/euler/issues).
 

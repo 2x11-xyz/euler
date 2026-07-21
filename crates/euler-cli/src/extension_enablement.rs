@@ -80,6 +80,16 @@ fn registry_enabled_set(
             enabled.insert(id);
         }
     }
+    // `extension enable` records linked launch consent; that decision IS the
+    // session selection too. A consented extension joins fresh sessions
+    // without a separate --extensions opt-in, matching what the TUI manager
+    // reports; the project overlay still applies on top and can disable it
+    // per project, and every execution revalidates the package.
+    for id in valid {
+        if registry.linked_execution_enabled(id)?.is_enabled() {
+            enabled.insert(id.clone());
+        }
+    }
     Ok(enabled)
 }
 
