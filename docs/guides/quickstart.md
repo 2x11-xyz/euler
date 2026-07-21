@@ -63,6 +63,9 @@ failure.
 The catalog contains only public model metadata. Provider credentials are
 never downloaded into, copied into, or resolved by the catalog client.
 
+See [Provider catalog and model updates](provider-catalog.md) for the complete
+publication, binary-embedding, runtime-refresh, and failure lifecycle.
+
 If an older Euler generated `~/.euler/models.json`, the new loader recognizes
 its exact `"generated_by": "euler models refresh"` marker and ignores that
 obsolete machine-owned overlay. It leaves the file in place in case it was

@@ -145,6 +145,8 @@ contracts extensions rely on live in [docs/contracts/](docs/contracts/).
 - [Field evidence](docs/notes/field-evidence.md): external results that
   pressure-test the thesis, and what Euler takes from each
 - [Quickstart](docs/guides/quickstart.md): install → login → first session
+- [Provider catalog and model updates](docs/guides/provider-catalog.md): daily
+  publication, release embedding, automatic TUI checks, and explicit refresh
 - [Headless & long-horizon runs](docs/guides/headless.md): fleets, briefs,
   provenance monitoring, auto-compaction policies
 - [Building extensions](docs/guides/extensions.md): SDK traits, commands,
