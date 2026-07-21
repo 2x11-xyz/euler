@@ -269,11 +269,9 @@ envelope `v` per `docs/contracts/persistence.md`.
   grammar, and `content` is UTF-8 text capped at 4096 bytes. Control characters
   other than newline are rejected. Empty `content` deletes the slot. Slot
   payloads are below the blob externalization threshold and remain inline.
-- `project.context.relocated` (bound ahead of implementation in
-  `docs/contracts/project-context.md`, issue #180 phase 3; not implemented
-  today; `project.context.snapshot` and `project.context.diagnostic` have
-  their own ratified entries below): records an accepted resume relocation
-  and carries:
+- `project.context.relocated` (schema version 1; ADR 0017,
+  `docs/contracts/project-context.md`, issue #180 phase 3): records an
+  accepted resume relocation and carries:
   - `schema_version`: integer.
   - `prior_identity`: `{ "algorithm": <string>, "version": <int>,
     "digest": <hex string> }`, the workspace identity folded at the accepted
@@ -378,8 +376,8 @@ envelope `v` per `docs/contracts/persistence.md`.
   never cached, so they are re-checked on every listing.
 - `project.context.snapshot` (schema version 1; ADR 0017,
   `docs/contracts/project-context.md`): `schema_version`, `status`
-  (`admitted` | `disabled`; phase 3 adds `declined`/`unacknowledged`, which
-  reject until their permitted policy tuples exist),
+  (`admitted` | `disabled` | `declined` | `unacknowledged`, each gated by the
+  permitted policy-tuple table in the project-context contract),
   `policy`, `resolution_reason`, `acknowledgment_basis`, `candidate_digest`
   (versioned, domain-separated, length-prefixed digest of the canonical
   candidate manifest), `workspace_identity`

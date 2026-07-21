@@ -386,32 +386,42 @@ source and pin for installed extensions, an explicit linked-path marker for
 linked ones — so a released extension and a dev tree are never visually
 interchangeable.
 
-The resume relocation-consent card (project-context contract, "Resume
-relocation and consent") uses this same bordered approval treatment. It ships
-with issue #180 phase 3; until then a same-host workspace mismatch stays a
-plain-language hard failure. Its content is facts only, never a guessed reason
-for the change: the recorded workspace path, the current workspace path, and
-when the session was last active, followed by a plain-language statement that
-resuming here adopts the current folder for this session, that approvals from
-the old folder (project grants and project-context acknowledgments) do not carry
-over, and that the session keeps the project guidance it started with. Its
-choices are resume here or cancel; declining changes nothing. Example copy:
+The project-context acknowledgment card and the resume relocation-consent card
+(project-context contract, "Acknowledgment record" and "Resume relocation and
+consent") use this same bordered approval treatment. Both are pre-session cards:
+they are presented before the session is constructed, because the decision
+determines the immutable bootstrap the session records at `session.start`, so
+they render on a self-contained inline surface rather than as an in-transcript
+modal. Both are single-keypress with a safe-bias default highlight (Skip for the
+acknowledgment card, Cancel for the relocation card). Because this system has no
+horizontal button row, the choices are a stacked single-key list, exactly like
+the permission panels.
+
+The relocation card's content is facts only, never a guessed reason for the
+change: the recorded workspace path, the current workspace path, and when the
+session was last active, followed by a plain-language statement that resuming
+here adopts the current folder for this session, that approvals from the old
+folder (project grants and project-context acknowledgments) do not carry over,
+and that the session keeps the project guidance it started with. Declining
+changes nothing. Example copy:
 
 ```
-This session last ran in a different folder.
-
-  Recorded folder:  /home/ada/projects/euler
-  Current folder:   /home/ada/projects/euler-fork
-  Last active:      2026-07-19 14:32
-
-Resume here? Resuming adopts the current folder for this session from now on.
-Approvals from the old folder do not carry over: project permission grants and
-project-context acknowledgments belong to a specific folder, so the new folder
-keeps its own, and a future fresh session here asks about this project's
-context again. This session keeps the project guidance it started with; the new
-folder's EULER.md is not loaded until you start a new session.
-
-  [ Resume here ]   [ Cancel ]
+╭─ This session last ran in a different folder ─────────────────────────╮
+│ This session last ran in a different folder                           │
+│                                                                       │
+│   Last ran in:   /home/ada/projects/euler                             │
+│   Now opening:   /home/ada/projects/euler-fork                        │
+│   Last active:   2026-07-19 14:32                                     │
+│                                                                       │
+│ Resuming here makes this folder the session's home from now on.       │
+│ Approvals from the old folder don't carry over: this folder keeps its │
+│ own permissions and its own answer about loading project guidance.    │
+│ The session keeps the guidance it already loaded. The new folder's    │
+│ EULER.md isn't read until you start a new session here.               │
+│                                                                       │
+│   r  Resume here                                                      │
+│ › n  Cancel (leave the session where it was)                          │
+╰───────────────────────────────────────────────────────────────────────╯
 ```
 
 Headless resume never shows this card. It fails closed with plain-language
