@@ -96,9 +96,10 @@ pub use provenance::{
     DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT,
 };
 pub use resume::{
-    fold_session, read_resume_prefix, resume_session, resume_session_from_folded_prefix,
-    resume_session_from_prefix, resume_session_from_prefix_with_outcome,
-    resume_session_with_outcome, FoldedSession, ResumeError, ResumeOutcome, ResumeWarning,
+    fold_session, plan_relocation, read_resume_prefix, resume_session,
+    resume_session_from_folded_prefix, resume_session_from_prefix,
+    resume_session_from_prefix_with_outcome, resume_session_with_outcome, FoldedSession,
+    RelocationRequired, ResumeError, ResumeOutcome, ResumeWarning,
 };
 pub use sandbox::{
     probe_workspace_sandbox, SandboxAvailability, SandboxProfile, SandboxUnavailableReason,

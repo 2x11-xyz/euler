@@ -387,10 +387,15 @@ fn run_exec_resume(
     prompt: String,
 ) -> Result<()> {
     let overrides = ExecConfigOverrides::from_run(&run);
-    let mut outcome =
-        resume_cli_session(target, run, SubagentDecider::new(auto_approve), |config| {
+    let mut outcome = resume_cli_session(
+        target,
+        run,
+        SubagentDecider::new(auto_approve),
+        RelocationConsent::Headless,
+        |config| {
             apply_exec_config(config, overrides);
-        })?;
+        },
+    )?;
     SubagentDecider::apply_tier(auto_approve, &mut outcome.session);
     let turn_result = run_turn_streaming(&mut outcome.session, &prompt);
     if let Some(refresh) = outcome.refresh.as_ref() {
@@ -506,7 +511,7 @@ pub(super) fn resume_interactive_entry(
 }
 
 fn resume_line_oriented(target: ResumeTarget, run: RunArgs) -> Result<()> {
-    let mut outcome = resume_cli_session(target, run, CliDecider, |_| {})?;
+    let mut outcome = resume_cli_session(target, run, CliDecider, RelocationConsent::Line, |_| {})?;
     eprintln!(
         "resumed session {}: folded {} events, target {}/{}, recovery closure {}",
         outcome
@@ -534,9 +539,17 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
     let observe = run.observe.clone();
     let auth_file = run.auth_file.clone();
     let (decider, channels) = TuiDecider::new();
-    let mut outcome = resume_cli_session(target, run, decider, |_| {})?;
     let preference_path = model_preference::default_model_preference_path();
     let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
+    // The relocation card (when needed) is shown before the resumed session is
+    // built, using the resolved theme.
+    let mut outcome = resume_cli_session(
+        target,
+        run,
+        decider,
+        RelocationConsent::Card(theme_choice),
+        |_| {},
+    )?;
     let show_timestamp_gutter =
         load_timestamps_preference(preference_path.as_deref()).unwrap_or(false);
     let notifications_enabled =
@@ -595,10 +608,92 @@ struct ResumeCliOutcome<D: PermissionDecider> {
     session_name: Option<String>,
 }
 
+/// How a resume workspace relocation is consented to when the live folder does
+/// not match where the session last ran.
+enum RelocationConsent {
+    /// Headless: accept only if `--accept-relocation` was given, else fail
+    /// closed. Never prompts.
+    Headless,
+    /// Interactive TUI: present the bordered relocation card.
+    Card(crate::ui::theme::ThemeChoice),
+    /// Interactive line-oriented: a plain stdin prompt.
+    Line,
+}
+
+fn decide_relocation_card(
+    required: &euler_core::RelocationRequired,
+    theme_choice: crate::ui::theme::ThemeChoice,
+) -> Result<bool> {
+    let choice = crate::ui::consent_prompt::prompt_relocation(
+        required.recorded_root(),
+        required.current_root(),
+        required.last_active().unwrap_or("unknown"),
+        theme_choice,
+    )?;
+    Ok(choice == crate::ui::consent_prompt::ConsentChoice::Accept)
+}
+
+fn decide_relocation_line(required: &euler_core::RelocationRequired) -> Result<bool> {
+    eprintln!(
+        "This session last ran in {}, but you're now in {}.",
+        required.recorded_root(),
+        required.current_root()
+    );
+    eprintln!(
+        "Resuming here makes this folder the session's home. Approvals from the old folder don't \
+         carry over."
+    );
+    eprint!("Resume here? [y/N] ");
+    let _ = io::stderr().flush();
+    let mut answer = String::new();
+    Ok(io::stdin().read_line(&mut answer).is_ok() && answer.trim().eq_ignore_ascii_case("y"))
+}
+
+/// A same-host workspace relocation (ADR 0017 phase 3): if the live folder does
+/// not match where the session last ran, obtain consent, append the durable
+/// relocation event before any resumed activity, and extend the prefix.
+/// Declining resumes nothing.
+fn apply_resume_relocation(
+    prefix: &mut Vec<euler_event::EventEnvelope>,
+    live_root: &Path,
+    accept_relocation_flag: bool,
+    relocation: RelocationConsent,
+    writer: &ProvenanceWriter,
+) -> Result<()> {
+    let Some(required) = euler_core::plan_relocation(prefix, live_root)? else {
+        return Ok(());
+    };
+    let accept = if accept_relocation_flag {
+        true
+    } else {
+        match relocation {
+            RelocationConsent::Headless => false,
+            RelocationConsent::Card(theme_choice) => {
+                decide_relocation_card(&required, theme_choice)?
+            }
+            RelocationConsent::Line => decide_relocation_line(&required)?,
+        }
+    };
+    if !accept {
+        return Err(anyhow!(
+            "Can't resume here: this session last ran in {}, but you're in {}. Re-run from that \
+             folder, start a new session here, or pass --accept-relocation to move the session to \
+             this folder.",
+            required.recorded_root(),
+            required.current_root()
+        ));
+    }
+    let event = required.into_relocated_event();
+    writer.append(std::slice::from_ref(&event))?;
+    prefix.push(event);
+    Ok(())
+}
+
 fn resume_cli_session<D>(
     target: ResumeTarget,
     run: RunArgs,
     decider: D,
+    relocation: RelocationConsent,
     configure: impl FnOnce(&mut SessionConfig),
 ) -> Result<ResumeCliOutcome<D>>
 where
@@ -612,7 +707,7 @@ where
     } = target;
     bind_diagnostics_for_log(&log_path);
     let writer = ProvenanceWriter::new(log_path.clone())?;
-    let prefix = read_resume_prefix(&log_path)?;
+    let mut prefix = read_resume_prefix(&log_path)?;
     let session_id = session_id_from_events(&prefix)
         .unwrap_or(SESSION_ID)
         .to_owned();
@@ -628,6 +723,13 @@ where
             config.extensions_enabled.insert(id.clone());
         }
     }
+    apply_resume_relocation(
+        &mut prefix,
+        &config.root,
+        run.accept_relocation,
+        relocation,
+        &writer,
+    )?;
     let folded = fold_session(&config, prefix)?;
     let providers = (if let Some(original) = &folded.original_target {
         if invocation_target(&run) != *original {

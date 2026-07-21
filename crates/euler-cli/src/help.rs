@@ -18,6 +18,8 @@ const SESSION_OPTIONS: &str = "  \
                              (default: user)
   --project-context <p>      auto, on, or off: load this project's EULER.md
                              guidance (default: auto)
+  --accept-relocation        On resume, move the session to the current folder
+                             when it last ran somewhere else
   --auth-file <path>         Read credentials from <path>
   --provenance <path>        Write a standalone provenance log to <path>
                              instead of the home session store

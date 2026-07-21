@@ -48,7 +48,6 @@ impl RelocationIdentity {
 
     /// The `{ algorithm, version, digest }` JSON. Used by the write side (the
     /// acceptance path builds a payload) and by tests.
-    #[cfg(test)]
     fn to_value(&self) -> Value {
         serde_json::json!({
             "algorithm": self.algorithm,
@@ -58,7 +57,6 @@ impl RelocationIdentity {
     }
 
     /// The identity of a canonical workspace root under the current algorithm.
-    #[cfg(test)]
     fn of_canonical_root(canonical_root: &Path) -> Self {
         Self {
             algorithm: WORKSPACE_IDENTITY_ALGORITHM.to_owned(),
@@ -207,11 +205,18 @@ pub(crate) fn projected_new_root(events: &[EventEnvelope]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The workspace identity governing the accepted event prefix (the snapshot
+/// identity folded through any prior relocations), as the value a new
+/// relocation records for its `prior_identity`. `None` for a legacy prefix
+/// with no snapshot.
+pub(crate) fn governing_identity_value(events: &[EventEnvelope]) -> Result<Option<Value>, String> {
+    let base = snapshot_identity(events)?;
+    Ok(fold_governing_identity(events, base)?.map(|identity| identity.to_value()))
+}
+
 /// Build the canonical `project.context.relocated` payload the acceptance path
 /// appends. `new_root` is the same bounded lossy display form `session.start`
-/// records for its root. Test-only until the acceptance path (the write side)
-/// lands and promotes it.
-#[cfg(test)]
+/// records for its root.
 pub(crate) fn build_relocated_payload(
     prior_identity_value: &Value,
     live_canonical_root: &Path,

@@ -19,7 +19,9 @@ mod framing;
 mod manifest;
 mod relocation;
 
-pub(crate) use relocation::projected_new_root;
+pub(crate) use relocation::{
+    build_relocated_payload, governing_identity_value, projected_new_root,
+};
 
 pub use acknowledgment::{AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError};
 

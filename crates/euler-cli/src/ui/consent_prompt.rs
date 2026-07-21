@@ -112,3 +112,28 @@ pub(crate) fn prompt_acknowledgment(
         theme_choice,
     )
 }
+
+/// Present the relocation-consent card.
+pub(crate) fn prompt_relocation(
+    recorded_folder: &str,
+    current_folder: &str,
+    last_active: &str,
+    theme_choice: ThemeChoice,
+) -> Result<ConsentChoice> {
+    prompt(
+        |resume_selected, width, theme| {
+            crate::ui::transcript::render_relocation_card(
+                &crate::ui::transcript::RelocationCardView {
+                    recorded_folder,
+                    current_folder,
+                    last_active,
+                    resume_selected,
+                },
+                theme,
+                width,
+            )
+        },
+        'r',
+        theme_choice,
+    )
+}

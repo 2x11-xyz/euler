@@ -199,6 +199,9 @@ pub(crate) struct RawArgs {
     /// Fresh-session project-context exposure policy (`auto|on|off`). Applies
     /// to interactive and exec launches; resume ignores it.
     pub(crate) project_context: Option<euler_core::ProjectContextPolicy>,
+    /// Scripted acceptance of a resume workspace relocation. A single-invocation
+    /// decision; never sourced from repository config or stored state.
+    pub(crate) accept_relocation: bool,
 }
 
 impl RawArgs {

@@ -328,6 +328,54 @@ pub(crate) fn render_acknowledgment_card(
     lines
 }
 
+/// The resume relocation-consent card (ADR 0017 phase 3, project-context
+/// contract "Resume relocation and consent"). Facts only, never a guessed
+/// reason. Adapted to the real stacked single-key idiom (no horizontal button
+/// row exists in this system).
+pub(crate) struct RelocationCardView<'a> {
+    pub(crate) recorded_folder: &'a str,
+    pub(crate) current_folder: &'a str,
+    pub(crate) last_active: &'a str,
+    /// Whether Resume is highlighted (default: Cancel, the safe bias).
+    pub(crate) resume_selected: bool,
+}
+
+pub(crate) fn render_relocation_card(
+    view: &RelocationCardView<'_>,
+    theme: &Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let rows = vec![
+        PermissionPanelRow::title_with_corner(
+            "This session last ran in a different folder",
+            String::new(),
+        ),
+        PermissionPanelRow::body(String::new()),
+        PermissionPanelRow::metadata(format!("  Last ran in:   {}", view.recorded_folder)),
+        PermissionPanelRow::metadata(format!("  Now opening:   {}", view.current_folder)),
+        PermissionPanelRow::metadata(format!("  Last active:   {}", view.last_active)),
+        PermissionPanelRow::body(String::new()),
+        PermissionPanelRow::body("Resuming here makes this folder the session's home from now on."),
+        PermissionPanelRow::body(
+            "Approvals from the old folder don't carry over: this folder keeps its own \
+             permissions and its own answer about loading project guidance.",
+        ),
+        PermissionPanelRow::body(
+            "The session keeps the guidance it already loaded. The new folder's EULER.md isn't \
+             read until you start a new session here.",
+        ),
+        PermissionPanelRow::body(String::new()),
+        selectable_row("r  Resume here", view.resume_selected),
+        selectable_row(
+            "n  Cancel (leave the session where it was)",
+            !view.resume_selected,
+        ),
+    ];
+    let mut lines = Vec::new();
+    push_bordered_permission_panel(&mut lines, &rows, theme, width);
+    lines
+}
+
 fn selectable_row(text: &str, selected: bool) -> PermissionPanelRow {
     if selected {
         PermissionPanelRow::selected(text)
@@ -543,5 +591,24 @@ mod acknowledgment_card_tests {
         let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));
         assert!(rendered.contains("This project's guidance changed. Load it?"));
         assert!(rendered.contains("changed since you last loaded it"));
+    }
+
+    #[test]
+    fn relocation_card_states_facts_and_the_no_carry_over_line() {
+        let view = RelocationCardView {
+            recorded_folder: "/home/ada/projects/euler",
+            current_folder: "/home/ada/projects/euler-fork",
+            last_active: "2026-07-19 14:32",
+            resume_selected: false,
+        };
+        let rendered = text(&render_relocation_card(&view, &Theme::default(), 96));
+        assert!(rendered.contains("This session last ran in a different folder"));
+        assert!(rendered.contains("/home/ada/projects/euler"));
+        assert!(rendered.contains("/home/ada/projects/euler-fork"));
+        assert!(rendered.contains("Last active:"));
+        assert!(rendered.contains("don't carry over"));
+        assert!(rendered.contains("r  Resume here"));
+        assert!(rendered.contains("n  Cancel"));
+        assert!(!rendered.contains('\u{2014}'), "no em dashes in card copy");
     }
 }

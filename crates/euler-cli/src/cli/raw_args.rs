@@ -62,6 +62,7 @@ impl RawArgsParser {
                 no_tty: false,
                 linefeed_history_insert: None,
                 project_context: None,
+                accept_relocation: false,
             },
             top_level_command: None,
             saw_any_arg: false,
@@ -127,6 +128,10 @@ impl RawArgsParser {
             "--reasoning-effort" => self.parse_reasoning_effort(args),
             "--permission-reviewer" => self.parse_permission_reviewer(args),
             "--project-context" => self.parse_project_context(args),
+            "--accept-relocation" => {
+                self.parsed.accept_relocation = true;
+                Ok(ArgParseFlow::Continue)
+            }
             "--extensions" => self.parse_extensions(args),
             "--observe" => self.parse_observe(args),
             "--observe-cadence" => self.parse_observe_cadence(args),

@@ -2643,6 +2643,28 @@ fn project_context_policy_parses_for_run_tui_and_exec() {
 }
 
 #[test]
+fn accept_relocation_flag_parses_for_run_tui_and_exec() {
+    for (args, is_exec) in [
+        (&["run", "--accept-relocation"][..], false),
+        (&["tui", "--accept-relocation"][..], false),
+        (&["exec", "--accept-relocation", "hello"][..], true),
+    ] {
+        let mut iter = args.iter().copied().map(str::to_owned);
+        let parsed = Args::parse_with_env(&mut iter, EnvArgs::default()).expect("parse");
+        let run = match parsed.command {
+            Command::Exec(exec) if is_exec => exec.run,
+            Command::Run(run) | Command::Tui(run) if !is_exec => run,
+            _ => panic!("unexpected command shape"),
+        };
+        assert!(run.accept_relocation);
+    }
+    // Absent by default.
+    let mut iter = ["run"].iter().copied().map(str::to_owned);
+    let parsed = unwrap_run(Args::parse_with_env(&mut iter, EnvArgs::default()).expect("parse"));
+    assert!(!parsed.accept_relocation);
+}
+
+#[test]
 fn project_context_rejects_bad_values_and_duplicates() {
     for (args, expected) in [
         (
