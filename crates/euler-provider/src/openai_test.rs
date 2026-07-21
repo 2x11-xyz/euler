@@ -52,6 +52,66 @@ fn request_maps_system_text_tools_and_tool_loop() {
 }
 
 #[test]
+fn request_groups_consecutive_tool_calls_in_one_assistant_message() {
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![
+            ModelInputItem::Message {
+                role: ModelRole::User,
+                content: "lookup both".to_owned(),
+            },
+            ModelInputItem::ToolCall {
+                call_id: "call_a".to_owned(),
+                name: "tiny_lookup".to_owned(),
+                arguments: json!({"key": "a"}),
+            },
+            ModelInputItem::ToolCall {
+                call_id: "call_b".to_owned(),
+                name: "tiny_lookup".to_owned(),
+                arguments: json!({"key": "b"}),
+            },
+            ModelInputItem::ToolOutput {
+                call_id: "call_a".to_owned(),
+                name: "tiny_lookup".to_owned(),
+                ok: true,
+                output: Some("a = 1".to_owned()),
+                error: None,
+                exit_code: None,
+            },
+            ModelInputItem::ToolOutput {
+                call_id: "call_b".to_owned(),
+                name: "tiny_lookup".to_owned(),
+                ok: true,
+                output: Some("b = 2".to_owned()),
+                error: None,
+                exit_code: None,
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(
+        messages[1]["tool_calls"]
+            .as_array()
+            .expect("tool calls")
+            .len(),
+        2
+    );
+    assert_eq!(messages[1]["tool_calls"][0]["id"], "call_a");
+    assert_eq!(messages[1]["tool_calls"][1]["id"], "call_b");
+    assert_eq!(messages[2]["tool_call_id"], "call_a");
+    assert_eq!(messages[3]["tool_call_id"], "call_b");
+}
+
+#[test]
 fn request_applies_max_completion_tokens_cap() {
     let request = ModelRequest {
         model: DEFAULT_MODEL.to_owned(),

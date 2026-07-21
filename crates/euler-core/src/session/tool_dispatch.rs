@@ -17,14 +17,12 @@ use serde_json::Value;
 use std::time::Instant;
 
 impl<D: PermissionDecider> Session<D> {
-    #[allow(clippy::too_many_lines)] // ratchet: 188 lines, refactor target
-    pub(super) fn execute_tool_call<F>(
+    pub(super) fn record_tool_call<F>(
         &mut self,
-        call: ToolCall,
-        model_result_id: String,
+        call: &ToolCall,
+        model_result_id: &str,
         sink: &mut EventSink<'_, F>,
-        turn_state: &mut TurnState,
-    ) -> Result<(), SessionError>
+    ) -> Result<String, SessionError>
     where
         F: FnMut(&EventEnvelope),
     {
@@ -35,11 +33,24 @@ impl<D: PermissionDecider> Session<D> {
                 ("name", call.name.clone().into()),
                 ("input", call.input.clone()),
             ]),
-            Some(model_result_id),
+            Some(model_result_id.to_owned()),
         )?;
         self.flag_tool_call_exposure(&tool_call_event_id, &call.input)?;
         sink.flush(self.bus.events());
+        Ok(tool_call_event_id)
+    }
 
+    #[allow(clippy::too_many_lines)] // ratchet: 188 lines, refactor target
+    pub(super) fn execute_recorded_tool_call<F>(
+        &mut self,
+        call: ToolCall,
+        tool_call_event_id: String,
+        sink: &mut EventSink<'_, F>,
+        turn_state: &mut TurnState,
+    ) -> Result<(), SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
         let mut covered_grant_source: Option<crate::GrantSource> = None;
         let mut static_safe = false;
         if let Some(capability) = self
@@ -251,7 +262,7 @@ impl<D: PermissionDecider> Session<D> {
     }
 
     /// Failed tool-result emission shared by the execution-error and
-    /// patch-write-failure paths of [`Self::execute_tool_call`].
+    /// patch-write-failure paths of [`Self::execute_recorded_tool_call`].
     fn emit_failed_tool_result(
         &mut self,
         call_id: String,

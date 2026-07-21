@@ -398,6 +398,68 @@ fn request_time_resolved_provider_secret_registers_with_session_redactor() {
 }
 
 #[test]
+fn batched_tool_calls_replay_as_calls_then_outputs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join("a.txt"), "alpha").expect("a");
+    std::fs::write(temp.path().join("b.txt"), "bravo").expect("b");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = CapturingScriptedProvider::new(
+        vec![
+            FixtureResponse::ToolCalls(vec![
+                euler_provider::ToolCall {
+                    id: "call-a".to_owned(),
+                    name: "read_file".to_owned(),
+                    input: json!({"path": "a.txt"}),
+                },
+                euler_provider::ToolCall {
+                    id: "call-b".to_owned(),
+                    name: "read_file".to_owned(),
+                    input: json!({"path": "b.txt"}),
+                },
+            ]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ],
+        Arc::clone(&captured),
+    );
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("read both").expect("turn");
+
+    let requests = captured.lock().expect("captured requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool calls should trigger one follow-up round"
+    );
+    let replay = requests[1]
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            ModelInputItem::Message { role, content } => {
+                Some(format!("message:{}:{content}", role.as_str()))
+            }
+            ModelInputItem::ToolCall { call_id, .. } => Some(format!("call:{call_id}")),
+            ModelInputItem::ToolOutput { call_id, .. } => Some(format!("output:{call_id}")),
+            ModelInputItem::ProjectContext { .. } | ModelInputItem::Reasoning { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replay,
+        vec![
+            "message:user:read both",
+            "call:call-a",
+            "call:call-b",
+            "output:call-a",
+            "output:call-b",
+        ]
+    );
+}
+
+#[test]
 fn into_fresh_session_carries_registered_secret_values() {
     // /new rebuilds the session in-process; host-seeded redaction values
     // (auth-file credentials, resolved x-secret values) must survive the
@@ -2100,6 +2162,35 @@ impl ModelProvider for CapturingProvider {
             ]
             .into_iter(),
         ))
+    }
+}
+
+#[derive(Debug)]
+struct CapturingScriptedProvider {
+    inner: ScriptedProvider,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+impl CapturingScriptedProvider {
+    fn new(responses: Vec<FixtureResponse>, requests: Arc<Mutex<Vec<ModelRequest>>>) -> Self {
+        Self {
+            inner: ScriptedProvider::new(responses),
+            requests,
+        }
+    }
+}
+
+impl ModelProvider for CapturingScriptedProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests
+            .lock()
+            .expect("captured requests lock")
+            .push(request.clone());
+        self.inner.invoke(request)
     }
 }
 

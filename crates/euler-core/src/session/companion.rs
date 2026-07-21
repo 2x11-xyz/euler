@@ -69,6 +69,8 @@ struct CompanionLoop<'a, D> {
     tokens: u64,
 }
 
+type CompanionRecordedToolCall = (ToolCall, String);
+
 pub(super) struct ParentedAppender<'a> {
     pub(super) writer: &'a Arc<crate::provenance::ProvenanceWriter>,
     pub(super) bus: &'a mut crate::EventBus,
@@ -274,7 +276,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     /// Permission denial is a failed tool result the companion's model can
     /// adapt to, exactly as in the parent session loop; it never terminates
     /// the companion. Budgets bound the loop.
-    fn execute_tool_call(&mut self, call: ToolCall) -> Result<(), SessionError> {
+    fn record_tool_call(&mut self, call: &ToolCall) -> Result<String, SessionError> {
         let tool_call_event_id = self
             .append(
                 EventKind::TOOL_CALL,
@@ -286,7 +288,14 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 None,
             )?
             .id;
+        Ok(tool_call_event_id)
+    }
 
+    fn execute_recorded_tool_call(
+        &mut self,
+        call: ToolCall,
+        tool_call_event_id: String,
+    ) -> Result<(), SessionError> {
         if let Some(capability) = self
             .tools
             .required_capability_for_input(&call.name, &call.input)
@@ -342,6 +351,27 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
 
         self.execute_authorized_tool(call, tool_call_event_id)?;
         Ok(())
+    }
+
+    fn record_tool_call_batch(
+        &mut self,
+        tool_calls: Vec<ToolCall>,
+    ) -> Result<Vec<CompanionRecordedToolCall>, SessionError> {
+        let mut recorded_calls = Vec::with_capacity(tool_calls.len());
+        for call in tool_calls {
+            let tool_call_event_id = self.record_tool_call(&call)?;
+            recorded_calls.push((call, tool_call_event_id));
+        }
+        Ok(recorded_calls)
+    }
+
+    fn remaining_tool_call_slots(&self) -> usize {
+        self.task
+            .budget()
+            .max_tool_calls()
+            .map_or(usize::MAX, |max| {
+                max.saturating_sub(self.tool_calls) as usize
+            })
     }
 
     fn execute_authorized_tool(
@@ -875,19 +905,27 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
                 "budget exhausted: max_tokens",
             )));
         }
-        for call in data.tool_calls {
-            if self.tool_budget_exhausted() {
-                return Ok(RoundOutcome::Complete(companion_failure(
-                    "budget exhausted: max_tool_calls",
-                )));
-            }
-            self.execute_tool_call(call)?;
+        if self.tool_budget_exhausted() {
+            return Ok(RoundOutcome::Complete(companion_failure(
+                "budget exhausted: max_tool_calls",
+            )));
+        }
+        let accepted_calls = self.remaining_tool_call_slots().min(data.tool_calls.len());
+        let over_budget_tool_calls = accepted_calls < data.tool_calls.len();
+        let recordable_calls = data
+            .tool_calls
+            .into_iter()
+            .take(accepted_calls)
+            .collect::<Vec<_>>();
+        let remaining_calls = self.record_tool_call_batch(recordable_calls)?;
+        for (call, tool_call_event_id) in remaining_calls {
+            self.execute_recorded_tool_call(call, tool_call_event_id)?;
             self.tool_calls = self.tool_calls.saturating_add(1);
-            if self.tool_budget_exhausted() {
-                return Ok(RoundOutcome::Complete(companion_failure(
-                    "budget exhausted: max_tool_calls",
-                )));
-            }
+        }
+        if over_budget_tool_calls || self.tool_budget_exhausted() {
+            return Ok(RoundOutcome::Complete(companion_failure(
+                "budget exhausted: max_tool_calls",
+            )));
         }
         Ok(RoundOutcome::Continue)
     }
