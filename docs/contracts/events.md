@@ -67,8 +67,6 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `session.resumed`
 - `session.renamed`
 - `session.summary`
-- `project.context.snapshot`
-- `project.context.diagnostic`
 - `error`
 
 Unknown future event kinds are reader-specific. Inspection readers
@@ -271,16 +269,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   grammar, and `content` is UTF-8 text capped at 4096 bytes. Control characters
   other than newline are rejected. Empty `content` deletes the slot. Slot
   payloads are below the blob externalization threshold and remain inline.
-- `project.context.snapshot`, `project.context.diagnostic`,
-  `project.context.relocated`: the project-context event family, bound ahead of
-  implementation in `docs/contracts/project-context.md` (issue #180) and marked
-  binding shape there, not implemented today. That contract is the field
-  authority for `project.context.snapshot` (load policy and resolution reason,
-  acknowledgment basis, portable candidate digest, local workspace identity,
-  deterministic ordering, diagnostic counts, admitted `EULER.md` sources and
-  skills, schema version) and `project.context.diagnostic` (stable reason code,
-  bounded normalized relative identity when one exists, non-content numeric
-  metadata). `project.context.relocated` records an accepted resume relocation
+- `project.context.relocated` (bound ahead of implementation in
+  `docs/contracts/project-context.md`, issue #180 phase 3; not implemented
+  today; `project.context.snapshot` and `project.context.diagnostic` have
+  their own ratified entries below): records an accepted resume relocation
   and carries:
   - `schema_version`: integer.
   - `prior_identity`: `{ "algorithm": <string>, "version": <int>,
