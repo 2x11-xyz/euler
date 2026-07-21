@@ -307,27 +307,40 @@ class CommandModeTests(unittest.TestCase):
 class WorkflowTests(unittest.TestCase):
     def test_release_builds_wait_for_catalog_validation(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text()
+        build_start = workflow.index("\n  build:")
+        release_start = workflow.index("\n  release:")
+        validate_job = workflow[:build_start]
+        build_job = workflow[build_start:release_start]
+        release_job = workflow[release_start:]
 
-        self.assertIn("ref: refs/tags/${{ steps.tag.outputs.tag }}", workflow)
-        self.assertIn("python3 scripts/sync_provider_catalog.py --check", workflow)
-        self.assertIn("python3 scripts/sync_provider_catalog.py --check-pinned", workflow)
-        self.assertIn("if: github.event_name == 'push'", workflow)
-        self.assertIn("if: github.event_name == 'workflow_dispatch'", workflow)
+        self.assertIn("ref: refs/tags/${{ steps.tag.outputs.tag }}", validate_job)
+        self.assertIn("python3 scripts/sync_provider_catalog.py --check", validate_job)
         self.assertIn(
-            'gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"', workflow
+            "python3 scripts/sync_provider_catalog.py --check-pinned", validate_job
         )
-        self.assertIn("RELEASE_TAG: ${{ steps.tag.outputs.tag }}", workflow)
-        self.assertIn("needs: validate", workflow)
-        self.assertIn("commit: ${{ steps.commit.outputs.sha }}", workflow)
-        self.assertIn('echo "sha=$(git rev-parse HEAD)"', workflow)
+        self.assertIn("if: github.event_name == 'push'", validate_job)
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", validate_job)
         self.assertIn(
-            "ref: ${{ needs.validate.outputs.commit }}", workflow
+            'gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"', validate_job
         )
-        self.assertIn("VALIDATED_COMMIT: ${{ needs.validate.outputs.commit }}", workflow)
-        self.assertIn("Refuse a tag moved after validation", workflow)
+        self.assertIn("RELEASE_TAG: ${{ steps.tag.outputs.tag }}", validate_job)
+        self.assertIn("commit: ${{ steps.commit.outputs.sha }}", validate_job)
+        self.assertIn('echo "sha=$(git rev-parse HEAD)"', validate_job)
+        self.assertIn("needs: validate", build_job)
+        self.assertIn("ref: ${{ needs.validate.outputs.commit }}", build_job)
+        self.assertIn("ref: refs/tags/${{ needs.validate.outputs.tag }}", release_job)
+        self.assertIn(
+            "VALIDATED_COMMIT: ${{ needs.validate.outputs.commit }}", release_job
+        )
+        self.assertIn("Refuse a tag moved after validation", release_job)
+        self.assertIn(
+            'if [[ "$(git rev-parse HEAD)" != "$VALIDATED_COMMIT" ]]; then',
+            release_job,
+        )
+        self.assertIn("exit 1", release_job)
         self.assertLess(
-            workflow.index("Require the latest embedded provider catalog"),
-            workflow.index("\n  build:"),
+            release_job.index("ref: refs/tags/${{ needs.validate.outputs.tag }}"),
+            release_job.index("Refuse a tag moved after validation"),
         )
 
     def test_routine_ci_runs_only_offline_sync_tests(self) -> None:
