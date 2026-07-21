@@ -391,7 +391,10 @@ fn into_fresh_session_carries_registered_secret_values() {
     let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
     session.add_redacted_secret("carried-secret-value-xyz");
 
-    let fresh = session.into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()));
+    let bootstrap = session
+        .prepare_fresh_project_context()
+        .expect("fresh preflight");
+    let fresh = session.into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()), bootstrap);
 
     let out = fresh
         .redactor
@@ -2632,7 +2635,10 @@ fn resume_starts_the_reteach_streak_empty() {
     // into_fresh_session (the /new path, same code path resume rebuilds
     // through) starts the tracker empty — the next failure would be rung 1.
     let _ = &temp;
-    let fresh = session.into_fresh_session("resumed", ScriptedDecider::new(vec![]));
+    let bootstrap = session
+        .prepare_fresh_project_context()
+        .expect("fresh preflight");
+    let fresh = session.into_fresh_session("resumed", ScriptedDecider::new(vec![]), bootstrap);
     assert!(
         fresh.reteach_streak_is_empty(),
         "resume/new must start the reteach tracker empty (process-local)"
@@ -3169,6 +3175,59 @@ mod project_context_seam {
         let request = captured_request(&captured_resume);
         assert!(project_context_items(&request).is_empty());
         assert!(!format!("{request:?}").contains(REPO_TEXT));
+    }
+
+    #[test]
+    fn new_after_resume_rebuilds_the_bootstrap() {
+        // Reviewer attack (blocker 3): a resumed session carries no
+        // bootstrap in config (its snapshot folds from events), so a /new
+        // gated on config presence silently produced a legacy-shaped fresh
+        // session with no summary and no snapshot. The fresh session must
+        // always run its own preflight.
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+        let (session, _captured) = captured_session(dormant_config(&root));
+        let mut session =
+            session.with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+        session.run_turn("hello").expect("turn");
+        drop(session);
+
+        let captured_resume = Arc::new(Mutex::new(None));
+        let provider = CapturingProvider::new(Arc::clone(&captured_resume));
+        let mut config = SessionConfig::new(&root);
+        config.provider = "capture".to_owned();
+        config.model = "test-model".to_owned();
+        let resumed = resume_session_with_outcome(
+            config,
+            ProviderSet::single(provider),
+            ScriptedDecider::new(Vec::new()),
+            &log_path,
+        )
+        .expect("resume")
+        .session;
+
+        let bootstrap = resumed
+            .prepare_fresh_project_context()
+            .expect("fresh preflight");
+        let fresh = resumed.into_fresh_session(
+            "fresh-after-resume",
+            ScriptedDecider::new(Vec::new()),
+            bootstrap,
+        );
+        let events = fresh.events();
+        assert_eq!(events[0].kind.as_str(), EventKind::SESSION_START);
+        assert!(
+            events[0].payload.get("project_context").is_some(),
+            "fresh session announces its bootstrap"
+        );
+        assert_eq!(
+            events[1].kind.as_str(),
+            EventKind::PROJECT_CONTEXT_SNAPSHOT,
+            "fresh session records its snapshot"
+        );
+        crate::project_context::validate_bootstrap_shape(events).expect("bootstrap shape");
     }
 
     #[test]

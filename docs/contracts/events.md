@@ -360,7 +360,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   authoritative, and a disabled snapshot is a tombstone. Rehydration verifies
   the blob address and length and rejects invalid UTF-8, duplicate keys,
   trailing data, unsupported versions, limit violations, and digest
-  mismatches; it never falls back to current project files.
+  mismatches; it never falls back to current project files. Both shapes are
+  fully re-validated on fold as untrusted input: unknown payload fields,
+  malformed digests, non-normalized identities, unknown workspace-identity
+  algorithms, and count inconsistencies reject resume and request assembly.
 - `project.context.diagnostic` (schema version 1): `schema_version`,
   `snapshot_event_id`, `reason` (stable content-free code), optional bounded
   `path` (normalized relative identity), optional numeric `observed`. Never

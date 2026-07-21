@@ -674,7 +674,31 @@ impl<D> Session<D> {
             }));
     }
 
-    pub fn into_fresh_session(self, session_id: impl Into<String>, decider: D) -> Self {
+    /// Preflight for the session a `/new` will create: the dormant
+    /// project-context scan of the live workspace, seeded by this session's
+    /// carried redactor so every startup-known secret is registered before
+    /// discovery reads a byte. Borrowing (not consuming) lets a caller fail
+    /// the `/new` operation honestly while keeping the current session
+    /// alive; the only error is a workspace root that no longer resolves.
+    pub fn prepare_fresh_project_context(&self) -> Result<ProjectContextBootstrap, SessionError> {
+        ProjectContextBootstrap::dormant(&self.config.root, &self.redactor).map_err(|error| {
+            SessionError::ProjectContextInvalid(format!(
+                "cannot start a new session here: {error}; check that the folder still exists"
+            ))
+        })
+    }
+
+    /// Build the fresh session `/new` composes, with the bootstrap obtained
+    /// from [`Session::prepare_fresh_project_context`]. Every fresh session
+    /// gets its own immutable snapshot: the previous session's bootstrap (or
+    /// its absence — a resumed session carries none in config) is never
+    /// reused, so a `/new` after resume still writes the full bootstrap.
+    pub fn into_fresh_session(
+        self,
+        session_id: impl Into<String>,
+        decider: D,
+        project_context: ProjectContextBootstrap,
+    ) -> Self {
         let active_target = self.active_target;
         let code_swarm_extension = self.code_swarm_extension;
         let redactor = self.redactor;
@@ -682,15 +706,7 @@ impl<D> Session<D> {
         config.session_id = session_id.into();
         config.provider = active_target.provider;
         config.model = active_target.model;
-        // One immutable snapshot per fresh session: /new re-runs the dormant
-        // preflight against the live workspace instead of reusing the old
-        // session's frozen result. The carried redactor seeds it, so every
-        // startup-known secret is registered before discovery reads a byte.
-        // Exposure remains forced off in phase 2 regardless of how the
-        // previous bootstrap resolved.
-        if config.project_context.is_some() {
-            config.project_context = ProjectContextBootstrap::dormant(&config.root, &redactor).ok();
-        }
+        config.project_context = Some(project_context);
         let mut fresh = Self::new_with_providers(config, self.providers, decider);
         // Same user, same process: host-seeded secret values (auth file,
         // runtime-resolved) carry into the fresh session — /new must not

@@ -46,6 +46,11 @@ pub const MAX_COMBINED_EULER_MD_BYTES: usize = 64 * 1024;
 /// freezing a number).
 pub(crate) const MAX_IDENTITY_BYTES: usize = 1024;
 pub(crate) const MAX_MANIFEST_DIAGNOSTICS: usize = 512;
+/// Frozen contract bound: directory entries examined per directory level.
+/// A level whose listing exceeds this is omitted whole with a typed
+/// diagnostic — deterministic selection over a truncated listing is
+/// impossible.
+pub const MAX_DIR_ENTRIES: usize = 4096;
 
 /// Version of the `project.context.snapshot` / `project.context.diagnostic`
 /// payload schemas.
@@ -71,10 +76,13 @@ impl ProjectContextStatus {
 
 #[derive(Debug, Error)]
 pub enum ProjectContextError {
+    /// The workspace root itself cannot be canonicalized. A session whose
+    /// root cannot be resolved cannot enforce any path-keyed rule, so fresh
+    /// session start fails honestly instead of degrading; every other
+    /// preflight problem collapses into a disabled bootstrap with a typed
+    /// reason code and never blocks startup.
     #[error("could not resolve the workspace folder: {0}")]
     Workspace(io::Error),
-    #[error("project-context preflight produced an invalid manifest: {0}")]
-    Manifest(String),
 }
 
 /// The complete preflight result a fresh session boots from: the seeded
@@ -130,15 +138,7 @@ impl ProjectContextBootstrap {
         let canonical =
             std::fs::canonicalize(workspace_root).map_err(ProjectContextError::Workspace)?;
         let outcome = discovery::discover(&canonical, redactor);
-        let manifest = CandidateManifest {
-            version: MANIFEST_VERSION,
-            reason_counts: derive_reason_counts(&outcome.diagnostics),
-            sources: outcome.sources,
-            diagnostics: outcome.diagnostics,
-        };
-        manifest
-            .validate()
-            .map_err(|error| ProjectContextError::Manifest(error.to_string()))?;
+        let (manifest, collapsed) = sanitize_preflight(outcome);
         let candidate_digest = candidate_digest_v1(&manifest.to_canonical_json());
         let workspace_identity_digest = workspace_identity_digest_v1(&canonical);
         let source_identities = manifest
@@ -147,7 +147,10 @@ impl ProjectContextBootstrap {
             .map(|source| source.path.clone())
             .collect();
         let diagnostics = manifest.diagnostics.clone();
-        let (status, policy, resolution_reason, manifest) = if admit {
+        // A collapsed preflight can never be admitted, whatever policy asked
+        // for: the collapse means the bounded scan could not produce a
+        // trustworthy manifest, so exposure resolves disabled.
+        let (status, policy, resolution_reason, manifest) = if admit && !collapsed {
             (
                 ProjectContextStatus::Admitted,
                 "on",
@@ -158,12 +161,12 @@ impl ProjectContextBootstrap {
             // Dormant build: repository content can never reach a model, so
             // the frozen bodies are dropped here and only content-free data
             // survives.
-            (
-                ProjectContextStatus::Disabled,
-                "off",
-                "exposure_forced_off",
-                None,
-            )
+            let reason = if collapsed {
+                "preflight_collapsed"
+            } else {
+                "exposure_forced_off"
+            };
+            (ProjectContextStatus::Disabled, "off", reason, None)
         };
         Ok(Self {
             redactor: redactor.clone(),
@@ -275,6 +278,58 @@ impl ProjectContextBootstrap {
             })
             .collect()
     }
+}
+
+/// Turn a raw discovery outcome into a manifest that always satisfies its
+/// own validation. A preflight whose diagnostics exceed the manifest bound
+/// (or that fails validation for any other reason) collapses to a single
+/// typed diagnostic with nothing admitted; the collapse is itself part of
+/// the digested manifest, so it changes the candidate digest honestly. A
+/// preflight problem must never yield a bootstrap-less (legacy-shaped)
+/// fresh session.
+fn sanitize_preflight(outcome: discovery::DiscoveryOutcome) -> (CandidateManifest, bool) {
+    let overflow = outcome.diagnostics.len() > MAX_MANIFEST_DIAGNOSTICS;
+    if overflow {
+        return (
+            collapsed_manifest(discovery::diagnostic(
+                discovery::DiagnosticReason::DiagnosticOverflow,
+                None,
+                Some(outcome.diagnostics.len() as u64),
+            )),
+            true,
+        );
+    }
+    let manifest = CandidateManifest {
+        version: MANIFEST_VERSION,
+        reason_counts: derive_reason_counts(&outcome.diagnostics),
+        sources: outcome.sources,
+        diagnostics: outcome.diagnostics,
+    };
+    match manifest.validate() {
+        Ok(()) => (manifest, false),
+        // Defensive: discovery is constructed to satisfy the manifest rules;
+        // if it ever does not, collapse rather than degrade to a
+        // bootstrap-less session or block startup.
+        Err(_) => (
+            collapsed_manifest(discovery::diagnostic(
+                discovery::DiagnosticReason::PreflightInvalid,
+                None,
+                None,
+            )),
+            true,
+        ),
+    }
+}
+
+fn collapsed_manifest(record: ManifestDiagnostic) -> CandidateManifest {
+    let manifest = CandidateManifest {
+        version: MANIFEST_VERSION,
+        sources: Vec::new(),
+        reason_counts: derive_reason_counts(std::slice::from_ref(&record)),
+        diagnostics: vec![record],
+    };
+    debug_assert!(manifest.validate().is_ok());
+    manifest
 }
 
 fn derive_reason_counts(diagnostics: &[ManifestDiagnostic]) -> BTreeMap<String, u64> {

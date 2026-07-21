@@ -2189,8 +2189,16 @@ impl AppCore {
         if self.turn_in_flight() {
             return self.notice_item("new session waits for the active turn".to_owned());
         }
-        let AppState::Idle { .. } = self.state else {
+        let AppState::Idle { session } = &self.state else {
             return self.notice_item("new session needs an active session".to_owned());
+        };
+        // Preflight the fresh session's project context BEFORE consuming the
+        // current session: a workspace that no longer resolves fails the
+        // /new honestly while the current session stays alive (ADR 0017 —
+        // a fresh session is never composed without its bootstrap).
+        let project_context = match session.prepare_fresh_project_context() {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => return self.error_item(format!("new session failed: {error}")),
         };
         let created = self.session_store().and_then(|store| {
             let record = store.create_session()?;
@@ -2209,7 +2217,7 @@ impl AppCore {
         let reasoning_effort = old_session.reasoning_effort();
         let (decider, channels) = TuiDecider::new();
         let session = old_session
-            .into_fresh_session(session_id.clone(), decider)
+            .into_fresh_session(session_id.clone(), decider, project_context)
             .with_provenance(writer);
         let events = session.events().to_vec();
         let primary_agent_id = session_primary_agent_id(&session);

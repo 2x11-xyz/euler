@@ -55,24 +55,45 @@ pub(crate) fn fits_context_limit(required_tokens: u64, limit_tokens: u64) -> boo
     required_tokens <= limit_tokens
 }
 
+/// Every byte-bearing field of one provider-neutral input item. The proxy
+/// must never undercount: opaque reasoning artifacts (large provider
+/// signatures), call ids, and error strings all occupy request bytes when
+/// an adapter replays them, so they all count. Over-counting only fails a
+/// request early, which is the safe direction.
 fn input_item_bytes(item: &ModelInputItem) -> u64 {
     match item {
-        ModelInputItem::Message { content, .. } => content.len() as u64,
+        ModelInputItem::Message { content, role: _ } => content.len() as u64,
         ModelInputItem::ProjectContext { rendered } => rendered.len() as u64,
         ModelInputItem::ToolCall {
-            name, arguments, ..
-        } => name.len() as u64 + arguments.to_string().len() as u64,
-        ModelInputItem::ToolOutput {
+            call_id,
             name,
+            arguments,
+        } => call_id.len() as u64 + name.len() as u64 + arguments.to_string().len() as u64,
+        ModelInputItem::ToolOutput {
+            call_id,
+            name,
+            ok: _,
             output,
             error,
-            ..
+            exit_code: _,
         } => {
-            name.len() as u64
+            call_id.len() as u64
+                + name.len() as u64
                 + output.as_deref().map_or(0, str::len) as u64
                 + error.as_deref().map_or(0, str::len) as u64
         }
-        ModelInputItem::Reasoning { content, .. } => content.len() as u64,
+        ModelInputItem::Reasoning {
+            provider,
+            model,
+            fidelity: _,
+            content,
+            artifact,
+        } => {
+            provider.len() as u64
+                + model.len() as u64
+                + content.len() as u64
+                + artifact.as_deref().map_or(0, str::len) as u64
+        }
     }
 }
 
@@ -113,6 +134,64 @@ mod tests {
     fn overflow_returns_none() {
         assert_eq!(admission_required_tokens(usize::MAX, 0, u64::MAX), None);
         assert_eq!(admission_required_tokens(0, 0, u64::MAX), None);
+    }
+
+    #[test]
+    fn opaque_reasoning_artifacts_count_toward_the_request_proxy() {
+        // Reviewer attack: a large provider-opaque reasoning artifact (e.g.
+        // an Anthropic thinking signature) previously contributed zero
+        // bytes, undercounting the real request.
+        let base = ModelRequest {
+            model: "m".to_owned(),
+            instructions: String::new(),
+            input: vec![ModelInputItem::Reasoning {
+                provider: "anthropic".to_owned(),
+                model: "m".to_owned(),
+                fidelity: euler_provider::ReasoningFidelity::Opaque,
+                content: String::new(),
+                artifact: None,
+            }],
+            tools: Vec::new(),
+            reasoning_effort: ReasoningEffort::Medium,
+            max_output_tokens: None,
+        };
+        let without = request_required_tokens(&base, 0).expect("no overflow");
+        let mut with_artifact = base.clone();
+        if let ModelInputItem::Reasoning { artifact, .. } = &mut with_artifact.input[0] {
+            *artifact = Some("s".repeat(40_000));
+        }
+        let with = request_required_tokens(&with_artifact, 0).expect("no overflow");
+        assert_eq!(
+            with,
+            without + 10_000,
+            "40000 artifact bytes = 10000 proxy tokens"
+        );
+    }
+
+    #[test]
+    fn tool_output_and_call_ids_count_toward_the_request_proxy() {
+        let mut request = ModelRequest {
+            model: "m".to_owned(),
+            instructions: String::new(),
+            input: vec![ModelInputItem::ToolOutput {
+                call_id: String::new(),
+                name: String::new(),
+                ok: false,
+                output: None,
+                error: None,
+                exit_code: None,
+            }],
+            tools: Vec::new(),
+            reasoning_effort: ReasoningEffort::Medium,
+            max_output_tokens: None,
+        };
+        let empty = request_required_tokens(&request, 0).expect("no overflow");
+        if let ModelInputItem::ToolOutput { call_id, error, .. } = &mut request.input[0] {
+            *call_id = "c".repeat(400);
+            *error = Some("e".repeat(4_000));
+        }
+        let filled = request_required_tokens(&request, 0).expect("no overflow");
+        assert_eq!(filled, empty + 1_100);
     }
 
     #[test]

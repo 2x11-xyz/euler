@@ -12,10 +12,12 @@ use super::digest::{
     WORKSPACE_IDENTITY_ALGORITHM, WORKSPACE_IDENTITY_VERSION,
 };
 use super::framing::{render_project_context, FRAMING_VERSION};
-use super::manifest::CandidateManifest;
-use super::SNAPSHOT_SCHEMA_VERSION;
+use super::manifest::{validate_identity, validate_reason_code, CandidateManifest};
+use super::{MAX_EULER_MD_SOURCES, MAX_MANIFEST_DIAGNOSTICS, SNAPSHOT_SCHEMA_VERSION};
+use euler_event::JsonObject;
 use euler_event::{EventEnvelope, EventKind};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -91,80 +93,346 @@ pub(crate) fn fold_project_context(
     else {
         return Ok(ProjectContextFold::Absent);
     };
-    let schema_version = snapshot
-        .payload
-        .get("schema_version")
-        .and_then(Value::as_u64);
+    match validate_snapshot_payload(&snapshot.payload)? {
+        ValidatedSnapshot::Disabled => Ok(ProjectContextFold::Disabled),
+        ValidatedSnapshot::Admitted {
+            manifest,
+            candidate_digest,
+        } => {
+            let rendered = render_project_context(&manifest);
+            let rendered_digest = rendered_digest_v1(&rendered);
+            Ok(ProjectContextFold::Admitted(Box::new(
+                PinnedProjectContext {
+                    snapshot_event_id: snapshot.id.clone(),
+                    candidate_digest,
+                    rendered,
+                    rendered_digest,
+                },
+            )))
+        }
+    }
+}
+
+/// A snapshot payload that passed full field validation.
+enum ValidatedSnapshot {
+    Disabled,
+    Admitted {
+        manifest: CandidateManifest,
+        candidate_digest: String,
+    },
+}
+
+/// Payload keys the version-1 snapshot schema permits. Everything else is
+/// rejected: recorded payloads are untrusted input on resume, and an
+/// unknown field is exactly where forged content-bearing data would hide.
+const SNAPSHOT_COMMON_KEYS: &[&str] = &[
+    "schema_version",
+    "status",
+    "policy",
+    "resolution_reason",
+    "acknowledgment_basis",
+    "candidate_digest",
+    "workspace_identity",
+    "ordering",
+    "source_identities",
+    "diagnostic_count",
+    "diagnostic_reason_counts",
+];
+const SNAPSHOT_ADMITTED_KEYS: &[&str] = &["framing_version", "manifest_len", "manifest"];
+
+fn is_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Validate every field of a recorded snapshot payload against the same
+/// rules the encoder obeys. Both statuses are validated: a disabled
+/// tombstone with forged fields must reject resume, not silently disable.
+fn validate_snapshot_payload(
+    payload: &JsonObject,
+) -> Result<ValidatedSnapshot, ProjectContextFoldError> {
+    let schema_version = payload.get("schema_version").and_then(Value::as_u64);
     if schema_version != Some(u64::from(SNAPSHOT_SCHEMA_VERSION)) {
         return Err(ProjectContextFoldError::new(
             "it was written by a different Euler version",
         ));
     }
-    let status = snapshot
-        .payload
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    match status {
-        "admitted" => {}
+    let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
+    let admitted = match status {
+        "admitted" => true,
         // Tombstone family: phase 3 records "declined" and "unacknowledged";
         // decoding them now keeps latest-snapshot-authoritative stable.
-        "disabled" | "declined" | "unacknowledged" => return Ok(ProjectContextFold::Disabled),
+        "disabled" | "declined" | "unacknowledged" => false,
         _ => {
             return Err(ProjectContextFoldError::new(
                 "its status field is not one this Euler version knows",
             ))
         }
+    };
+    for key in payload.keys() {
+        let known = SNAPSHOT_COMMON_KEYS.contains(&key.as_str())
+            || (admitted && SNAPSHOT_ADMITTED_KEYS.contains(&key.as_str()));
+        if !known {
+            return Err(ProjectContextFoldError::new(format!(
+                "the snapshot carries a field this Euler version does not record: {key}"
+            )));
+        }
     }
-    let framing_version = snapshot
-        .payload
-        .get("framing_version")
-        .and_then(Value::as_u64);
-    if framing_version != Some(u64::from(FRAMING_VERSION)) {
+    for field in ["policy", "resolution_reason", "acknowledgment_basis"] {
+        let value = payload
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProjectContextFoldError::new(format!("its {field} is missing")))?;
+        validate_reason_code(value).map_err(|_| {
+            ProjectContextFoldError::new(format!("its {field} is not a stable code"))
+        })?;
+    }
+    let candidate_digest = payload
+        .get("candidate_digest")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !is_hex_digest(candidate_digest) {
+        return Err(ProjectContextFoldError::new(
+            "its candidate digest is malformed",
+        ));
+    }
+    validate_workspace_identity_field(payload)?;
+    if payload.get("ordering").and_then(Value::as_str) != Some(super::ORDERING_V1) {
+        return Err(ProjectContextFoldError::new(
+            "its ordering marker is not one this Euler version knows",
+        ));
+    }
+    let source_identities = validate_source_identities(payload)?;
+    let diagnostic_count = payload
+        .get("diagnostic_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            ProjectContextFoldError::new("the snapshot does not declare its diagnostic count")
+        })?;
+    if diagnostic_count > MAX_MANIFEST_DIAGNOSTICS as u64 {
+        return Err(ProjectContextFoldError::new(
+            "its diagnostic count exceeds the bound",
+        ));
+    }
+    let reason_counts = validate_reason_counts(payload, diagnostic_count)?;
+    if !admitted {
+        return Ok(ValidatedSnapshot::Disabled);
+    }
+    let manifest = validate_admitted_manifest(
+        payload,
+        candidate_digest,
+        &source_identities,
+        diagnostic_count,
+        &reason_counts,
+    )?;
+    Ok(ValidatedSnapshot::Admitted {
+        manifest,
+        candidate_digest: candidate_digest.to_owned(),
+    })
+}
+
+/// Admitted extras: the manifest string plus the end-to-end digest naming
+/// chain, and agreement between the summary fields and the manifest they
+/// summarize.
+fn validate_admitted_manifest(
+    payload: &JsonObject,
+    candidate_digest: &str,
+    source_identities: &[String],
+    diagnostic_count: u64,
+    reason_counts: &BTreeMap<String, u64>,
+) -> Result<CandidateManifest, ProjectContextFoldError> {
+    if payload.get("framing_version").and_then(Value::as_u64) != Some(u64::from(FRAMING_VERSION)) {
         return Err(ProjectContextFoldError::new(
             "its framing version is not one this Euler version knows",
         ));
     }
-    let Some(manifest_json) = snapshot.payload.get("manifest").and_then(Value::as_str) else {
+    let Some(manifest_json) = payload.get("manifest").and_then(Value::as_str) else {
         return Err(ProjectContextFoldError::new(
             "the admitted snapshot is missing its manifest",
         ));
     };
-    let manifest_len = snapshot.payload.get("manifest_len").and_then(Value::as_u64);
-    if manifest_len != Some(manifest_json.len() as u64) {
+    if payload.get("manifest_len").and_then(Value::as_u64) != Some(manifest_json.len() as u64) {
         return Err(ProjectContextFoldError::new(
             "the manifest length does not match the recorded length",
         ));
     }
-    let recorded_digest = snapshot
-        .payload
-        .get("candidate_digest")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if recorded_digest != candidate_digest_v1(manifest_json) {
+    if candidate_digest != candidate_digest_v1(manifest_json) {
         return Err(ProjectContextFoldError::new(
             "the manifest does not match its recorded digest",
         ));
     }
     let manifest = CandidateManifest::from_canonical_json(manifest_json)
         .map_err(|error| ProjectContextFoldError::new(error.to_string()))?;
-    let rendered = render_project_context(&manifest);
-    let rendered_digest = rendered_digest_v1(&rendered);
-    Ok(ProjectContextFold::Admitted(Box::new(
-        PinnedProjectContext {
-            snapshot_event_id: snapshot.id.clone(),
-            candidate_digest: recorded_digest.to_owned(),
-            rendered,
-            rendered_digest,
-        },
-    )))
+    let manifest_paths: Vec<&str> = manifest
+        .sources
+        .iter()
+        .map(|source| source.path.as_str())
+        .collect();
+    if manifest_paths
+        != source_identities
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    {
+        return Err(ProjectContextFoldError::new(
+            "its source identities do not match the manifest",
+        ));
+    }
+    if manifest.diagnostics.len() as u64 != diagnostic_count
+        || manifest.reason_counts != *reason_counts
+    {
+        return Err(ProjectContextFoldError::new(
+            "its diagnostic summary does not match the manifest",
+        ));
+    }
+    Ok(manifest)
+}
+
+fn validate_workspace_identity_field(payload: &JsonObject) -> Result<(), ProjectContextFoldError> {
+    let Some(identity) = payload.get("workspace_identity").and_then(Value::as_object) else {
+        return Err(ProjectContextFoldError::new(
+            "its workspace identity is missing",
+        ));
+    };
+    if identity.len() != 3
+        || identity.get("algorithm").and_then(Value::as_str)
+            != Some(super::WORKSPACE_IDENTITY_ALGORITHM)
+        || identity.get("version").and_then(Value::as_u64)
+            != Some(u64::from(super::WORKSPACE_IDENTITY_VERSION))
+    {
+        return Err(ProjectContextFoldError::new(
+            "its workspace identity uses an algorithm this Euler version does not know",
+        ));
+    }
+    let digest = identity.get("digest").and_then(Value::as_str).unwrap_or("");
+    if !is_hex_digest(digest) {
+        return Err(ProjectContextFoldError::new(
+            "its workspace identity digest is malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_identities(
+    payload: &JsonObject,
+) -> Result<Vec<String>, ProjectContextFoldError> {
+    let Some(entries) = payload.get("source_identities").and_then(Value::as_array) else {
+        return Err(ProjectContextFoldError::new(
+            "its source identity list is missing",
+        ));
+    };
+    if entries.len() > MAX_EULER_MD_SOURCES {
+        return Err(ProjectContextFoldError::new(
+            "its source identity list exceeds the bound",
+        ));
+    }
+    let mut identities = Vec::with_capacity(entries.len());
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let identity = entry.as_str().ok_or_else(|| {
+            ProjectContextFoldError::new("a source identity is not a path string")
+        })?;
+        validate_identity(identity).map_err(|_| {
+            ProjectContextFoldError::new(
+                "a source identity is not a normalized project-relative path",
+            )
+        })?;
+        if !seen.insert(identity) {
+            return Err(ProjectContextFoldError::new(
+                "a source identity is recorded twice",
+            ));
+        }
+        identities.push(identity.to_owned());
+    }
+    Ok(identities)
+}
+
+fn validate_reason_counts(
+    payload: &JsonObject,
+    diagnostic_count: u64,
+) -> Result<BTreeMap<String, u64>, ProjectContextFoldError> {
+    let Some(entries) = payload
+        .get("diagnostic_reason_counts")
+        .and_then(Value::as_object)
+    else {
+        return Err(ProjectContextFoldError::new(
+            "its per-reason counts are missing",
+        ));
+    };
+    let mut counts = BTreeMap::new();
+    let mut total: u64 = 0;
+    for (reason, count) in entries {
+        validate_reason_code(reason).map_err(|_| {
+            ProjectContextFoldError::new("a per-reason count key is not a stable code")
+        })?;
+        let count = count.as_u64().filter(|count| *count > 0).ok_or_else(|| {
+            ProjectContextFoldError::new("a per-reason count is not a positive number")
+        })?;
+        total = total.saturating_add(count);
+        counts.insert(reason.clone(), count);
+    }
+    if total != diagnostic_count {
+        return Err(ProjectContextFoldError::new(
+            "its per-reason counts do not sum to the declared diagnostic count",
+        ));
+    }
+    Ok(counts)
+}
+
+/// Diagnostic-event payload keys the version-1 schema permits.
+const DIAGNOSTIC_KEYS: &[&str] = &[
+    "schema_version",
+    "snapshot_event_id",
+    "reason",
+    "path",
+    "observed",
+];
+
+/// Validate one recorded `project.context.diagnostic` payload against the
+/// content-free schema: a stable reason code, an optional bounded
+/// normalized identity, optional numeric metadata, and nothing else.
+fn validate_diagnostic_payload(payload: &JsonObject) -> Result<(), String> {
+    for key in payload.keys() {
+        if !DIAGNOSTIC_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "a diagnostic carries a field this Euler version does not record: {key}"
+            ));
+        }
+    }
+    if payload.get("schema_version").and_then(Value::as_u64)
+        != Some(u64::from(SNAPSHOT_SCHEMA_VERSION))
+    {
+        return Err("a diagnostic was written by a different Euler version".to_owned());
+    }
+    let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("");
+    if validate_reason_code(reason).is_err() {
+        return Err("a diagnostic reason is not a stable code".to_owned());
+    }
+    if let Some(path) = payload.get("path") {
+        let path = path
+            .as_str()
+            .ok_or_else(|| "a diagnostic path is not a string".to_owned())?;
+        validate_identity(path).map_err(|_| {
+            "a diagnostic path is not a normalized project-relative path".to_owned()
+        })?;
+    }
+    if let Some(observed) = payload.get("observed") {
+        if observed.as_u64().is_none() {
+            return Err("a diagnostic observed value is not a number".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// Validate the durable bootstrap shape of an accepted event prefix:
 /// `session.start` (with its project-context summary), one snapshot, then
 /// exactly the snapshot's declared number of diagnostics, before anything
-/// else. Missing, partial, duplicated, and mixed shapes fail closed; the
-/// legacy shape (no summary and no snapshot anywhere) is the only fallback.
+/// else — with every recorded payload re-validated against the schema the
+/// encoder obeys. Missing, partial, duplicated, forged, and mixed shapes
+/// fail closed; the legacy shape (no summary and no snapshot anywhere) is
+/// the only fallback.
 pub(crate) fn validate_bootstrap_shape(events: &[EventEnvelope]) -> Result<(), String> {
     let summary = events
         .first()
@@ -205,6 +473,7 @@ pub(crate) fn validate_bootstrap_shape(events: &[EventEnvelope]) -> Result<(), S
             )
         }
     };
+    validate_snapshot_payload(&snapshot.payload).map_err(|error| error.to_string())?;
     let declared = snapshot
         .payload
         .get("diagnostic_count")
@@ -218,6 +487,27 @@ pub(crate) fn validate_bootstrap_shape(events: &[EventEnvelope]) -> Result<(), S
              {diagnostic_count}"
         ));
     }
+    validate_bootstrap_diagnostics(events, snapshot, declared)?;
+    // No diagnostics may appear outside the declared bootstrap block.
+    if events
+        .iter()
+        .skip(2 + declared)
+        .any(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_DIAGNOSTIC)
+    {
+        return Err("a project-context diagnostic appears outside the bootstrap".to_owned());
+    }
+    Ok(())
+}
+
+/// Validate the contiguous diagnostics block of the bootstrap: every event
+/// cites the snapshot, satisfies the content-free schema, and together they
+/// reproduce exactly the snapshot's per-reason counts.
+fn validate_bootstrap_diagnostics(
+    events: &[EventEnvelope],
+    snapshot: &EventEnvelope,
+    declared: usize,
+) -> Result<(), String> {
+    let mut recorded_counts: BTreeMap<String, u64> = BTreeMap::new();
     for (index, event) in events.iter().enumerate().skip(2).take(declared) {
         if event.kind.as_str() != EventKind::PROJECT_CONTEXT_DIAGNOSTIC {
             return Err(format!(
@@ -232,14 +522,32 @@ pub(crate) fn validate_bootstrap_shape(events: &[EventEnvelope]) -> Result<(), S
         {
             return Err("a diagnostic does not cite the session's snapshot".to_owned());
         }
+        validate_diagnostic_payload(&event.payload)?;
+        let reason = event
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        *recorded_counts.entry(reason).or_default() += 1;
     }
-    // No diagnostics may appear outside the declared bootstrap block.
-    if events
-        .iter()
-        .skip(2 + declared)
-        .any(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_DIAGNOSTIC)
-    {
-        return Err("a project-context diagnostic appears outside the bootstrap".to_owned());
+    // The snapshot's per-reason counts must equal the counts derived from
+    // the recorded diagnostic events.
+    let declared_counts: BTreeMap<String, u64> = snapshot
+        .payload
+        .get("diagnostic_reason_counts")
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(reason, count)| Some((reason.clone(), count.as_u64()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if recorded_counts != declared_counts {
+        return Err(
+            "the snapshot's per-reason counts do not match the recorded diagnostics".to_owned(),
+        );
     }
     Ok(())
 }

@@ -189,11 +189,14 @@ bounded. A check-then-open sequence alone is not sufficient. If a platform
 cannot perform a safe no-follow read, Euler omits that source rather than
 following it.
 
-For concurrent edits, Euler reads from one handle, compares stable metadata
-before and after the bounded read, and retries at most once. If the source is
-still changing, it is omitted with a typed `changed_during_read` diagnostic.
-Euler never admits a torn or partially truncated source merely to keep startup
-moving.
+For concurrent edits, Euler verifies each source with a pair of bounded
+reads from independently verified handles that must be byte-identical;
+per-handle stable-metadata comparison is a fast-path reject, not the
+admission criterion, because timestamp granularity on some filesystems
+cannot see a rapid same-size rewrite. The verification retries at most
+once. If the source is still changing, it is omitted with a typed
+`changed_during_read` diagnostic. Euler never admits a torn or partially
+truncated source merely to keep startup moving.
 
 Malformed, unsafe, and over-limit sources are omitted whole. Startup continues
 with visible typed diagnostics; content is never silently truncated because a
@@ -421,6 +424,7 @@ The initial implementation targets these contract limits:
 | Accepted `EULER.md` sources | 16 |
 | One `EULER.md` | 32 KiB |
 | Combined accepted `EULER.md` content | 64 KiB |
+| Directory entries examined per directory level | 4096 |
 | Skill traversal depth below each skills root | 6 |
 | Skill directories examined across all roots | 512 |
 | Accepted skills | 64 |

@@ -196,10 +196,13 @@ fn submodule_git_file_starts_a_new_boundary() {
 
 #[test]
 fn without_a_git_marker_the_chain_is_the_workspace_alone() {
+    // Hermetic against ancestor state (a stray `/tmp/.git` on the host must
+    // not change the outcome): the workspace sits deeper than the
+    // marker-search window, so only tempdir-owned directories are ever
+    // consulted.
     let temp = tempfile::tempdir().expect("temp");
     write(&temp.path().join("EULER.md"), "parent rules");
-    let workspace = temp.path().join("ws");
-    fs::create_dir_all(&workspace).expect("ws");
+    let workspace = nested_chain(temp.path(), MAX_CHAIN_LEVELS + 1);
     write(&workspace.join("EULER.md"), "workspace rules");
 
     let bootstrap = admitted(&workspace);
@@ -348,6 +351,33 @@ fn source_changing_across_both_read_attempts_is_omitted() {
     super::discovery::test_hook::set_after_read(Some(Box::new(move || {
         version += 1;
         fs::write(&target, format!("mutated {version} bytes longer")).expect("mutate");
+    })));
+    let bootstrap = admitted(&repo);
+    super::discovery::test_hook::set_after_read(None);
+
+    assert!(source_paths(&bootstrap).is_empty());
+    assert!(reasons(&bootstrap).contains(&"changed_during_read".to_owned()));
+}
+
+#[cfg(unix)]
+#[test]
+fn rapid_same_size_rewrites_are_omitted_despite_stable_metadata() {
+    // Reviewer attack: rewrite the file between reads with SAME-SIZE
+    // content. On filesystems with coarse timestamp granularity the
+    // metadata signature cannot see this; admission must rest on the two
+    // bounded reads being byte-identical, so the torn source is omitted on
+    // every filesystem, deterministically.
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    let file = repo.join("EULER.md");
+    write(&file, "generation A");
+
+    let target = file.clone();
+    let mut generation = b'A';
+    super::discovery::test_hook::set_after_read(Some(Box::new(move || {
+        generation += 1;
+        fs::write(&target, format!("generation {}", generation as char)).expect("mutate");
     })));
     let bootstrap = admitted(&repo);
     super::discovery::test_hook::set_after_read(None);
@@ -862,4 +892,336 @@ fn workspace_identity_with_unknown_algorithm_or_missing_record_is_unusable() {
 
     // Sessions without snapshots verify trivially.
     verify_workspace_identity(&[plain_session_start()], &repo).expect("legacy ok");
+}
+
+// ---------------------------------------------------------------------------
+// External review blockers (PR #184): attack reproductions
+// ---------------------------------------------------------------------------
+
+/// Blocker 1: a component of the purportedly canonical workspace path is a
+/// symlink (canonicalize-then-open race). The anchored component-wise
+/// `openat` walk must fail closed instead of following it.
+#[cfg(unix)]
+#[test]
+fn symlinked_component_in_the_workspace_path_fails_discovery_closed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let canonical_temp = fs::canonicalize(temp.path()).expect("canonical temp");
+    let real = canonical_temp.join("real");
+    let workspace = real.join("ws");
+    git_dir(&real);
+    fs::create_dir_all(&workspace).expect("ws");
+    write(&workspace.join("EULER.md"), "reachable only via the link");
+    std::os::unix::fs::symlink(&real, canonical_temp.join("link")).expect("symlink");
+
+    // The path LOOKS canonical but routes through the symlinked component,
+    // exactly what a swap between canonicalize() and the walk produces.
+    let raced = canonical_temp.join("link").join("ws");
+    let outcome = super::discovery::discover(&raced, &redactor());
+
+    assert!(outcome.sources.is_empty(), "nothing may be admitted");
+    assert!(outcome
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason == "symlink_rejected"));
+    // The genuinely canonical path still works.
+    let outcome = super::discovery::discover(&workspace, &redactor());
+    assert_eq!(outcome.sources.len(), 1);
+}
+
+/// Blocker 2: a repository-controlled diagnostic flood must collapse into a
+/// disabled bootstrap with a typed reason code — never a bootstrap-less
+/// (legacy-shaped) session and never a startup failure.
+#[test]
+fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
+    let flood = super::discovery::DiscoveryOutcome {
+        sources: vec![],
+        diagnostics: (0..MAX_MANIFEST_DIAGNOSTICS + 1)
+            .map(|_| {
+                super::discovery::diagnostic(
+                    super::discovery::DiagnosticReason::CaseMismatch,
+                    Some("euler.md".to_owned()),
+                    None,
+                )
+            })
+            .collect(),
+    };
+    let (manifest, collapsed) = super::sanitize_preflight(flood);
+    assert!(collapsed);
+    assert!(
+        manifest.sources.is_empty(),
+        "a collapsed preflight admits nothing"
+    );
+    assert_eq!(manifest.diagnostics.len(), 1);
+    assert_eq!(manifest.diagnostics[0].reason, "diagnostic_overflow");
+    assert_eq!(
+        manifest.diagnostics[0].observed,
+        Some(MAX_MANIFEST_DIAGNOSTICS as u64 + 1)
+    );
+    manifest.validate().expect("collapsed manifest is valid");
+
+    // Exactly at the bound nothing collapses.
+    let at_bound = super::discovery::DiscoveryOutcome {
+        sources: vec![],
+        diagnostics: (0..MAX_MANIFEST_DIAGNOSTICS)
+            .map(|_| {
+                super::discovery::diagnostic(
+                    super::discovery::DiagnosticReason::CaseMismatch,
+                    Some("euler.md".to_owned()),
+                    None,
+                )
+            })
+            .collect(),
+    };
+    let (manifest, collapsed) = super::sanitize_preflight(at_bound);
+    assert!(!collapsed);
+    assert_eq!(manifest.diagnostics.len(), MAX_MANIFEST_DIAGNOSTICS);
+}
+
+/// Blocker 2: even the admitted (test-hook) path resolves disabled when the
+/// preflight collapsed, and an unresolvable workspace root is the only
+/// preflight failure that surfaces as an error.
+#[test]
+fn unresolvable_workspace_is_the_only_preflight_error() {
+    let temp = tempfile::tempdir().expect("temp");
+    let missing = temp.path().join("does-not-exist");
+    assert!(matches!(
+        ProjectContextBootstrap::dormant(&missing, &redactor()),
+        Err(ProjectContextError::Workspace(_))
+    ));
+    assert!(matches!(
+        ProjectContextBootstrap::admitted_for_tests(&missing, &redactor()),
+        Err(ProjectContextError::Workspace(_))
+    ));
+}
+
+/// Blocker 6: a directory level with more entries than the frozen cap is
+/// omitted whole with a typed diagnostic; at the cap it scans normally.
+#[cfg(unix)]
+#[test]
+fn directory_entry_cap_omits_the_level_whole() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    write(&repo.join("EULER.md"), "root rules");
+
+    // cap: EULER.md plus cap-1 fillers scans normally.
+    let at_cap = repo.join("at-cap");
+    fs::create_dir_all(&at_cap).expect("at-cap");
+    write(&at_cap.join("EULER.md"), "at-cap rules");
+    for index in 0..super::MAX_DIR_ENTRIES - 1 {
+        fs::write(at_cap.join(format!("f{index:04}")), b"").expect("filler");
+    }
+    let bootstrap = admitted(&at_cap);
+    assert_eq!(
+        source_paths(&bootstrap),
+        vec!["EULER.md", "at-cap/EULER.md"]
+    );
+    assert!(!reasons(&bootstrap).contains(&"dir_entries_exceeded".to_owned()));
+
+    // cap + 1: the level is omitted whole — its EULER.md is NOT admitted,
+    // and no partial selection over the truncated listing occurs.
+    let over_cap = repo.join("over-cap");
+    fs::create_dir_all(&over_cap).expect("over-cap");
+    write(&over_cap.join("EULER.md"), "over-cap rules");
+    for index in 0..super::MAX_DIR_ENTRIES {
+        fs::write(over_cap.join(format!("f{index:04}")), b"").expect("filler");
+    }
+    let bootstrap = admitted(&over_cap);
+    assert_eq!(source_paths(&bootstrap), vec!["EULER.md"]);
+    let overflow = bootstrap
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.reason == "dir_entries_exceeded")
+        .expect("typed cap diagnostic");
+    assert_eq!(overflow.path.as_deref(), Some("over-cap"));
+    assert_eq!(overflow.observed, Some(super::MAX_DIR_ENTRIES as u64 + 1));
+}
+
+// Blocker 4: forged snapshot/diagnostic payloads in a resumed log must
+// reject, one test per mutation class the reviewer used.
+
+fn disabled_snapshot_event(mutate: impl FnOnce(&mut euler_event::JsonObject)) -> EventEnvelope {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    write(&repo.join("EULER.md"), "content");
+    let mut payload = dormant(&repo).snapshot_payload();
+    mutate(&mut payload);
+    EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::PROJECT_CONTEXT_SNAPSHOT,
+        payload,
+    )
+}
+
+fn assert_fold_rejects(event: EventEnvelope) {
+    assert!(
+        fold_project_context(&[event]).is_err(),
+        "forged payload must reject"
+    );
+}
+
+#[test]
+fn forged_candidate_digest_shape_rejects() {
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert(
+            "candidate_digest".to_owned(),
+            "not-a-digest-but-64-chars-oooooooooooooooooooooooooooooooooooooo".into(),
+        );
+    }));
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("candidate_digest".to_owned(), "abc123".into());
+    }));
+}
+
+#[test]
+fn forged_diagnostic_count_mismatch_rejects() {
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("diagnostic_count".to_owned(), 7.into());
+    }));
+}
+
+#[test]
+fn forged_outside_workspace_identity_rejects() {
+    for hostile in ["../../../etc/passwd", "/etc/passwd", "a/../EULER.md"] {
+        assert_fold_rejects(disabled_snapshot_event(|payload| {
+            payload.insert("source_identities".to_owned(), serde_json::json!([hostile]));
+        }));
+    }
+}
+
+#[test]
+fn forged_content_bearing_field_rejects() {
+    // An unknown field is exactly where forged excerpt content would hide.
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert(
+            "excerpt".to_owned(),
+            "-----BEGIN PRIVATE KEY----- stolen".into(),
+        );
+    }));
+    // A disabled snapshot must never carry admitted-only body fields.
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("manifest".to_owned(), "{\"forged\":true}".into());
+    }));
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("manifest_len".to_owned(), 16.into());
+    }));
+}
+
+#[test]
+fn forged_reason_count_key_rejects() {
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert(
+            "diagnostic_reason_counts".to_owned(),
+            serde_json::json!({"leaked file contents here!": 1}),
+        );
+    }));
+}
+
+#[test]
+fn forged_workspace_identity_algorithm_rejects_fold() {
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert(
+            "workspace_identity".to_owned(),
+            serde_json::json!({"algorithm": "attacker-host", "version": 9, "digest": "ab"}),
+        );
+    }));
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.remove("workspace_identity");
+    }));
+}
+
+#[test]
+fn forged_admitted_summary_field_mismatch_rejects() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    write(&repo.join("EULER.md"), "content");
+    let good = admitted(&repo).snapshot_payload();
+
+    // source_identities that disagree with the manifest they summarize.
+    let mut payload = good.clone();
+    payload.insert(
+        "source_identities".to_owned(),
+        serde_json::json!(["other/EULER.md"]),
+    );
+    assert!(fold_project_context(&[EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::PROJECT_CONTEXT_SNAPSHOT,
+        payload,
+    )])
+    .is_err());
+
+    // Reason-count summary that disagrees with the manifest.
+    let mut payload = good.clone();
+    payload.insert(
+        "diagnostic_reason_counts".to_owned(),
+        serde_json::json!({"io_error": 1}),
+    );
+    payload.insert("diagnostic_count".to_owned(), 1.into());
+    assert!(fold_project_context(&[EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::PROJECT_CONTEXT_SNAPSHOT,
+        payload,
+    )])
+    .is_err());
+
+    // The untampered payload still folds.
+    assert!(fold_project_context(&[EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::PROJECT_CONTEXT_SNAPSHOT,
+        good,
+    )])
+    .is_ok());
+}
+
+#[test]
+fn forged_diagnostic_event_payloads_fail_the_bootstrap_shape() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    write(&repo.join("EULER.md"), "content");
+    let workspace = repo.join("sub");
+    fs::create_dir_all(&workspace).expect("sub");
+    write(&workspace.join("euler.md"), "near miss");
+    let events = bootstrap_events(&dormant(&workspace));
+    assert!(events.len() >= 3, "bootstrap has a diagnostic to forge");
+    validate_bootstrap_shape(&events).expect("untampered shape is valid");
+
+    // Content-bearing field smuggled into a diagnostic event.
+    let mut forged = events.clone();
+    forged[2]
+        .payload
+        .insert("excerpt".to_owned(), "stolen repository text".into());
+    assert!(validate_bootstrap_shape(&forged).is_err());
+
+    // Diagnostic reason that is not a stable content-free code.
+    let mut forged = events.clone();
+    forged[2]
+        .payload
+        .insert("reason".to_owned(), "SELECT * FROM secrets".into());
+    assert!(validate_bootstrap_shape(&forged).is_err());
+
+    // Outside-workspace path on a diagnostic.
+    let mut forged = events.clone();
+    forged[2]
+        .payload
+        .insert("path".to_owned(), "../outside/EULER.md".into());
+    assert!(validate_bootstrap_shape(&forged).is_err());
+
+    // Recorded diagnostics that no longer match the snapshot's per-reason
+    // counts (reason swapped for another grammar-valid code).
+    let mut forged = events.clone();
+    forged[2]
+        .payload
+        .insert("reason".to_owned(), "io_error".into());
+    assert!(validate_bootstrap_shape(&forged).is_err());
 }

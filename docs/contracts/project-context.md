@@ -46,12 +46,21 @@ permission machinery as one suggested by an ordinary user message.
   state: tracked, untracked, and ignored files are admitted identically. An
   ignored `EULER.md` or skill directory is the supported private per-project
   overlay; snapshots record and frame it like any other source.
-- Containment: sources open relative to held root handles with
-  no-follow/beneath semantics; symlinks, reparse points, and non-regular
-  files are rejected; a platform that cannot no-follow-read omits the source.
-  Unstable reads retry once, then omit with a `changed_during_read`
-  diagnostic. Malformed, unsafe, or over-limit sources are omitted whole with
-  typed diagnostics, never truncated.
+- Containment: the workspace anchor is established by a component-wise
+  no-follow `openat` walk from the filesystem root (a check-then-open of an
+  absolute path is not sufficient); a component that resolves to a symlink
+  fails discovery closed with a typed diagnostic. Sources then open relative
+  to those held handles with no-follow/beneath semantics; symlinks, reparse
+  points, and non-regular files are rejected; a platform that cannot
+  no-follow-read omits the source. Directory enumeration is bounded: a level
+  with more entries than the frozen cap is omitted whole with a typed
+  `dir_entries_exceeded` diagnostic and its observed count — never scanned
+  through a truncated listing. Admission requires two bounded reads from
+  independently verified handles with byte-identical results (per-handle
+  stable-metadata comparison is only a fast-path reject); an unstable
+  verification retries once, then omits with a `changed_during_read`
+  diagnostic. Malformed, unsafe, or over-limit sources are omitted whole
+  with typed diagnostics, never truncated.
 
 Bounds (frozen by this contract; changing one is a contract change):
 
@@ -61,6 +70,7 @@ Bounds (frozen by this contract; changing one is a contract change):
 | Accepted `EULER.md` sources | 16 |
 | One `EULER.md` | 32 KiB |
 | Combined accepted `EULER.md` content | 64 KiB |
+| Directory entries examined per directory level | 4096 |
 | Skill traversal depth below each skills root | 6 |
 | Skill directories examined across all roots | 512 |
 | Accepted skills | 64 |
@@ -78,10 +88,22 @@ admission priority when the aggregate instruction budget forces a choice.
 Project-context preflight is local and occurs before acknowledgment because
 Euler must compute the digest the acknowledgment names. That preflight is not
 general filesystem authority: it uses only the discovery paths and bounds
-above, reads each attempt from one verified handle, retries an unstable source
-at most once as specified above, and freezes only the stable bytes so
-acknowledgment, persistence, and prompt assembly cannot observe different
-versions of a file.
+above, reads each verification from independently verified handles, retries
+an unstable source at most once as specified above, and freezes only the
+byte-stable result so acknowledgment, persistence, and prompt assembly
+cannot observe different versions of a file.
+
+Preflight failure is never silent degradation. A fresh session is never
+composed without its bootstrap: a preflight whose diagnostics exceed the
+manifest bound, or that cannot assemble a valid manifest for any other
+reason, collapses into a disabled result whose manifest contains exactly one
+typed record (`diagnostic_overflow` with the observed count, or
+`preflight_invalid`) and admits nothing — the collapse participates in the
+candidate digest like any other manifest content. The one unrecoverable
+case is a workspace root that cannot be canonicalized: a session whose root
+cannot be resolved cannot enforce any path-keyed rule, so fresh session
+start fails with a plain-language error instead of inventing an
+identity-less snapshot or starting a legacy-shaped session.
 
 The host constructs one startup redactor before preflight, seeds it with the
 environment, the selected auth store, and every other credential value known
@@ -162,7 +184,13 @@ per-project trust store.
   not regenerated during resume. Rehydration verifies the blob address and
   length, rejects invalid UTF-8, duplicate keys, trailing data, unsupported
   versions, limit violations, and internal digest mismatches, and never falls
-  back to current project files.
+  back to current project files. Recorded snapshot and diagnostic payloads
+  are untrusted input on fold: every field of both the admitted and the
+  disabled shapes is re-validated against the rules the encoder obeys —
+  unknown payload fields, malformed digest shapes, non-normalized or
+  traversal identities, unknown workspace-identity algorithm/version pairs,
+  reason codes outside the stable grammar, and per-reason counts that do not
+  match the recorded diagnostics all reject.
 - `project.context.diagnostic` events record omissions without embedding
   unsafe content. Their payload is limited to a stable reason code, bounded
   normalized relative identity when one exists, and non-content numeric

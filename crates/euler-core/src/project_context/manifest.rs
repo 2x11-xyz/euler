@@ -183,7 +183,10 @@ pub(crate) fn validate_identity(path: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
-fn validate_reason_code(reason: &str) -> Result<(), ManifestError> {
+/// Stable reason-code grammar shared by manifest records, snapshot payload
+/// label fields, and diagnostic events: 1-64 bytes of ASCII lowercase,
+/// digits, and underscores.
+pub(crate) fn validate_reason_code(reason: &str) -> Result<(), ManifestError> {
     let valid = !reason.is_empty()
         && reason.len() <= 64
         && reason

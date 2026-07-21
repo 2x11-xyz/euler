@@ -1,18 +1,27 @@
 //! Secure `EULER.md` discovery along the project-root-to-workspace chain.
 //!
 //! Containment rules (ADR 0017 / project-context contract):
+//! - the workspace anchor is established by a component-wise `openat` walk
+//!   from the filesystem root with `O_NOFOLLOW` on every step — never a
+//!   check-then-open of an absolute path. The walked path is already
+//!   canonical, so it contains no symlinks by construction; any race that
+//!   swaps one in makes the walk fail closed with a typed diagnostic;
 //! - the project discovery root is the nearest ancestor with an exact `.git`
 //!   entry that is a regular file or directory; a symlinked `.git` is not a
 //!   marker, and a `.git` file (linked worktree / submodule) is a root whose
 //!   contents are never followed;
-//! - every open is relative to a held directory handle with no-follow
-//!   semantics; symlinks, reparse points, devices, FIFOs, and other
-//!   non-regular files are rejected after the handle is verified;
+//! - every subsequent open is relative to a held directory handle with
+//!   no-follow semantics; symlinks, reparse points, devices, FIFOs, and
+//!   other non-regular files are rejected after the handle is verified;
 //! - directory entries are compared by exact name — a case-insensitive
-//!   filesystem lookup must never admit `euler.md` as `EULER.md`;
-//! - reads follow the stable-read protocol: one handle per attempt, stable
-//!   metadata compared before and after the bounded read, one retry, then a
-//!   typed `changed_during_read` omission;
+//!   filesystem lookup must never admit `euler.md` as `EULER.md` — and
+//!   enumeration is bounded: a directory with more entries than the frozen
+//!   per-level cap is omitted whole with a typed diagnostic, never scanned
+//!   through a truncated listing;
+//! - reads follow the stable-read protocol: each verification is a pair of
+//!   bounded reads from independently verified handles that must be
+//!   byte-identical (per-handle metadata comparison is a fast-path reject);
+//!   one retry, then a typed `changed_during_read` omission;
 //! - malformed, unsafe, or over-limit sources are omitted whole with typed
 //!   content-free diagnostics, never truncated;
 //! - discovery reads the working tree and ignores version-control state.
@@ -23,8 +32,8 @@
 use super::digest::source_digest_v1;
 use super::manifest::{ManifestDiagnostic, ManifestSource};
 use super::{
-    MAX_CHAIN_LEVELS, MAX_COMBINED_EULER_MD_BYTES, MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES,
-    MAX_IDENTITY_BYTES,
+    MAX_CHAIN_LEVELS, MAX_COMBINED_EULER_MD_BYTES, MAX_DIR_ENTRIES, MAX_EULER_MD_BYTES,
+    MAX_EULER_MD_SOURCES, MAX_IDENTITY_BYTES,
 };
 use crate::redaction::SecretRedactor;
 use std::path::Path;
@@ -47,6 +56,16 @@ pub(crate) enum DiagnosticReason {
     NonUtf8Path,
     IdentityTooLong,
     ChainDepthExceeded,
+    /// A directory level had more entries than the frozen per-level cap and
+    /// was omitted whole rather than scanned through a truncated listing.
+    DirEntriesExceeded,
+    /// The bounded preflight itself produced more diagnostics than the
+    /// manifest bound; the whole preflight collapsed to this single record
+    /// and no source was admitted.
+    DiagnosticOverflow,
+    /// Defensive collapse: the preflight assembled a manifest that failed
+    /// its own validation. Nothing was admitted.
+    PreflightInvalid,
     IoError,
     /// Constructed only on platforms without a ratified no-follow read path.
     #[cfg_attr(unix, allow(dead_code))]
@@ -67,6 +86,9 @@ impl DiagnosticReason {
             Self::NonUtf8Path => "non_utf8_path",
             Self::IdentityTooLong => "identity_too_long",
             Self::ChainDepthExceeded => "chain_depth_exceeded",
+            Self::DirEntriesExceeded => "dir_entries_exceeded",
+            Self::DiagnosticOverflow => "diagnostic_overflow",
+            Self::PreflightInvalid => "preflight_invalid",
             Self::IoError => "io_error",
             Self::NoFollowUnsupported => "no_follow_unsupported",
         }
@@ -82,7 +104,7 @@ pub(crate) struct DiscoveryOutcome {
     pub diagnostics: Vec<ManifestDiagnostic>,
 }
 
-fn diagnostic(
+pub(crate) fn diagnostic(
     reason: DiagnosticReason,
     path: Option<String>,
     observed: Option<u64>,
@@ -104,15 +126,35 @@ pub(crate) fn discover(canonical_workspace: &Path, redactor: &SecretRedactor) ->
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use std::ffi::{CString, OsStr};
+    use std::ffi::{CString, OsStr, OsString};
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::path::PathBuf;
+    use std::path::Component;
 
     struct Candidate {
         rel_path: String,
         content: String,
+    }
+
+    /// One directory on the anchored workspace chain.
+    struct ChainDir {
+        fd: OwnedFd,
+        /// Component name of this directory (`None` for the filesystem
+        /// root).
+        name: Option<OsString>,
+        /// The handle was opened traversal-only (search permission without
+        /// read permission); enumeration must upgrade via `openat(fd, ".")`.
+        traversal_only: bool,
+        /// Bounded enumeration result, cached so marker search and source
+        /// scanning observe one listing.
+        entries: Option<Enumeration>,
+    }
+
+    enum Enumeration {
+        Names(Vec<Vec<u8>>),
+        CapExceeded(u64),
+        Failed,
     }
 
     pub(super) fn discover(
@@ -120,8 +162,33 @@ mod imp {
         redactor: &SecretRedactor,
     ) -> DiscoveryOutcome {
         let mut diagnostics = Vec::new();
-        let root = find_discovery_root(canonical_workspace, &mut diagnostics);
-        let candidates = collect_candidates(&root, canonical_workspace, redactor, &mut diagnostics);
+        // Anchor: open every component of the canonical workspace path from
+        // the filesystem root with no-follow semantics, retaining handles
+        // for the marker-search window (the last MAX_CHAIN_LEVELS
+        // directories, workspace inclusive).
+        let (mut window, truncated_above) =
+            match open_workspace_chain(canonical_workspace, &mut diagnostics) {
+                Some(walk) => walk,
+                None => {
+                    return DiscoveryOutcome {
+                        sources: Vec::new(),
+                        diagnostics,
+                    }
+                }
+            };
+        // Nearest marker inside the window (workspace upward). Enumeration
+        // failures during marker search are best-effort no-marker levels;
+        // only chain levels get typed diagnostics below.
+        let root_index = find_marker_index(&mut window);
+        if root_index.is_none() && truncated_above {
+            diagnostics.push(diagnostic(
+                DiagnosticReason::ChainDepthExceeded,
+                None,
+                Some(MAX_CHAIN_LEVELS as u64),
+            ));
+        }
+        let root_index = root_index.unwrap_or(window.len() - 1);
+        let candidates = scan_chain(&mut window[root_index..], redactor, &mut diagnostics);
         let sources = admit_candidates(candidates, &mut diagnostics);
         DiscoveryOutcome {
             sources,
@@ -129,87 +196,46 @@ mod imp {
         }
     }
 
-    /// Nearest ancestor (workspace inclusive) whose directory listing has an
-    /// exact `.git` entry that is a regular file or directory. The search is
-    /// bounded by the chain-depth limit; without a marker inside the bound
-    /// the chain is the workspace alone.
-    fn find_discovery_root(
+    /// Component-wise `openat` walk from `/` to the canonical workspace.
+    /// Every step uses `O_NOFOLLOW`, so a component swapped for a symlink
+    /// after canonicalization fails the walk closed (typed diagnostic, no
+    /// sources) instead of being followed. Returns the retained window (the
+    /// deepest `MAX_CHAIN_LEVELS` directories) and whether directories were
+    /// dropped above it.
+    fn open_workspace_chain(
         canonical_workspace: &Path,
         diagnostics: &mut Vec<ManifestDiagnostic>,
-    ) -> PathBuf {
-        for (level, dir) in canonical_workspace.ancestors().enumerate() {
-            if level >= MAX_CHAIN_LEVELS {
-                diagnostics.push(diagnostic(
-                    DiagnosticReason::ChainDepthExceeded,
-                    None,
-                    Some(MAX_CHAIN_LEVELS as u64),
-                ));
-                break;
-            }
-            if has_exact_git_marker(dir) {
-                return dir.to_path_buf();
-            }
+    ) -> Option<(Vec<ChainDir>, bool)> {
+        let mut components = canonical_workspace.components();
+        if components.next() != Some(Component::RootDir) {
+            // Discovery operates on canonicalized absolute Unix paths only.
+            diagnostics.push(diagnostic(DiagnosticReason::IoError, None, None));
+            return None;
         }
-        canonical_workspace.to_path_buf()
-    }
-
-    /// Exact-entry `.git` marker check. Enumerates the directory (a plain
-    /// path lookup on a case-insensitive filesystem could match `.GIT`) and
-    /// classifies the entry without following symlinks.
-    fn has_exact_git_marker(dir: &Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        for entry in entries.flatten() {
-            if entry.file_name().as_os_str().as_bytes() != b".git" {
-                continue;
-            }
-            let Ok(file_type) = entry.file_type() else {
-                return false;
-            };
-            // A symlinked `.git` is not a marker; a regular file marks a
-            // linked worktree or submodule root (its contents are never
-            // followed), and a directory marks an ordinary repository.
-            return file_type.is_file() || file_type.is_dir();
-        }
-        false
-    }
-
-    fn collect_candidates(
-        root: &Path,
-        canonical_workspace: &Path,
-        redactor: &SecretRedactor,
-        diagnostics: &mut Vec<ManifestDiagnostic>,
-    ) -> Vec<Candidate> {
-        let mut candidates = Vec::new();
-        let rel = canonical_workspace
-            .strip_prefix(root)
-            .expect("discovery root is an ancestor of the workspace");
-        let components: Vec<&OsStr> = rel
-            .components()
-            .map(|component| component.as_os_str())
-            .collect();
-
-        let mut dir = match open_dir_abs(root) {
-            Ok(dir) => dir,
+        let root_fd = match open_filesystem_root() {
+            Ok(fd) => fd,
             Err(_) => {
                 diagnostics.push(diagnostic(DiagnosticReason::IoError, None, None));
-                return candidates;
+                return None;
             }
         };
-        let mut rel_dir = String::new();
-
-        for depth in 0..=components.len() {
-            scan_dir(&dir, &rel_dir, redactor, &mut candidates, diagnostics);
-            let Some(component) = components.get(depth) else {
-                break;
+        let mut window: Vec<ChainDir> = vec![ChainDir {
+            fd: root_fd,
+            name: None,
+            traversal_only: false,
+            entries: None,
+        }];
+        let mut truncated_above = false;
+        for component in components {
+            let Component::Normal(name) = component else {
+                // A canonical path has no `.`/`..` components; anything else
+                // means the input is not the canonical path this walk is
+                // contracted to anchor.
+                diagnostics.push(diagnostic(DiagnosticReason::IoError, None, None));
+                return None;
             };
-            let Some(component_str) = component.to_str() else {
-                diagnostics.push(diagnostic(DiagnosticReason::NonUtf8Path, None, None));
-                break;
-            };
-            let next_rel = join_rel(&rel_dir, component_str);
-            dir = match open_child_dir(&dir, component) {
+            let parent = &window.last().expect("window is never empty").fd;
+            let next = match open_component_dir(parent, name) {
                 Ok(next) => next,
                 Err(error) => {
                     let reason = if error.raw_os_error() == Some(libc::ELOOP)
@@ -219,38 +245,133 @@ mod imp {
                     } else {
                         DiagnosticReason::IoError
                     };
-                    diagnostics.push(diagnostic(reason, Some(next_rel), None));
-                    break;
+                    diagnostics.push(diagnostic(reason, None, None));
+                    return None;
                 }
             };
-            rel_dir = next_rel;
+            window.push(ChainDir {
+                fd: next.fd,
+                name: Some(name.to_owned()),
+                traversal_only: next.traversal_only,
+                entries: None,
+            });
+            if window.len() > MAX_CHAIN_LEVELS {
+                window.remove(0);
+                truncated_above = true;
+            }
+        }
+        Some((window, truncated_above))
+    }
+
+    /// Index (within the window) of the nearest ancestor with an exact
+    /// `.git` marker, searching from the workspace upward. Levels whose
+    /// bounded enumeration fails or caps out are best-effort no-marker
+    /// levels here; if they end up on the chain, `scan_chain` records their
+    /// typed diagnostic.
+    fn find_marker_index(window: &mut [ChainDir]) -> Option<usize> {
+        for index in (0..window.len()).rev() {
+            ensure_enumerated(&mut window[index]);
+            let has_exact_git = matches!(
+                &window[index].entries,
+                Some(Enumeration::Names(names))
+                    if names.iter().any(|name| name.as_slice() == b".git")
+            );
+            if !has_exact_git {
+                continue;
+            }
+            // Classify the exact entry without following symlinks: a
+            // symlinked `.git` is not a marker; a regular file marks a
+            // linked worktree or submodule root (its contents are never
+            // followed), and a directory marks an ordinary repository.
+            let Ok(stat) = fstatat_nofollow(&window[index].fd, OsStr::new(".git")) else {
+                continue;
+            };
+            let file_type = stat.st_mode & libc::S_IFMT;
+            if file_type == libc::S_IFDIR || file_type == libc::S_IFREG {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Populate the cached bounded enumeration for one chain directory.
+    fn ensure_enumerated(dir: &mut ChainDir) {
+        if dir.entries.is_none() {
+            dir.entries = Some(enumerate_bounded(&dir.fd, dir.traversal_only));
+        }
+    }
+
+    /// Scan the chain (discovery root first, workspace last) for exact
+    /// `EULER.md` candidates using the held handles and cached bounded
+    /// listings.
+    fn scan_chain(
+        chain: &mut [ChainDir],
+        redactor: &SecretRedactor,
+        diagnostics: &mut Vec<ManifestDiagnostic>,
+    ) -> Vec<Candidate> {
+        let mut candidates = Vec::new();
+        let mut rel_dir = String::new();
+        for (depth, dir) in chain.iter_mut().enumerate() {
+            if depth > 0 {
+                let name = dir
+                    .name
+                    .as_deref()
+                    .expect("only the filesystem root has no component name");
+                let Some(name) = name.to_str() else {
+                    // Identities are normalized UTF-8; a non-UTF-8 component
+                    // makes this level and everything beneath it
+                    // unrepresentable.
+                    diagnostics.push(diagnostic(DiagnosticReason::NonUtf8Path, None, None));
+                    break;
+                };
+                rel_dir = join_rel(&rel_dir, name);
+            }
+            ensure_enumerated(dir);
+            match dir.entries.as_ref().expect("enumerated above") {
+                Enumeration::Failed => {
+                    diagnostics.push(diagnostic(
+                        DiagnosticReason::IoError,
+                        rel_identity(&rel_dir),
+                        None,
+                    ));
+                }
+                Enumeration::CapExceeded(observed) => {
+                    // Whole-level omission: deterministic selection over a
+                    // truncated listing is impossible.
+                    diagnostics.push(diagnostic(
+                        DiagnosticReason::DirEntriesExceeded,
+                        rel_identity(&rel_dir),
+                        Some(*observed),
+                    ));
+                }
+                Enumeration::Names(names) => {
+                    scan_dir_names(
+                        &dir.fd,
+                        names,
+                        &rel_dir,
+                        redactor,
+                        &mut candidates,
+                        diagnostics,
+                    );
+                }
+            }
         }
         candidates
     }
 
-    /// Scan one held directory handle for an exact `EULER.md` entry and
+    /// Scan one enumerated directory for an exact `EULER.md` entry and
     /// near-miss casings, then read the candidate under the stable-read
     /// protocol.
-    fn scan_dir(
+    fn scan_dir_names(
         dir: &OwnedFd,
+        names: &[Vec<u8>],
         rel_dir: &str,
         redactor: &SecretRedactor,
         candidates: &mut Vec<Candidate>,
         diagnostics: &mut Vec<ManifestDiagnostic>,
     ) {
-        let names = match dir_entry_names(dir) {
-            Ok(names) => names,
-            Err(_) => {
-                diagnostics.push(diagnostic(
-                    DiagnosticReason::IoError,
-                    rel_identity(rel_dir),
-                    None,
-                ));
-                return;
-            }
-        };
         let mut exact = false;
-        for name in &names {
+        for name in names {
             if name.as_slice() == EULER_MD_FILE_NAME.as_bytes() {
                 exact = true;
             } else if name.eq_ignore_ascii_case(EULER_MD_FILE_NAME.as_bytes()) {
@@ -359,9 +480,10 @@ mod imp {
         (!rel_dir.is_empty()).then(|| rel_dir.to_owned())
     }
 
-    fn open_dir_abs(path: &Path) -> std::io::Result<OwnedFd> {
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    /// The filesystem root cannot be a symlink; it is the sole absolute-path
+    /// open in this module.
+    fn open_filesystem_root() -> std::io::Result<OwnedFd> {
+        let c_path = CString::new("/").expect("no interior NUL");
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
@@ -374,12 +496,47 @@ mod imp {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    fn open_child_dir(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OwnedFd> {
-        openat(
-            parent,
-            name,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    struct OpenedDir {
+        fd: OwnedFd,
+        traversal_only: bool,
+    }
+
+    /// Open one path component relative to its held parent handle with
+    /// no-follow semantics. Ancestors that grant search permission but not
+    /// read permission are opened traversal-only so the walk matches what
+    /// the kernel itself would traverse.
+    fn open_component_dir(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OpenedDir> {
+        let readable_flags =
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        match openat(parent, name, readable_flags) {
+            Ok(fd) => Ok(OpenedDir {
+                fd,
+                traversal_only: false,
+            }),
+            Err(error)
+                if error.raw_os_error() == Some(libc::EACCES)
+                    || error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                let fd = openat(parent, name, traversal_open_flags())?;
+                Ok(OpenedDir {
+                    fd,
+                    traversal_only: true,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Search-only directory open flags for ancestors without read
+    /// permission: `O_PATH` on Linux, `O_EXEC` (POSIX `O_SEARCH`) on macOS.
+    #[cfg(target_os = "linux")]
+    fn traversal_open_flags() -> libc::c_int {
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn traversal_open_flags() -> libc::c_int {
+        libc::O_EXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
     }
 
     fn openat(parent: &OwnedFd, name: &OsStr, flags: libc::c_int) -> std::io::Result<OwnedFd> {
@@ -392,19 +549,58 @@ mod imp {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    fn dir_entry_names(dir: &OwnedFd) -> std::io::Result<Vec<Vec<u8>>> {
-        let dup = unsafe { libc::dup(dir.as_raw_fd()) };
-        if dup < 0 {
+    fn fstatat_nofollow(dir: &OwnedFd, name: &OsStr) -> std::io::Result<libc::stat> {
+        let c_name = CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
             return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { stat.assume_init() })
+    }
+
+    /// Bounded directory enumeration from a held handle. Stops as soon as
+    /// the per-level entry cap is exceeded; callers must treat a capped
+    /// level as unscannable rather than select over a truncated listing.
+    fn enumerate_bounded(dir: &OwnedFd, traversal_only: bool) -> Enumeration {
+        // Traversal-only handles cannot be read; upgrade through the handle
+        // itself (`.` cannot be a symlink) so no path re-resolution occurs.
+        let readable;
+        let read_fd: &OwnedFd = if traversal_only {
+            match openat(
+                dir,
+                OsStr::new("."),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            ) {
+                Ok(fd) => {
+                    readable = fd;
+                    &readable
+                }
+                Err(_) => return Enumeration::Failed,
+            }
+        } else {
+            dir
+        };
+        let dup = unsafe { libc::dup(read_fd.as_raw_fd()) };
+        if dup < 0 {
+            return Enumeration::Failed;
         }
         let dirp = unsafe { libc::fdopendir(dup) };
         if dirp.is_null() {
-            let error = std::io::Error::last_os_error();
             unsafe { libc::close(dup) };
-            return Err(error);
+            return Enumeration::Failed;
         }
         unsafe { libc::rewinddir(dirp) };
         let mut names = Vec::new();
+        let mut capped = false;
         loop {
             let entry = unsafe { libc::readdir(dirp) };
             if entry.is_null() {
@@ -415,13 +611,21 @@ mod imp {
             if bytes == b"." || bytes == b".." {
                 continue;
             }
+            if names.len() >= MAX_DIR_ENTRIES {
+                capped = true;
+                break;
+            }
             names.push(bytes.to_vec());
         }
         unsafe { libc::closedir(dirp) };
+        if capped {
+            // Observed count: the cap plus the entry that proved the excess.
+            return Enumeration::CapExceeded(MAX_DIR_ENTRIES as u64 + 1);
+        }
         // Deterministic selection must not depend on filesystem iteration
         // order.
         names.sort();
-        Ok(names)
+        Enumeration::Names(names)
     }
 
     enum ReadCandidateError {
@@ -460,10 +664,10 @@ mod imp {
         Ok(unsafe { stat.assume_init() })
     }
 
-    /// One stable-read attempt from one freshly verified handle: open with
+    /// One bounded read from one freshly verified handle: open with
     /// no-follow (O_NONBLOCK so a FIFO cannot block startup), verify the
     /// opened handle is a bounded regular file, read, then compare stable
-    /// metadata before and after the read.
+    /// metadata before and after the read as a fast-path instability reject.
     fn read_candidate_once(dir: &OwnedFd) -> Result<Vec<u8>, ReadCandidateError> {
         let fd = openat(
             dir,
@@ -499,11 +703,27 @@ mod imp {
         Ok(bytes)
     }
 
-    /// Stable-read protocol: retry an unstable source at most once, then omit
-    /// it with `changed_during_read`.
+    /// One verification: two independent bounded reads whose bytes must be
+    /// identical. Metadata granularity on some filesystems cannot detect a
+    /// rapid same-size rewrite, so byte equality across two verified handles
+    /// is the admission criterion; the per-handle metadata comparison is
+    /// only a fast-path reject.
+    fn read_candidate_verified(dir: &OwnedFd) -> Result<Vec<u8>, ReadCandidateError> {
+        let first = read_candidate_once(dir)?;
+        let second = read_candidate_once(dir)?;
+        if first == second {
+            Ok(second)
+        } else {
+            Err(ReadCandidateError::Unstable)
+        }
+    }
+
+    /// Stable-read protocol: retry an unstable source at most once, then
+    /// omit it with `changed_during_read`. Errors other than instability
+    /// abort immediately.
     fn read_candidate_stable(dir: &OwnedFd) -> Result<Vec<u8>, ReadCandidateError> {
-        match read_candidate_once(dir) {
-            Err(ReadCandidateError::Unstable) => match read_candidate_once(dir) {
+        match read_candidate_verified(dir) {
+            Err(ReadCandidateError::Unstable) => match read_candidate_verified(dir) {
                 Err(ReadCandidateError::Unstable) => Err(ReadCandidateError::Unstable),
                 other => other,
             },
@@ -541,9 +761,9 @@ pub(crate) mod test_hook {
         static AFTER_READ: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
     }
 
-    /// Install a callback that runs after each stable-read attempt's bounded
-    /// read and before its confirming metadata check. Used to exercise the
-    /// concurrent-mutation path deterministically.
+    /// Install a callback that runs after each bounded read and before its
+    /// confirming metadata check. Used to exercise the concurrent-mutation
+    /// path deterministically.
     pub(crate) fn set_after_read(hook: Option<Box<dyn FnMut()>>) {
         AFTER_READ.with(|cell| *cell.borrow_mut() = hook);
     }

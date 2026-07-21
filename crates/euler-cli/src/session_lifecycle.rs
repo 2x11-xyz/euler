@@ -160,18 +160,22 @@ fn stored_credential_values(auth_file: Option<&std::path::Path>) -> Vec<String> 
 /// forced off: the preflight records what was discovered but no repository
 /// text is admitted, persisted, or shown to a model.
 ///
-/// Best-effort: if the workspace cannot be resolved the session starts in
-/// the legacy shape (no snapshot events) and redaction still applies via
-/// `seed_secret_redaction`.
+/// A preflight problem never silently degrades to a bootstrap-less session:
+/// recoverable problems collapse into a disabled bootstrap inside the
+/// preflight itself, and the one unrecoverable case — a workspace root that
+/// cannot be resolved — fails session start honestly, because a session
+/// whose root cannot be resolved cannot enforce any path-keyed rule.
 pub(crate) fn startup_project_context(
     root: &std::path::Path,
     auth_file: Option<&std::path::Path>,
-) -> Option<euler_core::ProjectContextBootstrap> {
+) -> Result<euler_core::ProjectContextBootstrap> {
     let redactor = euler_core::redaction::SecretRedactor::from_env();
     for value in stored_credential_values(auth_file) {
         redactor.add_value(value);
     }
-    euler_core::ProjectContextBootstrap::dormant(root, &redactor).ok()
+    euler_core::ProjectContextBootstrap::dormant(root, &redactor).map_err(|error| {
+        anyhow!("cannot start a session in this folder: {error}; check that the folder exists and is accessible")
+    })
 }
 
 pub(crate) fn session_config(
