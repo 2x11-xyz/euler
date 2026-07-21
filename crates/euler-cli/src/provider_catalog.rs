@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn corrupt_cached_release_falls_back_to_embedded() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let release = release_at("2026-07-19T00:00:00Z");
+        let release = release_after_embedded_hours(1);
         let path = temp
             .path()
             .join(format!("{}.json", release.manifest.release_id));
@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn valid_newer_cached_release_replaces_embedded_membership() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let candidate = release_at("2026-07-19T00:00:00Z");
+        let candidate = release_after_embedded_hours(1);
         write_cached_release(temp.path(), &candidate).expect("cache");
 
         let load = load_managed_catalog(Some(temp.path()));
@@ -977,7 +977,7 @@ mod tests {
             .join(".euler")
             .join("catalogs")
             .join("provider-v1");
-        let candidate = release_at("2026-07-19T00:00:00Z");
+        let candidate = release_after_embedded_hours(1);
         let manifest = canonical_manifest_bytes(&candidate.manifest);
         let catalog = candidate.catalog_json.as_bytes().to_vec();
         let expected_catalog_url = release_catalog_url(&candidate.manifest.release_id);
@@ -1001,14 +1001,7 @@ mod tests {
     #[test]
     fn successful_refresh_bounds_cache_and_sweeps_only_stale_owned_temps() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let releases = [
-            "2026-07-19T00:00:00Z",
-            "2026-07-19T01:00:00Z",
-            "2026-07-19T02:00:00Z",
-            "2026-07-19T03:00:00Z",
-            "2026-07-19T04:00:00Z",
-        ]
-        .map(release_at);
+        let releases = [1, 2, 3, 4, 5].map(release_after_embedded_hours);
         for release in &releases {
             write_cached_release(temp.path(), release).expect("cached release");
         }
@@ -1068,14 +1061,7 @@ mod tests {
     #[test]
     fn pruning_preserves_an_older_selected_release_and_the_two_newest_others() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let releases = [
-            "2026-07-19T00:00:00Z",
-            "2026-07-19T01:00:00Z",
-            "2026-07-19T02:00:00Z",
-            "2026-07-19T03:00:00Z",
-            "2026-07-19T04:00:00Z",
-        ]
-        .map(release_at);
+        let releases = [1, 2, 3, 4, 5].map(release_after_embedded_hours);
         for release in &releases {
             write_cached_release(temp.path(), release).expect("cached release");
         }
@@ -1105,12 +1091,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let target = temp.path().join("target");
         fs::write(&target, b"keep").expect("target");
-        let symlink_release = release_at("2026-07-19T00:00:00Z");
+        let symlink_release = release_after_embedded_hours(1);
         let symlink_path = temp
             .path()
             .join(format!("{}.json", symlink_release.manifest.release_id));
         symlink(&target, &symlink_path).expect("symlink");
-        let directory_release = release_at("2026-07-19T01:00:00Z");
+        let directory_release = release_after_embedded_hours(2);
         let directory_path = temp
             .path()
             .join(format!("{}.json", directory_release.manifest.release_id));
@@ -1134,9 +1120,9 @@ mod tests {
     #[test]
     fn failed_digest_preserves_last_known_good_release() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let baseline = release_at("2026-07-19T00:00:00Z");
+        let baseline = release_after_embedded_hours(1);
         write_cached_release(temp.path(), &baseline).expect("baseline");
-        let candidate = release_at("2026-07-20T00:00:00Z");
+        let candidate = release_after_embedded_hours(2);
         let manifest = canonical_manifest_bytes(&candidate.manifest);
         let mut calls = 0;
 
@@ -1159,9 +1145,9 @@ mod tests {
     #[test]
     fn refresh_refuses_a_remote_downgrade_without_fetching_catalog() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let newer = release_at("2026-07-20T00:00:00Z");
+        let newer = release_after_embedded_hours(2);
         write_cached_release(temp.path(), &newer).expect("newer cache");
-        let older = release_at("2026-07-19T00:00:00Z");
+        let older = release_after_embedded_hours(1);
         let manifest = canonical_manifest_bytes(&older.manifest);
         let mut calls = 0;
 
@@ -1182,7 +1168,11 @@ mod tests {
     #[test]
     fn refresh_refuses_an_implausibly_future_release_without_fetching_catalog() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let candidate = release_at("2026-07-23T00:00:01Z");
+        let candidate = release_at_datetime(
+            test_now()
+                + chrono::Duration::from_std(MAX_RELEASE_CLOCK_SKEW).expect("clock skew")
+                + chrono::Duration::seconds(1),
+        );
         let manifest = canonical_manifest_bytes(&candidate.manifest);
         let mut calls = 0;
 
@@ -1230,7 +1220,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let model_path = temp.path().join(".euler").join("models.json");
         let cache_dir = managed_catalog_dir_for_model_path(&model_path);
-        let candidate = release_at("2026-07-19T00:00:00Z");
+        let candidate = release_after_embedded_hours(1);
         write_cached_release(&cache_dir, &candidate).expect("managed catalog");
         fs::write(
             &model_path,
@@ -1294,7 +1284,7 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("legacy machine-generated")));
 
-        let candidate = release_at("2026-07-19T00:00:00Z");
+        let candidate = release_after_embedded_hours(1);
         let cache_dir = managed_catalog_dir_for_model_path(&model_path);
         write_cached_release(&cache_dir, &candidate).expect("managed catalog");
         let managed = crate::model_catalog::load_model_catalog(Some(&model_path));
@@ -1356,6 +1346,14 @@ mod tests {
         validate_release(manifest, embedded.catalog_json.into_bytes()).expect("release")
     }
 
+    fn release_at_datetime(generated_at: DateTime<Utc>) -> ValidatedRelease {
+        release_at(&generated_at.to_rfc3339_opts(SecondsFormat::Secs, true))
+    }
+
+    fn release_after_embedded_hours(hours: i64) -> ValidatedRelease {
+        release_at_datetime(embedded_release().generated_at + chrono::Duration::hours(hours))
+    }
+
     fn canonical_manifest_bytes(manifest: &ReleaseManifest) -> Vec<u8> {
         let mut bytes = serde_json::to_vec_pretty(manifest).expect("manifest JSON");
         bytes.push(b'\n');
@@ -1363,8 +1361,6 @@ mod tests {
     }
 
     fn test_now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
-            .expect("test time")
-            .with_timezone(&Utc)
+        embedded_release().generated_at + chrono::Duration::hours(12)
     }
 }

@@ -318,9 +318,13 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIn("RELEASE_TAG: ${{ steps.tag.outputs.tag }}", workflow)
         self.assertIn("needs: validate", workflow)
+        self.assertIn("commit: ${{ steps.commit.outputs.sha }}", workflow)
+        self.assertIn('echo "sha=$(git rev-parse HEAD)"', workflow)
         self.assertIn(
-            "ref: refs/tags/${{ needs.validate.outputs.tag }}", workflow
+            "ref: ${{ needs.validate.outputs.commit }}", workflow
         )
+        self.assertIn("VALIDATED_COMMIT: ${{ needs.validate.outputs.commit }}", workflow)
+        self.assertIn("Refuse a tag moved after validation", workflow)
         self.assertLess(
             workflow.index("Require the latest embedded provider catalog"),
             workflow.index("\n  build:"),
