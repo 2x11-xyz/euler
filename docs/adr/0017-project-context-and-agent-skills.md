@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted (2026-07-21; proposed 2026-07-20). Not implemented.
+Accepted (2026-07-21; proposed 2026-07-20). Delivery slice 2 (dormant
+project-context substrate) is implemented with effective exposure forced
+off; slices 3–6 are not implemented. Implementation tracking and the honest
+statement-level status live in `docs/contracts/project-context.md` and
+issue #180.
 
 This ADR records the intended architecture. Its normative shape is bound now
 in `docs/contracts/project-context.md`, marked binding shape ahead of

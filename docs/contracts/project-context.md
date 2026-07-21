@@ -1,10 +1,23 @@
 # Project Context Contract (binding shape)
 
 ADR 0017 governs project context; this contract binds its concrete shape.
-Implementation status: NOTHING in this contract is implemented. Every section
-binds the eventual shape, not present behavior; issue #180 tracks the slices.
-As each slice lands, its statements convert from bound shape to implemented
-truth, and this line shrinks accordingly.
+Implementation status: the phase-2 dormant substrate is implemented (issue
+#180, delivery slice 2) with effective exposure forced off. Implemented
+truth: `EULER.md` discovery/containment/bounds, preflight redaction
+ordering, the candidate manifest and all four digest domains, the
+`project.context.snapshot`/`project.context.diagnostic` events and durable
+bootstrap, core framing and the pinned provider-neutral input with its
+budget accounting, provenance-only resume with workspace-identity
+enforcement, and child `none | inherit` filtering at request assembly. NOT
+yet implemented (still bound shape): every statement about `--project-context`
+policy resolution, the acknowledgment record and store ("Acknowledgment
+record" section in full), skills and `skill_read` ("Skills" section, the
+skill rows of the bounds table, and skill fields of the snapshot), the
+always-on catalog, explicit reload, and guardian/worker `inherit` wiring
+(today every child uses the `none` default). In phase 2 the only public
+bootstrap constructor resolves disabled, so no root session can expose
+repository text; issue #180 tracks the remaining slices, and this paragraph
+shrinks as they land.
 
 ## Definition and non-authority
 

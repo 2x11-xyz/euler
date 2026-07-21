@@ -64,6 +64,8 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `session.resumed`
 - `session.renamed`
 - `session.summary`
+- `project.context.snapshot`
+- `project.context.diagnostic`
 - `error`
 
 Unknown future event kinds are reader-specific. Inspection readers
@@ -197,7 +199,11 @@ envelope `v` per `docs/contracts/persistence.md`.
   including the truncation marker and must set `truncated=true` with a non-null
   `omitted_reason`.
 - `model.call`: `provider`, `model`, `canvas_items`,
-  `requested_reasoning_effort`, optional `reasoning_effort`
+  `requested_reasoning_effort`, optional `reasoning_effort`. Optional
+  `project_context_digest` (ADR 0017) is the versioned rendered-context
+  digest, recorded only when those exact core-framed bytes occur in the
+  provider-neutral request being dispatched (no TOCTOU between snapshot and
+  prompt assembly); absent whenever the request carries no project context.
 - `model.effort.changed`: `from_effort`, `to_effort`, `reason`.
   (provider-scoped string, emitted and stored verbatim — core does not
   normalize; examples non-exhaustive: `"low"` | `"medium"` | `"high"`, with
@@ -302,6 +308,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   recoverable tool-result demotion. Both default to `true` in new sessions;
   older streams without the object use the launching configuration. The
   legacy `tier` field remains for compatibility and is normalized at resume.
+  Optional `project_context` is the compact bootstrap summary (ADR 0017):
+  `{ "expected": true, "schema_version": 1, "status", "policy",
+  "candidate_digest", "source_count", "diagnostic_count" }`. Present exactly
+  when the session was created with a project-context bootstrap; it announces
+  that one `project.context.snapshot` follows immediately. Absent means the
+  legacy shape: no snapshot events exist and resume treats project context as
+  disabled. A summary without its snapshot (or vice versa) is an invalid
+  mixed shape and resume fails closed.
 - `session.resumed`: `provider`, `model`, `events_folded`, optional
   `resumed_from_event_id`. A durable audit marker recording that the session
   lifetime was continued, against which target and from which tail event.
@@ -326,6 +340,32 @@ envelope `v` per `docs/contracts/persistence.md`.
   outside its integrity model. Any event append or log rewrite moves the key
   and forces re-projection, and integrity failures (`invalid` status) are
   never cached, so they are re-checked on every listing.
+- `project.context.snapshot` (schema version 1; ADR 0017,
+  `docs/contracts/project-context.md`): `schema_version`, `status`
+  (`admitted` | `disabled`; phase 3 adds `declined`/`unacknowledged`),
+  `policy`, `resolution_reason`, `acknowledgment_basis`, `candidate_digest`
+  (versioned, domain-separated, length-prefixed digest of the canonical
+  candidate manifest), `workspace_identity`
+  (`{ "algorithm": "unix-raw-osstr", "version": 1, "digest" }` over the raw
+  canonicalized workspace-root bytes), `ordering` (`lexicographic-v1`),
+  `source_identities` (bounded normalized project-root-relative paths),
+  `diagnostic_count`, and `diagnostic_reason_counts`. An admitted snapshot
+  additionally carries `framing_version`, `manifest_len`, and `manifest` —
+  the complete canonical UTF-8 manifest JSON as one top-level payload string,
+  externalized as one content-addressed blob above the provenance threshold.
+  A disabled snapshot persists NO source body, per-source content hash, exact
+  content length, or parser excerpt. The durable bootstrap order is exactly
+  `session.start`, one snapshot, then the declared diagnostics, all persisted
+  before any provider dispatch; the latest snapshot in durable sequence is
+  authoritative, and a disabled snapshot is a tombstone. Rehydration verifies
+  the blob address and length and rejects invalid UTF-8, duplicate keys,
+  trailing data, unsupported versions, limit violations, and digest
+  mismatches; it never falls back to current project files.
+- `project.context.diagnostic` (schema version 1): `schema_version`,
+  `snapshot_event_id`, `reason` (stable content-free code), optional bounded
+  `path` (normalized relative identity), optional numeric `observed`. Never
+  carries excerpts, raw parser errors, outside-workspace paths, or exception
+  strings derived from a candidate.
 - `canvas.snapshot`: `selected_event_ids`, `counts`, retention telemetry
   `retained_items`, `retained_bytes`, `demoted_items`, `automatic`, `stubs`,
   `tier`, `budget_bytes`,
@@ -368,6 +408,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   v0. `capabilities` are canonical capability strings using exact set
   semantics from `docs/contracts/capabilities.md`. `budget` is bounded metadata
   in v0, not an escrow or accounting record.
+  `project_context` is `none` or `inherit` (ADR 0017): whether the child
+  request assembly receives the parent's frozen project-context snapshot.
+  Missing (events written before the field existed) decodes as `none`; an
+  unknown value is invalid and never falls through to inheritance.
 - `agent.message`: `from_agent_id`, `to_agent_id`, `spawn_event_id`,
   `queued_ts`, `payload`. This is a parent-drained child-to-parent report from
   a live current-process background child, not transcript content and not a
@@ -424,6 +468,11 @@ envelope `v` per `docs/contracts/persistence.md`.
   accepted in one durable batch.
 - `session.start` has parent null. It is always the session's first
   persisted event.
+- `project.context.snapshot` parents `session.start`;
+  `project.context.diagnostic` parents its snapshot and also cites it in
+  `snapshot_event_id`. The bootstrap sequence is contiguous:
+  `session.start`, one snapshot, then exactly the snapshot's declared number
+  of diagnostics, before any other persisted event.
 - `session.resumed` parents the accepted tail it continued from (the same
   event the first continued turn parents off). It is a sibling LEAF of that
   continuation, never its parent — so a resumed lifetime's causal chain is
