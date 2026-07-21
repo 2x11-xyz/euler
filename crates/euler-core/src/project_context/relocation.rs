@@ -151,18 +151,31 @@ fn validate_relocated_shape(payload: &JsonObject) -> Result<Relocation, String> 
 /// if the relocation chain is valid, otherwise the base snapshot identity.
 ///
 /// Returns `Ok(None)` for a legacy session with no snapshot identity. Any
-/// malformed or stale relocation in the chain fails closed with a
-/// plain-language reason (resume rejects rather than falling back).
+/// malformed, mis-parented, or stale relocation in the chain fails closed with
+/// a plain-language reason (resume rejects rather than falling back).
 pub(crate) fn fold_governing_identity(
     events: &[EventEnvelope],
     snapshot_identity: Option<RelocationIdentity>,
 ) -> Result<Option<RelocationIdentity>, String> {
     let mut governing = snapshot_identity;
-    for event in events
-        .iter()
-        .filter(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_RELOCATED)
-    {
+    for (index, event) in events.iter().enumerate() {
+        if event.kind.as_str() != EventKind::PROJECT_CONTEXT_RELOCATED {
+            continue;
+        }
         let relocation = validate_relocated_shape(&event.payload)?;
+        // Parentage: the relocation MUST parent the accepted tail it was
+        // appended after, which is the event immediately preceding it in the
+        // durable sequence (project-context contract, "Resume relocation and
+        // consent"). A missing or wrong parent is a forged or branched event
+        // and never governs.
+        let expected_parent = index.checked_sub(1).map(|prior| events[prior].id.as_str());
+        if event.parent.as_deref() != expected_parent {
+            return Err(
+                "a relocation record does not attach to where the session actually ran; start a \
+                 new session in this folder"
+                    .to_owned(),
+            );
+        }
         // The prior identity MUST equal the identity governing immediately
         // before this event. A stale or branched acceptance (its prior does
         // not match the current governing identity) is rejected and never
@@ -212,6 +225,23 @@ pub(crate) fn projected_new_root(events: &[EventEnvelope]) -> Option<String> {
 pub(crate) fn governing_identity_value(events: &[EventEnvelope]) -> Result<Option<Value>, String> {
     let base = snapshot_identity(events)?;
     Ok(fold_governing_identity(events, base)?.map(|identity| identity.to_value()))
+}
+
+/// Validate a candidate relocation event against the accepted prefix using the
+/// exact fold acceptance check (shape, parentage, and the identity chain).
+/// Returns `Err` when the resume fold would reject the candidate, so the caller
+/// can refuse to append anything the fold would later reject.
+pub(crate) fn validate_candidate_relocation(
+    prefix: &[EventEnvelope],
+    candidate: &EventEnvelope,
+) -> Result<(), String> {
+    let mut extended: Vec<EventEnvelope> = prefix.to_vec();
+    extended.push(candidate.clone());
+    let base = snapshot_identity(&extended)?;
+    // Fold must accept the whole chain including the candidate; a rejection
+    // means the candidate is not appendable.
+    fold_governing_identity(&extended, base)?;
+    Ok(())
 }
 
 /// Build the canonical `project.context.relocated` payload the acceptance path
@@ -266,7 +296,13 @@ mod tests {
         RelocationIdentity::of_canonical_root(path)
     }
 
-    fn relocated_event(parent: &str, prior: &RelocationIdentity, new_root: &Path) -> EventEnvelope {
+    /// A relocation event parented to `parent_id` (the id of the event it is
+    /// appended after, which the fold requires it to name).
+    fn relocated_event(
+        parent_id: &str,
+        prior: &RelocationIdentity,
+        new_root: &Path,
+    ) -> EventEnvelope {
         let payload = build_relocated_payload(
             &prior.to_value(),
             new_root,
@@ -276,7 +312,7 @@ mod tests {
         EventEnvelope::new(
             "session",
             "root",
-            Some(parent.to_owned()),
+            Some(parent_id.to_owned()),
             EventKind::PROJECT_CONTEXT_RELOCATED,
             payload,
         )
@@ -302,10 +338,9 @@ mod tests {
         let old = std::fs::canonicalize(&old).expect("c-old");
         let new = std::fs::canonicalize(&new).expect("c-new");
         let old_identity = identity_of(&old);
-        let events = vec![
-            snapshot_event(&old_identity),
-            relocated_event("snap", &old_identity, &new),
-        ];
+        let snap = snapshot_event(&old_identity);
+        let reloc = relocated_event(&snap.id, &old_identity, &new);
+        let events = vec![snap, reloc];
         let base = snapshot_identity(&events).expect("ok").expect("some");
         assert_eq!(base, old_identity);
         let governing = fold_governing_identity(&events, Some(base))
@@ -329,10 +364,9 @@ mod tests {
             version: u64::from(WORKSPACE_IDENTITY_VERSION),
             digest: "c".repeat(64),
         };
-        let events = vec![
-            snapshot_event(&identity_of(&old)),
-            relocated_event("snap", &wrong_prior, &new),
-        ];
+        let snap = snapshot_event(&identity_of(&old));
+        let reloc = relocated_event(&snap.id, &wrong_prior, &new);
+        let events = vec![snap, reloc];
         let base = snapshot_identity(&events).expect("ok");
         let error = fold_governing_identity(&events, base).expect_err("stale rejects");
         assert!(error.contains("start a new session"));
@@ -353,14 +387,15 @@ mod tests {
         // new_identity now describes `real-new`, but new_root says something
         // else: re-derivation must fail.
         payload.insert("new_root".to_owned(), "/some/other/path".into());
+        let snap = snapshot_event(&old_identity);
         let event = EventEnvelope::new(
             "session",
             "root",
-            Some("snap".to_owned()),
+            Some(snap.id.clone()),
             EventKind::PROJECT_CONTEXT_RELOCATED,
             payload,
         );
-        let events = vec![snapshot_event(&old_identity), event];
+        let events = vec![snap, event];
         let base = snapshot_identity(&events).expect("ok");
         let error = fold_governing_identity(&events, base).expect_err("mismatch rejects");
         assert!(error.contains("does not match"));
@@ -379,14 +414,15 @@ mod tests {
             "2026-07-21T00:00:00Z".to_owned(),
         );
         payload.insert("smuggled".to_owned(), "payload".into());
+        let snap = snapshot_event(&old_identity);
         let event = EventEnvelope::new(
             "session",
             "root",
-            Some("snap".to_owned()),
+            Some(snap.id.clone()),
             EventKind::PROJECT_CONTEXT_RELOCATED,
             payload,
         );
-        let events = vec![snapshot_event(&old_identity), event];
+        let events = vec![snap, event];
         let base = snapshot_identity(&events).expect("ok");
         assert!(fold_governing_identity(&events, base).is_err());
     }
@@ -399,11 +435,11 @@ mod tests {
         let c = a.join("c");
         let id_a = identity_of(&a);
         let id_b = identity_of(&b);
-        let events = vec![
-            snapshot_event(&id_a),
-            relocated_event("snap", &id_a, &b),
-            relocated_event("reloc1", &id_b, &c),
-        ];
+        let snap = snapshot_event(&id_a);
+        let reloc1 = relocated_event(&snap.id, &id_a, &b);
+        // The second relocation parents the first (the tail at its append).
+        let reloc2 = relocated_event(&reloc1.id, &id_b, &c);
+        let events = vec![snap, reloc1, reloc2];
         let base = snapshot_identity(&events).expect("ok").expect("some");
         let governing = fold_governing_identity(&events, Some(base))
             .expect("valid")
@@ -427,5 +463,65 @@ mod tests {
             Some(identity)
         );
         assert_eq!(projected_new_root(&events), None);
+    }
+
+    #[test]
+    fn relocation_with_no_parent_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp");
+        let old = std::fs::canonicalize(temp.path()).expect("c");
+        let new = old.join("new");
+        let old_identity = identity_of(&old);
+        let snap = snapshot_event(&old_identity);
+        // A relocation event that parents nothing (or the wrong event) must not
+        // govern even though its identity chain is otherwise valid.
+        let orphan = EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::PROJECT_CONTEXT_RELOCATED,
+            build_relocated_payload(
+                &old_identity.to_value(),
+                &new,
+                session_root_for_event(&new),
+                "2026-07-21T00:00:00Z".to_owned(),
+            ),
+        );
+        let events = vec![snap, orphan];
+        let base = snapshot_identity(&events).expect("ok");
+        let error = fold_governing_identity(&events, base).expect_err("no-parent rejects");
+        assert!(error.contains("does not attach"));
+    }
+
+    #[test]
+    fn relocation_with_the_wrong_parent_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp");
+        let old = std::fs::canonicalize(temp.path()).expect("c");
+        let new = old.join("new");
+        let old_identity = identity_of(&old);
+        let snap = snapshot_event(&old_identity);
+        // Parents an unrelated id rather than the tail it was appended after.
+        let reloc = relocated_event("some-other-event-id", &old_identity, &new);
+        let events = vec![snap, reloc];
+        let base = snapshot_identity(&events).expect("ok");
+        let error = fold_governing_identity(&events, base).expect_err("wrong-parent rejects");
+        assert!(error.contains("does not attach"));
+    }
+
+    // Blocker 2/3: the append guard refuses any candidate the fold would
+    // reject, so a bad event can never reach the log.
+    #[test]
+    fn validate_candidate_refuses_events_the_fold_would_reject() {
+        let temp = tempfile::tempdir().expect("temp");
+        let old = std::fs::canonicalize(temp.path()).expect("c");
+        let new = old.join("new");
+        let old_identity = identity_of(&old);
+        let snap = snapshot_event(&old_identity);
+        let prefix = vec![snap];
+        // Wrong parent: the fold rejects it, so the guard refuses to append.
+        let bad = relocated_event("wrong-parent", &old_identity, &new);
+        assert!(validate_candidate_relocation(&prefix, &bad).is_err());
+        // A correctly parented candidate on the same prefix is appendable.
+        let good = relocated_event(&prefix[0].id, &old_identity, &new);
+        assert!(validate_candidate_relocation(&prefix, &good).is_ok());
     }
 }

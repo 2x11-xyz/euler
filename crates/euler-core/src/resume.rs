@@ -290,6 +290,19 @@ pub fn plan_relocation(
                               resumed here; start a new session"
                         .to_owned(),
                 })?;
+            // The workspace identity hashes the raw canonical path bytes, but
+            // the recorded `new_root` is a lossy display string. For a root
+            // whose canonical bytes are not valid UTF-8 the display form cannot
+            // faithfully represent the folder, so it can never re-derive to the
+            // identity. Refuse relocation for such roots rather than append an
+            // event the fold would reject (v1 behavior).
+            if !canonical_root_is_representable(&canonical) {
+                return Err(ResumeError::WorkspaceMismatch {
+                    message: "this folder's path can't be represented safely, so this session \
+                              can't be moved here; start a new session in this folder"
+                        .to_owned(),
+                });
+            }
             let current_root = crate::session_root::session_root_for_event(live_root);
             let recorded_root = crate::project_context::projected_new_root(prefix)
                 .or_else(|| session_start_root(prefix))
@@ -320,6 +333,12 @@ pub fn plan_relocation(
                 EventKind::PROJECT_CONTEXT_RELOCATED,
                 payload,
             );
+            // Validation before append (mandatory): run the exact fold
+            // acceptance check the resume will apply, against the candidate
+            // event on the folded prefix. Never hand back an event the fold
+            // would reject, so a bad candidate can never reach the log.
+            crate::project_context::validate_candidate_relocation(prefix, &relocated_event)
+                .map_err(|reason| ResumeError::ProjectContextBootstrap { reason })?;
             Ok(Some(RelocationRequired {
                 recorded_root,
                 current_root,
@@ -328,6 +347,15 @@ pub fn plan_relocation(
             }))
         }
     }
+}
+
+/// Whether a canonical workspace root's path can be faithfully represented by
+/// the lossy display string the relocation event records. Only UTF-8-clean
+/// canonical paths can relocate in v1 (project-context contract, "The
+/// workspace identity payload"); a path with non-UTF-8 bytes would lose
+/// information under lossy display and could never re-derive to its identity.
+fn canonical_root_is_representable(canonical: &Path) -> bool {
+    canonical.as_os_str().to_str().is_some()
 }
 
 fn session_start_root(events: &[EventEnvelope]) -> Option<String> {
@@ -940,6 +968,46 @@ mod relocation_epoch_tests {
         assert!(plan_relocation(&extended, &new).expect("plan").is_none());
         // A resume back at the old root is now itself a mismatch.
         assert!(plan_relocation(&extended, &old).expect("plan").is_some());
+    }
+
+    // Attack (blocker 2): a workspace whose canonical path bytes are not valid
+    // UTF-8 cannot be faithfully represented by the lossy `new_root` display
+    // string, so relocation is refused (rather than appending a durable event
+    // the fold would then reject). Tested at the representability gate so it is
+    // deterministic across platforms (macOS refuses to even create a non-UTF-8
+    // directory name).
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_canonical_root_is_not_representable() {
+        use std::os::unix::ffi::OsStrExt;
+        let good = std::path::Path::new("/home/ada/projects/euler");
+        assert!(canonical_root_is_representable(good));
+        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/ada/bad-\xff-name"));
+        assert!(
+            !canonical_root_is_representable(&bad),
+            "a non-UTF8 canonical root must be refused so no relocation event is appended"
+        );
+    }
+
+    // The end-to-end refusal (requires creating a non-UTF-8 directory, which
+    // only some Unix filesystems allow) runs on Linux; macOS enforces UTF-8
+    // names and cannot host the fixture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_root_refuses_relocation_without_appending() {
+        use std::os::unix::ffi::OsStrExt;
+        let (temp, _old, _new, prefix) = old_new_prefix();
+        let bad = temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"bad-\xff-name"));
+        if std::fs::create_dir_all(&bad).is_err() {
+            return; // filesystem rejects non-UTF-8 names; the gate test covers it
+        }
+        match plan_relocation(&prefix, &bad) {
+            Err(ResumeError::WorkspaceMismatch { .. }) => {}
+            Err(other) => panic!("non-UTF8 root must refuse with a mismatch, got {other:?}"),
+            Ok(_) => panic!("non-UTF8 root must refuse relocation, not return a plan"),
+        }
     }
 
     // Attack: a session-scoped grant recorded before an accepted relocation

@@ -682,13 +682,20 @@ impl<D> Session<D> {
             }));
     }
 
-    /// Preflight for the session a `/new` will create: the dormant
-    /// project-context scan of the live workspace, seeded by this session's
+    /// Preflight for the session a `/new` will create: the project-context
+    /// policy resolution for the live workspace, seeded by this session's
     /// carried redactor so every startup-known secret is registered before
     /// discovery reads a byte. Borrowing (not consuming) lets a caller fail
-    /// the `/new` operation honestly while keeping the current session
-    /// alive; the only error is a workspace root that no longer resolves.
-    pub fn prepare_fresh_project_context(&self) -> Result<ProjectContextBootstrap, SessionError> {
+    /// the `/new` operation honestly while keeping the current session alive.
+    ///
+    /// The full resolution is surfaced (not swallowed): when the fresh session
+    /// finds unacknowledged guidance, an interactive caller MUST present the
+    /// acknowledgment card and resolve the returned pending decision before
+    /// composing the fresh session (ADR 0017 decision 13). A headless caller
+    /// that cannot prompt resolves it unprompted (fail closed).
+    pub fn prepare_fresh_project_context(
+        &self,
+    ) -> Result<crate::project_context::ProjectContextResolution, SessionError> {
         let options = crate::project_context::ProjectContextResolveOptions {
             // `/new` is always an interactive fresh session under `auto`; it is
             // never a trusted-local run.
@@ -705,7 +712,7 @@ impl<D> Session<D> {
                 .unwrap_or(self.config.compaction_reserve_tokens as u64),
             canvas_budget_bytes: self.config.auto_compaction.budget_bytes,
         };
-        let resolution = ProjectContextBootstrap::resolve(
+        ProjectContextBootstrap::resolve(
             &self.config.root,
             &self.redactor,
             options,
@@ -716,19 +723,12 @@ impl<D> Session<D> {
             SessionError::ProjectContextInvalid(format!(
                 "cannot start a new session here: {error}; check that the folder still exists"
             ))
-        })?;
-        match resolution {
-            crate::project_context::ProjectContextResolution::Resolved(bootstrap) => Ok(*bootstrap),
-            crate::project_context::ProjectContextResolution::Budget(error) => {
-                Err(SessionError::ProjectContextInvalid(error.user_message()))
-            }
-            // The interactive acknowledgment card lands in a later slice
-            // (issue #180); until then `/new` with unacknowledged guidance
-            // runs unprompted (without it), fail closed.
-            crate::project_context::ProjectContextResolution::NeedsAcknowledgment(pending) => {
-                Ok(pending.unprompted())
-            }
-        }
+        })
+    }
+
+    /// The live workspace root, for a `/new` acknowledgment card's folder label.
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.config.root
     }
 
     /// Build the fresh session `/new` composes, with the bootstrap obtained

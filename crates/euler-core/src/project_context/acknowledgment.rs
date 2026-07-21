@@ -155,6 +155,11 @@ impl AcknowledgmentStore {
         identity_digest: &str,
         candidate_digest: &str,
     ) -> AcknowledgmentLookup {
+        // Reject a symlinked or public store directory before reading through
+        // it (`read_record`'s O_NOFOLLOW only protects the final component).
+        if let Err(detail) = validate_store_dir(&self.dir) {
+            return AcknowledgmentLookup::Unsafe(detail);
+        }
         let path = self.path_for_root(canonical_root);
         match read_record(&path) {
             Ok(None) => AcknowledgmentLookup::None {
@@ -267,6 +272,7 @@ fn validate_record_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), 
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
         // A hard link means another name shares these bytes; reject it, exactly
         // as the provenance lock file does.
         if metadata.nlink() > 1 {
@@ -277,8 +283,64 @@ fn validate_record_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), 
         if metadata.uid() != current_euid() {
             return Err(unsafe_record_message(path));
         }
+        // The record must be owner-only (mode 0600 is what we write). Any
+        // group or other permission bit is rejected: a world- or group-writable
+        // record could be swapped by another user to preseed an admission, and
+        // a readable one leaks the acceptance metadata.
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(unsafe_record_message(path));
+        }
     }
     Ok(())
+}
+
+/// Validate that the per-user store directory is a real directory this user
+/// owns, not a symlink and not group/other writable. `std::fs::metadata`
+/// follows a symlinked directory, so this uses `symlink_metadata` and rejects a
+/// symlinked store directory on both the read and write paths. A missing
+/// directory is fine for a read (there is simply no record); the write path
+/// creates it.
+#[cfg(unix)]
+fn validate_store_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(unsafe_store_dir_message(dir)),
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(unsafe_store_dir_message(dir));
+            }
+            if metadata.uid() != current_euid() {
+                return Err(unsafe_store_dir_message(dir));
+            }
+            // Not writable by group or other: a public store directory would
+            // let another user drop in a record.
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err(unsafe_store_dir_message(dir));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not read {}: {error}", dir.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_store_dir(dir: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(unsafe_store_dir_message(dir)),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not read {}: {error}", dir.display())),
+    }
+}
+
+fn unsafe_store_dir_message(dir: &Path) -> String {
+    format!(
+        "Euler won't use the saved approvals in this folder because it isn't a private directory \
+         you own, so project guidance wasn't loaded. Remove it and approve again: {}",
+        dir.display()
+    )
 }
 
 #[cfg(unix)]
@@ -303,8 +365,10 @@ fn write_record_atomic(
     path: &Path,
     record: &AcknowledgmentRecord,
 ) -> Result<(), AcknowledgmentWriteError> {
-    reject_symlink_for_write(path)?;
+    // Validate the store directory (reject a symlinked or public one) before
+    // touching anything through it, then the final component.
     ensure_private_dir(dir)?;
+    reject_symlink_for_write(path)?;
     let bytes = serde_json::to_vec_pretty(record)
         .map_err(|error| AcknowledgmentWriteError::Serialize(error.to_string()))?;
     let mut temp = tempfile::Builder::new()
@@ -340,25 +404,20 @@ fn reject_symlink_for_write(path: &Path) -> Result<(), AcknowledgmentWriteError>
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), AcknowledgmentWriteError> {
-    fs::create_dir_all(path).map_err(AcknowledgmentWriteError::Io)?;
-    let metadata = fs::metadata(path).map_err(AcknowledgmentWriteError::Io)?;
-    if !metadata.is_dir() {
-        return Err(AcknowledgmentWriteError::Unsafe(format!(
-            "acknowledgment directory path is not a directory: {}",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != current_euid() {
-            return Err(AcknowledgmentWriteError::Unsafe(format!(
-                "acknowledgment directory must be owned by the current user: {}",
-                path.display()
-            )));
+    // A directory that already exists must be a real, owned, non-public
+    // directory: never write through a symlinked store directory. Only create
+    // it when it is genuinely absent.
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_store_dir(path).map_err(AcknowledgmentWriteError::Unsafe)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(AcknowledgmentWriteError::Io)?;
         }
+        Err(error) => return Err(AcknowledgmentWriteError::Io(error)),
     }
     set_dir_mode_0700(path).map_err(AcknowledgmentWriteError::Io)?;
+    // Re-validate after the mode clamp so a directory that was public at entry
+    // is now private (and a symlink that appeared is still rejected).
+    validate_store_dir(path).map_err(AcknowledgmentWriteError::Unsafe)?;
     Ok(())
 }
 
@@ -597,6 +656,75 @@ mod tests {
             AcknowledgmentLookup::None {
                 previously_acknowledged: true
             }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attack_world_writable_record_is_rejected_on_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, store, root) = store();
+        store.record(&root, IDENTITY, DIGEST_A).expect("record");
+        let path = store.path_for_root(&root);
+        // Another user makes the record world-writable to swap it later.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        match store.lookup(&root, IDENTITY, DIGEST_A) {
+            AcknowledgmentLookup::Unsafe(_) => {}
+            other => panic!("a world-writable record must be unsafe, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attack_symlinked_store_directory_is_rejected_on_read() {
+        let (temp, store, root) = store();
+        // A valid record living in an attacker-controlled directory, reached
+        // through a symlinked store directory.
+        let target = temp.path().join("attacker-store");
+        std::fs::create_dir_all(&target).expect("target dir");
+        let record_name = store
+            .path_for_root(&root)
+            .file_name()
+            .expect("name")
+            .to_owned();
+        std::fs::write(
+            target.join(&record_name),
+            serde_json::to_string(&AcknowledgmentRecord {
+                version: ACK_FORMAT_VERSION,
+                workspace_identity: RecordedIdentity::current(IDENTITY),
+                candidate_digest: DIGEST_A.to_owned(),
+                accepted_at_unix_ms: 0,
+            })
+            .expect("json"),
+        )
+        .expect("write record in target");
+        std::fs::create_dir_all(store.dir.parent().expect("parent")).expect("consent dir");
+        std::os::unix::fs::symlink(&target, &store.dir).expect("symlink store dir");
+        match store.lookup(&root, IDENTITY, DIGEST_A) {
+            AcknowledgmentLookup::Unsafe(_) => {}
+            other => panic!("a symlinked store directory must be unsafe on read, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attack_symlinked_store_directory_is_rejected_on_write() {
+        let (temp, store, root) = store();
+        let target = temp.path().join("attacker-store");
+        std::fs::create_dir_all(&target).expect("target dir");
+        std::fs::create_dir_all(store.dir.parent().expect("parent")).expect("consent dir");
+        std::os::unix::fs::symlink(&target, &store.dir).expect("symlink store dir");
+        let error = store
+            .record(&root, IDENTITY, DIGEST_A)
+            .expect_err("write through a symlinked store directory must fail");
+        assert!(matches!(error, AcknowledgmentWriteError::Unsafe(_)));
+        // Nothing was written through the symlink into the attacker's dir.
+        let leaked = std::fs::read_dir(&target)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            leaked, 0,
+            "write must not follow the symlinked store directory"
         );
     }
 }

@@ -127,6 +127,16 @@ pub enum TranscriptItem {
         capabilities: Vec<String>,
         selected_option: ApprovalOption,
     },
+    /// The project-context acknowledgment card shown for an in-app `/new`
+    /// (ADR 0017 phase 3). At launch the same card renders on the pre-session
+    /// surface instead.
+    ProjectContextAck {
+        folder_label: String,
+        content_changed: bool,
+        sources: Vec<String>,
+        skipped_count: usize,
+        load_selected: bool,
+    },
     PermissionDecision {
         capability: String,
         decision: String,
@@ -306,6 +316,7 @@ pub(crate) fn item_wants_timestamp(item: &TranscriptItem) -> bool {
             | TranscriptItem::WorkedDuration(_)
             | TranscriptItem::TurnRecap { .. }
             | TranscriptItem::PermissionAsk { .. }
+            | TranscriptItem::ProjectContextAck { .. }
     )
 }
 

@@ -1,6 +1,23 @@
 use super::*;
 use crate::extensions::ExtensionHostError;
 use crate::permissions::ScriptedDecider;
+
+/// Unwrap a `/new` project-context resolution into its bootstrap for tests:
+/// a resolved bootstrap directly, or the unprompted tombstone when discovery
+/// finds unacknowledged guidance (no card in a test harness).
+fn resolution_bootstrap(
+    resolution: crate::project_context::ProjectContextResolution,
+) -> ProjectContextBootstrap {
+    match resolution {
+        crate::project_context::ProjectContextResolution::Resolved(bootstrap) => *bootstrap,
+        crate::project_context::ProjectContextResolution::NeedsAcknowledgment(pending) => {
+            pending.unprompted()
+        }
+        crate::project_context::ProjectContextResolution::Budget(error) => {
+            panic!("unexpected project-context budget failure: {error}")
+        }
+    }
+}
 use crate::provenance::ProvenanceWriterError;
 use crate::read_provenance;
 use crate::{probe_workspace_sandbox, SandboxProfile, SubprocessSandbox};
@@ -391,9 +408,11 @@ fn into_fresh_session_carries_registered_secret_values() {
     let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
     session.add_redacted_secret("carried-secret-value-xyz");
 
-    let bootstrap = session
-        .prepare_fresh_project_context()
-        .expect("fresh preflight");
+    let bootstrap = resolution_bootstrap(
+        session
+            .prepare_fresh_project_context()
+            .expect("fresh preflight"),
+    );
     let fresh = session.into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()), bootstrap);
 
     let out = fresh
@@ -2635,9 +2654,11 @@ fn resume_starts_the_reteach_streak_empty() {
     // into_fresh_session (the /new path, same code path resume rebuilds
     // through) starts the tracker empty — the next failure would be rung 1.
     let _ = &temp;
-    let bootstrap = session
-        .prepare_fresh_project_context()
-        .expect("fresh preflight");
+    let bootstrap = resolution_bootstrap(
+        session
+            .prepare_fresh_project_context()
+            .expect("fresh preflight"),
+    );
     let fresh = session.into_fresh_session("resumed", ScriptedDecider::new(vec![]), bootstrap);
     assert!(
         fresh.reteach_streak_is_empty(),
@@ -3208,9 +3229,11 @@ mod project_context_seam {
         .expect("resume")
         .session;
 
-        let bootstrap = resumed
-            .prepare_fresh_project_context()
-            .expect("fresh preflight");
+        let bootstrap = resolution_bootstrap(
+            resumed
+                .prepare_fresh_project_context()
+                .expect("fresh preflight"),
+        );
         let fresh = resumed.into_fresh_session(
             "fresh-after-resume",
             ScriptedDecider::new(Vec::new()),

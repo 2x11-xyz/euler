@@ -365,9 +365,17 @@ requires.
 Validation (any breach fails closed and rejects the resume): `prior_identity`
 MUST equal the identity folded at the accepted prefix; `new_identity` MUST equal
 the live canonical root's identity at decision time; `new_root` MUST re-derive
-to `new_identity` under the identity algorithm; and a relocation whose
-`prior_identity` does not match the current governing identity (a stale fold or
-a branched acceptance) is rejected and never supersedes.
+to `new_identity` under the identity algorithm; the event MUST parent the
+accepted tail event (the durable event immediately preceding it), so a missing
+or wrong parent rejects; and a relocation whose `prior_identity` does not match
+the current governing identity (a stale fold or a branched acceptance) is
+rejected and never supersedes. The acceptance path validates the candidate event
+against the folded prefix with this exact check before appending it, so nothing
+the fold would reject can ever reach the log. Because the workspace identity
+hashes the raw canonical path bytes while `new_root` is a lossy display string,
+a workspace root whose canonical path bytes are not valid UTF-8 cannot relocate
+in v1: it is refused with a plain-language error rather than recorded, because
+the display form could never re-derive to its identity.
 `docs/contracts/events.md` carries the same field, parentage, and validation
 rules for the event kind.
 

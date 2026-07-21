@@ -12176,3 +12176,124 @@ fn tui_pty_relocation_card_accept_resumes_and_records() {
         "accepting the card must record a durable project.context.relocated event"
     );
 }
+
+/// An in-app `/new` after EULER.md appears (or changes) must present the
+/// acknowledgment card before composing the fresh session (ADR 0017 decision
+/// 13, blocker 4). Accepting loads it and records a durable acknowledgment.
+#[test]
+fn tui_pty_new_session_acknowledgment_card_accept_records() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    // No EULER.md at launch, so there is no launch card.
+    let script = write_fixture_script(
+        temp.path(),
+        "new-card-accept.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "ok"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
+    // The project gains guidance while the session runs.
+    std::fs::write(workspace.join("EULER.md"), "Prefer small commits.").expect("euler md");
+    tui.write("/new\r");
+    assert!(
+        tui.wait_for_screen("Load this project's guidance?"),
+        "/new did not present the acknowledgment card:\n{}",
+        tui.screen_text()
+    );
+    tui.write("y");
+    assert!(
+        tui.wait_for_screen("new session"),
+        "new session did not start after accepting:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let ack_dir = home.join(".euler").join("project-context");
+    let recorded = std::fs::read_dir(&ack_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recorded, 1,
+        "accepting the /new card must record one acknowledgment"
+    );
+}
+
+/// Skipping the `/new` acknowledgment card starts the fresh session without the
+/// guidance and writes no durable record (decline is session-only).
+#[test]
+fn tui_pty_new_session_acknowledgment_card_skip_writes_no_record() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    let script = write_fixture_script(
+        temp.path(),
+        "new-card-skip.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "ok"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+    assert!(tui.wait_for_screen("/ commands"), "{}", tui.screen_text());
+    std::fs::write(workspace.join("EULER.md"), "Prefer small commits.").expect("euler md");
+    tui.write("/new\r");
+    assert!(
+        tui.wait_for_screen("Load this project's guidance?"),
+        "/new did not present the acknowledgment card:\n{}",
+        tui.screen_text()
+    );
+    tui.write("n");
+    assert!(
+        tui.wait_for_screen("new session"),
+        "new session did not start after skipping:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let ack_dir = home.join(".euler").join("project-context");
+    let recorded = std::fs::read_dir(&ack_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recorded, 0,
+        "skipping the /new card must not record an acknowledgment"
+    );
+}

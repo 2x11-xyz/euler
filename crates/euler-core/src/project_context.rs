@@ -21,6 +21,7 @@ mod relocation;
 
 pub(crate) use relocation::{
     build_relocated_payload, governing_identity_value, projected_new_root,
+    validate_candidate_relocation,
 };
 
 pub use acknowledgment::{AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError};

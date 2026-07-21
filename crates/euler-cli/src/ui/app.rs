@@ -51,7 +51,8 @@ use euler_core::{
     event_is_runtime_only, fold_session, load_extension_package, read_resume_prefix,
     resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, EulerHome,
     ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
-    ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
+    ProjectContextBootstrap, ProvenanceWriter, ReasoningEffort, ScopePattern, Session,
+    SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -219,6 +220,9 @@ pub struct AppCore {
     composer_navigation_width: u16,
     last_working_elapsed_secs: Option<u64>,
     modal: Option<Modal>,
+    /// The pending `/new` acknowledgment awaiting the card's answer. Set while
+    /// `Modal::ProjectContextAck` owns the keyboard; consumed on the decision.
+    pending_new_ack: Option<Box<euler_core::PendingAcknowledgment>>,
     approval_selection: ApprovalOption,
     /// Composer draft stashed while an approval modal owns the keyboard.
     /// The panel's instruction input must start EMPTY: a pre-existing draft
@@ -350,7 +354,22 @@ enum Modal {
     Permission(PermissionRequest),
     PermissionBatch(PermissionRequestBatch),
     PatchApproval(PatchApprovalModal),
+    /// The project-context acknowledgment card for an in-app `/new` (ADR 0017
+    /// phase 3). Its pending decision lives in `App::pending_new_ack`; this
+    /// carries only the display state and which option is highlighted.
+    ProjectContextAck(AckModalState),
     Help,
+}
+
+/// Display state for the in-app acknowledgment card. Default highlight is Skip
+/// (the safe bias).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AckModalState {
+    folder_label: String,
+    content_changed: bool,
+    sources: Vec<String>,
+    skipped_count: usize,
+    load_selected: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -870,6 +889,13 @@ fn session_primary_agent_id(session: &Session<TuiDecider>) -> Option<String> {
         .map(|event| event.agent.clone())
 }
 
+/// A short folder label for the acknowledgment card's title corner.
+fn project_context_folder_label(root: &std::path::Path) -> String {
+    root.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
 impl AppCore {
     #[cfg(test)]
     pub fn new(session: Session<TuiDecider>, channels: PermissionChannels) -> Self {
@@ -908,6 +934,7 @@ impl AppCore {
             composer_navigation_width: 80,
             last_working_elapsed_secs: None,
             modal: None,
+            pending_new_ack: None,
             approval_selection: ApprovalOption::default(),
             modal_stashed_draft: None,
             quit_armed: None,
@@ -1711,6 +1738,12 @@ impl AppCore {
     }
 
     fn handle_modal_input(&mut self, input: InputEvent) -> CoreEffect {
+        if matches!(self.modal, Some(Modal::ProjectContextAck(_))) {
+            let InputEvent::Key(key) = input else {
+                return CoreEffect::None;
+            };
+            return self.handle_ack_modal_key(key);
+        }
         let InputEvent::Key(key) = input else {
             return self.handle_modal_composer_input(input);
         };
@@ -1718,6 +1751,58 @@ impl AppCore {
             return self.handle_patch_modal_key(key);
         }
         self.handle_approval_modal_key(key)
+    }
+
+    /// The in-app acknowledgment card (`/new`) is single-keypress: `y` loads,
+    /// `n`/`Esc` skips, arrows move the highlight, Enter commits it. There is
+    /// no composer here (unlike the permission panel), so keys never insert
+    /// text.
+    fn handle_ack_modal_key(&mut self, key: KeyEvent) -> CoreEffect {
+        let load_selected = match &self.modal {
+            Some(Modal::ProjectContextAck(state)) => state.load_selected,
+            _ => return CoreEffect::None,
+        };
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.resolve_new_session_ack(false)
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.resolve_new_session_ack(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.resolve_new_session_ack(false)
+            }
+            KeyCode::Enter => self.resolve_new_session_ack(load_selected),
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
+                if let Some(Modal::ProjectContextAck(state)) = &mut self.modal {
+                    state.load_selected = !state.load_selected;
+                }
+                CoreEffect::Render
+            }
+            _ => CoreEffect::None,
+        }
+    }
+
+    /// Complete a `/new` from the acknowledgment card's answer. Accept writes
+    /// the durable record (fail closed on write error, running without the
+    /// guidance); decline is a session-only tombstone.
+    fn resolve_new_session_ack(&mut self, accept: bool) -> CoreEffect {
+        self.modal = None;
+        self.restore_stashed_draft();
+        let Some(pending) = self.pending_new_ack.take() else {
+            return CoreEffect::Render;
+        };
+        let bootstrap = if accept {
+            match pending.accept() {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    // Fail closed: never admit without a recorded acceptance.
+                    let _ = self.notice_item(format!("project guidance not loaded: {error}"));
+                    pending.decline()
+                }
+            }
+        } else {
+            pending.decline()
+        };
+        self.finish_new_session(bootstrap)
     }
 
     fn handle_help_input(&mut self, input: InputEvent) -> CoreEffect {
@@ -1878,7 +1963,9 @@ impl AppCore {
         match &self.modal {
             Some(Modal::Permission(request)) => Some(request),
             Some(Modal::PatchApproval(modal)) => Some(&modal.request),
-            None | Some(Modal::PermissionBatch(_)) | Some(Modal::Help) => None,
+            None | Some(Modal::PermissionBatch(_) | Modal::ProjectContextAck(_) | Modal::Help) => {
+                None
+            }
         }
     }
 
@@ -2194,12 +2281,46 @@ impl AppCore {
         };
         // Preflight the fresh session's project context BEFORE consuming the
         // current session: a workspace that no longer resolves fails the
-        // /new honestly while the current session stays alive (ADR 0017 —
-        // a fresh session is never composed without its bootstrap).
-        let project_context = match session.prepare_fresh_project_context() {
-            Ok(bootstrap) => bootstrap,
+        // /new honestly while the current session stays alive (ADR 0017: a
+        // fresh session is never composed without its bootstrap).
+        let folder_label = project_context_folder_label(session.workspace_root());
+        let resolution = match session.prepare_fresh_project_context() {
+            Ok(resolution) => resolution,
             Err(error) => return self.error_item(format!("new session failed: {error}")),
         };
+        match resolution {
+            euler_core::ProjectContextResolution::Resolved(bootstrap) => {
+                self.finish_new_session(*bootstrap)
+            }
+            euler_core::ProjectContextResolution::Budget(error) => {
+                self.error_item(format!("new session failed: {}", error.user_message()))
+            }
+            // Unacknowledged guidance: present the card, then compose the fresh
+            // session from the answer (ADR 0017 decision 13). The current
+            // session stays alive until the decision.
+            euler_core::ProjectContextResolution::NeedsAcknowledgment(pending) => {
+                let state = AckModalState {
+                    folder_label,
+                    content_changed: pending.content_changed(),
+                    sources: pending.source_identities().to_vec(),
+                    skipped_count: pending.skipped_count(),
+                    load_selected: false,
+                };
+                self.pending_new_ack = Some(pending);
+                self.modal_stashed_draft = Some(self.bottom.composer().submit_text().to_owned());
+                self.bottom.replace_composer_text("");
+                self.modal = Some(Modal::ProjectContextAck(state));
+                CoreEffect::Render
+            }
+        }
+    }
+
+    /// Compose the fresh `/new` session from a resolved project-context
+    /// bootstrap (either resolved directly, or from the acknowledgment card).
+    fn finish_new_session(&mut self, project_context: ProjectContextBootstrap) -> CoreEffect {
+        if !matches!(self.state, AppState::Idle { .. }) {
+            return self.error_item("new session needs an active session".to_owned());
+        }
         let created = self.session_store().and_then(|store| {
             let record = store.create_session()?;
             Ok((record.id().to_owned(), record.events_path().to_path_buf()))
@@ -2725,7 +2846,12 @@ impl AppCore {
     fn working_hud_line(&self) -> Option<HudLine> {
         if matches!(
             self.modal,
-            Some(Modal::Permission(_) | Modal::PermissionBatch(_) | Modal::PatchApproval(_))
+            Some(
+                Modal::Permission(_)
+                    | Modal::PermissionBatch(_)
+                    | Modal::PatchApproval(_)
+                    | Modal::ProjectContextAck(_)
+            )
         ) {
             return None;
         }
@@ -2820,6 +2946,13 @@ impl AppCore {
                     .map(|capability| capability.as_str().to_owned())
                     .collect(),
                 selected_option: self.approval_selection,
+            }),
+            Some(Modal::ProjectContextAck(state)) => Some(TranscriptItem::ProjectContextAck {
+                folder_label: state.folder_label.clone(),
+                content_changed: state.content_changed,
+                sources: state.sources.clone(),
+                skipped_count: state.skipped_count,
+                load_selected: state.load_selected,
             }),
             None | Some(Modal::PatchApproval(_)) | Some(Modal::Help) => None,
         }

@@ -210,7 +210,12 @@ impl AppCore {
                 VisualBlockRole::PermissionAsk,
                 self.patch_approval_canvas_lines(modal, width),
             ),
-            Some(Modal::Permission(_) | Modal::PermissionBatch(_)) | None => {}
+            // The acknowledgment card renders through `push_visual_permission_block`
+            // (like the permission asks), so it is a no-op here.
+            Some(
+                Modal::Permission(_) | Modal::PermissionBatch(_) | Modal::ProjectContextAck(_),
+            )
+            | None => {}
         }
     }
 
