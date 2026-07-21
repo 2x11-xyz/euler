@@ -52,6 +52,8 @@ pub enum AgentError {
     UnknownSpawn { spawn_event_id: String },
     #[error("agent result child id mismatch for spawn {spawn_event_id}")]
     ChildAgentMismatch { spawn_event_id: String },
+    #[error("agent.spawn records an unknown project_context policy")]
+    InvalidProjectContextPolicy,
     #[error("message-payload-not-object")]
     MessagePayloadNotObject,
     #[error("message-payload-too-large")]
@@ -114,6 +116,49 @@ impl AgentBudget {
     }
 }
 
+/// Whether a spawned child receives the parent session's frozen project
+/// context (ADR 0017). Distinct from `include_parent_canvas`, which controls
+/// only non-project parent items. The default is `None`: a child never
+/// discovers project context from the filesystem and never inherits it
+/// implicitly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProjectContextPolicy {
+    #[default]
+    None,
+    Inherit,
+}
+
+impl ProjectContextPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Inherit => "inherit",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "inherit" => Some(Self::Inherit),
+            _ => None,
+        }
+    }
+
+    /// Decode the policy recorded on an `agent.spawn` payload. A missing
+    /// field (an event written before this field existed) decodes as `None`;
+    /// an unknown or non-string value is invalid and never falls through to
+    /// inheritance.
+    pub fn from_spawn_payload(payload: &JsonObject) -> Result<Self, AgentError> {
+        match payload.get("project_context") {
+            None => Ok(Self::None),
+            Some(Value::String(value)) => {
+                Self::parse(value).ok_or(AgentError::InvalidProjectContextPolicy)
+            }
+            Some(_) => Err(AgentError::InvalidProjectContextPolicy),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentTask {
     task: String,
@@ -123,6 +168,7 @@ pub struct AgentTask {
     system_prompt: Option<String>,
     explicit_context: Option<String>,
     include_parent_canvas: bool,
+    project_context: ProjectContextPolicy,
     capabilities: Vec<Capability>,
     budget: AgentBudget,
     result_schema: Option<Value>,
@@ -143,6 +189,7 @@ impl AgentTask {
             system_prompt: None,
             explicit_context: None,
             include_parent_canvas: true,
+            project_context: ProjectContextPolicy::None,
             capabilities: Vec::new(),
             budget: AgentBudget::default(),
             result_schema: None,
@@ -161,6 +208,7 @@ impl AgentTask {
             system_prompt: None,
             explicit_context: None,
             include_parent_canvas: true,
+            project_context: ProjectContextPolicy::None,
             capabilities: Vec::new(),
             budget: AgentBudget::default(),
             result_schema: None,
@@ -191,6 +239,14 @@ impl AgentTask {
 
     pub fn with_parent_canvas(mut self, include: bool) -> Self {
         self.include_parent_canvas = include;
+        self
+    }
+
+    /// Explicit project-context inheritance for this child (ADR 0017).
+    /// Distinct from `with_parent_canvas`; the default is
+    /// [`ProjectContextPolicy::None`].
+    pub fn with_project_context(mut self, policy: ProjectContextPolicy) -> Self {
+        self.project_context = policy;
         self
     }
 
@@ -231,6 +287,10 @@ impl AgentTask {
 
     pub fn includes_parent_canvas(&self) -> bool {
         self.include_parent_canvas
+    }
+
+    pub fn project_context(&self) -> ProjectContextPolicy {
+        self.project_context
     }
 
     pub fn explicit_context(&self) -> Option<&str> {
@@ -418,6 +478,10 @@ pub fn agent_spawn_payload(task: &AgentTask, child_agent_id: &str) -> JsonObject
     payload.insert(
         "include_parent_canvas".to_owned(),
         task.includes_parent_canvas().into(),
+    );
+    payload.insert(
+        "project_context".to_owned(),
+        task.project_context().as_str().into(),
     );
     if let Some(context) = task.explicit_context() {
         payload.insert("explicit_context_bytes".to_owned(), context.len().into());
@@ -654,6 +718,44 @@ impl Write for BoundedCountingWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_context_policy_defaults_to_none_and_is_recorded_on_spawn() {
+        let task = AgentTask::new("review", "default", "fixture", "model").expect("task");
+        assert_eq!(task.project_context(), ProjectContextPolicy::None);
+        let payload = agent_spawn_payload(&task, "child-1");
+        assert_eq!(payload["project_context"], Value::from("none"));
+
+        let inheriting = task.with_project_context(ProjectContextPolicy::Inherit);
+        let payload = agent_spawn_payload(&inheriting, "child-1");
+        assert_eq!(payload["project_context"], Value::from("inherit"));
+    }
+
+    #[test]
+    fn project_context_policy_decode_missing_is_none_unknown_is_invalid() {
+        let empty = JsonObject::new();
+        assert_eq!(
+            ProjectContextPolicy::from_spawn_payload(&empty),
+            Ok(ProjectContextPolicy::None)
+        );
+        let mut payload = JsonObject::new();
+        payload.insert("project_context".to_owned(), "inherit".into());
+        assert_eq!(
+            ProjectContextPolicy::from_spawn_payload(&payload),
+            Ok(ProjectContextPolicy::Inherit)
+        );
+        // An unknown value is invalid and never falls through to inherit.
+        payload.insert("project_context".to_owned(), "everything".into());
+        assert_eq!(
+            ProjectContextPolicy::from_spawn_payload(&payload),
+            Err(AgentError::InvalidProjectContextPolicy)
+        );
+        payload.insert("project_context".to_owned(), 1.into());
+        assert_eq!(
+            ProjectContextPolicy::from_spawn_payload(&payload),
+            Err(AgentError::InvalidProjectContextPolicy)
+        );
+    }
 
     #[test]
     fn task_rejects_empty_required_fields() {

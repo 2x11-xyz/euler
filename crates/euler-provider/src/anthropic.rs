@@ -224,6 +224,18 @@ impl MessageBuilder {
 
 fn anthropic_content_block(model: &str, item: &ModelInputItem) -> Option<(AnthropicRole, Value)> {
     match item {
+        // Project context becomes one user-role text block; the core-framed
+        // rendered bytes pass through verbatim (never trimmed, normalized,
+        // combined, or omitted — project-context contract). Core framing
+        // guarantees non-empty rendered bytes, so the empty-block drop that
+        // applies to ordinary messages can never apply here.
+        ModelInputItem::ProjectContext { rendered } => Some((
+            AnthropicRole::User,
+            json!({
+                "type": "text",
+                "text": rendered,
+            }),
+        )),
         ModelInputItem::Message { role, content } => message_content_block(*role, content),
         ModelInputItem::Reasoning {
             provider,

@@ -638,6 +638,54 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
 /// wholesale in `finish_round`. `Complete` carries the companion result
 /// summary ([`AgentResult`]) so budget failures, honest truncation
 /// failures, and completions all exit the loop as a structured result.
+impl<D: PermissionDecider> CompanionLoop<'_, D> {
+    /// Assemble this child's request canvas under its recorded policies.
+    /// A task that declares no parent-canvas inheritance gets none here
+    /// either (the flag is a privacy boundary), and the explicit child
+    /// project-context policy (ADR 0017) filters the whole classified item
+    /// family unless the spawn recorded `inherit` — which conversely
+    /// supplies the frozen snapshot even without the parent canvas. A
+    /// malformed latest snapshot fails the round rather than silently
+    /// assembling a request without the recorded policy.
+    fn assemble_child_canvas(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<crate::CanvasItem>,
+            crate::project_context::ProjectContextFold,
+        ),
+        SessionError,
+    > {
+        let project_context = match crate::project_context::fold_project_context(self.bus.events())
+        {
+            Ok(fold) => fold,
+            Err(error) => {
+                let error = SessionError::ProjectContextInvalid(error.to_string());
+                self.append(
+                    EventKind::ERROR,
+                    object([
+                        ("source", "companion".into()),
+                        ("message", error.to_string().into()),
+                    ]),
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
+        let mut canvas = if self.task.includes_parent_canvas() {
+            assemble_canvas(self.bus.events(), &self.auto_compaction)
+        } else {
+            Vec::new()
+        };
+        super::apply_child_project_context_policy(
+            &mut canvas,
+            self.task.project_context(),
+            &project_context,
+        );
+        Ok((canvas, project_context))
+    }
+}
+
 impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
     type Complete = AgentResult;
 
@@ -653,14 +701,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         &mut self,
         target: &ModelTarget,
     ) -> Result<(String, ModelRequest), SessionError> {
-        // A task that declares no parent-canvas inheritance gets none here
-        // either: the flag is a privacy boundary, and honouring it only on the
-        // batch path would make it a lie on this one.
-        let canvas = if self.task.includes_parent_canvas() {
-            assemble_canvas(self.bus.events(), &self.auto_compaction)
-        } else {
-            Vec::new()
-        };
+        let (canvas, project_context) = self.assemble_child_canvas()?;
         if self.task.includes_parent_canvas() {
             if let Some(error) = context_budget_exhausted(self.auto_compaction, &canvas) {
                 self.append(
@@ -697,6 +738,9 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         let round_max_output_tokens = self.round_max_output_tokens();
         if let Some(max_output_tokens) = round_max_output_tokens {
             model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
+        }
+        if let Some(digest) = super::canvas_project_context_digest(&canvas, &project_context) {
+            model_call.insert("project_context_digest".to_owned(), digest.into());
         }
         let model_call_id = self.append(EventKind::MODEL_CALL, model_call, None)?.id;
         let mut input = canvas.iter().map(model_input_item).collect::<Vec<_>>();

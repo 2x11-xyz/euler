@@ -123,6 +123,16 @@ pub fn canvas_bytes(items: &[CanvasItem]) -> usize {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanvasItem {
+    /// Pinned repository project context (ADR 0017): the exact core-framed
+    /// bytes of the session's admitted snapshot. Always first in canvas
+    /// order, pinned while its snapshot is active — never demoted, stubbed,
+    /// or dropped by compaction. Carries its snapshot digest so child
+    /// request assembly can filter the whole project-context class.
+    ProjectContext {
+        event_id: String,
+        snapshot_digest: String,
+        rendered: String,
+    },
     Message {
         event_id: String,
         role: CanvasRole,
@@ -171,7 +181,8 @@ pub enum CanvasItem {
 impl CanvasItem {
     pub fn event_id(&self) -> &str {
         match self {
-            Self::Message { event_id, .. }
+            Self::ProjectContext { event_id, .. }
+            | Self::Message { event_id, .. }
             | Self::Projection { event_id, .. }
             | Self::Slot { event_id, .. }
             | Self::Reasoning { event_id, .. }
@@ -251,6 +262,20 @@ fn collect_canvas_items(
     // compaction is deferred to later slices). projection_blob is inline
     // text or v1 structured JSON; blob-ref resolution is deferred.
     let mut items = Vec::new();
+    // Pinned project context folds over the full event slice, like context
+    // slots: the latest admitted snapshot stays pinned across compaction
+    // frontiers instead of silently disappearing (project-context contract,
+    // "Framing and canvas admission"). A malformed latest snapshot yields no
+    // item here; the request-assembly seams independently fail closed on it.
+    if let Ok(fold) = crate::project_context::fold_project_context(events) {
+        if let Some(pinned) = fold.admitted() {
+            items.push(CanvasItem::ProjectContext {
+                event_id: pinned.snapshot_event_id.clone(),
+                snapshot_digest: pinned.candidate_digest.clone(),
+                rendered: pinned.rendered.clone(),
+            });
+        }
+    }
     if let Some(swap) = &active_swap {
         if let Some((_, content, schema_version)) = &swap.projection {
             items.push(CanvasItem::Projection {
@@ -805,6 +830,9 @@ pub fn canvas_prompt(items: &[CanvasItem]) -> String {
 
 fn render_canvas_item(item: &CanvasItem) -> String {
     match item {
+        // Pinned project context renders as its exact core-framed bytes;
+        // any wrapper here would double-frame what core already framed.
+        CanvasItem::ProjectContext { rendered, .. } => rendered.clone(),
         CanvasItem::Message { role, content, .. } => {
             format!("{}: {content}", role.as_str())
         }

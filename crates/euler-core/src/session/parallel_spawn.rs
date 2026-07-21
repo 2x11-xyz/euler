@@ -96,9 +96,29 @@ impl<D: PermissionDecider> Session<D> {
                 return Err(error);
             }
         }
+        // One immutable pre-fan-out project-context snapshot for the whole
+        // batch: parallel inheriting children can never diverge because a
+        // file changed during the batch (they read no files at all).
+        let project_context = match crate::project_context::fold_project_context(self.bus.events())
+        {
+            Ok(fold) => fold,
+            Err(error) => {
+                let error = SessionError::ProjectContextInvalid(error.to_string());
+                let agent_id = self.config.agent_id.clone();
+                self.appender_as(&writer, &agent_id).append(
+                    EventKind::ERROR,
+                    object([
+                        ("source", "companion".into()),
+                        ("message", error.to_string().into()),
+                    ]),
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
         let mut prepared = Vec::with_capacity(tasks.len());
         for task in tasks {
-            prepared.push(self.prepare_reviewer(task, &writer, &canvas)?);
+            prepared.push(self.prepare_reviewer(task, &writer, &canvas, &project_context)?);
         }
 
         // Phase 2 (worker threads): concurrent provider calls. Workers
@@ -132,17 +152,27 @@ impl<D: PermissionDecider> Session<D> {
         task: AgentTask,
         writer: &Arc<crate::provenance::ProvenanceWriter>,
         canvas: &[crate::CanvasItem],
+        project_context: &crate::project_context::ProjectContextFold,
     ) -> Result<PreparedReviewer, SessionError> {
         let target = self.resolve_companion_target(&task)?;
         let spawned = self.record_companion_spawn(&task, &target, writer)?;
         let child_agent_id = spawned.child_agent_id().to_owned();
-        let task_canvas = if task.includes_parent_canvas() {
-            canvas
+        let mut task_canvas: Vec<crate::CanvasItem> = if task.includes_parent_canvas() {
+            canvas.to_vec()
         } else {
-            &[]
+            Vec::new()
         };
+        // Explicit child project-context policy (ADR 0017): filter the whole
+        // classified item family unless the spawn recorded `inherit`, and
+        // supply the shared pre-fan-out snapshot under `inherit` even
+        // without the parent canvas.
+        super::apply_child_project_context_policy(
+            &mut task_canvas,
+            task.project_context(),
+            project_context,
+        );
         let snapshot_payload =
-            canvas_snapshot_payload(task_canvas, self.config.auto_compaction, None, None);
+            canvas_snapshot_payload(&task_canvas, self.config.auto_compaction, None, None);
         self.appender_as(writer, &child_agent_id).append(
             EventKind::CANVAS_SNAPSHOT,
             snapshot_payload,
@@ -154,8 +184,11 @@ impl<D: PermissionDecider> Session<D> {
             (Some(session_cap), Some(task_cap)) => Some(session_cap.min(task_cap)),
             (session_cap, task_cap) => session_cap.or(task_cap),
         };
-        let model_call =
+        let mut model_call =
             self.reviewer_model_call_payload(&target, task_canvas.len(), max_output_tokens);
+        if let Some(digest) = super::canvas_project_context_digest(&task_canvas, project_context) {
+            model_call.insert("project_context_digest".to_owned(), digest.into());
+        }
         let model_call_id = self
             .appender_as(writer, &child_agent_id)
             .append(EventKind::MODEL_CALL, model_call, None)?
@@ -641,5 +674,6 @@ fn model_input_bytes(item: &ModelInputItem) -> usize {
                 + error.as_deref().map_or(0, str::len)
         }
         ModelInputItem::Reasoning { content, .. } => content.len(),
+        ModelInputItem::ProjectContext { rendered } => rendered.len(),
     }
 }

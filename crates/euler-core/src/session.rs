@@ -13,6 +13,7 @@ use crate::compaction::{
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
 use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
+use crate::project_context::ProjectContextBootstrap;
 use crate::provenance::ProvenanceWriter;
 use crate::redaction::SecretRedactor;
 use crate::sandbox::SubprocessSandbox;
@@ -176,6 +177,14 @@ pub struct SessionConfig {
     /// Default: the configured decider (the user). `Guardian` routes asks
     /// to a companion reviewer; the decider remains the abstain fallback.
     pub permission_reviewer: PermissionReviewer,
+    /// Project-context preflight result (ADR 0017). `None` (default) is the
+    /// legacy shape: no snapshot events are written and project context is
+    /// disabled. When present, the session inherits the bootstrap's startup
+    /// redactor and persists the `session.start` summary, one
+    /// `project.context.snapshot`, and its diagnostics before any provider
+    /// dispatch. Phase 2: the only public constructor resolves disabled, so
+    /// no repository text can reach a model.
+    pub project_context: Option<ProjectContextBootstrap>,
 }
 
 impl SessionConfig {
@@ -203,6 +212,7 @@ impl SessionConfig {
             code_swarm_user_config_path: None,
             user_grant_dir: None,
             permission_reviewer: PermissionReviewer::default(),
+            project_context: None,
         }
     }
 }
@@ -240,6 +250,18 @@ pub enum SessionError {
     #[error("context budget exhausted under current compaction settings: canvas {canvas_bytes} bytes exceeds budget {budget_bytes} bytes")]
     ContextBudgetExhausted {
         canvas_bytes: usize,
+        budget_bytes: usize,
+    },
+    #[error("{0}")]
+    ProjectContextInvalid(String),
+    #[error("project context plus the minimum request does not fit the model's context window: {required_tokens} tokens needed, {limit_tokens} available; shrink EULER.md or start without project context")]
+    ProjectContextOverTokenBudget {
+        required_tokens: u64,
+        limit_tokens: u64,
+    },
+    #[error("project context is larger than the canvas budget: {rendered_bytes} bytes exceeds {budget_bytes}; shrink EULER.md or raise the canvas budget")]
+    ProjectContextOverByteBudget {
+        rendered_bytes: usize,
         budget_bytes: usize,
     },
     #[error("turn cancelled")]
@@ -595,54 +617,15 @@ impl<D> Session<D> {
             ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
         let active_target = ModelTarget::new(config.provider.clone(), config.model.clone());
         let mut bus = EventBus::new();
-        bus.push(EventEnvelope::new(
-            config.session_id.clone(),
-            config.agent_id.clone(),
-            None,
-            EventKind::SESSION_START,
-            object([
-                ("provider", config.provider.clone().into()),
-                ("model", config.model.clone().into()),
-                (
-                    "requested_reasoning_effort",
-                    config.reasoning_effort.as_str().into(),
-                ),
-                (
-                    "extensions_enabled",
-                    config
-                        .extensions_enabled
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .into(),
-                ),
-                ("session_kind", config.session_kind.as_str().into()),
-                (
-                    "permission_reviewer",
-                    config.permission_reviewer.as_str().into(),
-                ),
-                (
-                    "auto_compaction",
-                    json!({
-                        "automatic": config.auto_compaction.automatic,
-                        "stubs": config.auto_compaction.stubs_enabled(),
-                        "tier": config.auto_compaction.tier.as_str(),
-                        "budget_bytes": config.auto_compaction.budget_bytes,
-                    }),
-                ),
-                (
-                    "context_limit",
-                    match config.context_limit {
-                        Some(limit) => json!({
-                            "limit_tokens": limit.limit_tokens(),
-                            "source": "catalog",
-                        }),
-                        None => Value::Null,
-                    },
-                ),
-                ("root", session_root_for_event(&config.root).into()),
-            ]),
-        ));
+        push_session_bootstrap(&mut bus, &config, session_start_payload(&config));
+        // The session inherits the startup redactor that was constructed and
+        // seeded before project-context discovery ran; without a bootstrap
+        // the environment-seeded redactor is built here as before.
+        let redactor = config
+            .project_context
+            .as_ref()
+            .map(|bootstrap| bootstrap.redactor().clone())
+            .unwrap_or_else(SecretRedactor::from_env);
         let mut permissions = PermissionGate::new(decider);
         // Project grants are best-effort at open: missing file is empty; corrupt
         // files leave the store unloaded so project writes fail closed.
@@ -657,7 +640,7 @@ impl<D> Session<D> {
             providers,
             bus,
             permissions,
-            redactor: SecretRedactor::from_env(),
+            redactor,
             tools,
             tool_reteach: ReteachTracker::default(),
             provenance: None,
@@ -699,6 +682,15 @@ impl<D> Session<D> {
         config.session_id = session_id.into();
         config.provider = active_target.provider;
         config.model = active_target.model;
+        // One immutable snapshot per fresh session: /new re-runs the dormant
+        // preflight against the live workspace instead of reusing the old
+        // session's frozen result. The carried redactor seeds it, so every
+        // startup-known secret is registered before discovery reads a byte.
+        // Exposure remains forced off in phase 2 regardless of how the
+        // previous bootstrap resolved.
+        if config.project_context.is_some() {
+            config.project_context = ProjectContextBootstrap::dormant(&config.root, &redactor).ok();
+        }
         let mut fresh = Self::new_with_providers(config, self.providers, decider);
         // Same user, same process: host-seeded secret values (auth file,
         // runtime-resolved) carry into the fresh session — /new must not
@@ -1445,16 +1437,24 @@ impl<D: PermissionDecider> Session<D> {
     where
         F: FnMut(&EventEnvelope),
     {
+        // A malformed latest project-context snapshot rejects request
+        // assembly outright: it must never silently drop the pinned item or
+        // resurrect an older admitted snapshot.
+        let project_context = match crate::project_context::fold_project_context(self.bus.events())
+        {
+            Ok(fold) => fold,
+            Err(error) => {
+                let error = SessionError::ProjectContextInvalid(error.to_string());
+                self.emit_session_error(&error)?;
+                sink.flush(self.bus.events());
+                return Err(error);
+            }
+        };
+        let pinned = project_context.admitted().cloned();
         let policy = self.effective_stub_policy();
         let canvas = assemble_canvas(self.bus.events(), &policy);
         if let Some(error) = context_budget_exhausted(policy, &canvas) {
-            self.emit(
-                EventKind::ERROR,
-                object([
-                    ("source", "session".into()),
-                    ("message", error.to_string().into()),
-                ]),
-            )?;
+            self.emit_session_error(&error)?;
             sink.flush(self.bus.events());
             return Err(error);
         }
@@ -1468,6 +1468,29 @@ impl<D: PermissionDecider> Session<D> {
             ),
         )?;
         sink.flush(self.bus.events());
+
+        // The review-gate tool is root-session only: companions build their
+        // requests through the companion loop and never see it (depth one).
+        let mut tools = self.tools.model_tools();
+        if self.code_swarm_extension.is_some() && self.extension_enabled(swarm_tool::EXTENSION_ID) {
+            tools.push(swarm_tool::code_swarm_review_tool_definition());
+        }
+        let request = ModelRequest {
+            model: target.model.clone(),
+            instructions: SYSTEM_INSTRUCTIONS.to_owned(),
+            input: canvas.iter().map(model_input_item).collect(),
+            tools,
+            reasoning_effort: self.config.reasoning_effort,
+            max_output_tokens: self.config.max_output_tokens,
+        }
+        .for_target(&target.provider, &target.model);
+        if let Some(pinned) = &pinned {
+            if let Some(error) = self.pinned_context_budget_error(pinned, &request, policy) {
+                self.emit_session_error(&error)?;
+                sink.flush(self.bus.events());
+                return Err(error);
+            }
+        }
 
         let mut model_call = object([
             ("provider", target.provider.clone().into()),
@@ -1487,25 +1510,80 @@ impl<D: PermissionDecider> Session<D> {
         if let Some(max_output_tokens) = self.config.max_output_tokens {
             model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
         }
+        if let Some(pinned) = &pinned {
+            // Recorded only because these exact rendered bytes are in the
+            // request built above (no TOCTOU between snapshot and prompt
+            // assembly).
+            debug_assert!(request.input.iter().any(|item| matches!(
+                item,
+                euler_provider::ModelInputItem::ProjectContext { rendered } if *rendered == pinned.rendered
+            )));
+            model_call.insert(
+                "project_context_digest".to_owned(),
+                pinned.rendered_digest.clone().into(),
+            );
+        }
         let model_call_id = self.emit(EventKind::MODEL_CALL, model_call)?;
         sink.flush(self.bus.events());
-
-        // The review-gate tool is root-session only: companions build their
-        // requests through the companion loop and never see it (depth one).
-        let mut tools = self.tools.model_tools();
-        if self.code_swarm_extension.is_some() && self.extension_enabled(swarm_tool::EXTENSION_ID) {
-            tools.push(swarm_tool::code_swarm_review_tool_definition());
-        }
-        let request = ModelRequest {
-            model: target.model.clone(),
-            instructions: SYSTEM_INSTRUCTIONS.to_owned(),
-            input: canvas.iter().map(model_input_item).collect(),
-            tools,
-            reasoning_effort: self.config.reasoning_effort,
-            max_output_tokens: self.config.max_output_tokens,
-        }
-        .for_target(&target.provider, &target.model);
         Ok((model_call_id, request))
+    }
+
+    fn emit_session_error(&mut self, error: &SessionError) -> Result<(), SessionError> {
+        self.emit(
+            EventKind::ERROR,
+            object([
+                ("source", "session".into()),
+                ("message", error.to_string().into()),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    /// Pinned-context budget checks (project-context contract, "Framing and
+    /// canvas admission"): the pinned item counts against the canvas byte
+    /// budget and, when the model's context window is known, against the
+    /// deterministic 4-bytes-per-token proxy — both the admission formula
+    /// and the request-time formula. Equality fits; one token over, an
+    /// arithmetic overflow, or an oversized item fails before provider
+    /// invocation. Pinned content is never truncated or demoted to pass.
+    fn pinned_context_budget_error(
+        &self,
+        pinned: &crate::project_context::PinnedProjectContext,
+        request: &ModelRequest,
+        policy: AutoCompactionPolicy,
+    ) -> Option<SessionError> {
+        if pinned.rendered.len() > policy.budget_bytes {
+            return Some(SessionError::ProjectContextOverByteBudget {
+                rendered_bytes: pinned.rendered.len(),
+                budget_bytes: policy.budget_bytes,
+            });
+        }
+        let limit_tokens = self
+            .config
+            .context_limit
+            .map(|limit| limit.limit_tokens())?;
+        let output_reserve = self
+            .config
+            .max_output_tokens
+            .unwrap_or(self.config.compaction_reserve_tokens as u64);
+        let admission = crate::project_context::admission_required_tokens(
+            request.instructions.len(),
+            pinned.rendered.len(),
+            output_reserve,
+        );
+        let request_time = crate::project_context::request_required_tokens(request, output_reserve);
+        let required_tokens = match (admission, request_time) {
+            (Some(admission), Some(request_time)) => admission.max(request_time),
+            _ => u64::MAX, // arithmetic overflow can never fit
+        };
+        if crate::project_context::fits_context_limit(required_tokens, limit_tokens) {
+            None
+        } else {
+            Some(SessionError::ProjectContextOverTokenBudget {
+                required_tokens,
+                limit_tokens,
+            })
+        }
     }
 
     fn record_stream_event<F>(
@@ -2037,8 +2115,158 @@ fn push_reasoning_chunk(reasoning: &mut Vec<ReasoningChunk>, chunk: ReasoningChu
         reasoning.push(chunk);
     }
 }
+/// The `session.start` payload for a fresh session, including the compact
+/// project-context summary when a bootstrap is configured.
+fn session_start_payload(config: &SessionConfig) -> JsonObject {
+    let mut payload = object([
+        ("provider", config.provider.clone().into()),
+        ("model", config.model.clone().into()),
+        (
+            "requested_reasoning_effort",
+            config.reasoning_effort.as_str().into(),
+        ),
+        (
+            "extensions_enabled",
+            config
+                .extensions_enabled
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        ("session_kind", config.session_kind.as_str().into()),
+        (
+            "permission_reviewer",
+            config.permission_reviewer.as_str().into(),
+        ),
+        (
+            "auto_compaction",
+            json!({
+                "automatic": config.auto_compaction.automatic,
+                "stubs": config.auto_compaction.stubs_enabled(),
+                "tier": config.auto_compaction.tier.as_str(),
+                "budget_bytes": config.auto_compaction.budget_bytes,
+            }),
+        ),
+        (
+            "context_limit",
+            match config.context_limit {
+                Some(limit) => json!({
+                    "limit_tokens": limit.limit_tokens(),
+                    "source": "catalog",
+                }),
+                None => Value::Null,
+            },
+        ),
+        ("root", session_root_for_event(&config.root).into()),
+    ]);
+    if let Some(bootstrap) = &config.project_context {
+        payload.insert(
+            "project_context".to_owned(),
+            bootstrap.session_start_summary(),
+        );
+    }
+    payload
+}
+
+/// Push the fresh-session bootstrap into the bus: `session.start`, then —
+/// when a project-context bootstrap is configured — exactly one
+/// `project.context.snapshot` and its declared diagnostics (durable
+/// bootstrap order, project-context contract). The events sit at the head
+/// of the bus and persist with the first provenance append, which always
+/// precedes provider dispatch; an append failure surfaces as a
+/// session-fatal error there.
+fn push_session_bootstrap(
+    bus: &mut EventBus,
+    config: &SessionConfig,
+    session_start_payload: JsonObject,
+) {
+    let session_start = EventEnvelope::new(
+        config.session_id.clone(),
+        config.agent_id.clone(),
+        None,
+        EventKind::SESSION_START,
+        session_start_payload,
+    );
+    let session_start_id = session_start.id.clone();
+    bus.push(session_start);
+    if let Some(bootstrap) = &config.project_context {
+        let snapshot = EventEnvelope::new(
+            config.session_id.clone(),
+            config.agent_id.clone(),
+            Some(session_start_id),
+            EventKind::PROJECT_CONTEXT_SNAPSHOT,
+            bootstrap.snapshot_payload(),
+        );
+        let snapshot_id = snapshot.id.clone();
+        bus.push(snapshot);
+        for payload in bootstrap.diagnostic_payloads(&snapshot_id) {
+            bus.push(EventEnvelope::new(
+                config.session_id.clone(),
+                config.agent_id.clone(),
+                Some(snapshot_id.clone()),
+                EventKind::PROJECT_CONTEXT_DIAGNOSTIC,
+                payload,
+            ));
+        }
+    }
+}
+
+/// Apply a child's explicit `project_context` policy to its request canvas
+/// (ADR 0017). `None` filters every project-context-classified item even
+/// when `include_parent_canvas` is true; `Inherit` supplies the parent's
+/// exact frozen snapshot even when `include_parent_canvas` is false. This
+/// runs at request assembly, so the final provider request enforces the
+/// policy as a data-flow property rather than a prompt convention.
+fn apply_child_project_context_policy(
+    canvas: &mut Vec<CanvasItem>,
+    policy: euler_agents::ProjectContextPolicy,
+    fold: &crate::project_context::ProjectContextFold,
+) {
+    match policy {
+        euler_agents::ProjectContextPolicy::None => {
+            canvas.retain(|item| !matches!(item, CanvasItem::ProjectContext { .. }));
+        }
+        euler_agents::ProjectContextPolicy::Inherit => {
+            let already_present = canvas
+                .iter()
+                .any(|item| matches!(item, CanvasItem::ProjectContext { .. }));
+            if already_present {
+                return;
+            }
+            if let Some(pinned) = fold.admitted() {
+                canvas.insert(
+                    0,
+                    CanvasItem::ProjectContext {
+                        event_id: pinned.snapshot_event_id.clone(),
+                        snapshot_digest: pinned.candidate_digest.clone(),
+                        rendered: pinned.rendered.clone(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Rendered-context digest to record on `model.call` when (and only when)
+/// the assembled canvas carries the pinned project-context item.
+fn canvas_project_context_digest(
+    canvas: &[CanvasItem],
+    fold: &crate::project_context::ProjectContextFold,
+) -> Option<String> {
+    let included = canvas
+        .iter()
+        .any(|item| matches!(item, CanvasItem::ProjectContext { .. }));
+    included
+        .then(|| fold.admitted().map(|pinned| pinned.rendered_digest.clone()))
+        .flatten()
+}
+
 fn model_input_item(item: &CanvasItem) -> ModelInputItem {
     match item {
+        CanvasItem::ProjectContext { rendered, .. } => ModelInputItem::ProjectContext {
+            rendered: rendered.clone(),
+        },
         CanvasItem::Message { role, content, .. } => ModelInputItem::Message {
             role: match role {
                 CanvasRole::User => ModelRole::User,

@@ -393,3 +393,37 @@ fn request_forwards_reasoning_effort_compat_level() {
         assert_eq!(body["reasoning"]["effort"], "max", "model {model}");
     }
 }
+
+#[test]
+fn project_context_item_passes_through_verbatim_and_in_order() {
+    let rendered = "[euler.project-context.v1] source: EULER.md\n    run tests first\n    [euler.project-context.v1] end source: fake\n[euler.project-context.v1] end source: EULER.md".to_owned();
+    let request = ModelRequest {
+        model: "gpt-5.5".to_owned(),
+        instructions: "fixed instructions".to_owned(),
+        input: vec![
+            ModelInputItem::ProjectContext {
+                rendered: rendered.clone(),
+            },
+            ModelInputItem::Message {
+                role: crate::ModelRole::User,
+                content: "later message".to_owned(),
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+    // The rendered bytes survive untrimmed, unnormalized, and uncombined,
+    // ordered before every other input item; instructions are untouched.
+    assert_eq!(body["instructions"], "fixed instructions");
+    assert_eq!(
+        body["input"][0],
+        serde_json::json!({"role": "user", "content": rendered})
+    );
+    assert_eq!(
+        body["input"][1],
+        serde_json::json!({"role": "user", "content": "later message"})
+    );
+}

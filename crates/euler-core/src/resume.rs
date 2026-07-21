@@ -65,6 +65,10 @@ pub enum ResumeError {
     Io(#[from] io::Error),
     #[error("failed to append resume recovery closure: {0}")]
     Append(io::Error),
+    #[error("resume incompatible: {reason}; start a new session to rebuild its project context")]
+    ProjectContextBootstrap { reason: String },
+    #[error("{message}")]
+    WorkspaceMismatch { message: String },
     #[error(transparent)]
     Session(#[from] crate::session::SessionError),
     #[error(transparent)]
@@ -81,6 +85,7 @@ pub fn fold_session(
     events: Vec<EventEnvelope>,
 ) -> Result<FoldedSession, ResumeError> {
     preflight_events(&events)?;
+    preflight_project_context(config, &events)?;
     let initial = ModelTarget::new(config.provider.clone(), config.model.clone());
     let mut target_at_event = initial;
     let mut reasoning_effort = config.reasoning_effort;
@@ -155,6 +160,46 @@ pub fn fold_session(
         session_allowed_capabilities,
         warnings,
     })
+}
+
+/// Project-context resume preflight (ADR 0017): fail closed on a missing,
+/// partial, duplicated, or inconsistent bootstrap and on a malformed latest
+/// snapshot — only the legacy shape (no summary and no snapshot) resumes
+/// with project context disabled — and verify the live workspace is the one
+/// the session was recorded in. False rejection is preferred to applying
+/// one checkout's frozen guidance to another checkout's files.
+fn preflight_project_context(
+    config: &SessionConfig,
+    events: &[EventEnvelope],
+) -> Result<(), ResumeError> {
+    crate::project_context::validate_bootstrap_shape(events)
+        .map_err(|reason| ResumeError::ProjectContextBootstrap { reason })?;
+    crate::project_context::fold_project_context(events).map_err(|error| {
+        ResumeError::ProjectContextBootstrap {
+            reason: error.to_string(),
+        }
+    })?;
+    if let Err(issue) = crate::project_context::verify_workspace_identity(events, &config.root) {
+        use crate::project_context::WorkspaceIdentityIssue;
+        let message = match issue {
+            WorkspaceIdentityIssue::Mismatch => {
+                "this session was started in a different folder (or that folder has moved); \
+                 open the original folder to resume it, or start a new session here"
+            }
+            WorkspaceIdentityIssue::Unresolvable => {
+                "the current folder cannot be resolved, so this session cannot be resumed \
+                 here; start a new session"
+            }
+            WorkspaceIdentityIssue::Unusable => {
+                "this session's workspace record cannot be read by this version of Euler; \
+                 start a new session"
+            }
+        };
+        return Err(ResumeError::WorkspaceMismatch {
+            message: message.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn fold_session_permission_decision(

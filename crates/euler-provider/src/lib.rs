@@ -55,6 +55,7 @@ impl ModelRequest {
                 ModelInputItem::Message { role, content } => {
                     format!("{}: {content}", role.as_str())
                 }
+                ModelInputItem::ProjectContext { rendered } => rendered.clone(),
                 ModelInputItem::ToolCall {
                     call_id,
                     name,
@@ -188,6 +189,14 @@ pub enum ModelInputItem {
     Message {
         role: ModelRole,
         content: String,
+    },
+    /// Core-framed repository project context (ADR 0017). The rendered bytes
+    /// are produced once by core framing; adapters may wrap them in
+    /// provider-specific role or envelope data but must not trim, normalize,
+    /// combine, reorder, or silently omit them. An adapter that cannot
+    /// represent this item must fail before dispatch.
+    ProjectContext {
+        rendered: String,
     },
     ToolCall {
         call_id: String,
