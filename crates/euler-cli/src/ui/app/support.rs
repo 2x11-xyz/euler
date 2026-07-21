@@ -1106,7 +1106,7 @@ mod tests {
 
         assert_eq!(
             context_window_tokens_for(&catalog, "chatgpt", "gpt-5.6-terra"),
-            Some(353_400)
+            Some(258_400)
         );
         let choices = model_choices(
             &catalog,
@@ -1118,7 +1118,7 @@ mod tests {
             .iter()
             .find(|choice| choice.provider == "chatgpt" && choice.model == "gpt-5.6-terra")
             .expect("Terra choice");
-        assert!(terra.label.contains("353K ctx"), "{}", terra.label);
+        assert!(terra.label.contains("258K ctx"), "{}", terra.label);
     }
 
     #[test]
