@@ -36,10 +36,8 @@ pub struct TokenUsageSnapshot {
     pub output_tokens: u64,
     pub reasoning_tokens: Option<u64>,
     pub context_window_tokens: Option<u64>,
-    pub demoted_items: u64,
     pub canvas_retained_bytes: Option<u64>,
     pub canvas_budget_bytes: Option<u64>,
-    pub compaction_tier: Option<String>,
     /// Cumulative USD in trillionths (pico-dollars), computed from the model
     /// metadata attached to each persisted model result.
     pub session_cost_picos: u128,
@@ -99,8 +97,8 @@ pub enum TurnStatus {
 
 /// Footer v2 (Review v2 §15): two hard-edged clusters with empty space
 /// between — left flush-left (contextual hints, then `cwd (branch)`),
-/// right flush-right (`model(effort) · ctx N%` [· `$N.NNN`] [+ session name
-/// once named]).
+/// right flush-right (`model(effort) · ctx N% · $N.NNN` [+ session name once
+/// named]).
 /// Test-only: exercises the same span builder as the production
 /// `status_line_canvas` but flattens to plain text for easy assertions.
 #[cfg(test)]
@@ -198,7 +196,7 @@ impl Widget for StatusWidget<'_> {
 
 #[cfg(test)]
 pub fn context_segment(snapshot: &TokenUsageSnapshot) -> String {
-    let mut base = match snapshot.context_window_tokens.filter(|window| *window > 0) {
+    match snapshot.context_window_tokens.filter(|window| *window > 0) {
         Some(window) => {
             let percent = rounded_context_percent(snapshot.input_tokens, window).min(99);
             format!("Context {percent}% used")
@@ -213,15 +211,7 @@ pub fn context_segment(snapshot: &TokenUsageSnapshot) -> String {
             }
             _ => "Context ?% used".to_owned(),
         },
-    };
-    if snapshot.demoted_items > 0 {
-        base.push_str(&format!(" · {} demoted", snapshot.demoted_items));
-        if let Some(tier) = snapshot.compaction_tier.as_deref() {
-            base.push_str(" · ");
-            base.push_str(tier);
-        }
     }
-    base
 }
 
 fn rounded_context_percent(input_tokens: u64, window: u64) -> u64 {
@@ -316,15 +306,18 @@ fn identity_context_style(tokens: &TokenUsageSnapshot, theme: &Theme) -> Style {
     }
 }
 
+/// The footer cost chip follows the "absence over punctuation" rule: it is
+/// present only when the priced cost subtotal is greater than zero, rendered
+/// as the plain `$N.NNN`. A zero subtotal (genuinely free, no calls made, or
+/// only unpriced calls) yields no chip at all: no `$0`, no `$?`, no marker.
+/// The mixed case (nonzero priced plus some unpriced) shows the plain subtotal
+/// unmarked; the complete honesty (`$?` / `$N.NNN+ (N unpriced calls)`) lives
+/// in `/usage`, not the footer.
 fn identity_cost_label(tokens: &TokenUsageSnapshot) -> Option<String> {
-    match (tokens.priced_calls, tokens.unpriced_calls) {
-        (0, 0) => None,
-        (0, _) => Some("$?".to_owned()),
-        (_, 0) => Some(format_cost_picos(tokens.session_cost_picos, 3)),
-        (_, _) => Some(format!(
-            "{}+",
-            format_cost_picos(tokens.session_cost_picos, 3)
-        )),
+    if tokens.session_cost_picos == 0 {
+        None
+    } else {
+        Some(format_cost_picos(tokens.session_cost_picos, 3))
     }
 }
 
@@ -341,9 +334,10 @@ pub(super) fn format_cost_picos(picos: u128, decimals: u32) -> String {
     format!("${whole}.{fraction:0width$}", width = decimals as usize)
 }
 
-/// Right cluster, flush-right: `model(effort) · ctx N%` [· `$N.NNN`] [+ session
-/// name once named] [+ demoted-items note]. Branch no longer lives here (#48)
-/// — see the left cluster's `cwd (branch)` instead.
+/// Right cluster, flush-right: `model(effort) · ctx N%` [· `$N.NNN`] [· session
+/// name once named]. The cost chip appears only for a nonzero priced subtotal
+/// (see `identity_cost_label`). Branch no longer lives here (#48) — see the
+/// left cluster's `cwd (branch)` instead.
 fn identity_segment_spans(
     snapshot: &StatusSnapshot,
     tokens: &TokenUsageSnapshot,
@@ -376,12 +370,6 @@ fn identity_segment_spans(
         .filter(|name| !name.is_empty())
     {
         spans.push(Span::styled(format!(" · {name}"), theme.status.faint));
-    }
-    if tokens.demoted_items > 0 {
-        spans.push(Span::styled(
-            format!(" · {} demoted", tokens.demoted_items),
-            theme.status.faint,
-        ));
     }
     spans
 }
@@ -432,7 +420,7 @@ fn join_footer_span_clusters(
 ) -> Vec<Span<'static>> {
     let right_width = spans_width(&right);
     if right_width >= width {
-        // The right cluster (model(effort) · ctx N% [· session name]) never yields;
+        // The right cluster (model(effort) · ctx N% · $N.NNN [· session name]) never yields;
         // if even it alone can't fit, it gets the whole line.
         return truncate_spans(&right, width);
     }
@@ -541,6 +529,8 @@ mod tests {
         assert!(!full.contains("ctrl+o expand"));
         assert!(full.contains("/tmp/repo (main)"));
         assert!(full.contains("z-ai/glm-5.2(extra-high) · ctx ?%"));
+        // Zero priced subtotal: the cost chip is absent, no orphaned separator.
+        assert!(!full.contains("ctx ?% · $"));
         // Branch v2 (#48): lives beside the directory, never on the right.
         assert!(!full.contains("ctx ?% · main"));
         assert!(!full.contains("e???? ·"));
@@ -609,10 +599,8 @@ mod tests {
             output_tokens: 50_000,
             reasoning_tokens: Some(25_000),
             context_window_tokens: Some(1_000_000),
-            demoted_items: 0,
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
-            compaction_tier: None,
             ..TokenUsageSnapshot::default()
         };
 
@@ -747,17 +735,21 @@ mod tests {
         assert!(rendered.ends_with("echo · ctx ?% · $12.346"));
     }
 
+    /// Absence over punctuation: a zero priced subtotal shows no cost chip at
+    /// all (even when unpriced calls were made) and never orphans the ` · `
+    /// separator. A nonzero subtotal that also has unpriced calls shows the
+    /// plain numeric subtotal, unmarked (no `+`); the `$?` / `$N.NNN+` honesty
+    /// lives in `/usage`, not the footer.
     #[test]
-    fn statusline_marks_unknown_and_partial_costs() {
+    fn statusline_cost_chip_absent_at_zero_subtotal_and_unmarked_when_partial() {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/repo"));
         let unknown = TokenUsageSnapshot {
             unpriced_calls: 1,
             ..TokenUsageSnapshot::default()
         };
-        assert!(
-            status_line_text(&snapshot, &unknown, TurnStatus::Idle, false, 120)
-                .ends_with("echo · ctx ?% · $?")
-        );
+        let rendered = status_line_text(&snapshot, &unknown, TurnStatus::Idle, false, 120);
+        assert!(rendered.ends_with("echo · ctx ?%"));
+        assert!(!rendered.contains('$'));
 
         let partial = TokenUsageSnapshot {
             session_cost_picos: 1_250_000_000_000,
@@ -765,10 +757,9 @@ mod tests {
             unpriced_calls: 2,
             ..TokenUsageSnapshot::default()
         };
-        assert!(
-            status_line_text(&snapshot, &partial, TurnStatus::Idle, false, 120)
-                .ends_with("echo · ctx ?% · $1.250+")
-        );
+        let partial_rendered = status_line_text(&snapshot, &partial, TurnStatus::Idle, false, 120);
+        assert!(partial_rendered.ends_with("echo · ctx ?% · $1.250"));
+        assert!(!partial_rendered.contains('+'));
     }
 
     #[test]
@@ -786,10 +777,8 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: None,
             context_window_tokens: Some(100),
-            demoted_items: 0,
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
-            compaction_tier: None,
             ..TokenUsageSnapshot::default()
         };
         let label = format!("ctx {percent}%");
@@ -868,7 +857,8 @@ mod tests {
 
         // Sized so the directory's budget is exactly 12 cells — enough for
         // `…/2x11/euler` (the ellipsis plus the last 11 characters) and not
-        // one cell more.
+        // one cell more. At zero cost the right cluster is `echo · ctx ?%`
+        // (no cost chip), so the width that leaves a 12-cell path budget is 49.
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 49);
 
         assert!(rendered.contains("/ commands · …/2x11/euler (main)"));
@@ -886,8 +876,8 @@ mod tests {
         snapshot.git_branch = Some("main".to_owned());
         let tokens = TokenUsageSnapshot::default();
 
-        // 4 cells narrower than the `…/2x11/euler` case above — exactly
-        // enough budget for the pre-fix raw cut to land inside "2x11"
+        // 4 cells narrower than the `…/2x11/euler` case above (49 → 45),
+        // exactly enough budget for the pre-fix raw cut to land inside "2x11"
         // ("11/euler"); the fix must sacrifice the whole component instead.
         let rendered = status_line_text(&snapshot, &tokens, TurnStatus::Idle, false, 45);
 
@@ -917,6 +907,7 @@ mod tests {
         snapshot.session_name = Some("apple-terminal-v4-test".to_owned());
         snapshot.reasoning_effort = Some("medium".to_owned());
         let tokens = TokenUsageSnapshot::default();
+        // Zero cost: no chip, so the right cluster carries no `$0` segment.
         let right_cluster = "z-ai/glm-5.2(medium) · ctx ?% · apple-terminal-v4-test";
 
         // 66 is the exact width from the owner's dogfood screenshot where
@@ -963,10 +954,8 @@ mod tests {
             output_tokens: u64::MAX,
             reasoning_tokens: Some(u64::MAX),
             context_window_tokens: Some(1),
-            demoted_items: 0,
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
-            compaction_tier: None,
             ..TokenUsageSnapshot::default()
         };
 
@@ -981,10 +970,8 @@ mod tests {
             output_tokens: 999,
             reasoning_tokens: None,
             context_window_tokens: Some(1_000),
-            demoted_items: 0,
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
-            compaction_tier: None,
             ..TokenUsageSnapshot::default()
         };
 
@@ -995,31 +982,11 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: None,
             context_window_tokens: Some(1_000),
-            demoted_items: 0,
             canvas_retained_bytes: None,
             canvas_budget_bytes: None,
-            compaction_tier: None,
             ..TokenUsageSnapshot::default()
         };
 
         assert_eq!(context_segment(&clamped), "Context 99% used");
-    }
-    #[test]
-    fn demoted_items_append_to_context_segment() {
-        let snapshot = TokenUsageSnapshot {
-            input_tokens: 120_000,
-            output_tokens: 0,
-            reasoning_tokens: None,
-            context_window_tokens: Some(1_000_000),
-            demoted_items: 12,
-            canvas_retained_bytes: Some(600_000),
-            canvas_budget_bytes: Some(640_000),
-            compaction_tier: Some("stubs".to_owned()),
-            ..TokenUsageSnapshot::default()
-        };
-        assert_eq!(
-            context_segment(&snapshot),
-            "Context 12% used · 12 demoted · stubs"
-        );
     }
 }

@@ -187,25 +187,40 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   next round boundary as canonical `user.message` events (the model sees
   them in-turn; docs/contracts/events.md). Entries the turn never absorbed —
   paused queue, arrival after the final round — flush into the next turn,
-  as before. The running footer hint reads `⏎ steer`.
+  as before. Pending rows show one visual line: the message body is capped at
+  64 terminal display cells, truncates at a word boundary with an ASCII
+  ` ...` suffix, and never alters the full queued input. Two fallbacks apply at
+  tight widths: when the first word alone exceeds the budget there is no word
+  boundary to keep, so the preview hard-cuts mid-word before appending the
+  suffix; and when the budget is four cells or fewer (at or below the suffix
+  width) the ` ...` suffix is dropped and the body is a bare hard cut. The
+  running footer hint reads `⏎ steer`.
 - Footer: **one** line below the composer — two hard-edged clusters:
-  contextual hints then `cwd (branch)` flush-left; `model · ctx N% · $N.NNN`
-  (plus the session name once named) flush-right. Cost is cumulative USD over
-  persisted `model.result.cost` snapshots in the session, including companion
-  calls. The model-result emission boundary computes each snapshot once from
-  disjoint usage buckets and the exact resolved catalog schedule; live display,
-  resume, and replay validate the saved component arithmetic against the saved
-  usage and selected rates, then sum the persisted integer components. Only
-  the primary session actor updates the active `ctx` counters; companion and
-  reviewer calls contribute cost without replacing that reading.
-  Catalog refresh never reprices history. The segment is omitted before the
-  first result; `$?` means no result had a valid persisted quote, and a trailing
-  `+` marks a known subtotal when any result was unpriced. Subscription-backed
-  ChatGPT shows an equivalent API-price estimate when its catalog entry has a
-  quote; this is neither an invoice nor a claim about incremental spend. No
-  session id in the footer — ids live in `/status` and resume copy (#21). Ctx%
-  uses attention at ≥70% and failure at ≥85%. No second status row; detail
-  lives under `/status`.
+  contextual hints then `cwd (branch)` flush-left; `model · ctx N%` with an
+  optional `· $N.NNN` (plus the session name once named) flush-right. The cost
+  chip follows absence over punctuation: it renders only when the priced cost
+  subtotal is greater than zero, as the plain `$N.NNN`. A zero subtotal (a
+  genuinely free session, no calls yet, or only unpriced calls) shows no chip at
+  all: no `$0`, no `$?`, no placeholder, and the ` · ` separator never orphans.
+  The mixed case (a nonzero priced subtotal alongside some unpriced calls) shows
+  that plain subtotal, unmarked. The footer carries no unknown or partial
+  markers; quote completeness and unpriced call counts stay explicit in
+  `/usage`, which keeps `$? (N unpriced calls)` for the all-unpriced history and
+  `$N.NNN+ (N unpriced calls)` for the partial one. The subtotal is cumulative USD over
+  valid persisted `model.result.cost` snapshots in the session, including
+  companion calls. The model-result emission boundary computes each snapshot
+  once from disjoint usage buckets and the exact resolved catalog schedule;
+  live display, resume, and replay validate the saved component arithmetic
+  against the saved usage and selected rates, then sum the persisted integer
+  components. Only the primary session actor updates the active `ctx` counters;
+  companion and reviewer calls contribute cost without replacing that reading.
+  Catalog refresh never reprices history. Subscription-backed ChatGPT shows an
+  equivalent API-price estimate when its catalog entry has a quote; this is
+  neither an invoice nor a claim about incremental spend. No session id in the
+  footer — ids live in `/status` and resume copy (#21). Ctx% uses attention at
+  ≥70% and failure at ≥85%. Canvas compaction data, including demotion counts
+  and tier, remains canonical `canvas.snapshot` provenance (events contract),
+  not footer state. No second status row; detail lives under `/status`.
 
 ### Streaming, scroll, motion
 
