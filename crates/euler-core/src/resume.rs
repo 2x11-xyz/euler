@@ -305,6 +305,7 @@ pub fn plan_relocation(
             }
             let current_root = crate::session_root::session_root_for_event(live_root);
             let recorded_root = crate::project_context::projected_new_root(prefix)
+                .map_err(|reason| ResumeError::ProjectContextBootstrap { reason })?
                 .or_else(|| session_start_root(prefix))
                 .unwrap_or_else(|| "(unknown folder)".to_owned());
             let last_active = prefix.last().map(|event| event.ts.clone());

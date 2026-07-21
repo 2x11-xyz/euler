@@ -903,12 +903,24 @@ fn session_projection_from_events_or_sidecar(
             kind: None,
         };
     };
+    let root = match root_from_events(&events) {
+        Ok(root) => root.or(sidecar_root),
+        Err(_) => {
+            return SessionProjection {
+                status: SessionStatus::Invalid,
+                name: None,
+                title: None,
+                root: None,
+                kind: None,
+            }
+        }
+    };
     SessionProjection {
         status: status_from_events(&events),
         name: name_from_events(&events)
             .or_else(|| sidecar_name.and_then(|name| session_name_for_display(&name))),
         title: title_from_events(&events),
-        root: root_from_events(&events).or(sidecar_root),
+        root,
         kind: kind_from_events(&events).or(sidecar_kind),
     }
 }
@@ -987,22 +999,22 @@ fn kind_from_events(events: &[euler_event::EventEnvelope]) -> Option<SessionKind
         .and_then(SessionKind::parse)
 }
 
-fn root_from_events(events: &[euler_event::EventEnvelope]) -> Option<PathBuf> {
+fn root_from_events(events: &[euler_event::EventEnvelope]) -> Result<Option<PathBuf>, String> {
     // An accepted `project.context.relocated` supersedes the recorded root
     // everywhere the first `session.start` root is used (ADR 0017 phase 3):
     // the latest relocation's `new_root` governs listing, grouping, and the
     // recorded path a later relocation card renders.
-    if let Some(new_root) = crate::project_context::projected_new_root(events) {
+    if let Some(new_root) = crate::project_context::projected_new_root(events)? {
         if let Some(path) = session_root_from_str(&new_root) {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
-    events
+    Ok(events
         .iter()
         .find(|event| event.kind.as_str() == EventKind::SESSION_START)
         .and_then(|event| event.payload.get("root"))
         .and_then(serde_json::Value::as_str)
-        .and_then(session_root_from_str)
+        .and_then(session_root_from_str))
 }
 
 #[cfg(test)]

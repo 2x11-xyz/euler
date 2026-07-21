@@ -92,6 +92,11 @@ pub(crate) struct Relocation {
     pub new_root: String,
 }
 
+struct RelocationFold {
+    governing_identity: Option<RelocationIdentity>,
+    projected_root: Option<String>,
+}
+
 /// Validate one `project.context.relocated` payload's shape, in isolation
 /// (untrusted input). Chain and supersession rules are enforced separately in
 /// [`fold_governing_identity`].
@@ -157,7 +162,15 @@ pub(crate) fn fold_governing_identity(
     events: &[EventEnvelope],
     snapshot_identity: Option<RelocationIdentity>,
 ) -> Result<Option<RelocationIdentity>, String> {
-    let mut governing = snapshot_identity;
+    Ok(fold_relocations(events, snapshot_identity)?.governing_identity)
+}
+
+fn fold_relocations(
+    events: &[EventEnvelope],
+    snapshot_identity: Option<RelocationIdentity>,
+) -> Result<RelocationFold, String> {
+    let mut governing_identity = snapshot_identity;
+    let mut projected_root = None;
     for (index, event) in events.iter().enumerate() {
         if event.kind.as_str() != EventKind::PROJECT_CONTEXT_RELOCATED {
             continue;
@@ -180,7 +193,7 @@ pub(crate) fn fold_governing_identity(
         // before this event. A stale or branched acceptance (its prior does
         // not match the current governing identity) is rejected and never
         // supersedes.
-        match &governing {
+        match &governing_identity {
             Some(current) if *current == relocation.prior_identity => {}
             Some(_) => {
                 return Err(
@@ -197,25 +210,24 @@ pub(crate) fn fold_governing_identity(
                 )
             }
         }
-        governing = Some(relocation.new_identity);
+        governing_identity = Some(relocation.new_identity);
+        projected_root = Some(relocation.new_root);
     }
-    Ok(governing)
+    Ok(RelocationFold {
+        governing_identity,
+        projected_root,
+    })
 }
 
 /// The projected workspace root after folding: the latest valid relocation's
 /// `new_root`, or `None` when there is no relocation. The caller uses this to
 /// project the session's root everywhere the first `session.start` root is
-/// used. Chain validity is the caller's concern (via
-/// [`fold_governing_identity`]); this only extracts the latest recorded root.
-pub(crate) fn projected_new_root(events: &[EventEnvelope]) -> Option<String> {
-    events
-        .iter()
-        .rev()
-        .find(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_RELOCATED)
-        .and_then(|event| event.payload.get("new_root"))
-        .and_then(Value::as_str)
-        .filter(|root| !root.is_empty())
-        .map(str::to_owned)
+/// used. Relocation events are untrusted input: any malformed, mis-parented,
+/// or stale relocation rejects the projection rather than falling back to a
+/// forged display path.
+pub(crate) fn projected_new_root(events: &[EventEnvelope]) -> Result<Option<String>, String> {
+    let base = snapshot_identity(events)?;
+    Ok(fold_relocations(events, base)?.projected_root)
 }
 
 /// The workspace identity governing the accepted event prefix (the snapshot
@@ -348,7 +360,7 @@ mod tests {
             .expect("identity");
         assert_eq!(governing, identity_of(&new), "new identity governs");
         assert_eq!(
-            projected_new_root(&events).as_deref(),
+            projected_new_root(&events).expect("project").as_deref(),
             Some(session_root_for_event(&new).as_str())
         );
     }
@@ -446,7 +458,7 @@ mod tests {
             .expect("identity");
         assert_eq!(governing, identity_of(&c));
         assert_eq!(
-            projected_new_root(&events).as_deref(),
+            projected_new_root(&events).expect("project").as_deref(),
             Some(session_root_for_event(&c).as_str())
         );
     }
@@ -462,7 +474,7 @@ mod tests {
             fold_governing_identity(&events, base).expect("ok"),
             Some(identity)
         );
-        assert_eq!(projected_new_root(&events), None);
+        assert_eq!(projected_new_root(&events).expect("project"), None);
     }
 
     #[test]
