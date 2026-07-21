@@ -247,9 +247,11 @@ per-project trust store.
   deliberately not portable.
 - Resume folds the snapshot from the accepted event prefix and performs no
   filesystem discovery; legacy sessions resume with project context disabled;
-  resume verifies the canonical live workspace root against the recorded one
-  and fails mismatches with remediation. Older Euler versions fail safe on
-  the unknown event kind and cannot resume such sessions.
+  resume verifies the canonical live workspace root against the recorded one.
+  A mismatch is never silently followed. Interactive resume offers relocation
+  consent (see "Resume relocation and consent" below); headless resume and the
+  phase-2 interim fail closed with the plain-language remediation. Older Euler
+  versions fail safe on the unknown event kind and cannot resume such sessions.
 - The latest snapshot event in durable sequence is authoritative. An admitted
   latest snapshot yields exactly one pinned item; a later disabled or declined
   snapshot is a tombstone and yields none. A malformed latest snapshot rejects
@@ -264,12 +266,84 @@ targets Euler's supported Unix hosts and hashes raw `OsStr` bytes with no lossy
 display conversion or Unicode normalization. A future host requires a distinct
 algorithm version and test vectors before it can resume project-context
 sessions. Canonicalization failure and unknown algorithms reject.
-Cross-platform resume, path relocation, and a different worktree therefore
-reject; false rejection is preferred to merging distinct roots. This identity
-detects location mismatch, not replacement of content at the same path, and is
-not workspace authentication. Legacy fallback applies only when both the
-project-context summary and snapshot are absent; a mixed shape with context
-events but no identity is invalid.
+Cross-platform resume rejects, because a different host algorithm cannot be
+compared; false rejection is preferred to merging distinct roots. Within one
+host a path relocation or a different worktree is a recorded mismatch, resolved
+through the relocation-consent flow below rather than a silent merge. This
+identity detects location mismatch, not replacement of content at the same
+path, and is not workspace authentication. Legacy fallback applies only when
+both the project-context summary and snapshot are absent; a mixed shape with
+context events but no identity is invalid.
+
+## Resume relocation and consent
+
+Implementation status: unimplemented; ships with issue #180 phase 3 (the
+`EULER.md` exposure phase), alongside the acknowledgment store and its
+interactive surface. Until then a same-host workspace mismatch is the phase-2
+interim hard failure described above: interactive and headless resume both fail
+closed with the plain-language remediation, and starting a new session is the
+only remediation. This is exposure-adjacent interactive machinery and does not
+land before exposure.
+
+When phase 3 lands, an interactive resume whose live canonical workspace does
+not match the recorded workspace identity neither fails closed nor silently
+adopts the new location. Euler shows a relocation-consent card and asks one
+question: resume this session here, or not.
+
+The card states facts and never a guessed reason. Euler cannot know why a path
+changed (a rename, a move, a fresh clone at a new location, a different
+checkout) and must not speculate. The card carries exactly:
+
+- the recorded workspace path (where this session last ran);
+- the current workspace path (where the resume is being attempted);
+- when the session was last active.
+
+The card discloses the consequence in plain language before the choice.
+Resuming adopts the current folder for this session going forward, and
+approvals keyed to the old location do not carry over. Project grants and
+project-context acknowledgments are two-party records keyed to a canonical
+workspace root, so the new root has its own records: project grants at the new
+root require the new root's own consent intersection, and the next fresh
+session under the new root re-asks acknowledgment for the new
+(root, candidate digest) pair. Nothing from the old root is copied, widened, or
+assumed.
+
+Affirmative acceptance appends one explicit `project.context.relocated` event
+(durable, versioned) and then proceeds with the resume. Declining changes
+nothing (no event, no identity change) and the resume does not proceed; the
+session remains exactly as it was, resumable at its recorded location.
+
+The `project.context.relocated` payload carries at least:
+
+- the prior workspace identity payload (algorithm, platform version, digest);
+- the new workspace identity payload (algorithm, platform version, digest),
+  computed from the current canonicalized `SessionConfig.root` exactly as a
+  fresh snapshot computes it;
+- the accepted-at position, so the event's place in durable sequence is
+  unambiguous and later folding is deterministic;
+- schema version.
+
+The event embeds no absolute path strings (the identity payloads are digests,
+deliberately non-portable), no repository content, and no guessed reason. The
+original snapshot and every prior event are never rewritten.
+
+Identity supersession: the latest workspace identity in durable sequence
+governs future resume checks. After a relocation event, resume compares the
+live root against the new identity; later resumes at the new path succeed
+without re-asking, and a resume back at the old path is itself a mismatch and
+gets the same card. Successive relocations chain the same way, each appending
+its own event, and the most recent one wins. A malformed or unsupported
+relocation event rejects resume rather than falling back to an older identity.
+
+Headless resume never prompts. Without the explicit flag it keeps failing
+closed with the plain-language remediation. `--accept-relocation` supplied by
+the current invocation is the scripted equivalent of answering yes: it accepts
+the specific live-versus-recorded mismatch present at this resume, appends the
+same `project.context.relocated` event, and is recorded identically in
+provenance. The flag is a single-invocation decision. It cannot come from
+repository configuration, stored acknowledgment, or resumed state, it accepts
+only the mismatch actually present (never a future or different relocation),
+and it carries no old-root approvals forward.
 
 ## Framing and canvas admission
 
