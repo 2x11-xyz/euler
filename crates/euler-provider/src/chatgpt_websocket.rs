@@ -77,7 +77,11 @@ fn websocket_endpoint(endpoint: &str) -> Result<String, ConnectError> {
 fn websocket_body(mut body: Value) -> Value {
     body["type"] = json!("response.create");
     body["include"] = json!(["reasoning.encrypted_content"]);
-    body["parallel_tool_calls"] = json!(false);
+    // Parallel tool calls stay enabled: suppressing them caps every response
+    // at one tool call, which measurably multiplies model round-trips (each a
+    // full context re-send). Euler still executes batched calls serially, so
+    // permission gating and provenance ordering are unaffected.
+    body["parallel_tool_calls"] = json!(true);
     body["tool_choice"] = json!("auto");
     body["text"] = json!({"verbosity": "low"});
     if !body["reasoning"].is_object() {
@@ -206,7 +210,7 @@ mod tests {
             "reasoning": {"effort": "medium"}
         }));
 
-        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["type"], "response.create");
         assert_eq!(body["reasoning"]["context"], "all_turns");
         assert_eq!(body["reasoning"]["summary"], "auto");
