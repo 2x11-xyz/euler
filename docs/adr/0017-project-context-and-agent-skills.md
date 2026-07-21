@@ -323,15 +323,42 @@ chain, so mismatch fails with a clear remediation. Euler does not silently:
 - rediscover worktree B's instructions inside worktree A's history;
 - switch the live tool root back to an old path without the user's knowledge.
 
-Moving or forking a historical session into another worktree requires a future
+Moving or forking a historical session into another worktree requires an
 explicit operation with new workspace and project-context events. Starting a
-new session is the first-release remediation.
+new session is the interim remediation until the relocation-consent flow lands
+(see amendment below).
 
 This comparison uses a versioned, platform-local digest of the exact
 canonicalized path representation, not a lossy display string. It deliberately
 rejects cross-platform relocation and detects location mismatch rather than
 authenticating filesystem contents. Legacy behavior applies only when both the
 project-context summary and snapshot are absent; mixed shapes fail closed.
+
+**Amendment (2026-07-21, owner decision).** A same-host workspace mismatch no
+longer ends at "start a new session." Beginning with the exposure phase (issue
+#180 phase 3), an interactive resume whose live workspace does not match the
+recorded identity shows a facts-only relocation-consent card (recorded path,
+current path, last-active time) and asks whether to resume here. Euler shows
+the facts and never a guessed reason for the change. An affirmative answer
+relocates the session going forward and is recorded honestly as one
+`project.context.relocated` event; the latest identity in durable sequence then
+governs resume checks, so later resumes at the new path succeed and resumes at
+the old path now mismatch and get the same card. Declining changes nothing.
+Headless resume never prompts and keeps failing closed, with
+`--accept-relocation` as the scripted equivalent of yes, recorded identically
+and never sourced from repository configuration or stored state. Old-root
+approvals never carry over: acceptance establishes a permission epoch that
+invalidates earlier session-scoped grants, project grants reload from the new
+root's two-party intersection, and only workspace-independent durable user rules
+survive. The relocation event also carries the new canonical root in
+`session.start`'s bounded display form, and the latest relocation governs the
+session's projected root (picker, resume checks, the next card) while the
+security digest stays authoritative for identity. Resume still rediscovers
+nothing, so the card also discloses that the session keeps the guidance it
+started with and the new folder's `EULER.md` is not loaded until a fresh
+session. Until phase 3 lands, the hard failure above is the correct interim.
+`docs/contracts/project-context.md` ("Resume relocation and consent") and
+`docs/contracts/events.md` bind the shape.
 
 ### 8. Give independent sessions independent snapshots
 
@@ -603,7 +630,10 @@ Implementation proceeds in independently reviewable vertical slices.
    - user-owned acknowledgment store and pre-session interaction;
    - fresh-session policy, CLI controls, and disclosure;
    - enable the already-filtered root-driver model input across launch,
-     headless, resume, and `/new` composition paths.
+     headless, resume, and `/new` composition paths;
+   - interactive resume relocation consent, the `project.context.relocated`
+     event and identity-supersession folding, and the `--accept-relocation`
+     headless flag (owner decision 2026-07-21).
 4. **`.agents/skills/` vertical slice**
    - bounded deterministic discovery and validation;
    - frozen bodies and compact catalog;
@@ -642,6 +672,12 @@ The implementation is not complete without tests covering:
 - mid-session file mutation and deletion with immutable live behavior;
 - byte-equivalent model project context after resume, including a resume
   attempt from a different current directory or worktree;
+- relocation consent: interactive mismatch showing facts-only content,
+  affirmative acceptance appending `project.context.relocated` and superseding
+  identity so later resumes at the new path succeed and the old path now
+  mismatches, declining leaving state unchanged, headless resume never
+  prompting, `--accept-relocation` recording an identical event, and the flag
+  never sourced from repository configuration or stored state;
 - `skill_read` name-only access, frozen-body behavior, output bounds, and normal
   tool provenance parentage;
 - `allowed-tools` and instruction claims producing no permission delta;
@@ -747,7 +783,9 @@ This feature neither relies on nor changes repository ignore rules.
 - user-global `EULER.md` and `~/.agents/skills/`;
 - `.euler/skills/` and product-native compatibility roots;
 - `AGENTS.md` or `CLAUDE.md` fallback behavior;
-- explicit reload and session relocation/fork semantics;
+- explicit reload and session fork semantics (interactive resume relocation
+  moved to issue #180 phase 3 by the 2026-07-21 owner decision; see decision 7
+  amendment);
 - `/skill:name` user commands;
 - skill installation, registries, and management UX;
 - automatic dependency installation or helper-script execution;

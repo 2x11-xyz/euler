@@ -386,6 +386,44 @@ source and pin for installed extensions, an explicit linked-path marker for
 linked ones — so a released extension and a dev tree are never visually
 interchangeable.
 
+The resume relocation-consent card (project-context contract, "Resume
+relocation and consent") uses this same bordered approval treatment. It ships
+with issue #180 phase 3; until then a same-host workspace mismatch stays a
+plain-language hard failure. Its content is facts only, never a guessed reason
+for the change: the recorded workspace path, the current workspace path, and
+when the session was last active, followed by a plain-language statement that
+resuming here adopts the current folder for this session, that approvals from
+the old folder (project grants and project-context acknowledgments) do not carry
+over, and that the session keeps the project guidance it started with. Its
+choices are resume here or cancel; declining changes nothing. Example copy:
+
+```
+This session last ran in a different folder.
+
+  Recorded folder:  /home/ada/projects/euler
+  Current folder:   /home/ada/projects/euler-fork
+  Last active:      2026-07-19 14:32
+
+Resume here? Resuming adopts the current folder for this session from now on.
+Approvals from the old folder do not carry over: project permission grants and
+project-context acknowledgments belong to a specific folder, so the new folder
+keeps its own, and a future fresh session here asks about this project's
+context again. This session keeps the project guidance it started with; the new
+folder's EULER.md is not loaded until you start a new session.
+
+  [ Resume here ]   [ Cancel ]
+```
+
+Headless resume never shows this card. It fails closed with plain-language
+remediation, for example:
+
+```
+Cannot resume: this session was recorded in /home/ada/projects/euler, but the
+current folder is /home/ada/projects/euler-fork. Re-run from the recorded
+folder, start a new session here, or pass --accept-relocation to move this
+session to the current folder.
+```
+
 `/permissions` offers session-local postures before its advanced
 per-capability controls: **Read only** permits `fs-read`, `provenance-read`,
 and `diagnostics-read`; **Ask every time** puts every capability in `ask`; and
