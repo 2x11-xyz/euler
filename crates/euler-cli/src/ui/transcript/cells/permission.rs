@@ -255,6 +255,87 @@ pub(in crate::ui::transcript) fn render_permission_batch_ask(
     push_bordered_permission_panel(lines, &rows, theme, width);
 }
 
+/// The project-context acknowledgment card (ADR 0017 phase 3). Presented
+/// before the first model request when a fresh interactive `auto` session
+/// finds unacknowledged repository guidance. Same bordered approval treatment
+/// as the permission panels; single-keypress. Plain language throughout, no
+/// digest on the face (the changed-content signal is the headline on a
+/// re-ask).
+pub(crate) struct AcknowledgmentCardView<'a> {
+    /// A short folder label shown faint in the title corner.
+    pub(crate) folder_label: &'a str,
+    /// True when this folder was acknowledged before but its guidance changed.
+    pub(crate) content_changed: bool,
+    /// The accepted `EULER.md` source identities, general to specific.
+    pub(crate) sources: &'a [String],
+    /// How many discovered files were skipped (shown only when non-zero).
+    pub(crate) skipped_count: usize,
+    /// Whether the Load option is highlighted (default: Skip, the safe bias).
+    pub(crate) load_selected: bool,
+}
+
+pub(crate) fn render_acknowledgment_card(
+    view: &AcknowledgmentCardView<'_>,
+    theme: &Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let title = if view.content_changed {
+        "This project's guidance changed. Load it?"
+    } else {
+        "Load this project's guidance?"
+    };
+    let mut rows = vec![
+        PermissionPanelRow::title_with_corner(title, view.folder_label.to_owned()),
+        PermissionPanelRow::body(String::new()),
+    ];
+    if view.content_changed {
+        rows.push(PermissionPanelRow::body(
+            "The EULER.md guidance in this folder changed since you last loaded it.",
+        ));
+    } else {
+        rows.push(PermissionPanelRow::body(
+            "This folder ships an EULER.md with instructions for how Euler should work here.",
+        ));
+    }
+    rows.push(PermissionPanelRow::body(
+        "It's guidance for the model only. It can't grant permissions, run commands, or change \
+         what Euler is allowed to do.",
+    ));
+    rows.push(PermissionPanelRow::body(String::new()));
+    rows.push(PermissionPanelRow::body("Files:"));
+    for source in view.sources {
+        rows.push(PermissionPanelRow::body(format!("  {source}")));
+    }
+    if view.skipped_count > 0 {
+        rows.push(PermissionPanelRow::body(String::new()));
+        let (files, were) = if view.skipped_count == 1 {
+            ("file", "was")
+        } else {
+            ("files", "were")
+        };
+        rows.push(PermissionPanelRow::metadata(format!(
+            "{} {files} here couldn't be read and {were} skipped.",
+            view.skipped_count
+        )));
+    }
+    rows.push(PermissionPanelRow::body(String::new()));
+    let load = "y  Load it (won't ask again unless it changes)";
+    let skip = "n  Skip for now";
+    rows.push(selectable_row(load, view.load_selected));
+    rows.push(selectable_row(skip, !view.load_selected));
+    let mut lines = Vec::new();
+    push_bordered_permission_panel(&mut lines, &rows, theme, width);
+    lines
+}
+
+fn selectable_row(text: &str, selected: bool) -> PermissionPanelRow {
+    if selected {
+        PermissionPanelRow::selected(text)
+    } else {
+        PermissionPanelRow::body(text)
+    }
+}
+
 fn push_bordered_permission_panel(
     lines: &mut Vec<Line<'static>>,
     rows: &[PermissionPanelRow],
@@ -406,4 +487,61 @@ fn consequences_row(
         return None;
     }
     Some(format!("consequences: {}", parts.join(" · ")))
+}
+
+#[cfg(test)]
+mod acknowledgment_card_tests {
+    use super::*;
+    use crate::ui::theme::Theme;
+
+    fn text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn acknowledgment_card_shows_plain_language_and_files() {
+        let sources = vec!["EULER.md".to_owned(), "crates/EULER.md".to_owned()];
+        let view = AcknowledgmentCardView {
+            folder_label: "euler",
+            content_changed: false,
+            sources: &sources,
+            skipped_count: 2,
+            load_selected: false,
+        };
+        let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));
+        assert!(rendered.contains("Load this project's guidance?"));
+        assert!(rendered.contains("guidance for the model only"));
+        assert!(rendered.contains("EULER.md"));
+        assert!(rendered.contains("crates/EULER.md"));
+        assert!(rendered.contains("2 files here couldn't be read"));
+        assert!(rendered.contains("y  Load it"));
+        assert!(rendered.contains("n  Skip"));
+        // No digest or other contract vocabulary on the face (criterion 4).
+        assert!(!rendered.to_lowercase().contains("digest"));
+        assert!(!rendered.contains('\u{2014}'), "no em dashes in card copy");
+    }
+
+    #[test]
+    fn changed_content_leads_with_the_change_headline() {
+        let sources = vec!["EULER.md".to_owned()];
+        let view = AcknowledgmentCardView {
+            folder_label: "euler",
+            content_changed: true,
+            sources: &sources,
+            skipped_count: 0,
+            load_selected: true,
+        };
+        let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));
+        assert!(rendered.contains("This project's guidance changed. Load it?"));
+        assert!(rendered.contains("changed since you last loaded it"));
+    }
 }

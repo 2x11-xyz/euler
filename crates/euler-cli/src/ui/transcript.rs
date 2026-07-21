@@ -27,6 +27,7 @@ use cells::{
     file_change_action_label, file_change_path_label, normalize_tool_run_output,
     tool_output_is_foldable,
 };
+pub(crate) use cells::{render_acknowledgment_card, AcknowledgmentCardView};
 use file_diff::file_diff_is_foldable;
 use line::render_line_oriented_item;
 #[cfg(test)]

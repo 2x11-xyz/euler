@@ -80,12 +80,13 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             live_session.config.extensions_enabled.insert(id.clone());
         }
     }
-    let bootstrap = crate::session_lifecycle::startup_project_context(
+    let resolution = crate::session_lifecycle::resolve_startup_project_context(
         &live_session.config,
         run.auth_file.as_deref(),
         run.project_context,
         false,
     )?;
+    let bootstrap = finalize_project_context_line(resolution, &live_session.config.root)?;
     live_session.config.project_context = Some(bootstrap);
     bind_diagnostics_for_log(&live_session.log_path);
     let providers = ProviderSet::single_named(run.provider_id.clone(), run.provider)
@@ -98,6 +99,97 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     }
     wire_code_swarm(&mut session);
     run_stdin_loop(&mut session, live_session.refresh.as_ref())
+}
+
+/// A short folder label for the acknowledgment card's title corner.
+fn project_context_folder_label(root: &Path) -> String {
+    root.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
+/// Turn a pending acknowledgment into a bootstrap from the user's card answer.
+/// Accept writes the durable acknowledgment; a write failure fails closed
+/// (surface the remediation, run without the guidance this session). Decline
+/// is session-only.
+fn finalize_pending_choice(
+    pending: &euler_core::PendingAcknowledgment,
+    choice: crate::ui::consent_prompt::ConsentChoice,
+) -> euler_core::ProjectContextBootstrap {
+    use crate::ui::consent_prompt::ConsentChoice;
+    match choice {
+        ConsentChoice::Accept => match pending.accept() {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                eprintln!("{error}");
+                pending.decline()
+            }
+        },
+        ConsentChoice::Decline => pending.decline(),
+    }
+}
+
+/// Finalize the project-context resolution for the full TUI: present the
+/// bordered acknowledgment card when a decision is needed.
+fn finalize_project_context_tui(
+    resolution: euler_core::ProjectContextResolution,
+    root: &Path,
+    theme_choice: crate::ui::theme::ThemeChoice,
+) -> Result<euler_core::ProjectContextBootstrap> {
+    use euler_core::ProjectContextResolution as Resolution;
+    match resolution {
+        Resolution::Resolved(bootstrap) => Ok(*bootstrap),
+        Resolution::Budget(error) => Err(anyhow!("{}", error.user_message())),
+        Resolution::NeedsAcknowledgment(pending) => {
+            let label = project_context_folder_label(root);
+            let choice = crate::ui::consent_prompt::prompt_acknowledgment(
+                &label,
+                pending.content_changed(),
+                pending.source_identities(),
+                pending.skipped_count(),
+                theme_choice,
+            )?;
+            Ok(finalize_pending_choice(&pending, choice))
+        }
+    }
+}
+
+/// Finalize for the line-oriented interactive path: a plain stdin prompt with
+/// the same plain-language copy (no bordered card in line mode).
+fn finalize_project_context_line(
+    resolution: euler_core::ProjectContextResolution,
+    root: &Path,
+) -> Result<euler_core::ProjectContextBootstrap> {
+    use crate::ui::consent_prompt::ConsentChoice;
+    use euler_core::ProjectContextResolution as Resolution;
+    match resolution {
+        Resolution::Resolved(bootstrap) => Ok(*bootstrap),
+        Resolution::Budget(error) => Err(anyhow!("{}", error.user_message())),
+        Resolution::NeedsAcknowledgment(pending) => {
+            let label = project_context_folder_label(root);
+            if pending.content_changed() {
+                eprintln!("The project guidance in {label} changed since you last loaded it.");
+            } else {
+                eprintln!(
+                    "{label} ships an EULER.md with instructions for how Euler should work here."
+                );
+            }
+            eprintln!(
+                "It's guidance for the model only. It can't grant permissions or run anything."
+            );
+            eprint!("Load this project's guidance? It won't ask again unless it changes. [y/N] ");
+            let _ = io::stderr().flush();
+            let mut answer = String::new();
+            let choice = if io::stdin().read_line(&mut answer).is_ok()
+                && answer.trim().eq_ignore_ascii_case("y")
+            {
+                ConsentChoice::Accept
+            } else {
+                ConsentChoice::Decline
+            };
+            Ok(finalize_pending_choice(&pending, choice))
+        }
+    }
 }
 
 pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
@@ -120,19 +212,25 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             live_session.config.extensions_enabled.insert(id.clone());
         }
     }
-    let bootstrap = crate::session_lifecycle::startup_project_context(
+    let preference_path = model_preference::default_model_preference_path();
+    let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
+    // Resolve the project-context policy and, when interactive `auto` finds
+    // unacknowledged guidance, present the bordered acknowledgment card BEFORE
+    // the session is constructed: the decision determines the immutable
+    // bootstrap the session records at session.start.
+    let resolution = crate::session_lifecycle::resolve_startup_project_context(
         &live_session.config,
         run.auth_file.as_deref(),
         run.project_context,
         false,
     )?;
+    let bootstrap =
+        finalize_project_context_tui(resolution, &live_session.config.root, theme_choice)?;
     live_session.config.project_context = Some(bootstrap);
     bind_diagnostics_for_log(&live_session.log_path);
     let (decider, channels) = TuiDecider::new();
     let providers = tui_provider_set(run.provider_id.clone(), run.provider, &run.custom_providers)
         .with_model_catalog(run.model_catalog.clone());
-    let preference_path = model_preference::default_model_preference_path();
-    let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
     // v2 Warm Spine: timestamps are opt-in (§5.5); the anchor spine carries
     // the ledger by default.
     let show_timestamp_gutter =
@@ -247,12 +345,13 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
             live_session.config.extensions_enabled.insert(id.clone());
         }
     }
-    let bootstrap = crate::session_lifecycle::startup_project_context(
+    let resolution = crate::session_lifecycle::resolve_startup_project_context(
         &live_session.config,
         exec.run.auth_file.as_deref(),
         exec.run.project_context,
         exec.auto_approve == AutoApproveTier::TrustedLocal,
     )?;
+    let bootstrap = crate::session_lifecycle::finalize_project_context_headless(resolution)?;
     live_session.config.project_context = Some(bootstrap);
     let tier = exec.auto_approve;
     let providers = ProviderSet::single_named(exec.run.provider_id.clone(), exec.run.provider)

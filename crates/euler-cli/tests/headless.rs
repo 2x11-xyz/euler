@@ -10115,6 +10115,13 @@ const PTY_QUIET_INTERVAL: Duration = Duration::from_millis(100);
 
 impl PtyHarness {
     fn spawn_with_args(home: &Path, args: &[&str]) -> Self {
+        Self::spawn_with_args_in_dir(home, None, args)
+    }
+
+    /// Like `spawn_with_args` but runs the process in `workspace` when given,
+    /// so project-context discovery scans a controlled folder rather than the
+    /// test's own CWD.
+    fn spawn_with_args_in_dir(home: &Path, workspace: Option<&Path>, args: &[&str]) -> Self {
         record_recent_catalog_refresh_for_test(home);
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -10127,6 +10134,9 @@ impl PtyHarness {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_euler"));
         cmd.args(args);
         cmd.env("HOME", home.as_os_str());
+        if let Some(workspace) = workspace {
+            cmd.cwd(workspace.as_os_str());
+        }
 
         let child = pty.slave.spawn_command(cmd).expect("spawn euler tui");
         drop(pty.slave);
@@ -11846,4 +11856,129 @@ fn run_euler_with_input_from(
         .write_all(input.as_bytes())
         .expect("write stdin");
     child.wait_with_output().expect("wait for euler")
+}
+
+/// The acknowledgment card (ADR 0017 phase 3) is presented before the session
+/// starts when a fresh interactive `auto` session finds unacknowledged
+/// EULER.md guidance. A single keypress accepts it and writes a durable
+/// acknowledgment under the user home.
+#[test]
+fn tui_pty_acknowledgment_card_accept_loads_and_records() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    std::fs::write(workspace.join("EULER.md"), "Prefer small commits.").expect("euler md");
+
+    let script = write_fixture_script(
+        temp.path(),
+        "ack-card-accept.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "hello"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+
+    assert!(
+        tui.wait_for_screen("Load this project's guidance?"),
+        "acknowledgment card did not render:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        tui.screen_text().contains("EULER.md"),
+        "the card must list the discovered file:\n{}",
+        tui.screen_text()
+    );
+    tui.write("y");
+    assert!(
+        tui.wait_for_screen("/ commands"),
+        "the app did not start after accepting:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let ack_dir = home.join(".euler").join("project-context");
+    let recorded = std::fs::read_dir(&ack_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recorded, 1,
+        "accepting must write one durable acknowledgment"
+    );
+}
+
+/// Skipping the acknowledgment card starts the session without the guidance
+/// and writes no durable record (decline is session-only).
+#[test]
+fn tui_pty_acknowledgment_card_skip_writes_no_record() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    std::fs::write(workspace.join("EULER.md"), "Prefer small commits.").expect("euler md");
+
+    let script = write_fixture_script(
+        temp.path(),
+        "ack-card-skip.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "hello"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args_in_dir(
+        &home,
+        Some(&workspace),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+
+    assert!(
+        tui.wait_for_screen("Load this project's guidance?"),
+        "acknowledgment card did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("n");
+    assert!(
+        tui.wait_for_screen("/ commands"),
+        "the app did not start after skipping:\n{}",
+        tui.screen_text()
+    );
+    tui.quit();
+
+    let ack_dir = home.join(".euler").join("project-context");
+    let recorded = std::fs::read_dir(&ack_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recorded, 0,
+        "skipping must not write a durable acknowledgment"
+    );
 }

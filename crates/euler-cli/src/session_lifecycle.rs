@@ -165,12 +165,12 @@ fn stored_credential_values(auth_file: Option<&std::path::Path>) -> Vec<String> 
 /// preflight itself, and the one unrecoverable case (a workspace root that
 /// cannot be resolved) fails session start honestly, because a session whose
 /// root cannot be resolved cannot enforce any path-keyed rule.
-pub(crate) fn startup_project_context(
+pub(crate) fn resolve_startup_project_context(
     config: &SessionConfig,
     auth_file: Option<&std::path::Path>,
     policy: Option<euler_core::ProjectContextPolicy>,
     trusted_local: bool,
-) -> Result<euler_core::ProjectContextBootstrap> {
+) -> Result<euler_core::ProjectContextResolution> {
     let redactor = euler_core::redaction::SecretRedactor::from_env();
     for value in stored_credential_values(auth_file) {
         redactor.add_value(value);
@@ -188,7 +188,7 @@ pub(crate) fn startup_project_context(
             .unwrap_or(config.compaction_reserve_tokens as u64),
         canvas_budget_bytes: config.auto_compaction.budget_bytes,
     };
-    let resolution = euler_core::ProjectContextBootstrap::resolve(
+    euler_core::ProjectContextBootstrap::resolve(
         &config.root,
         &redactor,
         options,
@@ -197,19 +197,13 @@ pub(crate) fn startup_project_context(
     )
     .map_err(|error| {
         anyhow!("cannot start a session in this folder: {error}; check that the folder exists and is accessible")
-    })?;
-    finalize_project_context(resolution)
+    })
 }
 
-/// Turn a policy resolution into the bootstrap the session boots from.
-///
-/// A budget failure fails honestly before any provider dispatch. An
-/// interactive `auto` session that needs an acknowledgment card currently
-/// resolves unprompted (runs without the guidance), because the interactive
-/// acknowledgment surface lands in a later slice (issue #180); the card will
-/// intercept `NeedsAcknowledgment` in the interactive launch path before this
-/// finalizer is reached.
-fn finalize_project_context(
+/// Finalize a resolution for a run that never prompts (headless `exec`). A
+/// budget failure fails honestly before any provider dispatch. Discoverable
+/// but unacknowledged guidance runs unprompted (fail closed, no exposure).
+pub(crate) fn finalize_project_context_headless(
     resolution: euler_core::ProjectContextResolution,
 ) -> Result<euler_core::ProjectContextBootstrap> {
     match resolution {

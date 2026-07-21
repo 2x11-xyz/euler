@@ -6,6 +6,7 @@ pub mod banner;
 pub mod bottom_surface;
 pub mod commands;
 pub mod composer;
+pub(crate) mod consent_prompt;
 pub mod dirty;
 pub mod event_loop;
 pub(crate) mod external_clipboard;
