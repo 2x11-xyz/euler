@@ -80,10 +80,13 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             live_session.config.extensions_enabled.insert(id.clone());
         }
     }
-    live_session.config.project_context = Some(crate::session_lifecycle::startup_project_context(
-        &live_session.config.root,
+    let bootstrap = crate::session_lifecycle::startup_project_context(
+        &live_session.config,
         run.auth_file.as_deref(),
-    )?);
+        run.project_context,
+        false,
+    )?;
+    live_session.config.project_context = Some(bootstrap);
     bind_diagnostics_for_log(&live_session.log_path);
     let providers = ProviderSet::single_named(run.provider_id.clone(), run.provider)
         .with_model_catalog(run.model_catalog.clone());
@@ -117,10 +120,13 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             live_session.config.extensions_enabled.insert(id.clone());
         }
     }
-    live_session.config.project_context = Some(crate::session_lifecycle::startup_project_context(
-        &live_session.config.root,
+    let bootstrap = crate::session_lifecycle::startup_project_context(
+        &live_session.config,
         run.auth_file.as_deref(),
-    )?);
+        run.project_context,
+        false,
+    )?;
+    live_session.config.project_context = Some(bootstrap);
     bind_diagnostics_for_log(&live_session.log_path);
     let (decider, channels) = TuiDecider::new();
     let providers = tui_provider_set(run.provider_id.clone(), run.provider, &run.custom_providers)
@@ -241,10 +247,13 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
             live_session.config.extensions_enabled.insert(id.clone());
         }
     }
-    live_session.config.project_context = Some(crate::session_lifecycle::startup_project_context(
-        &live_session.config.root,
+    let bootstrap = crate::session_lifecycle::startup_project_context(
+        &live_session.config,
         exec.run.auth_file.as_deref(),
-    )?);
+        exec.run.project_context,
+        exec.auto_approve == AutoApproveTier::TrustedLocal,
+    )?;
+    live_session.config.project_context = Some(bootstrap);
     let tier = exec.auto_approve;
     let providers = ProviderSet::single_named(exec.run.provider_id.clone(), exec.run.provider)
         .with_model_catalog(exec.run.model_catalog.clone());

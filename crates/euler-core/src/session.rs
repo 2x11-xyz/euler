@@ -70,6 +70,14 @@ const CONTEXT_LIMIT_MESSAGE: &str =
 const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
 const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. To create a new file, prefer write_file. For code and text file updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff. Write plain prose without emoji or decorative symbols; the terminal ledger renders a fixed glyph vocabulary only.";
+
+/// The byte length of the fixed Euler instructions the root driver sends. This
+/// is the `fixed_instruction_bytes` term of the project-context admission-time
+/// budget formula, exposed so the admission check can run before a session is
+/// even constructed (project-context contract, "Framing and canvas admission").
+pub fn system_instruction_bytes() -> usize {
+    SYSTEM_INSTRUCTIONS.len()
+}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContextLimitConfig {
     limit_tokens: u64,
@@ -681,11 +689,46 @@ impl<D> Session<D> {
     /// the `/new` operation honestly while keeping the current session
     /// alive; the only error is a workspace root that no longer resolves.
     pub fn prepare_fresh_project_context(&self) -> Result<ProjectContextBootstrap, SessionError> {
-        ProjectContextBootstrap::dormant(&self.config.root, &self.redactor).map_err(|error| {
+        let options = crate::project_context::ProjectContextResolveOptions {
+            // `/new` is always an interactive fresh session under `auto`; it is
+            // never a trusted-local run.
+            policy: crate::project_context::ProjectContextPolicy::Auto,
+            session_kind: self.config.session_kind,
+            trusted_local: false,
+        };
+        let budget = crate::project_context::AdmissionBudget {
+            fixed_instruction_bytes: system_instruction_bytes(),
+            context_limit_tokens: self.config.context_limit.map(|limit| limit.limit_tokens()),
+            output_reserve_tokens: self
+                .config
+                .max_output_tokens
+                .unwrap_or(self.config.compaction_reserve_tokens as u64),
+            canvas_budget_bytes: self.config.auto_compaction.budget_bytes,
+        };
+        let resolution = ProjectContextBootstrap::resolve(
+            &self.config.root,
+            &self.redactor,
+            options,
+            self.config.project_grant_consent_dir.as_deref(),
+            budget,
+        )
+        .map_err(|error| {
             SessionError::ProjectContextInvalid(format!(
                 "cannot start a new session here: {error}; check that the folder still exists"
             ))
-        })
+        })?;
+        match resolution {
+            crate::project_context::ProjectContextResolution::Resolved(bootstrap) => Ok(*bootstrap),
+            crate::project_context::ProjectContextResolution::Budget(error) => {
+                Err(SessionError::ProjectContextInvalid(error.user_message()))
+            }
+            // The interactive acknowledgment card lands in a later slice
+            // (issue #180); until then `/new` with unacknowledged guidance
+            // runs unprompted (without it), fail closed.
+            crate::project_context::ProjectContextResolution::NeedsAcknowledgment(pending) => {
+                Ok(pending.unprompted())
+            }
+        }
     }
 
     /// Build the fresh session `/new` composes, with the bootstrap obtained

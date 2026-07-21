@@ -105,10 +105,10 @@ pub use sandbox::{
     SubprocessSandbox,
 };
 pub use session::{
-    fold_model_target, fold_reasoning_effort, AgentReporter, AgentResultSummary, BackgroundAgent,
-    BackgroundAgentPoll, BackgroundAgentReportDrain, ContextLimitConfig, ExtensionExecutionError,
-    ModelTarget, RoundObserverConfig, Session, SessionConfig, SessionError, SteeringQueue,
-    WorkspaceRestoreOutcome,
+    fold_model_target, fold_reasoning_effort, system_instruction_bytes, AgentReporter,
+    AgentResultSummary, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
+    ContextLimitConfig, ExtensionExecutionError, ModelTarget, RoundObserverConfig, Session,
+    SessionConfig, SessionError, SteeringQueue, WorkspaceRestoreOutcome,
 };
 pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};

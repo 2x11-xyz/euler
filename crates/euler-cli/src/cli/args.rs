@@ -196,6 +196,9 @@ pub(crate) struct RawArgs {
     pub(crate) scrub: Option<ScrubArgs>,
     pub(crate) no_tty: bool,
     pub(crate) linefeed_history_insert: Option<bool>,
+    /// Fresh-session project-context exposure policy (`auto|on|off`). Applies
+    /// to interactive and exec launches; resume ignores it.
+    pub(crate) project_context: Option<euler_core::ProjectContextPolicy>,
 }
 
 impl RawArgs {

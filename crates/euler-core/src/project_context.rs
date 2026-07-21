@@ -262,6 +262,17 @@ impl PendingAcknowledgment {
     pub fn decline(&self) -> ProjectContextBootstrap {
         self.preflight.clone().into_bootstrap(Admission::declined())
     }
+
+    /// Resolve to the unacknowledged tombstone without prompting. Used when a
+    /// caller cannot present the card (the interactive acknowledgment surface
+    /// lands in a later slice, issue #180): the session runs without the
+    /// guidance and records that it found context but did not prompt, exactly
+    /// like a headless `auto` run. Fail closed; nothing is admitted.
+    pub fn unprompted(&self) -> ProjectContextBootstrap {
+        self.preflight
+            .clone()
+            .into_bootstrap(Admission::unacknowledged())
+    }
 }
 
 /// The resolved admission decision that turns a preflight into a bootstrap.

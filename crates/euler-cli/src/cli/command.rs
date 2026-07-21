@@ -101,6 +101,9 @@ pub(crate) struct RunArgs {
     pub(crate) observe: ObserveOptions,
     pub(crate) linefeed_history_insert: bool,
     pub(crate) linefeed_history_insert_from_cli: bool,
+    /// Fresh-session project-context policy (`auto|on|off`); `None` uses the
+    /// default (`auto`). Resume never consults it.
+    pub(crate) project_context: Option<euler_core::ProjectContextPolicy>,
 }
 pub(crate) struct ExecArgs {
     pub(crate) run: RunArgs,
@@ -439,6 +442,7 @@ fn build_run_args(
         observe,
         linefeed_history_insert: parsed.linefeed_history_insert.unwrap_or(parsed.tui),
         linefeed_history_insert_from_cli: parsed.linefeed_history_insert.is_some(),
+        project_context: parsed.project_context,
     })
 }
 

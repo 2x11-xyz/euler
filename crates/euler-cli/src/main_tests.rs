@@ -2609,6 +2609,68 @@ fn permission_reviewer_parses_for_run_tui_and_exec() {
 }
 
 #[test]
+fn project_context_policy_parses_for_run_tui_and_exec() {
+    for (args, is_exec, expected) in [
+        (
+            &["run", "--project-context", "on"][..],
+            false,
+            euler_core::ProjectContextPolicy::On,
+        ),
+        (
+            &["tui", "--project-context", "off"][..],
+            false,
+            euler_core::ProjectContextPolicy::Off,
+        ),
+        (
+            &["exec", "--project-context", "auto", "hello"][..],
+            true,
+            euler_core::ProjectContextPolicy::Auto,
+        ),
+    ] {
+        let mut args = args.iter().copied().map(str::to_owned);
+        let parsed = Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse");
+        let run = match parsed.command {
+            Command::Exec(exec) if is_exec => exec.run,
+            Command::Run(run) | Command::Tui(run) if !is_exec => run,
+            _ => panic!("unexpected command shape"),
+        };
+        assert_eq!(run.project_context, Some(expected));
+    }
+    // Default: no flag means the session default (auto) applies downstream.
+    let mut args = ["run"].iter().copied().map(str::to_owned);
+    let parsed = unwrap_run(Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse"));
+    assert_eq!(parsed.project_context, None);
+}
+
+#[test]
+fn project_context_rejects_bad_values_and_duplicates() {
+    for (args, expected) in [
+        (
+            &["run", "--project-context", "sometimes"][..],
+            "--project-context must be one of auto, on, off",
+        ),
+        (
+            &["run", "--project-context"][..],
+            "--project-context requires a value",
+        ),
+        (
+            &["run", "--project-context", "on", "--project-context", "off"][..],
+            "--project-context was provided more than once",
+        ),
+    ] {
+        let mut iter = args.iter().copied().map(str::to_owned);
+        let error = match Args::parse_with_env(&mut iter, EnvArgs::default()) {
+            Ok(_) => panic!("expected args error for {args:?}"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error}"
+        );
+    }
+}
+
+#[test]
 fn permission_reviewer_rejects_bad_values_and_duplicates() {
     for (args, expected) in [
         (

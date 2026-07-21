@@ -16,6 +16,8 @@ const SESSION_OPTIONS: &str = "  \
                              (default: extension-defined; bundled default: 8)
   --permission-reviewer <r>  user or guardian: who reviews permission asks
                              (default: user)
+  --project-context <p>      auto, on, or off: load this project's EULER.md
+                             guidance (default: auto)
   --auth-file <path>         Read credentials from <path>
   --provenance <path>        Write a standalone provenance log to <path>
                              instead of the home session store
