@@ -44,6 +44,6 @@ rather than being backfilled or reused.
 | [0014](0014-linux-workspace-subprocess-sandbox.md) | Linux workspace subprocess sandbox | Accepted 2026-07-14 |
 | [0015](0015-extension-distribution.md) | Extension distribution | Accepted 2026-07-18 |
 | [0016](0016-github-provider-catalog.md) | GitHub provider catalog distribution | Accepted 2026-07-18 |
-| [0017](0017-project-context-and-agent-skills.md) | Repository project context and shareable agent skills | Proposed 2026-07-20 |
+| [0017](0017-project-context-and-agent-skills.md) | Repository project context and shareable agent skills | Accepted 2026-07-21 |
 
 Next number: **0018**.

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-07-20). Not implemented.
+Accepted (2026-07-21; proposed 2026-07-20). Not implemented.
 
 This ADR records the intended architecture. Its normative shape is bound now
 in `docs/contracts/project-context.md`, marked binding shape ahead of
