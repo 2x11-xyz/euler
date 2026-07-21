@@ -392,10 +392,10 @@ with issue #180 phase 3; until then a same-host workspace mismatch stays a
 plain-language hard failure. Its content is facts only, never a guessed reason
 for the change: the recorded workspace path, the current workspace path, and
 when the session was last active, followed by a plain-language statement that
-resuming here adopts the current folder for this session and that approvals
-from the old folder (project grants and project-context acknowledgments) do not
-carry over. Its choices are resume here or cancel; declining changes nothing.
-Example copy:
+resuming here adopts the current folder for this session, that approvals from
+the old folder (project grants and project-context acknowledgments) do not carry
+over, and that the session keeps the project guidance it started with. Its
+choices are resume here or cancel; declining changes nothing. Example copy:
 
 ```
 This session last ran in a different folder.
@@ -408,7 +408,8 @@ Resume here? Resuming adopts the current folder for this session from now on.
 Approvals from the old folder do not carry over: project permission grants and
 project-context acknowledgments belong to a specific folder, so the new folder
 keeps its own, and a future fresh session here asks about this project's
-context again.
+context again. This session keeps the project guidance it started with; the new
+folder's EULER.md is not loaded until you start a new session.
 
   [ Resume here ]   [ Cancel ]
 ```

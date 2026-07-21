@@ -298,7 +298,7 @@ checkout) and must not speculate. The card carries exactly:
 - the current workspace path (where the resume is being attempted);
 - when the session was last active.
 
-The card discloses the consequence in plain language before the choice.
+The card discloses the consequences in plain language before the choice.
 Resuming adopts the current folder for this session going forward, and
 approvals keyed to the old location do not carry over. Project grants and
 project-context acknowledgments are two-party records keyed to a canonical
@@ -306,34 +306,85 @@ workspace root, so the new root has its own records: project grants at the new
 root require the new root's own consent intersection, and the next fresh
 session under the new root re-asks acknowledgment for the new
 (root, candidate digest) pair. Nothing from the old root is copied, widened, or
-assumed.
+assumed. That non-carry-over is enforced by a permission epoch, not by wording
+(see "Permission epoch" below).
+
+The session also keeps the project guidance it started with. Resume performs no
+filesystem discovery, so after relocation the old folder's frozen `EULER.md`
+sources and skills remain in model input while tools operate on the new folder,
+and the new folder's `EULER.md` is not read; only a fresh session under the new
+root discovers and (after acknowledgment) admits the new folder's context. The
+card states this in one line.
+
+Permission epoch. Accepting relocation establishes a permission epoch at the
+relocation event. Session-scoped permission grants recorded before that event
+are invalidated: the resume permission fold ignores session grants that precede
+the governing `project.context.relocated` event, so an earlier `shell-exec` or
+`fs-write` session grant cannot silently authorize an operation in the newly
+adopted folder. Project grants do not transfer; they reload from the new root's
+two-party consent intersection (`docs/contracts/capabilities.md`, "Project
+grants"), which is keyed to the canonical root and is empty for the new root
+until the user approves there. Only durable user rules survive, because they are
+workspace-independent by design (`docs/contracts/capabilities.md`, "User
+rules"). This mechanism, not the card's wording, is what makes the
+no-carry-over line literally true.
 
 Affirmative acceptance appends one explicit `project.context.relocated` event
-(durable, versioned) and then proceeds with the resume. Declining changes
-nothing (no event, no identity change) and the resume does not proceed; the
-session remains exactly as it was, resumable at its recorded location.
+and then proceeds with the resume. Declining changes nothing (no event, no
+identity change, no epoch) and the resume does not proceed; the session remains
+exactly as it was, resumable at its recorded location.
 
-The `project.context.relocated` payload carries at least:
+The event's canonical payload is:
 
-- the prior workspace identity payload (algorithm, platform version, digest);
-- the new workspace identity payload (algorithm, platform version, digest),
-  computed from the current canonicalized `SessionConfig.root` exactly as a
-  fresh snapshot computes it;
-- the accepted-at position, so the event's place in durable sequence is
-  unambiguous and later folding is deterministic;
-- schema version.
+- `schema_version` (integer).
+- `prior_identity`: `{ algorithm, version, digest }`, the workspace identity
+  folded at the accepted event prefix (the identity governing immediately
+  before this event).
+- `new_identity`: `{ algorithm, version, digest }`, the identity of the live
+  canonical root at decision time, computed exactly as a fresh snapshot computes
+  it from the canonicalized `SessionConfig.root`.
+- `new_root`: the new canonical workspace root in the same bounded, normalized,
+  lossy display form `session.start` records for its `root`. This field is
+  display and projection metadata only, never identity authority; identity
+  comparison uses `new_identity`. It exists because the identity digests are
+  irreversible, so without a recorded display path Euler could not render the
+  recorded path on a later relocation card or in the session picker.
+- `decided_at`: an audit wall-clock stamp of acceptance, audit metadata only.
+  It never orders events or establishes authority; the event's durable append
+  position and parentage are the causal facts.
 
-The event embeds no absolute path strings (the identity payloads are digests,
-deliberately non-portable), no repository content, and no guessed reason. The
-original snapshot and every prior event are never rewritten.
+The event embeds no repository content and no guessed reason, and the original
+snapshot and every prior event are never rewritten.
 
-Identity supersession: the latest workspace identity in durable sequence
-governs future resume checks. After a relocation event, resume compares the
-live root against the new identity; later resumes at the new path succeed
-without re-asking, and a resume back at the old path is itself a mismatch and
-gets the same card. Successive relocations chain the same way, each appending
-its own event, and the most recent one wins. A malformed or unsupported
-relocation event rejects resume rather than falling back to an older identity.
+Parentage and durability. The event parents the accepted tail event the resume
+folded to (the same event a first continued turn attaches to). It is an in-chain
+durable event, not a log-leaf: it persists (append and any blob) before any
+resumed activity proceeds, and it becomes the frontier the first continued turn
+and the emitted `session.resumed` attach to. Append or blob failure is fatal and
+cannot fall through to a provider call, exactly as the bootstrap sequence
+requires.
+
+Validation (any breach fails closed and rejects the resume): `prior_identity`
+MUST equal the identity folded at the accepted prefix; `new_identity` MUST equal
+the live canonical root's identity at decision time; `new_root` MUST re-derive
+to `new_identity` under the identity algorithm; and a relocation whose
+`prior_identity` does not match the current governing identity (a stale fold or
+a branched acceptance) is rejected and never supersedes.
+`docs/contracts/events.md` carries the same field, parentage, and validation
+rules for the event kind.
+
+Identity and projection supersession: the latest `project.context.relocated` in
+durable sequence governs both the identity used for resume comparison and the
+projected workspace root. Its `new_identity` becomes the identity later resumes
+compare the live root against, and its `new_root` governs the projected root
+everywhere the first `session.start` root is used today (session listing and
+picker, current-directory grouping, resume checks, and the recorded path the
+next relocation card renders). After a relocation event, later resumes at the
+new path succeed without re-asking, and a resume back at the old path is itself
+a mismatch and gets the same card. Successive relocations chain the same way,
+each appending its own event, and the most recent one wins. A malformed or
+unsupported relocation event rejects resume rather than falling back to an older
+identity or root.
 
 Headless resume never prompts. Without the explicit flag it keeps failing
 closed with the plain-language remediation. `--accept-relocation` supplied by

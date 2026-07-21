@@ -347,11 +347,18 @@ the old path now mismatch and get the same card. Declining changes nothing.
 Headless resume never prompts and keeps failing closed, with
 `--accept-relocation` as the scripted equivalent of yes, recorded identically
 and never sourced from repository configuration or stored state. Old-root
-approvals never carry over: project grants and project-context acknowledgments
-stay keyed to their workspace root, so the new root uses its own two-party
-records. Until phase 3 lands, the hard failure above is the correct interim.
-`docs/contracts/project-context.md` ("Resume relocation and consent") binds the
-shape.
+approvals never carry over: acceptance establishes a permission epoch that
+invalidates earlier session-scoped grants, project grants reload from the new
+root's two-party intersection, and only workspace-independent durable user rules
+survive. The relocation event also carries the new canonical root in
+`session.start`'s bounded display form, and the latest relocation governs the
+session's projected root (picker, resume checks, the next card) while the
+security digest stays authoritative for identity. Resume still rediscovers
+nothing, so the card also discloses that the session keeps the guidance it
+started with and the new folder's `EULER.md` is not loaded until a fresh
+session. Until phase 3 lands, the hard failure above is the correct interim.
+`docs/contracts/project-context.md` ("Resume relocation and consent") and
+`docs/contracts/events.md` bind the shape.
 
 ### 8. Give independent sessions independent snapshots
 

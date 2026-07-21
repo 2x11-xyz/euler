@@ -49,6 +49,9 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `model.effort.changed`
 - `context.limit`
 - `context.slot.updated`
+- `project.context.snapshot`
+- `project.context.diagnostic`
+- `project.context.relocated`
 - `canvas.snapshot`
 - `canvas.policy.changed`
 - `canvas.swap`
@@ -268,6 +271,44 @@ envelope `v` per `docs/contracts/persistence.md`.
   grammar, and `content` is UTF-8 text capped at 4096 bytes. Control characters
   other than newline are rejected. Empty `content` deletes the slot. Slot
   payloads are below the blob externalization threshold and remain inline.
+- `project.context.snapshot`, `project.context.diagnostic`,
+  `project.context.relocated`: the project-context event family, bound ahead of
+  implementation in `docs/contracts/project-context.md` (issue #180) and marked
+  binding shape there, not implemented today. That contract is the field
+  authority for `project.context.snapshot` (load policy and resolution reason,
+  acknowledgment basis, portable candidate digest, local workspace identity,
+  deterministic ordering, diagnostic counts, admitted `EULER.md` sources and
+  skills, schema version) and `project.context.diagnostic` (stable reason code,
+  bounded normalized relative identity when one exists, non-content numeric
+  metadata). `project.context.relocated` records an accepted resume relocation
+  and carries:
+  - `schema_version`: integer.
+  - `prior_identity`: `{ "algorithm": <string>, "version": <int>,
+    "digest": <hex string> }`, the workspace identity folded at the accepted
+    event prefix.
+  - `new_identity`: same shape, the identity of the live canonical root at
+    decision time, computed as a fresh snapshot computes it.
+  - `new_root`: normalized lossy path string in the same bounded display form
+    as `session.start` `root`; display and projection metadata only, never
+    identity authority (identity comparison uses `new_identity`).
+  - `decided_at`: audit wall-clock stamp of acceptance; audit metadata only,
+    never ordering or authority (append position and parentage are the causal
+    facts).
+  Parentage: it parents the accepted tail event the resume folded to (the same
+  event a first continued turn attaches to) and is an in-chain durable event,
+  not a log-leaf, so the continued turn and the emitted `session.resumed`
+  attach to it. Validation (any breach fails closed and rejects the resume):
+  `prior_identity` MUST equal the identity folded at the accepted prefix;
+  `new_identity` MUST equal the live canonical root's identity at decision time;
+  `new_root` MUST re-derive to `new_identity` under the identity algorithm; a
+  relocation whose `prior_identity` does not match the current governing
+  identity (stale or branched acceptance) is rejected and never supersedes; and
+  the event MUST persist durably before any resumed activity proceeds.
+  Projection: the latest `project.context.relocated` `new_root` in durable
+  sequence governs the session's projected root everywhere the first
+  `session.start` `root` is used (listing and picker, current-directory
+  grouping, resume checks, and the recorded path a later relocation card
+  renders), and its `new_identity` governs resume comparison.
 - `session.start`: `provider`, `model`, optional `root`. `root` is only a
   filesystem path string derived from `SessionConfig.root`; it is not an
   arbitrary JSON object or workflow identity token. To emit or compare it,
@@ -486,6 +527,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   event the first continued turn parents off). It is a sibling LEAF of that
   continuation, never its parent — so a resumed lifetime's causal chain is
   identical to an uninterrupted run.
+- `project.context.relocated` parents the accepted tail event the resume folded
+  to. Unlike `session.resumed` it is an in-chain durable event, not a leaf: it
+  must persist before any resumed activity, and it becomes the frontier the
+  first continued turn and the emitted `session.resumed` attach to.
 - `extension.artifact` parents the previous persisted event at append time.
   Source attribution belongs in `source_event_ids`; those ids do not choose the
   artifact event's parent.
