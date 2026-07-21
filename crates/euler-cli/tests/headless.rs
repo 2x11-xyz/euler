@@ -50,19 +50,23 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
 
     let jsonl = fs::read_to_string(&log).expect("read jsonl");
     let lines: Vec<&str> = jsonl.lines().collect();
-    assert_eq!(lines.len(), 6);
+    assert_eq!(lines.len(), 7);
     assert!(lines[0].contains("\"kind\":\"session.start\""));
-    assert!(lines[1].contains("\"kind\":\"user.message\""));
-    assert!(lines[2].contains("\"kind\":\"canvas.snapshot\""));
-    assert!(lines[3].contains("\"kind\":\"model.call\""));
-    assert!(lines[4].contains("\"kind\":\"model.result\""));
-    assert!(lines[5].contains("\"kind\":\"assistant.message\""));
+    // Dormant project-context bootstrap (ADR 0017): one disabled snapshot,
+    // no diagnostics in an empty temp workspace, and no source bodies.
+    assert!(lines[1].contains("\"kind\":\"project.context.snapshot\""));
+    assert!(lines[1].contains("\"status\":\"disabled\""));
+    assert!(lines[2].contains("\"kind\":\"user.message\""));
+    assert!(lines[3].contains("\"kind\":\"canvas.snapshot\""));
+    assert!(lines[4].contains("\"kind\":\"model.call\""));
+    assert!(lines[5].contains("\"kind\":\"model.result\""));
+    assert!(lines[6].contains("\"kind\":\"assistant.message\""));
 
-    assert!(lines[1].contains("\"content\":\"hello skeleton\""));
-    assert!(lines[3].contains("\"provider\":\"fixture\""));
-    assert!(lines[3].contains("\"model\":\"echo\""));
-    assert!(lines[4].contains("\"content\":\"user: hello skeleton\""));
+    assert!(lines[2].contains("\"content\":\"hello skeleton\""));
+    assert!(lines[4].contains("\"provider\":\"fixture\""));
+    assert!(lines[4].contains("\"model\":\"echo\""));
     assert!(lines[5].contains("\"content\":\"user: hello skeleton\""));
+    assert!(lines[6].contains("\"content\":\"user: hello skeleton\""));
 }
 
 #[test]
@@ -1044,7 +1048,7 @@ fn fixture_loop_without_provenance_writes_home_session_store() {
 
     let log = sessions.join(session_id).join("events.jsonl");
     let events = read_jsonl(&log);
-    assert_eq!(events.len(), 6);
+    assert_eq!(events.len(), 7);
     assert!(events.iter().all(|event| event.session == session_id));
     assert_eq!(events[0].kind.as_str(), EventKind::SESSION_START);
     assert!(sessions.join(session_id).join("session.json").is_file());
@@ -1420,7 +1424,7 @@ fn headless_edit_file_persists_metadata_only_file_change_event() {
     let file_change_json = file_change.to_json_line().expect("serialize file.change");
     assert!(!file_change_json.contains("hello"));
 
-    let resumed = run_euler_with_input(exe, &["--resume", path_str(&log)], "");
+    let resumed = run_euler_with_input_from(exe, &["--resume", path_str(&log)], "", root.path());
     assert!(
         resumed.status.success(),
         "resume stderr: {}",
@@ -1558,7 +1562,7 @@ fn headless_write_file_persists_metadata_only_file_change_event() {
     let file_change_json = file_change.to_json_line().expect("serialize file.change");
     assert!(!file_change_json.contains("hello"));
 
-    let resumed = run_euler_with_input(exe, &["--resume", path_str(&log)], "");
+    let resumed = run_euler_with_input_from(exe, &["--resume", path_str(&log)], "", root.path());
     assert!(
         resumed.status.success(),
         "resume stderr: {}",
@@ -1687,7 +1691,7 @@ fn headless_direct_apply_patch_persists_metadata_only_file_change_event() {
     assert!(!file_change_json.contains("hello"));
     assert!(!file_change_json.contains("*** Begin Patch"));
 
-    let resumed = run_euler_with_input(exe, &["--resume", path_str(&log)], "");
+    let resumed = run_euler_with_input_from(exe, &["--resume", path_str(&log)], "", root.path());
     assert!(
         resumed.status.success(),
         "resume stderr: {}",
@@ -1817,7 +1821,7 @@ fn headless_apply_patch_shell_intercept_persists_metadata_only_file_change_event
     assert!(!file_change_json.contains("hello"));
     assert!(!file_change_json.contains("*** Begin Patch"));
 
-    let resumed = run_euler_with_input(exe, &["--resume", path_str(&log)], "");
+    let resumed = run_euler_with_input_from(exe, &["--resume", path_str(&log)], "", root.path());
     assert!(
         resumed.status.success(),
         "resume stderr: {}",
@@ -7482,14 +7486,26 @@ fn resume_then_next_turn_matches_uninterrupted_transcript_projection() {
     let uninterrupted_log = temp.path().join("uninterrupted.jsonl");
     let exe = env!("CARGO_BIN_EXE_euler");
 
-    let first = run_euler_with_input(exe, &["--provenance", path_str(&resumed_log)], "alpha\n");
+    // One shared workspace for create and resume: sessions resume only from
+    // the folder they were recorded in (ADR 0017).
+    let first = run_euler_with_input_from(
+        exe,
+        &["--provenance", path_str(&resumed_log)],
+        "alpha\n",
+        temp.path(),
+    );
     assert!(first.status.success());
 
-    let resumed = run_euler_with_input(exe, &["--resume", path_str(&resumed_log)], "beta\n");
+    let resumed = run_euler_with_input_from(
+        exe,
+        &["--resume", path_str(&resumed_log)],
+        "beta\n",
+        temp.path(),
+    );
     assert!(resumed.status.success());
     let stderr = String::from_utf8_lossy(&resumed.stderr);
     assert!(stderr.contains("resumed session headless-session"));
-    assert!(stderr.contains("folded 6 events"));
+    assert!(stderr.contains("folded 7 events"));
     assert!(stderr.contains("target fixture/echo"));
     assert!(stderr.contains("recovery closure not appended"));
 
@@ -9660,7 +9676,7 @@ fn tui_pty_without_provenance_writes_home_session_store() {
 
     let session_id = only_home_session_id(home.path());
     let events = read_jsonl(&home_session_log(home.path(), &session_id));
-    assert_eq!(events.len(), 6);
+    assert_eq!(events.len(), 7);
     assert!(events.iter().all(|event| event.session == session_id));
 }
 
@@ -10719,6 +10735,13 @@ fn record_recent_catalog_refresh_for_test(home: &Path) {
 fn command_with_home(exe: &str, home: &tempfile::TempDir) -> Command {
     let mut command = Command::new(exe);
     command.env("HOME", home.path());
+    // Pin the working directory to the isolated home. Sessions record their
+    // workspace and resume only from it (ADR 0017 same-workspace resume),
+    // and portable-pty defaults a spawned TUI's cwd to $HOME — one shared
+    // default keeps create/resume pairs in the same workspace and keeps
+    // project-context preflight away from the real checkout. Tests that
+    // need a specific workspace override this with `.current_dir(...)`.
+    command.current_dir(home.path());
     command
 }
 
@@ -11796,4 +11819,31 @@ fn copy_directory(source: &Path, destination: &Path) {
             fs::copy(entry.path(), target).expect("copy SDK file");
         }
     }
+}
+
+/// Like [`run_euler_with_input`], but from an explicit working directory —
+/// resumes must run in the workspace the session was recorded in (ADR 0017
+/// same-workspace resume).
+fn run_euler_with_input_from(
+    exe: &str,
+    args: &[&str],
+    input: &str,
+    cwd: &Path,
+) -> std::process::Output {
+    let home = isolated_home();
+    let mut child = command_with_home(exe, &home)
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for euler")
 }
