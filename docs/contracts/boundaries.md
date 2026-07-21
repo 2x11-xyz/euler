@@ -43,7 +43,7 @@ A native or transitional exception to this contract must document:
 - why the extension boundary is insufficient,
 - exit criteria.
 
-Bundled first-party extensions are not privileged core behavior. They use the
+First-party extensions are not privileged core behavior. They use the
 same SDK surface, remain removable, and prove the SDK works.
 
 ## Failure Isolation
@@ -62,7 +62,7 @@ remain intact.
 ## Prompt Budget
 
 Always-on instruction text is a product constraint, like the LOC budget but
-for context. Core tools and bundled extensions prefer compact names, schemas,
+for context. Core tools and first-party extensions prefer compact names, schemas,
 and defaults over long prompt fragments. If a feature needs extensive
 instructions to be usable, improve the interface before adding more prompt.
 Detail belongs in on-demand help, tool descriptions, and extension context

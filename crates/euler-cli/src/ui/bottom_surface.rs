@@ -1,8 +1,7 @@
 use super::commands::{
-    dispatch_command, filter_palette_entries, CausalDagStats, CheckpointItem, CommandAction,
-    CommandContext, CommandEffect, CompactionSettings, EffortChoice, ExtensionManagerItem,
-    ModelChoice, PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec, ResumeItem,
-    ThemeChoiceItem,
+    dispatch_command, filter_palette_entries, CheckpointItem, CommandAction, CommandContext,
+    CommandEffect, CompactionSettings, EffortChoice, ExtensionManagerItem, ModelChoice,
+    PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec, ResumeItem, ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
 use super::search::TranscriptSearch;
@@ -282,27 +281,13 @@ impl BottomSurface {
             return false;
         }
         let saved_draft = picker.saved_draft.clone();
-        if picker.kind == PickerKind::CausalDagFormats {
-            let Some(stats) = picker.causal_dag_stats.clone() else {
-                return false;
-            };
-            self.open_picker_from_spec(PickerSpec::CausalDagActions(stats), saved_draft);
-            return true;
-        }
-        if !matches!(
-            picker.kind,
-            PickerKind::CodeSwarmModels | PickerKind::CausalDagActions
-        ) {
+        if picker.kind != PickerKind::CodeSwarmModels {
             return false;
         }
         self.composer = saved_draft.clone();
         let entries = filter_palette_entries("/", &self.context);
         self.owner = BottomOwner::Palette(CommandPalette::new(saved_draft, entries));
         true
-    }
-
-    pub fn set_causal_dag_stats(&mut self, stats: Option<CausalDagStats>) {
-        self.context.causal_dag_stats = stats;
     }
 
     /// Handle manager-only keys: space toggle, a add, x remove. Enter uses confirm.
@@ -335,11 +320,6 @@ impl BottomSurface {
                 Some(SurfaceEvent::None)
             }
             'x' | 'X' => {
-                if item.bundled {
-                    return Some(SurfaceEvent::Message(
-                        "bundled extensions can be toggled but not removed".to_owned(),
-                    ));
-                }
                 self.owner = BottomOwner::ConfirmPrompt(ConfirmPrompt {
                     message: format!("remove extension {}?  Enter confirm  Esc cancel", item.id),
                     action: CommandAction::ExtensionRemove { id: item.id },
@@ -647,12 +627,6 @@ impl BottomSurface {
                     SurfaceEvent::None
                 }
             };
-        }
-        if let Some(CommandAction::OpenCausalDagExport { stats }) = picker.selected_action() {
-            let stats = stats.clone();
-            let saved_draft = picker.saved_draft.clone();
-            self.open_picker_from_spec(PickerSpec::CausalDagFormats(stats), saved_draft);
-            return SurfaceEvent::None;
         }
         match picker.selected_action() {
             Some(action) => self.apply_action(action.clone()),

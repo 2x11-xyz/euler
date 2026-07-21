@@ -1,4 +1,3 @@
-use crate::bundled_extensions::{bundled_descriptor_by_id, bundled_extension_by_id};
 use crate::cli::RawArgs;
 use crate::offline_extension_runner::{execute_offline_extension_run, OfflineExtensionRun};
 use anyhow::{anyhow, Result};
@@ -164,18 +163,19 @@ pub(super) fn run_session_export(export: ProvenanceExportArgs) -> Result<()> {
 }
 
 pub(super) fn execute_session_export(export: ProvenanceExportArgs) -> Result<serde_json::Value> {
-    let descriptor = bundled_descriptor_by_id("session-export")?
-        .ok_or_else(|| anyhow!("unknown extension id: session-export"))?;
-    let command = descriptor
-        .command(COMMAND_NAME)
-        .ok_or_else(|| anyhow!("unknown command for extension session-export: {COMMAND_NAME}"))?;
-    let bundled = bundled_extension_by_id("session-export")
-        .ok_or_else(|| anyhow!("unknown extension id: session-export"))?;
+    let Some((extension, command)) =
+        crate::extension_cli::resolve_live_linked_process_command("session-export", COMMAND_NAME)?
+    else {
+        return Err(anyhow!(
+            "session-export needs the session-export extension: install or link it from the \
+             euler-extensions repository, then run `euler extension enable session-export`"
+        ));
+    };
     let input = export.input();
     execute_offline_extension_run(OfflineExtensionRun {
         extension_id: "session-export",
-        command,
-        extension: bundled.extension,
+        command: &command,
+        extension: &extension,
         target: export.target,
         input,
     })

@@ -229,8 +229,8 @@ impl ExtensionRegistry {
         Ok(self.read_link_inventory()?.into_values().collect())
     }
     /// Return the explicit launch consent for a linked package. This is kept
-    /// separate from bundled-extension enablement because local package
-    /// activation must never affect project/session bundled selection.
+    /// separate from the general enablement log because local package
+    /// activation must never affect project/session extension selection.
     pub fn linked_execution_enabled(
         &self,
         id: &str,

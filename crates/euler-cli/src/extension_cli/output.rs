@@ -1,5 +1,4 @@
 use super::ExtensionSearchArgs;
-use crate::bundled_extensions::BundledDescriptor;
 use euler_core::{ExtensionMaterialization, LinkedExtension, LinkedExtensionStatus};
 use euler_sdk::{LoadedExtensionPackage, ManagedProcessEntrypoint, StaticCommandDescriptor};
 use serde::Serialize;
@@ -215,43 +214,6 @@ struct SearchCommand {
     required_capabilities: Vec<String>,
 }
 
-pub(super) fn search_result_for_bundled(
-    descriptor: &BundledDescriptor,
-    status: &str,
-) -> SearchResult {
-    SearchResult {
-        order: descriptor.table_index,
-        id: descriptor.id.to_owned(),
-        display_name: descriptor.display_name.to_owned(),
-        version: descriptor.version.to_owned(),
-        source_kind: "bundled".to_owned(),
-        runtime_kind: descriptor.runtime_kind.to_owned(),
-        status: status.to_owned(),
-        execution_granted: status == "enabled",
-        requires_review: false,
-        requires_execution_grant: false,
-        capabilities: descriptor
-            .capabilities
-            .iter()
-            .map(|capability| capability.as_str().to_owned())
-            .collect(),
-        commands: descriptor
-            .commands
-            .iter()
-            .map(|command| SearchCommand {
-                name: command.name.to_owned(),
-                display_name: command.display_name.to_owned(),
-                summary: command.summary.to_owned(),
-                required_capabilities: command
-                    .required_capabilities
-                    .iter()
-                    .map(|capability| capability.as_str().to_owned())
-                    .collect(),
-            })
-            .collect(),
-    }
-}
-
 pub(super) fn search_result_for_linked(
     linked: &LinkedExtension,
     execution_enabled: bool,
@@ -364,9 +326,8 @@ fn contains_ascii_case_insensitive(haystack: &str, folded_needle: &str) -> bool 
 
 fn source_rank(source_kind: &str) -> u8 {
     match source_kind {
-        "bundled" => 0,
-        "installed" => 1,
-        "linked" => 2,
-        _ => 3,
+        "installed" => 0,
+        "linked" => 1,
+        _ => 2,
     }
 }

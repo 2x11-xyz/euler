@@ -11,8 +11,8 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use super::scrub::ScrubArgs;
-use crate::bundled_extensions::ObserveOptions;
 use crate::extension_cli::ExtensionArgs;
+use crate::extension_cli::ObserveOptions;
 use crate::extension_enablement::ExtensionSelection;
 use crate::session_export::RawProvenanceExportArgs;
 use crate::subagent::AutoApproveTier;

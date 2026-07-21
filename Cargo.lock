@@ -466,12 +466,6 @@ dependencies = [
  "diffy",
  "euler-core",
  "euler-event",
- "euler-extension-autoresearch",
- "euler-extension-causal-dag",
- "euler-extension-code-swarm",
- "euler-extension-diagnostics-report",
- "euler-extension-maxproof",
- "euler-extension-session-export",
  "euler-managed-process",
  "euler-provider",
  "euler-sdk",
@@ -521,72 +515,6 @@ dependencies = [
  "serde",
  "serde_json",
  "ulid",
-]
-
-[[package]]
-name = "euler-extension-autoresearch"
-version = "0.1.2"
-dependencies = [
- "euler-agents",
- "euler-event",
- "euler-sdk",
- "serde_json",
-]
-
-[[package]]
-name = "euler-extension-causal-dag"
-version = "0.1.2"
-dependencies = [
- "euler-agents",
- "euler-core",
- "euler-event",
- "euler-provider",
- "euler-sdk",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "euler-extension-code-swarm"
-version = "0.1.2"
-dependencies = [
- "euler-sdk",
- "serde_json",
-]
-
-[[package]]
-name = "euler-extension-diagnostics-report"
-version = "0.1.2"
-dependencies = [
- "euler-sdk",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "euler-extension-maxproof"
-version = "0.1.2"
-dependencies = [
- "euler-event",
- "euler-sdk",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "euler-extension-session-export"
-version = "0.1.2"
-dependencies = [
- "euler-core",
- "euler-event",
- "euler-sdk",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

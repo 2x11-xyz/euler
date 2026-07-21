@@ -200,7 +200,7 @@ round data for the session thread to record.
 
 ## CodeSwarm review: persisted config and the review gate tool
 
-CodeSwarm review is one orchestration (the bundled `code-swarm` extension's
+CodeSwarm review is one orchestration (the `code-swarm` extension's
 `review` command, fanning out through `spawn_agents`) with exactly **one**
 entry point: the model-facing `code_swarm_review` tool.
 

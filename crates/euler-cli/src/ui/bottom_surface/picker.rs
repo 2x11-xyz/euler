@@ -1,11 +1,5 @@
 use super::*;
 
-mod causal_dag;
-use self::causal_dag::{
-    action_items as causal_dag_action_items, format_items as causal_dag_format_items,
-    short_session_id as short_causal_session_id,
-};
-
 impl BottomSurface {
     /// Space in the `/code-swarm` checklist toggles the selected row.
     /// Checking beyond the cap is refused (the row stays visible and dim in
@@ -64,7 +58,6 @@ pub struct ReplacementPicker {
     resume_preview: Option<Vec<String>>,
     /// `/code-swarm --user`: route the checklist save to the user tier.
     pub(super) code_swarm_user_tier: bool,
-    pub(super) causal_dag_stats: Option<CausalDagStats>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,8 +67,6 @@ pub(super) enum PickerKind {
     Resume,
     Extensions,
     CodeSwarmModels,
-    CausalDagActions,
-    CausalDagFormats,
     Compaction,
     /// §5.1 Advanced, one level down from the posture picker.
     PermissionsAdvanced,
@@ -148,10 +139,7 @@ impl ReplacementPicker {
                 matches!(item.action, CommandAction::SetPermissionPosture { .. }).then_some(dot)
             }
             PickerKind::Generic => self.items.iter().any(|item| item.current).then_some(dot),
-            PickerKind::Resume
-            | PickerKind::CausalDagActions
-            | PickerKind::CausalDagFormats
-            | PickerKind::PermissionsAdvanced => None,
+            PickerKind::Resume | PickerKind::PermissionsAdvanced => None,
         }
     }
 
@@ -233,12 +221,6 @@ impl ReplacementPicker {
                 footer: "↑↓ move · ⏎ resume · ctrl+o preview · esc cancel".to_owned(),
                 empty: "no matches",
             },
-            PickerKind::CausalDagFormats => PickerChrome {
-                title: self.title.clone(),
-                params: Vec::new(),
-                footer: "↑↓ move · ⏎ export · ⌫ back · esc cancel".to_owned(),
-                empty: "no matches",
-            },
             // §5.1: the posture picker's title carries the current state, so
             // the boundary in force is legible without reading every row.
             // "Current: custom" is the honest label for modes tuned under
@@ -258,7 +240,7 @@ impl ReplacementPicker {
                 footer: "↑↓ move · ⏎ select · ⌫ back · esc cancel".to_owned(),
                 empty: "no matches",
             },
-            PickerKind::CausalDagActions | PickerKind::Generic => PickerChrome {
+            PickerKind::Generic => PickerChrome {
                 title: self.title.clone(),
                 params: Vec::new(),
                 footer: "↑↓ move · ⏎ select · esc cancel".to_owned(),
@@ -463,12 +445,6 @@ impl ReplacementPicker {
                 ..
             }
         );
-        let causal_dag_stats = match &spec {
-            PickerSpec::CausalDagActions(stats) | PickerSpec::CausalDagFormats(stats) => {
-                Some(stats.clone())
-            }
-            _ => None,
-        };
         let (kind, title, items) = picker_parts(spec);
         let mut picker = Self {
             kind,
@@ -481,7 +457,6 @@ impl ReplacementPicker {
             saved_draft,
             resume_preview: None,
             code_swarm_user_tier,
-            causal_dag_stats,
         };
         picker.ensure_selected_visible();
         picker
@@ -558,15 +533,12 @@ impl ReplacementPicker {
         let CommandAction::ExtensionDetails { id } = &item.action else {
             return None;
         };
-        // The row's group column is the extension's kind: "bundled", or the
-        // materialization for a linked package.
-        let bundled = item.group.as_deref() == Some("bundled");
+        // The row's group column is the linked package's materialization.
         Some(ExtensionManagerItem {
             id: id.clone(),
             display_name: item.label.clone(),
             enabled: item.current,
-            bundled,
-            materialization: (!bundled).then(|| item.group.clone()).flatten(),
+            materialization: item.group.clone(),
             version: String::new(),
             commands: Vec::new(),
             capabilities: Vec::new(),
@@ -780,21 +752,6 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             },
             code_swarm_model_items(choices, &selected),
         ),
-        PickerSpec::CausalDagActions(stats) => (
-            PickerKind::CausalDagActions,
-            format!(
-                "CAUSAL DAG · session {} · {} nodes · {} cross-arcs",
-                short_causal_session_id(&stats.session_id),
-                stats.node_count,
-                stats.cross_arc_count
-            ),
-            causal_dag_action_items(stats),
-        ),
-        PickerSpec::CausalDagFormats(stats) => (
-            PickerKind::CausalDagFormats,
-            format!("CAUSAL DAG › EXPORT · {} nodes", stats.node_count),
-            causal_dag_format_items(),
-        ),
         PickerSpec::Compaction(settings) => (
             PickerKind::Compaction,
             "COMPACTION".to_owned(),
@@ -878,22 +835,18 @@ const CODE_SWARM_MAX_MODELS: usize = 5;
 
 /// §4.2: the row is caret + state marker + label + description column, and it
 /// never repeats its own value. `ExtensionManagerItem::label()` predates the
-/// unified picker and bakes all three into one string — `● causal-dag
-/// (bundled)` — so using it here rendered the marker twice (the picker adds
-/// its own), the kind twice (it is also the group header), and the id twice
-/// (it was also the description). The id alone is the label; every other fact
-/// gets exactly one home.
+/// unified picker and baked all three into one string, so using it here
+/// rendered the marker twice (the picker adds its own), the kind twice (it is
+/// also the group header), and the id twice (it was also the description).
+/// The id alone is the label; every other fact gets exactly one home.
 fn extension_manager_items(items: Vec<ExtensionManagerItem>) -> Vec<PickerItem> {
     items
         .into_iter()
         .map(|item| {
-            let kind = if item.bundled {
-                "bundled".to_owned()
-            } else {
-                item.materialization
-                    .clone()
-                    .unwrap_or_else(|| "linked".to_owned())
-            };
+            let kind = item
+                .materialization
+                .clone()
+                .unwrap_or_else(|| "linked".to_owned());
             let id = item.id.clone();
             PickerItem {
                 label: id.clone(),

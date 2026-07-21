@@ -1,8 +1,7 @@
+use crate::extension_cli::resolve_round_observer;
 use crate::{extension_cli, model_preference};
 use anyhow::Result;
 use auth_commands::LogoutArgs;
-use bundled_extensions::{bundled_descriptor_by_id, resolve_round_observer};
-use cli::extension_run::execute_headless_extension_run;
 use cli::permission::CliDecider;
 use cli::providers::{
     load_custom_provider_config, load_known_theme_preference, provider_for_id, resume_provider_set,
@@ -23,7 +22,6 @@ use euler_provider::catalog::{
 };
 use euler_provider::provider_config::ProviderConfigRegistry;
 use euler_provider::ReasoningEffort;
-use extension_enablement::resolve_session_extensions;
 use login::LoginArgs;
 use session_export::{execute_session_export, ProvenanceExportArgs};
 use session_lifecycle::{apply_catalog_context_limit, session_config, LiveProvenance};
@@ -32,8 +30,8 @@ use subagent::{AutoApproveTier, SubagentDecider};
 use theme_catalog::ThemeChoice;
 
 use crate::{
-    auth_commands, bundled_extensions, cli, companion_run, extension_enablement, login,
-    session_export, session_lifecycle, subagent, theme_catalog,
+    auth_commands, cli, companion_run, login, session_export, session_lifecycle, subagent,
+    theme_catalog,
 };
 
 #[path = "main_exec_tests.rs"]

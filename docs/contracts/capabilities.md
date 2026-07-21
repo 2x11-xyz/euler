@@ -378,9 +378,8 @@ Extension event-feed checkpoints are private extension state:
 - `fs-write` permits the host to perform internal directory reads needed for
   safe checkpoint replacement, quota checks, and file-type validation, but it
   does not grant the extension read access to existing checkpoint contents.
-- Bundled extensions that use durable cursors, such as `causal-dag.update`,
-  must declare these capabilities even when they access checkpoints only
-  through host APIs. The authority remains session-private checkpoint state, not
+- Extensions that use durable cursors must declare these capabilities even
+  when they access checkpoints only through host APIs. The authority remains session-private checkpoint state, not
   arbitrary path access.
 
 - Native extension manifests declare the maximum capability envelope for the

@@ -6,8 +6,8 @@ use euler_core::{CompactionTier, PermissionReviewer, ReasoningEffort};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::bundled_extensions::ObserveOptions;
 use crate::extension_cli::ExtensionArgs;
+use crate::extension_cli::ObserveOptions;
 use crate::extension_enablement::ExtensionSelection;
 use crate::session_export::RawProvenanceExportArgs;
 use crate::subagent::AutoApproveTier;

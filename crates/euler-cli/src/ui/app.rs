@@ -38,10 +38,7 @@ use super::visual_canvas::{
     TextRole, VisualBlock, VisualBlockRole, VisualCanvasFrame, VisualCanvasSnapshot,
     VisualCanvasState,
 };
-use crate::bundled_extensions::{
-    bundled_descriptor_by_id, bundled_descriptors, bundled_extension_by_id, resolve_round_observer,
-    ObserveOptions,
-};
+use crate::extension_cli::{resolve_round_observer, ObserveOptions};
 use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection};
 use crate::model_preference;
 use anyhow::{anyhow, Result};
@@ -50,13 +47,12 @@ use euler_core::permissions::{PermissionRequest, PermissionRequestBatch};
 use euler_core::{
     event_is_runtime_only, fold_session, load_extension_package, read_resume_prefix,
     resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, EulerHome,
-    ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
-    ProjectContextBootstrap, ProvenanceWriter, ReasoningEffort, ScopePattern, Session,
-    SessionStore,
+    ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget, ProjectContextBootstrap,
+    ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
-use euler_sdk::{Capability, Extension};
+use euler_sdk::Capability;
 use ratatui::backend::CrosstermBackend;
 #[cfg(test)]
 use ratatui::layout::Rect;
@@ -120,9 +116,9 @@ mod visual;
 use self::visual::ratatui_lines_to_canvas;
 
 use self::support::{
-    causal_dag_stats_from_events, command_context, context_window_tokens_for, detect_git_branch,
-    is_copy_key, merge_effects, read_terminal_event, session_resume_label,
-    session_root_status_path, update_token_usage, CommandContextParts,
+    command_context, context_window_tokens_for, detect_git_branch, is_copy_key, merge_effects,
+    read_terminal_event, session_resume_label, session_root_status_path, update_token_usage,
+    CommandContextParts,
 };
 
 /// Working HUD content, shared by the plain-text and styled render paths
@@ -852,7 +848,6 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         empty_command_context_parts(
             reasoning_effort,
             theme_choice,
-            Some(session_id.clone()),
             CompactionSettings {
                 automatic: session.auto_compaction_policy().automatic,
                 stubs: session.auto_compaction_policy().stubs_enabled(),
@@ -983,7 +978,6 @@ impl AppCore {
             extension_items,
             extension_slash_commands,
             code_swarm_models: self.code_swarm_models.clone(),
-            causal_dag_stats: self.current_causal_dag_stats(),
             compaction: self.current_compaction_settings(),
         };
         self.bottom.reset_context(command_context(
@@ -1005,7 +999,6 @@ impl AppCore {
             extension_items,
             extension_slash_commands,
             code_swarm_models: self.code_swarm_models.clone(),
-            causal_dag_stats: self.current_causal_dag_stats(),
             compaction: self.current_compaction_settings(),
         };
         self.bottom = BottomSurface::new(command_context(
@@ -1064,28 +1057,17 @@ impl AppCore {
         Vec<crate::ui::commands::ExtensionManagerItem>,
         Vec<crate::ui::commands::ExtensionSlashCommand>,
     ) {
-        let session_enabled = match &self.state {
-            AppState::Idle { session } => Some(session.extensions_enabled().clone()),
-            _ => None,
-        };
-        // Registry listing is cached (disk-backed, hot path); the session's
-        // enablement overlay is applied per call. Bundled items take the
-        // session set when one is available — the same rule
-        // `list_extension_manager_items` applies — while linked items keep
-        // their separately persisted launch consent.
-        let mut items = match &self.extension_registry_items {
+        // Registry listing is cached (disk-backed, hot path). Linked items
+        // carry their separately persisted launch consent; there is no
+        // session-enablement overlay to apply.
+        let items = match &self.extension_registry_items {
             Some(items) => items.clone(),
             None => {
-                let items = list_extension_manager_items(None);
+                let items = list_extension_manager_items();
                 self.extension_registry_items = Some(items.clone());
                 items
             }
         };
-        if let Some(enabled) = &session_enabled {
-            for item in items.iter_mut().filter(|item| item.bundled) {
-                item.enabled = enabled.contains(&item.id);
-            }
-        }
         let slash = crate::ui::commands::build_extension_slash_commands(&items);
         (items, slash)
     }
@@ -1094,22 +1076,6 @@ impl AppCore {
     /// `current_extension_context` re-reads the extension registry.
     fn invalidate_extension_registry_items(&mut self) {
         self.extension_registry_items = None;
-    }
-
-    fn current_causal_dag_stats(&self) -> Option<crate::ui::commands::CausalDagStats> {
-        let session_id = self.status.session_id.as_deref()?;
-        match &self.state {
-            AppState::Idle { session } => {
-                Some(causal_dag_stats_from_events(session.events(), session_id))
-            }
-            _ => self.bottom.context().causal_dag_stats.clone().or_else(|| {
-                Some(crate::ui::commands::CausalDagStats {
-                    session_id: session_id.to_owned(),
-                    node_count: 0,
-                    cross_arc_count: 0,
-                })
-            }),
-        }
     }
 
     fn current_reasoning_effort(&self) -> ReasoningEffort {
@@ -2206,11 +2172,6 @@ impl AppCore {
             CommandAction::ToggleTimestamps => self.toggle_timestamps(),
             CommandAction::ShowDiff => self.show_session_diff(),
             CommandAction::ShowUsage => self.show_session_usage(),
-            CommandAction::OpenCausalDagExport { stats } => {
-                self.bottom
-                    .open_picker(crate::ui::commands::PickerSpec::CausalDagFormats(stats));
-                CoreEffect::Render
-            }
             CommandAction::OpenExtensionManager => self.open_extension_manager(),
             CommandAction::ExtensionToggle { id, enable } => self.toggle_extension(id, enable),
             CommandAction::ExtensionDetails { id } => self.show_extension_details(id),
@@ -3022,7 +2983,6 @@ fn resolve_session_store() -> Result<SessionStore> {
 fn empty_command_context_parts(
     current_effort: ReasoningEffort,
     current_theme: ThemeChoice,
-    current_session_id: Option<String>,
     compaction: CompactionSettings,
 ) -> CommandContextParts {
     CommandContextParts {
@@ -3033,13 +2993,6 @@ fn empty_command_context_parts(
         extension_slash_commands: Vec::new(),
         code_swarm_models: Vec::new(),
         compaction,
-        causal_dag_stats: current_session_id.map(|session_id| {
-            crate::ui::commands::CausalDagStats {
-                session_id,
-                node_count: 0,
-                cross_arc_count: 0,
-            }
-        }),
     }
 }
 

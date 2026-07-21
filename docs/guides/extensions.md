@@ -1,12 +1,14 @@
 # Building extensions
 
 This describes the extension surface that is in this tree today. Euler ships
-native Rust extensions compiled into the `euler` binary, and can run explicitly
-enabled, locally linked `managed-process` packages over a versioned JSON-RPC
-stdio contract. Linked commands work through standalone `extension run`, the
-line-oriented live-session `extension_run` control line, and the TUI
-`/extension run` form. Python is the first client SDK for that contract; it is
-not a Python-only runtime mode.
+no extensions of its own: every extension is an explicitly linked or installed
+package, run over a versioned JSON-RPC stdio contract (`managed-process`).
+First-party extensions live in the separate
+[euler-extensions](https://github.com/2x11-xyz/euler-extensions) repository.
+Linked commands work through standalone `extension run`, the line-oriented
+live-session `extension_run` control line, and the TUI `/extension run` form.
+Python is the first client SDK for that contract; it is not a Python-only
+runtime mode.
 
 Managed-process packages may also declare a round observer:
 
@@ -108,8 +110,8 @@ impl ExtensionCommand for HelloCommand {
 }
 ```
 
-For a smallest real extension, read `crates/euler-extension-session-export`.
-It queries provenance and writes a JSON artifact.
+For a smallest real extension, read `extensions/session-export` in the
+euler-extensions repository. It queries provenance and writes a JSON artifact.
 
 ## Managed-process packages
 
@@ -230,29 +232,21 @@ Host calls gate on those capabilities:
 - `update_context_slot` needs `context-slot`; content is capped at 4096 bytes,
   and a session has at most 8 context slots.
 
-Example: `causal-dag.record-observation` declares only
-`provenance-read` and `agent-record`, because it queries the log and records the
-observer audit as agent spawn/result events; it does not write a graph artifact.
+Example: an observation-recording command can declare only `provenance-read`
+and `agent-record`, because it queries the log and records the observer audit
+as agent spawn/result events; it does not write a graph artifact.
 
 ## Discovery, enablement, and running
 
-Bundled native extensions are compiled into the CLI and exposed by descriptor:
+`extension list` shows linked and installed packages; a fresh Euler lists
+nothing. `extension run` accepts `EXTENSION.COMMAND`, then a session id,
+session name, or events path. The extension must be linked and enabled first.
 
-```sh
-euler extension list
-euler extension enable causal-dag
-euler extension disable causal-dag
-euler extension run causal-dag.export ./session.jsonl --limit 128
-```
-
-`extension run` accepts `EXTENSION.COMMAND`, then a session id, session name, or
-events path, then descriptor-backed flags. The extension must be enabled first.
-
-`euler exec --extensions` controls which bundled extensions are enabled for a
+`euler exec --extensions` controls which linked extensions are enabled for a
 live headless session:
 
 ```sh
-euler exec --extensions causal-dag,maxproof "work on this task"
+euler exec --extensions session-export "work on this task"
 euler exec --extensions none "work without extensions"
 ```
 
@@ -260,8 +254,12 @@ If `--extensions` is omitted, Euler folds the user registry and the project
 overlay at `.euler/extensions.json`:
 
 ```json
-{"enable": ["causal-dag"], "disable": ["session-export"]}
+{"enable": ["session-export"], "disable": ["diagnostics-report"]}
 ```
+
+Enablement entries for ids that are no longer linked or installed (for
+example, formerly bundled extensions after an upgrade) are skipped as stale
+state; `--extensions` and the project overlay still reject unknown ids.
 
 Local package commands support review, inventory, and managed-process launch:
 
@@ -298,23 +296,29 @@ invocation. Euler announces the exact capability list on stderr before launch;
 declarations are never silent grants. Child-process stdout/stderr are not
 forwarded there.
 
-Linked-package enablement is explicit user-scope launch consent, separate from
-the bundled-extension registry and its project/session selection overlay. It
+Linked-package enablement is explicit user-scope launch consent. It
 reviews the current manifest and exact argv—not a content hash of every source
 file—so trusted local package code can iterate without re-enabling after every
 edit. A manifest or argv change is the review boundary: it must be reloaded and
 enabled again before launch.
 
-## Bundled examples
+## First-party extensions
 
-- `session-export`: bounded provenance query plus JSON artifact write.
-- `causal-dag`: graph projection, checkpoints, artifacts, context slots, and
-  observer audit records.
+The [euler-extensions](https://github.com/2x11-xyz/euler-extensions)
+repository holds the converted first-party extensions, each a standalone
+managed-process package:
+
+- `session-export`: bounded provenance query plus JSON artifact write. The
+  `euler session-export` CLI shortcut and the code-swarm review tool resolve
+  their extensions from the linked/installed registry; without them the
+  surface reports plainly how to add them.
 - `code-swarm`: review-only companion-agent brief generation and report folding.
 - `diagnostics-report`: diagnostics tail aggregation into an artifact.
 - `autoresearch`: objective brief/report flow with a context slot.
 - `maxproof`: population/verifier brief generation and deterministic tournament
   artifacting.
+- `causal-dag`: spec-only for now, pending a behavior redesign; the package
+  preserves the schemas and golden fixtures a rewrite must satisfy.
 
 ## Process trust boundary
 

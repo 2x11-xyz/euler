@@ -359,8 +359,9 @@ One source may provide several extensions. A source-level manifest
 templates; absent that manifest, discovery is conventional:
 `extensions/*/Euler.extension.json`. Extension identity remains the extension
 manifest id. The same id offered by two sources is a surfaced conflict, never
-a silent override; ids reserved by bundled extensions stay refused until the
-bundled crate is removed (ADR 0015 amendment).
+a silent override. (Euler ships no bundled extensions; the former bundled-id
+reservations ended when the last bundled crate was removed per the ADR 0015
+amendment.)
 
 ### Store
 
@@ -423,7 +424,7 @@ Exact event field names bind with the implementing slice.
 - `Invocation::AgentOnly`: the command is a step an agent takes on the user's
   behalf, reachable only through a session tool. `build_extension_slash_commands`
   mints no token for it; the headless control line and the CLI refuse it by
-  name. The bundled `code-swarm` `review` command is the first of these.
+  name. The `code-swarm` extension's `review` command is the first of these.
 
 Rules:
 

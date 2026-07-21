@@ -1,7 +1,6 @@
 use super::*;
-use euler_core::{read_provenance, EulerHome, ProvenanceWriter, SessionStore};
+use euler_core::ProvenanceWriter;
 use euler_event::{object, EventEnvelope, EventKind};
-use serde_json::json;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -114,119 +113,21 @@ fn session_export_rejects_invalid_query_flags() {
 }
 
 #[test]
-fn session_export_executes_extension_and_writes_artifact() {
+fn session_export_requires_a_linked_session_export_extension() {
+    // ADR 0015 core-only: session-export ships from the euler-extensions
+    // repository. Without it linked, the CLI names the way in.
     let temp = tempfile::tempdir().expect("temp dir");
+    let _home_guard = EnvVarGuard::set_path("EULER_HOME", &temp.path().join(".euler"));
     let session_id = "session-123";
     let session_dir = temp.path().join("sessions").join(session_id);
     fs::create_dir_all(&session_dir).expect("session dir");
     let log = session_dir.join("events.jsonl");
-    let start = session_start_event(session_id);
-    let user = content_event(
-        session_id,
-        EventKind::USER_MESSAGE,
-        "hello",
-        Some(&start.id),
-    );
-    let assistant = content_event(
-        session_id,
-        EventKind::ASSISTANT_MESSAGE,
-        "hi",
-        Some(&user.id),
-    );
     {
         let writer = ProvenanceWriter::new(&log).expect("writer");
         writer
-            .append(&[start.clone(), user.clone(), assistant.clone()])
-            .expect("append events");
+            .append(&[session_start_event(session_id)])
+            .expect("append start");
     }
-
-    let output = execute_session_export(ProvenanceExportArgs {
-        target: log.clone(),
-        limit: Some(1),
-        scan_limit: None,
-        after_event_id: Some(start.id.clone()),
-        kinds: vec![EventKind::USER_MESSAGE.to_owned()],
-    })
-    .expect("session export");
-    let relative_path = output["relative_path"].as_str().expect("relative path");
-    let artifact_bytes = fs::read(temp.path().join(relative_path)).expect("artifact bytes");
-    let artifact: serde_json::Value =
-        serde_json::from_slice(&artifact_bytes).expect("artifact json");
-    let events = read_provenance(&log).expect("read provenance");
-    let artifact_event = events.last().expect("artifact event");
-
-    assert_eq!(output["event_count"], json!(1));
-    assert_eq!(output["truncated"], json!(false));
-    assert_eq!(artifact["events"][0]["id"], json!(user.id));
-    assert_eq!(artifact_event.kind.as_str(), EventKind::EXTENSION_ARTIFACT);
-    assert_eq!(
-        artifact_event.payload.get("extension_id"),
-        Some(&json!("session-export"))
-    );
-    assert_eq!(
-        artifact_event.payload.get("source_event_ids"),
-        Some(&json!([artifact["events"][0]["id"].as_str().expect("id")]))
-    );
-}
-
-#[test]
-fn session_export_resolves_session_id_and_name_targets() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
-    let store = SessionStore::new(home.clone()).expect("store");
-    let record = store.create_session().expect("session");
-    let start = session_start_event(record.id());
-    let rename = session_renamed_event(record.id(), &start.id, "research branch");
-    let user = content_event(
-        record.id(),
-        EventKind::USER_MESSAGE,
-        "exportable",
-        Some(&rename.id),
-    );
-    {
-        let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
-        writer
-            .append(&[start, rename, user.clone()])
-            .expect("append events");
-    }
-    store
-        .refresh_session_metadata(record.id())
-        .expect("refresh metadata");
-
-    let _home_guard = EnvVarGuard::set_path("EULER_HOME", home.root());
-    let index = home.root().join("sessions").join("index.jsonl");
-    let index_lines_before = line_count(&index);
-    for target in [record.id().to_owned(), "research branch".to_owned()] {
-        let output = execute_session_export(ProvenanceExportArgs {
-            target: PathBuf::from(target),
-            limit: None,
-            scan_limit: None,
-            after_event_id: None,
-            kinds: vec![EventKind::USER_MESSAGE.to_owned()],
-        })
-        .expect("session export");
-        let relative_path = output["relative_path"].as_str().expect("relative path");
-        let artifact_bytes = fs::read(home.root().join(relative_path)).expect("artifact bytes");
-        let artifact: serde_json::Value =
-            serde_json::from_slice(&artifact_bytes).expect("artifact json");
-
-        assert_eq!(output["event_count"], json!(1));
-        assert_eq!(artifact["events"][0]["id"], json!(user.id));
-    }
-    assert_eq!(line_count(&index), index_lines_before + 2);
-}
-
-#[test]
-fn session_export_fails_when_session_log_is_locked() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let session_id = "session-123";
-    let session_dir = temp.path().join("sessions").join(session_id);
-    fs::create_dir_all(&session_dir).expect("session dir");
-    let log = session_dir.join("events.jsonl");
-    let writer = ProvenanceWriter::new(&log).expect("writer");
-    writer
-        .append(&[session_start_event(session_id)])
-        .expect("append start");
 
     let error = execute_session_export(ProvenanceExportArgs {
         target: log,
@@ -235,11 +136,14 @@ fn session_export_fails_when_session_log_is_locked() {
         after_event_id: None,
         kinds: Vec::new(),
     })
-    .expect_err("locked session");
+    .expect_err("unlinked session-export");
 
     let message = error.to_string();
-    assert!(message.contains("already open by another Euler process"));
-    assert!(message.contains("Close that process and retry."));
+    assert!(
+        message.contains("session-export needs the session-export extension"),
+        "message: {message}"
+    );
+    assert!(message.contains("euler extension enable session-export"));
 }
 
 fn parse_args_without_env<const N: usize>(args: [&str; N]) -> Args {
@@ -254,31 +158,6 @@ fn session_start_event(session_id: &str) -> EventEnvelope {
         None,
         EventKind::SESSION_START,
         object([("provider", "fixture".into()), ("model", "echo".into())]),
-    )
-}
-
-fn session_renamed_event(session_id: &str, parent: &str, name: &str) -> EventEnvelope {
-    EventEnvelope::new(
-        session_id,
-        "agent-1",
-        Some(parent.to_owned()),
-        EventKind::SESSION_RENAMED,
-        object([("name", name.to_owned().into())]),
-    )
-}
-
-fn content_event(
-    session_id: &str,
-    kind: &'static str,
-    content: &str,
-    parent: Option<&str>,
-) -> EventEnvelope {
-    EventEnvelope::new(
-        session_id,
-        "agent-1",
-        parent.map(str::to_owned),
-        kind,
-        object([("content", content.to_owned().into())]),
     )
 }
 
@@ -302,11 +181,4 @@ impl Drop for EnvVarGuard {
             None => env::remove_var(self.key),
         }
     }
-}
-
-fn line_count(path: &Path) -> usize {
-    fs::read_to_string(path)
-        .expect("read lines")
-        .lines()
-        .count()
 }

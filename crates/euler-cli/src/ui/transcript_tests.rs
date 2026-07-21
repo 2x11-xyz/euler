@@ -66,7 +66,7 @@ fn projects_supported_events_and_skips_control_events() {
 #[test]
 fn operation_permission_panel_names_the_operation_and_every_capability() {
     let items = vec![TranscriptItem::PermissionBatchAsk {
-        operation: "extension causal-dag.refresh".to_owned(),
+        operation: "extension session-export.export".to_owned(),
         capabilities: vec![
             "fs-read".to_owned(),
             "fs-write".to_owned(),
@@ -78,7 +78,7 @@ fn operation_permission_panel_names_the_operation_and_every_capability() {
     let rendered = line_texts(&render_items_for_history(&items, &Theme::default(), 96)).join("\n");
 
     assert!(rendered.contains("Approve operation?"));
-    assert!(rendered.contains("extension causal-dag.refresh"));
+    assert!(rendered.contains("extension session-export.export"));
     assert!(rendered.contains("requests: fs-read · fs-write · network"));
     assert!(rendered.contains("y  Allow once"));
     assert!(rendered.contains("a  Allow all requested capabilities for this session"));
@@ -790,7 +790,7 @@ fn tui_history_suppresses_routine_allow_permission_rows() {
                 ("decision", "allowed".into()),
                 ("allowed", true.into()),
                 ("source", "extension".into()),
-                ("extension_id", "causal-dag".into()),
+                ("extension_id", "session-export".into()),
                 ("command", serde_json::Value::Null),
             ]),
         ),
@@ -802,7 +802,7 @@ fn tui_history_suppresses_routine_allow_permission_rows() {
                 ("decision", "denied".into()),
                 ("allowed", false.into()),
                 ("source", "extension".into()),
-                ("extension_id", "causal-dag".into()),
+                ("extension_id", "session-export".into()),
                 ("command", "network-check".into()),
             ]),
         ),
@@ -1438,14 +1438,14 @@ fn line_oriented_batch_permission_prompt_names_operation_and_capabilities() {
                 "capabilities",
                 serde_json::json!(["fs-read", "fs-write", "network"]),
             ),
-            ("operation", "extension causal-dag.refresh".into()),
-            ("reason", "extension causal-dag.refresh".into()),
+            ("operation", "extension session-export.export".into()),
+            ("reason", "extension session-export.export".into()),
         ]),
     )];
 
     assert_eq!(
         render_line_oriented(&events),
-        "permission.prompt: extension causal-dag.refresh; capabilities: fs-read, fs-write, network\n"
+        "permission.prompt: extension session-export.export; capabilities: fs-read, fs-write, network\n"
     );
 }
 
@@ -2610,7 +2610,7 @@ fn disabled_extension_notice_renders_muted_without_glyph_or_prefix() {
     // no red error style, no "ui:" source prefix.
     let theme = Theme::default();
     let message =
-        crate::ui::commands::disabled_extension_teach("/catch-up", "causal-dag").to_owned();
+        crate::ui::commands::disabled_extension_teach("/summarize", "note-taker").to_owned();
     let items = vec![TranscriptItem::Notice(message.clone())];
 
     let lines = render_items_for_history(&items, &theme, 80);
@@ -2645,7 +2645,7 @@ fn disabled_extension_notice_renders_every_entrance_without_dedup() {
     // is entered — typed, via palette, or via the extension run form — not
     // just once per session.
     let theme = Theme::default();
-    let message = crate::ui::commands::disabled_extension_teach("/causal-dag", "causal-dag");
+    let message = crate::ui::commands::disabled_extension_teach("/note-taker", "note-taker");
     let items = vec![
         TranscriptItem::Notice(message.clone()),
         TranscriptItem::Notice(message.clone()),
@@ -2668,7 +2668,7 @@ fn consecutive_notice_items_stack_without_separating_blank_lines() {
     // blank-separated event per line.
     let theme = Theme::default();
     let items = vec![
-        TranscriptItem::Notice("extension enabled: causal-dag".to_owned()),
+        TranscriptItem::Notice("extension enabled: note-taker".to_owned()),
         TranscriptItem::Notice("extension enabled: code-swarm".to_owned()),
         TranscriptItem::AssistantMessage("unrelated answer".to_owned()),
     ];
@@ -2676,7 +2676,7 @@ fn consecutive_notice_items_stack_without_separating_blank_lines() {
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
     let first = texts
         .iter()
-        .position(|line| line.contains("causal-dag"))
+        .position(|line| line.contains("note-taker"))
         .expect("first notice present");
     let second = texts
         .iter()

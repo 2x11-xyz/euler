@@ -177,11 +177,6 @@ impl AppCore {
         auto_flush: bool,
     ) {
         session.set_model_catalog(self.model_catalog.clone());
-        self.bottom
-            .set_causal_dag_stats(Some(causal_dag_stats_from_events(
-                session.events(),
-                session.session_id(),
-            )));
         if self.active_session_home_managed {
             let session_id = session.session_id().to_owned();
             if let Err(error) = self.refresh_current_session_metadata(&session_id) {
@@ -228,21 +223,15 @@ impl AppCore {
         }
         match outcome {
             ExtensionOutcome::Complete(output) => {
-                if let Some(summary) =
-                    causal_dag_summary_line(&request.id, &request.command, &output)
-                {
-                    let _ = self.summary_item(summary);
-                } else {
-                    // Foldable artifact row with pretty JSON, not a one-line dump
-                    // (calibration finding E4).
-                    let rendered =
-                        serde_json::to_string_pretty(&output).unwrap_or_else(|_| "null".to_owned());
-                    self.push_finalized_visual_item(TranscriptItem::ExtensionResult {
-                        reference: format!("{}.{}", request.id, request.command),
-                        ok: true,
-                        output: rendered,
-                    });
-                }
+                // Foldable artifact row with pretty JSON, not a one-line dump
+                // (calibration finding E4).
+                let rendered =
+                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "null".to_owned());
+                self.push_finalized_visual_item(TranscriptItem::ExtensionResult {
+                    reference: format!("{}.{}", request.id, request.command),
+                    ok: true,
+                    output: rendered,
+                });
                 self.notice = Some(format!(
                     "extension {}.{} complete",
                     request.id, request.command
@@ -387,76 +376,6 @@ impl AppCore {
             .events()
             .last()
             .is_some_and(|event| event.kind.as_str() == EventKind::ERROR)
-    }
-}
-
-fn causal_dag_summary_line(
-    extension_id: &str,
-    command: &str,
-    output: &serde_json::Value,
-) -> Option<String> {
-    if extension_id != "causal-dag" {
-        return None;
-    }
-    match command {
-        "view" => output["summary"].as_str().map(str::to_owned),
-        "export" => {
-            let format = output["format"].as_str().unwrap_or("unknown");
-            let path = output["out_path"]
-                .as_str()
-                .or_else(|| output["suggested_name"].as_str())
-                .unwrap_or("(unknown path)");
-            let nodes = output["node_count"].as_u64().unwrap_or_default();
-            let suffix = if output["self_contained"].as_bool().unwrap_or(false) {
-                " · self-contained"
-            } else {
-                ""
-            };
-            Some(format!(
-                "exported causal DAG → {format} · {path} · {nodes} nodes{suffix}"
-            ))
-        }
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod causal_dag_summary_tests {
-    use super::causal_dag_summary_line;
-    use serde_json::json;
-
-    #[test]
-    fn export_notice_uses_requested_path_and_self_contained_marker() {
-        assert_eq!(
-            causal_dag_summary_line(
-                "causal-dag",
-                "export",
-                &json!({
-                    "format": "html",
-                    "out_path": "reports/dag.html",
-                    "suggested_name": "dag-session.html",
-                    "node_count": 35,
-                    "self_contained": true
-                })
-            ),
-            Some(
-                "exported causal DAG → html · reports/dag.html · 35 nodes · self-contained"
-                    .to_owned()
-            )
-        );
-    }
-
-    #[test]
-    fn view_notice_is_the_compact_graph_summary() {
-        assert_eq!(
-            causal_dag_summary_line(
-                "causal-dag",
-                "view",
-                &json!({"summary": "GRAPH: active path"})
-            ),
-            Some("GRAPH: active path".to_owned())
-        );
-        assert_eq!(causal_dag_summary_line("other", "view", &json!({})), None);
     }
 }
 

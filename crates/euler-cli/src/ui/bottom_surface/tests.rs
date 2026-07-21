@@ -1,9 +1,8 @@
 use super::*;
 use crate::ui::commands::ExtensionCommandItem;
 use crate::ui::commands::{
-    build_extension_slash_commands, command_table, permission_choices, theme_choices,
-    CausalDagStats, CompactionSettings, EffortChoice, ExtensionManagerItem, ModelChoice,
-    PermissionPosture, ResumeItem,
+    command_table, permission_choices, theme_choices, CompactionSettings, EffortChoice,
+    ExtensionManagerItem, ModelChoice, PermissionPosture, ResumeItem,
 };
 use crate::ui::theme::ThemeChoice;
 use euler_core::{ApprovalMode, ReasoningEffort};
@@ -33,49 +32,19 @@ fn code_swarm_checked(surface: &BottomSurface) -> usize {
     picker.items.iter().filter(|item| item.current).count()
 }
 
-fn causal_dag_surface() -> BottomSurface {
-    let extension_items = vec![ExtensionManagerItem {
-        id: "causal-dag".to_owned(),
-        display_name: "Causal DAG".to_owned(),
-        enabled: true,
-        bundled: true,
-        materialization: None,
-        version: "0.2.0".to_owned(),
-        commands: vec![
-            ExtensionCommandItem::user("view"),
-            ExtensionCommandItem::user("export"),
-            ExtensionCommandItem::user("refresh"),
-        ],
-        capabilities: vec![],
-        audit_status: None,
-    }];
-    let context = CommandContext {
-        extension_slash_commands: build_extension_slash_commands(&extension_items),
-        extension_items,
-        causal_dag_stats: Some(CausalDagStats {
-            session_id: "01KX8VEXAMPLE".to_owned(),
-            node_count: 35,
-            cross_arc_count: 7,
-        }),
-        ..CommandContext::default()
-    };
-    BottomSurface::new(context)
-}
-
 /// §4.2: a row is caret + one state marker + label + description column, and
 /// it never repeats its own value. `ExtensionManagerItem::label()` used to bake
 /// the marker, id and kind into one string, so the unified picker rendered
-/// `› ● ● causal-dag  (bundled)  causal-dag` — marker twice, kind twice (it is
-/// also the group header), id twice. Nothing covered this path.
+/// marker twice, kind twice (it is also the group header), id twice. Nothing
+/// covered this path.
 #[test]
 fn extension_picker_row_states_each_fact_once() {
     let items = vec![
         ExtensionManagerItem {
-            id: "causal-dag".to_owned(),
-            display_name: "Causal DAG".to_owned(),
+            id: "note-taker".to_owned(),
+            display_name: "Note Taker".to_owned(),
             enabled: true,
-            bundled: true,
-            materialization: None,
+            materialization: Some("installed".to_owned()),
             version: "0.2.0".to_owned(),
             commands: vec![],
             capabilities: vec![],
@@ -85,7 +54,6 @@ fn extension_picker_row_states_each_fact_once() {
             id: "local-thing".to_owned(),
             display_name: "Local Thing".to_owned(),
             enabled: false,
-            bundled: false,
             materialization: Some("copied".to_owned()),
             version: "0.1.0".to_owned(),
             commands: vec![],
@@ -102,19 +70,19 @@ fn extension_picker_row_states_each_fact_once() {
 
     let enabled = rendered
         .lines()
-        .find(|line| line.contains("causal-dag"))
+        .find(|line| line.contains("note-taker"))
         .expect("enabled row");
     assert_eq!(enabled.matches('●').count(), 1, "row: {enabled:?}");
     assert_eq!(
-        enabled.matches("causal-dag").count(),
+        enabled.matches("note-taker").count(),
         1,
         "id must not repeat: {enabled:?}"
     );
     assert!(
-        !enabled.contains("bundled"),
+        !enabled.contains("installed"),
         "kind belongs to the group header, not the row: {enabled:?}"
     );
-    assert!(rendered.contains("BUNDLED"), "rendered:\n{rendered}");
+    assert!(rendered.contains("INSTALLED"), "rendered:\n{rendered}");
 
     // Disabled + linked: hollow marker, materialization as the group.
     let disabled = rendered
@@ -123,59 +91,6 @@ fn extension_picker_row_states_each_fact_once() {
         .expect("disabled row");
     assert_eq!(disabled.matches('○').count(), 1, "row: {disabled:?}");
     assert!(rendered.contains("COPIED"), "rendered:\n{rendered}");
-}
-
-#[test]
-fn causal_dag_picker_drills_into_formats_and_steps_back() {
-    let mut surface = causal_dag_surface();
-    surface.open_palette();
-    surface.palette_insert("causal-dag");
-    assert_eq!(surface.confirm(), SurfaceEvent::None);
-    let actions = surface
-        .surface_lines(100)
-        .expect("action picker")
-        .join("\n");
-    assert!(actions.contains("CAUSAL DAG · session 01KX8V… · 35 nodes · 7 cross-arcs · (1/3)"));
-    assert!(actions.contains("→ view     Show current graph"));
-    assert!(actions.contains("refresh  Re-observe recent activity"));
-
-    surface.move_selection_down();
-    assert_eq!(surface.confirm(), SurfaceEvent::None);
-    let formats = surface
-        .surface_lines(100)
-        .expect("format picker")
-        .join("\n");
-    assert!(formats.contains("CAUSAL DAG › EXPORT · 35 nodes"));
-    assert!(formats.contains("html      Interactive viewer"));
-    assert!(formats.contains("summary   Compact GRAPH: slot text"));
-    assert!(formats.contains("⌫ back"));
-
-    assert!(surface.picker_backspace_steps_back());
-    assert!(matches!(
-        surface.owner(),
-        BottomOwner::Picker(picker) if picker.kind == PickerKind::CausalDagActions
-    ));
-    assert!(surface.picker_backspace_steps_back());
-    assert!(matches!(surface.owner(), BottomOwner::Palette(_)));
-}
-
-#[test]
-fn causal_dag_format_selection_runs_the_extension_with_selected_format() {
-    let mut surface = causal_dag_surface();
-    surface.open_picker(PickerSpec::CausalDagFormats(CausalDagStats {
-        session_id: "session".to_owned(),
-        node_count: 3,
-        cross_arc_count: 1,
-    }));
-    assert_eq!(
-        surface.confirm(),
-        SurfaceEvent::Action(CommandAction::ExtensionRun {
-            id: "causal-dag".to_owned(),
-            command: "export".to_owned(),
-            input: serde_json::json!({"format": "html"}),
-            raw_args: None,
-        })
-    );
 }
 
 #[test]
@@ -191,8 +106,7 @@ fn palette_confirm_on_code_swarm_opens_config_not_extension_run() {
             id: "code-swarm".to_owned(),
             display_name: "CodeSwarm Review".to_owned(),
             enabled: true,
-            bundled: true,
-            materialization: None,
+            materialization: Some("linked".to_owned()),
             version: "0.1.0".to_owned(),
             commands: vec![
                 ExtensionCommandItem::user("review-brief"),
@@ -274,8 +188,7 @@ fn palette_confirm_on_extension_entry_keeps_typed_arguments() {
             id: "code-swarm".to_owned(),
             display_name: "CodeSwarm Review".to_owned(),
             enabled: true,
-            bundled: true,
-            materialization: None,
+            materialization: Some("linked".to_owned()),
             version: "0.1.0".to_owned(),
             commands: vec![
                 ExtensionCommandItem::user("review-brief"),
@@ -314,8 +227,7 @@ fn palette_confirm_on_disabled_extension_returns_muted_notice_every_time() {
             id: "code-swarm".to_owned(),
             display_name: "CodeSwarm Review".to_owned(),
             enabled: false,
-            bundled: true,
-            materialization: None,
+            materialization: Some("linked".to_owned()),
             version: "0.1.0".to_owned(),
             commands: vec![
                 ExtensionCommandItem::user("review-brief"),

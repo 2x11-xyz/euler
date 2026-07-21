@@ -5,25 +5,21 @@
 mod observer;
 mod output;
 
-use crate::bundled_extensions::{
-    bundled_descriptor_by_id, bundled_descriptors, bundled_extension_by_id, BundledDescriptor,
-};
-use crate::extension_enablement::RegistryResolution;
 use crate::offline_extension_runner::{execute_offline_extension_run, OfflineExtensionRun};
 use anyhow::{anyhow, Result};
 use euler_core::{
-    EulerHome, ExtensionAuditErrorReport, ExtensionEnablement, ExtensionMaterialization,
-    ExtensionRegistry, ExtensionRegistryError, LinkedExtension, LinkedExtensionStatus,
+    EulerHome, ExtensionAuditErrorReport, ExtensionMaterialization, ExtensionRegistry,
+    LinkedExtension, LinkedExtensionStatus,
 };
 use euler_managed_process::ManagedProcessExtension;
 use euler_sdk::{
     load_extension_package, managed_process_entrypoint_from_manifest_bytes,
-    valid_extension_identifier, ArgSpec, ArgValueKind, CommandDescriptor,
+    valid_extension_identifier, CommandDescriptor,
 };
 use output::{
     installed_info_summary, linked_info, linked_link_info, linked_status, package_validation_info,
-    search_matches, search_result_for_bundled, search_result_for_linked, sort_search_results,
-    SearchOutput, UninstallInfo, UnlinkInfo,
+    search_matches, search_result_for_linked, sort_search_results, SearchOutput, UninstallInfo,
+    UnlinkInfo,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -184,10 +180,6 @@ fn extension_registry_read_only() -> Result<ExtensionRegistry> {
 
 fn run_list(stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry()?;
-    for descriptor in bundled_descriptors()? {
-        let status = status_label(registry.state(&descriptor.id));
-        writeln!(stdout, "{} {status}", descriptor.id)?;
-    }
     for linked in registry.linked_extensions()? {
         let execution_enabled = current_linked_execution_enabled(&registry, &linked)?;
         writeln!(
@@ -203,20 +195,17 @@ fn run_list(stdout: &mut dyn Write) -> Result<()> {
 
 fn run_status(id: &str, stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry()?;
-    if validate_known_extension_id(id).is_ok() {
-        writeln!(stdout, "{} {}", id, status_label(registry.state(id)))?;
-    } else if let Some(linked) = linked_extension(&registry, id)? {
-        let execution_enabled = current_linked_execution_enabled(&registry, &linked)?;
-        writeln!(
-            stdout,
-            "{} {} {}",
-            linked.id,
-            linked_status(&linked, execution_enabled),
-            linked.materialization.as_str()
-        )?;
-    } else {
-        validate_known_extension_id(id)?;
-    }
+    let Some(linked) = linked_extension(&registry, id)? else {
+        return Err(anyhow!("unknown extension id: {id}"));
+    };
+    let execution_enabled = current_linked_execution_enabled(&registry, &linked)?;
+    writeln!(
+        stdout,
+        "{} {} {}",
+        linked.id,
+        linked_status(&linked, execution_enabled),
+        linked.materialization.as_str()
+    )?;
     Ok(())
 }
 
@@ -236,8 +225,7 @@ fn run_info(id: &str, stdout: &mut dyn Write) -> Result<()> {
             ))?
         )?;
     } else {
-        let descriptor = validate_known_extension_id(id)?;
-        writeln!(stdout, "{}", serde_json::to_string(&descriptor.to_info())?)?;
+        return Err(anyhow!("unknown extension id: {id}"));
     }
     Ok(())
 }
@@ -245,18 +233,10 @@ fn run_info(id: &str, stdout: &mut dyn Write) -> Result<()> {
 fn run_search(search: &ExtensionSearchArgs, stdout: &mut dyn Write) -> Result<()> {
     let registry = extension_registry().ok();
     let mut results = Vec::new();
-    for descriptor in bundled_descriptors()? {
-        results.push(search_result_for_bundled(
-            &descriptor,
-            bundled_status(registry.as_ref(), &descriptor.id),
-        ));
-    }
     if let Some(registry) = &registry {
         for linked in linked_extensions_for_search(registry) {
-            if bundled_extension_by_id(&linked.id).is_none() {
-                let execution_enabled = current_linked_execution_enabled(registry, &linked)?;
-                results.push(search_result_for_linked(&linked, execution_enabled));
-            }
+            let execution_enabled = current_linked_execution_enabled(registry, &linked)?;
+            results.push(search_result_for_linked(&linked, execution_enabled));
         }
     }
     results.retain(|result| search_matches(search, result));
@@ -288,7 +268,6 @@ fn run_audit(stdout: &mut dyn Write) -> Result<()> {
 
 fn run_validate(path: &Path, stdout: &mut dyn Write) -> Result<()> {
     let package = load_extension_package(path)?;
-    reject_bundled_id(&package.descriptor.id)?;
     let entrypoint = package_process_entrypoint(&package)?;
     writeln!(
         stdout,
@@ -304,7 +283,6 @@ fn run_validate(path: &Path, stdout: &mut dyn Write) -> Result<()> {
 
 fn run_link(path: &Path, stdout: &mut dyn Write) -> Result<()> {
     let package = load_extension_package(path)?;
-    reject_bundled_id(&package.descriptor.id)?;
     let entrypoint = package_process_entrypoint(&package)?;
     let registry = extension_registry()?;
     let linked = registry.link_package(package)?;
@@ -318,7 +296,6 @@ fn run_link(path: &Path, stdout: &mut dyn Write) -> Result<()> {
 
 fn run_install(path: &Path, stdout: &mut dyn Write) -> Result<()> {
     let package = load_extension_package(path)?;
-    reject_bundled_id(&package.descriptor.id)?;
     let registry = extension_registry()?;
     let installed = registry.install_package(package)?;
     writeln!(
@@ -359,9 +336,6 @@ fn run_unlink(id: &str, stdout: &mut dyn Write) -> Result<()> {
 
 fn run_uninstall(id: &str, stdout: &mut dyn Write) -> Result<()> {
     validate_extension_id_shape(id)?;
-    if bundled_extension_by_id(id).is_some() {
-        return Err(anyhow!("bundled extension cannot be uninstalled: {id}"));
-    }
     let registry = extension_registry()?;
     let uninstalled = registry.uninstall_installed(id)?;
     writeln!(
@@ -388,10 +362,7 @@ fn run_enable(id: &str, stdout: &mut dyn Write) -> Result<()> {
         )?;
         return Ok(());
     }
-    validate_known_extension_id(id)?;
-    registry.enable(id)?;
-    writeln!(stdout, "{id} enabled")?;
-    Ok(())
+    Err(anyhow!("unknown extension id: {id}"))
 }
 
 fn run_disable(id: &str, stdout: &mut dyn Write) -> Result<()> {
@@ -407,10 +378,7 @@ fn run_disable(id: &str, stdout: &mut dyn Write) -> Result<()> {
         writeln!(stdout, "{id} disabled")?;
         return Ok(());
     }
-    validate_known_extension_id(id)?;
-    registry.disable(id)?;
-    writeln!(stdout, "{id} disabled")?;
-    Ok(())
+    Err(anyhow!("unknown extension id: {id}"))
 }
 
 fn run_extension(run: ExtensionRunArgs, stdout: &mut dyn Write) -> Result<()> {
@@ -443,36 +411,7 @@ fn run_extension(run: ExtensionRunArgs, stdout: &mut dyn Write) -> Result<()> {
         writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
         return Ok(());
     }
-    validate_known_extension_id(&run.id)?;
-    // Registry corruption must fail closed before target-dependent work; the
-    // project overlay then belongs to the TARGET session's directory, not the
-    // caller's shell CWD: `euler extension run <ref> /path/to/log` invoked
-    // from anywhere must gate against the session's own project policy.
-    let mut resolution = RegistryResolution::load()?;
-    let target = crate::session_lifecycle::resolve_resume_target(run.target)?;
-    let root = target
-        .log_path
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    resolution.apply_project(&root)?;
-    if !resolution.enabled.contains(&run.id) {
-        return Err(anyhow!("extension disabled: {}", run.id));
-    }
-    let descriptor = validate_known_extension_command(&run.id, &run.command)?;
-    let bundled = bundled_extension_by_id(&run.id)
-        .ok_or_else(|| anyhow!("unknown extension id: {}", run.id))?;
-    let output = execute_offline_extension_run(OfflineExtensionRun {
-        extension_id: &run.id,
-        command: descriptor
-            .command(&run.command)
-            .expect("validated bundled command must exist"),
-        extension: bundled.extension,
-        target: target.log_path.clone(),
-        input: run.input,
-    })?;
-    writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
-    Ok(())
+    Err(anyhow!("unknown extension id: {}", run.id))
 }
 
 fn announce_managed_process_capability_grant(id: &str, command: &CommandDescriptor) {
@@ -515,7 +454,6 @@ fn non_runnable_extension_error(linked: &LinkedExtension, action: &str) -> anyho
 fn validate_linked_process_for_activation(
     linked: &LinkedExtension,
 ) -> Result<euler_sdk::ManagedProcessEntrypoint> {
-    reject_bundled_link_collision(&linked.id)?;
     let package = load_linked_process_for_action(linked, "enable")?;
     managed_process_entrypoint_from_manifest_bytes(&package.manifest_bytes).map_err(Into::into)
 }
@@ -600,7 +538,6 @@ pub(crate) fn resolve_live_linked_process_command(
     let Some(linked) = linked_extension(&registry, id)? else {
         return Ok(None);
     };
-    reject_bundled_link_collision(id)?;
     validate_linked_command(&linked, command)?;
     let package = load_enabled_linked_process(&registry, &linked)?;
     let extension = ManagedProcessExtension::from_package(&package)
@@ -612,16 +549,7 @@ pub(crate) fn resolve_live_linked_process_command(
     Ok(Some((extension, descriptor)))
 }
 
-pub(crate) use observer::resolve as resolve_live_linked_observer;
-
-fn reject_bundled_link_collision(id: &str) -> Result<()> {
-    if bundled_extension_by_id(id).is_some() {
-        return Err(anyhow!(
-            "extension id `{id}` is ambiguous: a linked package conflicts with a bundled extension; unlink or rename the linked package"
-        ));
-    }
-    Ok(())
-}
+pub(crate) use observer::{live_linked_extension_arc, resolve_round_observer, ObserveOptions};
 
 /// Change linked-process launch consent through the same validation boundary
 /// as the CLI enable/disable actions. Returns `false` when `id` is not linked.
@@ -654,25 +582,6 @@ fn linked_extension(registry: &ExtensionRegistry, id: &str) -> Result<Option<Lin
     Ok(registry.linked_extension(id)?)
 }
 
-fn status_label(state: Result<ExtensionEnablement, ExtensionRegistryError>) -> String {
-    match state {
-        Ok(ExtensionEnablement::Enabled) => "enabled".to_owned(),
-        Ok(ExtensionEnablement::Disabled) => "disabled".to_owned(),
-        Err(error) => format!("unavailable: {error}"),
-    }
-}
-
-fn bundled_status(registry: Option<&ExtensionRegistry>, id: &str) -> &'static str {
-    let Some(registry) = registry else {
-        return "unavailable";
-    };
-    match registry.state(id) {
-        Ok(ExtensionEnablement::Enabled) => "enabled",
-        Ok(ExtensionEnablement::Disabled) => "disabled",
-        Err(_) => "unavailable",
-    }
-}
-
 fn linked_extensions_for_search(registry: &ExtensionRegistry) -> Vec<LinkedExtension> {
     registry.linked_extensions().unwrap_or_default()
 }
@@ -697,23 +606,7 @@ fn parse_extension_run(args: &mut impl Iterator<Item = String>) -> Result<Extens
         ));
     }
     let target = PathBuf::from(target);
-    let descriptor =
-        bundled_descriptor_by_id(&id)?.and_then(|descriptor| descriptor.command(&command).cloned());
-    // Refuse before parsing the rest: an agent-only command is not something
-    // this CLI runs, so validating its flags would only teach a dead surface.
-    if descriptor
-        .as_ref()
-        .is_some_and(|descriptor| descriptor.invocation.is_agent_only())
-    {
-        return Err(anyhow!(
-            "{reference} is agent-only: it is run by an agent in a live session, not by `euler \
-             extension run`. Start a session and ask for it in ordinary turn text."
-        ));
-    }
-    let input = match descriptor.as_ref() {
-        Some(descriptor) => parse_extension_run_input(&reference, Some(descriptor), args)?,
-        None => parse_managed_process_input(&reference, args)?,
-    };
+    let input = parse_managed_process_input(&reference, args)?;
     Ok(ExtensionRunArgs {
         id,
         command,
@@ -803,101 +696,6 @@ fn parse_extension_command_reference(reference: &str) -> Result<(String, String)
     Ok((id.to_owned(), command.to_owned()))
 }
 
-/// Shared by the CLI argv path and the TUI slash path (`--flag value…` after
-/// an extension token) so both surfaces honor the same ArgSpec contract.
-pub(crate) fn parse_extension_run_input(
-    reference: &str,
-    descriptor: Option<&CommandDescriptor>,
-    args: &mut impl Iterator<Item = String>,
-) -> Result<serde_json::Value> {
-    let mut input = serde_json::Map::new();
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(arg) = args.next() {
-        let Some(flag) = arg.strip_prefix("--") else {
-            return Err(anyhow!("unknown extension run argument: {arg}"));
-        };
-        let Some(spec) =
-            descriptor.and_then(|descriptor| descriptor.args.iter().find(|spec| spec.flag == flag))
-        else {
-            return Err(anyhow!("--{flag} is not supported by {reference}"));
-        };
-        if !spec.repeatable && !seen.insert(spec.flag.clone()) {
-            return Err(anyhow!("--{} was provided more than once", spec.flag));
-        }
-        let value = parse_arg_value(spec, args)?;
-        insert_input_value(&mut input, &spec.input_key, value, spec.repeatable)?;
-    }
-    if let Some(descriptor) = descriptor {
-        for spec in descriptor.args.iter().filter(|spec| spec.required) {
-            if !seen.contains(&spec.flag) {
-                return Err(anyhow!(
-                    "extension run {reference} requires --{} <{}>",
-                    spec.flag,
-                    value_shape(&spec.value_kind)
-                ));
-            }
-        }
-    }
-    Ok(serde_json::Value::Object(input))
-}
-
-fn parse_arg_value(
-    spec: &ArgSpec,
-    args: &mut impl Iterator<Item = String>,
-) -> Result<serde_json::Value> {
-    match &spec.value_kind {
-        ArgValueKind::PositiveInt { max } => parse_positive_value(args, &spec.flag, *max),
-        ArgValueKind::BoundedString { max_bytes } => {
-            parse_bounded_string(args, &spec.flag, *max_bytes).map(serde_json::Value::String)
-        }
-        ArgValueKind::StringList => required_arg(args, format!("--{} requires a value", spec.flag))
-            .map(serde_json::Value::String),
-        ArgValueKind::JsonObjectFile {
-            max_bytes,
-            reject_wrapper_key,
-        } => parse_json_object_file(args, &spec.flag, *max_bytes, reject_wrapper_key.as_deref()),
-    }
-}
-
-fn parse_positive_value(
-    args: &mut impl Iterator<Item = String>,
-    flag: &str,
-    max: Option<usize>,
-) -> Result<serde_json::Value> {
-    let message = format!("--{flag} requires a positive integer");
-    let value = required_arg(args, &message)?;
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| anyhow!(message.clone()))?;
-    if parsed == 0 {
-        return Err(anyhow!(message));
-    }
-    if let Some(max) = max {
-        if parsed > max {
-            return Err(anyhow!("--{flag} must be at most {max}"));
-        }
-    }
-    Ok(parsed.into())
-}
-
-fn parse_bounded_string(
-    args: &mut impl Iterator<Item = String>,
-    flag: &str,
-    max_bytes: usize,
-) -> Result<String> {
-    let value = required_arg(args, format!("--{flag} requires a value"))?;
-    if value.is_empty() {
-        return Err(anyhow!("--{flag} requires a value"));
-    }
-    if value.len() > max_bytes {
-        return Err(anyhow!("--{flag} must be at most {max_bytes} bytes"));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(anyhow!("--{flag} must not contain control characters"));
-    }
-    Ok(value)
-}
-
 fn parse_json_object_file(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
@@ -945,59 +743,6 @@ fn parse_json_object_file(
     Ok(json)
 }
 
-fn insert_input_value(
-    input: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: serde_json::Value,
-    repeatable: bool,
-) -> Result<()> {
-    if let Some((outer, inner)) = key.split_once('.') {
-        let entry = input
-            .entry(outer.to_owned())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        let object = entry
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("conflicting nested input key: {key}"))?;
-        object.insert(inner.to_owned(), value);
-        return Ok(());
-    }
-    if repeatable {
-        input
-            .entry(key.to_owned())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-            .as_array_mut()
-            .ok_or_else(|| anyhow!("conflicting repeated input key: {key}"))?
-            .push(value);
-    } else {
-        input.insert(key.to_owned(), value);
-    }
-    Ok(())
-}
-
-fn value_shape(kind: &ArgValueKind) -> &'static str {
-    match kind {
-        ArgValueKind::PositiveInt { .. } => "positive-int",
-        ArgValueKind::BoundedString { .. } => "value",
-        ArgValueKind::StringList => "value",
-        ArgValueKind::JsonObjectFile { .. } => "json-file",
-    }
-}
-
-fn validate_known_extension_id(id: &str) -> Result<BundledDescriptor> {
-    validate_extension_id_shape(id)?;
-    bundled_descriptor_by_id(id)?.ok_or_else(|| anyhow!("unknown extension id: {id}"))
-}
-
-fn validate_known_extension_command(id: &str, command: &str) -> Result<BundledDescriptor> {
-    let descriptor = validate_known_extension_id(id)?;
-    validate_extension_command_shape(command)?;
-    if descriptor.command(command).is_some() {
-        Ok(descriptor)
-    } else {
-        Err(anyhow!("unknown command for extension {id}: {command}"))
-    }
-}
-
 fn validate_linked_command(linked: &LinkedExtension, command: &str) -> Result<()> {
     validate_extension_command_shape(command)?;
     if linked.descriptor.command(command).is_some() {
@@ -1007,16 +752,6 @@ fn validate_linked_command(linked: &LinkedExtension, command: &str) -> Result<()
             "unknown command for extension {}: {command}",
             linked.id
         ))
-    }
-}
-
-fn reject_bundled_id(id: &str) -> Result<()> {
-    if bundled_extension_by_id(id).is_some() {
-        Err(anyhow!(
-            "extension id is reserved by bundled extension: {id}"
-        ))
-    } else {
-        Ok(())
     }
 }
 
@@ -1075,7 +810,7 @@ mod tests {
     #[test]
     fn extension_run_flag_in_session_position_is_rejected_plainly() {
         let mut args = [
-            "maxproof.population-brief".to_owned(),
+            "session-export.session-export".to_owned(),
             "--problem".to_owned(),
             "prove it".to_owned(),
         ]
@@ -1091,11 +826,11 @@ mod tests {
     #[test]
     fn extension_info_parse_shape_is_distinct_from_status() {
         assert_eq!(
-            ExtensionArgs::parse(&mut ["info".to_owned(), "causal-dag".to_owned()].into_iter())
+            ExtensionArgs::parse(&mut ["info".to_owned(), "session-export".to_owned()].into_iter())
                 .expect("parse"),
             ExtensionArgs {
                 action: ExtensionAction::Info {
-                    id: "causal-dag".to_owned()
+                    id: "session-export".to_owned()
                 }
             }
         );

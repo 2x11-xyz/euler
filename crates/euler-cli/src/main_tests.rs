@@ -1769,9 +1769,9 @@ fn scrub_stdin_rejects_empty_lines_and_short_values() {
 
 #[test]
 fn observe_flag_parses_valid_extension_and_default_cadence() {
-    let args = parse_without_env(["--observe", "causal-dag"]);
+    let args = parse_without_env(["--observe", "session-export"]);
 
-    assert_eq!(args.observe.extension_id.as_deref(), Some("causal-dag"));
+    assert_eq!(args.observe.extension_id.as_deref(), Some("session-export"));
     assert_eq!(args.observe.cadence_rounds, None);
 }
 
@@ -1793,13 +1793,14 @@ fn observe_flag_defers_observer_capability_validation() {
 #[test]
 fn observe_flag_parse_edge_cases() {
     assert_eq!(
-        parse_args_error(["--observe", "causal-dag", "--observe", "causal-dag"]).to_string(),
+        parse_args_error(["--observe", "session-export", "--observe", "session-export"])
+            .to_string(),
         "--observe was provided more than once"
     );
     assert_eq!(
         parse_args_error([
             "--observe",
-            "causal-dag",
+            "session-export",
             "--observe-cadence",
             "4",
             "--observe-cadence",
@@ -1809,7 +1810,7 @@ fn observe_flag_parse_edge_cases() {
         "--observe-cadence was provided more than once"
     );
     assert_eq!(
-        parse_args_error(["--observe", "causal-dag", "--observe-cadence", "0"]).to_string(),
+        parse_args_error(["--observe", "session-export", "--observe-cadence", "0"]).to_string(),
         "--observe-cadence requires a positive integer"
     );
     assert_eq!(
@@ -1827,47 +1828,22 @@ fn observe_cadence_requires_observe() {
 }
 
 #[test]
-fn observe_requires_extension_enabled_set() {
-    let run = parse_without_env(["--observe", "causal-dag", "--extensions", "none"]);
-    let root = tempfile::tempdir().expect("root");
-    let enabled = resolve_session_extensions(root.path(), &run.extensions).expect("extensions");
+fn observe_unlinked_extension_id_is_an_honest_error() {
+    // Hermetic registry: an EULER_HOME with no linked extensions, so the
+    // resolve cannot see a developer machine's real registry.
+    let home = tempfile::tempdir().expect("home");
+    std::env::set_var("EULER_HOME", home.path());
+    let run = parse_without_env(["--observe", "no-such-extension"]);
 
-    let error = match resolve_round_observer(&run.observe, &enabled) {
-        Ok(_) => panic!("expected observer disabled"),
+    let error = match resolve_round_observer(&run.observe) {
+        Ok(_) => panic!("expected unknown extension id error"),
         Err(error) => error,
     };
 
     assert_eq!(
         error.to_string(),
-        "--observe causal-dag requires extension causal-dag to be enabled; enable it with --extensions causal-dag or your Euler extension registry/project config"
+        "--observe no-such-extension: unknown extension id; link or install extension no-such-extension first"
     );
-}
-
-#[test]
-fn observer_wiring_uses_bundled_command_pair() {
-    let run = parse_without_env(["--observe", "causal-dag", "--extensions", "causal-dag"]);
-    let root = tempfile::tempdir().expect("root");
-    let enabled = resolve_session_extensions(root.path(), &run.extensions).expect("extensions");
-    let (observer, _) = resolve_round_observer(&run.observe, &enabled)
-        .expect("observer")
-        .expect("configured");
-    let descriptor = bundled_descriptor_by_id("causal-dag")
-        .expect("descriptor")
-        .expect("causal-dag descriptor");
-    let commands = descriptor
-        .observer_commands
-        .expect("causal-dag observer commands");
-    let mut config = session_config(
-        root.path().to_path_buf(),
-        run.provider_id,
-        run.model,
-        "session-id".to_owned(),
-    );
-    config.round_observer = Some(observer);
-    let observer = config.round_observer.expect("observer config");
-
-    assert_eq!(observer.brief_command, commands.brief);
-    assert_eq!(observer.apply_command, commands.apply);
 }
 
 #[test]
@@ -2400,11 +2376,17 @@ fn parse_with_preference_and_catalog<const N: usize>(
 fn extensions_flag_is_rejected_where_no_session_exists() {
     for (args, expected) in [
         (
-            &["models", "--extensions", "maxproof"][..],
+            &["models", "--extensions", "session-export"][..],
             "--extensions is not supported with models",
         ),
         (
-            &["login", "--provider", "chatgpt", "--extensions", "maxproof"][..],
+            &[
+                "login",
+                "--provider",
+                "chatgpt",
+                "--extensions",
+                "session-export",
+            ][..],
             "--extensions is not supported with login",
         ),
         (
@@ -2413,28 +2395,33 @@ fn extensions_flag_is_rejected_where_no_session_exists() {
                 "--provider",
                 "chatgpt",
                 "--extensions",
-                "maxproof",
+                "session-export",
             ][..],
             "--extensions is not supported with logout",
         ),
         (
-            &["auth", "status", "--extensions", "maxproof"][..],
+            &["auth", "status", "--extensions", "session-export"][..],
             "--extensions is not supported with auth status",
         ),
         (
-            &["session-export", "events.jsonl", "--extensions", "maxproof"][..],
+            &[
+                "session-export",
+                "events.jsonl",
+                "--extensions",
+                "session-export",
+            ][..],
             "--extensions is not supported with session-export",
         ),
         (
-            &["session-export", "--extensions", "maxproof"][..],
+            &["session-export", "--extensions", "session-export"][..],
             "session-export requires a session id, name, or events path before `--extensions`",
         ),
         (
-            &["--replay", "events.jsonl", "--extensions", "maxproof"][..],
+            &["--replay", "events.jsonl", "--extensions", "session-export"][..],
             "--extensions is not supported with --replay",
         ),
         (
-            &["extension", "list", "--extensions", "maxproof"][..],
+            &["extension", "list", "--extensions", "session-export"][..],
             "extension list does not accept arguments: --extensions",
         ),
     ] {

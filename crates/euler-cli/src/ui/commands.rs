@@ -2,8 +2,6 @@ use super::theme::ThemeChoice;
 use euler_core::{ActiveGrant, ApprovalMode, GrantSource, ReasoningEffort};
 use euler_sdk::Capability;
 
-mod causal_dag;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
     pub token: &'static str,
@@ -22,14 +20,12 @@ pub struct CommandContext {
     pub effort_choices: Vec<EffortChoice>,
     pub theme_choices: Vec<ThemeChoiceItem>,
     pub checkpoint_items: Vec<CheckpointItem>,
-    /// Bundled + linked extensions for the `/extension` manager and palette.
+    /// Linked extensions for the `/extension` manager and palette.
     pub extension_items: Vec<ExtensionManagerItem>,
     /// Extension slash entries (⋄ annotated in the palette).
     pub extension_slash_commands: Vec<ExtensionSlashCommand>,
     /// Saved `/code-swarm` reviewer model set (provider::model strings).
     pub code_swarm_models: Vec<String>,
-    /// Current causal-DAG counts for its extension-owned picker surface.
-    pub causal_dag_stats: Option<CausalDagStats>,
     /// Current session-local compaction controls for `/compaction`.
     pub compaction: CompactionSettings,
 }
@@ -49,20 +45,12 @@ impl Default for CompactionSettings {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CausalDagStats {
-    pub session_id: String,
-    pub node_count: usize,
-    pub cross_arc_count: usize,
-}
-
 /// One extension row for the `/extension` manager picker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtensionManagerItem {
     pub id: String,
     pub display_name: String,
     pub enabled: bool,
-    pub bundled: bool,
     pub materialization: Option<String>,
     pub version: String,
     pub commands: Vec<ExtensionCommandItem>,
@@ -99,13 +87,9 @@ impl ExtensionManagerItem {
             ),
             format!(
                 "source: {}",
-                if self.bundled {
-                    "bundled".to_owned()
-                } else {
-                    self.materialization
-                        .clone()
-                        .unwrap_or_else(|| "linked".to_owned())
-                }
+                self.materialization
+                    .clone()
+                    .unwrap_or_else(|| "linked".to_owned())
             ),
         ];
         if !self.commands.is_empty() {
@@ -129,9 +113,6 @@ impl ExtensionManagerItem {
         }
         if let Some(audit) = &self.audit_status {
             lines.push(format!("audit: {audit}"));
-        }
-        if self.bundled {
-            lines.push("bundled extensions can be toggled but not removed".to_owned());
         }
         lines.join("\n")
     }
@@ -568,10 +549,6 @@ pub enum CommandAction {
     ShowDiff,
     /// Token breakdown for the session (costs only when catalog prices exist).
     ShowUsage,
-    /// Drill from the causal-DAG action picker into its export formats.
-    OpenCausalDagExport {
-        stats: CausalDagStats,
-    },
     /// Open the extensions manager picker.
     OpenExtensionManager,
     /// Toggle extension enablement (registry + live session set).
@@ -583,7 +560,7 @@ pub enum CommandAction {
     ExtensionDetails {
         id: String,
     },
-    /// Remove a non-bundled extension (unlink/uninstall).
+    /// Remove a linked or installed extension (unlink/uninstall).
     ExtensionRemove {
         id: String,
     },
@@ -619,8 +596,6 @@ pub enum PickerSpec {
         selected: Vec<String>,
         user_tier: bool,
     },
-    CausalDagActions(CausalDagStats),
-    CausalDagFormats(CausalDagStats),
     Compaction(CompactionSettings),
     /// §5.1 Advanced, one level down from the posture picker.
     PermissionsAdvanced(Vec<PermissionChoice>),
@@ -842,17 +817,6 @@ pub fn build_extension_slash_commands(
     let mut claimed = core_tokens;
     let mut out = Vec::new();
     for item in items {
-        if item.id == "causal-dag" {
-            claimed.insert("causal-dag".to_owned());
-            out.push(ExtensionSlashCommand {
-                token: "/causal-dag".to_owned(),
-                summary: "causal-dag · view, export, or refresh".to_owned(),
-                extension_id: item.id.clone(),
-                command: "surface".to_owned(),
-                enabled: item.enabled,
-            });
-            continue;
-        }
         if item.id == "code-swarm" {
             // TUI-side surface (picker + orchestration) keyed to this
             // extension; dispatched by the explicit "/code-swarm" arm, never
@@ -1046,7 +1010,6 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/timestamps" => CommandEffect::Action(CommandAction::ToggleTimestamps),
         "/diff" => CommandEffect::Action(CommandAction::ShowDiff),
         "/usage" => CommandEffect::Action(CommandAction::ShowUsage),
-        "/causal-dag" => causal_dag::effect(parsed.arg, context),
         "/code-swarm" => code_swarm_effect(parsed.arg, context),
         token => extension_slash_or_unknown(token, parsed.arg, context),
     }
@@ -1579,10 +1542,10 @@ mod tests {
             })
         );
         assert_eq!(
-            dispatch_command("/extension run causal-dag.catch-up", &context),
+            dispatch_command("/extension run session-export.session-export", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
-                id: "causal-dag".to_owned(),
-                command: "catch-up".to_owned(),
+                id: "session-export".to_owned(),
+                command: "session-export".to_owned(),
                 input: serde_json::json!({}),
                 raw_args: None,
             })
@@ -1741,8 +1704,7 @@ mod tests {
                 id: "code-swarm".to_owned(),
                 display_name: "CodeSwarm Review".to_owned(),
                 enabled,
-                bundled: true,
-                materialization: None,
+                materialization: Some("linked".to_owned()),
                 version: "0.1.0".to_owned(),
                 // Mirrors production: the real ReviewCommand descriptor is
                 // AgentOnly, so a fixture claiming otherwise would test a
@@ -1910,10 +1872,10 @@ mod tests {
         // behavior under test was never CodeSwarm-specific.)
         let context = CommandContext {
             extension_slash_commands: vec![ExtensionSlashCommand {
-                token: "/catch-up".to_owned(),
-                summary: "causal-dag · catch-up".to_owned(),
-                extension_id: "causal-dag".to_owned(),
-                command: "catch-up".to_owned(),
+                token: "/summarize".to_owned(),
+                summary: "note-taker · summarize".to_owned(),
+                extension_id: "note-taker".to_owned(),
+                command: "summarize".to_owned(),
                 enabled: true,
             }],
             ..CommandContext::default()
@@ -1921,40 +1883,40 @@ mod tests {
 
         // JSON argument parses into the input.
         assert_eq!(
-            dispatch_command("/catch-up {\"format\":\"json\"}", &context),
+            dispatch_command("/summarize {\"format\":\"json\"}", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
-                id: "causal-dag".to_owned(),
-                command: "catch-up".to_owned(),
+                id: "note-taker".to_owned(),
+                command: "summarize".to_owned(),
                 input: serde_json::json!({"format": "json"}),
                 raw_args: None,
             })
         );
         // Flag arguments travel to resolve-time ArgSpec parsing.
         assert_eq!(
-            dispatch_command("/catch-up --format json", &context),
+            dispatch_command("/summarize --format json", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
-                id: "causal-dag".to_owned(),
-                command: "catch-up".to_owned(),
+                id: "note-taker".to_owned(),
+                command: "summarize".to_owned(),
                 input: serde_json::json!({}),
                 raw_args: Some("--format json".to_owned()),
             })
         );
         // Invalid JSON is an error, not a silent default run.
         assert!(matches!(
-            dispatch_command("/catch-up {broken", &context),
+            dispatch_command("/summarize {broken", &context),
             CommandEffect::Message(message) if message.contains("must be JSON")
         ));
         // Free text is a usage error, not a silent default run.
         assert!(matches!(
-            dispatch_command("/catch-up json please", &context),
+            dispatch_command("/summarize json please", &context),
             CommandEffect::Message(message) if message.contains("usage:")
         ));
         // No argument still dispatches with empty input.
         assert_eq!(
-            dispatch_command("/catch-up", &context),
+            dispatch_command("/summarize", &context),
             CommandEffect::Action(CommandAction::ExtensionRun {
-                id: "causal-dag".to_owned(),
-                command: "catch-up".to_owned(),
+                id: "note-taker".to_owned(),
+                command: "summarize".to_owned(),
                 input: serde_json::json!({}),
                 raw_args: None,
             })
@@ -1965,17 +1927,17 @@ mod tests {
     fn disabled_extension_slash_teaches_instead_of_unknown() {
         let context = CommandContext {
             extension_slash_commands: vec![ExtensionSlashCommand {
-                token: "/catch-up".to_owned(),
-                summary: "causal-dag · catch-up".to_owned(),
-                extension_id: "causal-dag".to_owned(),
-                command: "catch-up".to_owned(),
+                token: "/summarize".to_owned(),
+                summary: "note-taker · summarize".to_owned(),
+                extension_id: "note-taker".to_owned(),
+                command: "summarize".to_owned(),
                 enabled: false,
             }],
             ..CommandContext::default()
         };
         assert_eq!(
-            dispatch_command("/catch-up", &context),
-            CommandEffect::Notice(disabled_extension_teach("/catch-up", "causal-dag"))
+            dispatch_command("/summarize", &context),
+            CommandEffect::Notice(disabled_extension_teach("/summarize", "note-taker"))
         );
     }
 
@@ -1984,23 +1946,22 @@ mod tests {
         // Third entrance (review v2 §14.4): `/extension run <ext>.<cmd>`.
         let context = CommandContext {
             extension_items: vec![ExtensionManagerItem {
-                id: "causal-dag".to_owned(),
-                display_name: "Causal DAG".to_owned(),
+                id: "note-taker".to_owned(),
+                display_name: "Note Taker".to_owned(),
                 enabled: false,
-                bundled: true,
-                materialization: None,
+                materialization: Some("linked".to_owned()),
                 version: "0.1.0".to_owned(),
-                commands: vec![ExtensionCommandItem::user("catch-up")],
+                commands: vec![ExtensionCommandItem::user("summarize")],
                 capabilities: vec![],
                 audit_status: None,
             }],
             ..CommandContext::default()
         };
         assert_eq!(
-            dispatch_command("/extension run causal-dag.catch-up", &context),
+            dispatch_command("/extension run note-taker.summarize", &context),
             CommandEffect::Notice(disabled_extension_teach(
-                "/causal-dag.catch-up",
-                "causal-dag"
+                "/note-taker.summarize",
+                "note-taker"
             ))
         );
     }
@@ -2039,7 +2000,7 @@ mod tests {
             CommandEffect::Action(CommandAction::OpenExtensionManager)
         );
         assert_eq!(
-            dispatch_command("/extension run causal-dag", &context),
+            dispatch_command("/extension run note-taker", &context),
             CommandEffect::Message(
                 "usage: /extension  or  /extension run <ext>.<cmd> [json-input]".to_owned()
             )
@@ -2057,7 +2018,7 @@ mod tests {
             CommandEffect::Message("unknown command: /dag".to_owned())
         );
         assert!(matches!(
-            dispatch_command("/extension run causal-dag.catch-up {", &context),
+            dispatch_command("/extension run note-taker.summarize {", &context),
             CommandEffect::Message(message) if message.starts_with("extension input must be JSON:")
         ));
         assert_eq!(

@@ -1,4 +1,3 @@
-use crate::bundled_extensions::bundled_descriptors;
 use anyhow::{anyhow, Result};
 use euler_core::{EulerHome, ExtensionEnablement, ExtensionRegistry};
 use serde::Deserialize;
@@ -30,8 +29,8 @@ pub(crate) fn resolve_session_extensions(
     root: &Path,
     selection: &ExtensionSelection,
 ) -> Result<BTreeSet<String>> {
-    let valid = valid_bundled_ids()?;
     if let Some(value) = selection.cli_value.as_deref() {
+        let valid = valid_registry_ids()?;
         return parse_cli_extensions(value, &valid);
     }
     resolve_registry_project_extensions(root)
@@ -53,7 +52,7 @@ pub(crate) struct RegistryResolution {
 
 impl RegistryResolution {
     pub(crate) fn load() -> Result<Self> {
-        let valid = valid_bundled_ids()?;
+        let valid = valid_registry_ids()?;
         let registry = ExtensionRegistry::open_read_only(EulerHome::resolve()?);
         let enabled = registry_enabled_set(&registry, &valid)?;
         Ok(Self { valid, enabled })
@@ -71,8 +70,11 @@ fn registry_enabled_set(
     let valid_set = valid.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut enabled = BTreeSet::new();
     for (id, state) in registry.enablement_states()? {
+        // Enablement entries for ids no longer present (e.g. formerly bundled
+        // extensions) are stale state, not corruption: skip them rather than
+        // failing every session after an upgrade.
         if !valid_set.contains(id.as_str()) {
-            return Err(unknown_registry_id_error(&id, valid));
+            continue;
         }
         if state == ExtensionEnablement::Enabled {
             enabled.insert(id);
@@ -131,10 +133,12 @@ fn apply_project_overlay(
     Ok(())
 }
 
-fn valid_bundled_ids() -> Result<Vec<String>> {
-    Ok(bundled_descriptors()?
+fn valid_registry_ids() -> Result<Vec<String>> {
+    let registry = ExtensionRegistry::open_read_only(EulerHome::resolve()?);
+    Ok(registry
+        .linked_extensions()?
         .into_iter()
-        .map(|descriptor| descriptor.id)
+        .map(|linked| linked.id)
         .collect())
 }
 
@@ -143,25 +147,23 @@ fn project_extensions_path(root: &Path) -> PathBuf {
 }
 
 fn unknown_cli_id_error(id: &str, valid: &[String]) -> anyhow::Error {
-    anyhow!(
-        "unknown extension id: {id}; valid ids: {}",
-        valid.join(", ")
-    )
-}
-
-fn unknown_registry_id_error(id: &str, valid: &[String]) -> anyhow::Error {
-    anyhow!(
-        "unknown extension id in user registry: {id}; valid ids: {}",
-        valid.join(", ")
-    )
+    anyhow!("unknown extension id: {id}; {}", valid_ids_hint(valid))
 }
 
 fn unknown_project_id_error(path: &Path, id: &str, valid: &[String]) -> anyhow::Error {
     anyhow!(
-        "unknown extension id in {}: {id}; valid ids: {}",
+        "unknown extension id in {}: {id}; {}",
         path.display(),
-        valid.join(", ")
+        valid_ids_hint(valid)
     )
+}
+
+fn valid_ids_hint(valid: &[String]) -> String {
+    if valid.is_empty() {
+        "no extensions are linked or installed; add one with `euler extension link` or `euler extension install`".to_owned()
+    } else {
+        format!("valid ids: {}", valid.join(", "))
+    }
 }
 
 fn malformed_project_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
