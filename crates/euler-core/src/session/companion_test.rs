@@ -46,6 +46,68 @@ fn companion_tool_output_is_redacted() {
 }
 
 #[test]
+fn companion_batched_tool_calls_replay_as_calls_then_outputs() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (temp, _log, mut session) = session_with_provider(
+        CapturingScriptedProvider {
+            inner: ScriptedProvider::new(vec![
+                FixtureResponse::ToolCalls(vec![
+                    ToolCall {
+                        id: "call-a".to_owned(),
+                        name: "read_file".to_owned(),
+                        input: json!({"path": "a.txt"}),
+                    },
+                    ToolCall {
+                        id: "call-b".to_owned(),
+                        name: "read_file".to_owned(),
+                        input: json!({"path": "b.txt"}),
+                    },
+                ]),
+                FixtureResponse::Assistant("done".to_owned()),
+            ]),
+            requests: Arc::clone(&requests),
+        },
+        ScriptedDecider::new(Vec::new()),
+    );
+    std::fs::write(temp.path().join("a.txt"), "alpha").expect("a");
+    std::fs::write(temp.path().join("b.txt"), "bravo").expect("b");
+
+    let summary = session
+        .spawn_companion(task_with_caps([Capability::FsRead]))
+        .expect("companion");
+
+    assert!(summary.result.ok());
+    let requests = requests.lock().expect("requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool calls should trigger a follow-up round"
+    );
+    let replay = requests[1]
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            euler_provider::ModelInputItem::ToolCall { call_id, .. } => {
+                Some(format!("call:{call_id}"))
+            }
+            euler_provider::ModelInputItem::ToolOutput { call_id, .. } => {
+                Some(format!("output:{call_id}"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replay,
+        vec![
+            "call:call-a",
+            "call:call-b",
+            "output:call-a",
+            "output:call-b"
+        ]
+    );
+}
+
+#[test]
 fn companion_provider_error_message_is_redacted() {
     // F8: the companion loop has its own provider-error emission site; it
     // must apply the same redaction chokepoint as the parent session.
@@ -851,6 +913,28 @@ impl ModelProvider for RequestCapture {
             ]
             .into_iter(),
         ))
+    }
+}
+
+struct CapturingScriptedProvider {
+    inner: ScriptedProvider,
+    requests: Arc<Mutex<Vec<euler_provider::ModelRequest>>>,
+}
+
+impl ModelProvider for CapturingScriptedProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(
+        &self,
+        request: euler_provider::ModelRequest,
+    ) -> Result<ProviderStream, euler_provider::ProviderError> {
+        self.requests
+            .lock()
+            .expect("requests")
+            .push(request.clone());
+        self.inner.invoke(request)
     }
 }
 

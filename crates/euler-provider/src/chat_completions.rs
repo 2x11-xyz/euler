@@ -268,12 +268,40 @@ fn chat_messages(request: &ModelRequest, options: &ChatCompletionsOptions) -> Ve
     // carrying the tool calls or final content of that turn — per OpenRouter's
     // reasoning-tokens preservation rules.
     let mut pending_reasoning_details: Vec<Value> = Vec::new();
+    let mut pending_tool_call_message: Option<Value> = None;
     for item in &request.input {
         if options.reasoning_details_enabled() {
             if let Some(details) = reasoning_details_from_item(item) {
                 pending_reasoning_details.extend(details);
                 continue;
             }
+        }
+        if let ModelInputItem::ToolCall {
+            call_id,
+            name,
+            arguments,
+        } = item
+        {
+            let message = pending_tool_call_message.get_or_insert_with(|| {
+                let mut message = json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [],
+                });
+                if !pending_reasoning_details.is_empty() {
+                    message["reasoning_details"] =
+                        Value::Array(std::mem::take(&mut pending_reasoning_details));
+                }
+                message
+            });
+            message["tool_calls"]
+                .as_array_mut()
+                .expect("tool_calls is an array")
+                .push(chat_tool_call(call_id, name, arguments));
+            continue;
+        }
+        if let Some(message) = pending_tool_call_message.take() {
+            messages.push(message);
         }
         if let Some(mut message) = chat_message(item) {
             if !pending_reasoning_details.is_empty() && message["role"] == "assistant" {
@@ -282,6 +310,9 @@ fn chat_messages(request: &ModelRequest, options: &ChatCompletionsOptions) -> Ve
             }
             messages.push(message);
         }
+    }
+    if let Some(message) = pending_tool_call_message {
+        messages.push(message);
     }
     messages
 }
@@ -320,22 +351,7 @@ fn chat_message(item: &ModelInputItem) -> Option<Value> {
             },
             "content": content,
         })),
-        ModelInputItem::ToolCall {
-            call_id,
-            name,
-            arguments,
-        } => Some(json!({
-            "role": "assistant",
-            "content": Value::Null,
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": arguments.to_string(),
-                },
-            }],
-        })),
+        ModelInputItem::ToolCall { .. } => None,
         ModelInputItem::ToolOutput {
             call_id,
             name: _,
@@ -358,6 +374,17 @@ fn chat_message(item: &ModelInputItem) -> Option<Value> {
         }
         ModelInputItem::Reasoning { .. } => None,
     }
+}
+
+fn chat_tool_call(call_id: &str, name: &str, arguments: &Value) -> Value {
+    json!({
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments.to_string(),
+        },
+    })
 }
 
 fn tool_definition(tool: &ToolDefinition) -> Value {

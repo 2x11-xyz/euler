@@ -266,8 +266,10 @@ fn three_consecutive_denials_trip_the_circuit_breaker_and_interrupt_the_turn() {
         payload_str(errors[0], "message"),
         Some("turn interrupted: 3 consecutive guardian permission denials")
     );
-    // The fourth tool call was never dispatched and no further model round
-    // ran: 1 root model.call + 3 guardian reviews.
+    // The provider returned all four calls in one assistant batch. The
+    // guardian reviews only the first three, then the circuit breaker closes
+    // the unattempted tail call with a failed tool result so replay never
+    // sees an open provider-emitted call.
     let root_calls = events_of(session.events(), EventKind::MODEL_CALL)
         .into_iter()
         .filter(|event| event.agent == ROOT_AGENT)
@@ -277,7 +279,20 @@ fn three_consecutive_denials_trip_the_circuit_breaker_and_interrupt_the_turn() {
         .into_iter()
         .filter(|event| event.agent == ROOT_AGENT)
         .count();
-    assert_eq!(root_tool_calls, 3);
+    assert_eq!(root_tool_calls, 4);
+    let root_tool_results = events_of(session.events(), EventKind::TOOL_RESULT)
+        .into_iter()
+        .filter(|event| event.agent == ROOT_AGENT)
+        .collect::<Vec<_>>();
+    assert_eq!(root_tool_results.len(), 4);
+    assert_eq!(payload_str(root_tool_results[3], "id"), Some("call-4"));
+    assert_eq!(root_tool_results[3].payload["ok"], json!(false));
+    assert_eq!(
+        payload_str(root_tool_results[3], "error"),
+        Some(
+            "permission denied: the guardian interrupted this turn before this batched call could run"
+        )
+    );
 }
 
 #[test]

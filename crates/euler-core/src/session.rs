@@ -27,7 +27,7 @@ use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{
     ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent, ProviderError,
     ProviderSet, ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason,
-    Usage,
+    ToolCall, Usage,
 };
 use euler_sdk::{Capability, EventWakeError, EventWakeRegistration, Extension};
 use round_loop::{
@@ -69,7 +69,7 @@ const CONTEXT_LIMIT_MESSAGE: &str =
     "Session stopped because the context limit threshold was reached.";
 const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
-const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. To create a new file, prefer write_file. For code and text file updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff. Write plain prose without emoji or decorative symbols; the terminal ledger renders a fixed glyph vocabulary only.";
+const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. To create a new file, prefer write_file. For code and text file updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. When operations are independent (reading several files, running separate inspections), issue them as multiple tool calls in a single response rather than one at a time. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff. Write plain prose without emoji or decorative symbols; the terminal ledger renders a fixed glyph vocabulary only.";
 
 /// The byte length of the fixed Euler instructions the root driver sends. This
 /// is the `fixed_instruction_bytes` term of the project-context admission-time
@@ -399,6 +399,8 @@ where
     rounds: &'a mut u64,
 }
 
+type RecordedToolCall = (ToolCall, String);
+
 impl<F, D> RoundLoopIo for SessionRoundIo<'_, '_, F, D>
 where
     F: FnMut(&EventEnvelope),
@@ -514,37 +516,7 @@ where
             return Ok(RoundOutcome::Complete(()));
         }
 
-        for call in data.tool_calls {
-            self.session.execute_tool_call(
-                call,
-                model_result_id.clone(),
-                self.sink,
-                self.turn_state,
-            )?;
-            self.sink.flush(self.session.bus.events());
-            if self.turn_state.guardian_interrupted() {
-                // Circuit breaker (ADR 0011): consecutive guardian denials
-                // end the turn instead of letting the model keep thrashing
-                // against the gate. The denied tool result is already
-                // recorded; remaining calls in this round are not attempted.
-                self.session.emit(
-                    EventKind::ERROR,
-                    object([
-                        ("source", "guardian".into()),
-                        (
-                            "message",
-                            crate::guardian::GUARDIAN_TURN_INTERRUPT_MESSAGE.into(),
-                        ),
-                    ]),
-                )?;
-                self.sink.flush(self.session.bus.events());
-                return Ok(RoundOutcome::Complete(()));
-            }
-            if cancel_flag.load(Ordering::Relaxed) {
-                return Err(SessionError::Cancelled);
-            }
-        }
-        Ok(RoundOutcome::Continue)
+        self.finish_tool_round(&model_result_id, data.tool_calls, cancel_flag)
     }
 
     fn round_completed(&mut self) {
@@ -607,6 +579,83 @@ where
         )?;
         self.sink.flush(self.session.bus.events());
         Ok(())
+    }
+}
+
+impl<'a, 'sink, F, D> SessionRoundIo<'a, 'sink, F, D>
+where
+    F: FnMut(&EventEnvelope),
+    D: PermissionDecider,
+{
+    fn finish_tool_round(
+        &mut self,
+        model_result_id: &str,
+        tool_calls: Vec<ToolCall>,
+        cancel_flag: &AtomicBool,
+    ) -> Result<RoundOutcome, SessionError> {
+        let recorded_calls = self.record_tool_call_batch(model_result_id, tool_calls)?;
+        let mut remaining_calls = recorded_calls.into_iter();
+        while let Some((call, tool_call_event_id)) = remaining_calls.next() {
+            self.session.execute_recorded_tool_call(
+                call,
+                tool_call_event_id,
+                self.sink,
+                self.turn_state,
+            )?;
+            self.sink.flush(self.session.bus.events());
+            if self.turn_state.guardian_interrupted() {
+                return self.finish_guardian_interrupted_batch(remaining_calls);
+            }
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err(SessionError::Cancelled);
+            }
+        }
+        Ok(RoundOutcome::Continue)
+    }
+
+    fn record_tool_call_batch(
+        &mut self,
+        model_result_id: &str,
+        tool_calls: Vec<ToolCall>,
+    ) -> Result<Vec<RecordedToolCall>, SessionError> {
+        let mut recorded_calls = Vec::with_capacity(tool_calls.len());
+        for call in tool_calls {
+            let tool_call_event_id =
+                self.session
+                    .record_tool_call(&call, model_result_id, self.sink)?;
+            recorded_calls.push((call, tool_call_event_id));
+        }
+        Ok(recorded_calls)
+    }
+
+    fn finish_guardian_interrupted_batch(
+        &mut self,
+        remaining_calls: impl IntoIterator<Item = RecordedToolCall>,
+    ) -> Result<RoundOutcome, SessionError> {
+        // Circuit breaker (ADR 0011): consecutive guardian denials end the
+        // turn instead of letting the model keep thrashing against the gate.
+        // The calls in this provider-emitted batch were already recorded, so
+        // close unattempted calls explicitly before ending the turn.
+        for (pending_call, pending_event_id) in remaining_calls {
+            self.session.emit_permission_denied_tool_result(
+                pending_call,
+                pending_event_id,
+                "permission denied: the guardian interrupted this turn before this batched call \
+                 could run",
+            )?;
+        }
+        self.session.emit(
+            EventKind::ERROR,
+            object([
+                ("source", "guardian".into()),
+                (
+                    "message",
+                    crate::guardian::GUARDIAN_TURN_INTERRUPT_MESSAGE.into(),
+                ),
+            ]),
+        )?;
+        self.sink.flush(self.session.bus.events());
+        Ok(RoundOutcome::Complete(()))
     }
 }
 
