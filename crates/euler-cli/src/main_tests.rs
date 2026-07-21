@@ -1855,7 +1855,9 @@ fn linked_launch_consent_joins_the_session_extension_set() {
     std::env::set_var("EULER_HOME", home.path());
     let extension_dir = tempfile::tempdir().expect("extension dir");
     std::fs::write(
-        extension_dir.path().join(euler_core::EXTENSION_MANIFEST_FILE),
+        extension_dir
+            .path()
+            .join(euler_core::EXTENSION_MANIFEST_FILE),
         r#"{
   "version": 1,
   "id": "example-extension",
@@ -1875,12 +1877,10 @@ fn linked_launch_consent_joins_the_session_extension_set() {
 }"#,
     )
     .expect("write extension manifest");
-    let registry = euler_core::ExtensionRegistry::new(
-        euler_core::EulerHome::resolve().expect("euler home"),
-    )
-    .expect("registry");
-    let package =
-        euler_sdk::load_extension_package(extension_dir.path()).expect("load package");
+    let registry =
+        euler_core::ExtensionRegistry::new(euler_core::EulerHome::resolve().expect("euler home"))
+            .expect("registry");
+    let package = euler_sdk::load_extension_package(extension_dir.path()).expect("load package");
     registry.link_package(package).expect("link package");
     registry
         .set_linked_execution_enabled("example-extension", true)
