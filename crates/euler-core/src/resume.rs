@@ -145,6 +145,15 @@ pub fn fold_session(
             EventKind::PERMISSION_PROMPT => {
                 warn_if_permission_prompt_unresolved(event, &events, &mut warnings)
             }
+            // Permission epoch (ADR 0017 phase 3): accepting a relocation
+            // invalidates every session-scoped grant recorded before it, so an
+            // earlier shell-exec or fs-write session grant cannot silently
+            // authorize an operation in the newly adopted folder. The ordered
+            // fold clears the accumulator here; only grants recorded after the
+            // latest relocation survive. Project grants reload from the new
+            // root's own consent intersection, and durable user rules (which
+            // are workspace-independent) are unaffected.
+            EventKind::PROJECT_CONTEXT_RELOCATED => session_allowed_capabilities.clear(),
             _ => {}
         }
     }
@@ -709,4 +718,118 @@ fn hash_bytes(bytes: &[u8]) -> String {
 
 fn is_known_kind(kind: &str) -> bool {
     EventKind::ALL.contains(&kind)
+}
+
+#[cfg(test)]
+mod relocation_epoch_tests {
+    use super::*;
+    use crate::project_context::ProjectContextBootstrap;
+    use crate::redaction::SecretRedactor;
+    use crate::session_root::session_root_for_event;
+
+    fn session_start(root_display: &str, summary: Value) -> EventEnvelope {
+        EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::SESSION_START,
+            object([
+                ("provider", "fixture".into()),
+                ("model", "m".into()),
+                ("root", root_display.into()),
+                ("project_context", summary),
+            ]),
+        )
+    }
+
+    fn config_for(root: &Path) -> SessionConfig {
+        let mut config = SessionConfig::new(root.to_path_buf());
+        config.agent_id = "root".to_owned();
+        config.provider = "fixture".to_owned();
+        config.model = "m".to_owned();
+        config
+    }
+
+    fn session_grant(parent: &str) -> EventEnvelope {
+        EventEnvelope::new(
+            "session",
+            "root",
+            Some(parent.to_owned()),
+            EventKind::PERMISSION_DECISION,
+            object([
+                ("scope", "session".into()),
+                ("decision", "allowed".into()),
+                ("capability", Capability::ShellExec.as_str().into()),
+            ]),
+        )
+    }
+
+    // Attack: a session-scoped grant recorded before an accepted relocation
+    // must not silently authorize an operation in the newly adopted folder.
+    #[test]
+    fn session_grants_before_a_relocation_are_invalidated() {
+        let temp = tempfile::tempdir().expect("temp");
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        std::fs::create_dir_all(&old).expect("old");
+        std::fs::create_dir_all(&new).expect("new");
+        let redactor = SecretRedactor::new();
+        let old_boot = ProjectContextBootstrap::dormant(&old, &redactor).expect("old boot");
+        let new_boot = ProjectContextBootstrap::dormant(&new, &redactor).expect("new boot");
+        let old_snap = old_boot.snapshot_payload();
+        let prior_identity = old_snap
+            .get("workspace_identity")
+            .expect("identity")
+            .clone();
+        let new_identity = new_boot
+            .snapshot_payload()
+            .get("workspace_identity")
+            .expect("identity")
+            .clone();
+        let old_root_display = session_root_for_event(&old);
+        let new_root_display = session_root_for_event(&new);
+
+        // Control: no relocation, resumed at the recorded root; the grant folds.
+        let start = session_start(&old_root_display, old_boot.session_start_summary());
+        let snap = EventEnvelope::new(
+            "session",
+            "root",
+            Some(start.id.clone()),
+            EventKind::PROJECT_CONTEXT_SNAPSHOT,
+            old_snap.clone(),
+        );
+        let grant = session_grant(&snap.id);
+        let folded = fold_session(
+            &config_for(&old),
+            vec![start.clone(), snap.clone(), grant.clone()],
+        )
+        .expect("fold at recorded root");
+        assert!(
+            folded
+                .session_allowed_capabilities
+                .contains(&Capability::ShellExec),
+            "without a relocation the session grant folds normally"
+        );
+
+        // Relocation: the pre-relocation grant is invalidated by the epoch.
+        let reloc = EventEnvelope::new(
+            "session",
+            "root",
+            Some(grant.id.clone()),
+            EventKind::PROJECT_CONTEXT_RELOCATED,
+            object([
+                ("schema_version", 1u64.into()),
+                ("prior_identity", prior_identity),
+                ("new_identity", new_identity),
+                ("new_root", new_root_display.into()),
+                ("decided_at", "2026-07-21T00:00:00Z".into()),
+            ]),
+        );
+        let folded = fold_session(&config_for(&new), vec![start, snap, grant, reloc])
+            .expect("fold at relocated root");
+        assert!(
+            folded.session_allowed_capabilities.is_empty(),
+            "the epoch must invalidate the pre-relocation session grant"
+        );
+    }
 }

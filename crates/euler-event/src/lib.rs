@@ -76,6 +76,11 @@ impl EventKind {
     /// source: stable reason code, bounded relative identity when one
     /// exists, and non-content numeric metadata only.
     pub const PROJECT_CONTEXT_DIAGNOSTIC: &'static str = "project.context.diagnostic";
+    /// Records an accepted resume workspace relocation (ADR 0017 phase 3): the
+    /// prior and new workspace identities, the new canonical root in display
+    /// form, and an audit acceptance stamp. An in-chain durable event that
+    /// governs later identity comparison and root projection.
+    pub const PROJECT_CONTEXT_RELOCATED: &'static str = "project.context.relocated";
     pub const ERROR: &'static str = "error";
     pub const ALL: &[&str] = &[
         Self::USER_MESSAGE,
@@ -118,6 +123,7 @@ impl EventKind {
         Self::SESSION_SUMMARY,
         Self::PROJECT_CONTEXT_SNAPSHOT,
         Self::PROJECT_CONTEXT_DIAGNOSTIC,
+        Self::PROJECT_CONTEXT_RELOCATED,
         Self::ERROR,
     ];
 
@@ -481,6 +487,7 @@ mod tests {
             EventKind::SESSION_SUMMARY,
             EventKind::PROJECT_CONTEXT_SNAPSHOT,
             EventKind::PROJECT_CONTEXT_DIAGNOSTIC,
+            EventKind::PROJECT_CONTEXT_RELOCATED,
             EventKind::ERROR,
         ];
 

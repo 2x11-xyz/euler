@@ -988,6 +988,15 @@ fn kind_from_events(events: &[euler_event::EventEnvelope]) -> Option<SessionKind
 }
 
 fn root_from_events(events: &[euler_event::EventEnvelope]) -> Option<PathBuf> {
+    // An accepted `project.context.relocated` supersedes the recorded root
+    // everywhere the first `session.start` root is used (ADR 0017 phase 3):
+    // the latest relocation's `new_root` governs listing, grouping, and the
+    // recorded path a later relocation card renders.
+    if let Some(new_root) = crate::project_context::projected_new_root(events) {
+        if let Some(path) = session_root_from_str(&new_root) {
+            return Some(path);
+        }
+    }
     events
         .iter()
         .find(|event| event.kind.as_str() == EventKind::SESSION_START)

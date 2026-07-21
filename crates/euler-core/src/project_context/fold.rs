@@ -7,10 +7,7 @@
 //! snapshot rejects resume or request assembly and never resurrects an
 //! older admitted snapshot.
 
-use super::digest::{
-    candidate_digest_v1, rendered_digest_v1, workspace_identity_digest_v1,
-    WORKSPACE_IDENTITY_ALGORITHM, WORKSPACE_IDENTITY_VERSION,
-};
+use super::digest::{candidate_digest_v1, rendered_digest_v1, workspace_identity_digest_v1};
 use super::framing::{render_project_context, FRAMING_VERSION};
 use super::manifest::{validate_identity, validate_reason_code, CandidateManifest};
 use super::{MAX_EULER_MD_SOURCES, MAX_MANIFEST_DIAGNOSTICS, SNAPSHOT_SCHEMA_VERSION};
@@ -699,38 +696,28 @@ pub(crate) enum WorkspaceIdentityIssue {
 /// Verify that the live workspace root is the workspace this session's
 /// snapshots were recorded in. Sessions without snapshots (legacy) verify
 /// trivially; false rejection is preferred to merging distinct roots.
+///
+/// The governing identity is relocation-aware: after an accepted
+/// `project.context.relocated` event, the latest relocation's `new_identity`
+/// governs, so a resume at the new path succeeds and a resume back at the old
+/// path is itself a mismatch. Any malformed or stale relocation in the chain
+/// makes the record unusable rather than falling back to an older identity.
 pub(crate) fn verify_workspace_identity(
     events: &[EventEnvelope],
     live_root: &Path,
 ) -> Result<(), WorkspaceIdentityIssue> {
-    let Some(snapshot) = events
-        .iter()
-        .rev()
-        .find(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_SNAPSHOT)
-    else {
-        return Ok(());
+    let snapshot_identity = match super::relocation::snapshot_identity(events) {
+        Ok(Some(identity)) => identity,
+        // Legacy session with no snapshot: nothing to compare against.
+        Ok(None) => return Ok(()),
+        Err(_) => return Err(WorkspaceIdentityIssue::Unusable),
     };
-    let Some(identity) = snapshot
-        .payload
-        .get("workspace_identity")
-        .and_then(Value::as_object)
-    else {
-        return Err(WorkspaceIdentityIssue::Unusable);
-    };
-    let algorithm = identity.get("algorithm").and_then(Value::as_str);
-    let version = identity.get("version").and_then(Value::as_u64);
-    let recorded_digest = identity.get("digest").and_then(Value::as_str);
-    if algorithm != Some(WORKSPACE_IDENTITY_ALGORITHM)
-        || version != Some(u64::from(WORKSPACE_IDENTITY_VERSION))
-    {
-        return Err(WorkspaceIdentityIssue::Unusable);
-    }
-    let Some(recorded_digest) = recorded_digest.filter(|digest| !digest.is_empty()) else {
-        return Err(WorkspaceIdentityIssue::Unusable);
-    };
+    let governing = super::relocation::fold_governing_identity(events, Some(snapshot_identity))
+        .map_err(|_| WorkspaceIdentityIssue::Unusable)?
+        .ok_or(WorkspaceIdentityIssue::Unusable)?;
     let canonical =
         std::fs::canonicalize(live_root).map_err(|_| WorkspaceIdentityIssue::Unresolvable)?;
-    if workspace_identity_digest_v1(&canonical) != recorded_digest {
+    if workspace_identity_digest_v1(&canonical) != governing.digest {
         return Err(WorkspaceIdentityIssue::Mismatch);
     }
     Ok(())

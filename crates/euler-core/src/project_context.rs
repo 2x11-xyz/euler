@@ -17,6 +17,9 @@ mod discovery;
 mod fold;
 mod framing;
 mod manifest;
+mod relocation;
+
+pub(crate) use relocation::projected_new_root;
 
 pub use acknowledgment::{AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError};
 

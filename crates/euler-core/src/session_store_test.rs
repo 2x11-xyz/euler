@@ -1373,3 +1373,32 @@ fn index_entries(store: &SessionStore) -> Vec<IndexEntry> {
         .map(|line| serde_json::from_str(line).expect("index entry"))
         .collect()
 }
+
+#[test]
+fn relocation_new_root_supersedes_the_session_start_root_projection() {
+    // The projected root is what listing, grouping, and resume checks use. An
+    // accepted relocation moves that projection to the new folder (ADR 0017).
+    let start = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::SESSION_START,
+        object([("root", "/home/ada/projects/euler".into())]),
+    );
+    assert_eq!(
+        root_from_events(std::slice::from_ref(&start)),
+        Some(std::path::PathBuf::from("/home/ada/projects/euler")),
+    );
+    let relocated = EventEnvelope::new(
+        "session",
+        "root",
+        Some(start.id.clone()),
+        EventKind::PROJECT_CONTEXT_RELOCATED,
+        object([("new_root", "/home/ada/projects/euler-fork".into())]),
+    );
+    assert_eq!(
+        root_from_events(&[start, relocated]),
+        Some(std::path::PathBuf::from("/home/ada/projects/euler-fork")),
+        "the latest relocation's new_root governs the projected root",
+    );
+}
