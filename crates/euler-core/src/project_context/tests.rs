@@ -994,11 +994,14 @@ fn unresolvable_workspace_is_the_only_preflight_error() {
     ));
 }
 
-/// Blocker 6: a directory level with more entries than the frozen cap is
-/// omitted whole with a typed diagnostic; at the cap it scans normally.
+/// Blocker 6 (revised by re-review): a directory level whose listing
+/// exceeds the frozen cap is indeterminate — its `.git` presence and its
+/// contents are equally unknowable — so the whole preflight fails closed
+/// instead of scanning a truncated listing or letting the boundary search
+/// continue past it. At the cap it scans normally.
 #[cfg(unix)]
 #[test]
-fn directory_entry_cap_omits_the_level_whole() {
+fn directory_entry_cap_fails_the_preflight_closed() {
     let temp = tempfile::tempdir().expect("temp");
     let repo = temp.path().join("repo");
     git_dir(&repo);
@@ -1018,8 +1021,9 @@ fn directory_entry_cap_omits_the_level_whole() {
     );
     assert!(!reasons(&bootstrap).contains(&"dir_entries_exceeded".to_owned()));
 
-    // cap + 1: the level is omitted whole — its EULER.md is NOT admitted,
-    // and no partial selection over the truncated listing occurs.
+    // cap + 1: the boundary is indeterminate; nothing is admitted anywhere
+    // on the chain — including the outer repo's file — and both typed
+    // records are present.
     let over_cap = repo.join("over-cap");
     fs::create_dir_all(&over_cap).expect("over-cap");
     write(&over_cap.join("EULER.md"), "over-cap rules");
@@ -1027,14 +1031,92 @@ fn directory_entry_cap_omits_the_level_whole() {
         fs::write(over_cap.join(format!("f{index:04}")), b"").expect("filler");
     }
     let bootstrap = admitted(&over_cap);
-    assert_eq!(source_paths(&bootstrap), vec!["EULER.md"]);
+    assert!(source_paths(&bootstrap).is_empty(), "nothing admitted");
+    // Even the admitted (test-hook) path resolves disabled: an
+    // indeterminate boundary can never be admitted.
+    assert_eq!(bootstrap.status(), ProjectContextStatus::Disabled);
+    assert_eq!(bootstrap.resolution_reason, "boundary_indeterminate");
+    let cap_reasons = reasons(&bootstrap);
+    assert!(cap_reasons.contains(&"dir_entries_exceeded".to_owned()));
+    assert!(cap_reasons.contains(&"marker_indeterminate".to_owned()));
     let overflow = bootstrap
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.reason == "dir_entries_exceeded")
         .expect("typed cap diagnostic");
-    assert_eq!(overflow.path.as_deref(), Some("over-cap"));
     assert_eq!(overflow.observed, Some(super::MAX_DIR_ENTRIES as u64 + 1));
+    assert!(
+        bootstrap.manifest.is_none(),
+        "disabled bootstraps drop the manifest"
+    );
+    let payload = serde_json::to_string(&bootstrap.snapshot_payload()).expect("payload");
+    assert!(!payload.contains("root rules"));
+    assert!(!payload.contains("over-cap rules"));
+}
+
+/// Re-review blocker 1: an over-cap nested repository root must not erase
+/// the nested repository boundary. Reproduces the reviewer's exact
+/// three-part setup: outer repo with EULER.md, nested repo with its own
+/// `.git`, nested root with more entries than the cap, workspace inside
+/// the nested repo. Previously the nested `.git` was skipped and the OUTER
+/// repository's guidance was admitted across the boundary.
+#[cfg(unix)]
+#[test]
+fn capped_nested_repository_root_fails_closed_instead_of_widening_upward() {
+    let temp = tempfile::tempdir().expect("temp");
+    let outer = temp.path().join("outer");
+    git_dir(&outer);
+    write(&outer.join("EULER.md"), "outer guidance must not leak");
+    let nested = outer.join("nested");
+    git_dir(&nested);
+    write(&nested.join("EULER.md"), "nested rules");
+    for index in 0..super::MAX_DIR_ENTRIES {
+        fs::write(nested.join(format!("f{index:04}")), b"").expect("filler");
+    }
+    let workspace = nested.join("ws");
+    fs::create_dir_all(&workspace).expect("ws");
+
+    let bootstrap = admitted(&workspace);
+    assert!(
+        source_paths(&bootstrap).is_empty(),
+        "no source may cross an indeterminate boundary: {:?}",
+        source_paths(&bootstrap)
+    );
+    assert_eq!(bootstrap.status(), ProjectContextStatus::Disabled);
+    assert_eq!(bootstrap.resolution_reason, "boundary_indeterminate");
+    let cap_reasons = reasons(&bootstrap);
+    assert!(cap_reasons.contains(&"dir_entries_exceeded".to_owned()));
+    assert!(cap_reasons.contains(&"marker_indeterminate".to_owned()));
+    let payload = serde_json::to_string(&bootstrap.snapshot_payload()).expect("payload");
+    assert!(!payload.contains("outer guidance must not leak"));
+    assert!(!payload.contains("nested rules"));
+}
+
+/// Complement: a nested repository under the cap still starts its own
+/// boundary, and the outer repository's guidance is never selected for a
+/// workspace inside the nested repository.
+#[test]
+fn nested_repository_boundary_holds_under_the_entry_cap() {
+    let temp = tempfile::tempdir().expect("temp");
+    let outer = temp.path().join("outer");
+    git_dir(&outer);
+    write(&outer.join("EULER.md"), "outer guidance must not leak");
+    let nested = outer.join("nested");
+    git_dir(&nested);
+    write(&nested.join("EULER.md"), "nested rules");
+    let workspace = nested.join("ws");
+    fs::create_dir_all(&workspace).expect("ws");
+
+    let bootstrap = admitted(&workspace);
+    assert_eq!(source_paths(&bootstrap), vec!["EULER.md"]);
+    let (_, content) = &manifest_sources(&bootstrap)[0];
+    assert_eq!(content, "nested rules");
+    let manifest_json = bootstrap
+        .manifest
+        .as_ref()
+        .expect("manifest")
+        .to_canonical_json();
+    assert!(!manifest_json.contains("outer guidance must not leak"));
 }
 
 // Blocker 4: forged snapshot/diagnostic payloads in a resumed log must
@@ -1224,4 +1306,104 @@ fn forged_diagnostic_event_payloads_fail_the_bootstrap_shape() {
         .payload
         .insert("reason".to_owned(), "io_error".into());
     assert!(validate_bootstrap_shape(&forged).is_err());
+}
+
+// Re-review blocker 2: forged session.start summaries and contradictory
+// policy tuples must fail closed.
+
+/// Build a valid dormant bootstrap event sequence, then let the test forge
+/// the session.start summary object.
+fn events_with_forged_summary(
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Vec<EventEnvelope> {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    write(&repo.join("EULER.md"), "content");
+    let mut events = bootstrap_events(&dormant(&repo));
+    let summary = events[0]
+        .payload
+        .get_mut("project_context")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("summary object");
+    mutate(summary);
+    events
+}
+
+#[test]
+fn forged_summary_status_rejects() {
+    // Reviewer attack: summary claims `admitted` against a disabled
+    // snapshot; previously the summary was never validated at all.
+    let events = events_with_forged_summary(|summary| {
+        summary.insert("status".to_owned(), "admitted".into());
+    });
+    assert!(validate_bootstrap_shape(&events).is_err());
+}
+
+#[test]
+fn forged_summary_digest_rejects() {
+    let events = events_with_forged_summary(|summary| {
+        summary.insert(
+            "candidate_digest".to_owned(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        );
+    });
+    assert!(validate_bootstrap_shape(&events).is_err());
+}
+
+#[test]
+fn forged_summary_count_rejects() {
+    let events = events_with_forged_summary(|summary| {
+        summary.insert("diagnostic_count".to_owned(), 999.into());
+    });
+    assert!(validate_bootstrap_shape(&events).is_err());
+    let events = events_with_forged_summary(|summary| {
+        summary.insert("source_count".to_owned(), 0.into());
+    });
+    assert!(validate_bootstrap_shape(&events).is_err());
+}
+
+#[test]
+fn forged_summary_unknown_field_rejects() {
+    let events = events_with_forged_summary(|summary| {
+        summary.insert("excerpt".to_owned(), "smuggled repository text".into());
+    });
+    assert!(validate_bootstrap_shape(&events).is_err());
+}
+
+#[test]
+fn matching_summary_and_snapshot_validate() {
+    // Happy path: the untampered summary reconciles against its snapshot,
+    // including the full policy tuple it now carries.
+    let events = events_with_forged_summary(|_| {});
+    validate_bootstrap_shape(&events).expect("matching summary validates");
+    let summary = events[0].payload["project_context"]
+        .as_object()
+        .expect("summary");
+    assert_eq!(summary["resolution_reason"], "exposure_forced_off");
+    assert_eq!(summary["acknowledgment_basis"], "none");
+}
+
+#[test]
+fn contradictory_policy_tuple_rejects() {
+    // Reviewer attack: each field passes the grammar individually, but the
+    // combination (a disabled snapshot claiming an admitted-side policy
+    // resolution) is not one this Euler version can produce.
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("policy".to_owned(), "on".into());
+        payload.insert("resolution_reason".to_owned(), "admitted".into());
+        payload.insert("acknowledgment_basis".to_owned(), "accepted".into());
+    }));
+    // Single-field contradictions reject too.
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("policy".to_owned(), "on".into());
+    }));
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("resolution_reason".to_owned(), "test_hook".into());
+    }));
+    // Phase-3 statuses have no permitted tuple yet and fail closed until
+    // their slice defines them.
+    assert_fold_rejects(disabled_snapshot_event(|payload| {
+        payload.insert("status".to_owned(), "declined".into());
+    }));
 }

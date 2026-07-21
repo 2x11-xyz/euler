@@ -53,9 +53,19 @@ permission machinery as one suggested by an ordinary user message.
   to those held handles with no-follow/beneath semantics; symlinks, reparse
   points, and non-regular files are rejected; a platform that cannot
   no-follow-read omits the source. Directory enumeration is bounded: a level
-  with more entries than the frozen cap is omitted whole with a typed
-  `dir_entries_exceeded` diagnostic and its observed count — never scanned
-  through a truncated listing. Admission requires two bounded reads from
+  with more entries than the frozen cap is unknowable — its `.git` presence
+  and its contents equally — so the boundary search may neither claim it as
+  a marker nor continue past it, because an indeterminate level must never
+  widen discovery upward across a possible nested-repository boundary. The
+  whole preflight fails closed instead: zero sources, a typed
+  `dir_entries_exceeded` diagnostic with the observed count plus a
+  `marker_indeterminate` record, and a disabled snapshot
+  (`resolution_reason: boundary_indeterminate`). A level whose enumeration
+  fails outright during the boundary search closes the preflight the same
+  way (`io_error` plus `marker_indeterminate`). These records carry no path:
+  no discovery root exists yet to relativize against, and ancestor path
+  fragments are outside-workspace data the manifest must not carry.
+  Admission requires two bounded reads from
   independently verified handles with byte-identical results (per-handle
   stable-metadata comparison is only a fast-path reject); an unstable
   verification retries once, then omits with a `changed_during_read`
@@ -190,7 +200,28 @@ per-project trust store.
   unknown payload fields, malformed digest shapes, non-normalized or
   traversal identities, unknown workspace-identity algorithm/version pairs,
   reason codes outside the stable grammar, and per-reason counts that do not
-  match the recorded diagnostics all reject.
+  match the recorded diagnostics all reject. Field-by-field validity is not
+  sufficient: the (status, policy, resolution_reason, acknowledgment_basis)
+  combination must be one this Euler version can produce. The permitted
+  tuples are frozen per phase and extended — never rediscovered — by later
+  slices:
+
+  | status | policy | resolution_reason | acknowledgment_basis |
+  |---|---|---|---|
+  | disabled | off | exposure_forced_off | none |
+  | disabled | off | preflight_collapsed | none |
+  | disabled | off | boundary_indeterminate | none |
+  | admitted | on | test_hook | none |
+
+  (`test_hook` is writable only by the crate-internal phase-2 test hook; no
+  public path produces an admitted tuple. Phase 3 replaces it with the
+  acknowledgment-side tuples and adds the `declined`/`unacknowledged`
+  statuses with theirs; until a status has a permitted tuple it rejects.)
+  The `session.start` project-context summary is validated with the same
+  rigor — key whitelist and grammar — and every overlapping field (status,
+  policy, resolution reason, acknowledgment basis, candidate digest, source
+  and diagnostic counts) must agree exactly with the snapshot it announces;
+  any mismatch fails the bootstrap shape.
 - `project.context.diagnostic` events record omissions without embedding
   unsafe content. Their payload is limited to a stable reason code, bounded
   normalized relative identity when one exists, and non-content numeric

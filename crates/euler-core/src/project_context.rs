@@ -139,6 +139,14 @@ impl ProjectContextBootstrap {
             std::fs::canonicalize(workspace_root).map_err(ProjectContextError::Workspace)?;
         let outcome = discovery::discover(&canonical, redactor);
         let (manifest, collapsed) = sanitize_preflight(outcome);
+        // An indeterminate repository boundary (a level between the
+        // workspace and the nearest determinable marker that could not be
+        // enumerated) failed the whole discovery closed; like a collapse,
+        // it can never resolve admitted.
+        let boundary_indeterminate = manifest
+            .diagnostics
+            .iter()
+            .any(|record| record.reason == "marker_indeterminate");
         let candidate_digest = candidate_digest_v1(&manifest.to_canonical_json());
         let workspace_identity_digest = workspace_identity_digest_v1(&canonical);
         let source_identities = manifest
@@ -147,27 +155,30 @@ impl ProjectContextBootstrap {
             .map(|source| source.path.clone())
             .collect();
         let diagnostics = manifest.diagnostics.clone();
-        // A collapsed preflight can never be admitted, whatever policy asked
-        // for: the collapse means the bounded scan could not produce a
-        // trustworthy manifest, so exposure resolves disabled.
-        let (status, policy, resolution_reason, manifest) = if admit && !collapsed {
-            (
-                ProjectContextStatus::Admitted,
-                "on",
-                "test_hook",
-                Some(manifest),
-            )
-        } else {
-            // Dormant build: repository content can never reach a model, so
-            // the frozen bodies are dropped here and only content-free data
-            // survives.
-            let reason = if collapsed {
-                "preflight_collapsed"
+        // A collapsed or boundary-indeterminate preflight can never be
+        // admitted, whatever policy asked for: the bounded scan could not
+        // produce a trustworthy manifest, so exposure resolves disabled.
+        let (status, policy, resolution_reason, manifest) =
+            if admit && !collapsed && !boundary_indeterminate {
+                (
+                    ProjectContextStatus::Admitted,
+                    "on",
+                    "test_hook",
+                    Some(manifest),
+                )
             } else {
-                "exposure_forced_off"
+                // Dormant build: repository content can never reach a model,
+                // so the frozen bodies are dropped here and only
+                // content-free data survives.
+                let reason = if collapsed {
+                    "preflight_collapsed"
+                } else if boundary_indeterminate {
+                    "boundary_indeterminate"
+                } else {
+                    "exposure_forced_off"
+                };
+                (ProjectContextStatus::Disabled, "off", reason, None)
             };
-            (ProjectContextStatus::Disabled, "off", reason, None)
-        };
         Ok(Self {
             redactor: redactor.clone(),
             status,
@@ -195,12 +206,16 @@ impl ProjectContextBootstrap {
     }
 
     /// Compact policy/count/digest summary recorded on `session.start`.
+    /// Every field overlapping the snapshot must agree with it exactly;
+    /// resume reconciles the two and fails closed on any mismatch.
     pub(crate) fn session_start_summary(&self) -> Value {
         json!({
             "expected": true,
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "status": self.status.as_str(),
             "policy": self.policy,
+            "resolution_reason": self.resolution_reason,
+            "acknowledgment_basis": "none",
             "candidate_digest": self.candidate_digest,
             "source_count": self.source_identities.len(),
             "diagnostic_count": self.diagnostics.len(),

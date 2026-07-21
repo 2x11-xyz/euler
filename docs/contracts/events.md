@@ -310,12 +310,15 @@ envelope `v` per `docs/contracts/persistence.md`.
   legacy `tier` field remains for compatibility and is normalized at resume.
   Optional `project_context` is the compact bootstrap summary (ADR 0017):
   `{ "expected": true, "schema_version": 1, "status", "policy",
-  "candidate_digest", "source_count", "diagnostic_count" }`. Present exactly
-  when the session was created with a project-context bootstrap; it announces
-  that one `project.context.snapshot` follows immediately. Absent means the
-  legacy shape: no snapshot events exist and resume treats project context as
+  "resolution_reason", "acknowledgment_basis", "candidate_digest",
+  "source_count", "diagnostic_count" }`. Present exactly when the session
+  was created with a project-context bootstrap; it announces that one
+  `project.context.snapshot` follows immediately. Absent means the legacy
+  shape: no snapshot events exist and resume treats project context as
   disabled. A summary without its snapshot (or vice versa) is an invalid
-  mixed shape and resume fails closed.
+  mixed shape and resume fails closed. The summary is validated like the
+  snapshot (key whitelist, grammar) and every overlapping field must agree
+  exactly with the snapshot it announces; any mismatch fails resume.
 - `session.resumed`: `provider`, `model`, `events_folded`, optional
   `resumed_from_event_id`. A durable audit marker recording that the session
   lifetime was continued, against which target and from which tail event.
@@ -342,7 +345,8 @@ envelope `v` per `docs/contracts/persistence.md`.
   never cached, so they are re-checked on every listing.
 - `project.context.snapshot` (schema version 1; ADR 0017,
   `docs/contracts/project-context.md`): `schema_version`, `status`
-  (`admitted` | `disabled`; phase 3 adds `declined`/`unacknowledged`),
+  (`admitted` | `disabled`; phase 3 adds `declined`/`unacknowledged`, which
+  reject until their permitted policy tuples exist),
   `policy`, `resolution_reason`, `acknowledgment_basis`, `candidate_digest`
   (versioned, domain-separated, length-prefixed digest of the canonical
   candidate manifest), `workspace_identity`
@@ -363,7 +367,9 @@ envelope `v` per `docs/contracts/persistence.md`.
   mismatches; it never falls back to current project files. Both shapes are
   fully re-validated on fold as untrusted input: unknown payload fields,
   malformed digests, non-normalized identities, unknown workspace-identity
-  algorithms, and count inconsistencies reject resume and request assembly.
+  algorithms, count inconsistencies, and status/policy/reason/basis
+  combinations outside the contract's permitted-tuple table reject resume
+  and request assembly.
 - `project.context.diagnostic` (schema version 1): `schema_version`,
   `snapshot_event_id`, `reason` (stable content-free code), optional bounded
   `path` (normalized relative identity), optional numeric `observed`. Never

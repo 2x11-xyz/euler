@@ -56,9 +56,17 @@ pub(crate) enum DiagnosticReason {
     NonUtf8Path,
     IdentityTooLong,
     ChainDepthExceeded,
-    /// A directory level had more entries than the frozen per-level cap and
-    /// was omitted whole rather than scanned through a truncated listing.
+    /// A directory level had more entries than the frozen per-level cap.
+    /// Its listing is unknowable, so the whole preflight fails closed
+    /// rather than selecting over a truncated listing or letting the
+    /// boundary search continue past it.
     DirEntriesExceeded,
+    /// A level between the workspace and the nearest determinable `.git`
+    /// marker could not be enumerated, so the repository boundary is
+    /// unknowable. The whole preflight failed closed: an indeterminate
+    /// level must never widen discovery upward across a possible nested
+    /// repository boundary.
+    MarkerIndeterminate,
     /// The bounded preflight itself produced more diagnostics than the
     /// manifest bound; the whole preflight collapsed to this single record
     /// and no source was admitted.
@@ -87,6 +95,7 @@ impl DiagnosticReason {
             Self::IdentityTooLong => "identity_too_long",
             Self::ChainDepthExceeded => "chain_depth_exceeded",
             Self::DirEntriesExceeded => "dir_entries_exceeded",
+            Self::MarkerIndeterminate => "marker_indeterminate",
             Self::DiagnosticOverflow => "diagnostic_overflow",
             Self::PreflightInvalid => "preflight_invalid",
             Self::IoError => "io_error",
@@ -176,18 +185,45 @@ mod imp {
                     }
                 }
             };
-        // Nearest marker inside the window (workspace upward). Enumeration
-        // failures during marker search are best-effort no-marker levels;
-        // only chain levels get typed diagnostics below.
-        let root_index = find_marker_index(&mut window);
-        if root_index.is_none() && truncated_above {
-            diagnostics.push(diagnostic(
-                DiagnosticReason::ChainDepthExceeded,
-                None,
-                Some(MAX_CHAIN_LEVELS as u64),
-            ));
-        }
-        let root_index = root_index.unwrap_or(window.len() - 1);
+        // Nearest marker inside the window (workspace upward). A level whose
+        // bounded enumeration caps out or fails is INDETERMINATE: it could
+        // hide a nested-repository `.git`, so continuing the search upward
+        // would silently erase a repository boundary. An indeterminate level
+        // must never widen discovery upward — the whole preflight fails
+        // closed instead. (These records carry no path: no discovery root
+        // exists yet to relativize against, and ancestor path fragments are
+        // outside-workspace data the manifest must not carry.)
+        let root_index = match find_marker_index(&mut window) {
+            MarkerSearch::Indeterminate { observed } => {
+                let companion = match observed {
+                    Some(observed) => {
+                        diagnostic(DiagnosticReason::DirEntriesExceeded, None, Some(observed))
+                    }
+                    None => diagnostic(DiagnosticReason::IoError, None, None),
+                };
+                diagnostics.push(companion);
+                diagnostics.push(diagnostic(
+                    DiagnosticReason::MarkerIndeterminate,
+                    None,
+                    observed,
+                ));
+                return DiscoveryOutcome {
+                    sources: Vec::new(),
+                    diagnostics,
+                };
+            }
+            MarkerSearch::NotFound => {
+                if truncated_above {
+                    diagnostics.push(diagnostic(
+                        DiagnosticReason::ChainDepthExceeded,
+                        None,
+                        Some(MAX_CHAIN_LEVELS as u64),
+                    ));
+                }
+                window.len() - 1
+            }
+            MarkerSearch::Found(index) => index,
+        };
         let candidates = scan_chain(&mut window[root_index..], redactor, &mut diagnostics);
         let sources = admit_candidates(candidates, &mut diagnostics);
         DiscoveryOutcome {
@@ -263,14 +299,40 @@ mod imp {
         Some((window, truncated_above))
     }
 
+    enum MarkerSearch {
+        Found(usize),
+        NotFound,
+        /// A level between the workspace and the nearest determinable marker
+        /// could not be fully enumerated (entry cap with the observed count,
+        /// or an enumeration failure with `None`). The repository boundary
+        /// is unknowable: the level's own `.git` presence and its contents
+        /// are equally invisible, so it may neither be claimed as a marker
+        /// nor skipped.
+        Indeterminate {
+            observed: Option<u64>,
+        },
+    }
+
     /// Index (within the window) of the nearest ancestor with an exact
-    /// `.git` marker, searching from the workspace upward. Levels whose
-    /// bounded enumeration fails or caps out are best-effort no-marker
-    /// levels here; if they end up on the chain, `scan_chain` records their
-    /// typed diagnostic.
-    fn find_marker_index(window: &mut [ChainDir]) -> Option<usize> {
+    /// `.git` marker, searching from the workspace upward. The search stops
+    /// at the first indeterminate level: continuing upward past a level
+    /// whose listing is unknowable would let an over-cap (or unreadable)
+    /// nested repository root leak the OUTER repository's guidance across
+    /// the boundary.
+    fn find_marker_index(window: &mut [ChainDir]) -> MarkerSearch {
         for index in (0..window.len()).rev() {
             ensure_enumerated(&mut window[index]);
+            match window[index].entries.as_ref().expect("enumerated above") {
+                Enumeration::CapExceeded(observed) => {
+                    return MarkerSearch::Indeterminate {
+                        observed: Some(*observed),
+                    };
+                }
+                Enumeration::Failed => {
+                    return MarkerSearch::Indeterminate { observed: None };
+                }
+                Enumeration::Names(_) => {}
+            }
             let has_exact_git = matches!(
                 &window[index].entries,
                 Some(Enumeration::Names(names))
@@ -288,10 +350,10 @@ mod imp {
             };
             let file_type = stat.st_mode & libc::S_IFMT;
             if file_type == libc::S_IFDIR || file_type == libc::S_IFREG {
-                return Some(index);
+                return MarkerSearch::Found(index);
             }
         }
-        None
+        MarkerSearch::NotFound
     }
 
     /// Populate the cached bounded enumeration for one chain directory.
@@ -336,8 +398,10 @@ mod imp {
                     ));
                 }
                 Enumeration::CapExceeded(observed) => {
-                    // Whole-level omission: deterministic selection over a
-                    // truncated listing is impossible.
+                    // Defensive: marker search already enumerated every
+                    // chain level and fails the preflight closed on a cap,
+                    // so this arm is unreachable in practice. Keep the
+                    // typed whole-level omission as belt and braces.
                     diagnostics.push(diagnostic(
                         DiagnosticReason::DirEntriesExceeded,
                         rel_identity(&rel_dir),

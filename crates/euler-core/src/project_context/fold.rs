@@ -160,11 +160,12 @@ fn validate_snapshot_payload(
         ));
     }
     let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
+    // Phase 2 produces exactly two statuses. Phase 3 adds the
+    // `declined`/`unacknowledged` tombstones together with their permitted
+    // policy tuples; until those tuples exist, the statuses reject.
     let admitted = match status {
         "admitted" => true,
-        // Tombstone family: phase 3 records "declined" and "unacknowledged";
-        // decoding them now keeps latest-snapshot-authoritative stable.
-        "disabled" | "declined" | "unacknowledged" => false,
+        "disabled" => false,
         _ => {
             return Err(ProjectContextFoldError::new(
                 "its status field is not one this Euler version knows",
@@ -180,15 +181,7 @@ fn validate_snapshot_payload(
             )));
         }
     }
-    for field in ["policy", "resolution_reason", "acknowledgment_basis"] {
-        let value = payload
-            .get(field)
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProjectContextFoldError::new(format!("its {field} is missing")))?;
-        validate_reason_code(value).map_err(|_| {
-            ProjectContextFoldError::new(format!("its {field} is not a stable code"))
-        })?;
-    }
+    validate_policy_tuple(payload, status)?;
     let candidate_digest = payload
         .get("candidate_digest")
         .and_then(Value::as_str)
@@ -288,6 +281,50 @@ fn validate_admitted_manifest(
         ));
     }
     Ok(manifest)
+}
+
+/// The permitted (status, policy, resolution_reason, acknowledgment_basis)
+/// combinations this Euler version can produce (project-context contract,
+/// "Snapshot, events, and replay"). Field-by-field grammar is not enough: a
+/// disabled snapshot claiming `policy: on` with an admitted-side reason is
+/// individually well-formed but semantically forged. Phase 3 extends this
+/// table (acknowledged/declined/unacknowledged tuples) rather than
+/// rediscovering it.
+const PERMITTED_POLICY_TUPLES: &[(&str, &str, &str, &str)] = &[
+    ("disabled", "off", "exposure_forced_off", "none"),
+    ("disabled", "off", "preflight_collapsed", "none"),
+    ("disabled", "off", "boundary_indeterminate", "none"),
+    // The only admitted producer in phase 2 is the crate-internal test
+    // hook; no public path can write this tuple.
+    ("admitted", "on", "test_hook", "none"),
+];
+
+fn validate_policy_tuple(
+    payload: &JsonObject,
+    status: &str,
+) -> Result<(), ProjectContextFoldError> {
+    let mut fields = ["", "", ""];
+    for (slot, field) in ["policy", "resolution_reason", "acknowledgment_basis"]
+        .into_iter()
+        .enumerate()
+    {
+        let value = payload
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProjectContextFoldError::new(format!("its {field} is missing")))?;
+        validate_reason_code(value).map_err(|_| {
+            ProjectContextFoldError::new(format!("its {field} is not a stable code"))
+        })?;
+        fields[slot] = value;
+    }
+    let tuple = (status, fields[0], fields[1], fields[2]);
+    if !PERMITTED_POLICY_TUPLES.contains(&tuple) {
+        return Err(ProjectContextFoldError::new(
+            "its status, policy, resolution reason, and acknowledgment basis are not a \
+             combination this Euler version can produce",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_workspace_identity_field(payload: &JsonObject) -> Result<(), ProjectContextFoldError> {
@@ -474,6 +511,10 @@ pub(crate) fn validate_bootstrap_shape(events: &[EventEnvelope]) -> Result<(), S
         }
     };
     validate_snapshot_payload(&snapshot.payload).map_err(|error| error.to_string())?;
+    validate_summary_against_snapshot(
+        summary.expect("summary presence checked above"),
+        &snapshot.payload,
+    )?;
     let declared = snapshot
         .payload
         .get("diagnostic_count")
@@ -495,6 +536,86 @@ pub(crate) fn validate_bootstrap_shape(events: &[EventEnvelope]) -> Result<(), S
         .any(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_DIAGNOSTIC)
     {
         return Err("a project-context diagnostic appears outside the bootstrap".to_owned());
+    }
+    Ok(())
+}
+
+/// Payload keys the version-1 `session.start` project-context summary
+/// permits.
+const SUMMARY_KEYS: &[&str] = &[
+    "expected",
+    "schema_version",
+    "status",
+    "policy",
+    "resolution_reason",
+    "acknowledgment_basis",
+    "candidate_digest",
+    "source_count",
+    "diagnostic_count",
+];
+
+/// The `session.start` summary is untrusted input on resume exactly like
+/// the snapshot it announces: validate its shape with the same rigor and
+/// reconcile every overlapping field against the (already validated)
+/// snapshot payload. A summary claiming a different status, digest, policy
+/// resolution, or count than its snapshot is a forgery and fails the
+/// bootstrap shape.
+fn validate_summary_against_snapshot(summary: &Value, snapshot: &JsonObject) -> Result<(), String> {
+    let Some(summary) = summary.as_object() else {
+        return Err("the session.start project-context summary is not an object".to_owned());
+    };
+    for key in summary.keys() {
+        if !SUMMARY_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "the project-context summary carries a field this Euler version does not \
+                 record: {key}"
+            ));
+        }
+    }
+    if summary.get("expected") != Some(&Value::Bool(true)) {
+        return Err("the project-context summary does not expect its snapshot".to_owned());
+    }
+    if summary.get("schema_version").and_then(Value::as_u64)
+        != Some(u64::from(SNAPSHOT_SCHEMA_VERSION))
+    {
+        return Err(
+            "the project-context summary was written by a different Euler version".to_owned(),
+        );
+    }
+    // Overlapping snapshot fields must agree exactly. The snapshot side has
+    // already passed full payload validation, so equality inherits its
+    // grammar and tuple checks.
+    for field in [
+        "status",
+        "policy",
+        "resolution_reason",
+        "acknowledgment_basis",
+        "candidate_digest",
+    ] {
+        let summary_value = summary.get(field).and_then(Value::as_str);
+        let snapshot_value = snapshot.get(field).and_then(Value::as_str);
+        if summary_value.is_none() || summary_value != snapshot_value {
+            return Err(format!(
+                "the project-context summary's {field} does not match the snapshot"
+            ));
+        }
+    }
+    let summary_sources = summary.get("source_count").and_then(Value::as_u64);
+    let snapshot_sources = snapshot
+        .get("source_identities")
+        .and_then(Value::as_array)
+        .map(|identities| identities.len() as u64);
+    if summary_sources.is_none() || summary_sources != snapshot_sources {
+        return Err(
+            "the project-context summary's source count does not match the snapshot".to_owned(),
+        );
+    }
+    let summary_diagnostics = summary.get("diagnostic_count").and_then(Value::as_u64);
+    let snapshot_diagnostics = snapshot.get("diagnostic_count").and_then(Value::as_u64);
+    if summary_diagnostics.is_none() || summary_diagnostics != snapshot_diagnostics {
+        return Err(
+            "the project-context summary's diagnostic count does not match the snapshot".to_owned(),
+        );
     }
     Ok(())
 }
