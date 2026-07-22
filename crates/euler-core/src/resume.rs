@@ -1,6 +1,6 @@
 use crate::canvas::{AutoCompactionPolicy, CompactionTier};
 use crate::permissions::{permission_prompt_capabilities, ApprovalMode};
-use crate::provenance::{accepted_prefix_lines, ProvenanceWriter};
+use crate::provenance::{nul_offset_in_line, numbered_accepted_prefix_lines, ProvenanceWriter};
 use crate::session::{
     fold_model_target, fold_reasoning_effort, ModelTarget, Session, SessionConfig,
 };
@@ -56,11 +56,17 @@ pub enum ResumeError {
     MissingBlob { hash: String, path: PathBuf },
     #[error("resume incompatible: provenance blob hash mismatch for {hash} at {}", path.display())]
     BlobHashMismatch { hash: String, path: PathBuf },
-    #[error("invalid provenance line: {source}")]
+    #[error("invalid provenance line {line}: {source}")]
     InvalidLine {
+        line: usize,
         #[source]
         source: serde_json::Error,
     },
+    #[error(
+        "session log is corrupted at line {line} (byte offset {offset}): unexpected NUL bytes; \
+         the session cannot be resumed"
+    )]
+    CorruptedLog { line: usize, offset: usize },
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error("failed to append resume recovery closure: {0}")]
@@ -429,9 +435,22 @@ pub fn read_resume_prefix(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>, 
         .join("blobs");
     let mut events = Vec::new();
 
-    for line in accepted_prefix_lines(&content) {
-        let event = EventEnvelope::from_json_line(line)
-            .map_err(|source| ResumeError::InvalidLine { source })?;
+    for line in numbered_accepted_prefix_lines(&content) {
+        // A NUL run is a zero-filled page from a power-loss tear, not a
+        // malformed event: classify it as corruption, with the position a
+        // user (or tooling) needs to inspect the log.
+        if let Some(nul) = nul_offset_in_line(line.text) {
+            return Err(ResumeError::CorruptedLog {
+                line: line.number,
+                offset: line.offset + nul,
+            });
+        }
+        let event = EventEnvelope::from_json_line(line.text).map_err(|source| {
+            ResumeError::InvalidLine {
+                line: line.number,
+                source,
+            }
+        })?;
         preflight_event(&event)?;
         events.push(verify_and_rehydrate_blobs(event, &blob_dir)?);
     }

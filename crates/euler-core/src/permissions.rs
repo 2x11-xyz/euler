@@ -34,6 +34,15 @@ pub struct PermissionRequest {
     /// safe escape hatch in scoped matching (fail closed to token-only
     /// coverage).
     pub workspace_root: Option<PathBuf>,
+    /// True when `path` names a categorically sensitive file
+    /// ([`crate::command_safety::sensitive_basename`]: `.env*`, `*secret*`,
+    /// `*credential*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`), checked on
+    /// the literal argument AND its canonicalized workspace form. Such a
+    /// request never rides a blanket `session-allow`:
+    /// [`PermissionGate::mode_for_request`] escalates it to `ask`, so
+    /// accessing the file takes an explicit decision or a covering grant
+    /// (deep review P1-b).
+    pub sensitive_path: bool,
 }
 
 impl PermissionRequest {
@@ -45,6 +54,7 @@ impl PermissionRequest {
             command_truncated: false,
             path: None,
             workspace_root: None,
+            sensitive_path: false,
         }
     }
 
@@ -352,6 +362,23 @@ impl<D> PermissionGate<D> {
             .get(&capability)
             .copied()
             .unwrap_or(ApprovalMode::AlwaysDeny)
+    }
+
+    /// The mode governing one concrete request: the capability's configured
+    /// mode, escalated from blanket `SessionAllow` to `Ask` when the request
+    /// targets a sensitive basename (deep review P1-b — `read_file .env`
+    /// must not run unprompted while `cat .env` asks). The escalated ask
+    /// flows through the ordinary braid, so a covering session/project/user
+    /// grant still applies and a decider allow can install one — a
+    /// deliberate decision is required, not a hard deny. `AlwaysDeny` is
+    /// never weakened.
+    pub fn mode_for_request(&self, request: &PermissionRequest) -> ApprovalMode {
+        let mode = self.mode(request.capability);
+        if mode == ApprovalMode::SessionAllow && request.sensitive_path {
+            ApprovalMode::Ask
+        } else {
+            mode
+        }
     }
 
     pub fn configured_capabilities(&self) -> impl Iterator<Item = Capability> + '_ {
@@ -1169,6 +1196,26 @@ mod tests {
             1
         );
         assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::Ask);
+    }
+
+    #[test]
+    fn sensitive_path_escalates_session_allow_to_ask_only() {
+        // Deep review P1-b: a sensitive basename must not ride the blanket
+        // fs-read session-allow, but the escalation never weakens
+        // always-deny and never touches ordinary requests.
+        let gate = PermissionGate::new(PanicDecider);
+        let mut sensitive =
+            PermissionRequest::new(Capability::FsRead, "tool read_file").with_path(".env");
+        sensitive.sensitive_path = true;
+        assert_eq!(gate.mode_for_request(&sensitive), ApprovalMode::Ask);
+
+        let plain =
+            PermissionRequest::new(Capability::FsRead, "tool read_file").with_path("notes.txt");
+        assert_eq!(gate.mode_for_request(&plain), ApprovalMode::SessionAllow);
+
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.set_mode(Capability::FsRead, ApprovalMode::AlwaysDeny);
+        assert_eq!(gate.mode_for_request(&sensitive), ApprovalMode::AlwaysDeny);
     }
 
     #[test]

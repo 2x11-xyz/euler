@@ -311,7 +311,10 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 &call.input,
                 self.tools,
             );
-            let mode = self.permissions.mode(capability);
+            // Request-aware mode: a sensitive-basename path escalates
+            // blanket SessionAllow to Ask (deep review P1-b), mirroring the
+            // root-session gate.
+            let mode = self.permissions.mode_for_request(&request);
             let needs_prompt = mode == ApprovalMode::Ask && !self.permissions.is_granted(&request);
             let prompt_id = if needs_prompt {
                 Some(

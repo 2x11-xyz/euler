@@ -1,5 +1,6 @@
 use super::{
-    accepted_prefix_lines, containing_dir, hash_bytes, recover_mutex, sync_dir, ProvenanceWriter,
+    containing_dir, hash_bytes, nul_offset_in_line, numbered_accepted_prefix_lines, recover_mutex,
+    sync_dir, ProvenanceWriter,
 };
 use crate::redaction::{scrub_secrets_in_bytes, scrub_secrets_in_object};
 use crate::scrub::{scrub_json_file, write_private_atomic, ScrubReport};
@@ -31,11 +32,20 @@ impl ProvenanceWriter {
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error),
         };
-        let mut events = accepted_prefix_lines(&content)
-            .into_iter()
-            .map(EventEnvelope::from_json_line)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(io::Error::other)?;
+        let mut events = Vec::new();
+        for line in numbered_accepted_prefix_lines(&content) {
+            if let Some(nul) = nul_offset_in_line(line.text) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "provenance log is corrupted at line {} (byte offset {}): unexpected NUL bytes",
+                        line.number,
+                        line.offset + nul
+                    ),
+                ));
+            }
+            events.push(EventEnvelope::from_json_line(line.text).map_err(io::Error::other)?);
+        }
         let mut pass = ScrubPass::default();
 
         for event in &mut events {

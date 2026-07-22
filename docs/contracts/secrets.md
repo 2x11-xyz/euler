@@ -110,7 +110,16 @@ Redaction is implemented in two layers:
 Every path a credential can enter euler must register it with the session
 redactor the moment it exists:
 
-- configured secret environment variables, at session construction;
+- environment variables whose NAME classifies as secret-bearing, at
+  session construction. One classifier serves both this seeding and the
+  agent-subprocess env scrub: the explicit provider keys plus any
+  `*_API_KEY` / `*_ACCESS_KEY` suffix or a
+  KEY/TOKEN/SECRET/CREDENTIAL(S)/PASSWORD underscore segment,
+  case-insensitive. Values below the redactor's minimum length are never
+  registered (masking tiny strings would mangle ordinary output), and
+  `EULER_AUTH_FILE` is excluded — its value is a path, scrubbed from
+  subprocess env as a parent control, while the credentials inside the file
+  register via the auth-file source below;
 - stored auth-file credentials (including a `--auth-file` override), at
   launch, exec, CLI resume, AND in-app resume;
 - custom-provider secrets (`$ENV` / `!command` / literal api_key and header

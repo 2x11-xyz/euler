@@ -432,10 +432,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SwarmConfigError> {
             .map_err(|source| io_error(source, &temp_path))?;
     }
     fs::rename(&temp_path, path).map_err(|source| io_error(source, path))?;
-    #[cfg(unix)]
-    {
-        let _ = fs::File::open(dir).and_then(|f| f.sync_all());
-    }
+    crate::home::sync_dir(dir).map_err(|source| io_error(source, dir))?;
     Ok(())
 }
 

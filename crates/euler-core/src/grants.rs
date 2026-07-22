@@ -22,7 +22,7 @@
 
 use euler_sdk::Capability;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -640,11 +640,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProjectGrantError> {
         path: path.to_path_buf(),
         source,
     })?;
-    // Best-effort directory sync on Unix.
-    #[cfg(unix)]
-    {
-        let _ = File::open(dir).and_then(|f| f.sync_all());
-    }
+    crate::home::sync_dir(dir).map_err(|source| ProjectGrantError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 

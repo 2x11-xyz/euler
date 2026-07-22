@@ -412,6 +412,7 @@ impl SessionStore {
             title: metadata.title.clone(),
             root: metadata.root.as_deref().and_then(session_root_from_str),
             kind: metadata.kind,
+            invalid_reason: None,
         };
         // Carry the projection cache key through so a metadata touch that
         // rewrites the sidecar keeps the cached projection warm.
@@ -466,6 +467,7 @@ impl SessionStore {
                     title: metadata.title.clone(),
                     root: sidecar_root.clone(),
                     kind: sidecar_kind,
+                    invalid_reason: None,
                 };
                 return SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projection)
                     .with_projection_key(Some(key));
@@ -505,6 +507,11 @@ pub struct SessionRecord {
     title: Option<String>,
     root: Option<PathBuf>,
     kind: Option<SessionKind>,
+    /// Why `status` is `Invalid` (plain language, with the failing line and
+    /// byte offset when known). In-memory only: Invalid projections are
+    /// never cached to the sidecar, so a sidecar-served record carries no
+    /// reason and a repaired log clears it on the next full projection.
+    invalid_reason: Option<String>,
     /// (len, mtime-ns) of events.jsonl that the projection fields describe;
     /// carried into sidecar writes so metadata touches keep the cache warm.
     projection_key: Option<(u64, u64)>,
@@ -531,6 +538,7 @@ impl SessionRecord {
             title: projection.title,
             root: projection.root,
             kind: projection.kind,
+            invalid_reason: projection.invalid_reason,
             projection_key: None,
         }
     }
@@ -570,6 +578,13 @@ impl SessionRecord {
 
     pub fn status(&self) -> SessionStatus {
         self.status
+    }
+
+    /// Plain-language reason the record's status is [`SessionStatus::Invalid`]
+    /// (e.g. where the event log is corrupted), when the projection that
+    /// produced this record diagnosed one.
+    pub fn invalid_reason(&self) -> Option<&str> {
+        self.invalid_reason.as_deref()
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -867,6 +882,12 @@ struct SessionProjection {
     title: Option<String>,
     root: Option<PathBuf>,
     kind: Option<SessionKind>,
+    /// Why the projection is `Invalid`, in user-facing language (e.g.
+    /// "session log is corrupted at line 12 (byte offset 480): unexpected
+    /// NUL bytes; the session cannot be resumed"). Never persisted: Invalid
+    /// projections are never cached, so the reason is re-derived — and can
+    /// clear — on every listing.
+    invalid_reason: Option<String>,
 }
 
 impl SessionProjection {
@@ -877,6 +898,18 @@ impl SessionProjection {
             title: None,
             root: None,
             kind: None,
+            invalid_reason: None,
+        }
+    }
+
+    fn invalid(reason: String) -> Self {
+        Self {
+            status: SessionStatus::Invalid,
+            name: None,
+            title: None,
+            root: None,
+            kind: None,
+            invalid_reason: Some(reason),
         }
     }
 }
@@ -894,25 +927,16 @@ fn session_projection_from_events_or_sidecar(
     note_event_log_projection();
     // `read_resume_prefix` reads the complete accepted prefix. Status depends
     // on seeing the latest terminal status event in that durable prefix.
-    let Ok(events) = read_resume_prefix(path) else {
-        return SessionProjection {
-            status: SessionStatus::Invalid,
-            name: None,
-            title: None,
-            root: None,
-            kind: None,
-        };
+    // Failures carry the diagnosis: an Invalid status without a reason is
+    // unactionable after e.g. a power-loss tear zero-fills a log page.
+    let events = match read_resume_prefix(path) {
+        Ok(events) => events,
+        Err(error) => return SessionProjection::invalid(error.to_string()),
     };
     let root = match root_from_events(&events) {
         Ok(root) => root.or(sidecar_root),
-        Err(_) => {
-            return SessionProjection {
-                status: SessionStatus::Invalid,
-                name: None,
-                title: None,
-                root: None,
-                kind: None,
-            }
+        Err(error) => {
+            return SessionProjection::invalid(format!("invalid root projection: {error}"))
         }
     };
     SessionProjection {
@@ -922,6 +946,7 @@ fn session_projection_from_events_or_sidecar(
         title: title_from_events(&events),
         root,
         kind: kind_from_events(&events).or(sidecar_kind),
+        invalid_reason: None,
     }
 }
 

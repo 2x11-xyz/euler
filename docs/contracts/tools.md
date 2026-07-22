@@ -57,7 +57,7 @@ Semantics:
 
 | Tool | Capability | Notes |
 |---|---|---|
-| `read_file` | FsRead | Relative path; optional line offset / max_bytes / max_lines |
+| `read_file` | FsRead | Relative path; optional line offset / max_bytes / max_lines. A sensitive basename (capabilities contract, “Sensitive-basename ask”: `.env*`, `*secret*`, `*credential*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key` — literal or symlink-resolved) escalates the request from blanket `session-allow` to an explicit ask. |
 | `edit_file` | FsWrite | Single exact replacement |
 | `write_file` | FsWrite | Create a new file from plain `{path, content}` — no patch dialect. Create-only: fails if the file exists (use `edit_file`/`apply_patch` to modify) or the parent directory is missing. Emits the same `patch.proposed`/`patch.applied`/`file.change`/`file.diff` provenance as the add path of `apply_patch`. |
 | `apply_patch` | FsWrite | Structured single-file patch |

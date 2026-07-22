@@ -726,10 +726,11 @@ fn normalize_sandbox_subprocess_error(sandboxed: bool, error: ToolError) -> Tool
 
 const DISPLAY_PATH_MAX_CHARS: usize = 256;
 
-/// Sanitize a model-supplied path for inclusion in an error message:
-/// replace control characters and cap the length so hostile or degenerate
-/// input cannot inject terminal escapes, split log lines, or bloat events.
-fn display_path(path: &str) -> String {
+/// Sanitize a model-supplied path for inclusion in an error message or a
+/// permission-prompt reason: replace control characters and cap the length so
+/// hostile or degenerate input cannot inject terminal escapes, split log
+/// lines, or bloat events.
+pub(crate) fn display_path(path: &str) -> String {
     let mut sanitized: String = path
         .chars()
         .take(DISPLAY_PATH_MAX_CHARS)
@@ -743,7 +744,7 @@ fn display_path(path: &str) -> String {
 
 fn scrub_agent_subprocess_env(command: &mut Command) {
     for (name, _) in std::env::vars_os() {
-        if is_secret_env_name(&name) || is_parent_control_env_name(&name) {
+        if crate::redaction::is_secret_env_name(&name) || is_parent_control_env_name(&name) {
             command.env_remove(name);
         }
     }
@@ -752,36 +753,22 @@ fn scrub_agent_subprocess_env(command: &mut Command) {
 /// Ambient controls for the owning Euler process must not silently configure
 /// programs launched by the agent. A command can still set any of these
 /// explicitly in its own shell text when that is part of the requested work.
+/// `EULER_AUTH_FILE` lives here rather than in the secret-name classifier:
+/// its value is a path (the credentials live in the file), so the subprocess
+/// must not see it, but the path itself is not a redaction known-value.
 fn is_parent_control_env_name(name: &std::ffi::OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
     matches!(
         name,
-        "EULER_HOME" | "EULER_PROVIDER" | "EULER_MODEL" | "EULER_NO_TTY" | "EULER_TUI_METRICS"
-    )
-}
-
-fn is_secret_env_name(name: &std::ffi::OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let upper = name.to_ascii_uppercase();
-    matches!(
-        upper.as_str(),
-        "ANTHROPIC_API_KEY"
-            | "OPENAI_API_KEY"
-            | "OPENROUTER_API_KEY"
-            | "XAI_API_KEY"
+        "EULER_HOME"
+            | "EULER_PROVIDER"
+            | "EULER_MODEL"
+            | "EULER_NO_TTY"
+            | "EULER_TUI_METRICS"
             | "EULER_AUTH_FILE"
-    ) || upper.ends_with("_API_KEY")
-        || upper.ends_with("_ACCESS_KEY")
-        || upper.split('_').any(|segment| {
-            matches!(
-                segment,
-                "KEY" | "TOKEN" | "SECRET" | "CREDENTIAL" | "CREDENTIALS" | "PASSWORD"
-            )
-        })
+    )
 }
 
 fn empty_parameters() -> Value {

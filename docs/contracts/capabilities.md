@@ -277,7 +277,8 @@ analysis reasons about the whole line:
   non-existing argument must be relative with no `..` component, no leading
   `~`, and no `$`/backtick. A sensitive-basename denylist (`.env*`, names
   containing `secret`/`credential`, `id_rsa`, `id_ed25519`, `*.pem`,
-  `*.key`) rejects even inside the workspace. Argument positions are
+  `*.key`) rejects even inside the workspace; the same list drives the
+  fs-tool "Sensitive-basename ask" below — one list, not two. Argument positions are
   classified conservatively — only the grep/rg pattern position is exempt,
   and only when no `-e`/`-f`-style flag can shift it; `--flag=value` values
   are checked, and flags that could carry an attached path reject. A
@@ -400,3 +401,23 @@ but every execution records a permission decision event. `fs-write`,
 capabilities remain `always-deny`; child-agent gates start deny-all and inherit
 only their explicit attenuated envelope. Headless auto-approve tiers override
 these root defaults with the explicit mapping above.
+
+**Sensitive-basename ask.** A blanket `session-allow` never covers a tool
+request whose path names a categorically sensitive file. When a path-taking
+tool request (`read_file`, and the write tools' paths equally) targets a
+basename on the sensitive list — the same list static command safety
+enforces: `.env*`, names containing `secret`/`credential`, `id_rsa`,
+`id_ed25519`, `*.pem`, `*.key` — the gate escalates that single request from
+`session-allow` to `ask`. The check applies to the literal argument AND its
+canonicalized workspace resolution, so an innocently named symlink cannot
+evade it. The escalated ask flows through the ordinary permission braid: a
+covering session/project/user grant satisfies it silently (the tool result
+carries the usual `grant_source` tag), otherwise a `permission.prompt` is
+emitted whose reason names the file and why it is sensitive, and the
+configured decider resolves it — allow-once, a session grant (which then
+covers later sensitive reads), or deny. This is an ask, not a deny:
+`always-deny` is never weakened and no new denial surface exists. Both
+permission gates — root session and companion loop — apply the same
+escalation. In headless auto-approve tiers the escalated ask reaches the
+fail-closed headless decider and is therefore denied unless a durable grant
+covers it.

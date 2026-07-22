@@ -325,6 +325,10 @@ fn invalid_projection_is_never_cached_and_can_recover() {
         .expect("find")
         .expect("record");
     assert_eq!(listed.status(), SessionStatus::Invalid);
+    // The diagnosis rides along instead of being discarded into a bare
+    // Invalid status.
+    let reason = listed.invalid_reason().expect("invalid reason");
+    assert!(reason.starts_with("invalid provenance line 1:"), "{reason}");
     let sidecar: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
             .expect("json");
@@ -338,6 +342,89 @@ fn invalid_projection_is_never_cached_and_can_recover() {
         .expect("find")
         .expect("record");
     assert_eq!(recovered.status(), SessionStatus::Active);
+    assert_eq!(recovered.invalid_reason(), None);
+}
+
+#[test]
+fn interior_nul_run_projects_invalid_with_corruption_reason() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer
+        .append(std::slice::from_ref(&start))
+        .expect("append start");
+    drop(writer);
+    let accepted_len = fs::metadata(record.events_path()).expect("metadata").len() as usize;
+    // A zero-filled page from a power-loss tear: a NUL run in the interior
+    // of the log, with valid-looking bytes after it.
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(record.events_path())
+        .expect("open events");
+    file.write_all(b"\x00\x00\x00\x00\n{\"still\":\"json\"}\n")
+        .expect("append corruption");
+    drop(file);
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+
+    assert_eq!(listed.status(), SessionStatus::Invalid);
+    let reason = listed.invalid_reason().expect("invalid reason");
+    assert_eq!(
+        reason,
+        format!(
+            "session log is corrupted at line 2 (byte offset {accepted_len}): \
+             unexpected NUL bytes; the session cannot be resumed"
+        )
+    );
+    // Invalid projections stay uncached, so a repaired log re-projects.
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(sidecar.get("projected_events_len").is_none());
+}
+
+#[test]
+fn torn_final_line_still_projects_accepted_prefix() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer
+        .append(std::slice::from_ref(&start))
+        .expect("append start");
+    drop(writer);
+    // A torn FINAL line (no trailing newline) is the ordinary crash shape;
+    // it must keep loading as the accepted prefix, not become Invalid.
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(record.events_path())
+        .expect("open events");
+    file.write_all(br#"{"torn":"#).expect("append torn tail");
+    drop(file);
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+
+    assert_eq!(listed.status(), SessionStatus::Active);
+    assert_eq!(listed.invalid_reason(), None);
 }
 
 #[test]
