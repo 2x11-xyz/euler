@@ -13,7 +13,7 @@ impl AppCore {
             return;
         }
         let ts = event.ts.clone();
-        if let Some(item) = transcript::project_latest_event_for_ui(self.transcript.events()) {
+        if let Some(item) = self.transcript.project_latest_for_ui() {
             self.push_finalized_visual_item_at(item, &ts);
         }
     }

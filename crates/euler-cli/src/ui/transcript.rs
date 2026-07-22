@@ -8,7 +8,7 @@ use euler_event::{EventEnvelope, EventKind};
 use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 10;
 
@@ -420,6 +420,10 @@ pub struct TranscriptState {
     reasoning_body: String,
     scroll_offset: usize,
     auto_follow: bool,
+    /// Incremental cross-event projection context, folded forward once per
+    /// `push_event` so the streaming latest-event projection never replays
+    /// history on the UI thread.
+    projection: StreamProjection,
 }
 
 impl Default for TranscriptState {
@@ -432,6 +436,7 @@ impl Default for TranscriptState {
             reasoning_body: String::new(),
             scroll_offset: 0,
             auto_follow: true,
+            projection: StreamProjection::default(),
         }
     }
 }
@@ -450,6 +455,7 @@ impl TranscriptState {
             }
             _ => {}
         }
+        self.projection.ingest(&event);
         self.events.push(event);
         if self.auto_follow {
             self.scroll_offset = 0;
@@ -458,6 +464,13 @@ impl TranscriptState {
 
     pub fn events(&self) -> &[EventEnvelope] {
         &self.events
+    }
+
+    /// Projection of the most recently pushed event for the streaming
+    /// visual-canvas path. O(1): computed once at `push_event` from the
+    /// incrementally maintained context, never by replaying history.
+    pub(crate) fn project_latest_for_ui(&self) -> Option<TranscriptItem> {
+        self.projection.latest_item.clone()
     }
 
     pub fn items(&self) -> Vec<TranscriptItem> {
@@ -806,11 +819,157 @@ fn scrub_notice_text(event: &EventEnvelope) -> String {
     )
 }
 
-pub(crate) fn project_latest_event_for_ui(events: &[EventEnvelope]) -> Option<TranscriptItem> {
+// Performance regression instrumentation (test builds only, zero-cost in
+// production). Counts per-event projection visits — one call of the
+// projection workhorse (`project_tui_event_with_context_and_spawn_ts`) for
+// one event. The streaming path (`TranscriptState::push_event` →
+// `StreamProjection::ingest`) must visit each pushed event exactly once
+// (O(N) per turn, on the UI thread). The pre-incremental implementation
+// replayed the whole history per streamed event — O(N²) visits per turn,
+// the same regression shape as the session store's list_sessions enter-key
+// stall (see the EVENT_LOG_PROJECTIONS guard in
+// euler-core/src/session_store.rs). Work-counting guards in
+// transcript_tests.rs assert linear scaling on the streaming path.
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_EVENT_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of per-event projection visits performed on the current thread
+/// since the last [`reset_projection_event_visits`]. Test-only work counter.
+#[cfg(test)]
+pub(crate) fn projection_event_visits() -> u64 {
+    PROJECTION_EVENT_VISITS.with(std::cell::Cell::get)
+}
+
+/// Resets the projection-visit work counter for the current thread.
+#[cfg(test)]
+pub(crate) fn reset_projection_event_visits() {
+    PROJECTION_EVENT_VISITS.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+fn note_projection_event_visit() {
+    PROJECTION_EVENT_VISITS.with(|counter| counter.set(counter.get().saturating_add(1)));
+}
+
+/// Incremental cross-event context for the streaming projection path: the
+/// state a full history replay used to rebuild per streamed event, now
+/// folded forward once per event so projecting the newest event is O(1)
+/// amortized on the UI thread. Owned by `TranscriptState` and fed from
+/// `push_event`, so every ingress path — live turn events, extension and
+/// companion event batches, rollback/compaction appends, and the resume
+/// rebuild (which replays history through `push_event`) — seeds it
+/// identically.
+///
+/// Parity contract: for any event sequence, `latest_item` after ingesting
+/// event N equals `replay_latest_event_for_ui(&events[..=N])` (the retired
+/// full-replay implementation, kept below as the test oracle).
+#[derive(Clone, Debug, Default)]
+struct StreamProjection {
+    /// Tool-call context (event id AND payload id → projection) for
+    /// tool.result matching. Grows with distinct tool calls; entries are
+    /// deliberately never dropped on match because the reference replay kept
+    /// every call visible to every later result (a duplicate/late result
+    /// must still resolve its command or path).
+    calls: HashMap<String, ToolCallProjection>,
+    /// `child_agent_id`s announced by agent.spawn events: child tool/model
+    /// events are suppressed from the live ledger (companion block owns
+    /// spawn/message/result presentation).
+    child_agents: HashSet<String>,
+    /// Content of the most recent model.result / assistant.message /
+    /// user.message "owner" event, but only when that owner was a
+    /// model.result with non-empty content — the fallback an immediately
+    /// following same-content assistant.message deduplicates against.
+    last_owner_fallback: Option<String>,
+    /// Every ingested event's id → ts, for companion elapsed stamps. The
+    /// reference replay resolved `spawn_event_id`/`parent` against ANY
+    /// earlier event (not just agent.spawn), so parity needs all ids; the
+    /// map stays small next to the event vec the state already retains.
+    event_ts_by_id: HashMap<String, String>,
+    /// Projection of the most recently ingested event, computed exactly once
+    /// at ingest — repeated reads can never re-project (or re-count) it.
+    latest_item: Option<TranscriptItem>,
+}
+
+impl StreamProjection {
+    /// Projects `event` as the newest streamed event against the context of
+    /// everything ingested before it, then folds the event into that context
+    /// for the events after it. Call exactly once per appended event.
+    fn ingest(&mut self, event: &EventEnvelope) {
+        self.latest_item = self.project(event);
+        if event.kind.as_str() == EventKind::AGENT_SPAWN {
+            if let Some(child) = payload_string(event, "child_agent_id") {
+                self.child_agents.insert(child);
+            }
+        }
+        if matches!(
+            event.kind.as_str(),
+            EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
+        ) {
+            self.last_owner_fallback = match model_result_fallback_item(event) {
+                Some(TranscriptItem::AssistantMessage(content)) => Some(content),
+                _ => None,
+            };
+        }
+        self.event_ts_by_id
+            .insert(event.id.clone(), event.ts.clone());
+    }
+
+    fn project(&mut self, event: &EventEnvelope) -> Option<TranscriptItem> {
+        if self.is_child_agent_event(event) {
+            // Child-agent tool/model events are not a joinable live nested
+            // ledger in v0 presentation; companion block owns
+            // spawn/message/result only. The full replay still folded child
+            // tool.calls into the call context — preserve that so a later
+            // result can resolve them.
+            let _ = project_tui_event_with_context(event, &mut self.calls);
+            return None;
+        }
+        if self.assistant_duplicates_last_fallback(event) {
+            // assistant.message never touches the call context.
+            return None;
+        }
+        if let Some(item) = model_result_fallback_item(event) {
+            // model.result never touches the call context.
+            return Some(item);
+        }
+        let Self {
+            calls,
+            event_ts_by_id,
+            ..
+        } = self;
+        let spawn_ts = companion_spawn_ts_lookup(event, event_ts_by_id);
+        project_tui_event_with_context_and_spawn_ts(event, calls, spawn_ts)
+    }
+
+    fn is_child_agent_event(&self, event: &EventEnvelope) -> bool {
+        !matches!(
+            event.kind.as_str(),
+            EventKind::AGENT_SPAWN | EventKind::AGENT_MESSAGE | EventKind::AGENT_RESULT
+        ) && self.child_agents.contains(event.agent.as_str())
+    }
+
+    fn assistant_duplicates_last_fallback(&self, event: &EventEnvelope) -> bool {
+        if event.kind.as_str() != EventKind::ASSISTANT_MESSAGE {
+            return false;
+        }
+        let Some(content) = payload_string(event, "content") else {
+            return false;
+        };
+        self.last_owner_fallback.as_deref() == Some(content.as_str())
+    }
+}
+
+/// Reference oracle for `StreamProjection`: the retired pre-incremental
+/// implementation, kept verbatim (test-only) so parity tests can assert the
+/// streaming path projects each event exactly as a fresh O(history) replay
+/// would. Never call from production code — it is the O(N²)-per-turn shape
+/// the incremental state exists to eliminate.
+#[cfg(test)]
+pub(crate) fn replay_latest_event_for_ui(events: &[EventEnvelope]) -> Option<TranscriptItem> {
     let (latest, earlier) = events.split_last()?;
     if is_child_agent_event(latest, earlier) {
-        // Child-agent tool/model events are not a joinable live nested ledger
-        // in v0 presentation; companion block owns spawn/message/result only.
         return None;
     }
     if assistant_duplicates_model_result_fallback(latest, earlier) {
@@ -1041,6 +1200,8 @@ fn project_tui_event_with_context_and_spawn_ts(
     calls: &mut HashMap<String, ToolCallProjection>,
     spawn_ts: Option<&str>,
 ) -> Option<TranscriptItem> {
+    #[cfg(test)]
+    note_projection_event_visit();
     match event.kind.as_str() {
         EventKind::TOOL_CALL => {
             if let Some(projection) = tool_projection_from_call(event) {
@@ -1217,6 +1378,9 @@ fn model_result_has_matching_assistant_message(
         })
 }
 
+/// Reference-oracle helper (see `replay_latest_event_for_ui`); the streaming
+/// path uses `StreamProjection::assistant_duplicates_last_fallback`.
+#[cfg(test)]
 fn assistant_duplicates_model_result_fallback(
     assistant: &EventEnvelope,
     earlier: &[EventEnvelope],
@@ -1546,6 +1710,9 @@ fn truncate_companion_text(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Reference-oracle helper (see `replay_latest_event_for_ui`); the streaming
+/// path uses `StreamProjection::is_child_agent_event`.
+#[cfg(test)]
 fn is_child_agent_event(event: &EventEnvelope, earlier: &[EventEnvelope]) -> bool {
     if matches!(
         event.kind.as_str(),
@@ -1567,6 +1734,10 @@ fn is_child_agent_id(agent: &str, child_agents: &HashMap<String, String>) -> boo
     child_agents.contains_key(agent)
 }
 
+/// Reference-oracle helper (see `replay_latest_event_for_ui`); the streaming
+/// path resolves the spawn ts via `StreamProjection::event_ts_by_id` with
+/// `companion_spawn_ts_lookup`.
+#[cfg(test)]
 fn companion_spawn_ts_for_event<'a>(
     event: &EventEnvelope,
     earlier: &'a [EventEnvelope],
