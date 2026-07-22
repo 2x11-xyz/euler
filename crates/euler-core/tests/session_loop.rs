@@ -1161,7 +1161,7 @@ fn tool_output_redacts_known_values_and_token_shapes() {
 fn tool_output_preview_is_derived_after_secret_redaction() {
     let temp = tempfile::tempdir().expect("temp dir");
     let secret = "registered-secret-value-42";
-    let command = format!("printf 'PPPPP{secret}{}'", "S".repeat(100));
+    let command = format!("printf 'PPPPP{secret}{}'", "S".repeat(1_000));
     let provider = ScriptedProvider::new(vec![
         FixtureResponse::ToolCalls(vec![ToolCall {
             id: "call-preview-secret".to_owned(),

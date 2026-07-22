@@ -849,7 +849,11 @@ pub fn projected_tool_output(event: &EventEnvelope) -> String {
 call tool_result_get with event_id={} and optional offset_bytes/max_bytes to recover the full result]",
         event.id
     ));
-    preview
+    if preview.len() < output.len() {
+        preview
+    } else {
+        output.to_owned()
+    }
 }
 
 fn string_field(event: &EventEnvelope, key: &str) -> Option<String> {
