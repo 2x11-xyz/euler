@@ -285,9 +285,9 @@ fn append_linked_manager_items(
         items.push(crate::ui::commands::ExtensionManagerItem {
             id: link.id.clone(),
             display_name: link.descriptor.display_name.clone(),
-            // Linked launch consent is persisted in the registry; the session's
-            // enabled set gains the ID only after the worker revalidates
-            // current consent and fingerprint at execution time.
+            // Enabled means persisted launch consent still matches the current
+            // manifest. Fresh-session resolution folds that state into the
+            // session set; the worker revalidates again at execution time.
             enabled: linked_enabled,
             materialization: Some(link.materialization.as_str().to_owned()),
             version: link.descriptor.version.clone(),

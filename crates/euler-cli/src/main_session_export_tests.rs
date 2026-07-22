@@ -116,6 +116,7 @@ fn session_export_rejects_invalid_query_flags() {
 fn session_export_requires_a_linked_session_export_extension() {
     // ADR 0015 core-only: session-export ships from the euler-extensions
     // repository. Without it linked, the CLI names the way in.
+    let _env_lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
     let temp = tempfile::tempdir().expect("temp dir");
     let _home_guard = EnvVarGuard::set_path("EULER_HOME", &temp.path().join(".euler"));
     let session_id = "session-123";

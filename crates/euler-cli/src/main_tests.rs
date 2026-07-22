@@ -1,4 +1,26 @@
 use super::*;
+
+struct EulerHomeEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EulerHomeEnvGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("EULER_HOME");
+        std::env::set_var("EULER_HOME", path);
+        Self { previous }
+    }
+}
+
+impl Drop for EulerHomeEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("EULER_HOME", value),
+            None => std::env::remove_var("EULER_HOME"),
+        }
+    }
+}
+
 #[test]
 fn chatgpt_provider_defaults_to_gpt_55_without_model() {
     let args = parse_without_env(["--provider", "chatgpt"]);
@@ -1831,8 +1853,9 @@ fn observe_cadence_requires_observe() {
 fn observe_unlinked_extension_id_is_an_honest_error() {
     // Hermetic registry: an EULER_HOME with no linked extensions, so the
     // resolve cannot see a developer machine's real registry.
+    let _env_lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
     let home = tempfile::tempdir().expect("home");
-    std::env::set_var("EULER_HOME", home.path());
+    let _home_guard = EulerHomeEnvGuard::set(home.path());
     let run = parse_without_env(["--observe", "no-such-extension"]);
 
     let error = match resolve_round_observer(&run.observe) {
@@ -1851,8 +1874,9 @@ fn linked_launch_consent_joins_the_session_extension_set() {
     // `extension enable` records linked launch consent only; a fresh session
     // must still see the extension in its enabled set (tool advertisement,
     // e.g. code-swarm) without a separate --extensions opt-in.
+    let _env_lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
     let home = tempfile::tempdir().expect("home");
-    std::env::set_var("EULER_HOME", home.path());
+    let _home_guard = EulerHomeEnvGuard::set(home.path());
     let extension_dir = tempfile::tempdir().expect("extension dir");
     std::fs::write(
         extension_dir

@@ -1057,9 +1057,9 @@ impl AppCore {
         Vec<crate::ui::commands::ExtensionManagerItem>,
         Vec<crate::ui::commands::ExtensionSlashCommand>,
     ) {
-        // Registry listing is cached (disk-backed, hot path). Linked items
-        // carry their separately persisted launch consent; there is no
-        // session-enablement overlay to apply.
+        // Registry listing is cached (disk-backed, hot path). The manager
+        // reports current user-scope launch consent; session/project selection
+        // is resolved separately.
         let items = match &self.extension_registry_items {
             Some(items) => items.clone(),
             None => {
