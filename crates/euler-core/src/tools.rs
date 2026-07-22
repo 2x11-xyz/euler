@@ -565,8 +565,8 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             }
         };
         // Defense in depth: Bubblewrap clears this environment too, while
-        // ordinary host execution keeps the existing secret-name scrub.
-        scrub_secret_env(&mut child);
+        // ordinary host execution needs an explicit child-process boundary.
+        scrub_agent_subprocess_env(&mut child);
         Ok(AgentSubprocess {
             command: child,
             sandboxed: self.workspace_sandbox.is_some(),
@@ -696,12 +696,30 @@ fn display_path(path: &str) -> String {
     sanitized
 }
 
-fn scrub_secret_env(command: &mut Command) {
+fn scrub_agent_subprocess_env(command: &mut Command) {
     for (name, _) in std::env::vars_os() {
-        if is_secret_env_name(&name) {
+        if is_secret_env_name(&name) || is_parent_control_env_name(&name) {
             command.env_remove(name);
         }
     }
+}
+
+/// Ambient controls for the owning Euler process must not silently configure
+/// programs launched by the agent. A command can still set any of these
+/// explicitly in its own shell text when that is part of the requested work.
+fn is_parent_control_env_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "EULER_HOME"
+            | "EULER_PROVIDER"
+            | "EULER_MODEL"
+            | "EULER_NO_TTY"
+            | "EULER_TUI_METRICS"
+            | "RUST_LOG"
+    )
 }
 
 fn is_secret_env_name(name: &std::ffi::OsStr) -> bool {

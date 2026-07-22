@@ -5,7 +5,7 @@
 //! and status scalars. They are not a proof against future misuse, but they keep
 //! user/model/tool payloads and resolved secrets out of the diagnostics log.
 
-use euler_provider::Usage;
+use euler_provider::{ProviderErrorCategory, Usage};
 
 const TARGET: &str = "euler_core::diagnostics";
 
@@ -40,14 +40,32 @@ pub(crate) fn model_call_end(
     );
 }
 
-pub(crate) fn transport_retry(session_id: &str, attempt: u64, backoff_ms: u64) {
-    tracing::info!(
-        target: TARGET,
-        event = "transport_retry",
-        session_id,
-        attempt,
-        backoff_ms
-    );
+pub(crate) fn provider_retry(
+    session_id: &str,
+    category: ProviderErrorCategory,
+    attempt: u64,
+    backoff_ms: u64,
+) {
+    match category {
+        ProviderErrorCategory::Transport => tracing::info!(
+            target: TARGET,
+            event = "transport_retry",
+            session_id,
+            attempt,
+            backoff_ms
+        ),
+        ProviderErrorCategory::RateLimit => tracing::info!(
+            target: TARGET,
+            event = "rate_limit_retry",
+            session_id,
+            attempt,
+            backoff_ms
+        ),
+        _ => debug_assert!(
+            false,
+            "non-retryable provider category reached retry diagnostics"
+        ),
+    }
 }
 
 pub(crate) fn tool_exec_end(session_id: &str, tool: &str, duration_ms: u64, ok: bool) {

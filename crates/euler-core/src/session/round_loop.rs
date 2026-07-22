@@ -94,12 +94,12 @@ pub(crate) struct RoundLoopConfig {
     /// turn, errors, or is cancelled. Interactive use relies on the human
     /// (and cancellation), not an arbitrary ceiling.
     pub(crate) max_rounds: Option<usize>,
-    /// Extra attempts after a transport-category provider failure on a round
-    /// that has processed no stream events. Non-transport failures and rounds
-    /// with partial output are never retried.
-    pub(crate) transport_retries: usize,
+    /// Extra attempts after a transient transport or rate-limit provider
+    /// failure on a round that has processed no stream events. Other failures
+    /// and rounds with partial output are never retried.
+    pub(crate) provider_retries: usize,
     /// Backoff before each retry; the last entry repeats if retries exceed it.
-    pub(crate) transport_retry_backoff_ms: Vec<u64>,
+    pub(crate) provider_retry_backoff_ms: Vec<u64>,
 }
 
 /// Session-side surface consumed by [`RoundLoop`].
@@ -255,9 +255,12 @@ where
                 Err(AttemptFailure::Session(error)) => return Err(error),
                 Err(AttemptFailure::Provider(error)) => error,
             };
-            let retryable = error.category() == ProviderErrorCategory::Transport
-                && !events_processed
-                && attempt < self.config.transport_retries;
+            let category = error.category();
+            let retryable = matches!(
+                category,
+                ProviderErrorCategory::Transport | ProviderErrorCategory::RateLimit
+            ) && !events_processed
+                && attempt < self.config.provider_retries;
             if !retryable {
                 self.io
                     .emit_provider_error(&error, model_call_id.to_owned())?;
@@ -266,13 +269,18 @@ where
             }
             let backoff_ms = self
                 .config
-                .transport_retry_backoff_ms
+                .provider_retry_backoff_ms
                 .get(attempt)
-                .or(self.config.transport_retry_backoff_ms.last())
+                .or(self.config.provider_retry_backoff_ms.last())
                 .copied()
                 .unwrap_or(0);
             attempt += 1;
-            crate::diagnostics::transport_retry(self.io.session_id(), attempt as u64, backoff_ms);
+            crate::diagnostics::provider_retry(
+                self.io.session_id(),
+                category,
+                attempt as u64,
+                backoff_ms,
+            );
             sleep_with_cancel(backoff_ms, cancel_flag)?;
         }
     }

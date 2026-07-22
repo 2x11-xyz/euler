@@ -34,6 +34,7 @@ use round_loop::{
     EventSink, ModelRoundData, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, TurnState,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,7 +70,22 @@ const CONTEXT_LIMIT_MESSAGE: &str =
     "Session stopped because the context limit threshold was reached.";
 const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
-const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provided tools when useful. To create a new file, prefer write_file. For code and text file updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, inspections, deletes, and renames. When operations are independent (reading several files, running separate inspections), issue them as multiple tool calls in a single response rather than one at a time. After a successful code edit, use Euler's emitted file diff artifact to summarize what changed; do not call git diff or reread files solely to restate that diff. Write plain prose without emoji or decorative symbols; the terminal ledger renders a fixed glyph vocabulary only.";
+const SYSTEM_INSTRUCTIONS_VERSION: u64 = 1;
+const SYSTEM_INSTRUCTIONS: &str = concat!(
+    "You are Euler, a coding agent. Work through the user's task completely: do not stop after ",
+    "analysis, a plan, or partial implementation. Continue until every requested deliverable is ",
+    "complete or you are genuinely blocked, and verify the result with the most relevant available ",
+    "checks before finishing. Never claim a check passed when it failed or was not run. Use the ",
+    "provided tools when useful. To create a new file, prefer write_file. For code and text file ",
+    "updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, ",
+    "inspections, deletes, and renames. When operations are independent (reading several files, ",
+    "running separate inspections), issue them as multiple tool calls in a single response rather ",
+    "than one at a time. After a successful code edit, use Euler's emitted file diff artifact to ",
+    "summarize what changed; do not call git diff or reread files solely to restate that diff. In ",
+    "the final response, state the outcome, verification, and any remaining blocker concisely. ",
+    "Write plain prose without emoji or decorative symbols; the terminal ledger renders a fixed ",
+    "glyph vocabulary only."
+);
 
 /// The byte length of the fixed Euler instructions the root driver sends. This
 /// is the `fixed_instruction_bytes` term of the project-context admission-time
@@ -77,6 +93,10 @@ const SYSTEM_INSTRUCTIONS: &str = "You are Euler, a coding agent. Use the provid
 /// even constructed (project-context contract, "Framing and canvas admission").
 pub fn system_instruction_bytes() -> usize {
     SYSTEM_INSTRUCTIONS.len()
+}
+
+fn system_instructions_sha256() -> String {
+    format!("{:x}", Sha256::digest(SYSTEM_INSTRUCTIONS.as_bytes()))
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContextLimitConfig {
@@ -144,8 +164,9 @@ pub struct SessionConfig {
     /// model finishes, fails, or the user cancels. Set only when a hard
     /// ceiling is explicitly wanted (e.g. exec --max-tool-rounds).
     pub max_tool_rounds: Option<usize>,
-    /// Extra attempts after transport-category provider failures on rounds
-    /// with no processed stream events. Default: 2 (backoff 1s then 3s).
+    /// Extra attempts after transient transport or rate-limit failures on
+    /// rounds with no processed stream events. Default: 2 (backoff 1s then
+    /// 3s). The transport-named fields are retained for source compatibility.
     pub provider_transport_retries: usize,
     pub provider_transport_retry_backoff_ms: Vec<u64>,
     /// Canvas retention policy (ADR canvas-retention-and-auto-compaction):
@@ -1516,8 +1537,8 @@ impl<D: PermissionDecider> Session<D> {
         let mut turn_state = TurnState::default();
         let mut rounds = 0_u64;
         let max_rounds = self.config.max_tool_rounds;
-        let transport_retries = self.config.provider_transport_retries;
-        let transport_retry_backoff_ms = self.config.provider_transport_retry_backoff_ms.clone();
+        let provider_retries = self.config.provider_transport_retries;
+        let provider_retry_backoff_ms = self.config.provider_transport_retry_backoff_ms.clone();
         let mut io = SessionRoundIo {
             session: self,
             sink,
@@ -1528,8 +1549,8 @@ impl<D: PermissionDecider> Session<D> {
             &mut io,
             RoundLoopConfig {
                 max_rounds,
-                transport_retries,
-                transport_retry_backoff_ms,
+                provider_retries,
+                provider_retry_backoff_ms,
             },
         )
         .run(cancel_flag);
@@ -1599,16 +1620,13 @@ impl<D: PermissionDecider> Session<D> {
                 return Err(error);
             }
         }
-
-        let mut model_call = object([
-            ("provider", target.provider.clone().into()),
-            ("model", target.model.clone().into()),
-            ("canvas_items", canvas.len().into()),
-            (
-                "requested_reasoning_effort",
-                self.config.reasoning_effort.as_str().into(),
-            ),
-        ]);
+        let mut model_call = root_model_call_payload(
+            target,
+            canvas.len(),
+            self.config.reasoning_effort,
+            request.instructions.len(),
+        );
+        record_unseen_instructions(&mut model_call, self.bus.events(), &request.instructions);
         if let Some(reasoning_effort) = self
             .providers
             .reasoning_effort(&target.provider, &target.model)
@@ -2223,6 +2241,62 @@ fn push_reasoning_chunk(reasoning: &mut Vec<ReasoningChunk>, chunk: ReasoningChu
         reasoning.push(chunk);
     }
 }
+
+fn root_model_call_payload(
+    target: &ModelTarget,
+    canvas_items: usize,
+    requested_reasoning_effort: ReasoningEffort,
+    system_instructions_bytes: usize,
+) -> JsonObject {
+    object([
+        ("provider", target.provider.clone().into()),
+        ("model", target.model.clone().into()),
+        ("canvas_items", canvas_items.into()),
+        (
+            "requested_reasoning_effort",
+            requested_reasoning_effort.as_str().into(),
+        ),
+        (
+            "system_instructions_version",
+            SYSTEM_INSTRUCTIONS_VERSION.into(),
+        ),
+        (
+            "system_instructions_sha256",
+            system_instructions_sha256().into(),
+        ),
+        (
+            "system_instructions_bytes",
+            system_instructions_bytes.into(),
+        ),
+    ])
+}
+
+fn record_unseen_instructions(
+    model_call: &mut JsonObject,
+    events: &[EventEnvelope],
+    instructions: &str,
+) {
+    let digest = system_instructions_sha256();
+    let already_recorded = events.iter().any(|event| {
+        matches!(
+            event.kind.as_str(),
+            EventKind::SESSION_START | EventKind::MODEL_CALL
+        ) && event
+            .payload
+            .get("system_instructions_sha256")
+            .and_then(Value::as_str)
+            == Some(digest.as_str())
+            && event
+                .payload
+                .get("system_instructions")
+                .and_then(Value::as_str)
+                == Some(instructions)
+    });
+    if !already_recorded {
+        model_call.insert("system_instructions".to_owned(), instructions.into());
+    }
+}
+
 /// The `session.start` payload for a fresh session, including the compact
 /// project-context summary when a bootstrap is configured.
 fn session_start_payload(config: &SessionConfig) -> JsonObject {
@@ -2243,6 +2317,19 @@ fn session_start_payload(config: &SessionConfig) -> JsonObject {
                 .into(),
         ),
         ("session_kind", config.session_kind.as_str().into()),
+        (
+            "system_instructions_version",
+            SYSTEM_INSTRUCTIONS_VERSION.into(),
+        ),
+        ("system_instructions", SYSTEM_INSTRUCTIONS.into()),
+        (
+            "system_instructions_sha256",
+            system_instructions_sha256().into(),
+        ),
+        (
+            "system_instructions_bytes",
+            SYSTEM_INSTRUCTIONS.len().into(),
+        ),
         (
             "permission_reviewer",
             config.permission_reviewer.as_str().into(),

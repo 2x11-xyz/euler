@@ -66,6 +66,12 @@ Semantics:
 | `tool_result_get` | FsRead | Rehydrate a demoted/compacted tool result from the **current session** by `event_id` (required); optional `max_bytes`. Session-local only. |
 | `code_swarm_review` | AgentSpawn | Session-level review gate over required explicit `focus` (≤7 KiB) and `context` (≤256 KiB). The calling agent gathers material first through ordinary tools, so this gate has no hidden file, git, GitHub, or network authority. It forwards only that supplied context and a small reviewer brief — never ambient session canvas — fans out the persisted reviewer set, and returns every finding for caller adjudication. Optional: `personas`, `models` (non-empty one-off override; an empty model-facing list is omission), `max_tokens`. Advertised only in the root session when the `code-swarm` extension is wired and enabled; companions never see it (depth one). Config, result shape, and failure honesty: multi-agent contract. |
 
+Agent-controlled shell and Git subprocesses inherit ordinary project
+environment variables, but not credential-shaped values or the owning Euler
+process's routing, home, TTY, metrics, and `RUST_LOG` controls. Commands may
+set an explicit command-local value when the task requires one; ambient parent
+configuration never silently changes a nested build, test, or Euler process.
+
 `code_swarm_review` is not executed by the `ToolRegistry`: it is a
 session-level tool intercepted after the ordinary permission gate, because
 its execution spawns child agents through the session. It rides the same

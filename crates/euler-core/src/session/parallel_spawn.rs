@@ -128,8 +128,8 @@ impl<D: PermissionDecider> Session<D> {
             &self.config.session_id,
             RoundLoopConfig {
                 max_rounds: Some(1),
-                transport_retries: self.config.provider_transport_retries,
-                transport_retry_backoff_ms: self.config.provider_transport_retry_backoff_ms.clone(),
+                provider_retries: self.config.provider_transport_retries,
+                provider_retry_backoff_ms: self.config.provider_transport_retry_backoff_ms.clone(),
             },
             &prepared,
             cancel_flag,
@@ -512,8 +512,8 @@ fn run_workers(
             .map(|reviewer| {
                 let worker_config = RoundLoopConfig {
                     max_rounds: config.max_rounds,
-                    transport_retries: config.transport_retries,
-                    transport_retry_backoff_ms: config.transport_retry_backoff_ms.clone(),
+                    provider_retries: config.provider_retries,
+                    provider_retry_backoff_ms: config.provider_retry_backoff_ms.clone(),
                 };
                 scope.spawn(move || {
                     // Phase 1 already rejected this reviewer and recorded its
@@ -566,7 +566,7 @@ fn run_workers(
     })
 }
 
-/// Worker-side [`RoundLoopIo`]: reuses the shared loop (transport retries,
+/// Worker-side [`RoundLoopIo`]: reuses the shared loop (transient retries,
 /// stream drain, truncation detection) but appends nothing — provider
 /// errors are buffered for the session thread to record in batch order.
 struct WorkerIo<'a> {

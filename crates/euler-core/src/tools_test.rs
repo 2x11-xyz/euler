@@ -990,7 +990,7 @@ fn non_apply_patch_shell_commands_still_execute_normally() {
 }
 
 #[test]
-fn run_shell_scrubs_secret_env_and_keeps_ordinary_env() {
+fn run_shell_scrubs_secret_and_parent_control_env_and_keeps_ordinary_env() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     let _env_restore = EnvRestore::capture(&[
         "EULER_ORDINARY_VAR",
@@ -1001,6 +1001,12 @@ fn run_shell_scrubs_secret_env_and_keeps_ordinary_env() {
         "EULER_TEST_TOKEN",
         "EULER_TEST_SECRET",
         "EULER_TOKENIZER_MODE",
+        "EULER_HOME",
+        "EULER_PROVIDER",
+        "EULER_MODEL",
+        "EULER_NO_TTY",
+        "EULER_TUI_METRICS",
+        "RUST_LOG",
     ]);
     env::set_var("EULER_ORDINARY_VAR", "visible");
     env::set_var("ANTHROPIC_API_KEY", "anthropic-secret");
@@ -1010,6 +1016,12 @@ fn run_shell_scrubs_secret_env_and_keeps_ordinary_env() {
     env::set_var("EULER_TEST_TOKEN", "token-secret");
     env::set_var("EULER_TEST_SECRET", "generic-secret");
     env::set_var("EULER_TOKENIZER_MODE", "tokenizer-visible");
+    env::set_var("EULER_HOME", "/parent/euler-home");
+    env::set_var("EULER_PROVIDER", "parent-provider");
+    env::set_var("EULER_MODEL", "parent-model");
+    env::set_var("EULER_NO_TTY", "1");
+    env::set_var("EULER_TUI_METRICS", "/parent/metrics.jsonl");
+    env::set_var("RUST_LOG", "trace");
     let temp = tempfile::tempdir().expect("temp dir");
     let registry = ToolRegistry::new(temp.path());
 
@@ -1017,18 +1029,30 @@ fn run_shell_scrubs_secret_env_and_keeps_ordinary_env() {
             .execute(
                 "run_shell",
                 &json!({
-                    "command": "printf '%s|%s|%s|%s|%s|%s|%s|%s' \"$EULER_ORDINARY_VAR\" \"$ANTHROPIC_API_KEY\" \"$EULER_AUTH_FILE\" \"$EULER_CUSTOM_API_KEY\" \"$AWS_SECRET_ACCESS_KEY\" \"$EULER_TEST_TOKEN\" \"$EULER_TEST_SECRET\" \"$EULER_TOKENIZER_MODE\""
+                    "command": "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$EULER_ORDINARY_VAR\" \"$ANTHROPIC_API_KEY\" \"$EULER_AUTH_FILE\" \"$EULER_CUSTOM_API_KEY\" \"$AWS_SECRET_ACCESS_KEY\" \"$EULER_TEST_TOKEN\" \"$EULER_TEST_SECRET\" \"$EULER_TOKENIZER_MODE\" \"$EULER_HOME\" \"$EULER_PROVIDER\" \"$EULER_MODEL\" \"$EULER_NO_TTY\" \"$EULER_TUI_METRICS\" \"$RUST_LOG\""
                 }),
             )
             .expect("shell");
 
-    assert!(execution.output.contains("visible|||||||tokenizer-visible"));
+    assert!(execution
+        .output
+        .contains("visible|||||||tokenizer-visible||||||"));
     assert!(!execution.output.contains("anthropic-secret"));
     assert!(!execution.output.contains("auth-file-secret"));
     assert!(!execution.output.contains("api-key-secret"));
     assert!(!execution.output.contains("access-key-secret"));
     assert!(!execution.output.contains("token-secret"));
     assert!(!execution.output.contains("generic-secret"));
+
+    let explicit = registry
+        .execute(
+            "run_shell",
+            &json!({
+                "command": "EULER_HOME=/explicit; RUST_LOG=debug; printf '%s|%s' \"$EULER_HOME\" \"$RUST_LOG\""
+            }),
+        )
+        .expect("shell with explicit controls");
+    assert!(explicit.output.contains("/explicit|debug"));
 }
 
 #[test]

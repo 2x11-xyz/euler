@@ -46,6 +46,12 @@ transport retry (#193 semantics: zero-output rounds, transport category
 only). This is a deliberate upgrade, not drift; a companion retry test is
 required.
 
+Amendment (2026-07-22): the same bounded, zero-output retry policy now also
+accepts provider rate-limit failures. Rejections, authentication failures,
+partial streams, and all other categories remain terminal. The existing
+transport-named public configuration fields are retained for source
+compatibility and govern both retryable categories.
+
 ## Decision 2: round-boundary observation hook (core primitive)
 
 Amendment (2026-07-07): the hook exists so extensions can construct derived

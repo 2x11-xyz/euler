@@ -52,6 +52,19 @@ fn session_new_records_session_start_first() {
     assert_eq!(payload_str(start, "model"), Some("echo"));
     assert_eq!(start.payload["auto_compaction"]["automatic"], json!(true));
     assert_eq!(start.payload["auto_compaction"]["stubs"], json!(true));
+    let instructions = payload_str(start, "system_instructions").expect("system instructions");
+    assert!(instructions.contains("do not stop after analysis, a plan, or partial implementation"));
+    assert!(instructions.contains("Never claim a check passed when it failed or was not run"));
+    assert_eq!(start.payload["system_instructions_version"], json!(1));
+    assert_eq!(
+        start.payload["system_instructions_bytes"],
+        json!(instructions.len())
+    );
+    let expected_digest = format!("{:x}", Sha256::digest(instructions.as_bytes()));
+    assert_eq!(
+        payload_str(start, "system_instructions_sha256"),
+        Some(expected_digest.as_str())
+    );
     let expected_root = temp
         .path()
         .canonicalize()
@@ -156,6 +169,29 @@ fn model_request_prefers_apply_patch_for_file_edits() {
     assert!(request
         .instructions
         .contains("emitted file diff artifact to summarize what changed"));
+    assert!(request
+        .instructions
+        .contains("Continue until every requested deliverable is complete"));
+    assert!(request
+        .instructions
+        .contains("verify the result with the most relevant available checks"));
+    let expected_digest = format!("{:x}", Sha256::digest(request.instructions.as_bytes()));
+    let model_call = find_kind(session.events(), EventKind::MODEL_CALL);
+    assert_eq!(model_call.payload["system_instructions_version"], json!(1));
+    assert!(model_call.payload.get("system_instructions").is_none());
+    assert_eq!(
+        model_call.payload["system_instructions_bytes"],
+        json!(request.instructions.len())
+    );
+    assert_eq!(
+        payload_str(model_call, "system_instructions_sha256"),
+        Some(expected_digest.as_str())
+    );
+    let session_start = find_kind(session.events(), EventKind::SESSION_START);
+    assert_eq!(
+        payload_str(session_start, "system_instructions_sha256"),
+        payload_str(model_call, "system_instructions_sha256")
+    );
     let apply_patch = request
         .tools
         .iter()
@@ -5351,6 +5387,56 @@ fn transport_error_at_invoke_retries_silently_and_recovers() {
 }
 
 #[test]
+fn rate_limit_error_at_invoke_retries_silently_and_recovers() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let invokes = Arc::new(AtomicUsize::new(0));
+    let provider = FlakyThenScriptedProvider::new(
+        vec![ProviderError::rate_limit("HTTP 429")],
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("recovered".to_owned())]),
+        Arc::clone(&invokes),
+    );
+    let mut config = SessionConfig::new(temp.path());
+    config.provider_transport_retries = 2;
+    config.provider_transport_retry_backoff_ms = vec![0];
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session.run_turn("hello").expect("turn recovers");
+
+    assert_eq!(invokes.load(Ordering::Relaxed), 2);
+    assert_eq!(count_kind(session.events(), EventKind::ERROR), 0);
+    assert!(session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::ASSISTANT_MESSAGE
+            && payload_str(event, "content") == Some("recovered")));
+}
+
+#[test]
+fn rate_limit_retries_exhausted_emits_single_error() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let invokes = Arc::new(AtomicUsize::new(0));
+    let provider = FlakyThenScriptedProvider::new(
+        vec![
+            ProviderError::rate_limit("limited one"),
+            ProviderError::rate_limit("limited two"),
+            ProviderError::rate_limit("limited three"),
+        ],
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("unreachable".to_owned())]),
+        Arc::clone(&invokes),
+    );
+    let mut config = SessionConfig::new(temp.path());
+    config.provider_transport_retries = 2;
+    config.provider_transport_retry_backoff_ms = vec![0];
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    let error = session.run_turn("hello").expect_err("retries exhausted");
+
+    assert!(matches!(error, SessionError::Provider(_)));
+    assert_eq!(invokes.load(Ordering::Relaxed), 3);
+    assert_eq!(count_kind(session.events(), EventKind::ERROR), 1);
+}
+
+#[test]
 fn transport_retries_exhausted_emits_single_error() {
     let temp = tempfile::tempdir().expect("temp dir");
     let invokes = Arc::new(AtomicUsize::new(0));
@@ -5416,6 +5502,29 @@ fn partial_stream_transport_error_is_not_retried() {
     match &error {
         SessionError::Provider(provider_error) => {
             assert!(provider_error.to_string().contains("network closed"));
+        }
+        other => panic!("expected provider error, got {other:?}"),
+    }
+    assert_eq!(count_kind(session.events(), EventKind::ERROR), 1);
+}
+
+#[test]
+fn partial_stream_rate_limit_error_is_not_retried() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = RawStreamProvider::new(vec![
+        Ok(ModelStreamEvent::TextDelta("one".to_owned())),
+        Err(ProviderError::rate_limit("limited after output")),
+    ]);
+    let mut config = SessionConfig::new(temp.path());
+    config.provider_transport_retries = 2;
+    config.provider_transport_retry_backoff_ms = vec![0];
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    let error = session.run_turn("partial").expect_err("provider error");
+
+    match &error {
+        SessionError::Provider(provider_error) => {
+            assert!(provider_error.to_string().contains("limited after output"));
         }
         other => panic!("expected provider error, got {other:?}"),
     }
