@@ -1210,7 +1210,7 @@ fn tui_exploration_coalesces_and_dedupes_read_labels() {
 
 #[test]
 fn shell_transcript_uses_the_shared_recoverable_preview() {
-    let full = format!("exit 0\nHEAD\nMIDDLE{}\nTAIL\n", "x".repeat(100));
+    let full = format!("exit 0\nHEAD\nMIDDLE{}\nTAIL\n", "x".repeat(1_000));
     let call = tool_call(
         "call-preview",
         "run_shell",
