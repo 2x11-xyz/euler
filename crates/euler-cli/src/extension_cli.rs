@@ -5,6 +5,7 @@
 mod observer;
 mod output;
 
+use crate::cli::set_once;
 use crate::offline_extension_runner::{execute_offline_extension_run, OfflineExtensionRun};
 use anyhow::{anyhow, Result};
 use euler_core::{
@@ -645,10 +646,9 @@ fn parse_extension_search(args: &mut impl Iterator<Item = String>) -> Result<Ext
                 )?);
             }
             "--runtime" => {
-                if runtime_kind.is_some() {
-                    return Err(anyhow!("--runtime was provided more than once"));
-                }
-                runtime_kind = Some(required_arg(args, "--runtime requires a runtime kind")?);
+                set_once(&mut runtime_kind, "--runtime", || {
+                    required_arg(args, "--runtime requires a runtime kind")
+                })?;
             }
             "--" => {
                 let value = required_arg(args, "extension search requires a query after --")?;

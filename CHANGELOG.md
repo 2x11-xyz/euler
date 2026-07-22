@@ -37,13 +37,17 @@ pull requests that landed them; deeper design rationale lives in
   linked/installed registry is the only extension surface; first-party
   extensions live in the euler-extensions repository, and their ids are now
   free for linked packages.
-- Cutovers: the code-swarm review tool and `euler session-export` resolve
-  their extensions from the linked registry, revalidating fingerprint and
+- Cutovers: the code-swarm review tool and session export resolve their
+  extensions from the linked registry, revalidating fingerprint and
   launch consent at execution time; with nothing linked, the tool is absent
   and the CLI explains how to add it. `--observe` resolves only linked
   observers. Stale enablement entries for formerly bundled ids are skipped
   instead of failing session start; `--extensions` and project overlays still
   reject unknown ids.
+- The top-level `euler session-export` command is removed. Session export now
+  runs through the extension lane only:
+  `euler extension run session-export.session-export <session> [--input-file
+  <json-object-file>]`.
 - The causal-dag TUI surface (`/causal-dag`, `/catch-up`, pickers, footer DAG
   stats) is removed pending the extension's behavior redesign; its schemas
   and golden fixtures are preserved as a spec-only package in

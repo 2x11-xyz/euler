@@ -122,6 +122,53 @@ impl ModelProvider for ChatCompletionsProvider {
     }
 }
 
+/// Defines the public newtype for one built-in chat-completions provider: the
+/// struct, `new`/`with_api_key_auth` constructors, `Default`, and the
+/// `ModelProvider` delegation, all driven by the module's
+/// [`ChatCompletionsSpec`]. Doc attributes pass through to the generated
+/// struct. The expansion is deliberately unhygienic so the invoking module's
+/// imports stay live: `ChatCompletionsProvider`, `ApiKeyAuth`,
+/// `ModelProvider`, `ModelRequest`, `ProviderError`, and `ProviderStream`
+/// must be in scope. Test-only helpers stay in the per-provider files.
+macro_rules! define_chat_completions_provider {
+    ($(#[$attr:meta])* $name:ident, $spec:ident) => {
+        $(#[$attr])*
+        #[derive(Clone, Debug)]
+        pub struct $name(ChatCompletionsProvider);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(ChatCompletionsProvider::from_env(&$spec))
+            }
+
+            pub fn with_api_key_auth(api_key: impl ApiKeyAuth + 'static) -> Self {
+                Self(ChatCompletionsProvider::new(&$spec, api_key))
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl ModelProvider for $name {
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+
+            fn validate_auth(&self) -> Result<(), ProviderError> {
+                self.0.validate_auth()
+            }
+
+            fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+                self.0.invoke(request)
+            }
+        }
+    };
+}
+pub(crate) use define_chat_completions_provider;
+
 /// How a [`send_chat_completions`] call failed, handed to the caller's error
 /// mapper: an HTTP status with its response body, or a transport-level error.
 pub(crate) enum SendFailure {

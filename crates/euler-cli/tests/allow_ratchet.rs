@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const BASELINE: usize = 52; // decrement as debt is paid; never increment without an ADR
+const BASELINE: usize = 6; // decrement as debt is paid; never increment without an ADR
 
 #[test]
 fn production_allow_count_does_not_increase() {

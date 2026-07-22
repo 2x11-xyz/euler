@@ -1,6 +1,8 @@
 use crate::auth::ApiKeyAuth;
 use crate::chat_completions::ChatCompletionsOptions;
-use crate::chat_completions_provider::{ChatCompletionsProvider, ChatCompletionsSpec};
+use crate::chat_completions_provider::{
+    define_chat_completions_provider, ChatCompletionsProvider, ChatCompletionsSpec,
+};
 use crate::{ModelProvider, ModelRequest, ProviderError, ProviderStream};
 
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
@@ -17,21 +19,15 @@ static SPEC: ChatCompletionsSpec = ChatCompletionsSpec {
     extract_rejection_detail: true,
 };
 
-/// OpenAI over the chat-completions dialect. A thin newtype over the shared
-/// [`ChatCompletionsProvider`]; all behaviour comes from `SPEC`.
-#[derive(Clone, Debug)]
-pub struct OpenAiProvider(ChatCompletionsProvider);
+define_chat_completions_provider!(
+    /// OpenAI over the chat-completions dialect. A thin newtype over the shared
+    /// [`ChatCompletionsProvider`]; all behaviour comes from `SPEC`.
+    OpenAiProvider,
+    SPEC
+);
 
+#[cfg(test)]
 impl OpenAiProvider {
-    pub fn new() -> Self {
-        Self(ChatCompletionsProvider::from_env(&SPEC))
-    }
-
-    pub fn with_api_key_auth(api_key: impl ApiKeyAuth + 'static) -> Self {
-        Self(ChatCompletionsProvider::new(&SPEC, api_key))
-    }
-
-    #[cfg(test)]
     fn with_endpoint_and_api_key_auth(
         endpoint: impl Into<String>,
         api_key: impl ApiKeyAuth + 'static,
@@ -39,26 +35,6 @@ impl OpenAiProvider {
         Self(ChatCompletionsProvider::with_endpoint(
             &SPEC, endpoint, api_key,
         ))
-    }
-}
-
-impl Default for OpenAiProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ModelProvider for OpenAiProvider {
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
-
-    fn validate_auth(&self) -> Result<(), ProviderError> {
-        self.0.validate_auth()
-    }
-
-    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
-        self.0.invoke(request)
     }
 }
 

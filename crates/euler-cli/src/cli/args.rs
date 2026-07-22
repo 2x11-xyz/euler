@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use crate::extension_cli::ExtensionArgs;
 use crate::extension_cli::ObserveOptions;
 use crate::extension_enablement::ExtensionSelection;
-use crate::session_export::RawProvenanceExportArgs;
 use crate::subagent::AutoApproveTier;
 
 pub(super) const EXPERIMENTAL_TUI_LINEFEED_HISTORY_FLAG: &str =
@@ -25,7 +24,6 @@ pub(super) enum TopLevelCommand {
     Logout,
     AuthStatus,
     Models,
-    SessionExport,
     Extension,
     Scrub,
 }
@@ -40,7 +38,6 @@ impl TopLevelCommand {
             Self::Logout => "logout",
             Self::AuthStatus => "auth status",
             Self::Models => "models",
-            Self::SessionExport => "session-export",
             Self::Extension => "extension",
             Self::Scrub => "scrub",
         }
@@ -92,6 +89,21 @@ pub(super) fn accept_linefeed_history_option(
             Ok(())
         }
     }
+}
+
+/// Fill an `Option` argv slot exactly once. The value is produced lazily so a
+/// repeated flag reports the repetition before its value is consumed or
+/// validated (the error precedence the argv tests pin down).
+pub(crate) fn set_once<T>(
+    slot: &mut Option<T>,
+    flag: &str,
+    value: impl FnOnce() -> Result<T>,
+) -> Result<()> {
+    if slot.is_some() {
+        return Err(anyhow!("{flag} was provided more than once"));
+    }
+    *slot = Some(value()?);
+    Ok(())
 }
 
 pub(super) fn parse_positive_u64(value: &str, flag: &str) -> Result<u64> {
@@ -152,7 +164,7 @@ pub(super) fn ensure_no_provider_options(parsed: &RawArgs, context: &str) -> Res
     }
 }
 
-pub(crate) fn ensure_no_extensions(parsed: &RawArgs, context: &str) -> Result<()> {
+pub(super) fn ensure_no_extensions(parsed: &RawArgs, context: &str) -> Result<()> {
     if parsed.extensions.is_cli_set() {
         Err(anyhow!("--extensions is not supported with {context}"))
     } else {
@@ -191,7 +203,6 @@ pub(crate) struct RawArgs {
     pub(crate) auth_status: bool,
     pub(crate) models: bool,
     pub(crate) models_command: ModelsCommand,
-    pub(crate) session_export: RawProvenanceExportArgs,
     pub(crate) extension: Option<ExtensionArgs>,
     pub(crate) scrub: Option<ScrubArgs>,
     pub(crate) no_tty: bool,
@@ -223,7 +234,6 @@ impl RawArgs {
             && !self.logout
             && !self.auth_status
             && !self.models
-            && !self.session_export.is_active()
             && self.extension.is_none()
             && self.replay_path.is_none()
             && !self.no_tty
@@ -234,12 +244,4 @@ impl RawArgs {
 pub(super) enum ArgParseFlow {
     Continue,
     Stop,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SessionExportOption {
-    Limit,
-    ScanLimit,
-    AfterEventId,
-    Kind,
 }

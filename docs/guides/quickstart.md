@@ -150,7 +150,6 @@ login
 logout
 auth status
 models
-session-export
 extension
 scrub
 ```

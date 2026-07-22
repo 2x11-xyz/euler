@@ -17,7 +17,6 @@ pub mod model_preference;
 mod offline_extension_runner;
 mod provider_catalog;
 mod provider_config_runtime;
-mod session_export;
 mod session_lifecycle;
 mod subagent;
 mod theme_catalog;

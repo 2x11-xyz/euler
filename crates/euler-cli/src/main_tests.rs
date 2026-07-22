@@ -2335,7 +2335,6 @@ fn unwrap_run(args: Args) -> RunArgs {
         Command::Logout(_) => panic!("expected run args"),
         Command::AuthStatus => panic!("expected run args"),
         Command::Models(_) => panic!("expected run args"),
-        Command::SessionExport(_) => panic!("expected run args"),
         Command::Extension(_) => panic!("expected run args"),
         Command::Scrub(_) => panic!("expected run args"),
     }
@@ -2479,19 +2478,6 @@ fn extensions_flag_is_rejected_where_no_session_exists() {
         (
             &["auth", "status", "--extensions", "session-export"][..],
             "--extensions is not supported with auth status",
-        ),
-        (
-            &[
-                "session-export",
-                "events.jsonl",
-                "--extensions",
-                "session-export",
-            ][..],
-            "--extensions is not supported with session-export",
-        ),
-        (
-            &["session-export", "--extensions", "session-export"][..],
-            "session-export requires a session id, name, or events path before `--extensions`",
         ),
         (
             &["--replay", "events.jsonl", "--extensions", "session-export"][..],

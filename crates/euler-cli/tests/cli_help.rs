@@ -11,7 +11,6 @@ const SUBCOMMANDS: &[&str] = &[
     "logout",
     "auth",
     "models",
-    "session-export",
     "extension",
 ];
 

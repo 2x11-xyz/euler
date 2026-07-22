@@ -9,9 +9,11 @@ mod scrub;
 mod session;
 mod terminal;
 
+pub(crate) use args::set_once;
 #[cfg(test)]
 pub(crate) use args::ProviderOptions;
-pub(crate) use args::{ensure_no_extensions, RawArgs};
+#[cfg(test)]
+pub(crate) use args::RawArgs;
 #[cfg(test)]
 pub(crate) use model_resolution::{resolve_live_options, LiveOptions};
 #[cfg(test)]
@@ -38,7 +40,6 @@ use session::{resume_interactive_entry, run_exec, run_interactive_entry, run_tui
 use crate::auth_commands::{logout_chatgpt, print_auth_status};
 use crate::extension_cli::run_extension_command;
 use crate::login::login_chatgpt;
-use crate::session_export::run_session_export;
 use crate::session_lifecycle::resolve_resume_target;
 use crate::ui::transcript::render_line_oriented;
 use crate::{help, model_catalog, model_catalog_refresh, provider_config_runtime};
@@ -79,7 +80,6 @@ pub(crate) fn run() -> Result<()> {
         Command::Resume { path, run, launch } => {
             resume_interactive_entry(resolve_resume_target(path)?, run, launch, args.no_tty)
         }
-        Command::SessionExport(export) => run_session_export(export),
         Command::Login(login) => login_chatgpt(login),
         Command::Logout(logout) => logout_chatgpt(logout),
         Command::AuthStatus => print_auth_status(),

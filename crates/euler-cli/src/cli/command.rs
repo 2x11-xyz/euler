@@ -23,7 +23,6 @@ use crate::extension_cli::ObserveOptions;
 use crate::extension_enablement::ExtensionSelection;
 use crate::login::{login_args_for_provider, LoginArgs};
 use crate::model_preference::{self, ModelPreference};
-use crate::session_export::{build_session_export_args, ProvenanceExportArgs};
 use crate::session_lifecycle::LiveProvenance;
 use crate::subagent::AutoApproveTier;
 use crate::{model_catalog, provider_config_runtime};
@@ -70,7 +69,6 @@ pub(crate) enum Command {
     Logout(LogoutArgs),
     AuthStatus,
     Models(ModelsCommand),
-    SessionExport(ProvenanceExportArgs),
     Extension(ExtensionArgs),
     Scrub(ScrubArgs),
 }
@@ -261,9 +259,6 @@ fn build_command_from_parsed(
             &model_catalog,
             &custom_providers,
         )?)
-    } else if parsed.session_export.is_active() {
-        ensure_no_provider_options(parsed, "session-export")?;
-        Command::SessionExport(build_session_export_args(parsed)?)
     } else if let Some(extension) = parsed.extension.as_ref() {
         ensure_no_provider_options(parsed, "extension")?;
         validate_extension_args(parsed)?;
@@ -347,11 +342,6 @@ fn validate_replay_resume_conflicts(parsed: &RawArgs) -> Result<()> {
     }
     if parsed.models && replay_or_resume {
         return Err(anyhow!("models cannot be used with --replay or --resume"));
-    }
-    if parsed.session_export.is_active() && replay_or_resume {
-        return Err(anyhow!(
-            "session-export cannot be used with --replay or --resume"
-        ));
     }
     if parsed.extension.is_some() && replay_or_resume {
         return Err(anyhow!(

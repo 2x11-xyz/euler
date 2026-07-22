@@ -1,6 +1,6 @@
 //! Help surface for the hand-rolled CLI parser. Content contract: every
 //! flag, value, and default below is verified against the code that consumes
-//! it (`RawArgsParser` in `main.rs`, `extension_cli.rs`, `session_export.rs`).
+//! it (`RawArgsParser` in `main.rs` and `extension_cli.rs`).
 
 use anyhow::{anyhow, Result};
 
@@ -66,7 +66,6 @@ fn subcommand_help(name: &str) -> Option<String> {
         "logout" => Some(credential_help("Remove stored", "logout")),
         "auth" => Some(AUTH_HELP.to_owned()),
         "models" => Some(MODELS_HELP.to_owned()),
-        "session-export" => Some(SESSION_EXPORT_HELP.to_owned()),
         "extension" => Some(EXTENSION_HELP.to_owned()),
         _ => None,
     }
@@ -90,7 +89,6 @@ Subcommands:
   logout          Remove stored provider credentials (--provider chatgpt)
   auth status     Show stored credential status
   models          List the offline catalog; `models refresh` checks GitHub
-  session-export  Export session events as JSON
   extension       Manage and run extensions
   help            Show help for a subcommand
 
@@ -195,21 +193,6 @@ Usage: euler models
        euler models refresh
 
 Options:
-  -h, --help                 Show this help
-";
-
-const SESSION_EXPORT_HELP: &str = "\
-Export session events as JSON.
-
-Usage: euler session-export <SESSION> [OPTIONS]
-
-<SESSION> is a session id, name, or events path.
-
-Options:
-  --limit <n>                Maximum events to export
-  --scan-limit <n>           Maximum events to scan
-  --after-event-id <id>      Export only events after this event id
-  --kind <kind>              Filter by event kind (repeatable)
   -h, --help                 Show this help
 ";
 
