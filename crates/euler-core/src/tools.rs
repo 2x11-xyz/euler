@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 /// Rung-2 escalation threshold (issue #94): the first failure of a
@@ -140,6 +141,7 @@ impl ReteachTracker {
 pub struct ToolRegistry {
     root: PathBuf,
     workspace_sandbox: Option<WorkspaceSandbox>,
+    agent_euler_home: OnceLock<tempfile::TempDir>,
 }
 
 impl ToolRegistry {
@@ -163,6 +165,7 @@ impl ToolRegistry {
         Self {
             root,
             workspace_sandbox,
+            agent_euler_home: OnceLock::new(),
         }
     }
 
@@ -554,6 +557,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
     /// sandbox branch deliberately receives no host `current_dir`: Bubblewrap
     /// establishes `/workspace` inside its private mount namespace.
     fn agent_subprocess(&self, program: &str, args: &[&str]) -> Result<AgentSubprocess, ToolError> {
+        let sandboxed = self.workspace_sandbox.is_some();
         let mut child = match &self.workspace_sandbox {
             Some(sandbox) => sandbox
                 .command(program, args)
@@ -567,10 +571,28 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
         // Defense in depth: Bubblewrap clears this environment too, while
         // ordinary host execution needs an explicit child-process boundary.
         scrub_agent_subprocess_env(&mut child);
+        if !sandboxed {
+            child.env("EULER_HOME", self.agent_euler_home()?);
+        }
         Ok(AgentSubprocess {
             command: child,
-            sandboxed: self.workspace_sandbox.is_some(),
+            sandboxed,
         })
+    }
+
+    fn agent_euler_home(&self) -> Result<&Path, ToolError> {
+        if let Some(home) = self.agent_euler_home.get() {
+            return Ok(home.path());
+        }
+        let candidate = tempfile::Builder::new()
+            .prefix("euler-agent-home-")
+            .tempdir()?;
+        let _ = self.agent_euler_home.set(candidate);
+        Ok(self
+            .agent_euler_home
+            .get()
+            .expect("an initialized agent Euler home cannot disappear")
+            .path())
     }
 
     fn resolve_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
@@ -713,12 +735,7 @@ fn is_parent_control_env_name(name: &std::ffi::OsStr) -> bool {
     };
     matches!(
         name,
-        "EULER_HOME"
-            | "EULER_PROVIDER"
-            | "EULER_MODEL"
-            | "EULER_NO_TTY"
-            | "EULER_TUI_METRICS"
-            | "RUST_LOG"
+        "EULER_HOME" | "EULER_PROVIDER" | "EULER_MODEL" | "EULER_NO_TTY" | "EULER_TUI_METRICS"
     )
 }
 

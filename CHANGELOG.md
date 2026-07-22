@@ -12,9 +12,11 @@ pull requests that landed them; deeper design rationale lives in
   same cancellation-aware policy as transient transport failures. Rejections,
   authentication failures, stream truncation, and partial responses still
   fail without replay; retry diagnostics identify the failure category.
-- Agent-launched shell and Git processes no longer inherit Euler's ambient
-  home, route, TTY, metrics, or logging controls. Credential scrubbing and
-  ordinary project-environment inheritance remain intact.
+- Under ordinary host execution, agent-launched shell and Git processes use a
+  private temporary Euler home and no longer inherit Euler's ambient route,
+  TTY, or metrics controls. Credential scrubbing and project-environment
+  inheritance, including `RUST_LOG`, remain intact; enforced sandboxes keep
+  their private minimal environment.
 - Root-agent instructions now require completing or honestly blocking the
   requested work and verifying before claiming success. Each fixed instruction
   identity is persisted with its complete text when first used, with its

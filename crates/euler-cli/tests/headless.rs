@@ -70,6 +70,117 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
 }
 
 #[test]
+fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let user_home = isolated_home();
+    let outer_euler_home = tempfile::tempdir().expect("outer Euler home");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_extension_manifest(extension_dir.path(), "default-only-extension", "0.1.0");
+
+    let linked = command_with_home(exe, &user_home)
+        .env_remove("EULER_HOME")
+        .args(["extension", "link", path_str(extension_dir.path())])
+        .output()
+        .expect("link extension in default home");
+    assert!(
+        linked.status.success(),
+        "link stderr: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let default_list = command_with_home(exe, &user_home)
+        .env_remove("EULER_HOME")
+        .args(["extension", "list"])
+        .output()
+        .expect("list default-home extensions");
+    assert!(
+        default_list.status.success(),
+        "default list stderr: {}",
+        String::from_utf8_lossy(&default_list.stderr)
+    );
+    assert!(String::from_utf8_lossy(&default_list.stdout).contains("default-only-extension"));
+
+    let nested_command = format!(
+        "printf 'rust-log=%s\\nchild-home=%s\\n' \"$RUST_LOG\" \"$EULER_HOME\"; {} extension list",
+        shell_quote(exe)
+    );
+    let script = write_fixture_script(
+        workspace.path(),
+        "nested-home.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [
+                {"events": [
+                    {"tool_call": {
+                        "id": "call-nested-euler",
+                        "name": "run_shell",
+                        "input": {"command": nested_command}
+                    }},
+                    {"finished": {"stop_reason": "tool_use"}}
+                ]},
+                {"events": [
+                    {"text_delta": "done"},
+                    {"finished": {"stop_reason": "completed"}}
+                ]}
+            ]
+        })
+        .to_string(),
+    );
+    let log = workspace.path().join("events.jsonl");
+    let output = command_with_home(exe, &user_home)
+        .current_dir(workspace.path())
+        .env("EULER_HOME", outer_euler_home.path())
+        .env("RUST_LOG", "project_under_test=trace")
+        .env_remove("EULER_PROVIDER")
+        .env_remove("EULER_MODEL")
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &format!("event-script={}", path_str(&script)),
+            "--extensions",
+            "none",
+            "--project-context",
+            "off",
+            "--auto-approve",
+            "trusted-local",
+            "--provenance",
+            path_str(&log),
+            "check nested Euler isolation",
+        ])
+        .output()
+        .expect("run outer Euler");
+    assert!(
+        output.status.success(),
+        "outer stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = read_jsonl(&log);
+    let tool_output = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .and_then(|event| event.payload.get("output"))
+        .and_then(serde_json::Value::as_str)
+        .expect("nested Euler tool output");
+    assert!(tool_output.contains("rust-log=project_under_test=trace"));
+    assert!(!tool_output.contains("default-only-extension"));
+    let child_home = tool_output
+        .lines()
+        .find_map(|line| line.strip_prefix("child-home="))
+        .map(PathBuf::from)
+        .expect("isolated child Euler home");
+    assert!(child_home.is_absolute());
+    assert_ne!(child_home, outer_euler_home.path());
+    assert_ne!(child_home, user_home.path().join(".euler"));
+    assert!(
+        !child_home.exists(),
+        "temporary child home should be removed"
+    );
+}
+
+#[test]
 fn headless_session_writes_stable_diagnostics_jsonl() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
@@ -7403,6 +7514,10 @@ fn wait_until_session_lock_held(lock: &Path, first: &mut std::process::Child) {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn write_extension_manifest(dir: &Path, id: &str, version: &str) {
