@@ -99,8 +99,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   `output_preview_max_lines`; the shared projection derives a head/tail preview
   from the redacted output and appends the result event id needed by
   `tool_result_get`. It leaves the output verbatim when the bounded form would
-  not be smaller. Large `output` strings are content-addressed in the durable
-  log and rehydrated at the session boundary.
+  not be smaller. Producers retain those limits even when the current output
+  fits, so a later secret-scrub rewrite cannot bypass the projection bound.
+  Large `output` strings are content-addressed in the durable log and
+  rehydrated at the session boundary.
   Optional `recovery_closure: true` marks a resume-time canonical closure for
   an interrupted tail `tool.call`; it records the resume observation, not the
   original tool outcome.

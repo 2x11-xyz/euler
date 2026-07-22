@@ -812,7 +812,11 @@ fn tool_output_item_with_compaction(event: &EventEnvelope, compact: bool) -> Opt
 /// model-canvas consumers share this projection so their truncation semantics
 /// cannot drift.
 pub fn projected_tool_output(event: &EventEnvelope) -> String {
-    let output = string_field(event, "output").unwrap_or_default();
+    let output = event
+        .payload
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let Some(max_bytes) = event
         .payload
         .get("output_preview_max_bytes")
@@ -820,7 +824,7 @@ pub fn projected_tool_output(event: &EventEnvelope) -> String {
         .and_then(|value| usize::try_from(value).ok())
         .filter(|value| *value > 0)
     else {
-        return output;
+        return output.to_owned();
     };
     let Some(max_lines) = event
         .payload
@@ -829,11 +833,11 @@ pub fn projected_tool_output(event: &EventEnvelope) -> String {
         .and_then(|value| usize::try_from(value).ok())
         .filter(|value| *value > 0)
     else {
-        return output;
+        return output.to_owned();
     };
-    let mut preview = crate::tools::bound_text(&output, max_bytes, max_lines);
+    let mut preview = crate::tools::bound_text(output, max_bytes, max_lines);
     if preview == output {
-        return output;
+        return preview;
     }
     let output_bytes = output.len();
     let preview_bytes = preview.len();

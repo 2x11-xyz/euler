@@ -299,18 +299,17 @@ pub(crate) fn tool_success_payload(
         ("output", redacted_output.clone().into()),
     ]);
     if let Some(budget) = execution.output_preview_budget {
-        let preview =
-            crate::tools::bound_text(&redacted_output, budget.max_bytes, budget.max_lines);
-        if preview != redacted_output {
-            payload.insert(
-                "output_preview_max_bytes".to_owned(),
-                budget.max_bytes.into(),
-            );
-            payload.insert(
-                "output_preview_max_lines".to_owned(),
-                budget.max_lines.into(),
-            );
-        }
+        // Retain the producer's projection contract even when the current
+        // output fits. A later explicit scrub can expand replacement markers;
+        // the durable budget must still bound that rewritten result.
+        payload.insert(
+            "output_preview_max_bytes".to_owned(),
+            budget.max_bytes.into(),
+        );
+        payload.insert(
+            "output_preview_max_lines".to_owned(),
+            budget.max_lines.into(),
+        );
     }
     if let Some(exit_code) = execution.exit_code {
         payload.insert("exit_code".to_owned(), exit_code.into());

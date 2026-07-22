@@ -1037,33 +1037,39 @@ fn append_read_file_truncation_marker(
 }
 
 pub(crate) fn bound_text(text: &str, max_bytes: usize, max_lines: usize) -> String {
-    let line_count = text.split_inclusive('\n').count();
-    if text.len() <= max_bytes && line_count <= max_lines {
+    if text.len() <= max_bytes
+        && text
+            .split_inclusive('\n')
+            .take(max_lines.saturating_add(1))
+            .count()
+            <= max_lines
+    {
         return text.to_owned();
     }
 
     // Preserve both the command's beginning and its terminal/error region.
     // Byte and line budgets apply to retained content; the honest omission
-    // marker is additional projection metadata.
+    // marker is additional projection metadata. Restrict line discovery to
+    // the byte windows first so preview work never scans the omitted middle.
     let head_line_count = max_lines.div_ceil(2);
     let tail_line_count = max_lines / 2;
-    let head_line_end = text
+    let head_byte_budget = max_bytes.div_ceil(2);
+    let tail_byte_budget = max_bytes / 2;
+    let head_byte_end = floor_char_boundary(text, text.len().min(head_byte_budget));
+    let head_end = text[..head_byte_end]
         .split_inclusive('\n')
         .take(head_line_count)
         .map(|line| line.len())
         .sum::<usize>();
-    let tail_line_bytes = text
+    let tail_byte_start = ceil_char_boundary(text, text.len().saturating_sub(tail_byte_budget));
+    let tail_window = &text[tail_byte_start..];
+    let tail_line_bytes = tail_window
         .split_inclusive('\n')
         .rev()
         .take(tail_line_count)
         .map(|line| line.len())
         .sum::<usize>();
     let tail_line_start = text.len().saturating_sub(tail_line_bytes);
-
-    let head_byte_budget = max_bytes.div_ceil(2);
-    let tail_byte_budget = max_bytes / 2;
-    let head_end = floor_char_boundary(text, head_line_end.min(head_byte_budget));
-    let tail_byte_start = ceil_char_boundary(text, text.len().saturating_sub(tail_byte_budget));
     let tail_start = tail_line_start.max(tail_byte_start).max(head_end);
 
     let mut output = text[..head_end].to_owned();

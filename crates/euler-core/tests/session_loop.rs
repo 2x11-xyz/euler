@@ -5085,6 +5085,72 @@ fn credential_in_tool_call_argument_warns_stays_faithful_and_scrubs_on_demand() 
     assert!(session.scrub_candidates().is_empty());
 }
 
+#[test]
+fn scrub_expansion_preserves_the_shell_result_preview_budget() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let scrubbed = "abcd".to_owned();
+    let command = r#"i=0; while [ "$i" -lt 4000 ]; do printf abcd; i=$((i + 1)); done"#;
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-shell-scrub-growth".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({ "command": command }),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(log).expect("provenance writer"));
+
+    session.run_turn("run it").expect("turn");
+
+    let before = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT
+                && event.payload.get("id").and_then(serde_json::Value::as_str)
+                    == Some("call-shell-scrub-growth")
+        })
+        .expect("tool result before scrub");
+    let before_output = payload_str(before, "output").expect("output before scrub");
+    assert!(before_output.len() < 16 * 1024);
+    assert_eq!(projected_tool_output(before), before_output);
+    assert_eq!(
+        before
+            .payload
+            .get("output_preview_max_bytes")
+            .and_then(serde_json::Value::as_u64),
+        Some(16 * 1024)
+    );
+
+    session
+        .scrub_live(std::slice::from_ref(&scrubbed))
+        .expect("scrub");
+
+    let after = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT
+                && event.payload.get("id").and_then(serde_json::Value::as_str)
+                    == Some("call-shell-scrub-growth")
+        })
+        .expect("tool result after scrub");
+    let after_output = payload_str(after, "output").expect("output after scrub");
+    let preview = projected_tool_output(after);
+    assert!(after_output.len() > 16 * 1024);
+    assert!(!after_output.contains(&scrubbed));
+    assert!(after_output.contains("[scrubbed]"));
+    assert!(preview.len() < after_output.len(), "{preview}");
+    assert!(preview.contains("tool_result_get"), "{preview}");
+    assert!(preview.contains(&after.id), "{preview}");
+}
+
 fn logged_kinds(path: &std::path::Path) -> Vec<String> {
     logged_events(path)
         .into_iter()
