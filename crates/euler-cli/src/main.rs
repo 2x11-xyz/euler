@@ -2,7 +2,6 @@
 
 mod auth_commands;
 mod auth_validation;
-mod bundled_extensions;
 mod cli;
 mod code_swarm_config;
 mod companion_run;

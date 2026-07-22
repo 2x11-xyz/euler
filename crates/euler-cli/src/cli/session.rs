@@ -19,8 +19,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 
 use crate::auth_validation::validate_provider_auth;
-use crate::bundled_extensions::resolve_round_observer;
 use crate::companion_run::execute_headless_companion_run;
+use crate::extension_cli::resolve_round_observer;
 use crate::extension_enablement::resolve_session_extensions;
 use crate::session_lifecycle::{
     apply_catalog_context_limit, live_session_config, resolve_resume_target, session_config,
@@ -73,7 +73,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
-    let observer = resolve_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
+    let observer = resolve_round_observer(&run.observe)?;
     if let Some((observer_config, _)) = &observer {
         live_session.config.round_observer = Some(observer_config.clone());
         if let Some(id) = run.observe.extension_id.as_ref() {
@@ -205,7 +205,7 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
-    let observer = resolve_round_observer(&run.observe, &live_session.config.extensions_enabled)?;
+    let observer = resolve_round_observer(&run.observe)?;
     if let Some((observer_config, _)) = &observer {
         live_session.config.round_observer = Some(observer_config.clone());
         if let Some(id) = run.observe.extension_id.as_ref() {
@@ -337,8 +337,7 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
     );
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &exec.run.extensions)?;
-    let observer =
-        resolve_round_observer(&exec.run.observe, &live_session.config.extensions_enabled)?;
+    let observer = resolve_round_observer(&exec.run.observe)?;
     if let Some((observer_config, _)) = &observer {
         live_session.config.round_observer = Some(observer_config.clone());
         if let Some(id) = exec.run.observe.extension_id.as_ref() {
@@ -716,7 +715,7 @@ where
     apply_permission_reviewer(&mut config, &run);
     config.extensions_enabled = resolve_session_extensions(&config.root, &run.extensions)?;
     configure(&mut config);
-    let observer = resolve_round_observer(&run.observe, &config.extensions_enabled)?;
+    let observer = resolve_round_observer(&run.observe)?;
     if let Some((observer_config, _)) = &observer {
         config.round_observer = Some(observer_config.clone());
         if let Some(id) = run.observe.extension_id.as_ref() {

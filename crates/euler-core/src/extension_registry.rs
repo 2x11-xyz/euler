@@ -228,9 +228,10 @@ impl ExtensionRegistry {
     pub fn linked_extensions(&self) -> Result<Vec<LinkedExtension>, ExtensionRegistryError> {
         Ok(self.read_link_inventory()?.into_values().collect())
     }
-    /// Return the explicit launch consent for a linked package. This is kept
-    /// separate from bundled-extension enablement because local package
-    /// activation must never affect project/session bundled selection.
+    /// Return the explicit launch consent for a linked package. Its persistence
+    /// stays separate from the general enablement log because it records the
+    /// reviewed process-launch decision. Default session selection folds this
+    /// consent in; explicit CLI and project selection can override it.
     pub fn linked_execution_enabled(
         &self,
         id: &str,

@@ -6,6 +6,28 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Core-only extensions (ADR 0015 end state)
+
+- Euler no longer ships bundled extensions. The six formerly bundled crates
+  (`session-export`, `causal-dag`, `code-swarm`, `diagnostics-report`,
+  `autoresearch`, `maxproof`) are removed from the workspace along with the
+  entire bundled machinery (`bundled_extensions.rs`, `StaticExtension`,
+  bundled-id reservations, the bundled/linked registry distinction). The
+  linked/installed registry is the only extension surface; first-party
+  extensions live in the euler-extensions repository, and their ids are now
+  free for linked packages.
+- Cutovers: the code-swarm review tool and `euler session-export` resolve
+  their extensions from the linked registry, revalidating fingerprint and
+  launch consent at execution time; with nothing linked, the tool is absent
+  and the CLI explains how to add it. `--observe` resolves only linked
+  observers. Stale enablement entries for formerly bundled ids are skipped
+  instead of failing session start; `--extensions` and project overlays still
+  reject unknown ids.
+- The causal-dag TUI surface (`/causal-dag`, `/catch-up`, pickers, footer DAG
+  stats) is removed pending the extension's behavior redesign; its schemas
+  and golden fixtures are preserved as a spec-only package in
+  euler-extensions.
+
 ### Footer cost
 
 - The TUI footer now shows cumulative model cost in USD beside context usage,

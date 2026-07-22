@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn batched_permission_ask_lists_the_requested_capabilities() {
         let item = TranscriptItem::PermissionBatchAsk {
-            operation: "extension causal-dag.refresh".to_owned(),
+            operation: "extension session-export.export".to_owned(),
             capabilities: vec![
                 "fs-read".to_owned(),
                 "fs-write".to_owned(),
@@ -250,7 +250,7 @@ mod tests {
 
         assert_eq!(
             render_line_oriented_item(&item),
-            "permission.ask: extension causal-dag.refresh; capabilities: fs-read, fs-write, network\n"
+            "permission.ask: extension session-export.export; capabilities: fs-read, fs-write, network\n"
         );
     }
 }

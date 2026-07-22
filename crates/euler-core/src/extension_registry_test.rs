@@ -494,9 +494,9 @@ fn linked_package_activation_is_explicit_and_reload_revokes_it() {
         ExtensionEnablement::Enabled
     );
     assert_eq!(
-        registry.state("example-extension").expect("bundled state"),
+        registry.state("example-extension").expect("general state"),
         ExtensionEnablement::Disabled,
-        "linked launch consent must not enter bundled extension selection"
+        "linked launch consent must not enter the general enablement log"
     );
     assert!(
         !registry
@@ -834,7 +834,9 @@ fn registry_link_inventory_is_separate_from_enablement_state_log() {
         ExtensionRegistryError::LinkInventory(LinkInventoryError::Json(_))
     ));
     assert_eq!(
-        registry.enable("session-export").expect("enable bundled"),
+        registry
+            .enable("session-export")
+            .expect("enable general state"),
         ExtensionEnablement::Enabled
     );
 }

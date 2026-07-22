@@ -18,8 +18,8 @@ use euler_provider::ModelProvider;
 use std::path::{Path, PathBuf};
 
 use crate::auth_commands::{logout_args_for_provider, LogoutArgs};
-use crate::bundled_extensions::ObserveOptions;
 use crate::extension_cli::ExtensionArgs;
+use crate::extension_cli::ObserveOptions;
 use crate::extension_enablement::ExtensionSelection;
 use crate::login::{login_args_for_provider, LoginArgs};
 use crate::model_preference::{self, ModelPreference};

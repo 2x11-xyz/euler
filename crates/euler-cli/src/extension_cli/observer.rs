@@ -1,7 +1,4 @@
-use super::{
-    extension_registry, linked_extension, load_enabled_linked_process,
-    reject_bundled_link_collision,
-};
+use super::{extension_registry, linked_extension, load_enabled_linked_process};
 use anyhow::{anyhow, Result};
 use euler_core::RoundObserverConfig;
 use euler_managed_process::ManagedProcessExtension;
@@ -21,7 +18,6 @@ pub(crate) fn resolve(
     let Some(linked) = linked_extension(&registry, id)? else {
         return Ok(None);
     };
-    reject_bundled_link_collision(id)?;
     let package = load_enabled_linked_process(&registry, &linked)?;
     // The loaded package is parsed from the source manifest and its SHA was
     // checked against the reviewed linked record above. Never trust duplicate
@@ -93,8 +89,6 @@ impl RevalidatedLinkedExtension {
                     .to_owned(),
             ));
         }
-        reject_bundled_link_collision(&self.id)
-            .map_err(|error| ExtensionError::Message(error.to_string()))?;
         let package = load_enabled_linked_process(&registry, &linked)
             .map_err(|error| ExtensionError::Message(error.to_string()))?;
         ManagedProcessExtension::from_package(&package)
@@ -145,4 +139,58 @@ impl CommandRegistrar for CommandCollector {
     fn register_command(&mut self, name: &str, command: Box<dyn ExtensionCommand>) {
         self.0.insert(name.to_owned(), command);
     }
+}
+
+/// `--observe` selection: which extension observes round boundaries, and how
+/// often. Parsed from CLI flags; `None` extension means no observer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ObserveOptions {
+    pub(crate) extension_id: Option<String>,
+    pub(crate) cadence_rounds: Option<NonZeroU64>,
+}
+
+impl ObserveOptions {
+    pub(crate) fn normalized(self) -> Result<Self> {
+        match (&self.extension_id, self.cadence_rounds) {
+            (None, Some(_)) => Err(anyhow!("--observe-cadence requires --observe")),
+            _ => Ok(self),
+        }
+    }
+}
+
+/// Resolve the round observer for a session. Only linked/installed
+/// managed-process extensions can observe; an unknown id is an honest error
+/// that names the way in.
+pub(crate) fn resolve_round_observer(
+    options: &ObserveOptions,
+) -> Result<Option<(RoundObserverConfig, Arc<dyn Extension>)>> {
+    let Some(id) = options.extension_id.as_deref() else {
+        return Ok(None);
+    };
+    match resolve(id, options.cadence_rounds)? {
+        Some(observer) => Ok(Some(observer)),
+        None => Err(anyhow!(
+            "--observe {id}: unknown extension id; link or install extension {id} first"
+        )),
+    }
+}
+
+/// Resolve a linked managed-process extension as a revalidating
+/// `Arc<dyn Extension>` for session wiring (e.g. the code-swarm tool).
+/// Returns `None` when the id is not linked. Enablement is not required at
+/// wiring time — every execution revalidates the fingerprint and the
+/// registry's enable state, so wiring alone grants nothing.
+pub(crate) fn live_linked_extension_arc(id: &str) -> Result<Option<Arc<dyn Extension>>> {
+    let registry = extension_registry()?;
+    let Some(linked) = linked_extension(&registry, id)? else {
+        return Ok(None);
+    };
+    let package = super::load_linked_process_for_action(&linked, "run")?;
+    let extension = ManagedProcessExtension::from_package(&package)
+        .map_err(|error| anyhow!(error.to_string()))?;
+    Ok(Some(Arc::new(RevalidatedLinkedExtension {
+        id: id.to_owned(),
+        manifest_sha256: linked.manifest_sha256,
+        manifest: extension.manifest(),
+    })))
 }

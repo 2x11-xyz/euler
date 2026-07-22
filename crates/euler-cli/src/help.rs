@@ -13,7 +13,7 @@ const SESSION_OPTIONS: &str = "  \
   --extensions <ids|none>    Comma-separated extension ids to enable
   --observe <extension-id>   Run that enabled extension's round observer
   --observe-cadence <n>      Observer cadence in driver rounds
-                             (default: extension-defined; bundled default: 8)
+                             (default: extension-defined)
   --permission-reviewer <r>  user or guardian: who reviews permission asks
                              (default: user)
   --project-context <p>      auto, on, or off: load this project's EULER.md

@@ -672,13 +672,13 @@ mod tests {
         let rendered = status_line_text(
             &snapshot,
             &tokens,
-            TurnStatus::Running("extension causal-dag.catch-up".to_owned()),
+            TurnStatus::Running("extension session-export.export".to_owned()),
             false,
             120,
         );
 
         assert!(rendered.contains("⏎ steer · esc interrupt now"));
-        assert!(!rendered.contains("running extension causal-dag.catch-up"));
+        assert!(!rendered.contains("running extension session-export.export"));
     }
 
     #[test]
