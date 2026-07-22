@@ -200,7 +200,13 @@ envelope `v` per `docs/contracts/persistence.md`.
   including the truncation marker and must set `truncated=true` with a non-null
   `omitted_reason`.
 - `model.call`: `provider`, `model`, `canvas_items`,
-  `requested_reasoning_effort`, optional `reasoning_effort`. Optional
+  `requested_reasoning_effort`, optional `reasoning_effort`. Root-agent calls
+  additionally carry `system_instructions_version`,
+  `system_instructions_sha256`, and `system_instructions_bytes`; those fields
+  name the exact fixed root instructions used for that call. The full text is
+  also present when this is the first occurrence of that instruction identity
+  in the stream. They are request audit metadata and are not model-canvas
+  content. Optional
   `project_context_digest` (ADR 0017) is the versioned rendered-context
   digest, recorded only when those exact core-framed bytes occur in the
   provider-neutral request being dispatched (no TOCTOU between snapshot and
@@ -319,6 +325,15 @@ envelope `v` per `docs/contracts/persistence.md`.
   metadata for grouping and current-directory prioritization, not resume
   authority and not model-canvas content. It is stored in cleartext, is not
   redacted or hashed in v0, and can contain user-identifying path components.
+  Current streams also record the fixed root-agent contract as
+  `system_instructions`, `system_instructions_version`,
+  `system_instructions_sha256`, and `system_instructions_bytes`. The complete
+  text is recorded when an instruction identity first appears so a session
+  remains reconstructable; each later root `model.call` repeats only its
+  version, digest, and byte length. A resumed session records the full text on
+  the first call after a binary update changes that identity. Older streams may
+  omit these fields. They are provenance metadata, not canvas content or resume
+  authority.
   Optional `session_kind` is `interactive` or `non-interactive`. It records
   how the session was launched for discovery/resume UI grouping only. Omitted
   means unknown/legacy and must not affect resume authority or canvas content.

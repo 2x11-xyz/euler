@@ -37,7 +37,7 @@ fn session_with_providers(
     config.session_id = "session-parallel".to_owned();
     config.provider = "p1".to_owned();
     config.model = "m1".to_owned();
-    // Keep failure tests fast: no transport retry backoff.
+    // Keep failure tests fast: no provider retry backoff.
     config.provider_transport_retries = 0;
     config.provider_transport_retry_backoff_ms = Vec::new();
     let session = Session::new_with_providers(config, providers, ScriptedDecider::new(Vec::new()))

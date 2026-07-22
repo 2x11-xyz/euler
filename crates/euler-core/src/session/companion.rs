@@ -51,8 +51,8 @@ struct CompanionLoop<'a, D> {
     /// tracked separately: each round requests at most the REMAINING task
     /// budget (see `round_max_output_tokens`).
     session_max_output_tokens: Option<u64>,
-    transport_retries: usize,
-    transport_retry_backoff_ms: Vec<u64>,
+    provider_retries: usize,
+    provider_retry_backoff_ms: Vec<u64>,
     providers: &'a euler_provider::ProviderSet,
     tools: &'a crate::tools::ToolRegistry,
     writer: Arc<crate::provenance::ProvenanceWriter>,
@@ -229,8 +229,8 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             auto_compaction: session.config.auto_compaction,
             reasoning_effort: session.config.reasoning_effort,
             session_max_output_tokens: session.config.max_output_tokens,
-            transport_retries: session.config.provider_transport_retries,
-            transport_retry_backoff_ms: session.config.provider_transport_retry_backoff_ms.clone(),
+            provider_retries: session.config.provider_transport_retries,
+            provider_retry_backoff_ms: session.config.provider_transport_retry_backoff_ms.clone(),
             providers: &session.providers,
             tools: &session.tools,
             writer,
@@ -245,7 +245,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     }
 
     /// Companion rounds run through the shared [`RoundLoop`] seam, so
-    /// companions inherit its transport retry (ADR 0009). max_turns
+    /// companions inherit its transient provider retry (ADR 0009). max_turns
     /// maps onto the loop's round limit: it counts companion model rounds,
     /// and max_turns = 1 means at most one model round total.
     fn run(&mut self, cancel_flag: &AtomicBool) -> AgentResult {
@@ -256,8 +256,8 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         }
         let config = RoundLoopConfig {
             max_rounds: self.task.budget().max_turns().map(|max| max as usize),
-            transport_retries: self.transport_retries,
-            transport_retry_backoff_ms: self.transport_retry_backoff_ms.clone(),
+            provider_retries: self.provider_retries,
+            provider_retry_backoff_ms: self.provider_retry_backoff_ms.clone(),
         };
         let outcome = RoundLoop::new(self, config).run(cancel_flag);
         match outcome {

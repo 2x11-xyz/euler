@@ -178,6 +178,39 @@ fn resume_constructor_and_fold_do_not_call_permission_decider() {
 }
 
 #[test]
+fn resumed_legacy_session_records_current_system_instructions_on_first_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    write_events(&log, &[session_start("fixture", "fixture")]);
+    let mut session = resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "done".to_owned(),
+        )])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    session.run_turn("continue").expect("continued turn");
+
+    let persisted = read_resume_prefix(&log).expect("read continued session");
+    let model_call = persisted
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("model call");
+    let instructions = model_call.payload["system_instructions"]
+        .as_str()
+        .expect("current instructions recorded");
+    assert!(instructions.contains("Continue until every requested deliverable is complete"));
+    assert_eq!(model_call.payload["system_instructions_version"], json!(1));
+    assert_eq!(
+        model_call.payload["system_instructions_bytes"],
+        json!(instructions.len())
+    );
+}
+
+#[test]
 fn interrupted_tool_tail_appends_one_side_effect_recovery_closure() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");

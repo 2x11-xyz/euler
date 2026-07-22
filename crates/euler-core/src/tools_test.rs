@@ -990,9 +990,16 @@ fn non_apply_patch_shell_commands_still_execute_normally() {
 }
 
 #[test]
-fn run_shell_scrubs_secret_env_and_keeps_ordinary_env() {
+fn run_shell_isolates_euler_controls_and_keeps_project_env() {
     let _guard = ENV_LOCK.lock().expect("env lock");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let user_home = tempfile::tempdir().expect("user home");
+    let parent_euler_home = user_home.path().join("parent-euler");
+    let default_euler_home = user_home.path().join(".euler");
+    fs::create_dir(&parent_euler_home).expect("parent Euler home");
+    fs::create_dir(&default_euler_home).expect("default Euler home");
     let _env_restore = EnvRestore::capture(&[
+        "HOME",
         "EULER_ORDINARY_VAR",
         "ANTHROPIC_API_KEY",
         "EULER_AUTH_FILE",
@@ -1001,7 +1008,17 @@ fn run_shell_scrubs_secret_env_and_keeps_ordinary_env() {
         "EULER_TEST_TOKEN",
         "EULER_TEST_SECRET",
         "EULER_TOKENIZER_MODE",
+        "EULER_HOME",
+        "EULER_PROVIDER",
+        "EULER_MODEL",
+        "EULER_NO_TTY",
+        "EULER_TUI_METRICS",
+        "RUST_LOG",
+        "euler_model",
+        "rust_log",
+        "Euler_Home",
     ]);
+    env::set_var("HOME", user_home.path());
     env::set_var("EULER_ORDINARY_VAR", "visible");
     env::set_var("ANTHROPIC_API_KEY", "anthropic-secret");
     env::set_var("EULER_AUTH_FILE", "auth-file-secret");
@@ -1010,25 +1027,100 @@ fn run_shell_scrubs_secret_env_and_keeps_ordinary_env() {
     env::set_var("EULER_TEST_TOKEN", "token-secret");
     env::set_var("EULER_TEST_SECRET", "generic-secret");
     env::set_var("EULER_TOKENIZER_MODE", "tokenizer-visible");
-    let temp = tempfile::tempdir().expect("temp dir");
-    let registry = ToolRegistry::new(temp.path());
+    env::set_var("EULER_HOME", &parent_euler_home);
+    env::set_var("EULER_PROVIDER", "parent-provider");
+    env::set_var("EULER_MODEL", "parent-model");
+    env::set_var("EULER_NO_TTY", "1");
+    env::set_var("EULER_TUI_METRICS", "/parent/metrics.jsonl");
+    env::set_var("RUST_LOG", "my_crate=trace");
+    env::set_var("euler_model", "project-model");
+    env::set_var("rust_log", "project-log");
+    env::set_var("Euler_Home", "project-home");
+    let registry = ToolRegistry::new(workspace.path());
 
     let execution = registry
-            .execute(
-                "run_shell",
-                &json!({
-                    "command": "printf '%s|%s|%s|%s|%s|%s|%s|%s' \"$EULER_ORDINARY_VAR\" \"$ANTHROPIC_API_KEY\" \"$EULER_AUTH_FILE\" \"$EULER_CUSTOM_API_KEY\" \"$AWS_SECRET_ACCESS_KEY\" \"$EULER_TEST_TOKEN\" \"$EULER_TEST_SECRET\" \"$EULER_TOKENIZER_MODE\""
-                }),
-            )
-            .expect("shell");
+        .execute(
+            "run_shell",
+            &json!({
+                "command": "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$EULER_ORDINARY_VAR\" \"$HOME\" \"$ANTHROPIC_API_KEY\" \"$EULER_AUTH_FILE\" \"$EULER_CUSTOM_API_KEY\" \"$AWS_SECRET_ACCESS_KEY\" \"$EULER_TEST_TOKEN\" \"$EULER_TEST_SECRET\" \"$EULER_TOKENIZER_MODE\" \"$EULER_HOME\" \"$EULER_PROVIDER\" \"$EULER_MODEL\" \"$EULER_NO_TTY\" \"$EULER_TUI_METRICS\" \"$RUST_LOG\""
+            }),
+        )
+        .expect("shell");
 
-    assert!(execution.output.contains("visible|||||||tokenizer-visible"));
-    assert!(!execution.output.contains("anthropic-secret"));
-    assert!(!execution.output.contains("auth-file-secret"));
-    assert!(!execution.output.contains("api-key-secret"));
-    assert!(!execution.output.contains("access-key-secret"));
-    assert!(!execution.output.contains("token-secret"));
-    assert!(!execution.output.contains("generic-secret"));
+    let values: Vec<_> = execution
+        .output
+        .strip_prefix("exit 0\n")
+        .expect("successful shell header")
+        .split('|')
+        .collect();
+    assert_eq!(values.len(), 15);
+    assert_eq!(values[0], "visible");
+    assert_eq!(Path::new(values[1]), user_home.path());
+    assert!(values[2..8].iter().all(|value| value.is_empty()));
+    assert_eq!(values[8], "tokenizer-visible");
+    let isolated_euler_home = PathBuf::from(values[9]);
+    assert!(isolated_euler_home.is_absolute());
+    assert!(isolated_euler_home.is_dir());
+    assert_ne!(isolated_euler_home, parent_euler_home);
+    assert_ne!(isolated_euler_home, default_euler_home);
+    assert!(values[10..14].iter().all(|value| value.is_empty()));
+    assert_eq!(values[14], "my_crate=trace");
+    assert_secret_sentinels_absent(&execution.output);
+
+    fs::write(isolated_euler_home.join("marker"), "persisted").expect("isolated marker");
+    let reused = registry
+        .execute(
+            "run_shell",
+            &json!({
+                "command": "printf '%s|%s|%s' \"$EULER_HOME\" \"$(cat \"$EULER_HOME/marker\")\" \"$RUST_LOG\""
+            }),
+        )
+        .expect("second shell");
+    assert_eq!(
+        reused.output,
+        format!(
+            "exit 0\n{}|persisted|my_crate=trace",
+            isolated_euler_home.display()
+        )
+    );
+
+    let case_distinct = registry
+        .execute(
+            "run_shell",
+            &json!({
+                "command": "printf '%s|%s|%s' \"$euler_model\" \"$rust_log\" \"$Euler_Home\""
+            }),
+        )
+        .expect("shell with case-distinct project variables");
+    assert!(case_distinct
+        .output
+        .contains("project-model|project-log|project-home"));
+
+    let explicit = registry
+        .execute(
+            "run_shell",
+            &json!({
+                "command": "EULER_HOME=/explicit; RUST_LOG=debug; printf '%s|%s' \"$EULER_HOME\" \"$RUST_LOG\""
+            }),
+        )
+        .expect("shell with explicit controls");
+    assert!(explicit.output.contains("/explicit|debug"));
+
+    drop(registry);
+    assert!(!isolated_euler_home.exists());
+}
+
+fn assert_secret_sentinels_absent(output: &str) {
+    for secret in [
+        "anthropic-secret",
+        "auth-file-secret",
+        "api-key-secret",
+        "access-key-secret",
+        "token-secret",
+        "generic-secret",
+    ] {
+        assert!(!output.contains(secret), "secret leaked: {secret}");
+    }
 }
 
 #[test]
