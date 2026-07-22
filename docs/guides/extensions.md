@@ -308,10 +308,11 @@ The [euler-extensions](https://github.com/2x11-xyz/euler-extensions)
 repository holds the converted first-party extensions, each a standalone
 managed-process package:
 
-- `session-export`: bounded provenance query plus JSON artifact write. The
-  `euler session-export` CLI shortcut and the code-swarm review tool resolve
-  their extensions from the linked/installed registry; without them the
-  surface reports plainly how to add them.
+- `session-export`: bounded provenance query plus JSON artifact write. Run it
+  with `euler extension run session-export.session-export <session>`; it and
+  the code-swarm review tool resolve their extensions from the
+  linked/installed registry, and without them the surface reports plainly how
+  to add them.
 - `code-swarm`: review-only companion-agent brief generation and report folding.
 - `diagnostics-report`: diagnostics tail aggregation into an artifact.
 - `autoresearch`: objective brief/report flow with a context slot.

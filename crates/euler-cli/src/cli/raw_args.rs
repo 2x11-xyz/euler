@@ -1,6 +1,6 @@
 use super::args::{
-    accept_linefeed_history_option, accept_top_level_command, parse_positive_u64, ArgParseFlow,
-    ProviderOptions, RawArgs, SessionExportOption, TopLevelCommand,
+    accept_linefeed_history_option, accept_top_level_command, parse_positive_u64, set_once,
+    ArgParseFlow, ProviderOptions, RawArgs, TopLevelCommand,
     EXPERIMENTAL_TUI_LINEFEED_HISTORY_FLAG, NO_TUI_LINEFEED_HISTORY_FLAG,
 };
 use super::command::{parse_models_command, ModelsCommand};
@@ -14,7 +14,6 @@ use super::scrub::ScrubArgs;
 use crate::extension_cli::ExtensionArgs;
 use crate::extension_cli::ObserveOptions;
 use crate::extension_enablement::ExtensionSelection;
-use crate::session_export::RawProvenanceExportArgs;
 use crate::subagent::AutoApproveTier;
 
 pub(super) struct RawArgsParser {
@@ -56,7 +55,6 @@ impl RawArgsParser {
                 auth_status: false,
                 models: false,
                 models_command: ModelsCommand::List,
-                session_export: RawProvenanceExportArgs::default(),
                 extension: None,
                 scrub: None,
                 no_tty: false,
@@ -96,7 +94,6 @@ impl RawArgsParser {
             }),
             "auth" => self.parse_auth_command(args),
             "models" if !self.parsed.exec => self.parse_models_command(args),
-            "session-export" if !self.parsed.exec => self.parse_session_export_command(args),
             "extension" if !self.parsed.exec => self.parse_extension_command(args),
             "scrub" if !self.parsed.exec => self.parse_scrub_command(args),
             "--provenance" => self.parse_provenance(args),
@@ -112,14 +109,6 @@ impl RawArgsParser {
             }
             EXPERIMENTAL_TUI_LINEFEED_HISTORY_FLAG => self.parse_linefeed_history(true, &arg),
             NO_TUI_LINEFEED_HISTORY_FLAG => self.parse_linefeed_history(false, &arg),
-            "--limit" => self.parse_session_export_option(args, SessionExportOption::Limit),
-            "--scan-limit" => {
-                self.parse_session_export_option(args, SessionExportOption::ScanLimit)
-            }
-            "--after-event-id" => {
-                self.parse_session_export_option(args, SessionExportOption::AfterEventId)
-            }
-            "--kind" => self.parse_session_export_option(args, SessionExportOption::Kind),
             "--auto-approve" => self.parse_auto_approve(args),
             "--max-output-tokens" => self.parse_max_output_tokens(args),
             "--max-tool-rounds" => self.parse_max_tool_rounds(args),
@@ -214,15 +203,6 @@ impl RawArgsParser {
         Ok(ArgParseFlow::Continue)
     }
 
-    fn parse_session_export_command(
-        &mut self,
-        args: &mut impl Iterator<Item = String>,
-    ) -> Result<ArgParseFlow> {
-        accept_top_level_command(&mut self.top_level_command, TopLevelCommand::SessionExport)?;
-        self.parsed.session_export.start(args)?;
-        Ok(ArgParseFlow::Continue)
-    }
-
     fn parse_extension_command(
         &mut self,
         args: &mut impl Iterator<Item = String>,
@@ -308,13 +288,10 @@ impl RawArgsParser {
     }
 
     fn parse_observe(&mut self, args: &mut impl Iterator<Item = String>) -> Result<ArgParseFlow> {
-        if self.parsed.observe.extension_id.is_some() {
-            return Err(anyhow!("--observe was provided more than once"));
-        }
-        self.parsed.observe.extension_id = Some(
+        set_once(&mut self.parsed.observe.extension_id, "--observe", || {
             args.next()
-                .ok_or_else(|| anyhow!("--observe requires an extension id"))?,
-        );
+                .ok_or_else(|| anyhow!("--observe requires an extension id"))
+        })?;
         Ok(ArgParseFlow::Continue)
     }
 
@@ -322,37 +299,24 @@ impl RawArgsParser {
         &mut self,
         args: &mut impl Iterator<Item = String>,
     ) -> Result<ArgParseFlow> {
-        if self.parsed.observe.cadence_rounds.is_some() {
-            return Err(anyhow!("--observe-cadence was provided more than once"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--observe-cadence requires a value"))?;
-        self.parsed.observe.cadence_rounds = Some(
-            NonZeroU64::new(parse_positive_u64(&value, "--observe-cadence")?)
-                .expect("positive cadence is non-zero"),
-        );
+        set_once(
+            &mut self.parsed.observe.cadence_rounds,
+            "--observe-cadence",
+            || {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--observe-cadence requires a value"))?;
+                Ok(
+                    NonZeroU64::new(parse_positive_u64(&value, "--observe-cadence")?)
+                        .expect("positive cadence is non-zero"),
+                )
+            },
+        )?;
         Ok(ArgParseFlow::Continue)
     }
 
     fn parse_linefeed_history(&mut self, enabled: bool, arg: &str) -> Result<ArgParseFlow> {
         accept_linefeed_history_option(&mut self.parsed.linefeed_history_insert, enabled, arg)?;
-        Ok(ArgParseFlow::Continue)
-    }
-
-    fn parse_session_export_option(
-        &mut self,
-        args: &mut impl Iterator<Item = String>,
-        option: SessionExportOption,
-    ) -> Result<ArgParseFlow> {
-        match option {
-            SessionExportOption::Limit => self.parsed.session_export.set_limit(args)?,
-            SessionExportOption::ScanLimit => self.parsed.session_export.set_scan_limit(args)?,
-            SessionExportOption::AfterEventId => {
-                self.parsed.session_export.set_after_event_id(args)?
-            }
-            SessionExportOption::Kind => self.parsed.session_export.add_kind(args)?,
-        }
         Ok(ArgParseFlow::Continue)
     }
 
@@ -363,18 +327,17 @@ impl RawArgsParser {
         if !self.parsed.exec {
             return Err(anyhow!("--auto-approve is only supported with exec"));
         }
-        if self.parsed.auto_approve.is_some() {
-            return Err(anyhow!("--auto-approve was provided more than once"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--auto-approve requires a tier"))?;
-        self.parsed.auto_approve = Some(AutoApproveTier::parse(&value).ok_or_else(|| {
-            anyhow!(
-                "unknown auto-approve tier: {value}; supported tiers: {}",
-                AutoApproveTier::SUPPORTED
-            )
-        })?);
+        set_once(&mut self.parsed.auto_approve, "--auto-approve", || {
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow!("--auto-approve requires a tier"))?;
+            AutoApproveTier::parse(&value).ok_or_else(|| {
+                anyhow!(
+                    "unknown auto-approve tier: {value}; supported tiers: {}",
+                    AutoApproveTier::SUPPORTED
+                )
+            })
+        })?;
         Ok(ArgParseFlow::Continue)
     }
 
@@ -385,13 +348,16 @@ impl RawArgsParser {
         if !self.parsed.exec {
             return Err(anyhow!("--max-output-tokens is only supported with exec"));
         }
-        if self.parsed.max_output_tokens.is_some() {
-            return Err(anyhow!("--max-output-tokens was provided more than once"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--max-output-tokens requires a value"))?;
-        self.parsed.max_output_tokens = Some(parse_positive_u64(&value, "--max-output-tokens")?);
+        set_once(
+            &mut self.parsed.max_output_tokens,
+            "--max-output-tokens",
+            || {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--max-output-tokens requires a value"))?;
+                parse_positive_u64(&value, "--max-output-tokens")
+            },
+        )?;
         Ok(ArgParseFlow::Continue)
     }
 
@@ -402,14 +368,16 @@ impl RawArgsParser {
         if !self.parsed.exec {
             return Err(anyhow!("--max-tool-rounds is only supported with exec"));
         }
-        if self.parsed.max_tool_rounds.is_some() {
-            return Err(anyhow!("--max-tool-rounds was provided more than once"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--max-tool-rounds requires a value"))?;
-        self.parsed.max_tool_rounds =
-            Some(parse_positive_u64(&value, "--max-tool-rounds")? as usize);
+        set_once(
+            &mut self.parsed.max_tool_rounds,
+            "--max-tool-rounds",
+            || {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--max-tool-rounds requires a value"))?;
+                Ok(parse_positive_u64(&value, "--max-tool-rounds")? as usize)
+            },
+        )?;
         Ok(ArgParseFlow::Continue)
     }
 
@@ -420,15 +388,17 @@ impl RawArgsParser {
         if !self.parsed.exec {
             return Err(anyhow!("--auto-compaction is only supported with exec"));
         }
-        if self.parsed.auto_compaction.is_some() {
-            return Err(anyhow!("--auto-compaction was provided more than once"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--auto-compaction requires a value"))?;
-        let tier = CompactionTier::parse(&value)
-            .ok_or_else(|| anyhow!("--auto-compaction must be one of off|stubs"))?;
-        self.parsed.auto_compaction = Some(tier);
+        set_once(
+            &mut self.parsed.auto_compaction,
+            "--auto-compaction",
+            || {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--auto-compaction requires a value"))?;
+                CompactionTier::parse(&value)
+                    .ok_or_else(|| anyhow!("--auto-compaction must be one of off|stubs"))
+            },
+        )?;
         Ok(ArgParseFlow::Continue)
     }
 
@@ -441,16 +411,16 @@ impl RawArgsParser {
                 "--compaction-budget-bytes is only supported with exec"
             ));
         }
-        if self.parsed.compaction_budget_bytes.is_some() {
-            return Err(anyhow!(
-                "--compaction-budget-bytes was provided more than once"
-            ));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--compaction-budget-bytes requires a value"))?;
-        self.parsed.compaction_budget_bytes =
-            Some(parse_positive_u64(&value, "--compaction-budget-bytes")? as usize);
+        set_once(
+            &mut self.parsed.compaction_budget_bytes,
+            "--compaction-budget-bytes",
+            || {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--compaction-budget-bytes requires a value"))?;
+                Ok(parse_positive_u64(&value, "--compaction-budget-bytes")? as usize)
+            },
+        )?;
         Ok(ArgParseFlow::Continue)
     }
 
@@ -461,16 +431,20 @@ impl RawArgsParser {
         if !self.parsed.exec {
             return Err(anyhow!("--reasoning-effort is only supported with exec"));
         }
-        if self.parsed.reasoning_effort.is_some() {
-            return Err(anyhow!("--reasoning-effort was provided more than once"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--reasoning-effort requires a value"))?;
-        let effort = ReasoningEffort::parse(&value).ok_or_else(|| {
-            anyhow!("--reasoning-effort must be one of xsmall|small|medium|large|xlarge|max")
-        })?;
-        self.parsed.reasoning_effort = Some(effort);
+        set_once(
+            &mut self.parsed.reasoning_effort,
+            "--reasoning-effort",
+            || {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--reasoning-effort requires a value"))?;
+                ReasoningEffort::parse(&value).ok_or_else(|| {
+                    anyhow!(
+                        "--reasoning-effort must be one of xsmall|small|medium|large|xlarge|max"
+                    )
+                })
+            },
+        )?;
         Ok(ArgParseFlow::Continue)
     }
 
@@ -478,15 +452,17 @@ impl RawArgsParser {
         &mut self,
         args: &mut impl Iterator<Item = String>,
     ) -> Result<ArgParseFlow> {
-        if self.parsed.permission_reviewer.is_some() {
-            return Err(anyhow!("--permission-reviewer was provided more than once"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--permission-reviewer requires a value"))?;
-        let reviewer = PermissionReviewer::parse(&value)
-            .ok_or_else(|| anyhow!("--permission-reviewer must be one of user|guardian"))?;
-        self.parsed.permission_reviewer = Some(reviewer);
+        set_once(
+            &mut self.parsed.permission_reviewer,
+            "--permission-reviewer",
+            || {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--permission-reviewer requires a value"))?;
+                PermissionReviewer::parse(&value)
+                    .ok_or_else(|| anyhow!("--permission-reviewer must be one of user|guardian"))
+            },
+        )?;
         Ok(ArgParseFlow::Continue)
     }
 
@@ -494,19 +470,21 @@ impl RawArgsParser {
         &mut self,
         args: &mut impl Iterator<Item = String>,
     ) -> Result<ArgParseFlow> {
-        if self.parsed.project_context.is_some() {
-            return Err(anyhow!("--project-context was provided more than once"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| anyhow!("--project-context requires a value"))?;
-        let policy = euler_core::ProjectContextPolicy::parse(&value).ok_or_else(|| {
-            anyhow!(
-                "--project-context must be one of {}",
-                euler_core::ProjectContextPolicy::SUPPORTED
-            )
-        })?;
-        self.parsed.project_context = Some(policy);
+        set_once(
+            &mut self.parsed.project_context,
+            "--project-context",
+            || {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--project-context requires a value"))?;
+                euler_core::ProjectContextPolicy::parse(&value).ok_or_else(|| {
+                    anyhow!(
+                        "--project-context must be one of {}",
+                        euler_core::ProjectContextPolicy::SUPPORTED
+                    )
+                })
+            },
+        )?;
         Ok(ArgParseFlow::Continue)
     }
 

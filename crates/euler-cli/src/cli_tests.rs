@@ -23,22 +23,16 @@ use euler_provider::catalog::{
 use euler_provider::provider_config::ProviderConfigRegistry;
 use euler_provider::ReasoningEffort;
 use login::LoginArgs;
-use session_export::{execute_session_export, ProvenanceExportArgs};
 use session_lifecycle::{apply_catalog_context_limit, session_config, LiveProvenance};
 use std::path::PathBuf;
 use subagent::{AutoApproveTier, SubagentDecider};
 use theme_catalog::ThemeChoice;
 
-use crate::{
-    auth_commands, cli, companion_run, login, session_export, session_lifecycle, subagent,
-    theme_catalog,
-};
+use crate::{auth_commands, cli, companion_run, login, session_lifecycle, subagent, theme_catalog};
 
 #[path = "main_exec_tests.rs"]
 mod exec_tests;
 #[path = "main_extension_tests.rs"]
 mod extension_tests;
-#[path = "main_session_export_tests.rs"]
-mod session_export_tests;
 #[path = "main_tests.rs"]
 mod tests;

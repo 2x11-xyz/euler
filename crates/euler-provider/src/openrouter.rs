@@ -1,6 +1,8 @@
 use crate::auth::ApiKeyAuth;
 use crate::chat_completions::ChatCompletionsOptions;
-use crate::chat_completions_provider::{ChatCompletionsProvider, ChatCompletionsSpec};
+use crate::chat_completions_provider::{
+    define_chat_completions_provider, ChatCompletionsProvider, ChatCompletionsSpec,
+};
 use crate::{ModelProvider, ModelRequest, ProviderError, ProviderStream};
 
 pub const DEFAULT_MODEL: &str = "openai/gpt-4.1-mini";
@@ -16,41 +18,13 @@ static SPEC: ChatCompletionsSpec = ChatCompletionsSpec {
     extract_rejection_detail: false,
 };
 
-/// OpenRouter over the chat-completions dialect. A thin newtype over the shared
-/// [`ChatCompletionsProvider`]; the only per-provider behaviour is the reasoning
-/// options in `SPEC`.
-#[derive(Clone, Debug)]
-pub struct OpenRouterProvider(ChatCompletionsProvider);
-
-impl OpenRouterProvider {
-    pub fn new() -> Self {
-        Self(ChatCompletionsProvider::from_env(&SPEC))
-    }
-
-    pub fn with_api_key_auth(api_key: impl ApiKeyAuth + 'static) -> Self {
-        Self(ChatCompletionsProvider::new(&SPEC, api_key))
-    }
-}
-
-impl Default for OpenRouterProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ModelProvider for OpenRouterProvider {
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
-
-    fn validate_auth(&self) -> Result<(), ProviderError> {
-        self.0.validate_auth()
-    }
-
-    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
-        self.0.invoke(request)
-    }
-}
+define_chat_completions_provider!(
+    /// OpenRouter over the chat-completions dialect. A thin newtype over the shared
+    /// [`ChatCompletionsProvider`]; the only per-provider behaviour is the reasoning
+    /// options in `SPEC`.
+    OpenRouterProvider,
+    SPEC
+);
 
 /// Options for the built-in OpenRouter route: `max_tokens` (not
 /// `max_completion_tokens`) plus the OpenRouter `reasoning` request field and

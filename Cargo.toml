@@ -6,7 +6,6 @@ members = [
     "crates/euler-agents",
     "crates/euler-core",
     "crates/euler-provider",
-    "crates/euler-tools",
     "crates/euler-cli",
 ]
 resolver = "2"
