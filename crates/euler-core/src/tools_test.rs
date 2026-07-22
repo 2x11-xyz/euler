@@ -1007,6 +1007,9 @@ fn run_shell_scrubs_secret_and_parent_control_env_and_keeps_ordinary_env() {
         "EULER_NO_TTY",
         "EULER_TUI_METRICS",
         "RUST_LOG",
+        "euler_model",
+        "rust_log",
+        "Euler_Home",
     ]);
     env::set_var("EULER_ORDINARY_VAR", "visible");
     env::set_var("ANTHROPIC_API_KEY", "anthropic-secret");
@@ -1022,6 +1025,9 @@ fn run_shell_scrubs_secret_and_parent_control_env_and_keeps_ordinary_env() {
     env::set_var("EULER_NO_TTY", "1");
     env::set_var("EULER_TUI_METRICS", "/parent/metrics.jsonl");
     env::set_var("RUST_LOG", "trace");
+    env::set_var("euler_model", "project-model");
+    env::set_var("rust_log", "project-log");
+    env::set_var("Euler_Home", "project-home");
     let temp = tempfile::tempdir().expect("temp dir");
     let registry = ToolRegistry::new(temp.path());
 
@@ -1043,6 +1049,18 @@ fn run_shell_scrubs_secret_and_parent_control_env_and_keeps_ordinary_env() {
     assert!(!execution.output.contains("access-key-secret"));
     assert!(!execution.output.contains("token-secret"));
     assert!(!execution.output.contains("generic-secret"));
+
+    let case_distinct = registry
+        .execute(
+            "run_shell",
+            &json!({
+                "command": "printf '%s|%s|%s' \"$euler_model\" \"$rust_log\" \"$Euler_Home\""
+            }),
+        )
+        .expect("shell with case-distinct project variables");
+    assert!(case_distinct
+        .output
+        .contains("project-model|project-log|project-home"));
 
     let explicit = registry
         .execute(

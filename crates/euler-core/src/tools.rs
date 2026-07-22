@@ -712,7 +712,7 @@ fn is_parent_control_env_name(name: &std::ffi::OsStr) -> bool {
         return false;
     };
     matches!(
-        name.to_ascii_uppercase().as_str(),
+        name,
         "EULER_HOME"
             | "EULER_PROVIDER"
             | "EULER_MODEL"
