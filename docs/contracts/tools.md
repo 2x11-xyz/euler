@@ -61,9 +61,9 @@ Semantics:
 | `edit_file` | FsWrite | Single exact replacement |
 | `write_file` | FsWrite | Create a new file from plain `{path, content}` — no patch dialect. Create-only: fails if the file exists (use `edit_file`/`apply_patch` to modify) or the parent directory is missing. Emits the same `patch.proposed`/`patch.applied`/`file.change`/`file.diff` provenance as the add path of `apply_patch`. |
 | `apply_patch` | FsWrite | Structured single-file patch |
-| `run_shell` | ShellExec | Workspace root; timeout bounds |
-| `git_status` / `git_diff` | FsRead | Short workspace git views |
-| `tool_result_get` | FsRead | Rehydrate a demoted/compacted tool result from the **current session** by `event_id` (required); optional `max_bytes`. Session-local only. |
+| `run_shell` | ShellExec | Workspace root; timeout bounds. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
+| `git_status` / `git_diff` | FsRead | Workspace git views. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
+| `tool_result_get` | FsRead | Rehydrate a demoted, compacted, or previewed tool result from the **current session** by `event_id` (required); optional `offset_bytes` (default `0`) and `max_bytes` (default 64 KiB) select a byte window. Session-local only. |
 | `code_swarm_review` | AgentSpawn | Session-level review gate over required explicit `focus` (≤7 KiB) and `context` (≤256 KiB). The calling agent gathers material first through ordinary tools, so this gate has no hidden file, git, GitHub, or network authority. It forwards only that supplied context and a small reviewer brief — never ambient session canvas — fans out the persisted reviewer set, and returns every finding for caller adjudication. Optional: `personas`, `models` (non-empty one-off override; an empty model-facing list is omission), `max_tokens`. Advertised only in the root session when the `code-swarm` extension is wired and enabled; companions never see it (depth one). Config, result shape, and failure honesty: multi-agent contract. |
 
 Under ordinary host execution, agent-controlled shell and Git subprocesses
@@ -87,7 +87,13 @@ tools, whose permissions and provenance remain visible at the retrieval step.
 This keeps the review gate's authority honest and its model-facing canvas
 small: reviewers receive only explicit context, not the parent canvas.
 
-When canvas stubs show `event <id>` (and optional `handle event:…` / `blob:…`
-metadata), prefer `tool_result_get` with that event id over re-running the
-original tool if the original inputs are expensive or non-idempotent. Blob-hash
-lookup is not supported: live and resumed sessions keep content inline.
+When canvas previews or stubs show `event <id>` (and optional
+`handle event:…` / `blob:…` metadata), prefer `tool_result_get` with that event
+id over re-running the original tool if the original inputs are expensive or
+non-idempotent. Continue a bounded result at the returned `offset_bytes`.
+Offsets and result ranges address the redacted, canonically stored output.
+They are UTF-8 byte positions and returned ranges are half-open. An offset
+inside a code point advances to its next boundary; a byte budget smaller than
+the next code point expands just enough to return that code point and guarantee
+progress. Blob-hash lookup is not supported: live and resumed sessions keep
+content inline.

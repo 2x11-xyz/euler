@@ -93,6 +93,16 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
   accompany `error` when the tool produced partial output before failing).
+  `output` is the complete redacted text supplied by the tool (and may be
+  partial on the failure path described above). A producer that bounds the
+  active display may add `output_preview_max_bytes` and
+  `output_preview_max_lines`; the shared projection derives a head/tail preview
+  from the redacted output and appends the result event id needed by
+  `tool_result_get`. It leaves the output verbatim when the bounded form would
+  not be smaller. Producers retain those limits even when the current output
+  fits, so a later secret-scrub rewrite cannot bypass the projection bound.
+  Large `output` strings are content-addressed in the durable log and
+  rehydrated at the session boundary.
   Optional `recovery_closure: true` marks a resume-time canonical closure for
   an interrupted tail `tool.call`; it records the resume observation, not the
   original tool outcome.

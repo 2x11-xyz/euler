@@ -39,6 +39,44 @@ fn newline_terminated_exact_fit_is_not_marked_truncated() {
 }
 
 #[test]
+fn bounded_text_preserves_the_head_and_tail() {
+    let text = (1..=10)
+        .map(|line| format!("line-{line:02}\n"))
+        .collect::<String>();
+
+    let bounded = bound_text(&text, 1_000, 4);
+
+    assert!(bounded.starts_with("line-01\nline-02\n"), "{bounded}");
+    assert!(bounded.contains("[... middle output omitted ...]"));
+    assert!(bounded.ends_with("line-09\nline-10\n"), "{bounded}");
+    assert!(!bounded.contains("line-05"));
+}
+
+#[test]
+fn bounded_text_counts_an_unterminated_final_line() {
+    let mut text = (1..=10)
+        .map(|line| format!("line-{line:02}-{}\n", "x".repeat(20)))
+        .collect::<String>();
+    text.pop();
+
+    let bounded = bound_text(&text, 1_000, 4);
+
+    assert!(bounded.starts_with("line-01-"), "{bounded}");
+    assert!(bounded.contains("[... middle output omitted ...]"));
+    assert!(bounded.ends_with(&format!("line-10-{}", "x".repeat(20))));
+    assert!(!bounded.contains("line-05-"));
+}
+
+#[test]
+fn bounded_text_respects_the_retained_byte_budget_for_multibyte_text() {
+    let text = "🦀".repeat(100);
+
+    let bounded = bound_text(&text, 9, 2);
+
+    assert_eq!(bounded, "🦀\n[... middle output omitted ...]\n🦀");
+}
+
+#[test]
 fn read_file_without_offset_returns_fitting_file_unchanged() {
     let temp = tempfile::tempdir().expect("temp dir");
     let content = "alpha\nbeta\n";
@@ -1358,6 +1396,77 @@ fn run_shell_fast_command_unaffected_by_timeout_default() {
 }
 
 #[test]
+fn run_shell_retains_complete_output_behind_a_bounded_preview() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "run_shell",
+            &json!({
+                "command": "i=1; while [ \"$i\" -le 500 ]; do printf 'line-%03d\\n' \"$i\"; i=$((i + 1)); done",
+                "max_bytes": 200
+            }),
+        )
+        .expect("shell output");
+
+    assert!(execution.output.starts_with("exit 0\nline-001\n"));
+    assert!(execution.output.contains("line-250\n"));
+    assert!(execution.output.ends_with("line-500\n"));
+    let budget = execution
+        .output_preview_budget
+        .expect("shell preview budget");
+    assert_eq!(budget.max_bytes, 200);
+    assert_eq!(budget.max_lines, DEFAULT_MAX_LINES);
+    let preview = bound_text(&execution.output, budget.max_bytes, budget.max_lines);
+    assert!(preview.starts_with("exit 0\nline-001\n"), "{preview}");
+    assert!(preview.contains("[... middle output omitted ...]"));
+    assert!(preview.ends_with("line-500\n"), "{preview}");
+    assert!(!preview.contains("line-250\n"));
+}
+
+#[test]
+fn git_status_retains_complete_output_behind_a_bounded_preview() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let init = std::process::Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .current_dir(temp.path())
+        .status()
+        .expect("git init");
+    assert!(init.success());
+    for index in 1..=500 {
+        fs::write(
+            temp.path()
+                .join(format!("untracked-file-{index:03}-long-name.txt")),
+            "fixture",
+        )
+        .expect("untracked fixture");
+    }
+    let registry = ToolRegistry::new(temp.path());
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git status");
+
+    assert!(execution
+        .output
+        .contains("untracked-file-001-long-name.txt"));
+    assert!(execution
+        .output
+        .contains("untracked-file-250-long-name.txt"));
+    assert!(execution
+        .output
+        .contains("untracked-file-500-long-name.txt"));
+    let budget = execution.output_preview_budget.expect("git preview budget");
+    assert_eq!(budget.max_bytes, DEFAULT_MAX_BYTES);
+    assert_eq!(budget.max_lines, DEFAULT_MAX_LINES);
+    let preview = bound_text(&execution.output, budget.max_bytes, budget.max_lines);
+    assert!(preview.contains("untracked-file-001-long-name.txt"));
+    assert!(!preview.contains("untracked-file-250-long-name.txt"));
+    assert!(preview.contains("untracked-file-500-long-name.txt"));
+}
+
+#[test]
 fn tool_result_get_rehydrates_session_tool_result_by_event_id() {
     use euler_event::{object, EventEnvelope, EventKind};
     let event = EventEnvelope::new(
@@ -1382,12 +1491,126 @@ fn tool_result_get_rehydrates_session_tool_result_by_event_id() {
 }
 
 #[test]
+fn tool_result_get_reads_contiguous_byte_windows() {
+    use euler_event::{object, EventEnvelope, EventKind};
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-1".into()),
+            ("name", "run_shell".into()),
+            ("ok", true.into()),
+            ("output", "0123456789".into()),
+        ]),
+    );
+    let event_id = event.id.clone();
+    let registry = ToolRegistry::new(".");
+
+    let first = registry
+        .execute_with_events(
+            "tool_result_get",
+            &json!({"event_id": event_id, "offset_bytes": 3, "max_bytes": 4}),
+            std::slice::from_ref(&event),
+        )
+        .expect("first window");
+    assert!(
+        first.output.contains("bytes 3..7 of 10"),
+        "{}",
+        first.output
+    );
+    assert!(first.output.contains("\n3456\n"), "{}", first.output);
+    assert!(
+        first.output.contains("offset_bytes=7 for more"),
+        "{}",
+        first.output
+    );
+
+    let second = registry
+        .execute_with_events(
+            "tool_result_get",
+            &json!({"event_id": event.id, "offset_bytes": 7, "max_bytes": 4}),
+            &[event],
+        )
+        .expect("second window");
+    assert!(
+        second.output.contains("bytes 7..10 of 10"),
+        "{}",
+        second.output
+    );
+    assert!(second.output.ends_with("\n789"), "{}", second.output);
+    assert!(!second.output.contains("for more"));
+}
+
+#[test]
+fn rehydrate_window_aligns_utf8_boundaries_and_makes_progress() {
+    let window = rehydrate_window("aé日z", 2, 1);
+
+    assert_eq!(window.start, 3);
+    assert_eq!(window.end, 6);
+    assert_eq!(window.total, 7);
+    assert_eq!(window.body, "日");
+}
+
+#[test]
+fn rehydrate_window_inside_final_code_point_returns_a_valid_eof_range() {
+    let window = rehydrate_window("a日", 2, 1);
+
+    assert_eq!(window.start, 4);
+    assert_eq!(window.end, 4);
+    assert_eq!(window.total, 4);
+    assert!(window.body.is_empty());
+
+    let beyond_eof = rehydrate_window("a日", usize::MAX, 1);
+    assert_eq!(beyond_eof.start, 4);
+    assert_eq!(beyond_eof.end, 4);
+    assert!(beyond_eof.body.is_empty());
+}
+
+#[test]
+fn tool_result_get_rejects_invalid_window_bounds() {
+    use euler_event::{object, EventEnvelope, EventKind};
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-1".into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+            ("output", "body".into()),
+        ]),
+    );
+    let registry = ToolRegistry::new(".");
+
+    let error = registry
+        .execute_with_events(
+            "tool_result_get",
+            &json!({"event_id": event.id.clone(), "max_bytes": 0}),
+            &[event],
+        )
+        .expect_err("zero max_bytes rejected");
+
+    assert!(matches!(error, ToolError::InvalidField("max_bytes")));
+}
+
+#[test]
 fn model_tools_includes_tool_result_get() {
     let registry = ToolRegistry::new(".");
-    assert!(registry
-        .model_tools()
+    let tools = registry.model_tools();
+    let tool = tools
         .iter()
-        .any(|tool| tool.name == "tool_result_get"));
+        .find(|tool| tool.name == "tool_result_get")
+        .expect("tool_result_get definition");
+    assert_eq!(
+        tool.parameters["properties"]["offset_bytes"]["minimum"],
+        json!(0)
+    );
+    assert!(tool.parameters["properties"]["max_bytes"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("one complete UTF-8 code point")));
 }
 
 // --- rung-2 re-teach escalation (issue #94) -------------------------------
