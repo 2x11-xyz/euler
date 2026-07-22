@@ -79,7 +79,11 @@ impl<D: PermissionDecider> Session<D> {
                 &call.input,
                 &self.tools,
             );
-            let mode = self.permissions.mode(capability);
+            // Request-aware mode: a sensitive-basename path escalates
+            // blanket SessionAllow to Ask (deep review P1-b), so the grant
+            // coverage and ask branches below apply to it like any other
+            // uncovered request.
+            let mode = self.permissions.mode_for_request(&request);
             // Statically-safe read-only shell commands run under `ask`
             // without a prompt (issue #78): recorded as a fresh
             // permission.decision with mode "static-safe" — allowed-once

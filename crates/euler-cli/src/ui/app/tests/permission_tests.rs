@@ -123,6 +123,33 @@ fn non_patch_permission_uses_generic_inline_ask() {
 }
 
 #[test]
+fn sensitive_read_ask_renders_reason_with_read_title() {
+    // fs-read asks are reachable in the default posture via the
+    // sensitive-basename escalation (capabilities contract); the panel must
+    // name the file via the reason rather than fall back to the legacy label.
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    let request = PermissionRequest::new(
+        Capability::FsRead,
+        "tool read_file: .env looks like a secrets file".to_owned(),
+    )
+    .with_path(".env");
+    core.modal = Some(core.modal_for_request(request));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("Read file?"), "contents: {contents:?}");
+    assert!(!contents.contains("Approval required"));
+    assert!(
+        contents.contains("request: tool read_file: .env"),
+        "contents: {contents:?}"
+    );
+    assert!(contents.contains("y  Allow once"));
+    assert!(contents.contains("a  Allow fs-read for this session"));
+}
+
+#[test]
 fn permission_panel_consequences_use_available_write_scope() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();

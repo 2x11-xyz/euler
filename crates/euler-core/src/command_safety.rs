@@ -218,7 +218,13 @@ fn arg_confined(arg: &str, canonical_root: &Path) -> bool {
 
 /// Names whose contents are categorically sensitive, denied even inside the
 /// workspace (security review F1).
-fn sensitive_basename(path: &Path) -> bool {
+///
+/// The single sensitive-name list (one list, not two): statically-safe shell
+/// analysis rejects these path arguments outright, and the fs-tool permission
+/// braid escalates a blanket `session-allow` to an explicit ask when a tool
+/// path names one (deep review P1-b — `read_file .env` must not run
+/// unprompted while `cat .env` asks).
+pub fn sensitive_basename(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };

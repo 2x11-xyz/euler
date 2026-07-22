@@ -3368,3 +3368,239 @@ mod project_context_seam {
         assert!(fold_session(&config, mutilated).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sensitive-basename reads (deep review P1-b): a read_file targeting a
+// sensitive name must take an explicit permission decision instead of riding
+// fs-read's blanket session-allow, exactly as `cat .env` falls to the ask
+// path under static command safety.
+// ---------------------------------------------------------------------------
+
+fn read_file_call(id: &str, path: &str) -> euler_provider::ToolCall {
+    euler_provider::ToolCall {
+        id: id.to_owned(),
+        name: "read_file".to_owned(),
+        input: json!({ "path": path }),
+    }
+}
+
+fn events_of_kind<'a>(events: &'a [EventEnvelope], kind: &'static str) -> Vec<&'a EventEnvelope> {
+    events
+        .iter()
+        .filter(|event| event.kind.as_str() == kind)
+        .collect()
+}
+
+#[test]
+fn sensitive_basename_read_asks_instead_of_riding_session_allow() {
+    // The defect: `read_file .env` ran unprompted under fs-read's default
+    // session-allow while the equivalent `cat .env` asked.
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join(".env"), "API_KEY=plain-canary-value").expect(".env");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![read_file_call("call-env", ".env")]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+
+    session.run_turn("read the env file").expect("turn");
+
+    let prompts = events_of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompts.len(), 1, "a sensitive read must prompt");
+    assert_eq!(prompts[0].payload["capability"], json!("fs-read"));
+    let reason = prompts[0].payload["reason"].as_str().expect("reason");
+    assert!(
+        reason.contains(".env"),
+        "prompt must name the file: {reason}"
+    );
+    assert!(
+        reason.contains("secrets"),
+        "prompt must say why it is sensitive: {reason}"
+    );
+    let decisions = events_of_kind(session.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].payload["mode"], json!("ask"));
+    assert_eq!(decisions[0].payload["allowed"], json!(true));
+    assert_eq!(decisions[0].payload["grant_scope"], json!("once"));
+    let results = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].payload["ok"], json!(true));
+    assert!(results[0].payload["output"]
+        .as_str()
+        .expect("output")
+        .contains("plain-canary-value"));
+}
+
+#[test]
+fn sensitive_basename_read_denial_blocks_the_tool() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join(".env"), "API_KEY=denied-canary-value").expect(".env");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![read_file_call("call-env", ".env")]),
+        FixtureResponse::Assistant("adapted without the file".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        // Empty script: the decider denies the escalated ask.
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("read the env file").expect("turn");
+
+    let results = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].payload["ok"], json!(false));
+    assert!(results[0].payload["error"]
+        .as_str()
+        .expect("error")
+        .contains("permission denied"));
+    for event in session.events() {
+        let payload = serde_json::to_string(&event.payload).expect("payload json");
+        assert!(
+            !payload.contains("denied-canary-value"),
+            "denied file content leaked into {}",
+            event.kind
+        );
+    }
+}
+
+#[test]
+fn ordinary_read_still_rides_session_allow_without_prompting() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join("notes.txt"), "plain notes").expect("notes");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![read_file_call("call-notes", "notes.txt")]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("read the notes").expect("turn");
+
+    assert!(
+        events_of_kind(session.events(), EventKind::PERMISSION_PROMPT).is_empty(),
+        "ordinary reads must not start prompting"
+    );
+    let decisions = events_of_kind(session.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].payload["mode"], json!("session-allow"));
+    let results = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(results[0].payload["ok"], json!(true));
+}
+
+#[test]
+fn session_grant_from_the_ask_covers_later_sensitive_reads() {
+    // Durable/session grants must be able to cover the sensitive-read ask —
+    // the point is a deliberate decision, not a prompt per read.
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join(".env"), "API_KEY=covered-canary-value").expect(".env");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![read_file_call("call-env-1", ".env")]),
+        FixtureResponse::ToolCalls(vec![read_file_call("call-env-2", ".env")]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::AllowSession]),
+    );
+
+    session.run_turn("read it twice").expect("turn");
+
+    let prompts = events_of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompts.len(), 1, "the session grant must cover the re-read");
+    let results = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(results.len(), 2);
+    assert!(results
+        .iter()
+        .all(|event| event.payload["ok"] == json!(true)));
+    assert_eq!(
+        results[1].payload["grant_source"],
+        json!("session"),
+        "the covered run must be attributed to the session grant"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn innocently_named_symlink_to_sensitive_file_still_asks() {
+    // The literal argument is clean; only the canonicalized workspace form
+    // reveals the sensitive basename. The escalation must see through it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join(".env"), "API_KEY=symlink-canary-value").expect(".env");
+    std::os::unix::fs::symlink(".env", temp.path().join("notes.txt")).expect("symlink");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![read_file_call("call-link", "notes.txt")]),
+        FixtureResponse::Assistant("adapted".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("read the link").expect("turn");
+
+    assert_eq!(
+        events_of_kind(session.events(), EventKind::PERMISSION_PROMPT).len(),
+        1,
+        "the resolved target must trigger the ask"
+    );
+    let results = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(results[0].payload["ok"], json!(false));
+    for event in session.events() {
+        let payload = serde_json::to_string(&event.payload).expect("payload json");
+        assert!(
+            !payload.contains("symlink-canary-value"),
+            "denied file content leaked into {}",
+            event.kind
+        );
+    }
+}
+
+#[test]
+fn broadly_classified_env_secret_is_masked_in_tool_output() {
+    // Deep review P2-c: the redactor seeded known values from a 4-name
+    // vendor list while the subprocess scrub used the broad classifier, so
+    // an AWS-style env value leaked verbatim when echoed. nextest runs each
+    // test in its own process, so setting the variable here is hermetic.
+    let canary = "aws-style-e2e-canary-value-77";
+    std::env::set_var("EULER_E2E_TEST_ACCESS_KEY", canary);
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
+            id: "call-echo".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": format!("printf 'value {canary} end'")}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    // No project-context bootstrap: the session builds its redactor via
+    // SecretRedactor::from_env, the path under test.
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+
+    session.run_turn("echo it").expect("turn");
+    std::env::remove_var("EULER_E2E_TEST_ACCESS_KEY");
+
+    let output = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .find_map(|event| event.payload["output"].as_str().map(str::to_owned))
+        .expect("tool output");
+    assert!(!output.contains(canary), "{output}");
+    assert!(output.contains("[redacted-secret]"), "{output}");
+}

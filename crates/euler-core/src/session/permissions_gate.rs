@@ -253,6 +253,42 @@ pub(crate) fn permission_request_for_tool(
         }
         _ => {}
     }
+    // Canonicalized workspace-relative form, resolved exactly as the tool
+    // resolves it (`..` and symlinks). `None` when the path cannot be
+    // resolved inside the workspace.
+    let resolved = request
+        .path
+        .as_deref()
+        .and_then(|path| tools.workspace_relative_path(&path.to_string_lossy()));
+    // Sensitive-basename escalation (deep review P1-b): a tool path naming a
+    // categorically sensitive file must not ride a blanket session
+    // allowance — `PermissionGate::mode_for_request` turns SessionAllow into
+    // an ask for it. Both the literal argument and the canonicalized form
+    // are checked so an innocently named symlink to `.env` cannot evade the
+    // list, mirroring the resolved-path check statically-safe shell analysis
+    // applies. Living HERE means every permission gate — root session AND
+    // companion loop — gets the same classification.
+    request.sensitive_path = request
+        .path
+        .as_deref()
+        .is_some_and(crate::command_safety::sensitive_basename)
+        || resolved
+            .as_deref()
+            .is_some_and(crate::command_safety::sensitive_basename);
+    if request.sensitive_path && capability == Capability::FsRead {
+        // Plain-language ask: name the file and say why it needs a
+        // deliberate decision. FsWrite reasons stay verbatim (`tool
+        // edit_file` …) — the patch-approval surface keys on them and
+        // already shows the file.
+        if let Some(path) = request.path.as_deref() {
+            request.reason = format!(
+                "{reason}: {path} looks like a secrets file (env/credential/key \
+                 names ask even when other reads are allowed) — allow reading it?",
+                reason = request.reason,
+                path = crate::tools::display_path(&path.to_string_lossy()),
+            );
+        }
+    }
     // Scoped fs-write grants match the canonicalized workspace-relative
     // path (`..`/symlinks resolved exactly as the write resolves them), so
     // `src/../Cargo.toml` or a symlink inside the granted subtree cannot
@@ -262,10 +298,7 @@ pub(crate) fn permission_request_for_tool(
     // loop — gets the same resolution; a caller-side fix-up covers one gate
     // and silently misses the twin (security audit finding).
     if capability == Capability::FsWrite {
-        request.path = request
-            .path
-            .as_deref()
-            .and_then(|path| tools.workspace_relative_path(&path.to_string_lossy()));
+        request.path = resolved;
     }
     request
 }
