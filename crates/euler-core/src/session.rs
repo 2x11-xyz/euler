@@ -63,7 +63,9 @@ pub use observer::RoundObserverConfig;
 pub(crate) use permissions_gate::{
     approval_mode_str, permission_decision_payload, permission_request_for_tool, PermissionRuling,
 };
-pub(crate) use tool_dispatch::{file_change_payload, file_diff_payload, maybe_store_pre_image};
+pub(crate) use tool_dispatch::{
+    file_change_payload, file_diff_payload, maybe_store_pre_image, tool_success_payload,
+};
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
 const CONTEXT_LIMIT_MESSAGE: &str =

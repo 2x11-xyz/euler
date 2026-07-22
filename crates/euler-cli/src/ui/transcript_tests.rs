@@ -1209,6 +1209,42 @@ fn tui_exploration_coalesces_and_dedupes_read_labels() {
 }
 
 #[test]
+fn shell_transcript_uses_the_shared_recoverable_preview() {
+    let full = format!("exit 0\nHEAD\nMIDDLE{}\nTAIL\n", "x".repeat(100));
+    let call = tool_call(
+        "call-preview",
+        "run_shell",
+        serde_json::json!({"command": "verbose-command"}),
+    );
+    let mut result = tool_result_with_exit("call-preview", "run_shell", &full, true, 0);
+    result
+        .payload
+        .insert("output_preview_max_bytes".to_owned(), 1_000.into());
+    result
+        .payload
+        .insert("output_preview_max_lines".to_owned(), 3.into());
+    let result_event_id = result.id.clone();
+
+    let projected = project_events(&[call, result]);
+    let output = projected
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::ToolRun { output, .. } | TranscriptItem::ToolResult { output, .. } => {
+                Some(output)
+            }
+            _ => None,
+        })
+        .expect("shell projection");
+
+    assert!(output.contains("HEAD"), "{output}");
+    assert!(output.contains("TAIL"), "{output}");
+    assert!(!output.contains("MIDDLE"), "{output}");
+    assert!(output.contains("head/tail preview"), "{output}");
+    assert!(output.contains("tool_result_get"), "{output}");
+    assert!(output.contains(&result_event_id), "{output}");
+}
+
+#[test]
 fn tui_assistant_finalization_does_not_leave_stale_exploration_fragments() {
     let events = vec![
         tool_call(

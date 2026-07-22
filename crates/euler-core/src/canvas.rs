@@ -778,15 +778,15 @@ fn tool_output_item(event: &EventEnvelope) -> Option<CanvasItem> {
 
 fn tool_output_item_with_compaction(event: &EventEnvelope, compact: bool) -> Option<CanvasItem> {
     let name = string_field(event, "name")?;
-    let raw_output = string_field(event, "output").unwrap_or_default();
+    let projected_output = projected_tool_output(event);
     let should_compact = compact && is_layer1_eligible(&name);
     let output = if should_compact {
-        compact_tool_output(&raw_output, 3)
+        compact_tool_output(&projected_output, 3)
     } else {
-        raw_output.clone()
+        projected_output.clone()
     };
     // compacted flag is true only when the output was actually transformed
-    let compacted = should_compact && output != raw_output;
+    let compacted = should_compact && output != projected_output;
     Some(CanvasItem::ToolOutput {
         event_id: event.id.clone(),
         call_id: string_field(event, "id")?,
@@ -802,6 +802,50 @@ fn tool_output_item_with_compaction(event: &EventEnvelope, compact: bool) -> Opt
         compacted,
         demoted: false,
     })
+}
+
+/// Return the bounded display projection of a canonical tool result.
+///
+/// Producers retain complete redacted output in `output` and may attach
+/// numeric preview limits. The bounded view and recovery notice are derived
+/// here, after redaction and after the event id exists. Transcript and
+/// model-canvas consumers share this projection so their truncation semantics
+/// cannot drift.
+pub fn projected_tool_output(event: &EventEnvelope) -> String {
+    let output = string_field(event, "output").unwrap_or_default();
+    let Some(max_bytes) = event
+        .payload
+        .get("output_preview_max_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+    else {
+        return output;
+    };
+    let Some(max_lines) = event
+        .payload
+        .get("output_preview_max_lines")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+    else {
+        return output;
+    };
+    let mut preview = crate::tools::bound_text(&output, max_bytes, max_lines);
+    if preview == output {
+        return output;
+    }
+    let output_bytes = output.len();
+    let preview_bytes = preview.len();
+    if !preview.ends_with('\n') {
+        preview.push('\n');
+    }
+    preview.push_str(&format!(
+        "[truncated: showing a {preview_bytes}-byte head/tail preview of {output_bytes} bytes; \
+call tool_result_get with event_id={} and optional offset_bytes/max_bytes to recover the full result]",
+        event.id
+    ));
+    preview
 }
 
 fn string_field(event: &EventEnvelope, key: &str) -> Option<String> {

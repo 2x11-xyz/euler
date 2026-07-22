@@ -3,9 +3,9 @@
 use super::{
     approval_mode_str, canvas_snapshot_payload, context_budget_exhausted, elapsed_ms,
     file_change_payload, file_diff_payload, maybe_store_pre_image, model_input_item,
-    permission_decision_payload, permission_request_for_tool, validate_model_target_shape,
-    ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session,
-    SessionError, TurnState, SYSTEM_INSTRUCTIONS,
+    permission_decision_payload, permission_request_for_tool, tool_success_payload,
+    validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig,
+    RoundLoopIo, RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
@@ -506,15 +506,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         execution: crate::tools::ToolExecution,
         tool_call_event_id: String,
     ) -> Result<(), SessionError> {
-        let mut payload = object([
-            ("id", call.id.into()),
-            ("name", execution.name.into()),
-            ("ok", true.into()),
-            ("output", self.redactor.redact(&execution.output).into()),
-        ]);
-        if let Some(exit_code) = execution.exit_code {
-            payload.insert("exit_code".to_owned(), exit_code.into());
-        }
+        let payload = tool_success_payload(call.id, &execution, &self.redactor);
         self.append(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
         Ok(())
     }

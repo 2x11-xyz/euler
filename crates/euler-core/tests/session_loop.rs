@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_lines)] // integration-test exemption for integration test modules
+use euler_core::canvas::projected_tool_output;
 use euler_core::permissions::{
     ApprovalMode, DeciderVerdict, PermissionDecider, PermissionRequest, ScriptedDecider,
 };
@@ -1154,6 +1155,48 @@ fn tool_output_redacts_known_values_and_token_shapes() {
     assert!(output.contains("[redacted-secret]"));
     // Non-secret content survives.
     assert!(output.contains("name=OPENROUTER_API_KEY"));
+}
+
+#[test]
+fn tool_output_preview_is_derived_after_secret_redaction() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let secret = "registered-secret-value-42";
+    let command = format!("printf 'PPPPP{secret}{}'", "S".repeat(100));
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-preview-secret".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({
+                "command": command,
+                "max_bytes": 32
+            }),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    session.add_redacted_secret(secret);
+
+    session.run_turn("read bounded output").expect("turn");
+
+    let result = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    let output = payload_str(result, "output").expect("canonical output");
+    let preview = projected_tool_output(result);
+    assert!(!output.contains(secret), "canonical secret leak: {output}");
+    assert!(output.contains("[redacted-secret]"), "{output}");
+    assert!(!preview.contains(secret), "preview secret leak: {preview}");
+    assert!(
+        !preview.contains("regi"),
+        "preview leaked a boundary fragment: {preview}"
+    );
+    assert!(preview.contains("tool_result_get"), "{preview}");
 }
 
 #[test]
@@ -2867,6 +2910,46 @@ fn shell_tool_result_records_exit_code_separately_from_invocation_ok() {
             .get("exit_code")
             .and_then(serde_json::Value::as_i64),
         Some(7)
+    );
+}
+
+#[test]
+fn shell_tool_result_keeps_complete_output_with_a_bounded_preview() {
+    let command = "i=1; while [ \"$i\" -le 500 ]; do printf 'line-%03d-abcdefghijklmnopqrstuvwxyz\\n' \"$i\"; i=$((i + 1)); done";
+    let events = run_shell_with_mode(ApprovalMode::SessionAllow, vec![], command, "");
+    let result = events
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT
+                && event
+                    .payload
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("run_shell")
+        })
+        .expect("shell result");
+    let output = payload_str(result, "output").expect("complete output");
+    let preview = projected_tool_output(result);
+
+    assert!(output.contains("line-001-abcdefghijklmnopqrstuvwxyz"));
+    assert!(output.contains("line-250-abcdefghijklmnopqrstuvwxyz"));
+    assert!(output.contains("line-500-abcdefghijklmnopqrstuvwxyz"));
+    assert!(preview.contains("line-001-abcdefghijklmnopqrstuvwxyz"));
+    assert!(!preview.contains("line-250-abcdefghijklmnopqrstuvwxyz"));
+    assert!(preview.contains("line-500-abcdefghijklmnopqrstuvwxyz"));
+    assert_eq!(
+        result
+            .payload
+            .get("output_preview_max_bytes")
+            .and_then(serde_json::Value::as_u64),
+        Some(16 * 1024)
+    );
+    assert_eq!(
+        result
+            .payload
+            .get("output_preview_max_lines")
+            .and_then(serde_json::Value::as_u64),
+        Some(400)
     );
 }
 

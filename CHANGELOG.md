@@ -8,6 +8,11 @@ pull requests that landed them; deeper design rationale lives in
 
 ### Agent session resilience
 
+- Shell and Git results now retain complete redacted output in their canonical
+  events while exposing bounded head/tail previews to the active canvas and
+  transcript. Every preview names its result event, and `tool_result_get`
+  supports bounded byte windows so omitted output remains recoverable without
+  repeating a command.
 - Provider calls now retry bounded, pre-output rate-limit failures through the
   same cancellation-aware policy as transient transport failures. Rejections,
   authentication failures, stream truncation, and partial responses still

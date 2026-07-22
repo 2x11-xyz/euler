@@ -227,6 +227,120 @@ fn blob_backed_large_tool_result_resume_equivalence() {
 }
 
 #[test]
+fn blob_backed_previewed_shell_result_resume_equivalence() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let uninterrupted_root = temp.path().join("shell-uninterrupted");
+    let resumed_root = temp.path().join("shell-resumed");
+    let resumed_log = resumed_root.join("events.jsonl");
+    let command = r#"i=1; while [ "$i" -le 500 ]; do printf 'line-%03d-abcdefghijklmnopqrstuvwxyz\n' "$i"; i=$((i + 1)); done"#;
+    let tool_round = FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-large-shell".to_owned(),
+        name: "run_shell".to_owned(),
+        input: json!({"command": command, "max_bytes": 200}),
+    }]);
+    let case = EquivalenceCase {
+        name: "blob_backed_previewed_shell_result",
+        uninterrupted_root,
+        resumed_root,
+        uninterrupted: RunPlan {
+            provider_plan: ProviderPlan::Fixture(vec![
+                tool_round.clone(),
+                FixtureResponse::Assistant("saw shell output".to_owned()),
+                FixtureResponse::Assistant("after resume".to_owned()),
+            ]),
+            decisions: vec![DeciderVerdict::Allow],
+            steps: vec![Step::Turn("run"), Step::Turn("continue")],
+        },
+        before_cut: RunPlan {
+            provider_plan: ProviderPlan::Fixture(vec![
+                tool_round,
+                FixtureResponse::Assistant("saw shell output".to_owned()),
+            ]),
+            decisions: vec![DeciderVerdict::Allow],
+            steps: vec![Step::Turn("run")],
+        },
+        after_resume: RunPlan {
+            provider_plan: ProviderPlan::Fixture(vec![FixtureResponse::Assistant(
+                "after resume".to_owned(),
+            )]),
+            decisions: vec![],
+            steps: vec![Step::Turn("continue")],
+        },
+    };
+
+    let outcome = assert_run_cut_resume_equivalent(case);
+    let result = outcome
+        .resumed_events
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT
+                && event.payload.get("id").and_then(Value::as_str) == Some("call-large-shell")
+        })
+        .expect("rehydrated shell result");
+    let output = result
+        .payload
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("canonical shell output");
+    assert!(output.contains("line-001-abcdefghijklmnopqrstuvwxyz"));
+    assert!(output.contains("line-250-abcdefghijklmnopqrstuvwxyz"));
+    assert!(output.contains("line-500-abcdefghijklmnopqrstuvwxyz"));
+    assert_eq!(
+        result
+            .payload
+            .get("output_preview_max_bytes")
+            .and_then(Value::as_u64),
+        Some(200)
+    );
+    assert_eq!(
+        result
+            .payload
+            .get("output_preview_max_lines")
+            .and_then(Value::as_u64),
+        Some(400)
+    );
+
+    let prompt = serde_json::to_string(&canvas_prompt(&assemble_canvas(
+        &outcome.resumed_events,
+        &AutoCompactionPolicy::default(),
+    )))
+    .expect("canvas prompt json");
+    assert!(
+        prompt.contains("line-001-abcdefghijklmnopqrstuvwxyz"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("line-500-abcdefghijklmnopqrstuvwxyz"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("line-250-abcdefghijklmnopqrstuvwxyz"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("tool_result_get"), "{prompt}");
+    assert!(prompt.contains(&result.id), "{prompt}");
+
+    let stored_result = fs::read_to_string(&resumed_log)
+        .expect("stored events")
+        .lines()
+        .map(|line| serde_json::from_str::<EventEnvelope>(line).expect("stored event"))
+        .find(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT
+                && event.payload.get("id").and_then(Value::as_str) == Some("call-large-shell")
+        })
+        .expect("stored shell result");
+    assert!(
+        stored_result
+            .payload
+            .get("output")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with("blob:")),
+        "large canonical output should be externalized"
+    );
+    assert!(stored_result.blobs.contains_key("output"));
+}
+
+#[test]
 fn permission_prompt_approved_path_resume_equivalence() {
     let temp = tempfile::tempdir().expect("temp dir");
     let uninterrupted_root = temp.path().join("allow-uninterrupted");
@@ -1026,6 +1140,14 @@ fn normalize_json_field(
             }
             for value in object.values_mut() {
                 normalize_json_field(value, allowlist, id_map);
+            }
+        }
+        Value::String(text) => {
+            for (event_id, normalized) in id_map {
+                if text.contains(event_id) {
+                    require_allowed(allowlist, "id");
+                    *text = text.replace(event_id, normalized);
+                }
             }
         }
         _ => {}
