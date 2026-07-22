@@ -337,6 +337,78 @@ fn demoted_stub_preserves_fact_status_size_and_event_handle() {
 }
 
 #[test]
+fn tool_output_preview_is_bounded_and_names_its_recovery_handle() {
+    let full = format!("exit 0\nHEAD\nMIDDLE{}\nTAIL\n", "x".repeat(1_000));
+    let mut events = tool_pair_events("call-preview", "run_shell", &full);
+    events[1]
+        .payload
+        .insert("output_preview_max_bytes".to_owned(), 1_000.into());
+    events[1]
+        .payload
+        .insert("output_preview_max_lines".to_owned(), 3.into());
+    let result_event_id = events[1].id.clone();
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+    let (_, output) = output_for(&canvas, "call-preview");
+
+    assert!(output.contains("HEAD"), "{output}");
+    assert!(output.contains("TAIL"), "{output}");
+    assert!(!output.contains("MIDDLE"), "{output}");
+    assert!(output.contains("head/tail preview"), "{output}");
+    assert!(output.contains("tool_result_get"), "{output}");
+    assert!(output.contains(&result_event_id), "{output}");
+}
+
+#[test]
+fn tool_output_preview_never_expands_a_short_canonical_result() {
+    let mut events = tool_pair_events("call-short-preview", "run_shell", "one\ntwo");
+    events[1]
+        .payload
+        .insert("output_preview_max_bytes".to_owned(), 1_000.into());
+    events[1]
+        .payload
+        .insert("output_preview_max_lines".to_owned(), 1.into());
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+    let (_, output) = output_for(&canvas, "call-short-preview");
+
+    assert_eq!(output, "one\ntwo");
+    assert!(!output.contains("tool_result_get"));
+}
+
+#[test]
+fn tool_output_preview_includes_recovery_notice_in_the_size_decision() {
+    let full = format!("exit 0\n{}", "\n".repeat(500));
+    let mut events = tool_pair_events("call-notice-expansion", "run_shell", &full);
+    events[1]
+        .payload
+        .insert("output_preview_max_bytes".to_owned(), (16 * 1024).into());
+    events[1]
+        .payload
+        .insert("output_preview_max_lines".to_owned(), 400.into());
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+    let (_, output) = output_for(&canvas, "call-notice-expansion");
+
+    assert_eq!(output, full);
+    assert!(!output.contains("tool_result_get"));
+}
+
+#[test]
+fn tool_output_without_preview_metadata_remains_verbatim() {
+    let events = tool_pair_events(
+        "call-legacy-output",
+        "run_shell",
+        "exit 0\nHEAD\nMIDDLE\nTAIL\n",
+    );
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+    let (_, output) = output_for(&canvas, "call-legacy-output");
+
+    assert_eq!(output, "exit 0\nHEAD\nMIDDLE\nTAIL\n");
+}
+
+#[test]
 fn demoted_stub_uses_provenance_blob_handle_when_available() {
     let mut events = tool_pair_events("call-blob", "read_file", &"x".repeat(5000));
     events[1]

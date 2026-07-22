@@ -9,7 +9,8 @@ use crate::file_diff::{
     file_diff_projection, observed_file_change_payload, observed_file_diff_payload, FileDiffSource,
 };
 use crate::permissions::{ApprovalMode, PermissionDecider};
-use crate::tools::PatchEvents;
+use crate::redaction::SecretRedactor;
+use crate::tools::{PatchEvents, ToolExecution};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::ToolCall;
 use euler_sdk::Capability;
@@ -151,7 +152,7 @@ impl<D: PermissionDecider> Session<D> {
                 // reasons (the streak tracks format competence, issue #94).
                 self.tool_reteach
                     .record_success(self.tools.reteach_identity(&call.name, &call.input));
-                if let Some(patch) = execution.patch {
+                if let Some(patch) = execution.patch.as_ref() {
                     let mut payload = object([
                         ("path", patch.path.clone().into()),
                         ("old", patch.before.clone().into()),
@@ -164,7 +165,7 @@ impl<D: PermissionDecider> Session<D> {
                         payload.clone(),
                         Some(tool_call_event_id.clone()),
                     )?;
-                    if let Err(error) = self.tools.apply_patch(&patch) {
+                    if let Err(error) = self.tools.apply_patch(patch) {
                         self.emit_failed_tool_result(
                             call.id,
                             execution.name,
@@ -179,13 +180,13 @@ impl<D: PermissionDecider> Session<D> {
                         payload,
                         Some(patch_proposed_id),
                     )?;
-                    let pre_image_blob = maybe_store_pre_image(self.config.root.as_path(), &patch);
+                    let pre_image_blob = maybe_store_pre_image(self.config.root.as_path(), patch);
                     let file_change_id = self.emit_with_parent(
                         EventKind::FILE_CHANGE,
-                        file_change_payload(&call.id, &patch, pre_image_blob.as_deref()),
+                        file_change_payload(&call.id, patch, pre_image_blob.as_deref()),
                         Some(patch_applied_id.clone()),
                     )?;
-                    let mut diff_payload = file_diff_payload(&call.id, &file_change_id, &patch);
+                    let mut diff_payload = file_diff_payload(&call.id, &file_change_id, patch);
                     self.redactor
                         .redact_payload_fields(&mut diff_payload, &["diff"]);
                     self.emit_with_parent(
@@ -210,15 +211,7 @@ impl<D: PermissionDecider> Session<D> {
                         Some(tool_call_event_id.clone()),
                     )?;
                 }
-                let mut payload = object([
-                    ("id", call.id.into()),
-                    ("name", execution.name.into()),
-                    ("ok", true.into()),
-                    ("output", self.redactor.redact(&execution.output).into()),
-                ]);
-                if let Some(exit_code) = execution.exit_code {
-                    payload.insert("exit_code".to_owned(), exit_code.into());
-                }
+                let mut payload = tool_success_payload(call.id, &execution, &self.redactor);
                 if let Some(source) = covered_grant_source {
                     // Ran under an existing grant — the ledger shows a dim
                     // `· session grant` on the tool header instead of a fresh
@@ -291,6 +284,37 @@ impl<D: PermissionDecider> Session<D> {
         );
         Ok(())
     }
+}
+
+pub(crate) fn tool_success_payload(
+    call_id: String,
+    execution: &ToolExecution,
+    redactor: &SecretRedactor,
+) -> JsonObject {
+    let redacted_output = redactor.redact(&execution.output);
+    let mut payload = object([
+        ("id", call_id.into()),
+        ("name", execution.name.clone().into()),
+        ("ok", true.into()),
+        ("output", redacted_output.clone().into()),
+    ]);
+    if let Some(budget) = execution.output_preview_budget {
+        // Retain the producer's projection contract even when the current
+        // output fits. A later explicit scrub can expand replacement markers;
+        // the durable budget must still bound that rewritten result.
+        payload.insert(
+            "output_preview_max_bytes".to_owned(),
+            budget.max_bytes.into(),
+        );
+        payload.insert(
+            "output_preview_max_lines".to_owned(),
+            budget.max_lines.into(),
+        );
+    }
+    if let Some(exit_code) = execution.exit_code {
+        payload.insert("exit_code".to_owned(), exit_code.into());
+    }
+    payload
 }
 
 pub(crate) fn file_change_payload(

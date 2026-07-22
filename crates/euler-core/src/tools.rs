@@ -85,10 +85,20 @@ pub enum ToolError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolExecution {
     pub name: String,
+    /// Complete tool output retained in the canonical event and provenance.
     pub output: String,
+    /// Optional display budget applied only after session redaction. The
+    /// complete `output` remains recoverable by event id.
+    pub output_preview_budget: Option<OutputPreviewBudget>,
     pub exit_code: Option<i32>,
     pub patch: Option<PatchEvents>,
     pub file_changes: Vec<ObservedFileChange>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputPreviewBudget {
+    pub max_bytes: usize,
+    pub max_lines: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,6 +312,7 @@ impl ToolRegistry {
         Ok(ToolExecution {
             name: "read_file".to_owned(),
             output,
+            output_preview_budget: None,
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
@@ -328,6 +339,7 @@ impl ToolRegistry {
         Ok(ToolExecution {
             name: "edit_file".to_owned(),
             output: format!("edited {relative}"),
+            output_preview_budget: None,
             exit_code: None,
             patch: Some(PatchEvents {
                 path: relative.to_owned(),
@@ -371,6 +383,7 @@ impl ToolRegistry {
         Ok(ToolExecution {
             name: origin.to_owned(),
             output: format!("created {relative}"),
+            output_preview_budget: None,
             exit_code: None,
             patch: Some(PatchEvents {
                 path: relative.to_owned(),
@@ -413,6 +426,7 @@ impl ToolRegistry {
                 Ok(ToolExecution {
                     name: name.to_owned(),
                     output: format!("{label} prepared add {path}"),
+                    output_preview_budget: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
                         path,
@@ -438,6 +452,7 @@ impl ToolRegistry {
                 Ok(ToolExecution {
                     name: name.to_owned(),
                     output: format!("{label} prepared update {path}"),
+                    output_preview_budget: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
                         path,
@@ -509,7 +524,6 @@ impl ToolRegistry {
         let file_changes = before
             .zip(after)
             .map_or_else(Vec::new, |(before, after)| before.changes_to(&after));
-        let bounded = bound_text(&text, max_bytes, DEFAULT_MAX_LINES);
         let (status, header) = match outcome.status {
             Some(status) => (status, format!("exit {status}")),
             None => (
@@ -520,9 +534,14 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
                 ),
             ),
         };
+        let output = format!("{header}\n{text}");
         Ok(ToolExecution {
             name: "run_shell".to_owned(),
-            output: format!("{header}\n{bounded}"),
+            output,
+            output_preview_budget: Some(OutputPreviewBudget {
+                max_bytes,
+                max_lines: DEFAULT_MAX_LINES,
+            }),
             exit_code: Some(status),
             patch: None,
             file_changes,
@@ -546,7 +565,11 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
         let status = output.status.code().unwrap_or(-1);
         Ok(ToolExecution {
             name: name.to_owned(),
-            output: bound_text(&text, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES),
+            output: text,
+            output_preview_budget: Some(OutputPreviewBudget {
+                max_bytes: DEFAULT_MAX_BYTES,
+                max_lines: DEFAULT_MAX_LINES,
+            }),
             exit_code: Some(status),
             patch: None,
             file_changes: Vec::new(),
@@ -1013,25 +1036,64 @@ fn append_read_file_truncation_marker(
     output.push_str(&marker);
 }
 
-fn bound_text(text: &str, max_bytes: usize, max_lines: usize) -> String {
-    let mut output = String::new();
-    let mut truncated = false;
-    for line in text.split_inclusive('\n').take(max_lines) {
-        if output.len() + line.len() > max_bytes {
-            let remaining = max_bytes.saturating_sub(output.len());
-            output.push_str(&line[..floor_char_boundary(line, remaining)]);
-            truncated = true;
-            break;
-        }
-        output.push_str(line);
+pub(crate) fn bound_text(text: &str, max_bytes: usize, max_lines: usize) -> String {
+    if text.len() <= max_bytes
+        && text
+            .split_inclusive('\n')
+            .take(max_lines.saturating_add(1))
+            .count()
+            <= max_lines
+    {
+        return text.to_owned();
     }
-    if text.split_inclusive('\n').count() > max_lines || text.len() > output.len() {
-        truncated = true;
+
+    // Preserve both the command's beginning and its terminal/error region.
+    // Byte and line budgets apply to retained content; the honest omission
+    // marker is additional projection metadata. Restrict line discovery to
+    // the byte windows first so preview work never scans the omitted middle.
+    let head_line_count = max_lines.div_ceil(2);
+    let tail_line_count = max_lines / 2;
+    let head_byte_budget = max_bytes.div_ceil(2);
+    let tail_byte_budget = max_bytes / 2;
+    let head_byte_end = floor_char_boundary(text, text.len().min(head_byte_budget));
+    let head_end = text[..head_byte_end]
+        .split_inclusive('\n')
+        .take(head_line_count)
+        .map(|line| line.len())
+        .sum::<usize>();
+    let tail_byte_start = ceil_char_boundary(text, text.len().saturating_sub(tail_byte_budget));
+    let tail_window = &text[tail_byte_start..];
+    let tail_line_bytes = tail_window
+        .split_inclusive('\n')
+        .rev()
+        .take(tail_line_count)
+        .map(|line| line.len())
+        .sum::<usize>();
+    let tail_line_start = text.len().saturating_sub(tail_line_bytes);
+    let tail_start = tail_line_start.max(tail_byte_start).max(head_end);
+
+    let mut output = text[..head_end].to_owned();
+    if !output.ends_with('\n') {
+        output.push('\n');
     }
-    if truncated {
-        output.push_str("\n[truncated]");
+    output.push_str("[... middle output omitted ...]");
+    if tail_start < text.len() {
+        output.push('\n');
+        output.push_str(&text[tail_start..]);
     }
-    output
+    if output.len() < text.len() {
+        output
+    } else {
+        text.to_owned()
+    }
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn overlapping_match_count(haystack: &str, needle: &str) -> usize {
@@ -1110,7 +1172,11 @@ after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "max_bytes": {"type": "integer", "minimum": 1},
+                    "max_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum command-output bytes retained across the active head/tail preview. Complete output remains recoverable by result event id."
+                    },
                     "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS}
                 },
                 "required": ["command"],
@@ -1155,12 +1221,24 @@ fn write_file_definition() -> ToolDefinition {
 fn tool_result_get_definition() -> ToolDefinition {
     ToolDefinition {
         name: "tool_result_get".to_owned(),
-        description: "Rehydrate a demoted or compacted tool result from the current session by event_id (required). Use the event id printed in canvas stubs (`event <id>`) instead of re-running the original tool.".to_owned(),
+        description: "Rehydrate a demoted, compacted, or previewed tool result from the current session by event_id (required). Use optional offset_bytes and max_bytes to read a bounded byte window instead of re-running the original tool.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "event_id": {"type": "string"},
-                "max_bytes": {"type": "integer", "minimum": 1}
+                "event_id": {
+                    "type": "string",
+                    "description": "Tool-result event id printed by a canvas preview or stub."
+                },
+                "offset_bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "UTF-8 byte offset into the canonical redacted result; defaults to 0."
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Target result-body byte budget; defaults to 65536 and may expand just enough to return one complete UTF-8 code point."
+                }
             },
             "required": ["event_id"],
             "additionalProperties": false
@@ -1169,12 +1247,8 @@ fn tool_result_get_definition() -> ToolDefinition {
 }
 
 fn tool_result_get(events: &[EventEnvelope], input: &Value) -> Result<ToolExecution, ToolError> {
-    let max_bytes = input
-        .get("max_bytes")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(64 * 1024)
-        .max(1);
+    let offset_bytes = optional_usize(input, "offset_bytes")?.unwrap_or(0);
+    let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(64 * 1024);
     let event = find_tool_result_event(events, input)?;
     let name = event
         .payload
@@ -1187,11 +1261,22 @@ fn tool_result_get(events: &[EventEnvelope], input: &Value) -> Result<ToolExecut
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let content = tool_result_content(event, ok);
-    let body = truncate_rehydrate_body(content, max_bytes);
+    let window = rehydrate_window(content, offset_bytes, max_bytes);
     let status = if ok { "ok" } else { "failed" };
+    let mut output = format!(
+        "[rehydrated {name} event {} ({status}); bytes {}..{} of {}]\n{}",
+        event.id, window.start, window.end, window.total, window.body
+    );
+    if window.end < window.total {
+        output.push_str(&format!(
+            "\n[truncated: call tool_result_get with event_id={} and offset_bytes={} for more]",
+            event.id, window.end
+        ));
+    }
     Ok(ToolExecution {
         name: "tool_result_get".to_owned(),
-        output: format!("[rehydrated {name} event {} ({status})]\n{body}", event.id),
+        output,
+        output_preview_budget: None,
         exit_code: None,
         patch: None,
         file_changes: Vec::new(),
@@ -1237,17 +1322,27 @@ fn tool_result_content(event: &EventEnvelope, ok: bool) -> &str {
     }
 }
 
-fn truncate_rehydrate_body(content: &str, max_bytes: usize) -> String {
-    if content.len() <= max_bytes {
-        return content.to_owned();
+struct RehydrateWindow {
+    body: String,
+    start: usize,
+    end: usize,
+    total: usize,
+}
+
+fn rehydrate_window(content: &str, offset_bytes: usize, max_bytes: usize) -> RehydrateWindow {
+    let total = content.len();
+    let start = ceil_char_boundary(content, offset_bytes.min(total));
+    let requested_end = start.saturating_add(max_bytes).min(total);
+    let mut end = floor_char_boundary(content, requested_end);
+    if end == start && start < total {
+        end = start + content[start..].chars().next().map_or(0, char::len_utf8);
     }
-    let cut = floor_char_boundary(content, max_bytes);
-    format!(
-        "{}\n[truncated: showing {} of {} bytes; call tool_result_get with a larger max_bytes for more]",
-        &content[..cut],
-        cut,
-        content.len()
-    )
+    RehydrateWindow {
+        body: content[start..end].to_owned(),
+        start,
+        end,
+        total,
+    }
 }
 
 #[cfg(test)]

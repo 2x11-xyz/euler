@@ -3,6 +3,7 @@ use super::patch_diff;
 use super::theme::Theme;
 use crate::ui::markdown_stream::MarkdownStreamCollector;
 use chrono::{DateTime, Local};
+use euler_core::canvas::projected_tool_output;
 use euler_event::{EventEnvelope, EventKind};
 use ratatui::text::Line;
 #[cfg(test)]
@@ -704,7 +705,7 @@ fn project_event_with_checkpoints(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
             error: payload_string(event, "error").unwrap_or_default(),
-            output: payload_string(event, "output").unwrap_or_default(),
+            output: projected_tool_output(event),
             exit_code: event
                 .payload
                 .get("exit_code")
@@ -1712,7 +1713,7 @@ fn run_item_from_result(
         // leading `exit N` status row dropped, render padding stripped —
         // so the collapsed and expanded views render the same stored
         // lines and agree on count/order by construction.
-        output: normalize_tool_run_output(&payload_string(event, "output").unwrap_or_default()),
+        output: normalize_tool_run_output(&projected_tool_output(event)),
         exit_code: event
             .payload
             .get("exit_code")
