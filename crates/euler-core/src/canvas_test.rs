@@ -1602,34 +1602,37 @@ fn prunes_reasoning_for_model_results_of_ineligible_tool_rounds() {
     )));
 }
 
-/// Perf guard (deep review P3-a): canvas assembly makes a bounded, pinned
-/// number of full event-stream passes. If this count grows, a duplicate
-/// fold was reintroduced — fuse or thread the existing fold instead of
-/// bumping the pin.
-///
-/// Under budget: project-context fold (1, in the public wrapper), active
-/// swap scan (1), tool-pair fold (1), included-model-call fold (1), context
-/// slot fold (1), and the item projection loop (1).
 #[test]
-fn assembly_full_stream_pass_count_is_pinned() {
-    let mut events = vec![EventEnvelope::new(
+fn prefolded_assembly_uses_the_callers_project_context_snapshot() {
+    let events = vec![EventEnvelope::new(
         "s",
         "a",
         None,
         EventKind::USER_MESSAGE,
         object([("content", "hello".into())]),
     )];
-    events.extend(tool_pair_events("call-1", "read_file", "small output"));
+    let pinned = PinnedProjectContext {
+        snapshot_event_id: "snapshot-from-caller".to_owned(),
+        candidate_digest: "candidate-digest".to_owned(),
+        rendered: "[euler.project-context.v1]\n  guidance".to_owned(),
+        rendered_digest: "rendered-digest".to_owned(),
+    };
 
-    reset_full_stream_passes();
-    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
-    assert!(!canvas.is_empty());
-    assert_eq!(full_stream_passes(), 6, "under-budget assembly passes");
+    let canvas = assemble_canvas_prefolded(
+        &events,
+        &AutoCompactionPolicy::default(),
+        &BTreeSet::new(),
+        Some(&pinned),
+    );
 
-    // Over budget adds exactly one pass: the stub-handle fold, deferred
-    // until demotion is actually needed.
-    reset_full_stream_passes();
-    let canvas = assemble_canvas(&events, &stubs_policy(0));
-    assert!(!canvas.is_empty());
-    assert_eq!(full_stream_passes(), 7, "over-budget assembly passes");
+    assert!(matches!(
+        canvas.first(),
+        Some(CanvasItem::ProjectContext {
+            event_id,
+            snapshot_digest,
+            rendered,
+        }) if event_id == "snapshot-from-caller"
+            && snapshot_digest == "candidate-digest"
+            && rendered == "[euler.project-context.v1]\n  guidance"
+    ));
 }

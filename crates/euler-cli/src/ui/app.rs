@@ -666,13 +666,10 @@ impl App {
     }
 
     fn shutdown(&mut self) -> Result<bool> {
-        if self.core.turn_in_flight() {
-            self.core.deny_open_modal();
-            // Deep-review P3-d: signal the in-flight worker before the
-            // detached thread is abandoned so provider requests cancel
-            // promptly instead of running until process exit. Never joins.
-            self.core.cancel_in_flight_for_shutdown();
-        }
+        // Pause/cancel the worker before releasing a permission modal. A deny
+        // wakes the blocked worker, which must observe shutdown state before
+        // it can process the denial or advance the round.
+        self.core.prepare_for_shutdown();
         let lines = self.core.exit_recap_lines();
         // Clean clear (§5.8): drop the live band — the echoed `/quit`
         // composer row included — in native colors, so the recap below is
@@ -1199,6 +1196,11 @@ impl AppCore {
             self.queued_inputs.set_paused(true);
             interrupt_flag.store(true, Ordering::SeqCst);
         }
+    }
+
+    fn prepare_for_shutdown(&mut self) {
+        self.cancel_in_flight_for_shutdown();
+        self.deny_open_modal();
     }
 
     pub fn drain_background(&mut self) -> bool {
@@ -1862,8 +1864,10 @@ impl AppCore {
             KeyCode::Char('n') | KeyCode::Char('N') if draft_empty => self.reply_deny_from_modal(),
             KeyCode::Esc => self.reply_deny_from_modal(),
             _ if modal_quit_key(&key) => {
-                // Quit path: bare deny only — do not queue a follow-up turn.
-                self.reply_to_modal(PermissionReply::Deny);
+                // App::shutdown owns the bare denial. It first publishes the
+                // steering pause and cancellation flag, then releases this
+                // modal so the permission-blocked worker cannot wake into a
+                // still-live round.
                 CoreEffect::Quit
             }
             _ => self.handle_modal_composer_key(key),

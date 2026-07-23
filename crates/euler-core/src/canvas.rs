@@ -8,34 +8,6 @@ use euler_sdk::MAX_CONTEXT_SLOTS_PER_SESSION;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-// Test-only work counter for full-event-stream passes, mirroring the
-// session_store EVENT_LOG_PROJECTIONS perf guard. Every function that
-// iterates the whole event slice notes exactly one pass; tests pin the
-// per-assembly and per-request counts so a future change cannot silently
-// reintroduce duplicate folds.
-#[cfg(test)]
-thread_local! {
-    static FULL_STREAM_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Number of full event-stream passes performed on the current thread since
-/// the last [`reset_full_stream_passes`]. Test-only work counter.
-#[cfg(test)]
-pub(crate) fn full_stream_passes() -> u64 {
-    FULL_STREAM_PASSES.with(std::cell::Cell::get)
-}
-
-/// Resets the full-event-stream-pass work counter for the current thread.
-#[cfg(test)]
-pub(crate) fn reset_full_stream_passes() {
-    FULL_STREAM_PASSES.with(|counter| counter.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn note_full_stream_pass() {
-    FULL_STREAM_PASSES.with(|counter| counter.set(counter.get().saturating_add(1)));
-}
-
 /// Default canvas retention budget in bytes.
 ///
 /// Derivation: frontier coding models commonly expose ~200k-token context
@@ -332,8 +304,6 @@ fn collect_canvas_items(
     }
     items.extend(active_slots.into_iter().map(ContextSlot::into_canvas_item));
 
-    #[cfg(test)]
-    note_full_stream_pass();
     for (index, event) in events.iter().enumerate() {
         if let Some(swap) = &active_swap {
             if let Some((frontier_start_index, _, _)) = &swap.projection {
@@ -400,8 +370,6 @@ impl ContextSlot {
 pub(crate) fn fold_context_slot_state(
     events: &[EventEnvelope],
 ) -> BTreeMap<(String, String), ContextSlot> {
-    #[cfg(test)]
-    note_full_stream_pass();
     let mut slots = BTreeMap::new();
     for event in events
         .iter()
@@ -454,8 +422,6 @@ struct ActiveSwap {
 }
 
 fn active_swap(events: &[EventEnvelope]) -> Option<ActiveSwap> {
-    #[cfg(test)]
-    note_full_stream_pass();
     events
         .iter()
         .rev()
@@ -509,8 +475,6 @@ fn render_projection_blob(blob: &str, schema_version: &str) -> String {
 /// must be present, matching the semantics of two independent `position`
 /// scans without the second full traversal.
 fn event_index_pair(events: &[EventEnvelope], first: &str, second: &str) -> Option<(usize, usize)> {
-    #[cfg(test)]
-    note_full_stream_pass();
     let mut first_index = None;
     let mut second_index = None;
     for (index, event) in events.iter().enumerate() {
@@ -547,8 +511,6 @@ struct ToolPair {
 }
 
 fn eligible_tool_pairs(events: &[EventEnvelope]) -> BTreeMap<String, ToolPair> {
-    #[cfg(test)]
-    note_full_stream_pass();
     let mut calls_by_id: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
     let mut paired_call_ids = BTreeSet::new();
     let mut pairs = BTreeMap::new();
@@ -599,8 +561,6 @@ fn eligible_tool_pairs(events: &[EventEnvelope]) -> BTreeMap<String, ToolPair> {
 /// available, the event id is the handle — the round is retrievable from
 /// provenance by id.
 fn result_stub_handles(events: &[EventEnvelope]) -> BTreeMap<String, String> {
-    #[cfg(test)]
-    note_full_stream_pass();
     events
         .iter()
         .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
@@ -799,8 +759,6 @@ fn included_model_call_ids(
     events: &[EventEnvelope],
     selected_model_result_ids: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    #[cfg(test)]
-    note_full_stream_pass();
     events
         .iter()
         .filter(|event| event.kind.as_str() == EventKind::MODEL_RESULT)

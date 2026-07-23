@@ -340,6 +340,65 @@ fn registry_rejects_symlinked_link_inventory_tmp_without_writing_through() {
 
 #[cfg(unix)]
 #[test]
+fn private_file_write_distinguishes_failure_after_visible_rename() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("state.json");
+    let tmp = dir.path().join("state.json.tmp");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300))
+        .expect("make directory writable but unreadable");
+
+    let error = write_private_file(&path, &tmp, b"new state\n")
+        .expect_err("parent directory sync should fail");
+
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+        .expect("restore directory permissions");
+    assert!(
+        matches!(error, PrivateFileWriteError::AfterRename(_)),
+        "the replacement is visible even though its directory sync failed: {error:?}"
+    );
+    assert_eq!(
+        fs::read(&path).expect("visible replacement"),
+        b"new state\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_install_rejects_symlinked_installed_root_without_deleting_target() {
+    let (_temp, registry) = registry();
+    let package_dir = extension_dir("example-extension");
+    let package = load_extension_package(package_dir.path()).expect("package");
+    let outside = tempfile::tempdir().expect("outside");
+    let outside_snapshot = outside
+        .path()
+        .join(&package.descriptor.id)
+        .join(&package.manifest_sha256);
+    fs::create_dir_all(&outside_snapshot).expect("outside snapshot");
+    let sentinel = outside_snapshot.join("sentinel");
+    fs::write(&sentinel, b"must survive\n").expect("sentinel");
+    symlink(outside.path(), registry.installed_extensions_dir()).expect("installed root symlink");
+
+    let error = registry
+        .install_package(package)
+        .expect_err("symlinked installed root");
+
+    assert!(matches!(error, ExtensionRegistryError::Io(_)));
+    assert!(error
+        .to_string()
+        .contains("installed extension path must not be a symlink"));
+    assert_eq!(
+        fs::read(&sentinel).expect("outside sentinel after rejected install"),
+        b"must survive\n"
+    );
+    assert!(registry.installed_extensions_dir().is_symlink());
+    assert!(registry
+        .linked_extension("example-extension")
+        .expect("inventory")
+        .is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn registry_install_replaces_orphan_snapshot_without_following_symlinked_tmp() {
     let (_temp, registry) = registry();
     let package_dir = extension_dir("example-extension");
@@ -802,6 +861,51 @@ fn registry_uninstall_rejects_symlinked_installed_snapshot() {
         ExtensionRegistryError::Io(_)
     ));
     assert!(outside.path().exists());
+    assert!(registry
+        .linked_extension("example-extension")
+        .expect("lookup")
+        .is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_uninstall_rejects_symlinked_installed_root_without_rewriting_inventory() {
+    let (_temp, registry) = registry();
+    let package_dir = extension_dir("example-extension");
+    let installed = registry
+        .install_package(load_extension_package(package_dir.path()).expect("package"))
+        .expect("install");
+    let inventory_before = fs::read(registry.link_inventory_path()).expect("inventory before");
+    let installed_root = registry.installed_extensions_dir();
+    fs::rename(
+        &installed_root,
+        registry.home().extensions_dir().join("installed-backup"),
+    )
+    .expect("move real installed root");
+
+    let outside = tempfile::tempdir().expect("outside dir");
+    let outside_snapshot = outside
+        .path()
+        .join(&installed.id)
+        .join(&installed.manifest_sha256);
+    fs::create_dir_all(&outside_snapshot).expect("outside snapshot");
+    let sentinel = outside_snapshot.join("sentinel");
+    fs::write(&sentinel, b"must survive\n").expect("sentinel");
+    symlink(outside.path(), &installed_root).expect("installed root symlink");
+
+    let error = registry
+        .uninstall_installed("example-extension")
+        .expect_err("symlinked installed root");
+
+    assert!(matches!(error, ExtensionRegistryError::Io(_)));
+    assert_eq!(
+        fs::read(&sentinel).expect("outside sentinel after rejected uninstall"),
+        b"must survive\n"
+    );
+    assert_eq!(
+        fs::read(registry.link_inventory_path()).expect("inventory after"),
+        inventory_before
+    );
     assert!(registry
         .linked_extension("example-extension")
         .expect("lookup")

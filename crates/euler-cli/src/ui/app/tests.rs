@@ -621,7 +621,7 @@ fn patch_modal_session_scope_uses_path_prefix_when_present() {
 }
 
 #[test]
-fn modal_ctrl_c_denies_and_quits() {
+fn modal_ctrl_c_defers_deny_until_shutdown_preparation() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
@@ -633,11 +633,17 @@ fn modal_ctrl_c_denies_and_quits() {
     let effect = core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
     assert_eq!(effect, CoreEffect::Quit);
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert!(reply_rx.try_recv().is_err());
+
+    core.prepare_for_shutdown();
+
+    assert!(core.modal.is_none());
     assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
 }
 
 #[test]
-fn patch_modal_ctrl_c_or_d_denies_and_quits() {
+fn patch_modal_ctrl_c_or_d_defers_deny_until_shutdown_preparation() {
     for code in [
         KeyCode::Char('c'),
         KeyCode::Char('C'),
@@ -652,6 +658,12 @@ fn patch_modal_ctrl_c_or_d_denies_and_quits() {
         let effect = core.handle_input(modified_key(code, KeyModifiers::CONTROL));
 
         assert_eq!(effect, CoreEffect::Quit);
+        assert!(matches!(core.modal, Some(Modal::PatchApproval(_))));
+        assert!(reply_rx.try_recv().is_err());
+
+        core.prepare_for_shutdown();
+
+        assert!(core.modal.is_none());
         assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
     }
 }
@@ -961,6 +973,59 @@ fn shutdown_cancellation_sets_in_flight_turn_interrupt_flag() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!core.turn_in_flight());
+}
+
+#[test]
+fn shutdown_cancels_before_releasing_permission_modal() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-write".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "printf should-not-run > shutdown-marker.txt"}),
+        }]),
+        FixtureResponse::Assistant("must not continue after shutdown".to_owned()),
+    ]);
+    let mut core = core_with_provider_at(provider, temp.path());
+    core.handle_input(key(KeyCode::Char('h')));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_permission_modal(&mut core);
+    let interrupt_flag = match &core.state {
+        AppState::TurnInFlight { interrupt_flag, .. } => Arc::clone(interrupt_flag),
+        _ => panic!("turn should be in flight"),
+    };
+
+    let effect = core.handle_input(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+
+    assert_eq!(effect, CoreEffect::Quit);
+    std::thread::sleep(Duration::from_millis(20));
+    core.drain_background();
+    assert!(core.turn_in_flight(), "quit intent must not wake worker");
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert!(!core.queued_inputs.paused());
+    assert!(!interrupt_flag.load(Ordering::SeqCst));
+
+    core.prepare_for_shutdown();
+
+    assert!(core.queued_inputs.paused());
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.modal.is_none());
+
+    for _ in 0..100 {
+        if core.drain_background() && !core.turn_in_flight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!core.turn_in_flight());
+    assert!(!temp.path().join("shutdown-marker.txt").exists());
+    assert!(!core.transcript.items().iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::AssistantMessage(content)
+                if content == "must not continue after shutdown"
+        )
+    }));
 }
 
 #[test]
@@ -4969,6 +5034,17 @@ fn wait_for_patch_diff(core: &mut AppCore) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("patch diff did not appear");
+}
+
+fn wait_for_permission_modal(core: &mut AppCore) {
+    for _ in 0..100 {
+        core.drain_background();
+        if matches!(core.modal, Some(Modal::Permission(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("permission modal did not appear");
 }
 
 fn wait_for_patch_modal(core: &mut AppCore) {

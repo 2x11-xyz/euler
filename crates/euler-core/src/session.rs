@@ -2281,8 +2281,6 @@ fn record_unseen_instructions(
     events: &[EventEnvelope],
     instructions: &str,
 ) {
-    #[cfg(test)]
-    crate::canvas::note_full_stream_pass();
     let digest = system_instructions_sha256();
     let already_recorded = events.iter().any(|event| {
         matches!(

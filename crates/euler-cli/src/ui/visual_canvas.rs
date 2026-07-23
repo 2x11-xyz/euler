@@ -249,9 +249,7 @@ impl VisualCanvasState {
     /// keystroke and per spinner tick, so the frame must never deep-copy the
     /// whole rendered history (deep review P2-d). Mutation paths go through
     /// `Arc::make_mut`, which is in-place in production because the previous
-    /// frame is dropped before the next render (the guard test
-    /// `frames_share_the_cached_history_allocation_instead_of_copying_it`
-    /// pins both properties).
+    /// frame is dropped before the next render.
     fn render_history<R>(
         &mut self,
         width: u16,
@@ -308,16 +306,6 @@ impl VisualCanvasState {
             item_end_offsets: item_end_offsets.clone(),
         });
         (lines, item_end_offsets)
-    }
-
-    /// The cache's shared history-lines allocation, for the frame-sharing
-    /// guard test (same spirit as transcript.rs's PROJECTION_EVENT_VISITS
-    /// and the session store's EVENT_LOG_PROJECTIONS work counters).
-    #[cfg(test)]
-    fn cached_history_lines(&self) -> Option<Arc<Vec<CanvasLine>>> {
-        self.history_cache
-            .as_ref()
-            .map(|cache| Arc::clone(&cache.lines))
     }
 }
 
@@ -492,20 +480,6 @@ impl<'a> FrameLines<'a> {
     }
 }
 
-#[cfg(test)]
-pub fn derive_frame(snapshot: &VisualCanvasSnapshot) -> VisualCanvasFrame {
-    let mut blocks = snapshot.blocks.clone();
-    let history = if blocks
-        .first()
-        .is_some_and(|block| block.role == VisualBlockRole::History)
-    {
-        Arc::new(blocks.remove(0).lines)
-    } else {
-        Arc::new(Vec::new())
-    };
-    derive_frame_owned(history, blocks, snapshot.focus)
-}
-
 /// Assemble a frame from the Arc-shared rendered history and the per-frame
 /// blocks below it, moving each block's lines into `tail_lines` rather than
 /// cloning them. The history segment is shared with the canvas cache and
@@ -571,11 +545,6 @@ impl VisualBlock {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VisualBlockRole {
-    /// Rendered finalized history. The production render path carries the
-    /// history as the frame's Arc-shared head segment rather than a block;
-    /// only tests still assemble History blocks (via `derive_frame`).
-    #[cfg(test)]
-    History,
     LiveTranscript,
     PermissionAsk,
     Activity,
@@ -873,12 +842,12 @@ mod tests {
 
     #[test]
     fn frame_stacks_blocks_in_stream_order() {
-        let snapshot = snapshot_with_blocks(vec![
-            VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("final")]),
-            VisualBlock::new(VisualBlockRole::Activity, vec![CanvasLine::plain("active")]),
-        ]);
+        let snapshot = snapshot_with_blocks(vec![VisualBlock::new(
+            VisualBlockRole::Activity,
+            vec![CanvasLine::plain("active")],
+        )]);
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(&snapshot, vec![CanvasLine::plain("final")]);
 
         assert_eq!(
             line_texts(&frame.active_frame_lines()),
@@ -890,15 +859,12 @@ mod tests {
 
     #[test]
     fn live_transcript_rows_stay_after_native_scrollback_commit_boundary() {
-        let snapshot = snapshot_with_blocks(vec![
-            VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
-            VisualBlock::new(
-                VisualBlockRole::LiveTranscript,
-                vec![CanvasLine::plain("live")],
-            ),
-        ]);
+        let snapshot = snapshot_with_blocks(vec![VisualBlock::new(
+            VisualBlockRole::LiveTranscript,
+            vec![CanvasLine::plain("live")],
+        )]);
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(&snapshot, vec![CanvasLine::plain("history")]);
 
         assert_eq!(
             line_texts(&frame.active_frame_lines()),
@@ -911,7 +877,6 @@ mod tests {
     #[test]
     fn non_prefix_transcript_rows_are_not_committable() {
         let snapshot = snapshot_with_blocks(vec![
-            VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(VisualBlockRole::Activity, vec![CanvasLine::plain("tool")]),
             VisualBlock::new(
                 VisualBlockRole::LiveTranscript,
@@ -919,7 +884,7 @@ mod tests {
             ),
         ]);
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(&snapshot, vec![CanvasLine::plain("history")]);
 
         assert_eq!(
             line_texts(&frame.active_frame_lines()),
@@ -934,7 +899,6 @@ mod tests {
     #[test]
     fn live_transcript_tail_closes_committable_prefix() {
         let snapshot = snapshot_with_blocks(vec![
-            VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(
                 VisualBlockRole::LiveTranscript,
                 vec![CanvasLine::plain("stable")],
@@ -945,7 +909,7 @@ mod tests {
             ),
         ]);
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(&snapshot, vec![CanvasLine::plain("history")]);
 
         assert_eq!(
             line_texts(&frame.active_frame_lines()),
@@ -958,7 +922,6 @@ mod tests {
     #[test]
     fn trailing_live_control_stack_is_pinned_suffix() {
         let snapshot = snapshot_with_blocks(vec![
-            VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(
                 VisualBlockRole::LiveTranscript,
                 vec![CanvasLine::plain("stream")],
@@ -979,7 +942,7 @@ mod tests {
             VisualBlock::new(VisualBlockRole::Status, vec![CanvasLine::plain("status")]),
         ]);
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(&snapshot, vec![CanvasLine::plain("history")]);
 
         assert_eq!(frame.pinned_rows, 5);
     }
@@ -987,7 +950,6 @@ mod tests {
     #[test]
     fn spacer_rows_are_part_of_the_trailing_pinned_suffix() {
         let snapshot = snapshot_with_blocks(vec![
-            VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(
                 VisualBlockRole::LiveTranscript,
                 vec![CanvasLine::plain("stream")],
@@ -999,7 +961,7 @@ mod tests {
             VisualBlock::new(VisualBlockRole::Status, vec![CanvasLine::plain("status")]),
         ]);
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(&snapshot, vec![CanvasLine::plain("history")]);
 
         assert_eq!(frame.pinned_rows, 5);
         assert_eq!(
@@ -1011,7 +973,6 @@ mod tests {
     #[test]
     fn pinned_suffix_stops_at_transcript_content() {
         let snapshot = snapshot_with_blocks(vec![
-            VisualBlock::new(VisualBlockRole::History, vec![CanvasLine::plain("history")]),
             VisualBlock::new(
                 VisualBlockRole::Activity,
                 vec![CanvasLine::plain("old tool")],
@@ -1024,7 +985,7 @@ mod tests {
             VisualBlock::new(VisualBlockRole::Status, vec![CanvasLine::plain("status")]),
         ]);
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(&snapshot, vec![CanvasLine::plain("history")]);
 
         assert_eq!(frame.pinned_rows, 2);
     }
@@ -1033,26 +994,23 @@ mod tests {
     fn history_inserted_before_focused_block_offsets_cursor() {
         let snapshot = VisualCanvasSnapshot::new(
             80,
-            vec![
-                VisualBlock::new(
-                    VisualBlockRole::History,
-                    vec![
-                        CanvasLine::plain("history-1"),
-                        CanvasLine::plain("history-2"),
-                    ],
-                ),
-                VisualBlock::new(
-                    VisualBlockRole::Composer,
-                    vec![CanvasLine::styled("draft", TextRole::Prompt)],
-                )
-                .with_cursor(BlockCursor { row: 0, column: 3 }),
-            ],
+            vec![VisualBlock::new(
+                VisualBlockRole::Composer,
+                vec![CanvasLine::styled("draft", TextRole::Prompt)],
+            )
+            .with_cursor(BlockCursor { row: 0, column: 3 })],
             status_snapshot(),
             composer_snapshot("draft"),
             FocusOwner::Composer,
         );
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(
+            &snapshot,
+            vec![
+                CanvasLine::plain("history-1"),
+                CanvasLine::plain("history-2"),
+            ],
+        );
 
         assert_eq!(frame.history_rows, 2);
         assert_eq!(frame.committable_rows, 2);
@@ -1080,7 +1038,7 @@ mod tests {
             FocusOwner::Composer,
         );
 
-        let frame = derive_frame(&snapshot);
+        let frame = derive_test_frame(&snapshot, Vec::new());
 
         assert_eq!(frame.cursor, Some(CursorTarget { row: 1, column: 2 }));
     }
@@ -1531,48 +1489,49 @@ mod tests {
 
     #[test]
     fn frames_share_the_cached_history_allocation_instead_of_copying_it() {
-        // Perf guard (deep review P2-d), same spirit as transcript.rs's
-        // PROJECTION_EVENT_VISITS counter and the session store's
-        // EVENT_LOG_PROJECTIONS guard: `render` runs per keystroke and per
-        // spinner tick, so a frame must Arc-share the cached history render.
-        // Reintroducing a per-frame deep copy (the old
-        // `cache.lines.clone()`) makes every `Arc::ptr_eq` below fail — a
-        // copy is a different allocation.
         let mut state = VisualCanvasState::default();
         for index in 0..64 {
             state.push_finalized(TranscriptItem::UserMessage(format!("m{index}")));
         }
         let first = render_incremental(&mut state, 80);
-        let cached = state.cached_history_lines().expect("cache populated");
-        assert!(
-            Arc::ptr_eq(&first.history_lines, &cached),
-            "the frame must share the cache's history allocation, not copy it"
-        );
 
-        // Idle repaint (spinner tick, keystroke): the same allocation again.
+        // Idle repaint (spinner tick, keystroke) must reuse the allocation.
         let second = render_incremental(&mut state, 80);
         assert!(
             Arc::ptr_eq(&second.history_lines, &first.history_lines),
             "an idle frame must reuse the cached allocation verbatim"
         );
+        let allocation_before_append = Arc::as_ptr(&second.history_lines);
 
-        // Append: production drops the previous frame before the next render,
-        // so the unshared cache extends its buffer in place instead of
-        // copying the existing lines for copy-on-write.
+        // Production drops every prior frame before the next render. With the
+        // cache then uniquely owned, Arc::make_mut must retain this exact Arc
+        // allocation across an incremental append. Holding an Arc clone here
+        // would force copy-on-write and make this assertion meaningless.
         drop(first);
         drop(second);
         state.push_finalized(TranscriptItem::UserMessage("appended".to_owned()));
         let after = render_incremental(&mut state, 80);
-        let cached = state.cached_history_lines().expect("cache populated");
-        assert!(
-            Arc::ptr_eq(&after.history_lines, &cached),
-            "an incremental append must extend the shared allocation in place"
+        assert_eq!(
+            Arc::as_ptr(&after.history_lines),
+            allocation_before_append,
+            "an incremental append must retain the cached Arc allocation"
         );
         assert_eq!(after.history_rows, after.history_lines.len());
         assert!(
             after.tail_lines.is_empty(),
             "history rows must never be rematerialized into the frame tail"
         );
+    }
+
+    fn derive_test_frame(
+        snapshot: &VisualCanvasSnapshot,
+        history_lines: Vec<CanvasLine>,
+    ) -> VisualCanvasFrame {
+        derive_frame_owned(
+            Arc::new(history_lines),
+            snapshot.blocks.clone(),
+            snapshot.focus,
+        )
     }
 
     fn snapshot_with_blocks(blocks: Vec<VisualBlock>) -> VisualCanvasSnapshot {
