@@ -417,17 +417,16 @@ pub fn query_provenance(
     let mut truncated = false;
     let mut next_after_event_id = None;
     let mut line_number = 0usize;
+    let mut file_offset = 0usize;
 
-    while let Some(line) = next_accepted_query_line(&mut reader, &mut line)? {
+    while let Some((line, consumed)) = next_accepted_query_line(&mut reader, &mut line)? {
         line_number += 1;
+        let line_offset = file_offset;
+        file_offset += consumed;
         if line.trim().is_empty() {
             continue;
         }
-        if nul_offset_in_line(line).is_some() {
-            return Err(ProvenanceQueryError::CorruptedLine { line: line_number });
-        }
-        let event = EventEnvelope::from_json_line(line)
-            .map_err(|source| ProvenanceQueryError::InvalidLine { source })?;
+        let event = parse_accepted_query_line(line, line_number, line_offset)?;
         if !cursor_seen {
             if Some(event.id.as_str()) == cursor {
                 cursor_seen = true;
@@ -477,10 +476,28 @@ pub fn query_provenance(
     })
 }
 
+fn parse_accepted_query_line(
+    line: &str,
+    line_number: usize,
+    line_offset: usize,
+) -> Result<EventEnvelope, ProvenanceQueryError> {
+    if let Some(nul) = nul_offset_in_line(line) {
+        return Err(ProvenanceQueryError::CorruptedLine {
+            line: line_number,
+            offset: line_offset + nul,
+        });
+    }
+    EventEnvelope::from_json_line(line)
+        .map_err(|source| ProvenanceQueryError::InvalidLine { source })
+}
+
+/// Returns the accepted line text and the raw byte count consumed from the
+/// reader (including the newline), so callers can track file offsets while
+/// streaming.
 fn next_accepted_query_line<'a>(
     reader: &mut impl BufRead,
     buffer: &'a mut Vec<u8>,
-) -> Result<Option<&'a str>, ProvenanceQueryError> {
+) -> Result<Option<(&'a str, usize)>, ProvenanceQueryError> {
     buffer.clear();
     let read = reader.read_until(b'\n', buffer)?;
     if read == 0 || !buffer.ends_with(b"\n") {
@@ -488,9 +505,11 @@ fn next_accepted_query_line<'a>(
     }
     let line = buffer.strip_suffix(b"\n").expect("checked newline suffix");
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    std::str::from_utf8(line).map(Some).map_err(|source| {
-        ProvenanceQueryError::Io(io::Error::new(io::ErrorKind::InvalidData, source))
-    })
+    std::str::from_utf8(line)
+        .map(|text| Some((text, read)))
+        .map_err(|source| {
+            ProvenanceQueryError::Io(io::Error::new(io::ErrorKind::InvalidData, source))
+        })
 }
 
 impl ProvenanceQuery {
@@ -1106,8 +1125,10 @@ pub enum ProvenanceQueryError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("provenance log is corrupted at line {line}: unexpected NUL bytes")]
-    CorruptedLine { line: usize },
+    #[error(
+        "provenance log is corrupted at line {line} (byte offset {offset}): unexpected NUL bytes"
+    )]
+    CorruptedLine { line: usize, offset: usize },
     #[error("missing provenance blob for field {field}: {hash} at {}", path.display())]
     MissingBlob {
         field: String,
