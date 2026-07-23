@@ -35,31 +35,35 @@ pub(super) struct VisibleActiveLines {
 impl VisibleActiveLines {
     pub(super) fn visible_pinned_bottom_band_rows(
         &self,
-        source_lines: &[CanvasLine],
+        source_lines: FrameLines<'_>,
         width: usize,
     ) -> Option<u16> {
-        let visible_pinned = source_lines.get(self.pinned_visible_start..)?;
+        if self.pinned_visible_start > source_lines.len() {
+            return None;
+        }
+        let visible_pinned = source_lines.range(self.pinned_visible_start, source_lines.len());
         u16::try_from(wrap_canvas_lines(visible_pinned, width).len()).ok()
     }
 }
 
 pub(super) fn visible_active_lines(
-    lines: &[CanvasLine],
+    lines: FrameLines<'_>,
     height: usize,
     scroll_offset: usize,
     pinned_rows: usize,
 ) -> VisibleActiveLines {
-    let pinned_start = lines.len().saturating_sub(pinned_rows.min(lines.len()));
+    let total = lines.len();
+    let pinned_start = total.saturating_sub(pinned_rows.min(total));
     if height == 0 {
         return VisibleActiveLines {
             lines: Vec::new(),
             prefix_start: 0,
             prefix_end: 0,
             pinned_start,
-            pinned_visible_start: lines.len(),
+            pinned_visible_start: total,
         };
     }
-    if lines.len() <= height {
+    if total <= height {
         return VisibleActiveLines {
             lines: lines.to_vec(),
             prefix_start: 0,
@@ -69,16 +73,16 @@ pub(super) fn visible_active_lines(
         };
     }
 
-    let visible_pinned_rows = lines.len().saturating_sub(pinned_start).min(height);
+    let visible_pinned_rows = total.saturating_sub(pinned_start).min(height);
     let prefix_height = height.saturating_sub(visible_pinned_rows);
     let max_prefix_start = pinned_start.saturating_sub(prefix_height);
     let prefix_start = max_prefix_start.saturating_sub(scroll_offset.min(max_prefix_start));
     let prefix_end = prefix_start.saturating_add(prefix_height).min(pinned_start);
-    let pinned_visible_start = lines.len().saturating_sub(visible_pinned_rows);
+    let pinned_visible_start = total.saturating_sub(visible_pinned_rows);
     let mut visible =
         Vec::with_capacity(prefix_end.saturating_sub(prefix_start) + visible_pinned_rows);
-    visible.extend_from_slice(&lines[prefix_start..prefix_end]);
-    visible.extend_from_slice(&lines[pinned_visible_start..]);
+    visible.extend(lines.range(prefix_start, prefix_end).cloned());
+    visible.extend(lines.range(pinned_visible_start, total).cloned());
 
     VisibleActiveLines {
         lines: visible,
@@ -111,8 +115,8 @@ pub(super) fn visible_cursor(
     None
 }
 
-pub(super) fn canvas_lines_are_blank(lines: &[CanvasLine]) -> bool {
-    lines.iter().all(|line| {
+pub(super) fn canvas_lines_are_blank<'a>(lines: impl IntoIterator<Item = &'a CanvasLine>) -> bool {
+    lines.into_iter().all(|line| {
         line.spans
             .iter()
             .all(|span| span.text.as_str().trim().is_empty())
@@ -121,11 +125,11 @@ pub(super) fn canvas_lines_are_blank(lines: &[CanvasLine]) -> bool {
 
 pub(super) fn shared_committed_prefix_len(
     committed: &[CanvasLine],
-    current: &[CanvasLine],
+    current: FrameLines<'_>,
 ) -> usize {
     committed
         .iter()
-        .zip(current)
+        .zip(current.iter())
         .take_while(|(committed, current)| committed == current)
         .count()
 }
@@ -247,9 +251,12 @@ pub(super) fn canvas_lines_to_ratatui(
         .collect()
 }
 
-pub(super) fn wrap_canvas_lines(lines: &[CanvasLine], width: usize) -> Vec<CanvasLine> {
+pub(super) fn wrap_canvas_lines<'a>(
+    lines: impl IntoIterator<Item = &'a CanvasLine>,
+    width: usize,
+) -> Vec<CanvasLine> {
     lines
-        .iter()
+        .into_iter()
         .flat_map(|line| wrap_canvas_line(line, width))
         .collect()
 }

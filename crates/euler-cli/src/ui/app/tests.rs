@@ -440,7 +440,7 @@ fn queued_steer_preview_is_visual_only() {
 
     let queued_line = core
         .visual_canvas_frame(120)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .find(|line| line.starts_with("▌ 1/1 "))
@@ -1517,7 +1517,7 @@ fn active_turn_frame_shows_working_state_and_next_draft() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1546,7 +1546,7 @@ fn active_turn_live_transcript_prefix_stays_after_commit_boundary() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1555,12 +1555,12 @@ fn active_turn_live_transcript_prefix_stays_after_commit_boundary() {
     assert!(text.contains("line one"), "frame: {text:?}");
     assert!(text.contains("⠋ working"), "frame: {text:?}");
     let first_live = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .position(|line| line.plain_text().contains("line one"))
         .expect("live line");
     assert!(first_live >= frame.committable_rows);
-    assert!(frame.committable_rows < frame.active_frame_lines.len());
+    assert!(frame.committable_rows < frame.active_frame_lines().len());
 }
 
 #[test]
@@ -1582,7 +1582,7 @@ fn active_turn_mutable_live_tail_is_not_committable() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -1621,7 +1621,7 @@ fn active_turn_open_code_fence_is_visible_but_not_committable() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -1660,7 +1660,7 @@ fn active_turn_bare_table_partial_row_stays_outside_commit_boundary() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1672,7 +1672,7 @@ fn active_turn_bare_table_partial_row_stays_outside_commit_boundary() {
         "partial row should be held: {text:?}"
     );
     assert!(frame.committable_rows > 0);
-    assert!(frame.committable_rows < frame.active_frame_lines.len());
+    assert!(frame.committable_rows < frame.active_frame_lines().len());
 }
 
 #[test]
@@ -1893,7 +1893,7 @@ fn live_file_diff_replaces_prior_patch_preview_for_same_path() {
 
     let rendered = core
         .visual_canvas_frame(96)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(|line| line.plain_text())
         .collect::<Vec<_>>()
@@ -1982,7 +1982,7 @@ fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -2149,7 +2149,7 @@ fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
     assert!(frame.committable_rows > 0);
     assert!(frame.committable_rows <= frame.history_rows);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -2164,7 +2164,7 @@ fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
     );
     let refolded = core.visual_canvas_frame(80);
     let refolded_text = refolded
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -3819,7 +3819,7 @@ fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
 
     let frame = core.render_visual_canvas(80);
     let lines: Vec<String> = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect();
@@ -3880,7 +3880,7 @@ fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
 
     let frame = core.render_visual_canvas(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -3991,8 +3991,8 @@ fn working_hud_canvas_line_uses_theme_tokens_for_spinner_and_suffix() {
     core.theme = Theme::warm_ledger();
 
     let frame = core.render_visual_canvas(80);
-    let activity_line = frame
-        .active_frame_lines
+    let frame_lines = frame.active_frame_lines();
+    let activity_line = frame_lines
         .iter()
         .find(|line| line.plain_text().contains("working"))
         .expect("activity line present");
@@ -4022,7 +4022,7 @@ fn working_hud_sits_directly_above_composer_with_no_blank_line() {
 
     let frame = core.render_visual_canvas(80);
     let lines = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -4280,7 +4280,7 @@ fn patch_approval_modal_renders_diff_and_prompt() {
     assert!(contents.contains("beta"));
     let visual = core
         .visual_canvas_frame(80)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -4308,7 +4308,7 @@ fn patch_approval_modal_has_blank_line_before_options_and_gold_selection() {
 
     let lines = core
         .visual_canvas_frame(80)
-        .active_frame_lines
+        .active_frame_lines()
         .into_iter()
         .collect::<Vec<_>>();
     let plain = lines
