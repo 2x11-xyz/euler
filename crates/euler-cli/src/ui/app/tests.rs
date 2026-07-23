@@ -4,9 +4,9 @@ use crate::ui::test_backend::VT100Backend;
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
     catalog::{MergedModelCatalog, EMBEDDED_CATALOG_JSON},
-    EchoProvider, FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError,
-    ProviderStream, ReasoningEffort, ScriptedProvider, ScriptedStreamStep, StopReason, ToolCall,
-    Usage,
+    EchoProvider, FixtureResponse, Gate, GateProvider, ModelProvider, ModelRequest,
+    ModelStreamEvent, ProviderError, ProviderStream, ReasoningEffort, ScriptedProvider,
+    ScriptedStreamStep, StopReason, ToolCall, Usage,
 };
 use ratatui::{
     layout::Rect,
@@ -22,56 +22,69 @@ mod chrome_tests;
 mod live_memoization_tests;
 mod permission_tests;
 
+/// The zero-config default `AppCore`: an `EchoProvider`, model `"echo"`, cwd
+/// root. Sugar over [`TestCore::builder`] for the common case where a test
+/// configures nothing.
 fn core() -> AppCore {
-    core_with_provider(EchoProvider)
+    TestCore::builder().build()
 }
 
-fn core_with_provider(provider: impl ModelProvider + 'static) -> AppCore {
-    core_with_provider_model_at(provider, "echo", ".")
+/// Fluent builder for the tests' `AppCore`. Replaces the former six positional
+/// `core_with_*` variants: a test names only what it configures and defaults
+/// the rest.
+struct TestCore;
+
+impl TestCore {
+    fn builder() -> TestCoreBuilder {
+        TestCoreBuilder {
+            provider: Box::new(EchoProvider),
+            model: "echo".to_owned(),
+            root: PathBuf::from("."),
+            options: AppOptions::default(),
+        }
+    }
 }
 
-fn core_with_provider_at(
-    provider: impl ModelProvider + 'static,
-    root: impl Into<PathBuf>,
-) -> AppCore {
-    core_with_provider_model_at(provider, "echo", root)
-}
-
-fn core_with_provider_model_at(
-    provider: impl ModelProvider + 'static,
-    model: &str,
-    root: impl Into<PathBuf>,
-) -> AppCore {
-    core_with_provider_model_options_at(provider, model, root, AppOptions::default())
-}
-
-fn core_with_provider_model_options_at(
-    provider: impl ModelProvider + 'static,
-    model: &str,
-    root: impl Into<PathBuf>,
+struct TestCoreBuilder {
+    provider: Box<dyn ModelProvider>,
+    model: String,
+    root: PathBuf,
     options: AppOptions,
-) -> AppCore {
-    let (decider, channels) = TuiDecider::new();
-    let mut config = euler_core::SessionConfig::new(root);
-    config.model = model.to_owned();
-    let session = Session::new(config, provider, decider);
-    AppCore::new_with_options(session, channels, options)
 }
 
-fn core_with_fixture_catalog(
-    provider: impl ModelProvider + 'static,
-    model: &str,
-    catalog: MergedModelCatalog,
-) -> AppCore {
-    core_with_provider_model_options_at(
-        provider,
-        model,
-        ".",
-        AppOptions {
-            model_catalog: Some(catalog),
-            ..AppOptions::default()
-        },
-    )
+impl TestCoreBuilder {
+    fn provider(mut self, provider: impl ModelProvider + 'static) -> Self {
+        self.provider = Box::new(provider);
+        self
+    }
+
+    fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    fn root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.root = root.into();
+        self
+    }
+
+    fn options(mut self, options: AppOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    fn catalog(mut self, catalog: MergedModelCatalog) -> Self {
+        self.options.model_catalog = Some(catalog);
+        self
+    }
+
+    fn build(self) -> AppCore {
+        let (decider, channels) = TuiDecider::new();
+        let mut config = euler_core::SessionConfig::new(self.root);
+        config.model = self.model;
+        let session = Session::new(config, self.provider, decider);
+        AppCore::new_with_options(session, channels, self.options)
+    }
 }
 
 #[test]
@@ -106,7 +119,10 @@ fn background_catalog_refresh_reports_success_and_failure_without_blocking_ui() 
 
 #[test]
 fn installed_catalog_reaches_idle_session_reasoning_policy() {
-    let mut core = core_with_provider_model_at(ChatGptEchoProvider, "gpt-5.5", ".");
+    let mut core = TestCore::builder()
+        .provider(ChatGptEchoProvider)
+        .model("gpt-5.5")
+        .build();
     let AppState::Idle { session } = &core.state else {
         panic!("test session must be idle");
     };
@@ -139,7 +155,10 @@ fn installed_catalog_reaches_idle_session_reasoning_policy() {
 
 #[test]
 fn installed_catalog_reaches_worker_session_at_the_turn_boundary() {
-    let mut core = core_with_provider_model_at(ChatGptEchoProvider, "gpt-5.5", ".");
+    let mut core = TestCore::builder()
+        .provider(ChatGptEchoProvider)
+        .model("gpt-5.5")
+        .build();
     let session = core.take_idle_session();
     let (_worker_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -252,17 +271,14 @@ fn ratatui_to_canvas_preserves_span_styles() {
     assert_eq!(canvas[0].spans[1].style.bg, Some(Color::Blue));
 }
 
-struct SlowEchoProvider;
-
-impl ModelProvider for SlowEchoProvider {
-    fn name(&self) -> &'static str {
-        "fixture"
-    }
-
-    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
-        std::thread::sleep(Duration::from_millis(50));
-        EchoProvider.invoke(request)
-    }
+/// Build an `AppCore` whose turn parks inside the provider until the returned
+/// [`Gate`] is opened. This replaces the former `SlowEchoProvider` (which slept
+/// 50ms and hoped the test thread won the race): the worker blocks in `invoke`,
+/// holding the in-flight AppState and the shared steering queue stable while
+/// the test asserts, then `gate.open()` releases it to complete deterministically.
+fn core_gated() -> (AppCore, Gate) {
+    let (provider, gate) = GateProvider::echo();
+    (TestCore::builder().provider(provider).build(), gate)
 }
 
 struct ChatGptEchoProvider;
@@ -455,11 +471,14 @@ fn queued_steer_preview_is_visual_only() {
 
 #[test]
 fn queued_inputs_auto_flush_fifo_after_normal_completion() {
-    let mut core = core_with_provider(SlowEchoProvider);
+    let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "first");
     submit_without_wait(&mut core, "second");
     submit_without_wait(&mut core, "third");
 
+    // The gate parks the first turn in-flight, so "second"/"third" queue
+    // deterministically instead of racing the worker's steering drain.
+    gate.open();
     wait_for_idle(&mut core);
 
     // FIFO holds whether the trailing submissions steered the running turn
@@ -477,11 +496,12 @@ fn queued_leftovers_run_as_their_own_turns() {
     // never fold into that turn's request. Queued directly while idle, the
     // entries predate the first spawn's steering generation, so each must
     // flush as its own turn: user → its model.call, three times.
-    let mut core = core_with_provider(SlowEchoProvider);
+    let (mut core, gate) = core_gated();
     core.queued_inputs.push_back("second".to_owned());
     core.queued_inputs.push_back("third".to_owned());
     submit_without_wait(&mut core, "first");
 
+    gate.open();
     wait_for_idle(&mut core);
 
     assert_eq!(user_messages(&core), ["first", "second", "third"]);
@@ -513,11 +533,14 @@ fn queued_leftovers_run_as_their_own_turns() {
 
 #[test]
 fn interrupt_keeps_queue_until_user_continues() {
-    let mut core = core_with_provider(SlowEchoProvider);
+    let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "first");
     submit_without_wait(&mut core, "queued");
 
     core.handle_input(key(KeyCode::Esc));
+    // Release the parked turn so it observes the interrupt flag and returns;
+    // the gate stays open for the later "continue" turn.
+    gate.open();
     wait_for_idle(&mut core);
 
     assert_eq!(core.queued_inputs.snapshot(), ["queued"]);
@@ -531,7 +554,12 @@ fn interrupt_keeps_queue_until_user_continues() {
 
 #[test]
 fn queued_input_recall_and_unqueue_use_selected_or_last() {
-    let mut core = core_with_provider(SlowEchoProvider);
+    // PR #176 flake class: the former SlowEchoProvider kept the turn in flight
+    // only by sleeping longer than the test thread, so the recall/unqueue
+    // assertions below were correct only when the worker lost the race. The
+    // gate parks the "active" turn in `invoke` for the whole test, holding the
+    // in-flight AppState and steering queue stable with no timing assumption.
+    let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "active");
     submit_without_wait(&mut core, "one");
     submit_without_wait(&mut core, "two");
@@ -551,6 +579,10 @@ fn queued_input_recall_and_unqueue_use_selected_or_last() {
         CoreEffect::Render
     );
     assert_eq!(core.queued_inputs.snapshot(), ["one", "three"]);
+
+    // Release the parked turn so the worker thread finishes rather than leaking.
+    gate.open();
+    wait_for_idle(&mut core);
 }
 
 #[test]
@@ -559,12 +591,7 @@ fn worker_completion_returns_idle() {
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
 
-    for _ in 0..50 {
-        if core.drain_background() && !core.turn_in_flight() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_idle(&mut core);
 
     assert!(!core.turn_in_flight());
     assert!(core
@@ -921,7 +948,7 @@ fn uppercase_ctrl_c_without_shift_arms_quit_and_does_not_copy() {
 
 #[test]
 fn escape_interrupts_in_flight_turn() {
-    let mut core = core_with_provider(SlowEchoProvider);
+    let (mut core, gate) = core_gated();
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
 
@@ -933,12 +960,10 @@ fn escape_interrupts_in_flight_turn() {
     };
     assert!(interrupt_flag.load(Ordering::SeqCst));
 
-    for _ in 0..50 {
-        if core.drain_background() && !core.turn_in_flight() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // Release the parked turn; the session loop then observes the flag and
+    // returns interrupted.
+    gate.open();
+    wait_for_idle(&mut core);
     assert!(core.notice.is_none());
     assert!(!core.interrupted_guidance);
     assert!(drain_finalized_visual_text(&mut core, 80)
@@ -950,7 +975,7 @@ fn shutdown_cancellation_sets_in_flight_turn_interrupt_flag() {
     // Deep-review P3-d: /quit mid-turn publishes the same cancel signal the
     // esc interrupt uses so the detached worker's provider round stops
     // promptly instead of running until process exit.
-    let mut core = core_with_provider(SlowEchoProvider);
+    let (mut core, gate) = core_gated();
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
     assert!(core.turn_in_flight());
@@ -964,14 +989,10 @@ fn shutdown_cancellation_sets_in_flight_turn_interrupt_flag() {
     };
     assert!(interrupt_flag.load(Ordering::SeqCst));
 
-    // The worker observes the flag and returns the session; drain so the
-    // thread finishes within the test.
-    for _ in 0..50 {
-        if core.drain_background() && !core.turn_in_flight() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // Release the parked turn so it observes the flag and returns the session;
+    // drain so the worker thread finishes within the test.
+    gate.open();
+    wait_for_idle(&mut core);
     assert!(!core.turn_in_flight());
 }
 
@@ -986,7 +1007,10 @@ fn shutdown_cancels_before_releasing_permission_modal() {
         }]),
         FixtureResponse::Assistant("must not continue after shutdown".to_owned()),
     ]);
-    let mut core = core_with_provider_at(provider, temp.path());
+    let mut core = TestCore::builder()
+        .provider(provider)
+        .root(temp.path())
+        .build();
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
     wait_for_permission_modal(&mut core);
@@ -998,6 +1022,10 @@ fn shutdown_cancels_before_releasing_permission_modal() {
     let effect = core.handle_input(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
 
     assert_eq!(effect, CoreEffect::Quit);
+    // Negative-timing assertion: the worker is parked on the pending permission
+    // decision. Give it a window to (mis)wake before asserting it did not —
+    // proving the absence of an async wake is inherently time-based, not
+    // event-driven, so this sleep stays.
     std::thread::sleep(Duration::from_millis(20));
     core.drain_background();
     assert!(core.turn_in_flight(), "quit intent must not wake worker");
@@ -1011,12 +1039,7 @@ fn shutdown_cancels_before_releasing_permission_modal() {
     assert!(interrupt_flag.load(Ordering::SeqCst));
     assert!(core.modal.is_none());
 
-    for _ in 0..100 {
-        if core.drain_background() && !core.turn_in_flight() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_idle(&mut core);
     assert!(!core.turn_in_flight());
     assert!(!temp.path().join("shutdown-marker.txt").exists());
     assert!(!core.transcript.items().iter().any(|item| {
@@ -1543,7 +1566,7 @@ fn active_turn_escape_interrupts_when_bottom_surface_owns_input() {
 
 #[test]
 fn next_draft_survives_active_turn_completion_and_can_submit() {
-    let mut core = core_with_provider(SlowEchoProvider);
+    let (mut core, gate) = core_gated();
     core.handle_input(key(KeyCode::Char('h')));
     assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
     assert!(core.turn_in_flight());
@@ -1553,12 +1576,10 @@ fn next_draft_survives_active_turn_completion_and_can_submit() {
     }
     assert_eq!(core.bottom.composer().submit_text(), "next");
 
-    for _ in 0..50 {
-        if core.drain_background() && !core.turn_in_flight() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // The draft was typed while the turn was parked in-flight; release it and
+    // drain to completion, then confirm the draft survived.
+    gate.open();
+    wait_for_idle(&mut core);
 
     assert!(!core.turn_in_flight());
     assert_eq!(core.bottom.composer().submit_text(), "next");
@@ -2545,11 +2566,9 @@ fn new_session_reuses_target_and_purges_visual_history() {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
     let store = SessionStore::new(home).expect("store");
-    let mut core = core_with_fixture_catalog(
-        EchoProvider,
-        "echo",
-        fixture_catalog_with_windows(&[("echo", 1_000)]),
-    );
+    let mut core = TestCore::builder()
+        .catalog(fixture_catalog_with_windows(&[("echo", 1_000)]))
+        .build();
     core.session_store = Some(store.clone());
     core.primary_agent_id = Some("stale-owner".to_owned());
     core.transcript.push_event(event(
@@ -2942,15 +2961,12 @@ fn theme_action_switches_profile_and_context() {
 
 #[test]
 fn theme_options_seed_initial_profile() {
-    let core = core_with_provider_model_options_at(
-        EchoProvider,
-        "echo",
-        ".",
-        AppOptions {
+    let core = TestCore::builder()
+        .options(AppOptions {
             theme_choice: ThemeChoice::GruvboxLight,
             ..AppOptions::default()
-        },
-    );
+        })
+        .build();
 
     assert_eq!(core.theme_choice, ThemeChoice::GruvboxLight);
     assert_eq!(
@@ -2963,15 +2979,12 @@ fn theme_options_seed_initial_profile() {
 fn theme_action_persists_when_preference_path_is_configured() {
     let temp = tempfile::tempdir().expect("tempdir");
     let preference_path = temp.path().join(".euler").join("preferences.json");
-    let mut core = core_with_provider_model_options_at(
-        EchoProvider,
-        "echo",
-        ".",
-        AppOptions {
+    let mut core = TestCore::builder()
+        .options(AppOptions {
             theme_preference_path: Some(preference_path.clone()),
             ..AppOptions::default()
-        },
-    );
+        })
+        .build();
 
     assert_eq!(
         core.set_theme(ThemeChoice::GruvboxLight),
@@ -2988,15 +3001,12 @@ fn theme_action_reports_preference_save_failure_without_reverting_theme() {
     let temp = tempfile::tempdir().expect("tempdir");
     let preference_path = temp.path().join("preferences.json");
     std::fs::write(&preference_path, r#"{"theme":"light","#).expect("write malformed");
-    let mut core = core_with_provider_model_options_at(
-        EchoProvider,
-        "echo",
-        ".",
-        AppOptions {
+    let mut core = TestCore::builder()
+        .options(AppOptions {
             theme_preference_path: Some(preference_path.clone()),
             ..AppOptions::default()
-        },
-    );
+        })
+        .build();
 
     assert_eq!(
         core.set_theme(ThemeChoice::GruvboxLight),
@@ -3017,15 +3027,12 @@ fn launch_auth_file_override_threads_into_the_core_for_resume_seeding() {
     // and must consult the SAME `--auth-file` the launch used — before this
     // threading, build_tui_resume fell back to the default auth store and
     // silently dropped the override's credential values from redaction.
-    let core = core_with_provider_model_options_at(
-        EchoProvider,
-        "echo",
-        ".",
-        AppOptions {
+    let core = TestCore::builder()
+        .options(AppOptions {
             auth_file: Some(PathBuf::from("/tmp/custom-auth.json")),
             ..AppOptions::default()
-        },
-    );
+        })
+        .build();
     assert_eq!(
         core.auth_file.as_deref(),
         Some(std::path::Path::new("/tmp/custom-auth.json"))
@@ -3153,15 +3160,12 @@ fn accepting_resume_restamps_replayed_history_when_timestamps_are_on() {
     // Review v2 §6: a rebuild (resume, new session, rollback) must stamp
     // every replayed event from its own provenance time — not leave the
     // gutter blank until new events arrive.
-    let mut core = core_with_provider_model_options_at(
-        EchoProvider,
-        "echo",
-        ".",
-        AppOptions {
+    let mut core = TestCore::builder()
+        .options(AppOptions {
             show_timestamp_gutter: Some(true),
             ..AppOptions::default()
-        },
-    );
+        })
+        .build();
     let (decider, channels) = TuiDecider::new();
     let mut config = euler_core::SessionConfig::new(".");
     config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9T".to_owned();
@@ -3467,11 +3471,11 @@ fn slash_palette_trailing_noise_correction_submits_visible_effort_argument() {
 
 #[test]
 fn model_picker_uses_catalog_and_keeps_active_explicit_target() {
-    let mut core = core_with_fixture_catalog(
-        ChatGptEchoProvider,
-        "gpt-5.5",
-        MergedModelCatalog::built_in(),
-    );
+    let mut core = TestCore::builder()
+        .provider(ChatGptEchoProvider)
+        .model("gpt-5.5")
+        .catalog(MergedModelCatalog::built_in())
+        .build();
 
     core.handle_input(key(KeyCode::Char('/')));
     for ch in "model".chars() {
@@ -4159,11 +4163,9 @@ fn layout_renders_at_80_by_24_and_after_resize() {
 #[test]
 fn footer_context_is_zero_percent_at_fresh_session_with_known_window() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
-    let mut core = core_with_fixture_catalog(
-        EchoProvider,
-        "echo",
-        fixture_catalog_with_windows(&[("echo", 1_000)]),
-    );
+    let mut core = TestCore::builder()
+        .catalog(fixture_catalog_with_windows(&[("echo", 1_000)]))
+        .build();
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
@@ -4176,8 +4178,9 @@ fn footer_context_is_zero_percent_at_fresh_session_with_known_window() {
 #[test]
 fn footer_context_is_unknown_when_model_window_is_unknown() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
-    let mut core =
-        core_with_fixture_catalog(EchoProvider, "echo", fixture_catalog_with_windows(&[]));
+    let mut core = TestCore::builder()
+        .catalog(fixture_catalog_with_windows(&[]))
+        .build();
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
 
@@ -4188,11 +4191,10 @@ fn footer_context_is_unknown_when_model_window_is_unknown() {
 #[test]
 fn scripted_model_result_usage_updates_footer_context_percent() {
     let provider = ScriptedProvider::new(vec![scripted_usage(123)]);
-    let mut core = core_with_fixture_catalog(
-        provider,
-        "echo",
-        fixture_catalog_with_windows(&[("echo", 1_000)]),
-    );
+    let mut core = TestCore::builder()
+        .provider(provider)
+        .catalog(fixture_catalog_with_windows(&[("echo", 1_000)]))
+        .build();
     core.status.cwd = PathBuf::from("/tmp/euler");
 
     core.handle_input(key(KeyCode::Char('e')));
@@ -4226,7 +4228,7 @@ fn persisted_model_results_rebuild_footer_cost_on_resume() {
         }"#,
     );
     assert!(warnings.is_empty(), "{warnings:?}");
-    let mut core = core_with_fixture_catalog(EchoProvider, "echo", catalog);
+    let mut core = TestCore::builder().catalog(catalog).build();
     let events = vec![model_result_usage_and_cost_event(
         json!({
             "input_tokens": 1_000,
@@ -4250,7 +4252,7 @@ fn persisted_model_results_rebuild_footer_cost_on_resume() {
 #[test]
 fn persisted_cost_rebuild_keeps_footer_subtotal_numeric_for_mixed_history() {
     let catalog = fixture_catalog_with_windows(&[("echo", 1_000)]);
-    let mut core = core_with_fixture_catalog(EchoProvider, "echo", catalog);
+    let mut core = TestCore::builder().catalog(catalog).build();
     let events = vec![
         model_result_usage_and_cost_event(
             json!({"input_tokens": 100, "output_tokens": 10}),
@@ -4286,11 +4288,12 @@ fn detailed_usage_distinguishes_unpriced_history_from_zero_cost() {
 
 #[test]
 fn model_switch_resets_footer_context_until_next_result() {
-    let mut core = core_with_fixture_catalog(
-        EchoProvider,
-        "echo",
-        fixture_catalog_with_windows(&[("echo", 1_000), ("other", 2_000)]),
-    );
+    let mut core = TestCore::builder()
+        .catalog(fixture_catalog_with_windows(&[
+            ("echo", 1_000),
+            ("other", 2_000),
+        ]))
+        .build();
     core.status.cwd = PathBuf::from("/tmp/euler");
 
     core.handle_turn_event(TurnEvent::Event(model_result_usage_event(json!({
@@ -4546,7 +4549,10 @@ fn rejecting_patch_permission_does_not_apply_patch_and_turn_continues() {
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
-    let mut core = core_with_provider_at(provider, temp.path());
+    let mut core = TestCore::builder()
+        .provider(provider)
+        .root(temp.path())
+        .build();
 
     core.handle_input(key(KeyCode::Char('e')));
     core.handle_input(key(KeyCode::Enter));
@@ -4609,7 +4615,10 @@ fn allowing_patch_permission_applies_patch_and_turn_continues() {
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
-    let mut core = core_with_provider_at(provider, temp.path());
+    let mut core = TestCore::builder()
+        .provider(provider)
+        .root(temp.path())
+        .build();
 
     core.handle_input(key(KeyCode::Char('e')));
     core.handle_input(key(KeyCode::Enter));
@@ -4649,7 +4658,10 @@ fn allowing_direct_apply_patch_permission_adds_file_and_turn_continues() {
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
-    let mut core = core_with_provider_at(provider, temp.path());
+    let mut core = TestCore::builder()
+        .provider(provider)
+        .root(temp.path())
+        .build();
 
     core.handle_input(key(KeyCode::Char('e')));
     core.handle_input(key(KeyCode::Enter));
@@ -4689,7 +4701,10 @@ fn allowing_direct_apply_patch_permission_updates_file_and_turn_continues() {
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
-    let mut core = core_with_provider_at(provider, temp.path());
+    let mut core = TestCore::builder()
+        .provider(provider)
+        .root(temp.path())
+        .build();
 
     core.handle_input(key(KeyCode::Char('e')));
     core.handle_input(key(KeyCode::Enter));
@@ -4731,7 +4746,10 @@ fn allowing_unsupported_direct_apply_patch_does_not_apply_patch() {
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
-    let mut core = core_with_provider_at(provider, temp.path());
+    let mut core = TestCore::builder()
+        .provider(provider)
+        .root(temp.path())
+        .build();
 
     core.handle_input(key(KeyCode::Char('e')));
     core.handle_input(key(KeyCode::Enter));
@@ -4886,16 +4904,13 @@ fn ctrl_f_opens_read_only_transcript_search() {
 fn timestamps_toggle_persists_and_logs_confirmation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let preference_path = temp.path().join("preferences.json");
-    let mut core = core_with_provider_model_options_at(
-        EchoProvider,
-        "echo",
-        ".",
-        AppOptions {
+    let mut core = TestCore::builder()
+        .options(AppOptions {
             theme_preference_path: Some(preference_path.clone()),
             show_timestamp_gutter: Some(true),
             ..AppOptions::default()
-        },
-    );
+        })
+        .build();
 
     assert!(core.show_timestamp_gutter);
     assert_eq!(
@@ -4930,15 +4945,12 @@ fn toggled_on_timestamp_gutter_stamps_every_event_first_row() {
     // provenance time, not a blank column — this is the production
     // visual-canvas path (real EventEnvelope timestamps), not a bare
     // TranscriptItem fixture.
-    let mut core = core_with_provider_model_options_at(
-        EchoProvider,
-        "echo",
-        ".",
-        AppOptions {
+    let mut core = TestCore::builder()
+        .options(AppOptions {
             show_timestamp_gutter: Some(true),
             ..AppOptions::default()
-        },
-    );
+        })
+        .build();
     core.drain_finalized_visual_lines(80);
 
     core.handle_turn_event(TurnEvent::Event(event(
@@ -4993,7 +5005,10 @@ fn at_mention_inserts_path_token_into_composer() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(temp.path().join("src")).expect("src");
     std::fs::write(temp.path().join("src/lib.rs"), "fn x() {}").expect("write");
-    let mut core = core_with_provider_at(EchoProvider, temp.path());
+    let mut core = TestCore::builder()
+        .provider(EchoProvider)
+        .root(temp.path())
+        .build();
 
     assert_eq!(
         core.handle_input(key(KeyCode::Char('@'))),
@@ -5031,6 +5046,8 @@ fn wait_for_patch_diff(core: &mut AppCore) {
         ) {
             return;
         }
+        // Wait on the detached worker thread: it delivers over a channel and
+        // drain_background only try_recv's, so yield briefly between polls.
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("patch diff did not appear");
@@ -5042,6 +5059,8 @@ fn wait_for_permission_modal(core: &mut AppCore) {
         if matches!(core.modal, Some(Modal::Permission(_))) {
             return;
         }
+        // Wait on the detached worker thread: it delivers over a channel and
+        // drain_background only try_recv's, so yield briefly between polls.
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("permission modal did not appear");
@@ -5053,6 +5072,8 @@ fn wait_for_patch_modal(core: &mut AppCore) {
         if matches!(core.modal, Some(Modal::PatchApproval(_))) {
             return;
         }
+        // Wait on the detached worker thread: it delivers over a channel and
+        // drain_background only try_recv's, so yield briefly between polls.
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("patch modal did not appear");
@@ -5064,6 +5085,8 @@ fn wait_for_idle(core: &mut AppCore) {
         if !core.turn_in_flight() {
             return;
         }
+        // Wait on the detached worker thread: it delivers over a channel and
+        // drain_background only try_recv's, so yield briefly between polls.
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("turn did not finish");
