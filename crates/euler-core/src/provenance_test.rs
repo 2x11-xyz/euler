@@ -435,6 +435,55 @@ fn patch_payload_old_new_externalize_to_blobs_and_rehydrate() {
 }
 
 #[test]
+fn write_blob_durable_creates_missing_blob() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("blob");
+
+    // Also the state after an external actor deletes the blob between the
+    // dedupe read and the write: NotFound must fall through to a fresh write.
+    write_blob_durable(&path, b"payload").expect("write missing blob");
+
+    assert_eq!(fs::read(&path).expect("blob"), b"payload");
+}
+
+#[test]
+fn write_blob_durable_rewrites_mismatched_content() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("blob");
+    fs::write(&path, b"stale").expect("stale blob");
+
+    write_blob_durable(&path, b"payload").expect("rewrite mismatched blob");
+
+    assert_eq!(fs::read(&path).expect("blob"), b"payload");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_blob_durable_skips_rewrite_for_matching_content() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("blob");
+    fs::write(&path, b"payload").expect("existing blob");
+    // A read-only dir makes any rewrite (tmp create + rename) fail, so
+    // success proves the matching-content path skipped the rewrite.
+    let mut read_only = fs::metadata(temp.path())
+        .expect("dir metadata")
+        .permissions();
+    read_only.set_mode(0o500);
+    fs::set_permissions(temp.path(), read_only).expect("read-only dir");
+
+    let result = write_blob_durable(&path, b"payload");
+
+    let mut writable = fs::metadata(temp.path())
+        .expect("dir metadata")
+        .permissions();
+    writable.set_mode(0o700);
+    fs::set_permissions(temp.path(), writable).expect("restore dir mode");
+    result.expect("matching blob needs no rewrite");
+    assert_eq!(fs::read(&path).expect("blob"), b"payload");
+}
+
+#[test]
 fn read_ignores_torn_final_line_with_garbage() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");

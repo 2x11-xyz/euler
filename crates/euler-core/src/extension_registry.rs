@@ -11,7 +11,7 @@ use euler_sdk::{
     LoadedExtensionPackage, EXTENSION_MANIFEST_FILE,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -86,6 +86,8 @@ pub enum ExtensionAuditIssueCode {
     InstalledManifestIdMismatch,
     #[serde(rename = "installed-manifest-digest-mismatch")]
     InstalledManifestDigestMismatch,
+    #[serde(rename = "installed-snapshot-orphaned")]
+    InstalledSnapshotOrphaned,
 }
 /// Machine-readable failure envelope for `extension audit`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -279,11 +281,12 @@ impl ExtensionRegistry {
         self.set_linked_execution_enabled_locked(id, true)
     }
     pub fn audit(&self) -> Result<ExtensionAuditReport, ExtensionRegistryError> {
-        let entries = self
-            .read_link_inventory()?
+        let links = self.read_link_inventory()?;
+        let mut entries: Vec<ExtensionAuditEntry> = links
             .values()
             .map(|record| self.audit_record(record))
             .collect();
+        entries.extend(self.orphaned_snapshot_entries(&links)?);
         Ok(ExtensionAuditReport {
             schema_version: EXTENSION_AUDIT_SCHEMA_VERSION,
             entries,
@@ -317,13 +320,24 @@ impl ExtensionRegistry {
         let installed_dir =
             self.installed_package_dir(&package.descriptor.id, &package.manifest_sha256);
         let installed = apply_install_package(&mut links, package, installed_dir)?;
-        if let Err(error) = self.write_installed_manifest(&installed.source_path, &manifest_bytes) {
+        if !existing_same_install {
+            // A snapshot dir with no inventory entry is a crash leftover;
+            // remove it up front so the digest recorded below describes bytes
+            // this install wrote, never stale ones.
+            self.remove_installed_snapshot(&installed.source_path)?;
+        }
+        let written = self
+            .write_installed_manifest(&installed.source_path, &manifest_bytes)
+            .and_then(|()| self.write_link_inventory_locked(&links));
+        if let Err(error) = written {
+            // Either write failing would leave the snapshot orphaned (no
+            // inventory entry points at it), so best-effort remove it; the
+            // write error still propagates.
             if !existing_same_install {
                 let _ = self.remove_installed_snapshot(&installed.source_path);
             }
             return Err(error);
         }
-        self.write_link_inventory_locked(&links)?;
         Ok(installed)
     }
     pub fn reload_link(&self, id: &str) -> Result<LinkedExtension, ExtensionRegistryError> {
@@ -632,6 +646,65 @@ impl ExtensionRegistry {
         }
         ExtensionAuditIssueCode::Ok
     }
+
+    /// Snapshot dirs no installed inventory entry points at are crash
+    /// leftovers from the install/uninstall two-file windows. They are
+    /// harmless (install replaces them) but must stay visible in the audit.
+    fn orphaned_snapshot_entries(
+        &self,
+        links: &BTreeMap<String, LinkedExtension>,
+    ) -> Result<Vec<ExtensionAuditEntry>, ExtensionRegistryError> {
+        let recorded: BTreeSet<&Path> = links
+            .values()
+            .filter(|record| record.materialization == ExtensionMaterialization::Installed)
+            .map(|record| record.source_path.as_path())
+            .collect();
+        let mut entries = Vec::new();
+        for id_dir in real_subdirectories(&self.installed_extensions_dir())? {
+            let id = id_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for snapshot_dir in real_subdirectories(&id_dir)? {
+                if recorded.contains(snapshot_dir.as_path()) {
+                    continue;
+                }
+                entries.push(ExtensionAuditEntry {
+                    id: id.clone(),
+                    source_kind: ExtensionMaterialization::Installed.as_str(),
+                    // Orphans have no inventory record, hence no recorded
+                    // status to echo back.
+                    recorded_status: "unrecorded",
+                    issue_code: ExtensionAuditIssueCode::InstalledSnapshotOrphaned,
+                });
+            }
+        }
+        Ok(entries)
+    }
+}
+
+/// Entries of `path` that are real directories. Symlinks and files are
+/// skipped: they cannot be managed snapshot storage. A missing `path` means
+/// no snapshots exist (audit must not create registry dirs).
+fn real_subdirectories(path: &Path) -> Result<Vec<PathBuf>, ExtensionRegistryError> {
+    let reader = match fs::read_dir(path) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(ExtensionRegistryError::Io(source)),
+    };
+    let mut dirs = Vec::new();
+    for entry in reader {
+        let entry_path = entry.map_err(ExtensionRegistryError::Io)?.path();
+        let metadata = match fs::symlink_metadata(&entry_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(ExtensionRegistryError::Io(source)),
+        };
+        if metadata.is_dir() {
+            dirs.push(entry_path);
+        }
+    }
+    Ok(dirs)
 }
 
 fn audit_linked_record(record: &LinkedExtension) -> ExtensionAuditIssueCode {

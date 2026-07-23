@@ -730,10 +730,22 @@ enum BlobExpansionError {
 }
 
 fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if path.exists() && fs::read(path)? == bytes {
-        let file = OpenOptions::new().read(true).open(path)?;
-        file.sync_data()?;
-        return Ok(());
+    // Content-addressed dedupe: matching bytes only need a durability sync.
+    // NotFound at any step means an external actor removed the blob between
+    // operations; fall through to a fresh write instead of failing the
+    // append. Any other read error still propagates.
+    match fs::read(path) {
+        Ok(existing) if existing == bytes => match OpenOptions::new().read(true).open(path) {
+            Ok(file) => {
+                file.sync_data()?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        },
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
 
     let temp_path = temp_path_with_suffix(path, ".tmp");
