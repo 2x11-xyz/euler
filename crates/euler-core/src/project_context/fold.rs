@@ -83,6 +83,8 @@ impl std::error::Error for ProjectContextFoldError {}
 pub(crate) fn fold_project_context(
     events: &[EventEnvelope],
 ) -> Result<ProjectContextFold, ProjectContextFoldError> {
+    #[cfg(test)]
+    crate::canvas::note_full_stream_pass();
     let Some(snapshot) = events
         .iter()
         .rev()

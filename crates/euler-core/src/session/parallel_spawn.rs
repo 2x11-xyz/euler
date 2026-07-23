@@ -14,7 +14,7 @@ use super::{
     ContextLimitConfig, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo,
     RoundOutcome, Session, SessionError, SYSTEM_INSTRUCTIONS,
 };
-use crate::canvas::assemble_canvas;
+use crate::canvas::assemble_canvas_prefolded;
 use crate::permissions::PermissionDecider;
 use euler_agents::{AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventKind, JsonObject};
@@ -75,10 +75,20 @@ impl<D: PermissionDecider> Session<D> {
 
         // Phase 1 (session thread, batch order): assemble the parent canvas
         // only when at least one task explicitly requests it. Self-contained
-        // review briefs do not inherit ambient session history.
+        // review briefs do not inherit ambient session history. The
+        // project-context fold happens once here and serves both canvas
+        // assembly and the per-task snapshot below; a fold error keeps its
+        // original precedence (reported after the canvas budget check) and,
+        // as before, contributes no pinned item to the assembled canvas.
+        let folded = crate::project_context::fold_project_context(self.bus.events());
         let include_parent_canvas = tasks.iter().any(AgentTask::includes_parent_canvas);
         let canvas = if include_parent_canvas {
-            assemble_canvas(self.bus.events(), &self.config.auto_compaction)
+            assemble_canvas_prefolded(
+                self.bus.events(),
+                &self.config.auto_compaction,
+                &std::collections::BTreeSet::new(),
+                folded.as_ref().ok().and_then(|fold| fold.admitted()),
+            )
         } else {
             Vec::new()
         };
@@ -99,8 +109,7 @@ impl<D: PermissionDecider> Session<D> {
         // One immutable pre-fan-out project-context snapshot for the whole
         // batch: parallel inheriting children can never diverge because a
         // file changed during the batch (they read no files at all).
-        let project_context = match crate::project_context::fold_project_context(self.bus.events())
-        {
+        let project_context = match folded {
             Ok(fold) => fold,
             Err(error) => {
                 let error = SessionError::ProjectContextInvalid(error.to_string());
