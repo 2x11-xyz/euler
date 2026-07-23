@@ -47,7 +47,7 @@ impl AppCore {
 
     #[cfg(test)]
     pub(super) fn drain_finalized_visual_lines(&mut self, width: u16) -> Vec<CanvasLine> {
-        self.render_visual_canvas(width).active_frame_lines
+        self.render_visual_canvas(width).active_frame_lines()
     }
 
     pub(super) fn render_visual_canvas(&mut self, width: u16) -> VisualCanvasFrame {

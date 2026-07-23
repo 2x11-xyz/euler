@@ -3,6 +3,8 @@ use super::transcript::{item_wants_timestamp, parse_event_time, EventTiming, Pro
 use super::transcript::{TimingClock, TranscriptItem};
 use chrono::Local;
 use ratatui::style::Style;
+use std::borrow::Cow;
+use std::sync::Arc;
 #[derive(Clone, Debug, Default)]
 pub struct VisualCanvasState {
     finalized: Vec<ProjectedEntry>,
@@ -181,7 +183,7 @@ impl VisualCanvasState {
             let line_keep = keep
                 .checked_sub(1)
                 .map_or(0, |last| cache.item_end_offsets[last]);
-            cache.lines.truncate(line_keep);
+            Arc::make_mut(&mut cache.lines).truncate(line_keep);
             cache.item_end_offsets.truncate(keep);
         }
     }
@@ -218,20 +220,14 @@ impl VisualCanvasState {
 
     pub fn render<R>(
         &mut self,
-        mut snapshot: VisualCanvasSnapshot,
+        snapshot: VisualCanvasSnapshot,
         render_finalized: R,
     ) -> VisualCanvasFrame
     where
         R: FnOnce(&[ProjectedEntry], usize, u16) -> (Vec<CanvasLine>, Vec<usize>),
     {
         let (history, offsets) = self.render_history(snapshot.width, render_finalized);
-        if !history.is_empty() {
-            snapshot
-                .blocks
-                .insert(0, VisualBlock::new(VisualBlockRole::History, history));
-        }
-        let focus = snapshot.focus;
-        let mut frame = derive_frame_owned(snapshot.blocks, focus);
+        let mut frame = derive_frame_owned(history, snapshot.blocks, snapshot.focus);
         frame.history_item_offsets = offsets;
         frame
     }
@@ -248,11 +244,19 @@ impl VisualCanvasState {
     ///
     /// `render_finalized(entries, render_from, width)` renders
     /// `entries[render_from..]` with offsets relative to that segment.
+    ///
+    /// The returned lines Arc-share the cache's buffer: `render` runs per
+    /// keystroke and per spinner tick, so the frame must never deep-copy the
+    /// whole rendered history (deep review P2-d). Mutation paths go through
+    /// `Arc::make_mut`, which is in-place in production because the previous
+    /// frame is dropped before the next render (the guard test
+    /// `frames_share_the_cached_history_allocation_instead_of_copying_it`
+    /// pins both properties).
     fn render_history<R>(
         &mut self,
         width: u16,
         render_finalized: R,
-    ) -> (Vec<CanvasLine>, Vec<usize>)
+    ) -> (Arc<Vec<CanvasLine>>, Vec<usize>)
     where
         R: FnOnce(&[ProjectedEntry], usize, u16) -> (Vec<CanvasLine>, Vec<usize>),
     {
@@ -270,7 +274,7 @@ impl VisualCanvasState {
                     .history_cache
                     .as_ref()
                     .expect("cache present when width matches");
-                return (cache.lines.clone(), cache.item_end_offsets.clone());
+                return (Arc::clone(&cache.lines), cache.item_end_offsets.clone());
             }
             let (mut new_lines, new_offsets) =
                 render_finalized(&self.finalized, cached_items, width);
@@ -280,28 +284,40 @@ impl VisualCanvasState {
                 .history_cache
                 .as_mut()
                 .expect("cache present when width matches");
+            let lines = Arc::make_mut(&mut cache.lines);
             if retract_seam_blank {
                 if let Some(last) = cache.item_end_offsets.last_mut() {
-                    if cache.lines.len() == *last && *last > 0 {
-                        cache.lines.pop();
+                    if lines.len() == *last && *last > 0 {
+                        lines.pop();
                         *last -= 1;
                     }
                 }
             }
-            let base = cache.lines.len();
-            cache.lines.append(&mut new_lines);
+            let base = lines.len();
+            lines.append(&mut new_lines);
             cache
                 .item_end_offsets
                 .extend(new_offsets.into_iter().map(|offset| offset + base));
-            return (cache.lines.clone(), cache.item_end_offsets.clone());
+            return (Arc::clone(&cache.lines), cache.item_end_offsets.clone());
         }
         let (lines, item_end_offsets) = render_finalized(&self.finalized, 0, width);
+        let lines = Arc::new(lines);
         self.history_cache = Some(RenderedHistoryCache {
             width,
-            lines: lines.clone(),
+            lines: Arc::clone(&lines),
             item_end_offsets: item_end_offsets.clone(),
         });
         (lines, item_end_offsets)
+    }
+
+    /// The cache's shared history-lines allocation, for the frame-sharing
+    /// guard test (same spirit as transcript.rs's PROJECTION_EVENT_VISITS
+    /// and the session store's EVENT_LOG_PROJECTIONS work counters).
+    #[cfg(test)]
+    fn cached_history_lines(&self) -> Option<Arc<Vec<CanvasLine>>> {
+        self.history_cache
+            .as_ref()
+            .map(|cache| Arc::clone(&cache.lines))
     }
 }
 
@@ -336,7 +352,9 @@ fn seam_retracts_trailing_blank(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RenderedHistoryCache {
     width: u16,
-    lines: Vec<CanvasLine>,
+    /// Arc-shared with every frame rendered from this cache; mutated only
+    /// through `Arc::make_mut` (in-place while the allocation is unshared).
+    lines: Arc<Vec<CanvasLine>>,
     item_end_offsets: Vec<usize>,
 }
 
@@ -369,7 +387,12 @@ impl VisualCanvasSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VisualCanvasFrame {
-    pub active_frame_lines: Vec<CanvasLine>,
+    /// Rendered finalized-history rows, Arc-shared with the canvas's
+    /// incremental cache — never deep-copied per frame (render runs per
+    /// keystroke and per spinner tick).
+    pub history_lines: Arc<Vec<CanvasLine>>,
+    /// Rows below the history: live transcript, chrome, composer, status.
+    pub tail_lines: Vec<CanvasLine>,
     pub cursor: Option<CursorTarget>,
     pub required_height: u16,
     pub history_rows: usize,
@@ -382,60 +405,146 @@ pub struct VisualCanvasFrame {
     pub history_item_offsets: Vec<usize>,
 }
 
-#[cfg(test)]
-pub fn derive_frame(snapshot: &VisualCanvasSnapshot) -> VisualCanvasFrame {
-    derive_frame_owned(snapshot.blocks.clone(), snapshot.focus)
+impl VisualCanvasFrame {
+    /// Two-segment view over every frame row (history followed by tail). All
+    /// row indices carried by the frame — `history_rows`, `committable_rows`,
+    /// `pinned_rows`, cursor rows, `history_item_offsets` — address this
+    /// concatenation; the head/tail split is storage only.
+    pub fn lines(&self) -> FrameLines<'_> {
+        FrameLines::new(&self.history_lines, &self.tail_lines)
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.history_lines.len() + self.tail_lines.len()
+    }
+
+    /// Materialized copy of every frame row, for test assertions only — the
+    /// production path never concatenates history and tail into one buffer.
+    #[cfg(test)]
+    pub fn active_frame_lines(&self) -> Vec<CanvasLine> {
+        self.lines().to_vec()
+    }
 }
 
-/// Flatten `blocks` into a frame, moving each block's lines into
-/// `active_frame_lines` rather than cloning them. The production render path
-/// hands ownership straight through (the large History block is never copied
-/// a second time); `derive_frame` keeps the borrowing entry point for tests.
-fn derive_frame_owned(blocks: Vec<VisualBlock>, focus: FocusOwner) -> VisualCanvasFrame {
-    let pinned_rows = pinned_suffix_rows(&blocks);
-    let prefer_stable_height = focus == FocusOwner::BottomSurface;
-    let mut active_frame_lines: Vec<CanvasLine> = Vec::new();
-    let mut cursor = None;
-    let mut history_rows = 0;
-    let mut committable_rows = 0;
-    let mut committable_prefix_open = true;
+/// Borrowed two-segment view over a frame's rows: the Arc-shared history
+/// segment followed by the per-frame tail. Row indices span the
+/// concatenation. Ranges that fall inside a single segment borrow it
+/// directly; only a range that straddles the seam materializes (rare and
+/// bounded — production commit slices always lie inside the history
+/// segment, and hand-built test frames keep everything in the tail).
+#[derive(Clone, Copy, Debug)]
+pub struct FrameLines<'a> {
+    head: &'a [CanvasLine],
+    tail: &'a [CanvasLine],
+}
 
-    for block in blocks {
-        if cursor.is_none() && focus.allows_cursor(block.role) {
-            cursor = block.cursor.map(|block_cursor| CursorTarget {
-                row: block_cursor
-                    .row
-                    .saturating_add(active_row_count_u16(&active_frame_lines)),
-                column: block_cursor.column,
-            });
-        }
-        let role = block.role;
-        let block_rows = block.lines.len();
-        active_frame_lines.extend(block.lines);
-        if role == VisualBlockRole::History {
-            history_rows = active_row_count(&active_frame_lines);
-        }
-        if committable_prefix_open && is_committable_prefix_role(role) {
-            committable_rows = active_row_count(&active_frame_lines);
-        } else if block_rows > 0 {
-            committable_prefix_open = false;
+impl<'a> FrameLines<'a> {
+    pub fn new(head: &'a [CanvasLine], tail: &'a [CanvasLine]) -> Self {
+        Self { head, tail }
+    }
+
+    /// View over a single contiguous buffer (test call sites that assemble
+    /// raw line vectors without a frame).
+    #[cfg(test)]
+    pub fn from_slice(lines: &'a [CanvasLine]) -> Self {
+        Self {
+            head: &[],
+            tail: lines,
         }
     }
 
+    pub fn len(self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = &'a CanvasLine> {
+        self.head.iter().chain(self.tail.iter())
+    }
+
+    /// Lines in `[start, end)`, clamped to the view's bounds.
+    pub fn range(self, start: usize, end: usize) -> impl Iterator<Item = &'a CanvasLine> {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        let head_len = self.head.len();
+        let head = &self.head[start.min(head_len)..end.min(head_len)];
+        let tail_start = start.saturating_sub(head_len).min(self.tail.len());
+        let tail_end = end.saturating_sub(head_len).min(self.tail.len());
+        head.iter().chain(self.tail[tail_start..tail_end].iter())
+    }
+
+    /// Lines in `[start, end)` as a slice: borrowed when the range lies
+    /// within one segment, materialized only when it straddles the seam.
+    pub fn range_cow(self, start: usize, end: usize) -> Cow<'a, [CanvasLine]> {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        let head_len = self.head.len();
+        if end <= head_len {
+            return Cow::Borrowed(&self.head[start..end]);
+        }
+        if start >= head_len {
+            return Cow::Borrowed(&self.tail[start - head_len..end - head_len]);
+        }
+        Cow::Owned(self.range(start, end).cloned().collect())
+    }
+
+    pub fn to_vec(self) -> Vec<CanvasLine> {
+        self.iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+pub fn derive_frame(snapshot: &VisualCanvasSnapshot) -> VisualCanvasFrame {
+    let mut blocks = snapshot.blocks.clone();
+    let history = if blocks
+        .first()
+        .is_some_and(|block| block.role == VisualBlockRole::History)
+    {
+        Arc::new(blocks.remove(0).lines)
+    } else {
+        Arc::new(Vec::new())
+    };
+    derive_frame_owned(history, blocks, snapshot.focus)
+}
+
+/// Assemble a frame from the Arc-shared rendered history and the per-frame
+/// blocks below it, moving each block's lines into `tail_lines` rather than
+/// cloning them. The history segment is shared with the canvas cache and
+/// never copied; only History rows are committable, so the committable
+/// prefix is exactly the history segment.
+fn derive_frame_owned(
+    history_lines: Arc<Vec<CanvasLine>>,
+    blocks: Vec<VisualBlock>,
+    focus: FocusOwner,
+) -> VisualCanvasFrame {
+    let pinned_rows = pinned_suffix_rows(&blocks);
+    let prefer_stable_height = focus == FocusOwner::BottomSurface;
+    let history_rows = history_lines.len();
+    let committable_rows = history_rows;
+    let mut tail_lines: Vec<CanvasLine> = Vec::new();
+    let mut cursor = None;
+
+    for block in blocks {
+        if cursor.is_none() && focus.allows_cursor(block.role) {
+            let rows_so_far = u16::try_from(history_rows + tail_lines.len()).unwrap_or(u16::MAX);
+            cursor = block.cursor.map(|block_cursor| CursorTarget {
+                row: block_cursor.row.saturating_add(rows_so_far),
+                column: block_cursor.column,
+            });
+        }
+        tail_lines.extend(block.lines);
+    }
+
     VisualCanvasFrame {
-        required_height: line_count_u16(&active_frame_lines),
+        required_height: u16::try_from(history_rows + tail_lines.len()).unwrap_or(u16::MAX),
         pinned_rows,
-        active_frame_lines,
+        history_lines,
+        tail_lines,
         cursor,
         history_rows,
         committable_rows,
         prefer_stable_height,
         history_item_offsets: Vec::new(),
     }
-}
-
-fn is_committable_prefix_role(role: VisualBlockRole) -> bool {
-    role == VisualBlockRole::History
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -462,6 +571,10 @@ impl VisualBlock {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VisualBlockRole {
+    /// Rendered finalized history. The production render path carries the
+    /// history as the frame's Arc-shared head segment rather than a block;
+    /// only tests still assemble History blocks (via `derive_frame`).
+    #[cfg(test)]
     History,
     LiveTranscript,
     PermissionAsk,
@@ -698,14 +811,6 @@ fn active_row_count(lines: &[CanvasLine]) -> usize {
     lines.len()
 }
 
-fn active_row_count_u16(lines: &[CanvasLine]) -> u16 {
-    line_count_u16(lines)
-}
-
-fn line_count_u16(lines: &[CanvasLine]) -> u16 {
-    u16::try_from(lines.len()).unwrap_or(u16::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,7 +881,7 @@ mod tests {
         let frame = derive_frame(&snapshot);
 
         assert_eq!(
-            line_texts(&frame.active_frame_lines),
+            line_texts(&frame.active_frame_lines()),
             vec!["final", "active"]
         );
         assert_eq!(frame.required_height, 2);
@@ -796,7 +901,7 @@ mod tests {
         let frame = derive_frame(&snapshot);
 
         assert_eq!(
-            line_texts(&frame.active_frame_lines),
+            line_texts(&frame.active_frame_lines()),
             vec!["history", "live"]
         );
         assert_eq!(frame.committable_rows, 1);
@@ -817,13 +922,13 @@ mod tests {
         let frame = derive_frame(&snapshot);
 
         assert_eq!(
-            line_texts(&frame.active_frame_lines),
+            line_texts(&frame.active_frame_lines()),
             vec!["history", "tool", "live"]
         );
         assert_eq!(frame.history_rows, 1);
         assert_eq!(frame.committable_rows, 1);
         assert!(frame.committable_rows <= frame.history_rows);
-        assert!(frame.history_rows <= frame.active_frame_lines.len());
+        assert!(frame.history_rows <= frame.active_frame_lines().len());
     }
 
     #[test]
@@ -843,7 +948,7 @@ mod tests {
         let frame = derive_frame(&snapshot);
 
         assert_eq!(
-            line_texts(&frame.active_frame_lines),
+            line_texts(&frame.active_frame_lines()),
             vec!["history", "stable", "mutable"]
         );
         assert_eq!(frame.committable_rows, 1);
@@ -898,7 +1003,7 @@ mod tests {
 
         assert_eq!(frame.pinned_rows, 5);
         assert_eq!(
-            line_texts(&frame.active_frame_lines),
+            line_texts(&frame.active_frame_lines()),
             vec!["history", "stream", "notice", "", "draft", "", "status"]
         );
     }
@@ -1083,10 +1188,10 @@ mod tests {
         // Every previously rendered row is byte-identical, and the second
         // render only extended the buffer — nothing above the seam moved.
         assert_eq!(
-            after.active_frame_lines[..before.active_frame_lines.len()],
-            before.active_frame_lines[..]
+            after.active_frame_lines()[..before.active_frame_lines().len()],
+            before.active_frame_lines()[..]
         );
-        assert!(after.active_frame_lines.len() > before.active_frame_lines.len());
+        assert!(after.active_frame_lines().len() > before.active_frame_lines().len());
         assert_eq!(
             after.history_item_offsets[..before.history_item_offsets.len()],
             before.history_item_offsets[..]
@@ -1099,7 +1204,7 @@ mod tests {
             ],
             80,
         );
-        assert_eq!(after.active_frame_lines, full.active_frame_lines);
+        assert_eq!(after.active_frame_lines(), full.active_frame_lines());
         assert_eq!(after.history_item_offsets, full.history_item_offsets);
     }
 
@@ -1168,7 +1273,7 @@ mod tests {
             .map(|index| TranscriptItem::UserMessage(format!("m{index}")))
             .collect();
         let full = full_render(&items, 40);
-        assert_eq!(narrow.active_frame_lines, full.active_frame_lines);
+        assert_eq!(narrow.active_frame_lines(), full.active_frame_lines());
         assert_eq!(narrow.history_item_offsets, full.history_item_offsets);
     }
 
@@ -1198,7 +1303,7 @@ mod tests {
             frame.history_item_offsets.last().copied(),
             Some(frame.history_rows)
         );
-        assert_eq!(frame.history_rows, frame.active_frame_lines.len());
+        assert_eq!(frame.history_rows, frame.active_frame_lines().len());
 
         // partition_point over the offsets recovers a whole-item boundary for
         // any committed row count (terminal.rs `set_committed_active_rows`).
@@ -1228,10 +1333,10 @@ mod tests {
         }
         let incremental = render_incremental(&mut state, 80);
         let full = full_render(&items, 80);
-        assert_eq!(incremental.active_frame_lines, full.active_frame_lines);
+        assert_eq!(incremental.active_frame_lines(), full.active_frame_lines());
         assert_eq!(incremental.history_item_offsets, full.history_item_offsets);
         // The two notices really are adjacent (no blank between them).
-        let texts = line_texts(&incremental.active_frame_lines);
+        let texts = line_texts(&incremental.active_frame_lines());
         let first = texts
             .iter()
             .position(|t| t == "notice:first")
@@ -1282,7 +1387,7 @@ mod tests {
             ],
             80,
         );
-        assert_eq!(merged.active_frame_lines, full.active_frame_lines);
+        assert_eq!(merged.active_frame_lines(), full.active_frame_lines());
         assert_eq!(merged.history_item_offsets, full.history_item_offsets);
     }
 
@@ -1303,11 +1408,11 @@ mod tests {
         let after = render_incremental(&mut state, 80);
 
         assert_eq!(
-            after.active_frame_lines[..committed_rows],
-            committed_frame.active_frame_lines[..committed_rows],
+            after.active_frame_lines()[..committed_rows],
+            committed_frame.active_frame_lines()[..committed_rows],
             "committed prefix rows must be byte-identical after later appends"
         );
-        assert!(after.active_frame_lines.len() > committed_rows);
+        assert!(after.active_frame_lines().len() > committed_rows);
     }
 
     #[test]
@@ -1331,7 +1436,7 @@ mod tests {
         state.set_committed_items(committed_items);
         let committed_rows = committed_frame.history_item_offsets[committed_items - 1];
         assert_eq!(
-            committed_frame.active_frame_lines[committed_rows - 1].text(),
+            committed_frame.active_frame_lines()[committed_rows - 1].text(),
             "",
             "Notice A's committed tail ends in its trailing blank"
         );
@@ -1345,8 +1450,8 @@ mod tests {
         //    full render would drop it: scrollback consistency wins over the
         //    notice-run rhythm rule above the committed boundary.
         assert_eq!(
-            after.active_frame_lines[..committed_rows],
-            committed_frame.active_frame_lines[..committed_rows],
+            after.active_frame_lines()[..committed_rows],
+            committed_frame.active_frame_lines()[..committed_rows],
             "committed prefix rows (incl. Notice A's blank) must be unchanged"
         );
         assert_eq!(
@@ -1355,7 +1460,7 @@ mod tests {
             "committed item offsets must be unchanged"
         );
         assert_eq!(
-            after.active_frame_lines[committed_rows - 1].text(),
+            after.active_frame_lines()[committed_rows - 1].text(),
             "",
             "Notice A keeps its committed trailing blank after Notice B lands"
         );
@@ -1420,8 +1525,54 @@ mod tests {
         }
         let incremental = render_incremental(&mut state, 72);
         let full = full_render(&pushes, 72);
-        assert_eq!(incremental.active_frame_lines, full.active_frame_lines);
+        assert_eq!(incremental.active_frame_lines(), full.active_frame_lines());
         assert_eq!(incremental.history_item_offsets, full.history_item_offsets);
+    }
+
+    #[test]
+    fn frames_share_the_cached_history_allocation_instead_of_copying_it() {
+        // Perf guard (deep review P2-d), same spirit as transcript.rs's
+        // PROJECTION_EVENT_VISITS counter and the session store's
+        // EVENT_LOG_PROJECTIONS guard: `render` runs per keystroke and per
+        // spinner tick, so a frame must Arc-share the cached history render.
+        // Reintroducing a per-frame deep copy (the old
+        // `cache.lines.clone()`) makes every `Arc::ptr_eq` below fail — a
+        // copy is a different allocation.
+        let mut state = VisualCanvasState::default();
+        for index in 0..64 {
+            state.push_finalized(TranscriptItem::UserMessage(format!("m{index}")));
+        }
+        let first = render_incremental(&mut state, 80);
+        let cached = state.cached_history_lines().expect("cache populated");
+        assert!(
+            Arc::ptr_eq(&first.history_lines, &cached),
+            "the frame must share the cache's history allocation, not copy it"
+        );
+
+        // Idle repaint (spinner tick, keystroke): the same allocation again.
+        let second = render_incremental(&mut state, 80);
+        assert!(
+            Arc::ptr_eq(&second.history_lines, &first.history_lines),
+            "an idle frame must reuse the cached allocation verbatim"
+        );
+
+        // Append: production drops the previous frame before the next render,
+        // so the unshared cache extends its buffer in place instead of
+        // copying the existing lines for copy-on-write.
+        drop(first);
+        drop(second);
+        state.push_finalized(TranscriptItem::UserMessage("appended".to_owned()));
+        let after = render_incremental(&mut state, 80);
+        let cached = state.cached_history_lines().expect("cache populated");
+        assert!(
+            Arc::ptr_eq(&after.history_lines, &cached),
+            "an incremental append must extend the shared allocation in place"
+        );
+        assert_eq!(after.history_rows, after.history_lines.len());
+        assert!(
+            after.tail_lines.is_empty(),
+            "history rows must never be rematerialized into the frame tail"
+        );
     }
 
     fn snapshot_with_blocks(blocks: Vec<VisualBlock>) -> VisualCanvasSnapshot {

@@ -178,7 +178,7 @@ fn inline_permission_ask_has_blank_line_before_options_and_gold_selection() {
         "tool run_shell".to_owned(),
     )));
 
-    let lines = core.visual_canvas_frame(80).active_frame_lines;
+    let lines = core.visual_canvas_frame(80).active_frame_lines();
     let plain = lines
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
