@@ -5762,7 +5762,7 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
         tui.screen_text()
     );
     assert!(
-        tui.wait_for_screen("ctrl+o expand"),
+        tui.wait_for_screen("25 more lines · ctrl+o expand"),
         "fold affordance missing:\n{}",
         tui.screen_text()
     );
@@ -5777,7 +5777,7 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     // Collapse (replay 2) in a stable window — repro 2's every-time case.
     tui.write("\x0f");
     assert!(
-        tui.wait_for_screen("ctrl+o expand"),
+        tui.wait_for_screen("25 more lines · ctrl+o expand"),
         "collapse did not restore the fold affordance:\n{}",
         tui.screen_text()
     );
@@ -5798,7 +5798,7 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     // the void being asserted on is exactly the head of the transcript.
     tui.write("\x0f");
     assert!(
-        tui.wait_for_screen("ctrl+o expand"),
+        tui.wait_for_screen("25 more lines · ctrl+o expand"),
         "final collapse did not restore the fold affordance:\n{}",
         tui.screen_text()
     );

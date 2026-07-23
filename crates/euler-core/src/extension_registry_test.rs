@@ -340,10 +340,70 @@ fn registry_rejects_symlinked_link_inventory_tmp_without_writing_through() {
 
 #[cfg(unix)]
 #[test]
-fn registry_install_rejects_symlinked_manifest_tmp_without_writing_through() {
+fn private_file_write_distinguishes_failure_after_visible_rename() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("state.json");
+    let tmp = dir.path().join("state.json.tmp");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300))
+        .expect("make directory writable but unreadable");
+
+    let error = write_private_file(&path, &tmp, b"new state\n")
+        .expect_err("parent directory sync should fail");
+
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+        .expect("restore directory permissions");
+    assert!(
+        matches!(error, PrivateFileWriteError::AfterRename(_)),
+        "the replacement is visible even though its directory sync failed: {error:?}"
+    );
+    assert_eq!(
+        fs::read(&path).expect("visible replacement"),
+        b"new state\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_install_rejects_symlinked_installed_root_without_deleting_target() {
     let (_temp, registry) = registry();
     let package_dir = extension_dir("example-extension");
     let package = load_extension_package(package_dir.path()).expect("package");
+    let outside = tempfile::tempdir().expect("outside");
+    let outside_snapshot = outside
+        .path()
+        .join(&package.descriptor.id)
+        .join(&package.manifest_sha256);
+    fs::create_dir_all(&outside_snapshot).expect("outside snapshot");
+    let sentinel = outside_snapshot.join("sentinel");
+    fs::write(&sentinel, b"must survive\n").expect("sentinel");
+    symlink(outside.path(), registry.installed_extensions_dir()).expect("installed root symlink");
+
+    let error = registry
+        .install_package(package)
+        .expect_err("symlinked installed root");
+
+    assert!(matches!(error, ExtensionRegistryError::Io(_)));
+    assert!(error
+        .to_string()
+        .contains("installed extension path must not be a symlink"));
+    assert_eq!(
+        fs::read(&sentinel).expect("outside sentinel after rejected install"),
+        b"must survive\n"
+    );
+    assert!(registry.installed_extensions_dir().is_symlink());
+    assert!(registry
+        .linked_extension("example-extension")
+        .expect("inventory")
+        .is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_install_replaces_orphan_snapshot_without_following_symlinked_tmp() {
+    let (_temp, registry) = registry();
+    let package_dir = extension_dir("example-extension");
+    let package = load_extension_package(package_dir.path()).expect("package");
+    let manifest_bytes = package.manifest_bytes.clone();
     let installed_dir =
         registry.installed_package_dir(&package.descriptor.id, &package.manifest_sha256);
     fs::create_dir_all(&installed_dir).expect("installed dir");
@@ -352,19 +412,21 @@ fn registry_install_rejects_symlinked_manifest_tmp_without_writing_through() {
     fs::write(target.path(), b"manifest tmp sentinel\n").expect("target content");
     symlink(target.path(), &tmp).expect("manifest tmp symlink");
 
-    let error = registry
-        .install_package(package)
-        .expect_err("symlinked manifest tmp");
+    // The pre-existing dir has no inventory entry, so install treats it as a
+    // crash orphan: the whole dir (including the symlink, unfollowed) is
+    // removed and replaced by a fresh snapshot.
+    let installed = registry.install_package(package).expect("install");
 
-    assert!(matches!(error, ExtensionRegistryError::Io(_)));
+    assert_eq!(installed.source_path, installed_dir);
     assert_eq!(
         fs::read(target.path()).expect("target after"),
         b"manifest tmp sentinel\n"
     );
-    // New install cleanup removes the managed snapshot directory after a
-    // manifest write failure. The symlink target itself must remain untouched.
-    assert!(!installed_dir.exists());
     assert!(!tmp.exists());
+    assert_eq!(
+        fs::read(installed.source_path.join(EXTENSION_MANIFEST_FILE)).expect("manifest"),
+        manifest_bytes
+    );
 }
 
 #[cfg(unix)]
@@ -717,6 +779,71 @@ fn registry_install_is_idempotent_for_same_digest_and_rejects_digest_drift() {
 
 #[cfg(unix)]
 #[test]
+fn registry_install_removes_snapshot_when_inventory_write_fails() {
+    let (_temp, registry) = registry();
+    let target = tempfile::NamedTempFile::new().expect("target file");
+    fs::write(target.path(), b"tmp sentinel\n").expect("target content");
+    symlink(target.path(), registry.link_inventory_tmp_path()).expect("inventory tmp symlink");
+    let package_dir = extension_dir("example-extension");
+    let package = load_extension_package(package_dir.path()).expect("package");
+    let installed_dir =
+        registry.installed_package_dir(&package.descriptor.id, &package.manifest_sha256);
+
+    let error = registry
+        .install_package(package)
+        .expect_err("symlinked inventory tmp");
+
+    assert!(matches!(error, ExtensionRegistryError::Io(_)));
+    // The manifest snapshot lands before the inventory write; compensation
+    // must remove it so the failed install leaves no orphan behind.
+    assert!(!installed_dir.exists());
+    assert!(registry
+        .linked_extension("example-extension")
+        .expect("lookup")
+        .is_none());
+    assert_eq!(
+        fs::read(target.path()).expect("target after"),
+        b"tmp sentinel\n"
+    );
+}
+
+#[test]
+fn registry_install_self_heals_orphaned_snapshot() {
+    let (_temp, registry) = registry();
+    let package_dir = extension_dir("example-extension");
+    let manifest = fs::read(package_dir.path().join(EXTENSION_MANIFEST_FILE)).expect("manifest");
+    let installed = registry
+        .install_package(load_extension_package(package_dir.path()).expect("first"))
+        .expect("first install");
+    // Simulate the install crash window: snapshot on disk (with drifted
+    // bytes), no inventory entry recorded.
+    fs::remove_file(registry.link_inventory_path()).expect("drop inventory");
+    fs::write(
+        installed.source_path.join(EXTENSION_MANIFEST_FILE),
+        b"stale bytes",
+    )
+    .expect("stale manifest");
+    let stale_extra = installed.source_path.join("stale-extra");
+    fs::write(&stale_extra, b"stale").expect("stale extra file");
+
+    let healed = registry
+        .install_package(load_extension_package(package_dir.path()).expect("again"))
+        .expect("reinstall over orphan");
+
+    assert_eq!(healed.source_path, installed.source_path);
+    assert_eq!(
+        fs::read(healed.source_path.join(EXTENSION_MANIFEST_FILE)).expect("snapshot"),
+        manifest
+    );
+    assert!(!stale_extra.exists());
+    assert_eq!(
+        audit_issue(&registry.audit().expect("audit"), "example-extension"),
+        ExtensionAuditIssueCode::Ok
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn registry_uninstall_rejects_symlinked_installed_snapshot() {
     let (_temp, registry) = registry();
     let package_dir = extension_dir("example-extension");
@@ -734,6 +861,51 @@ fn registry_uninstall_rejects_symlinked_installed_snapshot() {
         ExtensionRegistryError::Io(_)
     ));
     assert!(outside.path().exists());
+    assert!(registry
+        .linked_extension("example-extension")
+        .expect("lookup")
+        .is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_uninstall_rejects_symlinked_installed_root_without_rewriting_inventory() {
+    let (_temp, registry) = registry();
+    let package_dir = extension_dir("example-extension");
+    let installed = registry
+        .install_package(load_extension_package(package_dir.path()).expect("package"))
+        .expect("install");
+    let inventory_before = fs::read(registry.link_inventory_path()).expect("inventory before");
+    let installed_root = registry.installed_extensions_dir();
+    fs::rename(
+        &installed_root,
+        registry.home().extensions_dir().join("installed-backup"),
+    )
+    .expect("move real installed root");
+
+    let outside = tempfile::tempdir().expect("outside dir");
+    let outside_snapshot = outside
+        .path()
+        .join(&installed.id)
+        .join(&installed.manifest_sha256);
+    fs::create_dir_all(&outside_snapshot).expect("outside snapshot");
+    let sentinel = outside_snapshot.join("sentinel");
+    fs::write(&sentinel, b"must survive\n").expect("sentinel");
+    symlink(outside.path(), &installed_root).expect("installed root symlink");
+
+    let error = registry
+        .uninstall_installed("example-extension")
+        .expect_err("symlinked installed root");
+
+    assert!(matches!(error, ExtensionRegistryError::Io(_)));
+    assert_eq!(
+        fs::read(&sentinel).expect("outside sentinel after rejected uninstall"),
+        b"must survive\n"
+    );
+    assert_eq!(
+        fs::read(registry.link_inventory_path()).expect("inventory after"),
+        inventory_before
+    );
     assert!(registry
         .linked_extension("example-extension")
         .expect("lookup")
@@ -1056,6 +1228,32 @@ fn registry_audit_reports_installed_snapshot_damage() {
         ),
         ExtensionAuditIssueCode::InstalledPathInvalid
     );
+}
+
+#[test]
+fn registry_audit_reports_orphaned_installed_snapshot() {
+    let (_temp, registry) = registry();
+    let package_dir = extension_dir("example-extension");
+    let installed = registry
+        .install_package(load_extension_package(package_dir.path()).expect("package"))
+        .expect("install");
+    // Simulate the uninstall crash window: inventory entry gone, snapshot
+    // dir still on disk.
+    fs::remove_file(registry.link_inventory_path()).expect("drop inventory");
+
+    let report = registry.audit().expect("audit");
+
+    assert_eq!(report.entries.len(), 1);
+    let entry = &report.entries[0];
+    assert_eq!(entry.id, "example-extension");
+    assert_eq!(entry.source_kind, "installed");
+    assert_eq!(entry.recorded_status, "unrecorded");
+    assert_eq!(
+        entry.issue_code,
+        ExtensionAuditIssueCode::InstalledSnapshotOrphaned
+    );
+    // Audit only reports the orphan; the dir itself is left in place.
+    assert!(installed.source_path.exists());
 }
 
 #[cfg(unix)]

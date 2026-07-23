@@ -18,6 +18,7 @@ fn resolution_bootstrap(
         }
     }
 }
+use crate::canvas::assemble_canvas;
 use crate::provenance::ProvenanceWriterError;
 use crate::read_provenance;
 use crate::{probe_workspace_sandbox, SandboxProfile, SubprocessSandbox};

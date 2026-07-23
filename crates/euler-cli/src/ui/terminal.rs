@@ -39,7 +39,9 @@ use super::metrics;
 use super::text::display_width;
 #[cfg(test)]
 use super::theme::USER_RAIL_COLOR;
-use super::visual_canvas::{CanvasLine, CanvasSpan, CursorTarget, TextRole, VisualCanvasFrame};
+use super::visual_canvas::{
+    CanvasLine, CanvasSpan, CursorTarget, FrameLines, TextRole, VisualCanvasFrame,
+};
 
 static TERMINAL_OWNER: AtomicBool = AtomicBool::new(false);
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -575,7 +577,7 @@ where
             visible_height = self.resize_active_height(frame.required_height)?;
         }
         let visible = visible_active_lines(
-            &frame.active_frame_lines,
+            frame.lines(),
             usize::from(visible_height),
             self.review_scroll_offset,
             frame.pinned_rows,
@@ -587,7 +589,7 @@ where
         self.last_band_measurement = Some(BandMeasurement {
             band_rows: visible
                 .visible_pinned_bottom_band_rows(
-                    &frame.active_frame_lines,
+                    frame.lines(),
                     usize::from(self.viewport_area.width).max(1),
                 )
                 .unwrap_or(0),
@@ -609,7 +611,7 @@ where
             return Ok(false);
         }
         let tail_visible = visible_active_lines(
-            &frame.active_frame_lines,
+            frame.lines(),
             usize::from(visible_height),
             0,
             frame.pinned_rows,
@@ -632,10 +634,8 @@ where
                     // finalized items). Fall back to treating the rendered
                     // prefix as represented — accepts losing never-emitted
                     // rows rather than re-emitting everything.
-                    let shared_prefix = shared_committed_prefix_len(
-                        &self.committed_active_lines,
-                        &frame.active_frame_lines,
-                    );
+                    let shared_prefix =
+                        shared_committed_prefix_len(&self.committed_active_lines, frame.lines());
                     let represented_rows = frame.history_rows.max(shared_prefix);
                     self.set_committed_active_rows(frame, represented_rows);
                 } else {
@@ -663,25 +663,22 @@ where
         if commit_until <= self.committed_active_rows {
             return Ok(false);
         }
-        let start = self
-            .committed_active_rows
-            .min(frame.active_frame_lines.len());
-        let end = commit_until.min(frame.active_frame_lines.len());
+        let start = self.committed_active_rows.min(frame.line_count());
+        let end = commit_until.min(frame.line_count());
         let was_suspended_after_resize = self.linefeed_history_insert_suspended_after_resize;
         if start < end
             && was_suspended_after_resize
             && self.linefeed_history_insert_enabled
-            && canvas_lines_are_blank(&frame.active_frame_lines[start..end])
+            && canvas_lines_are_blank(frame.lines().range(start, end))
         {
             return Ok(false);
         }
         if start < end {
-            let bottom_band_rows = tail_visible.visible_pinned_bottom_band_rows(
-                &frame.active_frame_lines,
-                usize::from(width).max(1),
-            );
+            let bottom_band_rows = tail_visible
+                .visible_pinned_bottom_band_rows(frame.lines(), usize::from(width).max(1));
+            let commit_lines = frame.lines().range_cow(start, end);
             self.write_finalized_lines_with_bridge_policy(
-                &frame.active_frame_lines[start..end],
+                &commit_lines,
                 bottom_band_rows,
                 !was_suspended_after_resize,
             )?;
@@ -700,7 +697,7 @@ where
     }
 
     fn set_committed_active_rows(&mut self, frame: &VisualCanvasFrame, rows: usize) {
-        self.committed_active_rows = rows.min(frame.active_frame_lines.len());
+        self.committed_active_rows = rows.min(frame.line_count());
         // Track how many whole finalized items the committed rows cover; this
         // is the width-independent identity used for resize remapping and for
         // the canvas's mutate-above-the-boundary guard.
@@ -708,7 +705,7 @@ where
             .history_item_offsets
             .partition_point(|end| *end <= self.committed_active_rows);
         self.committed_active_lines = frame
-            .active_frame_lines
+            .lines()
             .iter()
             .take(self.committed_active_rows)
             .cloned()

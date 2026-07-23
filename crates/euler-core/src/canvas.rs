@@ -2,6 +2,7 @@
 
 use crate::apply_patch::{parse_single_file_apply_patch, ApplyPatchDocument};
 use crate::compaction::{compact_tool_output, is_layer1_eligible, WorkingStateProjection};
+use crate::project_context::{PinnedProjectContext, ProjectContextFold};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::MAX_CONTEXT_SLOTS_PER_SESSION;
 use serde_json::Value;
@@ -216,13 +217,30 @@ pub fn assemble_canvas_with_compaction(
     policy: &AutoCompactionPolicy,
     compacted_result_ids: &BTreeSet<String>,
 ) -> Vec<CanvasItem> {
-    let mut items = collect_canvas_items(events, compacted_result_ids);
+    // A malformed latest snapshot yields no pinned item here; the
+    // request-assembly seams independently fail closed on it (they fold
+    // before assembling and reject the request on error).
+    let fold = crate::project_context::fold_project_context(events).ok();
+    assemble_canvas_prefolded(
+        events,
+        policy,
+        compacted_result_ids,
+        fold.as_ref().and_then(ProjectContextFold::admitted),
+    )
+}
+
+/// Canvas assembly for callers that already folded project context from the
+/// same event slice (request assembly folds once and threads the result
+/// here), so the fold is never repeated per assembly.
+pub(crate) fn assemble_canvas_prefolded(
+    events: &[EventEnvelope],
+    policy: &AutoCompactionPolicy,
+    compacted_result_ids: &BTreeSet<String>,
+    pinned: Option<&PinnedProjectContext>,
+) -> Vec<CanvasItem> {
+    let mut items = collect_canvas_items(events, compacted_result_ids, pinned);
     if policy.stubs_enabled() {
-        demote_to_budget(
-            &mut items,
-            policy.budget_bytes,
-            &result_stub_handles(events),
-        );
+        demote_to_budget(&mut items, policy.budget_bytes, events);
     }
     items
 }
@@ -233,6 +251,7 @@ pub fn assemble_canvas_with_compaction(
 fn collect_canvas_items(
     events: &[EventEnvelope],
     compacted_result_ids: &BTreeSet<String>,
+    pinned: Option<&PinnedProjectContext>,
 ) -> Vec<CanvasItem> {
     let active_swap = active_swap(events);
     let mut active_compacted_result_ids = compacted_result_ids.clone();
@@ -245,11 +264,11 @@ fn collect_canvas_items(
         .map(|pair| pair.call_event_id.clone())
         .collect::<BTreeSet<_>>();
     let selected_tool_results = selected_pairs.keys().cloned().collect::<BTreeSet<_>>();
-    let selected_model_result_ids = events
-        .iter()
-        .filter(|event| event.kind.as_str() == EventKind::TOOL_CALL)
-        .filter(|event| selected_tool_calls.contains(&event.id))
-        .filter_map(|event| event.parent.clone())
+    // Each pair already carries its call event's parent (the model.result
+    // that issued the call), so no separate TOOL_CALL pass is needed.
+    let selected_model_result_ids = selected_pairs
+        .values()
+        .filter_map(|pair| pair.model_result_id.clone())
         .collect::<BTreeSet<_>>();
     let included_model_call_ids = included_model_call_ids(events, &selected_model_result_ids);
     // Context slots fold over the full event slice before compaction-frontier
@@ -262,19 +281,17 @@ fn collect_canvas_items(
     // compaction is deferred to later slices). projection_blob is inline
     // text or v1 structured JSON; blob-ref resolution is deferred.
     let mut items = Vec::new();
-    // Pinned project context folds over the full event slice, like context
-    // slots: the latest admitted snapshot stays pinned across compaction
-    // frontiers instead of silently disappearing (project-context contract,
-    // "Framing and canvas admission"). A malformed latest snapshot yields no
-    // item here; the request-assembly seams independently fail closed on it.
-    if let Ok(fold) = crate::project_context::fold_project_context(events) {
-        if let Some(pinned) = fold.admitted() {
-            items.push(CanvasItem::ProjectContext {
-                event_id: pinned.snapshot_event_id.clone(),
-                snapshot_digest: pinned.candidate_digest.clone(),
-                rendered: pinned.rendered.clone(),
-            });
-        }
+    // Pinned project context is folded over the full event slice, like
+    // context slots: the latest admitted snapshot stays pinned across
+    // compaction frontiers instead of silently disappearing (project-context
+    // contract, "Framing and canvas admission"). The fold itself happens
+    // exactly once per assembly, in the callers above.
+    if let Some(pinned) = pinned {
+        items.push(CanvasItem::ProjectContext {
+            event_id: pinned.snapshot_event_id.clone(),
+            snapshot_digest: pinned.candidate_digest.clone(),
+            rendered: pinned.rendered.clone(),
+        });
     }
     if let Some(swap) = &active_swap {
         if let Some((_, content, schema_version)) = &swap.projection {
@@ -429,8 +446,8 @@ fn full_swap_frontier(
 ) -> Option<(usize, String, String)> {
     let snapshot_end_id = string_field(event, "snapshot_end_id")?;
     let frontier_start_id = string_field(event, "frontier_start_id")?;
-    let snapshot_end_index = event_index(events, &snapshot_end_id)?;
-    let frontier_start_index = event_index(events, &frontier_start_id)?;
+    let (snapshot_end_index, frontier_start_index) =
+        event_index_pair(events, &snapshot_end_id, &frontier_start_id)?;
     (snapshot_end_index < frontier_start_index).then_some(())?;
     let blob = string_field(event, "projection_blob")?;
     if blob.is_empty() {
@@ -454,8 +471,24 @@ fn render_projection_blob(blob: &str, schema_version: &str) -> String {
     }
 }
 
-fn event_index(events: &[EventEnvelope], id: &str) -> Option<usize> {
-    events.iter().position(|event| event.id == id)
+/// First occurrence index of each of two event ids, found in one pass. Both
+/// must be present, matching the semantics of two independent `position`
+/// scans without the second full traversal.
+fn event_index_pair(events: &[EventEnvelope], first: &str, second: &str) -> Option<(usize, usize)> {
+    let mut first_index = None;
+    let mut second_index = None;
+    for (index, event) in events.iter().enumerate() {
+        if first_index.is_none() && event.id == first {
+            first_index = Some(index);
+        }
+        if second_index.is_none() && event.id == second {
+            second_index = Some(index);
+        }
+        if let (Some(first_index), Some(second_index)) = (first_index, second_index) {
+            return Some((first_index, second_index));
+        }
+    }
+    None
 }
 
 fn push_message(items: &mut Vec<CanvasItem>, role: CanvasRole, event: &EventEnvelope) {
@@ -471,10 +504,14 @@ fn push_message(items: &mut Vec<CanvasItem>, role: CanvasRole, event: &EventEnve
 #[derive(Clone, Debug)]
 struct ToolPair {
     call_event_id: String,
+    /// The call event's parent — the `model.result` that issued the call.
+    /// Carried here so canvas assembly derives the selected model-result
+    /// set from the pairs instead of rescanning the event stream.
+    model_result_id: Option<String>,
 }
 
 fn eligible_tool_pairs(events: &[EventEnvelope]) -> BTreeMap<String, ToolPair> {
-    let mut calls_by_id = BTreeMap::new();
+    let mut calls_by_id: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
     let mut paired_call_ids = BTreeSet::new();
     let mut pairs = BTreeMap::new();
 
@@ -487,7 +524,7 @@ fn eligible_tool_pairs(events: &[EventEnvelope]) -> BTreeMap<String, ToolPair> {
                     }
                     calls_by_id
                         .entry(call_id)
-                        .or_insert_with(|| event.id.clone());
+                        .or_insert_with(|| (event.id.clone(), event.parent.clone()));
                 }
             }
             EventKind::TOOL_RESULT => {
@@ -498,11 +535,12 @@ fn eligible_tool_pairs(events: &[EventEnvelope]) -> BTreeMap<String, ToolPair> {
                     if paired_call_ids.contains(&call_id) {
                         continue;
                     }
-                    if let Some(call_event_id) = calls_by_id.get(&call_id) {
+                    if let Some((call_event_id, model_result_id)) = calls_by_id.get(&call_id) {
                         pairs.insert(
                             event.id.clone(),
                             ToolPair {
                                 call_event_id: call_event_id.clone(),
+                                model_result_id: model_result_id.clone(),
                             },
                         );
                         paired_call_ids.insert(call_id);
@@ -579,23 +617,21 @@ fn artifact_paths(items: &[CanvasItem]) -> BTreeMap<String, String> {
 /// write-shaped result whose artifact path cannot be derived is never
 /// demoted (its stub could not carry the path the contract requires).
 /// Only ToolOutput content is touched — rounds, messages, and reasoning
-/// are never removed.
-fn demote_to_budget(
-    items: &mut [CanvasItem],
-    budget_bytes: usize,
-    handles: &BTreeMap<String, String>,
-) {
+/// are never removed. Stub handles are derived from `events` only after
+/// the budget check, so an under-budget canvas costs no extra event pass.
+fn demote_to_budget(items: &mut [CanvasItem], budget_bytes: usize, events: &[EventEnvelope]) {
     let mut total = canvas_bytes(items);
     if total <= budget_bytes {
         return;
     }
+    let handles = result_stub_handles(events);
     let paths = artifact_paths(items);
     for index in demotion_order(items, &paths) {
         if total <= budget_bytes {
             return;
         }
         let before = render_canvas_item(&items[index]).len();
-        if !demote_item(&mut items[index], handles, &paths) {
+        if !demote_item(&mut items[index], &handles, &paths) {
             continue;
         }
         let after = render_canvas_item(&items[index]).len();

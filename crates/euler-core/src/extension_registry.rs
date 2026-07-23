@@ -11,7 +11,7 @@ use euler_sdk::{
     LoadedExtensionPackage, EXTENSION_MANIFEST_FILE,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -86,6 +86,8 @@ pub enum ExtensionAuditIssueCode {
     InstalledManifestIdMismatch,
     #[serde(rename = "installed-manifest-digest-mismatch")]
     InstalledManifestDigestMismatch,
+    #[serde(rename = "installed-snapshot-orphaned")]
+    InstalledSnapshotOrphaned,
 }
 /// Machine-readable failure envelope for `extension audit`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -279,11 +281,12 @@ impl ExtensionRegistry {
         self.set_linked_execution_enabled_locked(id, true)
     }
     pub fn audit(&self) -> Result<ExtensionAuditReport, ExtensionRegistryError> {
-        let entries = self
-            .read_link_inventory()?
+        let links = self.read_link_inventory()?;
+        let mut entries: Vec<ExtensionAuditEntry> = links
             .values()
             .map(|record| self.audit_record(record))
             .collect();
+        entries.extend(self.orphaned_snapshot_entries(&links)?);
         Ok(ExtensionAuditReport {
             schema_version: EXTENSION_AUDIT_SCHEMA_VERSION,
             entries,
@@ -317,13 +320,29 @@ impl ExtensionRegistry {
         let installed_dir =
             self.installed_package_dir(&package.descriptor.id, &package.manifest_sha256);
         let installed = apply_install_package(&mut links, package, installed_dir)?;
+        if !existing_same_install {
+            // A snapshot dir with no inventory entry is a crash leftover;
+            // remove it up front so the digest recorded below describes bytes
+            // this install wrote, never stale ones.
+            self.remove_installed_snapshot(&installed.source_path)?;
+        }
         if let Err(error) = self.write_installed_manifest(&installed.source_path, &manifest_bytes) {
             if !existing_same_install {
                 let _ = self.remove_installed_snapshot(&installed.source_path);
             }
             return Err(error);
         }
-        self.write_link_inventory_locked(&links)?;
+        if let Err(error) = self.write_link_inventory_locked(&links) {
+            // Before the inventory rename, the new snapshot is provably
+            // unreferenced and compensation can remove it. After rename the
+            // visible inventory may already point at the snapshot even when
+            // syncing the parent directory failed, so preserve the snapshot:
+            // recovery is then either a valid install or an auditable orphan.
+            if !existing_same_install && !error.replacement_visible() {
+                let _ = self.remove_installed_snapshot(&installed.source_path);
+            }
+            return Err(error.into());
+        }
         Ok(installed)
     }
     pub fn reload_link(&self, id: &str) -> Result<LinkedExtension, ExtensionRegistryError> {
@@ -379,7 +398,10 @@ impl ExtensionRegistry {
             ExtensionMaterialization::Installed,
             MissingExtensionRecord::Installed,
         )?;
-        validate_installed_snapshot_for_removal(&existing.source_path)?;
+        validate_installed_snapshot_for_removal(
+            &self.installed_extensions_dir(),
+            &existing.source_path,
+        )?;
         links.remove(id);
         self.write_link_inventory_locked(&links)?;
         self.remove_installed_snapshot(&existing.source_path)?;
@@ -462,13 +484,12 @@ impl ExtensionRegistry {
     fn write_link_inventory_locked(
         &self,
         links: &BTreeMap<String, LinkedExtension>,
-    ) -> Result<(), ExtensionRegistryError> {
+    ) -> Result<(), PrivateFileWriteError> {
         let path = self.link_inventory_path();
-        write_private_file(
-            &path,
-            &self.link_inventory_tmp_path(),
-            &encode_link_inventory(links)?,
-        )
+        let bytes = encode_link_inventory(links)
+            .map_err(ExtensionRegistryError::from)
+            .map_err(PrivateFileWriteError::BeforeRename)?;
+        write_private_file(&path, &self.link_inventory_tmp_path(), &bytes)
     }
 
     fn write_installed_manifest(
@@ -488,7 +509,8 @@ impl ExtensionRegistry {
         }
         let manifest_path = installed_dir.join(EXTENSION_MANIFEST_FILE);
         let tmp = installed_dir.join(format!("{EXTENSION_MANIFEST_FILE}.tmp"));
-        write_private_file(&manifest_path, &tmp, manifest_bytes)?;
+        write_private_file(&manifest_path, &tmp, manifest_bytes)
+            .map_err(ExtensionRegistryError::from)?;
         sync_dir(installed_dir)?;
         sync_dir(&installed_root)?;
         Ok(())
@@ -500,7 +522,7 @@ impl ExtensionRegistry {
     ) -> Result<(), ExtensionRegistryError> {
         let installed_root = self.installed_extensions_dir();
         ensure_managed_install_path(&installed_root, installed_dir)?;
-        validate_installed_snapshot_for_removal(installed_dir)?;
+        validate_installed_snapshot_for_removal(&installed_root, installed_dir)?;
         match fs::remove_dir_all(installed_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -632,6 +654,65 @@ impl ExtensionRegistry {
         }
         ExtensionAuditIssueCode::Ok
     }
+
+    /// Snapshot dirs no installed inventory entry points at are crash
+    /// leftovers from the install/uninstall two-file windows. They are
+    /// harmless (install replaces them) but must stay visible in the audit.
+    fn orphaned_snapshot_entries(
+        &self,
+        links: &BTreeMap<String, LinkedExtension>,
+    ) -> Result<Vec<ExtensionAuditEntry>, ExtensionRegistryError> {
+        let recorded: BTreeSet<&Path> = links
+            .values()
+            .filter(|record| record.materialization == ExtensionMaterialization::Installed)
+            .map(|record| record.source_path.as_path())
+            .collect();
+        let mut entries = Vec::new();
+        for id_dir in real_subdirectories(&self.installed_extensions_dir())? {
+            let id = id_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for snapshot_dir in real_subdirectories(&id_dir)? {
+                if recorded.contains(snapshot_dir.as_path()) {
+                    continue;
+                }
+                entries.push(ExtensionAuditEntry {
+                    id: id.clone(),
+                    source_kind: ExtensionMaterialization::Installed.as_str(),
+                    // Orphans have no inventory record, hence no recorded
+                    // status to echo back.
+                    recorded_status: "unrecorded",
+                    issue_code: ExtensionAuditIssueCode::InstalledSnapshotOrphaned,
+                });
+            }
+        }
+        Ok(entries)
+    }
+}
+
+/// Entries of `path` that are real directories. Symlinks and files are
+/// skipped: they cannot be managed snapshot storage. A missing `path` means
+/// no snapshots exist (audit must not create registry dirs).
+fn real_subdirectories(path: &Path) -> Result<Vec<PathBuf>, ExtensionRegistryError> {
+    let reader = match fs::read_dir(path) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(ExtensionRegistryError::Io(source)),
+    };
+    let mut dirs = Vec::new();
+    for entry in reader {
+        let entry_path = entry.map_err(ExtensionRegistryError::Io)?.path();
+        let metadata = match fs::symlink_metadata(&entry_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(ExtensionRegistryError::Io(source)),
+        };
+        if metadata.is_dir() {
+            dirs.push(entry_path);
+        }
+    }
+    Ok(dirs)
 }
 
 fn audit_linked_record(record: &LinkedExtension) -> ExtensionAuditIssueCode {
@@ -763,21 +844,57 @@ fn wrong_mode(
     }
 }
 
-fn write_private_file(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), ExtensionRegistryError> {
-    reject_symlink(path, REGISTRY_LEAF_SYMLINK_MESSAGE)?;
-    prepare_private_tmp(tmp)?;
+#[derive(Debug)]
+enum PrivateFileWriteError {
+    BeforeRename(ExtensionRegistryError),
+    AfterRename(ExtensionRegistryError),
+}
+
+impl PrivateFileWriteError {
+    fn replacement_visible(&self) -> bool {
+        matches!(self, Self::AfterRename(_))
+    }
+}
+
+impl From<PrivateFileWriteError> for ExtensionRegistryError {
+    fn from(error: PrivateFileWriteError) -> Self {
+        match error {
+            PrivateFileWriteError::BeforeRename(error)
+            | PrivateFileWriteError::AfterRename(error) => error,
+        }
+    }
+}
+
+fn write_private_file(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), PrivateFileWriteError> {
+    reject_symlink(path, REGISTRY_LEAF_SYMLINK_MESSAGE)
+        .map_err(PrivateFileWriteError::BeforeRename)?;
+    prepare_private_tmp(tmp).map_err(PrivateFileWriteError::BeforeRename)?;
     let mut file = private_no_follow_open_options()
         .create_new(true)
         .write(true)
         .open(tmp)
-        .map_err(ExtensionRegistryError::Io)?;
-    set_file_mode_0600(&file)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    file.sync_data()?;
-    reject_symlink(path, REGISTRY_LEAF_SYMLINK_MESSAGE)?;
-    fs::rename(tmp, path)?;
-    sync_dir(containing_dir(path))?;
+        .map_err(ExtensionRegistryError::Io)
+        .map_err(PrivateFileWriteError::BeforeRename)?;
+    set_file_mode_0600(&file)
+        .map_err(ExtensionRegistryError::Io)
+        .map_err(PrivateFileWriteError::BeforeRename)?;
+    file.write_all(bytes)
+        .map_err(ExtensionRegistryError::Io)
+        .map_err(PrivateFileWriteError::BeforeRename)?;
+    file.flush()
+        .map_err(ExtensionRegistryError::Io)
+        .map_err(PrivateFileWriteError::BeforeRename)?;
+    file.sync_data()
+        .map_err(ExtensionRegistryError::Io)
+        .map_err(PrivateFileWriteError::BeforeRename)?;
+    reject_symlink(path, REGISTRY_LEAF_SYMLINK_MESSAGE)
+        .map_err(PrivateFileWriteError::BeforeRename)?;
+    fs::rename(tmp, path)
+        .map_err(ExtensionRegistryError::Io)
+        .map_err(PrivateFileWriteError::BeforeRename)?;
+    sync_dir(containing_dir(path))
+        .map_err(ExtensionRegistryError::Io)
+        .map_err(PrivateFileWriteError::AfterRename)?;
     Ok(())
 }
 fn acquire_file_lock(path: PathBuf) -> Result<File, ExtensionRegistryError> {
@@ -859,8 +976,12 @@ fn reject_symlink(path: &Path, message: &str) -> Result<(), ExtensionRegistryErr
     Ok(())
 }
 
-fn validate_installed_snapshot_for_removal(path: &Path) -> Result<(), ExtensionRegistryError> {
-    for candidate in [containing_dir(path), path] {
+fn validate_installed_snapshot_for_removal(
+    installed_root: &Path,
+    path: &Path,
+) -> Result<(), ExtensionRegistryError> {
+    ensure_managed_install_path(installed_root, path)?;
+    for candidate in [installed_root, containing_dir(path), path] {
         reject_symlink(candidate, "installed extension path must not be a symlink")?;
     }
     Ok(())

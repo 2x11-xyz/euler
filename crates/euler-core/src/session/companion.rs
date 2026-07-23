@@ -7,7 +7,7 @@ use super::{
     validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig,
     RoundLoopIo, RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
-use crate::canvas::{assemble_canvas, AutoCompactionPolicy};
+use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
 use euler_agents::{generated_agent_id, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
@@ -698,7 +698,14 @@ impl<D: PermissionDecider> CompanionLoop<'_, D> {
             }
         };
         let mut canvas = if self.task.includes_parent_canvas() {
-            assemble_canvas(self.bus.events(), &self.auto_compaction)
+            // The fold above is threaded into assembly so the child's event
+            // stream is folded for project context exactly once per request.
+            assemble_canvas_prefolded(
+                self.bus.events(),
+                &self.auto_compaction,
+                &std::collections::BTreeSet::new(),
+                project_context.admitted(),
+            )
         } else {
             Vec::new()
         };

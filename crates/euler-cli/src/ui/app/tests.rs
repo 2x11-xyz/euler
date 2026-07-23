@@ -440,7 +440,7 @@ fn queued_steer_preview_is_visual_only() {
 
     let queued_line = core
         .visual_canvas_frame(120)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .find(|line| line.starts_with("▌ 1/1 "))
@@ -621,7 +621,7 @@ fn patch_modal_session_scope_uses_path_prefix_when_present() {
 }
 
 #[test]
-fn modal_ctrl_c_denies_and_quits() {
+fn modal_ctrl_c_defers_deny_until_shutdown_preparation() {
     let mut core = core();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
@@ -633,11 +633,17 @@ fn modal_ctrl_c_denies_and_quits() {
     let effect = core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
     assert_eq!(effect, CoreEffect::Quit);
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert!(reply_rx.try_recv().is_err());
+
+    core.prepare_for_shutdown();
+
+    assert!(core.modal.is_none());
     assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
 }
 
 #[test]
-fn patch_modal_ctrl_c_or_d_denies_and_quits() {
+fn patch_modal_ctrl_c_or_d_defers_deny_until_shutdown_preparation() {
     for code in [
         KeyCode::Char('c'),
         KeyCode::Char('C'),
@@ -652,6 +658,12 @@ fn patch_modal_ctrl_c_or_d_denies_and_quits() {
         let effect = core.handle_input(modified_key(code, KeyModifiers::CONTROL));
 
         assert_eq!(effect, CoreEffect::Quit);
+        assert!(matches!(core.modal, Some(Modal::PatchApproval(_))));
+        assert!(reply_rx.try_recv().is_err());
+
+        core.prepare_for_shutdown();
+
+        assert!(core.modal.is_none());
         assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
     }
 }
@@ -931,6 +943,137 @@ fn escape_interrupts_in_flight_turn() {
     assert!(!core.interrupted_guidance);
     assert!(drain_finalized_visual_text(&mut core, 80)
         .contains("interrupted — tell euler what to do differently"));
+}
+
+#[test]
+fn shutdown_cancellation_sets_in_flight_turn_interrupt_flag() {
+    // Deep-review P3-d: /quit mid-turn publishes the same cancel signal the
+    // esc interrupt uses so the detached worker's provider round stops
+    // promptly instead of running until process exit.
+    let mut core = core_with_provider(SlowEchoProvider);
+    core.handle_input(key(KeyCode::Char('h')));
+    core.handle_input(key(KeyCode::Enter));
+    assert!(core.turn_in_flight());
+
+    core.cancel_in_flight_for_shutdown();
+
+    // Pause-before-flag, same ordering contract as `handle_interrupt`.
+    assert!(core.queued_inputs.paused());
+    let AppState::TurnInFlight { interrupt_flag, .. } = &core.state else {
+        panic!("turn should still be in flight");
+    };
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+
+    // The worker observes the flag and returns the session; drain so the
+    // thread finishes within the test.
+    for _ in 0..50 {
+        if core.drain_background() && !core.turn_in_flight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!core.turn_in_flight());
+}
+
+#[test]
+fn shutdown_cancels_before_releasing_permission_modal() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-write".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "printf should-not-run > shutdown-marker.txt"}),
+        }]),
+        FixtureResponse::Assistant("must not continue after shutdown".to_owned()),
+    ]);
+    let mut core = core_with_provider_at(provider, temp.path());
+    core.handle_input(key(KeyCode::Char('h')));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_permission_modal(&mut core);
+    let interrupt_flag = match &core.state {
+        AppState::TurnInFlight { interrupt_flag, .. } => Arc::clone(interrupt_flag),
+        _ => panic!("turn should be in flight"),
+    };
+
+    let effect = core.handle_input(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+
+    assert_eq!(effect, CoreEffect::Quit);
+    std::thread::sleep(Duration::from_millis(20));
+    core.drain_background();
+    assert!(core.turn_in_flight(), "quit intent must not wake worker");
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert!(!core.queued_inputs.paused());
+    assert!(!interrupt_flag.load(Ordering::SeqCst));
+
+    core.prepare_for_shutdown();
+
+    assert!(core.queued_inputs.paused());
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.modal.is_none());
+
+    for _ in 0..100 {
+        if core.drain_background() && !core.turn_in_flight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!core.turn_in_flight());
+    assert!(!temp.path().join("shutdown-marker.txt").exists());
+    assert!(!core.transcript.items().iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::AssistantMessage(content)
+                if content == "must not continue after shutdown"
+        )
+    }));
+}
+
+#[test]
+fn shutdown_cancellation_is_a_no_op_when_idle() {
+    let mut core = core();
+    core.cancel_in_flight_for_shutdown();
+    assert!(matches!(core.state, AppState::Idle { .. }));
+    assert!(!core.queued_inputs.paused());
+}
+
+#[test]
+#[should_panic(expected = "worker-channel invariant violated")]
+fn replacing_turn_in_flight_without_terminal_event_is_diagnosed() {
+    // Deep-review P3-e: the live session rides the worker channel and comes
+    // back only through the TurnInFlight receiver's terminal event, so
+    // replacing that state any other way must be loudly diagnosed.
+    let mut core = core();
+    let _session = core.take_idle_session();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.install_state(AppState::Empty);
+}
+
+#[test]
+fn turn_done_licenses_exactly_one_turn_in_flight_replacement() {
+    // The sanctioned path — consuming TurnDone — replaces TurnInFlight with
+    // Idle without tripping the guard, and the license does not linger.
+    let mut core = core();
+    let session = core.take_idle_session();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+
+    assert!(matches!(core.state, AppState::Idle { .. }));
+    assert!(!core.in_flight_session_returned);
 }
 
 #[test]
@@ -1439,7 +1582,7 @@ fn active_turn_frame_shows_working_state_and_next_draft() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1468,7 +1611,7 @@ fn active_turn_live_transcript_prefix_stays_after_commit_boundary() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1477,12 +1620,12 @@ fn active_turn_live_transcript_prefix_stays_after_commit_boundary() {
     assert!(text.contains("line one"), "frame: {text:?}");
     assert!(text.contains("⠋ working"), "frame: {text:?}");
     let first_live = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .position(|line| line.plain_text().contains("line one"))
         .expect("live line");
     assert!(first_live >= frame.committable_rows);
-    assert!(frame.committable_rows < frame.active_frame_lines.len());
+    assert!(frame.committable_rows < frame.active_frame_lines().len());
 }
 
 #[test]
@@ -1504,7 +1647,7 @@ fn active_turn_mutable_live_tail_is_not_committable() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -1543,7 +1686,7 @@ fn active_turn_open_code_fence_is_visible_but_not_committable() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -1582,7 +1725,7 @@ fn active_turn_bare_table_partial_row_stays_outside_commit_boundary() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1594,7 +1737,7 @@ fn active_turn_bare_table_partial_row_stays_outside_commit_boundary() {
         "partial row should be held: {text:?}"
     );
     assert!(frame.committable_rows > 0);
-    assert!(frame.committable_rows < frame.active_frame_lines.len());
+    assert!(frame.committable_rows < frame.active_frame_lines().len());
 }
 
 #[test]
@@ -1815,7 +1958,7 @@ fn live_file_diff_replaces_prior_patch_preview_for_same_path() {
 
     let rendered = core
         .visual_canvas_frame(96)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(|line| line.plain_text())
         .collect::<Vec<_>>()
@@ -1904,7 +2047,7 @@ fn active_turn_finalized_shell_artifacts_do_not_commit_mutable_live_text() {
 
     let frame = core.visual_canvas_frame(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -2071,7 +2214,7 @@ fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
     assert!(frame.committable_rows > 0);
     assert!(frame.committable_rows <= frame.history_rows);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -2086,7 +2229,7 @@ fn ctrl_o_can_expand_previous_artifacts_while_turn_is_in_flight() {
     );
     let refolded = core.visual_canvas_frame(80);
     let refolded_text = refolded
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -3741,7 +3884,7 @@ fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
 
     let frame = core.render_visual_canvas(80);
     let lines: Vec<String> = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect();
@@ -3802,7 +3945,7 @@ fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
 
     let frame = core.render_visual_canvas(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -3913,8 +4056,8 @@ fn working_hud_canvas_line_uses_theme_tokens_for_spinner_and_suffix() {
     core.theme = Theme::warm_ledger();
 
     let frame = core.render_visual_canvas(80);
-    let activity_line = frame
-        .active_frame_lines
+    let frame_lines = frame.active_frame_lines();
+    let activity_line = frame_lines
         .iter()
         .find(|line| line.plain_text().contains("working"))
         .expect("activity line present");
@@ -3944,7 +4087,7 @@ fn working_hud_sits_directly_above_composer_with_no_blank_line() {
 
     let frame = core.render_visual_canvas(80);
     let lines = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -4202,7 +4345,7 @@ fn patch_approval_modal_renders_diff_and_prompt() {
     assert!(contents.contains("beta"));
     let visual = core
         .visual_canvas_frame(80)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -4230,7 +4373,7 @@ fn patch_approval_modal_has_blank_line_before_options_and_gold_selection() {
 
     let lines = core
         .visual_canvas_frame(80)
-        .active_frame_lines
+        .active_frame_lines()
         .into_iter()
         .collect::<Vec<_>>();
     let plain = lines
@@ -4891,6 +5034,17 @@ fn wait_for_patch_diff(core: &mut AppCore) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("patch diff did not appear");
+}
+
+fn wait_for_permission_modal(core: &mut AppCore) {
+    for _ in 0..100 {
+        core.drain_background();
+        if matches!(core.modal, Some(Modal::Permission(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("permission modal did not appear");
 }
 
 fn wait_for_patch_modal(core: &mut AppCore) {

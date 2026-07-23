@@ -1601,3 +1601,38 @@ fn prunes_reasoning_for_model_results_of_ineligible_tool_rounds() {
         CanvasItem::ToolCall { call_id, .. } if call_id == "new-call"
     )));
 }
+
+#[test]
+fn prefolded_assembly_uses_the_callers_project_context_snapshot() {
+    let events = vec![EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "hello".into())]),
+    )];
+    let pinned = PinnedProjectContext {
+        snapshot_event_id: "snapshot-from-caller".to_owned(),
+        candidate_digest: "candidate-digest".to_owned(),
+        rendered: "[euler.project-context.v1]\n  guidance".to_owned(),
+        rendered_digest: "rendered-digest".to_owned(),
+    };
+
+    let canvas = assemble_canvas_prefolded(
+        &events,
+        &AutoCompactionPolicy::default(),
+        &BTreeSet::new(),
+        Some(&pinned),
+    );
+
+    assert!(matches!(
+        canvas.first(),
+        Some(CanvasItem::ProjectContext {
+            event_id,
+            snapshot_digest,
+            rendered,
+        }) if event_id == "snapshot-from-caller"
+            && snapshot_digest == "candidate-digest"
+            && rendered == "[euler.project-context.v1]\n  guidance"
+    ));
+}

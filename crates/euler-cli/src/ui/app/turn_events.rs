@@ -55,6 +55,17 @@ impl AppCore {
     }
 
     pub(super) fn handle_turn_event(&mut self, event: TurnEvent) {
+        if matches!(
+            event,
+            TurnEvent::TurnDone { .. }
+                | TurnEvent::ExtensionDone { .. }
+                | TurnEvent::CompanionDone { .. }
+        ) {
+            // The worker's terminal event carries the live session back to
+            // this thread; license exactly one replacement of the
+            // `TurnInFlight` state (consumed by `install_state`).
+            self.in_flight_session_returned = true;
+        }
         match event {
             TurnEvent::Event(event) => {
                 let is_tool_call = event.kind.as_str() == EventKind::TOOL_CALL;
@@ -197,7 +208,7 @@ impl AppCore {
                 return;
             }
         }
-        self.state = AppState::Idle { session };
+        self.install_state(AppState::Idle { session });
         // The session is back on this thread: refresh the last-known
         // authenticated-provider snapshot used by bottom-surface rebuilds
         // that happen while a turn is in flight.

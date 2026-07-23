@@ -127,16 +127,16 @@ fn ctrl_c_quit_notice_uses_reserved_transient_row_without_growing_frame() {
 
     assert_eq!(after.required_height, before.required_height);
     assert_eq!(
-        after.active_frame_lines.len(),
-        before.active_frame_lines.len()
+        after.active_frame_lines().len(),
+        before.active_frame_lines().len()
     );
     assert!(
-        after.active_frame_lines.iter().any(|line| {
+        after.active_frame_lines().iter().any(|line| {
             line.plain_text() == "ctrl+c again to quit · session saved, /resume restores"
         }),
         "lines: {:?}",
         after
-            .active_frame_lines
+            .active_frame_lines()
             .iter()
             .map(crate::ui::visual_canvas::CanvasLine::plain_text)
             .collect::<Vec<_>>()
@@ -148,12 +148,12 @@ fn ctrl_c_quit_notice_uses_reserved_transient_row_without_growing_frame() {
     );
     let palette = core.visual_canvas_frame(80);
     assert!(
-        !palette.active_frame_lines.iter().any(|line| {
+        !palette.active_frame_lines().iter().any(|line| {
             line.plain_text() == "ctrl+c again to quit · session saved, /resume restores"
         }),
         "lines: {:?}",
         palette
-            .active_frame_lines
+            .active_frame_lines()
             .iter()
             .map(crate::ui::visual_canvas::CanvasLine::plain_text)
             .collect::<Vec<_>>()
@@ -167,7 +167,7 @@ fn transient_notice_composer_and_status_are_separated_by_blank_rows() {
 
     let lines = core
         .visual_canvas_frame(80)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -208,7 +208,7 @@ fn slash_palette_renders_inside_composer_container_with_nothing_below_footer() {
     );
     let after = core.visual_canvas_frame(80);
     let lines = after
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>();
@@ -1223,7 +1223,7 @@ fn finalized_visual_output_renders_in_logical_canvas_without_active_duplicate() 
 
     let frame = core.render_visual_canvas(80);
     let text = frame
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1235,7 +1235,7 @@ fn finalized_visual_output_renders_in_logical_canvas_without_active_duplicate() 
 
     let second = core.render_visual_canvas(80);
     let second_text = second
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1538,7 +1538,7 @@ fn markdown_stream_handoff_keeps_heading_owned_by_one_surface() {
     assert!(core.transcript.live_items().is_empty());
     let active = core
         .visual_canvas_frame(80)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
@@ -1598,7 +1598,7 @@ fn markdown_stream_handoff_keeps_table_owned_by_one_surface() {
     assert!(core.transcript.live_items().is_empty());
     let active = core
         .visual_canvas_frame(80)
-        .active_frame_lines
+        .active_frame_lines()
         .iter()
         .map(crate::ui::visual_canvas::CanvasLine::plain_text)
         .collect::<Vec<_>>()
