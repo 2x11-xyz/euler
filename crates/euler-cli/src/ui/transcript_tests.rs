@@ -3,9 +3,10 @@ use super::{
     text::display_width,
     theme::Theme,
     transcript::{
-        normalized_shell_command, project_events, project_latest_event_for_ui,
+        normalized_shell_command, project_events, projection_event_visits,
         render_items_for_history, render_items_for_history_with_limit, render_line_oriented,
-        transcript_widget, TranscriptItem,
+        replay_latest_event_for_ui, reset_projection_event_visits, transcript_widget,
+        TranscriptItem,
     },
 };
 use euler_event::{object, EventEnvelope, EventKind};
@@ -649,7 +650,7 @@ fn transcript_model_result_same_content_then_followup_assistant_keeps_order() {
         object([("content", "A".into())]),
     ));
     assert_eq!(
-        project_latest_event_for_ui(state.events()),
+        state.project_latest_for_ui(),
         Some(TranscriptItem::AssistantMessage("A".to_owned()))
     );
 
@@ -657,14 +658,14 @@ fn transcript_model_result_same_content_then_followup_assistant_keeps_order() {
         EventKind::ASSISTANT_MESSAGE,
         object([("content", "A".into())]),
     ));
-    assert_eq!(project_latest_event_for_ui(state.events()), None);
+    assert_eq!(state.project_latest_for_ui(), None);
 
     state.push_event(event(
         EventKind::ASSISTANT_MESSAGE,
         object([("content", "B".into())]),
     ));
     assert_eq!(
-        project_latest_event_for_ui(state.events()),
+        state.project_latest_for_ui(),
         Some(TranscriptItem::AssistantMessage("B".to_owned()))
     );
 
@@ -704,6 +705,198 @@ fn transcript_model_result_intervening_assistant_owns_later_same_content_order()
             TranscriptItem::AssistantMessage("A".to_owned()),
         ]
     );
+}
+
+#[test]
+fn incremental_latest_projection_matches_full_replay_reference() {
+    let events = vec![
+        event(
+            EventKind::USER_MESSAGE,
+            object([("content", "run the checks".into())]),
+        ),
+        event(
+            EventKind::MODEL_CALL,
+            object([("provider", "fixture".into()), ("model", "echo".into())]),
+        ),
+        tool_call(
+            "call-1",
+            "run_shell",
+            serde_json::json!({"command": "cargo check"}),
+        ),
+        tool_result("call-1", "run_shell", "exit 0\nok"),
+        tool_call("call-2", "search", serde_json::json!({"query": "todo"})),
+        tool_result("call-2", "search", "src/lib.rs"),
+        tool_call(
+            "call-3",
+            "edit_file",
+            serde_json::json!({"path": "src/main.rs"}),
+        ),
+        event(
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", "call-3".into()),
+                ("name", "edit_file".into()),
+                ("ok", false.into()),
+                ("error", "conflict".into()),
+                ("output", "".into()),
+            ]),
+        ),
+        stream_event(
+            "spawn-1",
+            "agent",
+            None,
+            EventKind::AGENT_SPAWN,
+            object([
+                ("child_agent_id", "child-1".into()),
+                ("persona", "reviewer".into()),
+                ("task", "review the diff".into()),
+            ]),
+        ),
+        // Child-agent tool events: suppressed from the live ledger, but the
+        // call context must still ingest them.
+        stream_event(
+            "child-call",
+            "child-1",
+            None,
+            EventKind::TOOL_CALL,
+            object([
+                ("id", "child-inner".into()),
+                ("name", "run_shell".into()),
+                ("input", serde_json::json!({"command": "ls"})),
+            ]),
+        ),
+        stream_event(
+            "child-result",
+            "child-1",
+            None,
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", "child-inner".into()),
+                ("name", "run_shell".into()),
+                ("ok", true.into()),
+                ("output", "ok".into()),
+            ]),
+        ),
+        stream_event(
+            "msg-1",
+            "agent",
+            None,
+            EventKind::AGENT_MESSAGE,
+            object([
+                ("spawn_event_id", "spawn-1".into()),
+                ("from_agent_id", "child-1".into()),
+                ("payload", serde_json::json!({"note": "found it"})),
+            ]),
+        ),
+        stream_event(
+            "res-1",
+            "agent",
+            Some("spawn-1"),
+            EventKind::AGENT_RESULT,
+            object([
+                ("child_agent_id", "child-1".into()),
+                ("ok", true.into()),
+                ("summary", "done".into()),
+            ]),
+        ),
+        event(
+            EventKind::MODEL_RESULT,
+            object([("content", "answer".into())]),
+        ),
+        event(
+            EventKind::ASSISTANT_MESSAGE,
+            object([("content", "answer".into())]),
+        ),
+        event(
+            EventKind::ASSISTANT_MESSAGE,
+            object([("content", "follow-up".into())]),
+        ),
+        event(
+            EventKind::MODEL_DELTA,
+            object([("kind", "text".into()), ("delta", "x".into())]),
+        ),
+    ];
+
+    let mut state = TranscriptState::default();
+    for (index, next) in events.iter().enumerate() {
+        state.push_event(next.clone());
+        assert_eq!(
+            state.project_latest_for_ui(),
+            replay_latest_event_for_ui(&events[..=index]),
+            "incremental projection diverged from the full-replay reference at event {index}"
+        );
+    }
+
+    // Anchor a few concrete expectations so the parity loop can't pass on a
+    // mutually wrong pair: the run result resolved its call's command, and
+    // the child-agent events projected nothing.
+    assert!(matches!(
+        replay_latest_event_for_ui(&events[..4]),
+        Some(TranscriptItem::ToolRun { ref command, ok: true, .. }) if command == "cargo check"
+    ));
+    assert_eq!(replay_latest_event_for_ui(&events[..10]), None);
+    assert_eq!(replay_latest_event_for_ui(&events[..11]), None);
+}
+
+#[test]
+fn streaming_projection_work_stays_linear_in_event_count() {
+    let mut state = TranscriptState::default();
+    let rounds = 50u64;
+    reset_projection_event_visits();
+    for index in 0..rounds {
+        let id = format!("call-{index}");
+        let command = format!("echo {index}");
+        state.push_event(tool_call(
+            &id,
+            "run_shell",
+            serde_json::json!({ "command": command }),
+        ));
+        assert_eq!(state.project_latest_for_ui(), None);
+        state.push_event(tool_result(&id, "run_shell", "ok"));
+        match state.project_latest_for_ui() {
+            Some(TranscriptItem::ToolRun {
+                command: projected,
+                ok: true,
+                ..
+            }) => assert_eq!(projected, command),
+            other => panic!("expected ToolRun for round {index}, got {other:?}"),
+        }
+    }
+    // Exactly one projection visit per pushed event: 2 per round. The
+    // retired full-replay implementation visited the whole history per
+    // event (~(2N)²/2 visits for N rounds), so any reintroduced replay on
+    // the streaming path breaks this exact bound.
+    assert_eq!(projection_event_visits(), 2 * rounds);
+}
+
+#[test]
+fn resume_seeded_projection_matches_results_to_pre_resume_calls() {
+    let history = vec![
+        event(
+            EventKind::USER_MESSAGE,
+            object([("content", "run the tests".into())]),
+        ),
+        tool_call(
+            "resumed-call",
+            "run_shell",
+            serde_json::json!({"command": "cargo nextest run"}),
+        ),
+    ];
+
+    // The resume path (`rebuild_transcript_from_events`) seeds a fresh
+    // TranscriptState by replaying history through push_event — the
+    // projection context must carry across so a post-resume result still
+    // resolves its pre-resume call.
+    let mut state = TranscriptState::default();
+    for past in &history {
+        state.push_event(past.clone());
+    }
+    state.push_event(tool_result("resumed-call", "run_shell", "ok"));
+
+    match state.project_latest_for_ui() {
+        Some(TranscriptItem::ToolRun { command, .. }) => assert_eq!(command, "cargo nextest run"),
+        other => panic!("expected ToolRun resolved from resumed history, got {other:?}"),
+    }
 }
 
 #[test]
@@ -4246,6 +4439,21 @@ fn event_at(
 ) -> EventEnvelope {
     let mut event = event(kind, payload);
     event.ts = ts.to_owned();
+    event
+}
+
+/// Event with an explicit id / agent / parent, for sequences where later
+/// events reference earlier ones (companion spawn joins, child-agent
+/// suppression).
+fn stream_event(
+    id: &str,
+    agent: &str,
+    parent: Option<&str>,
+    kind: &'static str,
+    payload: euler_event::JsonObject,
+) -> EventEnvelope {
+    let mut event = EventEnvelope::new("session", agent, parent.map(str::to_owned), kind, payload);
+    event.id = id.to_owned();
     event
 }
 

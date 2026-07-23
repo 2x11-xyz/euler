@@ -305,8 +305,21 @@ fn latest_accepted_event_id(path: &Path) -> Result<Option<String>, EventWakeErro
         Err(error) => return Err(error.into()),
     };
     let mut latest = None;
-    for line in accepted_prefix_lines(&content) {
-        let event = EventEnvelope::from_json_line(line)
+    for line in numbered_accepted_prefix_lines(&content) {
+        if let Some(nul) = nul_offset_in_line(line.text) {
+            // EventWakeError lives in euler-sdk and has no corruption
+            // variant; an InvalidData io error keeps the classification
+            // (corruption, not a parse failure) without widening that crate.
+            return Err(EventWakeError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "provenance log is corrupted at line {} (byte offset {}): unexpected NUL bytes",
+                    line.number,
+                    line.offset + nul
+                ),
+            )));
+        }
+        let event = EventEnvelope::from_json_line(line.text)
             .map_err(|source| EventWakeError::InvalidLine { source })?;
         latest = Some(event.id);
     }
@@ -322,8 +335,14 @@ pub fn read_provenance(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>, Pro
         .join("blobs");
     let mut events = Vec::new();
 
-    for line in accepted_prefix_lines(&content) {
-        match EventEnvelope::from_json_line(line) {
+    for line in numbered_accepted_prefix_lines(&content) {
+        if let Some(nul) = nul_offset_in_line(line.text) {
+            return Err(ProvenanceReadError::CorruptedLine {
+                line: line.number,
+                offset: line.offset + nul,
+            });
+        }
+        match EventEnvelope::from_json_line(line.text) {
             Ok(event) => events.push(rehydrate_blobs(event, &blob_dir)?),
             Err(source) => return Err(ProvenanceReadError::InvalidLine { source }),
         }
@@ -397,13 +416,17 @@ pub fn query_provenance(
     let cursor = query.after_event_id.as_deref();
     let mut truncated = false;
     let mut next_after_event_id = None;
+    let mut line_number = 0usize;
+    let mut file_offset = 0usize;
 
-    while let Some(line) = next_accepted_query_line(&mut reader, &mut line)? {
+    while let Some((line, consumed)) = next_accepted_query_line(&mut reader, &mut line)? {
+        line_number += 1;
+        let line_offset = file_offset;
+        file_offset += consumed;
         if line.trim().is_empty() {
             continue;
         }
-        let event = EventEnvelope::from_json_line(line)
-            .map_err(|source| ProvenanceQueryError::InvalidLine { source })?;
+        let event = parse_accepted_query_line(line, line_number, line_offset)?;
         if !cursor_seen {
             if Some(event.id.as_str()) == cursor {
                 cursor_seen = true;
@@ -453,10 +476,28 @@ pub fn query_provenance(
     })
 }
 
+fn parse_accepted_query_line(
+    line: &str,
+    line_number: usize,
+    line_offset: usize,
+) -> Result<EventEnvelope, ProvenanceQueryError> {
+    if let Some(nul) = nul_offset_in_line(line) {
+        return Err(ProvenanceQueryError::CorruptedLine {
+            line: line_number,
+            offset: line_offset + nul,
+        });
+    }
+    EventEnvelope::from_json_line(line)
+        .map_err(|source| ProvenanceQueryError::InvalidLine { source })
+}
+
+/// Returns the accepted line text and the raw byte count consumed from the
+/// reader (including the newline), so callers can track file offsets while
+/// streaming.
 fn next_accepted_query_line<'a>(
     reader: &mut impl BufRead,
     buffer: &'a mut Vec<u8>,
-) -> Result<Option<&'a str>, ProvenanceQueryError> {
+) -> Result<Option<(&'a str, usize)>, ProvenanceQueryError> {
     buffer.clear();
     let read = reader.read_until(b'\n', buffer)?;
     if read == 0 || !buffer.ends_with(b"\n") {
@@ -464,9 +505,11 @@ fn next_accepted_query_line<'a>(
     }
     let line = buffer.strip_suffix(b"\n").expect("checked newline suffix");
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    std::str::from_utf8(line).map(Some).map_err(|source| {
-        ProvenanceQueryError::Io(io::Error::new(io::ErrorKind::InvalidData, source))
-    })
+    std::str::from_utf8(line)
+        .map(|text| Some((text, read)))
+        .map_err(|source| {
+            ProvenanceQueryError::Io(io::Error::new(io::ErrorKind::InvalidData, source))
+        })
 }
 
 impl ProvenanceQuery {
@@ -480,6 +523,21 @@ pub(crate) fn accepted_prefix_lines(content: &str) -> Vec<&str> {
 }
 
 fn accepted_prefix_line_iter(content: &str) -> impl Iterator<Item = &str> {
+    numbered_accepted_prefix_lines(content).map(|line| line.text)
+}
+
+/// One accepted-prefix line with the position diagnostics need to name where
+/// a log went bad: its 1-based physical line number and the byte offset of
+/// the line start within the log content.
+pub(crate) struct AcceptedLine<'a> {
+    pub(crate) number: usize,
+    pub(crate) offset: usize,
+    pub(crate) text: &'a str,
+}
+
+pub(crate) fn numbered_accepted_prefix_lines(
+    content: &str,
+) -> impl Iterator<Item = AcceptedLine<'_>> {
     let prefix = if content.ends_with('\n') {
         content
     } else {
@@ -487,7 +545,31 @@ fn accepted_prefix_line_iter(content: &str) -> impl Iterator<Item = &str> {
             .rsplit_once('\n')
             .map_or("", |(accepted, _torn)| accepted)
     };
-    prefix.lines().filter(|line| !line.trim().is_empty())
+    let mut offset = 0;
+    prefix
+        .split_inclusive('\n')
+        .enumerate()
+        .filter_map(move |(index, raw)| {
+            let start = offset;
+            offset += raw.len();
+            let text = raw.strip_suffix('\n').unwrap_or(raw);
+            let text = text.strip_suffix('\r').unwrap_or(text);
+            (!text.trim().is_empty()).then_some(AcceptedLine {
+                number: index + 1,
+                offset: start,
+                text,
+            })
+        })
+}
+
+/// Byte offset of the first NUL byte within `line`, if any.
+///
+/// Writers never emit NUL: event lines are JSON, which escapes control
+/// characters. A NUL run inside an accepted line is the characteristic
+/// signature of a zero-filled page left by a power-loss tear, so readers
+/// must classify it as log corruption rather than a merely unparsable line.
+pub(crate) fn nul_offset_in_line(line: &str) -> Option<usize> {
+    line.bytes().position(|byte| byte == 0)
 }
 
 fn rehydrate_blobs(
@@ -991,6 +1073,10 @@ pub enum ProvenanceReadError {
         #[source]
         source: serde_json::Error,
     },
+    #[error(
+        "provenance log is corrupted at line {line} (byte offset {offset}): unexpected NUL bytes"
+    )]
+    CorruptedLine { line: usize, offset: usize },
     #[error("missing provenance blob for field {field}: {hash} at {}", path.display())]
     MissingBlob {
         field: String,
@@ -1039,6 +1125,10 @@ pub enum ProvenanceQueryError {
         #[source]
         source: serde_json::Error,
     },
+    #[error(
+        "provenance log is corrupted at line {line} (byte offset {offset}): unexpected NUL bytes"
+    )]
+    CorruptedLine { line: usize, offset: usize },
     #[error("missing provenance blob for field {field}: {hash} at {}", path.display())]
     MissingBlob {
         field: String,

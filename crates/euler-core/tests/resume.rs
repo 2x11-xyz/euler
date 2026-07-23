@@ -1081,7 +1081,89 @@ fn resume_read_errors_on_malformed_non_final_line() {
 
     let error = read_resume_prefix(&log).expect_err("malformed non-final line");
 
-    assert!(matches!(error, ResumeError::InvalidLine { source: _ }));
+    assert!(matches!(error, ResumeError::InvalidLine { line: 1, .. }));
+    assert!(error.to_string().starts_with("invalid provenance line 1:"));
+}
+
+#[test]
+fn resume_read_classifies_interior_nul_run_as_corruption() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let first = user_message("first");
+    let last = user_message("last");
+    let first_line = first.to_json_line().expect("serialize first");
+    fs::write(
+        &log,
+        format!(
+            "{first_line}\n\0\0\0\0\n{}\n",
+            last.to_json_line().expect("serialize last")
+        ),
+    )
+    .expect("write log");
+
+    let error = read_resume_prefix(&log).expect_err("NUL run is corruption");
+
+    let expected_offset = first_line.len() + 1;
+    assert!(matches!(
+        error,
+        ResumeError::CorruptedLog { line: 2, offset } if offset == expected_offset
+    ));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "session log is corrupted at line 2 (byte offset {expected_offset}): \
+             unexpected NUL bytes; the session cannot be resumed"
+        )
+    );
+}
+
+#[test]
+fn resume_attempt_on_corrupt_log_reports_plain_language_error() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    fs::write(
+        &log,
+        format!(
+            "{}\n\0\0\0\0\n",
+            user_message("kept").to_json_line().expect("serialize")
+        ),
+    )
+    .expect("write log");
+
+    let error = match resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("corrupt log must not resume"),
+        Err(error) => error,
+    };
+
+    let message = error.to_string();
+    assert!(
+        message.contains("corrupted at line 2") && message.contains("unexpected NUL bytes"),
+        "{message}"
+    );
+}
+
+#[test]
+fn resume_read_classifies_nul_run_inside_line_as_corruption() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let event = user_message("event");
+    let line = event.to_json_line().expect("serialize");
+    // A zero-filled page can land mid-line: the bytes before the run may
+    // even still look like JSON. Classify by the NUL run, not parse failure.
+    let (head, _tail) = line.split_at(line.len() / 2);
+    fs::write(&log, format!("{head}\0\0\0\0\n{line}\n")).expect("write log");
+
+    let error = read_resume_prefix(&log).expect_err("mid-line NUL run is corruption");
+
+    assert!(matches!(
+        error,
+        ResumeError::CorruptedLog { line: 1, offset } if offset == head.len()
+    ));
 }
 
 fn write_events(path: &std::path::Path, events: &[EventEnvelope]) {

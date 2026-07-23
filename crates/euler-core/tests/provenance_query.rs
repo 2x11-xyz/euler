@@ -848,3 +848,29 @@ fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
 }
+
+#[test]
+fn provenance_query_interior_nul_run_reports_line_and_byte_offset() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let first = content_event(EventKind::USER_MESSAGE, "kept");
+    let first_line = first.to_json_line().expect("serialize");
+    // Second line: three JSON-looking bytes, then a NUL run — a torn page.
+    fs::write(&log, format!("{first_line}\n{{\"v\0\0\0\n")).expect("write log");
+
+    let error = query_provenance(&log, ProvenanceQuery::new(10)).expect_err("corrupted");
+
+    let ProvenanceQueryError::CorruptedLine { line, offset } = error else {
+        panic!("expected CorruptedLine, got: {error}");
+    };
+    assert_eq!(line, 2);
+    // Offset is file-absolute: the first line plus its newline, plus the
+    // three bytes before the NUL.
+    assert_eq!(offset, first_line.len() + 1 + 3);
+    assert_eq!(
+        ProvenanceQueryError::CorruptedLine { line, offset }.to_string(),
+        format!(
+            "provenance log is corrupted at line 2 (byte offset {offset}): unexpected NUL bytes"
+        )
+    );
+}

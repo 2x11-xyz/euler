@@ -589,6 +589,11 @@ fn resume_detail(record: &SessionRecord) -> String {
     if let Some(root) = record.root() {
         parts.push(root.display().to_string());
     }
+    // Surface the projection diagnosis on the existing detail line so an
+    // unresumable session names what is wrong instead of an opaque status.
+    if let Some(reason) = record.invalid_reason() {
+        parts.push(format!("unresumable: {reason}"));
+    }
     parts.join("  ")
 }
 
@@ -1104,6 +1109,31 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(!items.iter().any(|item| item.id == current.id()));
         assert!(items.iter().any(|item| item.id == prior.id()));
+    }
+
+    #[test]
+    fn resume_item_preview_names_corruption_for_invalid_session() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+        let store = SessionStore::new(home).expect("store");
+        let record = store.create_session().expect("session");
+        // A zero-filled interior line: the power-loss tear signature.
+        std::fs::write(record.events_path(), b"\x00\x00\x00\x00\n").expect("corrupt events");
+
+        let items = resume_items_from_records(store.list_sessions().expect("sessions"), None);
+
+        let item = items
+            .iter()
+            .find(|item| item.id == record.id())
+            .expect("corrupt session listed");
+        let preview = item.preview.as_deref().expect("preview");
+        assert!(
+            preview.contains(
+                "unresumable: session log is corrupted at line 1 (byte offset 0): \
+                 unexpected NUL bytes; the session cannot be resumed"
+            ),
+            "{preview}"
+        );
     }
 
     #[test]

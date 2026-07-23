@@ -158,6 +158,11 @@ pub(crate) fn approval_title(capability: &str) -> &'static str {
     match capability {
         "shell-exec" => "Run command?",
         "fs-write" => "Edit file?",
+        // Reachable in the default posture since the sensitive-basename
+        // escalation (capabilities contract): fs-read only asks for files
+        // whose names match the sensitive list, or when the user set reads
+        // to ask.
+        "fs-read" => "Read file?",
         _ => LEGACY_APPROVAL_LABEL,
     }
 }

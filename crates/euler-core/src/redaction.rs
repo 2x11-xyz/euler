@@ -168,14 +168,37 @@ const MIN_VALUE_LEN: usize = 8;
 /// Minimum run length after a known prefix before it reads as a credential.
 const MIN_TOKEN_TAIL: usize = 12;
 
-/// Environment variables whose values are secret-tainted when present.
-/// Mirrors the env-scrub list in `tools.rs` — both lists must grow together.
-const SECRET_ENV_NAMES: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "OPENROUTER_API_KEY",
-    "XAI_API_KEY",
-];
+/// Environment-variable NAME classifier for secret-bearing values: the
+/// explicit provider keys (all also covered by the `_API_KEY` suffix rule —
+/// listed so the guarantee survives rule edits) plus any `*_API_KEY` /
+/// `*_ACCESS_KEY` suffix or a KEY/TOKEN/SECRET/CREDENTIAL(S)/PASSWORD
+/// underscore segment, case-insensitive. The single classifier behind BOTH
+/// the agent-subprocess env scrub (`tools.rs`) and
+/// [`SecretRedactor::from_env`] known-value seeding — one classifier, not a
+/// drifting mirror (deep review P2-c: `AWS_SECRET_ACCESS_KEY` was scrubbed
+/// from subprocess env but its value never became a redaction known-value).
+///
+/// Deliberately NOT here: `EULER_AUTH_FILE`. Its value is a path, not a
+/// credential — the subprocess scrub removes it as a parent control
+/// (`is_parent_control_env_name`), and registering a home path as a
+/// redaction pattern would over-redact ordinary output.
+pub(crate) fn is_secret_env_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "OPENROUTER_API_KEY" | "XAI_API_KEY"
+    ) || upper.ends_with("_API_KEY")
+        || upper.ends_with("_ACCESS_KEY")
+        || upper.split('_').any(|segment| {
+            matches!(
+                segment,
+                "KEY" | "TOKEN" | "SECRET" | "CREDENTIAL" | "CREDENTIALS" | "PASSWORD"
+            )
+        })
+}
 
 /// Credential prefixes redacted by shape. Each entry is (prefix, charset).
 const TOKEN_PREFIXES: &[&str] = &[
@@ -206,11 +229,18 @@ impl SecretRedactor {
         Self::default()
     }
 
-    /// Seed from the configured secret environment variables.
+    /// Seed from every environment variable whose name classifies as
+    /// secret-bearing ([`is_secret_env_name`] — the same classifier the
+    /// agent-subprocess env scrub uses). [`Self::add_value`]'s minimum-length
+    /// guard still applies, so short values (`true`, `1`) that would
+    /// over-redact ordinary output are never registered.
     pub fn from_env() -> Self {
         let redactor = Self::new();
-        for name in SECRET_ENV_NAMES {
-            if let Ok(value) = std::env::var(name) {
+        for (name, value) in std::env::vars_os() {
+            if !is_secret_env_name(&name) {
+                continue;
+            }
+            if let Some(value) = value.to_str() {
                 redactor.add_value(value);
             }
         }
@@ -389,6 +419,55 @@ fn redact_token_shapes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_env_name_classifier_covers_broad_shapes() {
+        use std::ffi::OsStr;
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "MY_SERVICE_API_KEY",
+            "DEPLOY_TOKEN",
+            "db_password",
+            "GENERIC_CREDENTIALS",
+        ] {
+            assert!(is_secret_env_name(OsStr::new(name)), "must match: {name}");
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "EULER_TOKENIZER_MODE",
+            // A path to credentials, not a credential: scrubbed from
+            // subprocess env as a parent control, never a redaction value.
+            "EULER_AUTH_FILE",
+        ] {
+            assert!(
+                !is_secret_env_name(OsStr::new(name)),
+                "must not match: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_seeds_known_values_for_broadly_classified_names() {
+        // Deep review P2-c: the seeding list drifted from the subprocess
+        // scrub classifier, so AWS-style values never became known values.
+        // nextest runs one process per test, so env mutation is hermetic.
+        std::env::set_var(
+            "EULER_REDACTION_TEST_ACCESS_KEY",
+            "seeded-env-canary-value-42",
+        );
+        // Short values must not become redaction patterns even when the
+        // name classifies as secret-bearing.
+        std::env::set_var("EULER_REDACTION_TEST_TOKEN", "true");
+
+        let redactor = SecretRedactor::from_env();
+        std::env::remove_var("EULER_REDACTION_TEST_ACCESS_KEY");
+        std::env::remove_var("EULER_REDACTION_TEST_TOKEN");
+
+        let out = redactor.redact("before seeded-env-canary-value-42 after true end");
+        assert_eq!(out, format!("before {REDACTED} after true end"));
+    }
 
     #[test]
     fn known_values_are_replaced_everywhere() {

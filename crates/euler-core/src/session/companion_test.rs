@@ -414,6 +414,40 @@ fn companion_allow_session_decision_is_never_folded_on_resume() {
 }
 
 #[test]
+fn companion_sensitive_basename_read_prompts_despite_session_allow() {
+    // Deep review P1-b, companion twin: the escalation lives in the shared
+    // request builder + gate, so the companion loop must ask for `.env`
+    // exactly like the root session even though fs-read is session-allow.
+    let (_temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-env".to_owned(),
+                name: "read_file".to_owned(),
+                input: json!({"path": ".env"}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]),
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    std::fs::write(session.config.root.join(".env"), "API_KEY=companion-canary").expect(".env");
+
+    let summary = session
+        .spawn_companion(task_with_caps([Capability::FsRead]))
+        .expect("companion");
+
+    assert!(summary.result.ok());
+    let prompt = only_event(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompt.payload["capability"], json!("fs-read"));
+    assert!(prompt.payload["reason"]
+        .as_str()
+        .expect("reason")
+        .contains(".env"));
+    let decision = only_event(session.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decision.payload["mode"], json!("ask"));
+    assert_eq!(decision.payload["allowed"], json!(true));
+}
+
+#[test]
 fn companion_envelope_never_widens_parent_modes() {
     let ask = run_single_read_with_mode(ApprovalMode::Ask, [Capability::FsRead]);
     assert_eq!(permission_modes(&ask), vec!["ask"]);
