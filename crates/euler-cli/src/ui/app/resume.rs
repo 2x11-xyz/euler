@@ -175,9 +175,9 @@ impl AppCore {
         self.permission_rx = resume.channels.request_rx;
         self.reply_tx = resume.channels.reply_tx;
         self.primary_agent_id = primary_agent_id;
-        self.state = AppState::Idle {
+        self.install_state(AppState::Idle {
             session: Box::new(resume.session),
-        };
+        });
         self.status.provider = resume.active_target.provider.clone();
         self.status.model = resume.active_target.model.clone();
         self.status.session_id = Some(session_id.clone());

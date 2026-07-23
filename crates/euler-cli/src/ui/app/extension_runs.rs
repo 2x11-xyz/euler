@@ -122,14 +122,14 @@ impl AppCore {
             }
             state @ AppState::TurnInFlight { .. } => {
                 let label = request.label();
-                self.state = state;
+                self.install_state(state);
                 self.pending_runs
                     .push_back(PendingRunRequest::Extension(request));
                 self.notice = Some(format!("queued {label}"));
                 CoreEffect::Render
             }
             AppState::Empty => {
-                self.state = AppState::Empty;
+                self.install_state(AppState::Empty);
                 self.notice_item("extension run needs an active session".to_owned())
             }
         }
@@ -231,11 +231,11 @@ impl AppCore {
                 session,
             });
         });
-        self.state = AppState::TurnInFlight {
+        self.install_state(AppState::TurnInFlight {
             worker_rx,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
-        };
+        });
         self.in_flight_label = Some(label);
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;

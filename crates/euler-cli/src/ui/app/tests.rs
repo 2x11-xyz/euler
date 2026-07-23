@@ -934,6 +934,84 @@ fn escape_interrupts_in_flight_turn() {
 }
 
 #[test]
+fn shutdown_cancellation_sets_in_flight_turn_interrupt_flag() {
+    // Deep-review P3-d: /quit mid-turn publishes the same cancel signal the
+    // esc interrupt uses so the detached worker's provider round stops
+    // promptly instead of running until process exit.
+    let mut core = core_with_provider(SlowEchoProvider);
+    core.handle_input(key(KeyCode::Char('h')));
+    core.handle_input(key(KeyCode::Enter));
+    assert!(core.turn_in_flight());
+
+    core.cancel_in_flight_for_shutdown();
+
+    // Pause-before-flag, same ordering contract as `handle_interrupt`.
+    assert!(core.queued_inputs.paused());
+    let AppState::TurnInFlight { interrupt_flag, .. } = &core.state else {
+        panic!("turn should still be in flight");
+    };
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+
+    // The worker observes the flag and returns the session; drain so the
+    // thread finishes within the test.
+    for _ in 0..50 {
+        if core.drain_background() && !core.turn_in_flight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!core.turn_in_flight());
+}
+
+#[test]
+fn shutdown_cancellation_is_a_no_op_when_idle() {
+    let mut core = core();
+    core.cancel_in_flight_for_shutdown();
+    assert!(matches!(core.state, AppState::Idle { .. }));
+    assert!(!core.queued_inputs.paused());
+}
+
+#[test]
+#[should_panic(expected = "worker-channel invariant violated")]
+fn replacing_turn_in_flight_without_terminal_event_is_diagnosed() {
+    // Deep-review P3-e: the live session rides the worker channel and comes
+    // back only through the TurnInFlight receiver's terminal event, so
+    // replacing that state any other way must be loudly diagnosed.
+    let mut core = core();
+    let _session = core.take_idle_session();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.install_state(AppState::Empty);
+}
+
+#[test]
+fn turn_done_licenses_exactly_one_turn_in_flight_replacement() {
+    // The sanctioned path — consuming TurnDone — replaces TurnInFlight with
+    // Idle without tripping the guard, and the license does not linger.
+    let mut core = core();
+    let session = core.take_idle_session();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Complete,
+        session,
+    });
+
+    assert!(matches!(core.state, AppState::Idle { .. }));
+    assert!(!core.in_flight_session_returned);
+}
+
+#[test]
 fn uppercase_ctrl_c_without_shift_interrupts_in_flight_and_does_not_copy() {
     let mut core = core();
     let writes = Arc::new(Mutex::new(Vec::new()));
