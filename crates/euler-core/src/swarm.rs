@@ -428,11 +428,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SwarmConfigError> {
             .map_err(|source| io_error(source, &temp_path))?;
         file.flush()
             .map_err(|source| io_error(source, &temp_path))?;
-        file.sync_data()
+        crate::durability::sync_file_data(&file, &temp_path)
             .map_err(|source| io_error(source, &temp_path))?;
     }
     fs::rename(&temp_path, path).map_err(|source| io_error(source, path))?;
-    crate::home::sync_dir(dir).map_err(|source| io_error(source, dir))?;
+    crate::durability::sync_dir(dir).map_err(|source| io_error(source, dir))?;
     Ok(())
 }
 
@@ -594,5 +594,45 @@ mod tests {
         );
         let unlabeled = SwarmConfig::from_targets(&["a::b"], None).expect("config");
         assert_eq!(unlabeled.personas(), None);
+    }
+
+    #[test]
+    fn save_surfaces_injected_sync_failures_and_keeps_previous_config() {
+        use crate::durability::fault::{arm_matching, Op};
+
+        let temp = tempfile::tempdir().expect("temp");
+        let store = SwarmConfigStore::at_path(temp.path().join(SWARM_CONFIG_FILE));
+        let first = SwarmConfig::from_targets(&["anthropic::claude-opus-5"], None).expect("config");
+        store.save(&first).expect("initial save");
+
+        // Temp-file sync failure happens before the rename, so the previous
+        // config file must remain intact and loadable.
+        let second = SwarmConfig::from_targets(&["openai::gpt-5.5"], Some(4096)).expect("config");
+        {
+            let guard = arm_matching(Op::FileSync, |path| {
+                path.extension().is_some_and(|extension| extension == "tmp")
+            });
+            let error = store.save(&second).expect_err("temp-file sync failure");
+            assert!(matches!(error, SwarmConfigError::Io { .. }));
+            assert!(guard.fired());
+        }
+        assert_eq!(
+            store.load().expect("load after temp sync failure"),
+            Some(first)
+        );
+
+        // Directory-sync failure (the swallowed-fsync class fixed in PR
+        // #194): the error must propagate, and the file stays loadable.
+        {
+            let dir = temp.path().to_path_buf();
+            let guard = arm_matching(Op::DirSync, move |path| path == dir);
+            let error = store.save(&second).expect_err("dir sync failure");
+            assert!(matches!(error, SwarmConfigError::Io { .. }));
+            assert!(guard.fired());
+        }
+        assert_eq!(
+            store.load().expect("load after dir sync failure"),
+            Some(second)
+        );
     }
 }

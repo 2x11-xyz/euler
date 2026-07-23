@@ -1415,3 +1415,33 @@ fn write_managed_process_manifest(dir: &std::path::Path, id: &str, version: &str
 fn mode(path: &std::path::Path) -> u32 {
     fs::metadata(path).expect("metadata").permissions().mode() & 0o777
 }
+
+#[test]
+fn registry_install_removes_snapshot_when_inventory_sync_fault_is_injected() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let (_temp, registry) = registry();
+    let package_dir = extension_dir("example-extension");
+    let package = load_extension_package(package_dir.path()).expect("package");
+    let installed_dir =
+        registry.installed_package_dir(&package.descriptor.id, &package.manifest_sha256);
+
+    // Fail the inventory temp-file sync (a pre-rename failure, like the
+    // symlinked-tmp variant above, but injected directly at the seam).
+    let inventory_tmp = registry.link_inventory_tmp_path();
+    let guard = arm_matching(Op::FileSync, move |path| path == inventory_tmp);
+    let error = registry
+        .install_package(package)
+        .expect_err("injected inventory sync failure");
+    assert!(guard.fired());
+    drop(guard);
+
+    assert!(matches!(error, ExtensionRegistryError::Io(_)));
+    // The manifest snapshot lands before the inventory write; compensation
+    // must remove it so the failed install leaves no orphan behind.
+    assert!(!installed_dir.exists());
+    assert!(registry
+        .linked_extension("example-extension")
+        .expect("lookup")
+        .is_none());
+}
