@@ -184,6 +184,16 @@ pub struct ResumedAppState {
 
 pub struct AppCore {
     state: AppState,
+    /// Worker-channel invariant witness (deep-review P3-e): while a turn is
+    /// in flight the live `Box<Session>` exists only on the worker thread and
+    /// returns exclusively through the `TurnInFlight` receiver's terminal
+    /// event (`TurnDone` / `ExtensionDone` / `CompanionDone`); every
+    /// worker→UI send is `let _ = tx.send(..)`, so dropping that receiver any
+    /// other way silently loses the session. `handle_turn_event` sets this
+    /// when it consumes a terminal event, licensing exactly one replacement
+    /// of the `TurnInFlight` state; `install_state` consumes it and
+    /// diagnoses any unlicensed replacement.
+    in_flight_session_returned: bool,
     permission_rx: Receiver<PermissionPrompt>,
     reply_tx: Sender<PermissionReply>,
     bottom: BottomSurface,
@@ -658,6 +668,10 @@ impl App {
     fn shutdown(&mut self) -> Result<bool> {
         if self.core.turn_in_flight() {
             self.core.deny_open_modal();
+            // Deep-review P3-d: signal the in-flight worker before the
+            // detached thread is abandoned so provider requests cancel
+            // promptly instead of running until process exit. Never joins.
+            self.core.cancel_in_flight_for_shutdown();
         }
         let lines = self.core.exit_recap_lines();
         // Clean clear (§5.8): drop the live band — the echoed `/quit`
@@ -907,6 +921,7 @@ impl AppCore {
             state: AppState::Idle {
                 session: Box::new(session),
             },
+            in_flight_session_returned: false,
             permission_rx: channels.request_rx,
             reply_tx: channels.reply_tx,
             bottom: BottomSurface::new(boot.initial_context),
@@ -1165,6 +1180,25 @@ impl AppCore {
         }
         self.quit_armed = Some(Instant::now());
         self.handle_interrupt()
+    }
+
+    /// Shutdown hygiene (deep-review P3-d): a /quit mid-turn must not leave
+    /// the detached turn worker driving its provider HTTP round until
+    /// process exit. Publish the exact signal the esc interrupt uses —
+    /// pause the steering queue, then set the turn's cancel flag (the round
+    /// loop polls it at stream and round boundaries) — and return without
+    /// joining, so exit stays prompt. Companion and extension workers carry
+    /// a flag nothing observes yet (`handle_interrupt` reports the same
+    /// gap to the user), and the catalog refresh is a single short HTTP
+    /// call with no cancel signal; those threads run to completion and are
+    /// dropped with the process.
+    pub fn cancel_in_flight_for_shutdown(&mut self) {
+        if let AppState::TurnInFlight { interrupt_flag, .. } = &self.state {
+            // Same ordering contract as `handle_interrupt`: a worker that
+            // observes the flag must also observe the pause.
+            self.queued_inputs.set_paused(true);
+            interrupt_flag.store(true, Ordering::SeqCst);
+        }
     }
 
     pub fn drain_background(&mut self) -> bool {
@@ -2037,11 +2071,34 @@ impl AppCore {
         CoreEffect::Render
     }
 
+    /// The single seam for `self.state` writes (deep-review P3-e). Replacing
+    /// a `TurnInFlight` state drops the only receiver for the worker that
+    /// owns the live session, so it is legal only right after
+    /// `handle_turn_event` consumed that worker's terminal event
+    /// (`in_flight_session_returned`). Any other replacement is a bug:
+    /// loudly diagnosed here rather than silently losing the session.
+    /// (`std::mem::replace` take-and-restore sites hold the state in a local
+    /// and put it back through this method in the same expression, so the
+    /// receiver never escapes.)
+    fn install_state(&mut self, next: AppState) {
+        let licensed = std::mem::take(&mut self.in_flight_session_returned);
+        if matches!(self.state, AppState::TurnInFlight { .. }) && !licensed {
+            debug_assert!(
+                false,
+                "worker-channel invariant violated: TurnInFlight replaced without consuming its terminal event"
+            );
+            self.push_notice_item(
+                "internal error: in-flight worker state was replaced before its session returned; the previous session may be lost — please report this".to_owned(),
+            );
+        }
+        self.state = next;
+    }
+
     fn take_idle_session(&mut self) -> Box<Session<TuiDecider>> {
         match std::mem::replace(&mut self.state, AppState::Empty) {
             AppState::Idle { session } => session,
             state => {
-                self.state = state;
+                self.install_state(state);
                 unreachable!("submit checked idle state")
             }
         }
@@ -2085,11 +2142,11 @@ impl AppCore {
             };
             let _ = worker_tx.send(TurnEvent::TurnDone { outcome, session });
         });
-        self.state = AppState::TurnInFlight {
+        self.install_state(AppState::TurnInFlight {
             worker_rx,
             interrupt_flag,
             started_at: Instant::now(),
-        };
+        });
         self.in_flight_label = Some("turn".to_owned());
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
@@ -2307,9 +2364,9 @@ impl AppCore {
         self.permission_rx = channels.request_rx;
         self.reply_tx = channels.reply_tx;
         self.primary_agent_id = primary_agent_id;
-        self.state = AppState::Idle {
+        self.install_state(AppState::Idle {
             session: Box::new(session),
-        };
+        });
         self.status.provider = active_target.provider;
         self.status.model = active_target.model;
         self.status.session_id = Some(session_id.clone());
@@ -2342,14 +2399,14 @@ impl AppCore {
                 CoreEffect::Render
             }
             state @ AppState::TurnInFlight { .. } => {
-                self.state = state;
+                self.install_state(state);
                 self.pending_runs
                     .push_back(PendingRunRequest::Companion(request));
                 self.notice = Some("queued companion run".to_owned());
                 CoreEffect::Render
             }
             AppState::Empty => {
-                self.state = AppState::Empty;
+                self.install_state(AppState::Empty);
                 self.notice_item("companion run needs an active session".to_owned())
             }
         }
@@ -2378,11 +2435,11 @@ impl AppCore {
                 session,
             });
         });
-        self.state = AppState::TurnInFlight {
+        self.install_state(AppState::TurnInFlight {
             worker_rx,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
-        };
+        });
         self.in_flight_label = Some("companion run".to_owned());
         self.in_flight_companion_name = Some(request.task.persona().to_owned());
         self.in_flight_cancellable = false;
