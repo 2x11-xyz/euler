@@ -3,6 +3,7 @@ use super::*;
 mod terminal_tests {
     use super::*;
     use crate::ui::test_backend::VT100Backend;
+    use insta::assert_snapshot;
     use ratatui::style::{Color, Modifier};
     use std::sync::Mutex;
 
@@ -89,15 +90,9 @@ mod terminal_tests {
         let backend = VT100Backend::new(80, 20);
         let mut terminal = InlineTerminal::new(backend, 16).expect("inline terminal");
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![CanvasLine::plain("▌"), CanvasLine::plain("status")],
-            cursor: None,
             required_height: 2,
-            history_rows: 0,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
-            committable_rows: 0,
-            pinned_rows: 0,
+            ..VisualCanvasFrame::test_default()
         };
 
         terminal.draw_visual_frame(&frame).expect("draw frame");
@@ -123,19 +118,15 @@ mod terminal_tests {
         let backend = VT100Backend::new(40, 10);
         let mut terminal = InlineTerminal::new(backend, 8).expect("inline terminal");
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![
                 CanvasLine::plain("Paragraph 1: transcript content"),
                 CanvasLine::plain("▌ /quit"),
                 CanvasLine::plain("footer"),
             ],
-            cursor: None,
             required_height: 3,
-            history_rows: 0,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
             committable_rows: 1,
             pinned_rows: 2,
+            ..VisualCanvasFrame::test_default()
         };
         terminal.draw_visual_frame(&frame).expect("draw frame");
         assert!(terminal.backend().screen_contents().contains("/quit"));
@@ -177,15 +168,10 @@ mod terminal_tests {
         let backend = VT100Backend::new(40, 10);
         let mut terminal = InlineTerminal::new(backend, 8).expect("inline terminal");
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![CanvasLine::plain("Paragraph 1: transcript content")],
-            cursor: None,
             required_height: 1,
-            history_rows: 0,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
             committable_rows: 1,
-            pinned_rows: 0,
+            ..VisualCanvasFrame::test_default()
         };
         terminal.draw_visual_frame(&frame).expect("draw frame");
 
@@ -223,19 +209,15 @@ mod terminal_tests {
         let backend = VT100Backend::new(40, 10);
         let mut terminal = InlineTerminal::new(backend, 8).expect("inline terminal");
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![
                 CanvasLine::plain("Paragraph 1: transcript content"),
                 CanvasLine::plain("▌ /quit"),
                 CanvasLine::plain("footer"),
             ],
-            cursor: None,
             required_height: 3,
-            history_rows: 0,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
             committable_rows: 1,
             pinned_rows: 2,
+            ..VisualCanvasFrame::test_default()
         };
         terminal.draw_visual_frame(&frame).expect("draw frame");
 
@@ -267,15 +249,10 @@ mod terminal_tests {
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("▌ draft")],
                 cursor: Some(CursorTarget { row: 0, column: 3 }),
                 required_height: 1,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw cursor frame");
         let raw = terminal.backend().raw_output();
@@ -299,15 +276,9 @@ mod terminal_tests {
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("working")],
-                cursor: None,
                 required_height: 1,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw non-cursor frame");
         let raw = terminal.backend().raw_output();
@@ -328,33 +299,21 @@ mod terminal_tests {
         );
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("placeholder")],
-                cursor: None,
                 required_height: 1,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("prime draw cache");
         terminal.backend_mut().clear_raw_output();
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::from_spans(vec![
                     prompt,
                     CanvasSpan::new_lossy("draft", TextRole::Plain),
                 ])],
-                cursor: None,
                 required_height: 1,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw prompt frame");
 
@@ -444,15 +403,9 @@ mod terminal_tests {
             "raw startup bytes: {raw_startup:?}"
         );
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![CanvasLine::plain("▌"), CanvasLine::plain("status")],
-            cursor: None,
             required_height: 2,
-            history_rows: 0,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
-            committable_rows: 0,
-            pinned_rows: 0,
+            ..VisualCanvasFrame::test_default()
         };
 
         terminal.draw_visual_frame(&frame).expect("draw frame");
@@ -479,13 +432,17 @@ mod terminal_tests {
         let visible = visible_active_lines(FrameLines::from_slice(&lines), 2, 0, 0);
 
         assert_eq!(visible.prefix_start, 2);
-        assert_eq!(
+        assert_snapshot!(
             visible
                 .lines
                 .iter()
                 .map(CanvasLine::text)
-                .collect::<Vec<_>>(),
-            vec!["▌", "status"]
+                .collect::<Vec<_>>()
+                .join("\n"),
+            @"
+        ▌
+        status
+        "
         );
     }
 
@@ -501,13 +458,17 @@ mod terminal_tests {
         let visible = visible_active_lines(FrameLines::from_slice(&lines), 2, 2, 0);
 
         assert_eq!(visible.prefix_start, 0);
-        assert_eq!(
+        assert_snapshot!(
             visible
                 .lines
                 .iter()
                 .map(CanvasLine::text)
-                .collect::<Vec<_>>(),
-            vec!["old", "answer"]
+                .collect::<Vec<_>>()
+                .join("\n"),
+            @"
+        old
+        answer
+        "
         );
     }
 
@@ -524,13 +485,19 @@ mod terminal_tests {
         let visible = visible_active_lines(FrameLines::from_slice(&lines), 4, 2, 2);
 
         assert_eq!(visible.prefix_start, 0);
-        assert_eq!(
+        assert_snapshot!(
             visible
                 .lines
                 .iter()
                 .map(CanvasLine::text)
-                .collect::<Vec<_>>(),
-            vec!["old", "answer", "▌ next draft", "status"]
+                .collect::<Vec<_>>()
+                .join("\n"),
+            @"
+        old
+        answer
+        ▌ next draft
+        status
+        "
         );
         assert_eq!(
             visible_cursor(Some(CursorTarget { row: 3, column: 3 }), &visible),
@@ -546,7 +513,6 @@ mod terminal_tests {
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("old"),
                     CanvasLine::plain("answer"),
@@ -557,10 +523,8 @@ mod terminal_tests {
                 cursor: Some(CursorTarget { row: 3, column: 3 }),
                 required_height: 5,
                 history_rows: 3,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
                 pinned_rows: 2,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw reviewed frame");
 
@@ -665,19 +629,13 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("live-one"),
                     CanvasLine::plain("live-two"),
                     CanvasLine::plain("live-three"),
                 ],
-                cursor: None,
                 required_height: 3,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw active");
 
@@ -686,15 +644,9 @@ mod terminal_tests {
             .expect("write finalized");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("next"), CanvasLine::plain("status")],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw next active");
 
@@ -711,20 +663,16 @@ mod terminal_tests {
         let backend = VT100Backend::new(30, 4);
         let mut terminal = InlineTerminal::new(backend, 3).expect("inline terminal");
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![
                 CanvasLine::plain("history-one"),
                 CanvasLine::plain("history-two"),
                 CanvasLine::plain("▌ prompt"),
                 CanvasLine::plain("status"),
             ],
-            cursor: None,
             required_height: 4,
             history_rows: 2,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
             committable_rows: 2,
-            pinned_rows: 0,
+            ..VisualCanvasFrame::test_default()
         };
 
         terminal.draw_visual_frame(&frame).expect("draw frame");
@@ -810,20 +758,16 @@ mod terminal_tests {
         terminal.set_linefeed_history_insert_enabled(true);
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 4,
                 history_rows: 2,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 2,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("initial commit");
         assert!(terminal
@@ -846,7 +790,6 @@ mod terminal_tests {
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -854,13 +797,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 3,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 3,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("replay commit");
         let raw = terminal.backend().raw_output();
@@ -877,7 +817,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 4).expect("inline terminal");
         terminal.set_review_scroll_offset(8);
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![
                 CanvasLine::plain("history-one"),
                 CanvasLine::plain("history-two"),
@@ -885,13 +824,11 @@ mod terminal_tests {
                 CanvasLine::plain("▌ prompt"),
                 CanvasLine::plain("status"),
             ],
-            cursor: None,
             required_height: 5,
             history_rows: 3,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
             committable_rows: 3,
             pinned_rows: 2,
+            ..VisualCanvasFrame::test_default()
         };
 
         terminal.draw_visual_frame(&frame).expect("draw frame");
@@ -932,7 +869,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 3).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("narrow-one-a"),
                     CanvasLine::plain("narrow-one-b"),
@@ -941,38 +877,30 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 6,
                 history_rows: 4,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 4,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw narrow frame");
 
         terminal.backend_mut().resize(60, 4);
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("wide-one"),
                     CanvasLine::plain("wide-two"),
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 4,
                 history_rows: 2,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 2,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw wide frame");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("wide-one"),
                     CanvasLine::plain("wide-two"),
@@ -980,18 +908,14 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 3,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 3,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw appended wide frame");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("wide-one"),
                     CanvasLine::plain("wide-two"),
@@ -1000,13 +924,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 6,
                 history_rows: 4,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 4,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw second appended wide frame");
 
@@ -1025,27 +946,22 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 3).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 4,
                 history_rows: 2,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 2,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit initial history");
 
         terminal.backend_mut().resize(60, 4);
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -1053,18 +969,13 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 2,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw active resized frame");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -1072,13 +983,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 3,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 3,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw final resized frame");
 
@@ -1102,15 +1010,9 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 8).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("▌"), CanvasLine::plain("status")],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw frame");
 
@@ -1148,7 +1050,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 2).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("narrow-one-a"),
                     CanvasLine::plain("narrow-one-b"),
@@ -1157,20 +1058,16 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 6,
                 history_rows: 4,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 4,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit initial narrow history");
 
         terminal.backend_mut().resize(80, 3);
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("wide-history-one"),
                     CanvasLine::plain("wide-history-two"),
@@ -1178,18 +1075,13 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 2,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw active resized frame");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("wide-history-one"),
                     CanvasLine::plain("wide-history-two"),
@@ -1197,13 +1089,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 3,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 3,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw final resized frame");
 
@@ -1228,7 +1117,6 @@ mod terminal_tests {
         terminal.set_linefeed_history_insert_enabled(true);
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("same-prefix-one"),
                     CanvasLine::plain("same-prefix-two"),
@@ -1236,13 +1124,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 3,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 3,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit initial prefix");
 
@@ -1250,7 +1135,6 @@ mod terminal_tests {
         terminal.backend_mut().resize(80, 3);
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("same-prefix-one"),
                     CanvasLine::plain("same-prefix-two"),
@@ -1259,13 +1143,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 6,
                 history_rows: 1,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 4,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit appended prefix after resize");
 
@@ -1291,7 +1172,6 @@ mod terminal_tests {
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -1299,13 +1179,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 2,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 2,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit with conservative path");
 
@@ -1320,7 +1197,6 @@ mod terminal_tests {
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -1329,13 +1205,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 6,
                 history_rows: 3,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 3,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit next row after suspended bridge clears");
 
@@ -1357,7 +1230,6 @@ mod terminal_tests {
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -1365,13 +1237,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
                 history_rows: 2,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 4,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit with conservative path");
 
@@ -1386,7 +1255,6 @@ mod terminal_tests {
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -1395,13 +1263,10 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 6,
                 history_rows: 3,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 4,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit next row after one suspended bridge flush");
 
@@ -1423,20 +1288,16 @@ mod terminal_tests {
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain(""),
                     CanvasLine::plain("history-three"),
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 4,
                 history_rows: 1,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 1,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("skip blank-only resize-suspended commit");
 
@@ -1466,46 +1327,28 @@ mod terminal_tests {
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("one"), CanvasLine::plain("status")],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw compact frame");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("one"),
                     CanvasLine::plain("two"),
                     CanvasLine::plain("three"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 4,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw grown frame");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("done"), CanvasLine::plain("status")],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw compact frame again");
 
@@ -1532,38 +1375,26 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("old one"),
                     CanvasLine::plain("old two"),
                     CanvasLine::plain("old three"),
                     CanvasLine::plain("old status"),
                 ],
-                cursor: None,
                 required_height: 4,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw tall frame");
 
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("new prompt"),
                     CanvasLine::plain("new status"),
                 ],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw compact frame");
 
@@ -1582,7 +1413,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 8).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("stable transcript one"),
                     CanvasLine::plain("stable transcript two"),
@@ -1590,20 +1420,14 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw initial frame");
 
         terminal.backend_mut().clear_raw_output();
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("stable transcript one"),
                     CanvasLine::plain("stable transcript two"),
@@ -1611,13 +1435,8 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 5,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw changed transient frame");
 
@@ -1644,20 +1463,16 @@ mod terminal_tests {
         let backend = VT100Backend::new(30, 4);
         let mut terminal = InlineTerminal::new(backend, 3).expect("inline terminal");
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![
                 CanvasLine::plain("history-one"),
                 CanvasLine::plain("history-two"),
                 CanvasLine::plain("▌ prompt"),
                 CanvasLine::plain("status"),
             ],
-            cursor: None,
             required_height: 4,
             history_rows: 2,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
             committable_rows: 2,
-            pinned_rows: 0,
+            ..VisualCanvasFrame::test_default()
         };
 
         terminal.backend_mut().set_write_error(true);
@@ -1686,25 +1501,18 @@ mod terminal_tests {
             .expect("write finalized");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("▌ "),
                     CanvasLine::plain("fixture/echo status"),
                 ],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw compact footer");
         terminal.backend_mut().clear_raw_output();
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("▌ "),
                     CanvasLine::plain("fixture/echo status"),
@@ -1713,13 +1521,8 @@ mod terminal_tests {
                     CanvasLine::plain("(1/9)"),
                     CanvasLine::plain(" Enter select  Tab complete  Esc close"),
                 ],
-                cursor: None,
                 required_height: 6,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw appended slash surface");
 
@@ -1860,7 +1663,6 @@ mod terminal_tests {
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -1871,13 +1673,11 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 8,
                 history_rows: 6,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 6,
                 pinned_rows: 2,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw with history commit bridge");
 
@@ -1912,7 +1712,6 @@ mod terminal_tests {
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -1923,13 +1722,11 @@ mod terminal_tests {
                     CanvasLine::plain("▌ prompt"),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 8,
                 history_rows: 6,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 6,
                 pinned_rows: 2,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw with default history commit");
 
@@ -1955,7 +1752,6 @@ mod terminal_tests {
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("h1"),
                     CanvasLine::plain("h2"),
@@ -1966,13 +1762,11 @@ mod terminal_tests {
                     CanvasLine::plain("h7"),
                     CanvasLine::plain("status-wraps"),
                 ],
-                cursor: None,
                 required_height: 8,
                 history_rows: 7,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 7,
                 pinned_rows: 1,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw with wrapped footer");
 
@@ -1993,7 +1787,6 @@ mod terminal_tests {
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("history-one"),
                     CanvasLine::plain("history-two"),
@@ -2002,13 +1795,10 @@ mod terminal_tests {
                     CanvasLine::plain("history-five"),
                     CanvasLine::plain("history-six"),
                 ],
-                cursor: None,
                 required_height: 6,
                 history_rows: 6,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 6,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw with no pinned footer");
 
@@ -2053,7 +1843,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("transcript one"),
                     CanvasLine::plain("transcript two"),
@@ -2062,13 +1851,8 @@ mod terminal_tests {
                     CanvasLine::plain("▌ "),
                     CanvasLine::plain("fixture/echo status"),
                 ],
-                cursor: None,
                 required_height: 6,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw full live frame");
         let before = terminal.viewport_area();
@@ -2076,7 +1860,6 @@ mod terminal_tests {
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("transcript one"),
                     CanvasLine::plain("transcript two"),
@@ -2089,13 +1872,9 @@ mod terminal_tests {
                     CanvasLine::plain("(1/9)"),
                     CanvasLine::plain(" Enter select  Tab complete  Esc close"),
                 ],
-                cursor: None,
                 required_height: 10,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
                 prefer_stable_height: true,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw stable-height slash frame");
 
@@ -2136,29 +1915,17 @@ mod terminal_tests {
             .expect("write finalized");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("stale-status")],
-                cursor: None,
                 required_height: 1,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw old active");
 
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![CanvasLine::plain("draft"), CanvasLine::plain("status")],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw grown active");
 
@@ -2174,7 +1941,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 12).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("live transcript"),
                     CanvasLine::plain("more live transcript"),
@@ -2182,31 +1948,20 @@ mod terminal_tests {
                     CanvasLine::plain("▌ draft two"),
                     CanvasLine::plain("⠧ working (9s • esc to interrupt)"),
                 ],
-                cursor: None,
                 required_height: 5,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw tall frame");
 
         terminal.backend_mut().resize(24, 6);
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("▌ "),
                     CanvasLine::plain("fixture/echo ? · Context ?% used"),
                 ],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw compact frame");
 
@@ -2236,7 +1991,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::plain("EULER-TITLE"),
                     CanvasLine::plain("transcript-one"),
@@ -2245,13 +1999,8 @@ mod terminal_tests {
                     CanvasLine::plain("▌ draft"),
                     CanvasLine::plain("status line far wider than twenty-four columns"),
                 ],
-                cursor: None,
                 required_height: 6,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw full-height frame with over-wide bottom row");
 
@@ -2287,7 +2036,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
         terminal.set_linefeed_history_insert_enabled(true);
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![
                 CanvasLine::plain("head-one"),
                 CanvasLine::plain("head-two"),
@@ -2300,13 +2048,10 @@ mod terminal_tests {
                 CanvasLine::plain("▌ prompt"),
                 CanvasLine::plain("status"),
             ],
-            cursor: None,
             required_height: 10,
             history_rows: 8,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
             committable_rows: 8,
-            pinned_rows: 0,
+            ..VisualCanvasFrame::test_default()
         };
         // (The vt100 test emulator does not implement ESC[3J, so keep the
         // pre-replay state commit-free: the assertions below reconstruct
@@ -2351,19 +2096,15 @@ mod terminal_tests {
         let backend = VT100Backend::new(30, 6);
         let mut terminal = InlineTerminal::new(backend, u16::MAX).expect("inline terminal");
         let short_frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![
                 CanvasLine::plain("greeting"),
                 CanvasLine::plain("▌ prompt"),
                 CanvasLine::plain("status"),
             ],
-            cursor: None,
             required_height: 3,
             history_rows: 1,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
-            committable_rows: 0,
             pinned_rows: 2,
+            ..VisualCanvasFrame::test_default()
         };
         terminal.draw_visual_frame(&short_frame).expect("draw");
         assert_eq!(terminal.viewport_area(), Rect::new(0, 0, 30, 3));
@@ -2383,17 +2124,13 @@ mod terminal_tests {
         // Tall content is not clamped to any stale height: the viewport can
         // cover the whole live screen.
         let tall_frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: (0..20)
                 .map(|index| CanvasLine::plain(format!("row-{index}")))
                 .collect(),
-            cursor: None,
             required_height: 20,
             history_rows: 18,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
-            committable_rows: 0,
             pinned_rows: 2,
+            ..VisualCanvasFrame::test_default()
         };
         terminal.draw_visual_frame(&tall_frame).expect("tall draw");
         let area = terminal.viewport_area();
@@ -2413,34 +2150,28 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 4).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: (0..8)
                     .map(|index| CanvasLine::plain(format!("row-{index}")))
                     .collect(),
-                cursor: None,
                 required_height: 8,
                 history_rows: 6,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 6,
                 pinned_rows: 2,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("commit history");
 
         terminal.backend_mut().resize(30, 12);
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: (0..8)
                     .map(|index| CanvasLine::plain(format!("row-{index}")))
                     .collect(),
-                cursor: None,
                 required_height: 8,
                 history_rows: 6,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
                 committable_rows: 6,
                 pinned_rows: 2,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw after grow");
 
@@ -2465,7 +2196,6 @@ mod terminal_tests {
         let mut terminal = InlineTerminal::new(backend, 3).expect("inline terminal");
         terminal
             .draw_visual_frame(&VisualCanvasFrame {
-                history_lines: std::sync::Arc::new(Vec::new()),
                 tail_lines: vec![
                     CanvasLine::from_spans(vec![
                         CanvasSpan::new("artifact-body", TextRole::Plain),
@@ -2473,13 +2203,8 @@ mod terminal_tests {
                     ]),
                     CanvasLine::plain("status"),
                 ],
-                cursor: None,
                 required_height: 2,
-                history_rows: 0,
-                history_item_offsets: Vec::new(),
-                prefer_stable_height: false,
-                committable_rows: 0,
-                pinned_rows: 0,
+                ..VisualCanvasFrame::test_default()
             })
             .expect("draw padded row");
 
@@ -2512,15 +2237,9 @@ mod terminal_tests {
         let backend = VT100Backend::new(40, 12);
         let mut terminal = InlineTerminal::new(backend, 6).expect("inline terminal");
         let frame = VisualCanvasFrame {
-            history_lines: std::sync::Arc::new(Vec::new()),
             tail_lines: vec![CanvasLine::plain("live"), CanvasLine::plain("status")],
-            cursor: None,
             required_height: 2,
-            history_rows: 0,
-            history_item_offsets: Vec::new(),
-            prefer_stable_height: false,
-            committable_rows: 0,
-            pinned_rows: 0,
+            ..VisualCanvasFrame::test_default()
         };
 
         // A successful draw parks the cursor at a known position and marks the

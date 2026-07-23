@@ -1,0 +1,10 @@
+---
+source: crates/euler-cli/src/ui/bottom_surface/tests.rs
+expression: rendered
+---
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Compaction · automatic on · stubs on · (1/3)
+→     compact now           run the configured pipeline before the next turn
+  [x] automatic compaction  compact as the active model approaches its context limit
+  [x] tool stubs            demote bulky outputs with exact recovery handles
+↑↓ move · space toggle · ⏎ select · esc cancel

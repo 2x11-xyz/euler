@@ -1,0 +1,13 @@
+---
+source: crates/euler-cli/src/ui/bottom_surface/tests.rs
+expression: rendered
+---
+────────────────────────────────────────────────────────────────────────────────
+Permissions · Current: custom · (1/5)
+QUICK SETTINGS
+→ ○ Read only                                  allow local/session reads; deny w
+  ○ Ask every time                             clear session approvals; ask befo
+  ○ Full access (unsandboxed)                  allow every capability for this s
+    Auto in workspace sandbox (not available)  requires the Linux workspace sand
+    Advanced capability settings ›             per-capability modes, matching ru
+↑↓ move · ⏎ select · esc cancel

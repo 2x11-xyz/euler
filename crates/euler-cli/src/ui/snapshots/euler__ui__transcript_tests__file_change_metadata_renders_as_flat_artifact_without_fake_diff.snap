@@ -1,0 +1,10 @@
+---
+source: crates/euler-cli/src/ui/transcript_tests.rs
+expression: joined
+---
+• File modified src/lib.rs · metadata only
+    action: modify                                                              
+    origin: apply_patch                                                         
+    bytes: 10 -> 12                                                             
+    sha256: abcdef123456 -> fedcba654321                                        
+    diff: omitted (metadata only)

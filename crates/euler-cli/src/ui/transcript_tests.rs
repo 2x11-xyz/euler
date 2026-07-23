@@ -9,7 +9,9 @@ use super::{
         TranscriptItem,
     },
 };
+use crate::ui::test_support::{event, event_at};
 use euler_event::{object, EventEnvelope, EventKind};
+use insta::assert_snapshot;
 use ratatui::{layout::Rect, style::Style, text::Line, Terminal};
 
 use super::transcript::TranscriptState;
@@ -2976,14 +2978,13 @@ fn patch_proposed_artifact_uses_anchored_title_and_not_old_child_rows() {
     let texts = line_texts(&render_items_for_history(&items, &theme, 80));
     let joined = texts.join("\n");
 
+    // Full-surface pin: two anchored `Patch proposed` cells in order.
+    assert_snapshot!(joined);
     assert_eq!(
         joined.matches("Patch proposed").count(),
         2,
         "texts: {texts:?}"
     );
-    assert!(joined.contains("Patch proposed src/a.rs"));
-    assert!(joined.contains("     1 - a"));
-    assert!(joined.contains("     1 + aa"));
     // §4.1: no git `@@ … @@` fences; `a`→`aa` resolves no symbol, so the header
     // row is omitted and the body follows straight after the file row.
     assert!(!joined.contains("@@"), "no hunk fences: {texts:?}");
@@ -3133,6 +3134,10 @@ fn patch_applied_artifact_keeps_exact_render_shape() {
     // padded inside the cell, one blank separator row (hairlines are gone).
     // §4.1: single diffstat file row, no `@@ … @@` fence (`a`→`b` resolves no
     // symbol so the header row is omitted).
+    //
+    // Kept as an exact vec (not a snapshot): the trailing blank separator row
+    // and the padded body rows are load-bearing here, and insta trims trailing
+    // whitespace/newlines, which would silently drop the blank this test pins.
     assert_eq!(
         texts,
         vec![
@@ -3350,12 +3355,9 @@ fn file_change_metadata_renders_as_flat_artifact_without_fake_diff() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("File modified src/lib.rs · metadata only"));
-    assert!(joined.contains("  action: modify"));
-    assert!(joined.contains("  origin: apply_patch"));
-    assert!(joined.contains("  bytes: 10 -> 12"));
-    assert!(joined.contains("  sha256: abcdef123456 -> fedcba654321"));
-    assert!(joined.contains("  diff: omitted (metadata only)"));
+    // Full-surface pin: the flat metadata artifact (title + action/origin/bytes
+    // /sha256/diff rows). Behavioral guards below keep their own intent.
+    assert_snapshot!(joined);
     assert_no_box_chars(&texts);
     assert!(!joined.contains("@@"));
     assert!(!joined.contains("+         1 |"));
@@ -3379,9 +3381,8 @@ fn file_diff_renders_unified_diff_as_source_first_artifact() {
     let texts = line_texts(&render_items_for_history(&item, &theme, 80));
     let joined = texts.join("\n");
 
-    assert!(joined.contains("Edited src/lib.rs · +1 −1"));
-    assert!(joined.contains("     1 - old"));
-    assert!(joined.contains("     1 + new"));
+    // Full-surface pin: source-first unified diff (title diffstat + body rows).
+    assert_snapshot!(joined);
     assert_no_box_chars(&texts);
     assert!(!joined.contains("--- a/src/lib.rs"));
     assert!(!joined.contains("+++ b/src/lib.rs"));
@@ -3753,12 +3754,11 @@ fn file_change_sparse_metadata_uses_stable_fallbacks() {
 
     let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
 
-    assert!(joined.contains("File changed (unknown path) · metadata only"));
-    assert!(joined.contains("  action: unknown"));
+    // Full-surface pin: sparse metadata falls back to stable "unknown" tokens.
+    assert_snapshot!(joined);
+    // Absence guards: with no origin/sha256, those rows must not render at all.
     assert!(!joined.contains("  origin:"));
-    assert!(joined.contains("  bytes: unknown -> unknown"));
     assert!(!joined.contains("  sha256:"));
-    assert!(joined.contains("  diff: metadata only"));
 }
 
 #[test]
@@ -4426,20 +4426,6 @@ fn rendered_screen_with_limit(
         .expect("draw");
 
     terminal.backend().screen_contents()
-}
-
-fn event(kind: &'static str, payload: euler_event::JsonObject) -> EventEnvelope {
-    EventEnvelope::new("session", "agent", None, kind, payload)
-}
-
-fn event_at(
-    kind: &'static str,
-    payload: euler_event::JsonObject,
-    ts: &'static str,
-) -> EventEnvelope {
-    let mut event = event(kind, payload);
-    event.ts = ts.to_owned();
-    event
 }
 
 /// Event with an explicit id / agent / parent, for sequences where later

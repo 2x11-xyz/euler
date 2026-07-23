@@ -390,12 +390,9 @@ impl ExitRecapLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::test_support::event;
     use euler_event::object;
     use serde_json::json;
-
-    fn event(kind: &'static str, payload: euler_event::JsonObject) -> EventEnvelope {
-        EventEnvelope::new("session", "agent", None, kind, payload)
-    }
 
     #[test]
     fn recap_formats_files_diffstat_and_tests() {

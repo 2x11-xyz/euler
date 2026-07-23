@@ -6,6 +6,7 @@ use crate::ui::commands::{
 };
 use crate::ui::theme::ThemeChoice;
 use euler_core::{ApprovalMode, ReasoningEffort};
+use insta::assert_snapshot;
 
 fn code_swarm_picker_surface(selected: Vec<String>) -> BottomSurface {
     let mut surface = BottomSurface::new(CommandContext::default());
@@ -160,10 +161,8 @@ fn compaction_picker_shows_defaults_and_applies_independent_toggles() {
         .surface_lines(100)
         .expect("compaction picker")
         .join("\n");
-    assert!(rendered.contains("Compaction · automatic on · stubs on"));
-    assert!(rendered.contains("[x] automatic compaction"));
-    assert!(rendered.contains("[x] tool stubs"));
-    assert!(rendered.contains("space toggle"));
+    // Full-surface pin: header posture + both checkbox rows + toggle hint.
+    assert_snapshot!(rendered);
 
     surface.move_selection_down();
     assert_eq!(surface.compaction_toggle(), Some(SurfaceEvent::None));
@@ -687,9 +686,8 @@ fn effort_and_theme_pickers_mark_current_choice() {
     effort.palette_insert("effort");
     assert_eq!(effort.confirm(), SurfaceEvent::None);
     let rendered = effort.surface_lines(80).expect("effort picker").join("\n");
-    assert!(rendered.contains("Reasoning Effort"));
-    assert!(rendered.contains("medium - balanced default"));
-    assert!(rendered.contains("current"));
+    // Full-surface pin: effort list with the current choice marked.
+    assert_snapshot!("effort_picker", rendered);
 
     effort.move_selection_down();
     assert_eq!(
@@ -707,9 +705,8 @@ fn effort_and_theme_pickers_mark_current_choice() {
     theme.palette_insert("theme");
     assert_eq!(theme.confirm(), SurfaceEvent::None);
     let rendered = theme.surface_lines(80).expect("theme picker").join("\n");
-    assert!(rendered.contains("Theme"));
-    assert!(rendered.contains("Gruvbox Light"));
-    assert!(rendered.contains("current"));
+    // Full-surface pin: theme list with the current choice marked.
+    assert_snapshot!("theme_picker", rendered);
 }
 
 #[test]
@@ -856,15 +853,10 @@ fn permissions_picker_leads_with_honest_session_postures() {
         .surface_lines(80)
         .expect("permissions picker")
         .join("\n");
-    // §5.1: the title carries the posture in force. `permission_choices()`
-    // builds the list with no session behind it, so nothing is current — and
-    // "custom" is the honest reading of modes no posture describes.
-    assert!(rendered.contains("Permissions · Current: custom · (1/5)"));
-    assert!(rendered.contains("QUICK SETTINGS"));
-    // §5.1 radio variant: postures render ●/○, never a caret-only list.
-    assert!(rendered.contains("○ Read only"));
-    assert!(rendered.contains("○ Full access (unsandboxed)"));
-    assert!(rendered.contains("Auto in workspace sandbox (not available)"));
+    // §5.1: the title carries the posture in force (`Current: custom`, nothing
+    // current since no session backs the list); postures render as a ●/○ radio
+    // list, never a caret-only list. Full-surface pin captures the whole shape.
+    assert_snapshot!(rendered);
     assert!(!rendered.contains('%'));
 
     assert_eq!(
@@ -985,15 +977,11 @@ fn resume_picker_is_list_mode_with_indicator_and_action() {
     assert_eq!(picker.position_indicator(), "(1/2)");
     assert_eq!(picker.visible_row_count(), 1);
     let rendered = surface.surface_lines(80).expect("resume picker").join("\n");
-    assert!(rendered.contains("Resume · newest first"));
-    assert!(rendered.contains("4m ago"));
-    assert!(rendered.contains("2026-06-19 research"));
-    assert!(rendered.contains("TUI"));
-    // Selected-row preview (id + root), not a footer "Session:" detail.
-    assert!(rendered.contains("s1  /repo"));
+    // Full-surface pin: list-mode header, the single visible row (status/label
+    // /group/preview), and the `ctrl+o preview` hint.
+    assert_snapshot!(rendered);
+    // Absence guards: no footer "Session:" detail and no type filter chrome.
     assert!(!rendered.contains("Session:"));
-    assert!(rendered.contains("newest first"));
-    assert!(rendered.contains("ctrl+o preview"));
     assert!(!rendered.contains("Type: [All]"));
 
     surface.move_selection_down();
