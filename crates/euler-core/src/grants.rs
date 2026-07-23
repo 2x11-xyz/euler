@@ -631,16 +631,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProjectGrantError> {
             path: temp_path.clone(),
             source,
         })?;
-        file.sync_data().map_err(|source| ProjectGrantError::Io {
-            path: temp_path.clone(),
-            source,
+        crate::durability::sync_file_data(&file, &temp_path).map_err(|source| {
+            ProjectGrantError::Io {
+                path: temp_path.clone(),
+                source,
+            }
         })?;
     }
     fs::rename(&temp_path, path).map_err(|source| ProjectGrantError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    crate::home::sync_dir(dir).map_err(|source| ProjectGrantError::Io {
+    crate::durability::sync_dir(dir).map_err(|source| ProjectGrantError::Io {
         path: dir.to_path_buf(),
         source,
     })?;
@@ -1077,5 +1079,41 @@ mod tests {
         assert_eq!(list.as_slice().len(), 1);
         assert_eq!(list.revoke(Capability::FsWrite, &g.pattern), 1);
         assert!(list.as_slice().is_empty());
+    }
+
+    #[test]
+    fn save_surfaces_injected_sync_failures_and_keeps_previous_grants() {
+        use crate::durability::fault::{arm_matching, Op};
+
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ProjectGrantStore::at_path(temp.path().join("grants.json"));
+        let mut first = GrantList::new();
+        first.insert(ActiveGrant::unscoped(Capability::ShellExec));
+        store.save(&first).expect("initial save");
+
+        // Temp-file sync failure happens before the rename, so the previous
+        // grants file must remain intact and loadable.
+        let mut second = first.clone();
+        second.insert(ActiveGrant::unscoped(Capability::FsWrite));
+        {
+            let guard = arm_matching(Op::FileSync, |path| {
+                path.extension().is_some_and(|extension| extension == "tmp")
+            });
+            let error = store.save(&second).expect_err("temp-file sync failure");
+            assert!(matches!(error, ProjectGrantError::Io { .. }));
+            assert!(guard.fired());
+        }
+        assert_eq!(store.load().expect("load after temp sync failure"), first);
+
+        // Directory-sync failure (the swallowed-fsync class fixed in PR
+        // #194): the error must propagate, and the file stays loadable.
+        {
+            let dir = temp.path().to_path_buf();
+            let guard = arm_matching(Op::DirSync, move |path| path == dir);
+            let error = store.save(&second).expect_err("dir sync failure");
+            assert!(matches!(error, ProjectGrantError::Io { .. }));
+            assert!(guard.fired());
+        }
+        assert_eq!(store.load().expect("load after dir sync failure"), second);
     }
 }

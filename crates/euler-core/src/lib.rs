@@ -10,6 +10,7 @@ pub mod checkpoints;
 pub mod command_safety;
 pub mod compaction;
 mod diagnostics;
+mod durability;
 pub mod extension_registry;
 pub mod extensions;
 pub mod file_diff;

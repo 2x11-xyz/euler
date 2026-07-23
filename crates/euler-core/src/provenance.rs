@@ -1,3 +1,4 @@
+use crate::durability::{sync_dir, sync_file_data};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::{event_wake::EventWakeRegistry, EventWakeError, EventWakeRegistration};
 use fs4::TryLockError;
@@ -181,7 +182,7 @@ impl ProvenanceWriter {
             bytes = bytes.saturating_add(line.len() as u64).saturating_add(1);
         }
         file.flush()?;
-        file.sync_data()?;
+        sync_file_data(&file, &self.log_path)?;
         // Keep a newly created log name durable; this dir fsync is cheap
         // relative to the log fsync and harmless for later appends.
         sync_dir(log_dir)?;
@@ -737,7 +738,7 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     match fs::read(path) {
         Ok(existing) if existing == bytes => match OpenOptions::new().read(true).open(path) {
             Ok(file) => {
-                file.sync_data()?;
+                sync_file_data(&file, path)?;
                 return Ok(());
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -756,7 +757,7 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .open(&temp_path)?;
     file.write_all(bytes)?;
     file.flush()?;
-    file.sync_data()?;
+    sync_file_data(&file, &temp_path)?;
     drop(file);
     fs::rename(&temp_path, path)?;
     sync_dir(containing_dir(path))?;
@@ -1016,17 +1017,6 @@ fn recover_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[cfg(unix)]
-fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> io::Result<()> {
-    // std exposes no portable directory fsync on non-Unix platforms.
-    Ok(())
 }
 
 #[derive(Debug, Error)]

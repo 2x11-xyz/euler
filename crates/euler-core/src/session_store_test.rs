@@ -1564,3 +1564,59 @@ fn malformed_relocation_root_projection_is_invalid_not_projected() {
         "invalid relocation projections must not be cached"
     );
 }
+
+#[test]
+fn injected_index_append_sync_failure_surfaces_and_index_stays_readable() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+
+    let index_path = store.index_path();
+    let guard = arm_matching(Op::FileSync, move |path| path == index_path);
+    let error = store
+        .touch_session_updated_at(record.id())
+        .expect_err("injected index sync failure");
+    assert!(matches!(error, SessionStoreError::Io(_)));
+    assert!(guard.fired());
+    drop(guard);
+
+    // The prior index content is not corrupted: a fresh store still lists
+    // the session.
+    let reopened = SessionStore::new(store.home().clone()).expect("reopened store");
+    let sessions = reopened.list_sessions().expect("list after failed append");
+    assert!(sessions.iter().any(|session| session.id() == record.id()));
+}
+
+#[test]
+fn injected_sidecar_sync_failure_surfaces_and_previous_sidecar_survives() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let sidecar_before = fs::read_to_string(record.session_json_path()).expect("sidecar before");
+
+    // The sidecar replace writes through a `.session.json.<ulid>.tmp` file;
+    // failing its sync must abort before the rename.
+    let guard = arm_matching(Op::FileSync, |path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".session.json."))
+    });
+    let error = store
+        .touch_session_updated_at(record.id())
+        .expect_err("injected sidecar sync failure");
+    assert!(matches!(error, SessionStoreError::Io(_)));
+    assert!(guard.fired());
+    drop(guard);
+
+    assert_eq!(
+        fs::read_to_string(record.session_json_path()).expect("sidecar after"),
+        sidecar_before
+    );
+    let found = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(found.id(), record.id());
+}
