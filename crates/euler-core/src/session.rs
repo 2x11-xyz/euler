@@ -1,7 +1,7 @@
 //! Session state machine: turn loop, tool dispatch, compaction integration.
 //! Justification for >1000 lines: session.rs owns the main turn lifecycle while focused subsystems are extracted.
 use crate::canvas::{
-    assemble_canvas, assemble_canvas_with_compaction, canvas_bytes, retention_stats,
+    assemble_canvas_prefolded, assemble_canvas_with_compaction, canvas_bytes, retention_stats,
     AutoCompactionPolicy,
 };
 use crate::canvas::{render_context_slot, CanvasItem, CanvasRole};
@@ -1583,7 +1583,10 @@ impl<D: PermissionDecider> Session<D> {
         };
         let pinned = project_context.admitted().cloned();
         let policy = self.effective_stub_policy();
-        let canvas = assemble_canvas(self.bus.events(), &policy);
+        // The fold above is threaded into assembly: one project-context fold
+        // per prepared request, never a second one inside canvas assembly.
+        let events = self.bus.events();
+        let canvas = assemble_canvas_prefolded(events, &policy, &BTreeSet::new(), pinned.as_ref());
         if let Some(error) = context_budget_exhausted(policy, &canvas) {
             self.emit_session_error(&error)?;
             sink.flush(self.bus.events());
@@ -2278,6 +2281,8 @@ fn record_unseen_instructions(
     events: &[EventEnvelope],
     instructions: &str,
 ) {
+    #[cfg(test)]
+    crate::canvas::note_full_stream_pass();
     let digest = system_instructions_sha256();
     let already_recorded = events.iter().any(|event| {
         matches!(
