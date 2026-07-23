@@ -842,6 +842,229 @@ mod tests {
         assert!(ScopePattern::new("x".repeat(MAX_SCOPE_PATTERN_BYTES)).is_ok());
     }
 
+    /// Task-1 pin (fs-read canonicalization asymmetry audit): scoped
+    /// patterns have matching semantics for `shell-exec` (first token) and
+    /// `fs-write` (directory prefix) ONLY. For every other capability —
+    /// `fs-read` in particular — a patterned grant matches NOTHING and the
+    /// request falls back to the ask path (fail closed). This is the first
+    /// layer that makes the "literal `src/../outside` path borrows a scoped
+    /// read grant" attack structurally impossible: there is no scoped
+    /// fs-read matching for a literal path to fool. If someone adds fs-read
+    /// pattern matching to `ActiveGrant::matches`, this test fails and the
+    /// new arm must canonicalize the request path exactly as the fs-write
+    /// arm's callers do (`permission_request_for_tool`).
+    #[test]
+    fn scoped_fs_read_grant_matches_nothing_fail_closed() {
+        let grant = ActiveGrant::new(
+            Capability::FsRead,
+            ScopePattern::new("src").expect("pattern"),
+        );
+        for path in [
+            "src",               // the pattern itself
+            "src/lib.rs",        // squarely inside the would-be scope
+            "src/../.env",       // traversal that a lexical prefix would accept
+            "src/../../outside", // workspace escape
+            "docs/notes.txt",    // outside the would-be scope
+        ] {
+            assert!(
+                !grant.matches(Capability::FsRead, None, Some(Path::new(path)), None),
+                "scoped fs-read grant must be inert, matched: {path}"
+            );
+        }
+        let mut list = GrantList::new();
+        list.insert(grant);
+        assert!(!list.is_granted(
+            Capability::FsRead,
+            None,
+            Some(Path::new("src/lib.rs")),
+            None
+        ));
+        // Contrast: only the UNSCOPED grant covers fs-read, and it is
+        // capability-wide by contract (path plays no part in matching).
+        let unscoped = ActiveGrant::unscoped(Capability::FsRead);
+        assert!(unscoped.matches(
+            Capability::FsRead,
+            None,
+            Some(Path::new("anything/at/all")),
+            None
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // Adversarial grant-file loads: every malformed shape must fail closed
+    // (an error and no grants) or degrade to something strictly narrower
+    // than a missing file. A malformed file must never grant more than a
+    // missing one.
+    // -----------------------------------------------------------------
+
+    fn store_with_content(content: &[u8]) -> (tempfile::TempDir, ProjectGrantStore) {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("grants.json");
+        fs::write(&path, content).expect("write grants file");
+        (temp, ProjectGrantStore::at_path(path))
+    }
+
+    #[test]
+    fn load_missing_file_is_empty_baseline() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ProjectGrantStore::at_path(temp.path().join("grants.json"));
+        assert!(store
+            .load()
+            .expect("missing file loads")
+            .as_slice()
+            .is_empty());
+    }
+
+    #[test]
+    fn load_rejects_truncated_json() {
+        let (_temp, store) = store_with_content(br#"{"version":1,"grants":[{"capab"#);
+        assert!(matches!(
+            store.load(),
+            Err(ProjectGrantError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_empty_file() {
+        let (_temp, store) = store_with_content(b"");
+        assert!(matches!(
+            store.load(),
+            Err(ProjectGrantError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_wrong_type_fields() {
+        for content in [
+            br#"{"version":"1","grants":[]}"#.as_slice(),
+            br#"{"version":1,"grants":42}"#.as_slice(),
+            br#"{"version":1,"grants":[{"capability":42,"pattern":"src"}]}"#.as_slice(),
+            br#"{"version":1,"grants":[{"capability":"fs-write","pattern":{}}]}"#.as_slice(),
+        ] {
+            let (_temp, store) = store_with_content(content);
+            assert!(
+                matches!(store.load(), Err(ProjectGrantError::Invalid { .. })),
+                "wrong-type field must fail closed: {}",
+                String::from_utf8_lossy(content)
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_raw_nul_bytes() {
+        let (_temp, store) = store_with_content(b"\x00{\"version\":1,\"grants\":[]}");
+        assert!(matches!(
+            store.load(),
+            Err(ProjectGrantError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_nul_inside_a_pattern() {
+        // Valid JSON, but the decoded pattern carries a control byte:
+        // ScopePattern validation rejects it and the whole load fails.
+        let (_temp, store) = store_with_content(
+            br#"{"version":1,"grants":[{"capability":"fs-write","pattern":"src\u0000"}]}"#,
+        );
+        assert!(matches!(
+            store.load(),
+            Err(ProjectGrantError::BadPattern { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_unknown_capability() {
+        let (_temp, store) = store_with_content(
+            br#"{"version":1,"grants":[{"capability":"root-everything","pattern":""}]}"#,
+        );
+        assert!(matches!(
+            store.load(),
+            Err(ProjectGrantError::UnknownCapability { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_unsupported_version() {
+        let (_temp, store) = store_with_content(br#"{"version":2,"grants":[]}"#);
+        assert!(matches!(
+            store.load(),
+            Err(ProjectGrantError::UnsupportedVersion { version: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_oversize_file_before_parsing() {
+        let mut content = br#"{"version":1,"grants":[]}"#.to_vec();
+        content.resize((MAX_GRANTS_FILE_BYTES + 1) as usize, b' ');
+        let (_temp, store) = store_with_content(&content);
+        assert!(matches!(
+            store.load(),
+            Err(ProjectGrantError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn load_fails_closed_when_the_file_is_a_directory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("grants.json");
+        fs::create_dir(&path).expect("dir at grants path");
+        let store = ProjectGrantStore::at_path(path);
+        assert!(matches!(store.load(), Err(ProjectGrantError::Io { .. })));
+    }
+
+    #[test]
+    fn load_ignores_unknown_fields_and_keeps_known_entries() {
+        // Pinned current behavior: serde's default is to ignore unknown
+        // fields (top-level and per-entry). Extra fields add no authority —
+        // only the known capability/pattern pair loads.
+        let (_temp, store) = store_with_content(
+            br#"{"version":1,"future":true,
+                 "grants":[{"capability":"shell-exec","pattern":"cargo","mode":"root"}]}"#,
+        );
+        let list = store.load().expect("unknown fields are ignored");
+        assert_eq!(
+            list.as_slice(),
+            &[ActiveGrant::new(
+                Capability::ShellExec,
+                ScopePattern::new("cargo").expect("pattern"),
+            )]
+        );
+    }
+
+    #[test]
+    fn load_collapses_duplicate_entries() {
+        let (_temp, store) = store_with_content(
+            br#"{"version":1,"grants":[
+                {"capability":"fs-write","pattern":"src"},
+                {"capability":"fs-write","pattern":"src"}]}"#,
+        );
+        assert_eq!(store.load().expect("load").as_slice().len(), 1);
+    }
+
+    #[test]
+    fn outside_workspace_pattern_entries_load_but_never_match_workspace_requests() {
+        // A grant file can carry an absolute or parent-relative "prefix".
+        // Loading accepts it (the pattern is an opaque bounded string), but
+        // it grants nothing for real requests: fs-write request paths are
+        // canonicalized workspace-RELATIVE forms (or cleared when
+        // unresolvable), so an absolute prefix never lexically matches, and
+        // the ParentDir defense in `path_under_prefix` rejects any `..`
+        // component outright.
+        let (_temp, store) = store_with_content(
+            br#"{"version":1,"grants":[
+                {"capability":"fs-write","pattern":"/etc"},
+                {"capability":"fs-write","pattern":"../outside"}]}"#,
+        );
+        let list = store.load().expect("load");
+        assert_eq!(list.as_slice().len(), 2);
+        for path in ["etc/passwd", "outside", "outside/file.txt", "../outside"] {
+            assert!(
+                !list.is_granted(Capability::FsWrite, None, Some(Path::new(path)), None),
+                "outside-workspace pattern must grant nothing, matched: {path}"
+            );
+        }
+    }
+
     #[test]
     fn grant_list_dedupes_and_revokes() {
         let mut list = GrantList::new();
