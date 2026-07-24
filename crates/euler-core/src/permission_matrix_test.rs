@@ -2,24 +2,25 @@
 //! lane): capability x approval mode x grant scope shape x path/command
 //! shape, asserted against `docs/contracts/capabilities.md`.
 //!
-//! Each row evaluates one cell through the REAL decision path the tool
-//! dispatcher uses: `permission_request_for_tool` (request enrichment —
-//! canonicalization, sensitive-basename classification), then
-//! `mode_for_request` (sensitive escalation), the static-safe shell check,
-//! `granted_source` (covered grants), and finally `decide_detailed` for
-//! uncovered requests. One row per cell; a failing row names its cell.
+//! Each row executes one real provider-authored tool call through
+//! `Session::run_turn`. The dispatcher, rather than this test, chooses the
+//! capability, enriches the request, checks static safety and grant coverage,
+//! and resolves uncovered requests. The expected capability is used only to
+//! configure authority and verify the emitted decision; a tool-to-capability
+//! mapping regression therefore cannot borrow the test's answer.
 //!
 //! Contract-silent cells pinned to current fail-closed behavior (noted in
 //! the rows): scoped (patterned) grants for capabilities other than
 //! `shell-exec` and `fs-write` match nothing — `fs-read` and `agent-spawn`
 //! patterned grants are inert and fall back to the ask path.
 
-use super::permissions_gate::permission_request_for_tool;
+use super::{Session, SessionConfig};
 use crate::grants::{GrantScope, ScopePattern};
 use crate::permissions::{
     ApprovalMode, DeciderVerdict, GrantSource, PermissionDecider, PermissionGate, PermissionRequest,
 };
-use crate::tools::ToolRegistry;
+use euler_event::{EventEnvelope, EventKind};
+use euler_provider::{FixtureResponse, ScriptedProvider, ToolCall};
 use euler_sdk::Capability;
 use serde_json::{json, Value};
 
@@ -65,8 +66,7 @@ struct Case {
     mode: ModeSetup,
     /// Grants installed for `capability`; `""` is the unscoped pattern.
     grants: &'static [(Store, &'static str)],
-    /// Tool the request is built for; `spawn_agent` and unknown names carry
-    /// no path/command enrichment.
+    /// Real core tool whose dispatcher mapping is part of the assertion.
     tool: &'static str,
     /// Path for file tools, command for `run_shell`, ignored otherwise.
     subject: &'static str,
@@ -139,12 +139,20 @@ fn run_case(case: &Case) {
 }
 
 fn run_case_in(case: &Case, fixture: &Fixture) {
-    let tools = ToolRegistry::new(fixture.workspace.path());
-    let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
-    gate.load_project_grants(fixture.workspace.path(), Some(fixture.consent.path()))
-        .expect("project store");
-    gate.load_user_grants(Some(fixture.home.path()))
-        .expect("user store");
+    let input = tool_input(case);
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "matrix-call".to_owned(),
+            name: case.tool.to_owned(),
+            input,
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut config = SessionConfig::new(fixture.workspace.path());
+    config.project_grant_consent_dir = Some(fixture.consent.path().to_path_buf());
+    config.user_grant_dir = Some(fixture.home.path().to_path_buf());
+    let mut session = Session::new(config, provider, ProbeDecider { calls: 0 });
+
     for (store, pattern) in case.grants {
         let pattern = if pattern.is_empty() {
             ScopePattern::unscoped()
@@ -156,7 +164,10 @@ fn run_case_in(case: &Case, fixture: &Fixture) {
             Store::Project => GrantScope::Project(pattern),
             Store::User => GrantScope::User(pattern),
         };
-        gate.install_grant(case.capability, scope).expect("install");
+        session
+            .permissions
+            .install_grant(case.capability, scope)
+            .expect("install");
     }
     // Mode setup AFTER grant installs: installing an unscoped session grant
     // legitimately flips the mode to session-allow (legacy `AllowSession`),
@@ -164,63 +175,197 @@ fn run_case_in(case: &Case, fixture: &Fixture) {
     // the final authority, matching the contract's "always-deny still
     // denies even if a grant exists".
     if let ModeSetup::Set(mode) = case.mode {
-        gate.set_mode(case.capability, mode);
+        session.set_permission_mode(case.capability, mode);
     }
 
-    let input: Value = match case.tool {
+    session.run_turn(case.name).expect("matrix turn");
+
+    let outcome = observed_outcome(session.events(), case);
+    assert_eq!(outcome, case.expected, "cell `{}`", case.name);
+    assert_eq!(
+        session.permissions.decider_mut().calls,
+        usize::from(case.expected == Outcome::Asks),
+        "cell `{}`: decider consultation count",
+        case.name
+    );
+}
+
+fn tool_input(case: &Case) -> Value {
+    match case.tool {
         "run_shell" => json!({ "command": case.subject }),
-        "read_file" | "edit_file" | "write_file" => json!({ "path": case.subject }),
+        "read_file" => json!({ "path": case.subject }),
+        "edit_file" => {
+            let old = if case.subject.ends_with("new_file.rs") {
+                ""
+            } else if case.subject.ends_with("deep.rs") {
+                "deep"
+            } else if case.subject.ends_with("notes.txt") || case.subject.ends_with("link_docs.txt")
+            {
+                "notes"
+            } else {
+                "lib"
+            };
+            json!({
+                "path": case.subject,
+                "old": old,
+                "new": format!("{old}-updated"),
+            })
+        }
+        "write_file" => json!({ "path": case.subject, "content": "matrix" }),
+        "code_swarm_review" => json!({
+            "context": "permission matrix",
+            "focus": "permission matrix",
+            "models": ["fixture::echo"],
+        }),
         _ => json!({}),
+    }
+}
+
+fn observed_outcome(events: &[EventEnvelope], case: &Case) -> Outcome {
+    let call_index = tool_event_index(events, EventKind::TOOL_CALL, "matrix-call", case);
+    let result_index = tool_event_index(events, EventKind::TOOL_RESULT, "matrix-call", case);
+    assert!(
+        call_index < result_index,
+        "cell `{}`: tool result preceded its call",
+        case.name
+    );
+    let result = &events[result_index];
+
+    let prompts = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
+        .collect::<Vec<_>>();
+    let decisions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .collect::<Vec<_>>();
+
+    if let Some(source) = result
+        .payload
+        .get("grant_source")
+        .and_then(Value::as_str)
+        .map(grant_source)
+    {
+        assert!(
+            prompts.is_empty(),
+            "cell `{}`: covered call prompted",
+            case.name
+        );
+        assert!(
+            decisions.is_empty(),
+            "cell `{}`: covered call emitted a fresh decision",
+            case.name
+        );
+        return Outcome::CoveredBy(source);
+    }
+
+    let [(decision_index, decision)] = decisions.as_slice() else {
+        panic!(
+            "cell `{}`: expected exactly one dispatcher decision, got {}",
+            case.name,
+            decisions.len()
+        );
     };
-    let request = permission_request_for_tool(
-        case.capability,
-        &tools.permission_reason(case.tool, &input),
-        case.tool,
-        &input,
-        &tools,
+    assert_eq!(
+        decision.payload.get("capability").and_then(Value::as_str),
+        Some(case.capability.as_str()),
+        "cell `{}`: tool-to-capability mapping",
+        case.name
+    );
+    assert!(
+        call_index < *decision_index && *decision_index < result_index,
+        "cell `{}`: decision must be between tool call and result",
+        case.name
     );
 
-    // Mirror execute_recorded_tool_call's decision sequence exactly.
-    let mode = gate.mode_for_request(&request);
-    let static_safe = mode == ApprovalMode::Ask
-        && case.capability == Capability::ShellExec
-        && !request.command_truncated
-        && request.command.as_deref().is_some_and(|command| {
-            crate::command_safety::is_statically_safe_command(command, tools.root())
-        });
-    let outcome = if static_safe {
-        Outcome::StaticSafe
-    } else if let Some(source) = (mode == ApprovalMode::Ask)
-        .then(|| gate.granted_source(&request))
-        .flatten()
-    {
-        Outcome::CoveredBy(source)
-    } else {
-        let calls_before = gate.decider_mut().calls;
-        let decision = gate.decide_detailed(&request, mode);
-        let consulted = gate.decider_mut().calls > calls_before;
-        match mode {
-            ApprovalMode::SessionAllow => {
-                assert!(decision.allowed(), "cell `{}`", case.name);
-                assert!(
-                    !consulted,
-                    "cell `{}`: mode allow must not prompt",
-                    case.name
-                );
-                Outcome::AllowedByMode
-            }
-            ApprovalMode::AlwaysDeny => {
-                assert!(!decision.allowed(), "cell `{}`", case.name);
-                assert!(!consulted, "cell `{}`: deny must not prompt", case.name);
-                Outcome::Denied
-            }
-            ApprovalMode::Ask => {
-                assert!(consulted, "cell `{}`: uncovered ask must prompt", case.name);
-                Outcome::Asks
-            }
+    let mode = decision
+        .payload
+        .get("mode")
+        .and_then(Value::as_str)
+        .expect("decision mode");
+    let allowed = decision
+        .payload
+        .get("allowed")
+        .and_then(Value::as_bool)
+        .expect("decision allowed");
+    if mode == "ask" {
+        assert!(!allowed, "cell `{}`: deny decider was bypassed", case.name);
+        let [(prompt_index, prompt)] = prompts.as_slice() else {
+            panic!(
+                "cell `{}`: ask must emit exactly one prompt, got {}",
+                case.name,
+                prompts.len()
+            );
+        };
+        assert!(
+            call_index < *prompt_index
+                && *prompt_index < *decision_index
+                && *decision_index < result_index,
+            "cell `{}`: call/prompt/decision/result order",
+            case.name
+        );
+        assert_eq!(
+            decision.parent.as_deref(),
+            Some(prompt.id.as_str()),
+            "cell `{}`: ask decision parent",
+            case.name
+        );
+        return Outcome::Asks;
+    }
+
+    assert!(
+        prompts.is_empty(),
+        "cell `{}`: non-ask decision prompted",
+        case.name
+    );
+    assert_eq!(
+        decision.parent.as_deref(),
+        Some(events[call_index].id.as_str()),
+        "cell `{}`: non-ask decision parent",
+        case.name
+    );
+    match mode {
+        "session-allow" => {
+            assert!(allowed, "cell `{}`: session mode did not allow", case.name);
+            Outcome::AllowedByMode
         }
-    };
-    assert_eq!(outcome, case.expected, "cell `{}`", case.name);
+        "always-deny" => {
+            assert!(!allowed, "cell `{}`: deny mode allowed", case.name);
+            Outcome::Denied
+        }
+        "static-safe" => {
+            assert!(allowed, "cell `{}`: static-safe decision denied", case.name);
+            assert_eq!(
+                result.payload.get("static_safe").and_then(Value::as_bool),
+                Some(true),
+                "cell `{}`: static-safe result attribution",
+                case.name
+            );
+            Outcome::StaticSafe
+        }
+        other => panic!("cell `{}`: unexpected decision mode `{other}`", case.name),
+    }
+}
+
+fn tool_event_index(events: &[EventEnvelope], kind: &str, call_id: &str, case: &Case) -> usize {
+    events
+        .iter()
+        .position(|event| {
+            event.kind.as_str() == kind
+                && event.payload.get("id").and_then(Value::as_str) == Some(call_id)
+        })
+        .unwrap_or_else(|| panic!("cell `{}`: missing {kind}", case.name))
+}
+
+fn grant_source(source: &str) -> GrantSource {
+    match source {
+        "session" => GrantSource::Session,
+        "project" => GrantSource::Project,
+        "user" => GrantSource::User,
+        other => panic!("unexpected grant source `{other}`"),
+    }
 }
 
 use ApprovalMode::{AlwaysDeny, Ask, SessionAllow};
@@ -255,11 +400,6 @@ const MATRIX: &[Case] = &[
     Case { name: "fs-read / ask / unscoped session grant covers (path plays no part)",
         capability: FsRead, mode: Set(Ask), grants: &[(Store::Session, "")],
         tool: "read_file", subject: "docs/notes.txt", expected: CoveredBy(GrantSource::Session) },
-    // Gate-level cell only: the tool layer still rejects absolute paths at
-    // execution (resolve_path_inner), pinned in tools_test.rs.
-    Case { name: "fs-read / ask / unscoped grant covers an absolute path at the gate",
-        capability: FsRead, mode: Set(Ask), grants: &[(Store::Session, "")],
-        tool: "read_file", subject: "/etc/hosts", expected: CoveredBy(GrantSource::Session) },
     // Contract-silent cells (task-1 pin): a PATTERNED fs-read grant has no
     // matching semantics — it is inert and falls back to ask (fail closed).
     Case { name: "fs-read / ask / scoped `src` grant is inert even for an in-scope path",
@@ -278,6 +418,11 @@ const MATRIX: &[Case] = &[
     Case { name: "fs-write / default ask / no grant / plain relative",
         capability: FsWrite, mode: DefaultMode, grants: &[],
         tool: "edit_file", subject: "src/lib.rs", expected: Asks },
+    Case { name: "fs-write / run_shell apply_patch interception uses the write capability",
+        capability: FsWrite, mode: Set(AlwaysDeny), grants: &[],
+        tool: "run_shell",
+        subject: "apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH",
+        expected: Denied },
     Case { name: "fs-write / ask / scoped `src` covers an exact in-scope file",
         capability: FsWrite, mode: DefaultMode, grants: &[(Store::Session, "src")],
         tool: "edit_file", subject: "src/lib.rs", expected: CoveredBy(GrantSource::Session) },
@@ -355,13 +500,13 @@ const MATRIX: &[Case] = &[
         tool: "run_shell", subject: "cargo test > out.txt", expected: Asks },
     Case { name: "shell / explicit ask / unscoped grant covers any command",
         capability: ShellExec, mode: Set(Ask), grants: &[(Store::Session, "")],
-        tool: "run_shell", subject: "rm -rf /", expected: CoveredBy(GrantSource::Session) },
+        tool: "run_shell", subject: "touch unscoped-grant", expected: CoveredBy(GrantSource::Session) },
     Case { name: "shell / ask / durable user prefix rule covers",
         capability: ShellExec, mode: DefaultMode, grants: &[(Store::User, "cargo")],
         tool: "run_shell", subject: "cargo build --release", expected: CoveredBy(GrantSource::User) },
     Case { name: "shell / session-allow / mode is capability-wide",
         capability: ShellExec, mode: Set(SessionAllow), grants: &[],
-        tool: "run_shell", subject: "rm -rf /", expected: AllowedByMode },
+        tool: "run_shell", subject: "touch mode-allowed", expected: AllowedByMode },
     Case { name: "shell / always-deny / static safety never bypasses",
         capability: ShellExec, mode: Set(AlwaysDeny), grants: &[],
         tool: "run_shell", subject: "ls", expected: Denied },
@@ -371,33 +516,21 @@ const MATRIX: &[Case] = &[
     // ---------------------------------------------------- agent-spawn ---
     Case { name: "agent-spawn / default ask / no grant",
         capability: AgentSpawn, mode: DefaultMode, grants: &[],
-        tool: "spawn_agent", subject: "", expected: Asks },
+        tool: "code_swarm_review", subject: "", expected: Asks },
     Case { name: "agent-spawn / explicit ask / unscoped session grant covers",
         capability: AgentSpawn, mode: Set(Ask), grants: &[(Store::Session, "")],
-        tool: "spawn_agent", subject: "", expected: CoveredBy(GrantSource::Session) },
+        tool: "code_swarm_review", subject: "", expected: CoveredBy(GrantSource::Session) },
     // Contract-silent cell: patterned agent-spawn grants have no matching
     // semantics — inert, fail closed to ask.
     Case { name: "agent-spawn / ask / scoped pattern is inert",
         capability: AgentSpawn, mode: DefaultMode, grants: &[(Store::Session, "review")],
-        tool: "spawn_agent", subject: "", expected: Asks },
+        tool: "code_swarm_review", subject: "", expected: Asks },
     Case { name: "agent-spawn / session-allow",
         capability: AgentSpawn, mode: Set(SessionAllow), grants: &[],
-        tool: "spawn_agent", subject: "", expected: AllowedByMode },
+        tool: "code_swarm_review", subject: "", expected: AllowedByMode },
     Case { name: "agent-spawn / always-deny",
         capability: AgentSpawn, mode: Set(AlwaysDeny), grants: &[],
-        tool: "spawn_agent", subject: "", expected: Denied },
-    // --------------------------------------------------- unconfigured ---
-    Case { name: "network / unconfigured defaults to always-deny",
-        capability: Network, mode: DefaultMode, grants: &[],
-        tool: "fetch_url", subject: "", expected: Denied },
-    // Installing an unscoped session grant CONFIGURES the capability to
-    // session-allow (install semantics; how an extension-batch AllowSession
-    // lands for a previously unconfigured capability). An explicit
-    // always-deny set afterwards still wins — pinned by the always-deny
-    // rows above.
-    Case { name: "network / unscoped session grant install configures session-allow",
-        capability: Network, mode: DefaultMode, grants: &[(Store::Session, "")],
-        tool: "fetch_url", subject: "", expected: AllowedByMode },
+        tool: "code_swarm_review", subject: "", expected: Denied },
 ];
 
 #[test]
@@ -405,6 +538,23 @@ fn permission_decision_matrix() {
     for case in MATRIX {
         run_case(case);
     }
+}
+
+#[test]
+fn unconfigured_capability_gate_defaults_fail_closed() {
+    // Network has no core tool by design, so it cannot honestly be exercised
+    // through core tool dispatch. Pin the generic gate behavior at its owner.
+    let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
+    let request = PermissionRequest::new(Network, "extension network request");
+
+    let mode = gate.mode_for_request(&request);
+    assert_eq!(mode, AlwaysDeny);
+    assert!(!gate.decide_detailed(&request, mode).allowed());
+    assert_eq!(gate.decider_mut().calls, 0);
+
+    gate.install_grant(Network, GrantScope::Session(ScopePattern::unscoped()))
+        .expect("unscoped network grant");
+    assert_eq!(gate.mode_for_request(&request), SessionAllow);
 }
 
 /// Symlink-shaped path cells (unix-only). Same harness, plus the fixture's
