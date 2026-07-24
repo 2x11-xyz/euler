@@ -4,7 +4,11 @@ All notable changes to Euler are documented here. Entries reference the
 pull requests that landed them; deeper design rationale lives in
 `docs/contracts/` and the GitHub issue ledger.
 
-## Unreleased
+## 0.1.3 — 2026-07-24
+
+The first tagged release since v0.1.1; the 0.1.2 version number was used
+during development (and is the floor for price-bearing provider catalogs)
+but was never published, so everything below ships together in 0.1.3.
 
 ### Agent session resilience
 
