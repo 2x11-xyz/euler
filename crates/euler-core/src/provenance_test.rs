@@ -804,3 +804,51 @@ fn lock_path_hard_link_is_rejected_without_touching_target() {
         "do not modify"
     );
 }
+
+#[test]
+fn append_surfaces_injected_log_sync_failure_and_keeps_accepted_prefix() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let first = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    writer
+        .append(std::slice::from_ref(&first))
+        .expect("first append");
+    let durable_tail = writer.durable_tail();
+    assert_eq!(durable_tail.as_deref(), Some(first.id.as_str()));
+
+    let second = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(first.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "failed".into())]),
+    );
+    {
+        let log_path = log.clone();
+        let guard = arm_matching(Op::FileSync, move |path| path == log_path);
+        writer
+            .append(std::slice::from_ref(&second))
+            .expect_err("injected log sync failure");
+        assert!(guard.fired());
+    }
+
+    // The failed batch is never built upon: the in-memory tail stays at the
+    // last durable event.
+    assert_eq!(writer.durable_tail(), durable_tail);
+    // The log's accepted prefix stays parseable; the torn-tail machinery
+    // treats any residue from the failed append correctly.
+    let events = crate::resume::read_resume_prefix(&log).expect("resume prefix parses");
+    assert_eq!(
+        events.first().map(|event| event.id.as_str()),
+        Some(first.id.as_str())
+    );
+}

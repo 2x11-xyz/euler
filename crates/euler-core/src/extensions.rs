@@ -3,9 +3,8 @@
 //! registration, capability decisions, artifact writes, checkpoints, agent
 //! records, and context slot updates; split by host API family after SDK registration consolidates.
 use crate::canvas::fold_context_slot_state;
-use crate::home::{
-    containing_dir, ensure_private_dir, private_open_options, set_file_mode_0600, sync_dir,
-};
+use crate::durability::sync_dir;
+use crate::home::{containing_dir, ensure_private_dir, private_open_options, set_file_mode_0600};
 use crate::{query_provenance, ProvenanceQuery, ProvenanceWriter};
 use euler_agents::ExtensionAgentRecordContext;
 use euler_event::{object, EventEnvelope, EventKind};

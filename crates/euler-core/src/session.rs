@@ -2635,5 +2635,8 @@ fn validate_model_target_shape(target: &ModelTarget) -> Result<(), String> {
     Ok(())
 }
 #[cfg(test)]
+#[path = "permission_matrix_test.rs"]
+mod permission_matrix_test;
+#[cfg(test)]
 #[path = "session_test.rs"]
 mod session_test;

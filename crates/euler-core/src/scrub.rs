@@ -16,7 +16,8 @@
 //! Already-exported, copied, terminal-scrollback, or pushed data cannot be
 //! recalled.
 
-use crate::home::{containing_dir, private_open_options, set_file_mode_0600, sync_dir};
+use crate::durability::sync_dir;
+use crate::home::{containing_dir, private_open_options, set_file_mode_0600};
 use crate::provenance::{ProvenanceWriter, ProvenanceWriterError};
 use std::fs;
 use std::io::{self, Write};

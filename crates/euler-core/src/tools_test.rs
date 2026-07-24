@@ -1203,6 +1203,38 @@ fn resolve_path_rejects_symlink_escape() {
 }
 
 #[test]
+fn read_file_rejects_parent_traversal_escape() {
+    // Task-1 pin (fs-read canonicalization audit): whatever the permission
+    // gate concluded, read_file's own resolver canonicalizes `..` and
+    // refuses to read outside the workspace root — the enforcing boundary
+    // for reads.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let outside = tempfile::tempdir().expect("outside dir");
+    fs::write(outside.path().join("target.txt"), "outside").expect("outside file");
+    let registry = ToolRegistry::new(temp.path());
+    let escape = format!(
+        "../{}/target.txt",
+        outside
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("outside dir name")
+    );
+
+    let error = registry
+        .execute("read_file", &json!({ "path": escape }))
+        .expect_err("escape rejected");
+
+    assert!(matches!(
+        error,
+        ToolError::PathOutsideWorkspace {
+            reason: "path escapes the workspace root",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn apply_patch_rejects_absolute_add_path_with_actionable_diagnostic() {
     let temp = tempfile::tempdir().expect("temp dir");
     let registry = ToolRegistry::new(temp.path());
