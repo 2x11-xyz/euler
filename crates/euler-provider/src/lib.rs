@@ -1,4 +1,4 @@
-//! Provider abstraction plus offline fixture and ChatGPT providers.
+//! Provider abstraction shared by the built-in and custom model adapters.
 #![cfg_attr(test, allow(clippy::too_many_lines))] // unit-test exemption for inline test modules
 
 pub mod anthropic;

@@ -8,9 +8,10 @@
 //! reuses it so the ureq request + error skeleton is not a fourth copy, while
 //! keeping its own multi-secret auth resolution and labelling.
 //!
-//! The shape mirrors pi's `createProvider({ id, name, baseUrl, auth, api })`:
-//! the provider is data (a spec) and the chat-completions request/response
-//! machinery (`crate::chat_completions`) is the shared strategy it points at.
+//! This follows a provider-as-data pattern: each provider is a plain
+//! [`ChatCompletionsSpec`] value rather than its own implementation, and the
+//! chat-completions request/response machinery (`crate::chat_completions`) is
+//! the shared strategy the spec points at.
 
 use std::sync::Arc;
 
@@ -241,10 +242,9 @@ pub(crate) fn read_error_body(response: Box<ureq::Response>) -> String {
 
 const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
-/// Classify an HTTP rejection for a built-in chat-completions provider. The
-/// message wording matches the pre-collapse per-provider `classify_http_error`
-/// exactly; only providers whose spec sets `extract_rejection_detail` parse the
-/// body for an `error.type`/`code` suffix.
+/// Classify an HTTP rejection for a built-in chat-completions provider. Only
+/// providers whose spec sets `extract_rejection_detail` parse the body for an
+/// `error.type`/`code` suffix.
 pub(crate) fn classify_rejection(
     spec: &ChatCompletionsSpec,
     status: u16,

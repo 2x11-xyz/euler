@@ -9,12 +9,12 @@ pub const DEFAULT_MODEL: &str = "grok-4.3";
 
 const API_KEY_ENV: &str = "XAI_API_KEY";
 
-/// xAI speaks the plain chat-completions dialect. The PI reference pins
-/// `supportsStore`, `supportsDeveloperRole`, and `supportsReasoningEffort` to
-/// `false` for every xAI model; the default [`ChatCompletionsOptions`] already
-/// satisfies all three (no `store` field, `system` instruction role, no
-/// reasoning request), so xAI must not adopt the OpenRouter reasoning or header
-/// extensions — hence the default options and no rejection-detail parsing.
+/// xAI speaks the plain chat-completions dialect: no `store` field, the
+/// `system` instruction role, and no reasoning request are all correct for
+/// every xAI model, which is exactly what the default
+/// [`ChatCompletionsOptions`] sends. So xAI must not adopt the OpenRouter
+/// reasoning or header extensions — hence the default options and no
+/// rejection-detail parsing.
 static SPEC: ChatCompletionsSpec = ChatCompletionsSpec {
     id: "xai",
     display: "xAI",
