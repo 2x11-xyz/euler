@@ -426,10 +426,10 @@ fn join_footer_span_clusters(
     }
 
     // Always reserve at least one column of separation before the right
-    // cluster (v4 dogfood, #round4): the path is already squeezed to its
-    // minimum inside `status_left_spans`, but once the right cluster grows
-    // (adding session name this round) an exact-fit left cluster used to
-    // render with zero gap — `(inte` glued directly against
+    // cluster: the path is already squeezed to its minimum inside
+    // `status_left_spans`, but once the right cluster grows (now that it
+    // carries the session name) an exact-fit left cluster renders with zero
+    // gap — `(inte` glued directly against
     // `z-ai/glm-5.2(medium) · ctx …`. Truncate the left cluster (cwd/branch)
     // harder instead of ever letting the gap collapse to nothing.
     let available_for_left = width - right_width;
