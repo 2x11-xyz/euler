@@ -140,11 +140,7 @@ fn request_body(request: &ModelRequest) -> Value {
 }
 
 /// Maps the requested reasoning effort onto the Messages API
-/// `output_config.effort` scale (low/medium/high/xhigh/max). The adapter
-/// previously hardcoded "max", silently overriding the session's requested
-/// effort — provenance recorded `requested_reasoning_effort: medium` while
-/// every call ran at max and adaptive thinking could consume the entire
-/// output budget.
+/// `output_config.effort` scale (low/medium/high/xhigh/max).
 fn anthropic_effort(request: &ModelRequest) -> Option<&'static str> {
     if !model_supports_adaptive_thinking(&request.model) {
         return None;
