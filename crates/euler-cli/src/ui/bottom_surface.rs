@@ -157,10 +157,7 @@ impl BottomSurface {
     /// warning-token (gold) text, which plain strings cannot express.
     ///
     /// §4.2: *every* picker gets the bar — "there is no un-highlighted
-    /// picker; selection is never conveyed by the caret alone". This used to
-    /// reach only the palette, `/code-swarm`, and `/dag`, leaving the model,
-    /// resume, extensions, compaction, and generic pickers with a caret and
-    /// no bar.
+    /// picker; selection is never conveyed by the caret alone".
     pub fn surface_canvas_lines(&self, theme: &Theme, width: u16) -> Option<Vec<CanvasLine>> {
         match &self.owner {
             BottomOwner::Palette(palette) => Some(palette.render_canvas_lines(theme, width)),

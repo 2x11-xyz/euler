@@ -80,8 +80,7 @@ impl PickerKind {
 
 /// §4.2 chrome — the one shape every list-select surface renders in. There is
 /// no second picker style; a new surface fills this in rather than inventing
-/// a layout. The canonical reference is the `/code-swarm` / `/dag view`
-/// submenu.
+/// a layout. The canonical reference is the `/code-swarm` submenu.
 struct PickerChrome {
     /// Scope token — the submenu name, first on the title line.
     title: String,
@@ -262,9 +261,9 @@ impl ReplacementPicker {
     fn canonical_lines<T>(&self, width: u16, row: impl Fn(String, bool) -> T) -> Vec<T> {
         let chrome = self.chrome();
         let cols = usize::from(width);
-        // One hairline separates the picker region from the transcript. The
-        // `/dag` picker used to draw two (above and below the rows); the rule
-        // below the rows was chrome the footer already delimits.
+        // One hairline separates the picker region from the transcript, above
+        // the rows only: the footer already delimits the rows below, so a
+        // second rule there would be redundant chrome.
         let mut lines = vec![row("─".repeat(cols), false)];
 
         let mut title_parts = vec![chrome.title];

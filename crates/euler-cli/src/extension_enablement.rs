@@ -70,9 +70,9 @@ fn registry_enabled_set(
     let valid_set = valid.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut enabled = BTreeSet::new();
     for (id, state) in registry.enablement_states()? {
-        // Enablement entries for ids no longer present (e.g. formerly bundled
-        // extensions) are stale state, not corruption: skip them rather than
-        // failing every session after an upgrade.
+        // Enablement entries for ids no longer present (e.g. an extension
+        // removed after it was enabled) are stale state, not corruption: skip
+        // them rather than failing every session after an upgrade.
         if !valid_set.contains(id.as_str()) {
             continue;
         }
