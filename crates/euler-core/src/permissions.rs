@@ -400,10 +400,15 @@ impl<D> PermissionGate<D> {
         root: impl AsRef<Path>,
         consent_dir: Option<&Path>,
     ) -> Result<(), ProjectGrantError> {
+        // Fail closed from the first line: until BOTH stores load cleanly
+        // there are no active project grants and no project-grant writes.
+        // Resetting up front also guarantees a malformed file encountered on
+        // a RELOAD never leaves stale authority from an earlier load — a
+        // corrupt grants file must never grant more than a missing one.
+        self.project_grants = GrantList::new();
+        self.project_store = None;
+        self.consent_store = None;
         let Some(consent_dir) = consent_dir else {
-            self.project_grants = GrantList::new();
-            self.project_store = None;
-            self.consent_store = None;
             return Ok(());
         };
         let store = ProjectGrantStore::for_root(root.as_ref());
@@ -1333,5 +1338,120 @@ mod tests {
         assert!(decision.allowed());
         assert_eq!(decision.scope, GrantScope::Once);
         assert!(gate.user_grants().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Malformed grant stores at the gate: a corrupt file must never yield
+    // broader permissions than a missing file — no grants active, and
+    // durable installs fail closed (NoStore).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn corrupt_workspace_grants_file_fails_closed_at_the_gate() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workspace");
+        let consent = temp.path().join("home");
+        std::fs::create_dir_all(root.join(".euler")).expect("euler dir");
+        std::fs::write(root.join(".euler/grants.json"), "{not json").expect("corrupt file");
+
+        let mut gate = PermissionGate::new(PanicDecider);
+        assert!(gate.load_project_grants(&root, Some(&consent)).is_err());
+
+        assert!(gate.project_grants().is_empty());
+        let request =
+            PermissionRequest::new(Capability::FsWrite, "tool edit_file").with_path("src/lib.rs");
+        assert!(!gate.is_granted(&request));
+        // Writes fail closed too: the store did not load.
+        let result = gate.install_grant(
+            Capability::FsWrite,
+            GrantScope::Project(ScopePattern::new("src").expect("pattern")),
+        );
+        assert!(matches!(result, Err(ProjectGrantError::NoStore)));
+    }
+
+    #[test]
+    fn corrupt_consent_file_fails_closed_even_with_a_valid_workspace_file() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workspace");
+        let consent = temp.path().join("home");
+        std::fs::create_dir_all(&root).expect("root");
+        ProjectGrantStore::for_root(&root)
+            .add(&ActiveGrant::unscoped(Capability::ShellExec))
+            .expect("valid workspace grants");
+        let consent_path = ProjectGrantStore::consent_path_for_root(&consent, &root);
+        std::fs::create_dir_all(consent_path.parent().expect("parent")).expect("consent dir");
+        std::fs::write(&consent_path, "]]").expect("corrupt consent");
+
+        let mut gate = PermissionGate::new(PanicDecider);
+        assert!(gate.load_project_grants(&root, Some(&consent)).is_err());
+
+        assert!(gate.project_grants().is_empty());
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("anything");
+        assert!(!gate.is_granted(&request));
+    }
+
+    #[test]
+    fn reload_over_a_corrupt_workspace_file_clears_previously_active_grants() {
+        // The fail-closed invariant must hold on RELOAD too: a file that
+        // rots after a successful load must not leave stale authority
+        // behind the load error (audit finding on the early-return path).
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workspace");
+        let consent = temp.path().join("home");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut gate =
+            PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
+                GrantScope::Project(ScopePattern::new("cargo").expect("pattern")),
+            )]));
+        gate.load_project_grants(&root, Some(&consent))
+            .expect("load");
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(gate.decide(&request, ApprovalMode::Ask));
+        assert!(gate.is_granted(&request));
+
+        std::fs::write(root.join(".euler/grants.json"), "{corrupt").expect("rot the file");
+        assert!(gate.load_project_grants(&root, Some(&consent)).is_err());
+
+        assert!(
+            !gate.is_granted(&request),
+            "a corrupt file must never be broader than a missing one"
+        );
+        assert!(gate.project_grants().is_empty());
+        let result = gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::Project(ScopePattern::new("cargo").expect("pattern")),
+        );
+        assert!(matches!(result, Err(ProjectGrantError::NoStore)));
+    }
+
+    #[test]
+    fn corrupt_user_grants_file_fails_closed_and_reload_clears_stale_rules() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let pattern = ScopePattern::new("cargo").expect("pattern");
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.load_user_grants(Some(&home)).expect("load");
+        gate.install_grant(Capability::ShellExec, GrantScope::User(pattern))
+            .expect("install");
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("cargo test");
+        assert!(gate.is_granted(&request));
+
+        std::fs::write(home.join("user-grants.json"), "\u{0}garbage").expect("rot the file");
+        assert!(gate.load_user_grants(Some(&home)).is_err());
+
+        assert!(
+            !gate.is_granted(&request),
+            "a corrupt user store must never be broader than a missing one"
+        );
+        assert!(gate.user_grants().is_empty());
+        assert!(!gate.user_rules_enabled());
+        let result = gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::User(ScopePattern::new("git").expect("pattern")),
+        );
+        assert!(matches!(result, Err(ProjectGrantError::NoStore)));
     }
 }

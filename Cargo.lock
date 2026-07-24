@@ -472,6 +472,7 @@ dependencies = [
  "insta",
  "libc",
  "portable-pty",
+ "proc-macro2",
  "pulldown-cmark",
  "ratatui",
  "serde",

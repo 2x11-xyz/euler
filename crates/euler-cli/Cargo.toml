@@ -34,6 +34,7 @@ unicode-width = "0.2"
 [dev-dependencies]
 insta = "1"
 portable-pty = "0.9"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 tempfile.workspace = true
 vt100 = "0.15"
 

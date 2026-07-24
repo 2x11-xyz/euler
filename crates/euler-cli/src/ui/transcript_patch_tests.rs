@@ -5,6 +5,7 @@ use super::{
     theme::Theme,
     transcript::{project_events, transcript_widget, TranscriptItem},
 };
+use crate::ui::test_support::event;
 use euler_event::{object, EventEnvelope, EventKind};
 use ratatui::{layout::Rect, text::Line, Terminal};
 
@@ -157,8 +158,4 @@ fn line_texts(lines: &[Line<'_>]) -> Vec<String> {
                 .collect()
         })
         .collect()
-}
-
-fn event(kind: &'static str, payload: euler_event::JsonObject) -> EventEnvelope {
-    EventEnvelope::new("session", "agent", None, kind, payload)
 }

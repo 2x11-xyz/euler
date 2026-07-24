@@ -204,6 +204,15 @@ each entry; deleting either side deactivates the grant. Sessions opened
 without a resolvable consent directory disable project grants entirely —
 reads and writes both fail closed.
 
+A malformed or unreadable grants file — on either the workspace side or the
+consent side — fails closed exactly like a missing consent directory: no
+project grants load, project-grant writes are disabled for the session, and
+a reload over a corrupted file clears any previously active project grants.
+A corrupt file is never broader authority than a missing one. Load rejects
+oversize files, unknown versions, unknown capabilities, and control-bearing
+patterns; unknown JSON fields are ignored; duplicate entries collapse to
+one.
+
 ### User rules (durable prefix rules)
 
 User rules are the "don't ask again for commands starting with `cargo`"
@@ -214,7 +223,9 @@ need **no consent intersection** — the store is user-authored in the user's
 own home and is never repo-controlled content, so there is no second party
 whose entries could preseed authority. Sessions opened without a resolvable
 user grant dir disable user rules entirely — reads and writes both fail
-closed.
+closed. A malformed or unreadable user-grants file is treated the same way:
+no rules load, the store stays unloaded (durable installs fail), and a
+corrupt file never yields broader permissions than a missing one.
 
 Installing a user rule is an explicit durable-config write and **must** be
 recorded as a `permission.decision` event with `grant_scope: "user"` (and

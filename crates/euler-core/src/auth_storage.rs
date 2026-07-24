@@ -1,3 +1,4 @@
+use crate::durability::{sync_dir, sync_file_all};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::env;
@@ -745,12 +746,13 @@ fn write_document_atomic(path: &Path, document: &Value) -> Result<(), AuthError>
 
     let mut temp_file = NamedTempFile::with_suffix_in(TEMP_SUFFIX, dir).map_err(AuthError::Io)?;
     {
+        let temp_path = temp_file.path().to_path_buf();
         let file = temp_file.as_file_mut();
         set_file_mode_0600(file)?;
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.flush()?;
-        file.sync_all()?;
+        sync_file_all(file, &temp_path)?;
     }
 
     temp_file
@@ -877,16 +879,6 @@ fn set_file_mode_0600(file: &File) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn set_file_mode_0600(_file: &File) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

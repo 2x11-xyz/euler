@@ -1,0 +1,13 @@
+---
+source: crates/euler-cli/src/ui/bottom_surface/tests.rs
+expression: rendered
+---
+────────────────────────────────────────────────────────────────────────────────
+Reasoning Effort · (1/6)
+→ ○ xsmall - fastest/least reasoning  xsmall
+  ○ small - light reasoning           small
+  ● medium - balanced default         medium · current
+  ○ large - deeper reasoning          large
+  ○ xlarge - extra-high reasoning     xlarge
+  ○ max - maximum reasoning           max
+↑↓ move · ⏎ select · esc cancel

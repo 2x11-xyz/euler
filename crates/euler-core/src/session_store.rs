@@ -1,6 +1,7 @@
+use crate::durability::{sync_dir, sync_file_data};
 use crate::home::{
-    containing_dir, ensure_private_dir, private_open_options, set_file_mode_0600, sync_dir,
-    EulerHome, EulerHomeError,
+    containing_dir, ensure_private_dir, private_open_options, set_file_mode_0600, EulerHome,
+    EulerHomeError,
 };
 use crate::provenance::accepted_prefix_lines;
 use crate::resume::read_resume_prefix;
@@ -292,7 +293,7 @@ impl SessionStore {
         file.write_all(line.as_bytes())?;
         file.write_all(b"\n")?;
         file.flush()?;
-        file.sync_data()?;
+        sync_file_data(&file, &path)?;
         sync_dir(containing_dir(&path))?;
         Ok(())
     }
@@ -776,7 +777,7 @@ fn create_empty_private_file(path: &Path) -> Result<(), SessionStoreError> {
         .open(path)
         .map_err(SessionStoreError::Io)?;
     set_file_mode_0600(&file)?;
-    file.sync_data()?;
+    sync_file_data(&file, path)?;
     sync_dir(containing_dir(path))?;
     Ok(())
 }
@@ -845,7 +846,7 @@ fn write_json_private_new<T: Serialize>(path: &Path, value: &T) -> Result<(), Se
     serde_json::to_writer_pretty(&mut file, value).map_err(SessionStoreError::Serialize)?;
     file.write_all(b"\n")?;
     file.flush()?;
-    file.sync_data()?;
+    sync_file_data(&file, path)?;
     sync_dir(containing_dir(path))?;
     Ok(())
 }
@@ -869,7 +870,7 @@ fn write_json_private_replace<T: Serialize>(
         serde_json::to_writer_pretty(&mut file, value).map_err(SessionStoreError::Serialize)?;
         file.write_all(b"\n")?;
         file.flush()?;
-        file.sync_data()?;
+        sync_file_data(&file, &temp_path)?;
     }
     fs::rename(&temp_path, path).map_err(SessionStoreError::Io)?;
     sync_dir(containing_dir(path))?;
