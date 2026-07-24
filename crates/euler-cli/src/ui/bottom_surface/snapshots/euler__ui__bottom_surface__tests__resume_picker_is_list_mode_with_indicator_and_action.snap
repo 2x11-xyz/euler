@@ -1,0 +1,11 @@
+---
+source: crates/euler-cli/src/ui/bottom_surface/tests.rs
+expression: rendered
+---
+────────────────────────────────────────────────────────────────────────────────
+Resume · newest first · (1/2)
+>
+TUI
+→ 2026-06-19 research  4m ago
+    s1  /repo
+↑↓ move · ⏎ resume · ctrl+o preview · esc cancel

@@ -25,6 +25,8 @@ pub mod terminal;
 #[cfg(test)]
 #[path = "test_backend_test.rs"]
 pub mod test_backend;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod text;
 pub mod theme;
 pub mod transcript;
