@@ -1,11 +1,11 @@
 ---
 source: crates/euler-cli/src/ui/transcript_tests.rs
-expression: joined
+expression: snapshot_text(&texts)
 ---
 • Patch proposed src/a.rs
-       1 - a                                                                    
-       1 + aa                                                                   
+       1 - a
+       1 + aa
 
 • Patch proposed src/b.rs
-       1 - b                                                                    
+       1 - b
        1 + bb

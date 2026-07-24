@@ -9,6 +9,26 @@ mod terminal_tests {
 
     static TERMINAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    trait VisualCanvasFrameTestExt {
+        fn test_default() -> Self;
+    }
+
+    impl VisualCanvasFrameTestExt for VisualCanvasFrame {
+        fn test_default() -> Self {
+            Self {
+                history_lines: std::sync::Arc::new(Vec::new()),
+                tail_lines: Vec::new(),
+                cursor: None,
+                required_height: 0,
+                history_rows: 0,
+                committable_rows: 0,
+                pinned_rows: 0,
+                prefer_stable_height: false,
+                history_item_offsets: Vec::new(),
+            }
+        }
+    }
+
     #[test]
     fn terminal_owner_rejects_second_enter_before_terminal_setup() {
         let _guard = TERMINAL_TEST_LOCK.lock().expect("terminal test lock");

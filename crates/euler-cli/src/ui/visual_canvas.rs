@@ -394,28 +394,6 @@ pub struct VisualCanvasFrame {
 }
 
 impl VisualCanvasFrame {
-    /// Baseline frame for hand-built terminal-accounting tests: empty
-    /// Arc-shared history, no cursor, every row count zero,
-    /// `prefer_stable_height` off. Tests build with struct-update so each
-    /// literal states only the fields it asserts on, e.g.
-    /// `VisualCanvasFrame { tail_lines, required_height, ..test_default() }`.
-    /// The omitted fields are exactly this baseline — the common value the
-    /// converted field-by-field literals all shared.
-    #[cfg(test)]
-    pub(crate) fn test_default() -> Self {
-        Self {
-            history_lines: Arc::new(Vec::new()),
-            tail_lines: Vec::new(),
-            cursor: None,
-            required_height: 0,
-            history_rows: 0,
-            committable_rows: 0,
-            pinned_rows: 0,
-            prefer_stable_height: false,
-            history_item_offsets: Vec::new(),
-        }
-    }
-
     /// Two-segment view over every frame row (history followed by tail). All
     /// row indices carried by the frame — `history_rows`, `committable_rows`,
     /// `pinned_rows`, cursor rows, `history_item_offsets` — address this

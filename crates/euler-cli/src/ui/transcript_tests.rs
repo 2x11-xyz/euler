@@ -9,7 +9,7 @@ use super::{
         TranscriptItem,
     },
 };
-use crate::ui::test_support::{event, event_at};
+use crate::ui::test_support::{event, event_at, snapshot_text};
 use euler_event::{object, EventEnvelope, EventKind};
 use insta::assert_snapshot;
 use ratatui::{layout::Rect, style::Style, text::Line, Terminal};
@@ -2979,7 +2979,7 @@ fn patch_proposed_artifact_uses_anchored_title_and_not_old_child_rows() {
     let joined = texts.join("\n");
 
     // Full-surface pin: two anchored `Patch proposed` cells in order.
-    assert_snapshot!(joined);
+    assert_snapshot!(snapshot_text(&texts));
     assert_eq!(
         joined.matches("Patch proposed").count(),
         2,
@@ -3357,7 +3357,7 @@ fn file_change_metadata_renders_as_flat_artifact_without_fake_diff() {
 
     // Full-surface pin: the flat metadata artifact (title + action/origin/bytes
     // /sha256/diff rows). Behavioral guards below keep their own intent.
-    assert_snapshot!(joined);
+    assert_snapshot!(snapshot_text(&texts));
     assert_no_box_chars(&texts);
     assert!(!joined.contains("@@"));
     assert!(!joined.contains("+         1 |"));
@@ -3382,7 +3382,7 @@ fn file_diff_renders_unified_diff_as_source_first_artifact() {
     let joined = texts.join("\n");
 
     // Full-surface pin: source-first unified diff (title diffstat + body rows).
-    assert_snapshot!(joined);
+    assert_snapshot!(snapshot_text(&texts));
     assert_no_box_chars(&texts);
     assert!(!joined.contains("--- a/src/lib.rs"));
     assert!(!joined.contains("+++ b/src/lib.rs"));
@@ -3752,10 +3752,11 @@ fn file_change_sparse_metadata_uses_stable_fallbacks() {
         checkpoint_event_id: None,
     }];
 
-    let joined = line_texts(&render_items_for_history(&item, &theme, 80)).join("\n");
+    let texts = line_texts(&render_items_for_history(&item, &theme, 80));
+    let joined = texts.join("\n");
 
     // Full-surface pin: sparse metadata falls back to stable "unknown" tokens.
-    assert_snapshot!(joined);
+    assert_snapshot!(snapshot_text(&texts));
     // Absence guards: with no origin/sha256, those rows must not render at all.
     assert!(!joined.contains("  origin:"));
     assert!(!joined.contains("  sha256:"));

@@ -35,6 +35,7 @@
 //! every one must still appear.
 
 use euler_event::{EventEnvelope, JsonObject};
+use euler_provider::{EchoProvider, ModelProvider, ModelRequest, ProviderError, ProviderStream};
 
 /// A session-scoped agent event with the default id/parent — the baseline
 /// most transcript-projection tests want. Callers that need explicit
@@ -50,4 +51,72 @@ pub(crate) fn event_at(kind: &'static str, payload: JsonObject, ts: &'static str
     let mut event = event(kind, payload);
     event.ts = ts.to_owned();
     event
+}
+
+/// Join rendered rows for a shape snapshot without retaining terminal-only
+/// right fill. Tests where trailing padding is semantic use exact vectors.
+pub(crate) fn snapshot_text(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Test-only provider that parks every invocation until its shared gate opens.
+pub(crate) struct GateProvider {
+    gate: Gate,
+}
+
+impl GateProvider {
+    pub(crate) fn echo() -> (Self, Gate) {
+        let gate = Gate::new();
+        (Self { gate: gate.clone() }, gate)
+    }
+}
+
+impl ModelProvider for GateProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.gate.wait_until_open();
+        EchoProvider.invoke(request)
+    }
+}
+
+/// Release handle for [`GateProvider`]. Opening is permanent.
+#[derive(Clone)]
+pub(crate) struct Gate {
+    inner: std::sync::Arc<GateInner>,
+}
+
+struct GateInner {
+    open: std::sync::Mutex<bool>,
+    signal: std::sync::Condvar,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(GateInner {
+                open: std::sync::Mutex::new(false),
+                signal: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    fn wait_until_open(&self) {
+        let mut open = self.inner.open.lock().expect("gate mutex poisoned");
+        while !*open {
+            open = self.inner.signal.wait(open).expect("gate mutex poisoned");
+        }
+    }
+
+    pub(crate) fn open(&self) {
+        let mut open = self.inner.open.lock().expect("gate mutex poisoned");
+        *open = true;
+        self.inner.signal.notify_all();
+    }
 }

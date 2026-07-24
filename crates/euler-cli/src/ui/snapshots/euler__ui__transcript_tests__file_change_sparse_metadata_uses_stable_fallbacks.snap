@@ -1,8 +1,8 @@
 ---
 source: crates/euler-cli/src/ui/transcript_tests.rs
-expression: joined
+expression: snapshot_text(&texts)
 ---
 • File changed (unknown path) · metadata only
-    action: unknown                                                             
-    bytes: unknown -> unknown                                                   
+    action: unknown
+    bytes: unknown -> unknown
     diff: metadata only

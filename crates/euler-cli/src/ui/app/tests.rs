@@ -1,12 +1,13 @@
 use super::*;
 use crate::ui::patch_approval::PatchPreview;
 use crate::ui::test_backend::VT100Backend;
+use crate::ui::test_support::{Gate, GateProvider};
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
     catalog::{MergedModelCatalog, EMBEDDED_CATALOG_JSON},
-    EchoProvider, FixtureResponse, Gate, GateProvider, ModelProvider, ModelRequest,
-    ModelStreamEvent, ProviderError, ProviderStream, ReasoningEffort, ScriptedProvider,
-    ScriptedStreamStep, StopReason, ToolCall, Usage,
+    EchoProvider, FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError,
+    ProviderStream, ReasoningEffort, ScriptedProvider, ScriptedStreamStep, StopReason, ToolCall,
+    Usage,
 };
 use ratatui::{
     layout::Rect,
