@@ -1,5 +1,6 @@
+use crate::durability::{sync_dir, sync_file_data};
 use crate::home::{containing_dir, ensure_private_dir, private_open_options, set_file_mode_0600};
-use crate::home::{sync_dir, EulerHome, EulerHomeError};
+use crate::home::{EulerHome, EulerHomeError};
 use crate::provenance::accepted_prefix_lines;
 use euler_sdk::extension_package::{
     apply_install_package, apply_link_package, decode_link_inventory, encode_link_inventory,
@@ -466,7 +467,7 @@ impl ExtensionRegistry {
         set_file_mode_0600(&file)?;
         file.write_all(&entry_line)?;
         file.flush()?;
-        file.sync_data()?;
+        sync_file_data(&file, path)?;
         sync_dir(containing_dir(path))?;
         Ok(())
     }
@@ -884,7 +885,7 @@ fn write_private_file(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), Priva
     file.flush()
         .map_err(ExtensionRegistryError::Io)
         .map_err(PrivateFileWriteError::BeforeRename)?;
-    file.sync_data()
+    sync_file_data(&file, tmp)
         .map_err(ExtensionRegistryError::Io)
         .map_err(PrivateFileWriteError::BeforeRename)?;
     reject_symlink(path, REGISTRY_LEAF_SYMLINK_MESSAGE)

@@ -926,3 +926,34 @@ fn stale_temp_files_do_not_block_writes() {
         .expect("write despite stale file");
     assert_eq!(storage.get("openrouter"), Some(api_key("ok")));
 }
+#[test]
+fn injected_persist_sync_failure_keeps_previous_auth_file() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = TempDir::new().expect("temp dir");
+    let path = auth_path(&temp);
+    let mut storage = AuthStorage::new(&path).expect("storage");
+    storage
+        .set("openrouter", api_key("sk-first"))
+        .expect("first set");
+    let before = fs::read_to_string(&path).expect("auth before");
+
+    // The atomic write syncs its temp file before persisting over the auth
+    // file; failing that sync must abort before the previous file changes.
+    let guard = arm_matching(Op::FileSync, |candidate| {
+        candidate
+            .extension()
+            .is_some_and(|extension| extension == "tmp")
+    });
+    let error = storage
+        .set("chatgpt", api_key("sk-second"))
+        .expect_err("injected persist sync failure");
+    assert!(matches!(error, AuthError::Io(_)));
+    assert!(guard.fired());
+    drop(guard);
+
+    assert_eq!(fs::read_to_string(&path).expect("auth after"), before);
+    let reloaded = AuthStorage::new(&path).expect("reload");
+    assert_eq!(reloaded.get("openrouter"), Some(api_key("sk-first")));
+    assert!(!reloaded.contains_provider_entry("chatgpt"));
+}

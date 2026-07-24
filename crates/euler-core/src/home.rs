@@ -207,16 +207,6 @@ pub(crate) fn containing_dir(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-#[cfg(unix)]
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-pub(crate) fn sync_dir(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 fn map_home_io(path: &Path, source: io::Error) -> EulerHomeError {
     if is_symlink_loop(&source) {
         EulerHomeError::SymlinkLoop {

@@ -3567,6 +3567,70 @@ fn innocently_named_symlink_to_sensitive_file_still_asks() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn scoped_fs_read_grant_never_covers_reads_and_cannot_be_borrowed_by_escapes() {
+    // Task-1 verification pin (fs-read canonicalization asymmetry audit):
+    // `permission_request_for_tool` canonicalizes `request.path` only for
+    // FsWrite, but FsRead is NOT exploitable through the literal path,
+    // because scoped (patterned) fs-read grants have no matching semantics
+    // at all (`ActiveGrant::matches` falls through to false — fail closed
+    // to ask). End-to-end: after a decider installs a scoped `src` fs-read
+    // session grant, EVERY later read re-asks — the in-scope read, the
+    // `..` traversal, and the symlink alike — so there is no scope for a
+    // raw-path or symlink borrow. The tool layer additionally rejects
+    // workspace escapes at execution (tools_test.rs). Allow-once verdicts
+    // keep the turn alive (a deny would latch the capability for the rest
+    // of the turn and mask the re-ask count).
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir(temp.path().join("src")).expect("src dir");
+    std::fs::write(temp.path().join("src/notes.txt"), "inside-canary").expect("inside");
+    std::fs::write(temp.path().join("private.txt"), "outside-scope").expect("private");
+    std::os::unix::fs::symlink("../private.txt", temp.path().join("src/link.txt"))
+        .expect("symlink");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![read_file_call("call-in-scope", "src/notes.txt")]),
+        FixtureResponse::ToolCalls(vec![read_file_call("call-traversal", "src/../private.txt")]),
+        FixtureResponse::ToolCalls(vec![read_file_call("call-symlink", "src/link.txt")]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![
+            crate::permissions::DeciderVerdict::AllowScoped(crate::grants::GrantScope::Session(
+                crate::grants::ScopePattern::new("src").expect("pattern"),
+            )),
+            crate::permissions::DeciderVerdict::Allow,
+            crate::permissions::DeciderVerdict::Allow,
+        ]),
+    );
+    session.set_permission_mode(Capability::FsRead, ApprovalMode::Ask);
+
+    session.run_turn("read all three").expect("turn");
+
+    let prompts = events_of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(
+        prompts.len(),
+        3,
+        "a scoped fs-read grant must cover nothing: every read re-asks"
+    );
+    let results = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(results.len(), 3);
+    assert!(
+        results
+            .iter()
+            .all(|event| event.payload["ok"] == json!(true)),
+        "each read runs on its own explicit allow, never on the scoped grant"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|event| event.payload.get("grant_source").is_none()),
+        "no read may be attributed to the inert scoped grant"
+    );
+}
+
 #[test]
 fn broadly_classified_env_secret_is_masked_in_tool_output() {
     // Deep review P2-c: the redactor seeded known values from a 4-name
