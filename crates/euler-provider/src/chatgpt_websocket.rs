@@ -11,7 +11,6 @@ use tungstenite::{connect as websocket_connect, Error as TungsteniteError, WebSo
 use url::Url;
 
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
-
 #[derive(Debug)]
 pub(crate) enum ConnectError {
     HttpStatus(u16),
@@ -77,11 +76,9 @@ fn websocket_endpoint(endpoint: &str) -> Result<String, ConnectError> {
 fn websocket_body(mut body: Value) -> Value {
     body["type"] = json!("response.create");
     body["include"] = json!(["reasoning.encrypted_content"]);
-    // Parallel tool calls stay enabled: suppressing them caps every response
-    // at one tool call, which measurably multiplies model round-trips (each a
-    // full context re-send). Euler still executes batched calls serially, so
-    // permission gating and provenance ordering are unaffected.
-    body["parallel_tool_calls"] = json!(true);
+    // The ChatGPT subscription WebSocket route rejects `true` for Luna with
+    // `unsupported_value` even though other Responses routes accept it.
+    body["parallel_tool_calls"] = json!(false);
     body["tool_choice"] = json!("auto");
     body["text"] = json!({"verbosity": "low"});
     if !body["reasoning"].is_object() {
@@ -210,7 +207,7 @@ mod tests {
             "reasoning": {"effort": "medium"}
         }));
 
-        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["type"], "response.create");
         assert_eq!(body["reasoning"]["context"], "all_turns");
         assert_eq!(body["reasoning"]["summary"], "auto");

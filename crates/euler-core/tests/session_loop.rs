@@ -5632,6 +5632,36 @@ fn rejected_error_is_never_retried() {
 }
 
 #[test]
+fn entitlement_rejection_stream_is_not_retried_with_default_config() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![
+            vec![Err(ProviderError::rejected(
+                "ChatGPT response failed: request rejected",
+            ))],
+            text_stream("unreachable"),
+        ],
+        Arc::clone(&requests),
+    );
+    let config = SessionConfig::new(temp.path());
+    assert!(
+        config.provider_transport_retries > 0,
+        "test requires retries to be enabled"
+    );
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    let error = session
+        .run_turn("hello")
+        .expect_err("entitlement rejection fails fast");
+
+    assert!(matches!(error, SessionError::Provider(_)));
+    assert_eq!(request_log_guard(&requests).len(), 1);
+    assert_eq!(count_kind(session.events(), EventKind::ERROR), 1);
+}
+
+#[test]
 fn partial_stream_transport_error_is_not_retried() {
     let temp = tempfile::tempdir().expect("temp dir");
     let provider = RawStreamProvider::new(vec![

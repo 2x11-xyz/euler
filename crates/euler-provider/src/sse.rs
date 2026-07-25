@@ -155,7 +155,7 @@ fn parse_payload(data: &str) -> Option<Result<ModelStreamEvent, ProviderError>> 
                 usage: usage(&value),
             }))
         }
-        "response.failed" => Some(Err(response_failed_error(&value))),
+        "response.failed" | "error" => Some(Err(response_failed_error(&value))),
         _ => None,
     }
 }
@@ -229,9 +229,18 @@ fn response_failed_error(value: &Value) -> ProviderError {
         Some("rate_limit_exceeded" | "rate_limit") => {
             ProviderError::rate_limit("ChatGPT response failed: rate limit")
         }
-        Some("invalid_request_error" | "bad_request" | "content_policy_violation") => {
-            ProviderError::rejected("ChatGPT response failed: request rejected")
+        Some("unauthorized" | "authentication_error" | "invalid_api_key") => {
+            ProviderError::auth("ChatGPT response failed: authentication failed")
         }
+        Some(
+            "invalid_request"
+            | "invalid_request_error"
+            | "bad_request"
+            | "content_policy_violation"
+            | "unsupported_value"
+            | "usage_limit_reached"
+            | "usage_not_included",
+        ) => ProviderError::rejected("ChatGPT response failed: request rejected"),
         _ => ProviderError::transport("ChatGPT response failed"),
     }
 }
@@ -342,6 +351,54 @@ data: {"type":"response.completed"}
             collect(events),
             vec![Err(ProviderError::transport("ChatGPT response failed"))]
         );
+    }
+
+    #[test]
+    fn reports_top_level_websocket_error_as_terminal_without_body_details() {
+        assert_terminal_rejection(json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "code": "unsupported_value",
+                "param": "parallel_tool_calls",
+                "message": "request details"
+            }
+        }));
+    }
+
+    #[test]
+    fn reports_top_level_entitlement_errors_as_terminal_rejections() {
+        for code in ["usage_limit_reached", "usage_not_included"] {
+            assert_terminal_rejection(json!({
+                "type": "error",
+                "status": 429,
+                "error": {"type": code, "message": "account details"}
+            }));
+        }
+    }
+
+    #[test]
+    fn reports_nested_entitlement_failures_as_terminal_rejections() {
+        for code in ["usage_limit_reached", "usage_not_included"] {
+            assert_terminal_rejection(json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"code": code, "message": "account details"}
+                }
+            }));
+        }
+    }
+
+    #[test]
+    fn reports_transient_throttle_codes_as_rate_limits() {
+        for code in ["rate_limit", "rate_limit_exceeded"] {
+            let error = response_failed_error(&json!({"error": {"code": code}}));
+            assert_eq!(
+                error,
+                ProviderError::rate_limit("ChatGPT response failed: rate limit")
+            );
+        }
     }
 
     #[test]
@@ -529,5 +586,20 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         events: Vec<Result<ModelStreamEvent, ProviderError>>,
     ) -> Vec<Result<ModelStreamEvent, ProviderError>> {
         events
+    }
+
+    fn assert_terminal_rejection(payload: Value) {
+        let mut parser = ResponseEventParser::default();
+        let event = parser
+            .push_json(&payload.to_string())
+            .expect("provider error is a canonical stream event");
+
+        assert_eq!(
+            event,
+            Err(ProviderError::rejected(
+                "ChatGPT response failed: request rejected"
+            ))
+        );
+        assert!(parser.finish().is_none(), "the error is already terminal");
     }
 }
