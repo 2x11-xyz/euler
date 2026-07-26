@@ -214,6 +214,15 @@ mod imp {
         Failed,
     }
 
+    /// Shared mutable state threaded through the skill-tree scan: the
+    /// redactor plus the diagnostic, directory-count, and candidate sinks.
+    struct SkillScan<'a> {
+        redactor: &'a SecretRedactor,
+        diagnostics: &'a mut Vec<ManifestDiagnostic>,
+        directories_examined: &'a mut usize,
+        candidates: &'a mut Vec<SkillCandidate>,
+    }
+
     pub(super) fn discover(
         canonical_workspace: &Path,
         user_skills_root: Option<&Path>,
@@ -594,20 +603,21 @@ mod imp {
     ) -> Vec<ManifestSkill> {
         let mut candidates = Vec::new();
         let mut directories_examined = 0usize;
+        let mut scan = SkillScan {
+            redactor,
+            diagnostics,
+            directories_examined: &mut directories_examined,
+            candidates: &mut candidates,
+        };
         if let Some(root) = user_skills_root {
-            scan_user_skills_root(
-                root,
-                redactor,
-                diagnostics,
-                &mut directories_examined,
-                &mut candidates,
-            );
+            scan_user_skills_root(root, &mut scan);
         }
         let mut rel_dir = String::new();
         for (depth, dir) in project_chain.iter_mut().enumerate() {
             if depth > 0 {
                 let Some(name) = dir.name.as_deref().and_then(OsStr::to_str) else {
-                    diagnostics.push(diagnostic(DiagnosticReason::NonUtf8Path, None, None));
+                    scan.diagnostics
+                        .push(diagnostic(DiagnosticReason::NonUtf8Path, None, None));
                     break;
                 };
                 rel_dir = join_rel(&rel_dir, name);
@@ -616,66 +626,43 @@ mod imp {
             let Some(Enumeration::Names(names)) = dir.entries.as_ref() else {
                 continue;
             };
-            scan_project_skills_entry(
-                &dir.fd,
-                names,
-                &rel_dir,
-                redactor,
-                diagnostics,
-                &mut directories_examined,
-                &mut candidates,
-            );
+            scan_project_skills_entry(&dir.fd, names, &rel_dir, &mut scan);
         }
-        admit_skill_candidates(candidates, diagnostics)
+        let SkillScan {
+            diagnostics,
+            candidates,
+            ..
+        } = scan;
+        admit_skill_candidates(std::mem::take(candidates), diagnostics)
     }
 
-    fn scan_user_skills_root(
-        root: &Path,
-        redactor: &SecretRedactor,
-        diagnostics: &mut Vec<ManifestDiagnostic>,
-        directories_examined: &mut usize,
-        candidates: &mut Vec<SkillCandidate>,
-    ) {
+    fn scan_user_skills_root(root: &Path, scan: &mut SkillScan<'_>) {
         if !root.exists() {
             return;
         }
         let Some(fd) = open_absolute_dir_nofollow(root) else {
-            diagnostics.push(diagnostic(
+            scan.diagnostics.push(diagnostic(
                 DiagnosticReason::SymlinkRejected,
                 Some("user/skills".to_owned()),
                 None,
             ));
             return;
         };
-        scan_skills_tree(
-            &fd,
-            false,
-            "user/skills",
-            SkillScope::User,
-            0,
-            redactor,
-            diagnostics,
-            directories_examined,
-            candidates,
-        );
+        scan_skills_tree(&fd, false, "user/skills", SkillScope::User, 0, scan);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn scan_project_skills_entry(
         parent: &OwnedFd,
         names: &[Vec<u8>],
         rel_dir: &str,
-        redactor: &SecretRedactor,
-        diagnostics: &mut Vec<ManifestDiagnostic>,
-        directories_examined: &mut usize,
-        candidates: &mut Vec<SkillCandidate>,
+        scan: &mut SkillScan<'_>,
     ) {
         if !names.iter().any(|name| name.as_slice() == b".euler") {
             return;
         }
         let identity = join_rel(rel_dir, ".euler/skills");
         let Ok(euler_dir) = open_component_dir(parent, OsStr::new(".euler")) else {
-            diagnostics.push(diagnostic(
+            scan.diagnostics.push(diagnostic(
                 DiagnosticReason::SymlinkRejected,
                 Some(join_rel(rel_dir, ".euler")),
                 None,
@@ -685,14 +672,15 @@ mod imp {
         let Enumeration::Names(euler_names) =
             enumerate_bounded(&euler_dir.fd, euler_dir.traversal_only)
         else {
-            diagnostics.push(diagnostic(DiagnosticReason::IoError, Some(identity), None));
+            scan.diagnostics
+                .push(diagnostic(DiagnosticReason::IoError, Some(identity), None));
             return;
         };
         if !euler_names.iter().any(|name| name.as_slice() == b"skills") {
             return;
         }
         let Ok(skills_dir) = open_component_dir(&euler_dir.fd, OsStr::new("skills")) else {
-            diagnostics.push(diagnostic(
+            scan.diagnostics.push(diagnostic(
                 DiagnosticReason::SymlinkRejected,
                 Some(identity),
                 None,
@@ -705,37 +693,30 @@ mod imp {
             &join_rel(rel_dir, ".euler/skills"),
             SkillScope::Project,
             0,
-            redactor,
-            diagnostics,
-            directories_examined,
-            candidates,
+            scan,
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn scan_skills_tree(
         dir: &OwnedFd,
         traversal_only: bool,
         identity: &str,
         scope: SkillScope,
         depth: usize,
-        redactor: &SecretRedactor,
-        diagnostics: &mut Vec<ManifestDiagnostic>,
-        directories_examined: &mut usize,
-        candidates: &mut Vec<SkillCandidate>,
+        scan: &mut SkillScan<'_>,
     ) {
-        if *directories_examined >= MAX_SKILL_DIRECTORIES {
-            diagnostics.push(diagnostic(
+        if *scan.directories_examined >= MAX_SKILL_DIRECTORIES {
+            scan.diagnostics.push(diagnostic(
                 DiagnosticReason::SkillDirectoryCountExceeded,
                 Some(identity.to_owned()),
-                Some(*directories_examined as u64),
+                Some(*scan.directories_examined as u64),
             ));
             return;
         }
-        *directories_examined += 1;
+        *scan.directories_examined += 1;
         let enumeration = enumerate_bounded(dir, traversal_only);
         let Enumeration::Names(names) = enumeration else {
-            diagnostics.push(diagnostic(
+            scan.diagnostics.push(diagnostic(
                 DiagnosticReason::DirEntriesExceeded,
                 Some(identity.to_owned()),
                 None,
@@ -746,7 +727,14 @@ mod imp {
             .iter()
             .any(|name| name.as_slice() == SKILL_FILE_NAME.as_bytes())
         {
-            read_skill_candidate(dir, identity, scope, redactor, diagnostics, candidates);
+            read_skill_candidate(
+                dir,
+                identity,
+                scope,
+                scan.redactor,
+                scan.diagnostics,
+                scan.candidates,
+            );
         }
         if depth >= MAX_SKILL_TRAVERSAL_DEPTH {
             let has_child_directory = names.iter().any(|name| {
@@ -754,7 +742,7 @@ mod imp {
                     .is_ok_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
             });
             if has_child_directory {
-                diagnostics.push(diagnostic(
+                scan.diagnostics.push(diagnostic(
                     DiagnosticReason::SkillDepthExceeded,
                     Some(identity.to_owned()),
                     Some(depth as u64),
@@ -767,7 +755,8 @@ mod imp {
                 continue;
             }
             let Some(name_text) = std::str::from_utf8(&name).ok() else {
-                diagnostics.push(diagnostic(DiagnosticReason::NonUtf8Path, None, None));
+                scan.diagnostics
+                    .push(diagnostic(DiagnosticReason::NonUtf8Path, None, None));
                 continue;
             };
             let Ok(stat) = fstatat_nofollow(dir, OsStr::new(name_text)) else {
@@ -784,12 +773,9 @@ mod imp {
                     &child_identity,
                     scope,
                     depth + 1,
-                    redactor,
-                    diagnostics,
-                    directories_examined,
-                    candidates,
+                    scan,
                 ),
-                Err(_) => diagnostics.push(diagnostic(
+                Err(_) => scan.diagnostics.push(diagnostic(
                     DiagnosticReason::SymlinkRejected,
                     Some(child_identity),
                     None,

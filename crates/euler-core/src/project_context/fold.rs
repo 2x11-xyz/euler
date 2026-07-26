@@ -158,6 +158,16 @@ enum ValidatedSnapshot {
     },
 }
 
+/// The validated summary fields of a snapshot payload, independent of
+/// whether a manifest is admitted.
+struct SnapshotSummary {
+    candidate_digest: String,
+    source_identities: Vec<String>,
+    skill_count: u64,
+    diagnostic_count: u64,
+    reason_counts: BTreeMap<String, u64>,
+}
+
 /// Payload keys the version-1 snapshot schema permits. Everything else is
 /// rejected: recorded payloads are untrusted input on resume, and an
 /// unknown field is exactly where forged content-bearing data would hide.
@@ -232,6 +242,30 @@ fn validate_snapshot_payload(
         }
     }
     validate_policy_tuple(payload, status)?;
+    let summary = validate_snapshot_summary(payload, schema_version == Some(1))?;
+    if !manifest_admitted {
+        return Ok(ValidatedSnapshot::Disabled);
+    }
+    let manifest = validate_admitted_manifest(
+        payload,
+        &summary.candidate_digest,
+        &summary.source_identities,
+        summary.skill_count,
+        summary.diagnostic_count,
+        &summary.reason_counts,
+    )?;
+    Ok(ValidatedSnapshot::Admitted {
+        manifest,
+        candidate_digest: summary.candidate_digest,
+    })
+}
+
+/// Validate the digest, identity, ordering, and count summary fields every
+/// snapshot carries, whether it admits a manifest or is a tombstone.
+fn validate_snapshot_summary(
+    payload: &JsonObject,
+    legacy_schema: bool,
+) -> Result<SnapshotSummary, ProjectContextFoldError> {
     let candidate_digest = payload
         .get("candidate_digest")
         .and_then(Value::as_str)
@@ -248,7 +282,7 @@ fn validate_snapshot_payload(
         ));
     }
     let source_identities = validate_source_identities(payload)?;
-    let skill_count = if schema_version == Some(1) {
+    let skill_count = if legacy_schema {
         0
     } else {
         payload
@@ -268,20 +302,12 @@ fn validate_snapshot_payload(
         ));
     }
     let reason_counts = validate_reason_counts(payload, diagnostic_count)?;
-    if !manifest_admitted {
-        return Ok(ValidatedSnapshot::Disabled);
-    }
-    let manifest = validate_admitted_manifest(
-        payload,
-        candidate_digest,
-        &source_identities,
+    Ok(SnapshotSummary {
+        candidate_digest: candidate_digest.to_owned(),
+        source_identities,
         skill_count,
         diagnostic_count,
-        &reason_counts,
-    )?;
-    Ok(ValidatedSnapshot::Admitted {
-        manifest,
-        candidate_digest: candidate_digest.to_owned(),
+        reason_counts,
     })
 }
 

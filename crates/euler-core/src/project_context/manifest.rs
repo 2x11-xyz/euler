@@ -167,6 +167,13 @@ impl CandidateManifest {
                 "legacy manifests cannot contain skills".to_owned(),
             ));
         }
+        self.validate_sources()?;
+        self.validate_skills()?;
+        self.validate_diagnostics()?;
+        Ok(())
+    }
+
+    fn validate_sources(&self) -> Result<(), ManifestError> {
         if self.sources.len() > MAX_EULER_MD_SOURCES {
             return Err(ManifestError(format!(
                 "manifest lists {} sources; the limit is {MAX_EULER_MD_SOURCES}",
@@ -208,6 +215,10 @@ impl CandidateManifest {
                 "combined source content exceeds the aggregate limit".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_skills(&self) -> Result<(), ManifestError> {
         if self.skills.len() > MAX_SKILLS {
             return Err(ManifestError(format!(
                 "manifest lists {} skills; the limit is {MAX_SKILLS}",
@@ -272,6 +283,10 @@ impl CandidateManifest {
                 "combined skill bodies exceed the aggregate limit".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_diagnostics(&self) -> Result<(), ManifestError> {
         if self.diagnostics.len() > MAX_MANIFEST_DIAGNOSTICS {
             return Err(ManifestError(format!(
                 "manifest lists {} diagnostics; the limit is {MAX_MANIFEST_DIAGNOSTICS}",
