@@ -4,6 +4,17 @@ All notable changes to Euler are documented here. Entries reference the
 pull requests that landed them; deeper design rationale lives in
 `docs/contracts/` and the GitHub issue ledger.
 
+## Unreleased
+
+### ChatGPT subscription compatibility
+
+- GPT-5.6 Luna WebSocket requests again disable parallel tool calls, as
+  required by the subscription route's Responses Lite protocol. Top-level
+  WebSocket error frames are now terminal provider errors instead of being
+  ignored while the session waits indefinitely for another frame. Subscription
+  entitlement failures are terminal rejections rather than retryable rate
+  limits.
+
 ## 0.1.3 — 2026-07-24
 
 The first tagged release since v0.1.1; the 0.1.2 version number was used
