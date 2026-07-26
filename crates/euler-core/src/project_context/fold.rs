@@ -30,6 +30,44 @@ pub(crate) struct PinnedProjectContext {
     /// Domain-separated digest of `rendered`, recorded on `model.call` only
     /// when these exact bytes occur in the request.
     pub rendered_digest: String,
+    manifest: CandidateManifest,
+}
+
+impl PinnedProjectContext {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        snapshot_event_id: impl Into<String>,
+        candidate_digest: impl Into<String>,
+        rendered: impl Into<String>,
+        rendered_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            snapshot_event_id: snapshot_event_id.into(),
+            candidate_digest: candidate_digest.into(),
+            rendered: rendered.into(),
+            rendered_digest: rendered_digest.into(),
+            manifest: CandidateManifest {
+                version: super::manifest::MANIFEST_VERSION,
+                sources: Vec::new(),
+                skills: Vec::new(),
+                diagnostics: Vec::new(),
+                reason_counts: BTreeMap::new(),
+            },
+        }
+    }
+
+    pub(crate) fn frozen_skills(&self) -> Vec<crate::tools::FrozenSkill> {
+        self.manifest
+            .skills
+            .iter()
+            .map(|skill| crate::tools::FrozenSkill {
+                name: skill.name.clone(),
+                scope: skill.scope.as_str().to_owned(),
+                body_digest: skill.body_digest.clone(),
+                body: skill.body.clone(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +142,7 @@ pub(crate) fn fold_project_context(
                     candidate_digest,
                     rendered,
                     rendered_digest,
+                    manifest: manifest.clone(),
                 },
             )))
         }
@@ -129,9 +168,11 @@ const SNAPSHOT_COMMON_KEYS: &[&str] = &[
     "resolution_reason",
     "acknowledgment_basis",
     "candidate_digest",
+    "manifest_admitted",
     "workspace_identity",
     "ordering",
     "source_identities",
+    "skill_count",
     "diagnostic_count",
     "diagnostic_reason_counts",
 ];
@@ -151,7 +192,7 @@ fn validate_snapshot_payload(
     payload: &JsonObject,
 ) -> Result<ValidatedSnapshot, ProjectContextFoldError> {
     let schema_version = payload.get("schema_version").and_then(Value::as_u64);
-    if schema_version != Some(u64::from(SNAPSHOT_SCHEMA_VERSION)) {
+    if schema_version != Some(1) && schema_version != Some(u64::from(SNAPSHOT_SCHEMA_VERSION)) {
         return Err(ProjectContextFoldError::new(
             "it was written by a different Euler version",
         ));
@@ -169,9 +210,21 @@ fn validate_snapshot_payload(
             ))
         }
     };
+    let manifest_admitted = if schema_version == Some(1) {
+        admitted
+    } else {
+        payload
+            .get("manifest_admitted")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                ProjectContextFoldError::new(
+                    "the snapshot does not declare whether a manifest is admitted",
+                )
+            })?
+    };
     for key in payload.keys() {
         let known = SNAPSHOT_COMMON_KEYS.contains(&key.as_str())
-            || (admitted && SNAPSHOT_ADMITTED_KEYS.contains(&key.as_str()));
+            || (manifest_admitted && SNAPSHOT_ADMITTED_KEYS.contains(&key.as_str()));
         if !known {
             return Err(ProjectContextFoldError::new(format!(
                 "the snapshot carries a field this Euler version does not record: {key}"
@@ -195,6 +248,14 @@ fn validate_snapshot_payload(
         ));
     }
     let source_identities = validate_source_identities(payload)?;
+    let skill_count = if schema_version == Some(1) {
+        0
+    } else {
+        payload
+            .get("skill_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ProjectContextFoldError::new("the snapshot omits its skill count"))?
+    };
     let diagnostic_count = payload
         .get("diagnostic_count")
         .and_then(Value::as_u64)
@@ -207,13 +268,14 @@ fn validate_snapshot_payload(
         ));
     }
     let reason_counts = validate_reason_counts(payload, diagnostic_count)?;
-    if !admitted {
+    if !manifest_admitted {
         return Ok(ValidatedSnapshot::Disabled);
     }
     let manifest = validate_admitted_manifest(
         payload,
         candidate_digest,
         &source_identities,
+        skill_count,
         diagnostic_count,
         &reason_counts,
     )?;
@@ -230,6 +292,7 @@ fn validate_admitted_manifest(
     payload: &JsonObject,
     candidate_digest: &str,
     source_identities: &[String],
+    skill_count: u64,
     diagnostic_count: u64,
     reason_counts: &BTreeMap<String, u64>,
 ) -> Result<CandidateManifest, ProjectContextFoldError> {
@@ -268,6 +331,23 @@ fn validate_admitted_manifest(
     {
         return Err(ProjectContextFoldError::new(
             "its source identities do not match the manifest",
+        ));
+    }
+    if manifest.skills.len() as u64 != skill_count {
+        return Err(ProjectContextFoldError::new(
+            "its skill count does not match the manifest",
+        ));
+    }
+    let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
+    if status != "admitted"
+        && (!manifest.sources.is_empty()
+            || manifest
+                .skills
+                .iter()
+                .any(|skill| skill.scope == super::manifest::SkillScope::Project))
+    {
+        return Err(ProjectContextFoldError::new(
+            "a non-admitted project snapshot contains project-owned guidance",
         ));
     }
     if manifest.diagnostics.len() as u64 != diagnostic_count
@@ -446,9 +526,8 @@ fn validate_diagnostic_payload(payload: &JsonObject) -> Result<(), String> {
             ));
         }
     }
-    if payload.get("schema_version").and_then(Value::as_u64)
-        != Some(u64::from(SNAPSHOT_SCHEMA_VERSION))
-    {
+    let version = payload.get("schema_version").and_then(Value::as_u64);
+    if version != Some(1) && version != Some(u64::from(SNAPSHOT_SCHEMA_VERSION)) {
         return Err("a diagnostic was written by a different Euler version".to_owned());
     }
     let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("");
@@ -558,7 +637,9 @@ const SUMMARY_KEYS: &[&str] = &[
     "resolution_reason",
     "acknowledgment_basis",
     "candidate_digest",
+    "manifest_admitted",
     "source_count",
+    "skill_count",
     "diagnostic_count",
 ];
 
@@ -583,8 +664,11 @@ fn validate_summary_against_snapshot(summary: &Value, snapshot: &JsonObject) -> 
     if summary.get("expected") != Some(&Value::Bool(true)) {
         return Err("the project-context summary does not expect its snapshot".to_owned());
     }
-    if summary.get("schema_version").and_then(Value::as_u64)
-        != Some(u64::from(SNAPSHOT_SCHEMA_VERSION))
+    let summary_version = summary.get("schema_version").and_then(Value::as_u64);
+    let snapshot_version = snapshot.get("schema_version").and_then(Value::as_u64);
+    if summary_version != snapshot_version
+        || (summary_version != Some(1)
+            && summary_version != Some(u64::from(SNAPSHOT_SCHEMA_VERSION)))
     {
         return Err(
             "the project-context summary was written by a different Euler version".to_owned(),
@@ -606,6 +690,15 @@ fn validate_summary_against_snapshot(summary: &Value, snapshot: &JsonObject) -> 
             return Err(format!(
                 "the project-context summary's {field} does not match the snapshot"
             ));
+        }
+    }
+    if summary_version != Some(1) {
+        for field in ["manifest_admitted", "skill_count"] {
+            if summary.get(field) != snapshot.get(field) {
+                return Err(format!(
+                    "the project-context summary's {field} does not match the snapshot"
+                ));
+            }
         }
     }
     let summary_sources = summary.get("source_count").and_then(Value::as_u64);

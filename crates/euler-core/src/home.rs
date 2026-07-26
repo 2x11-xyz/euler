@@ -11,6 +11,7 @@ const PREFERENCES_FILE: &str = "preferences.json";
 const CODE_SWARM_CONFIG_FILE: &str = "code-swarm.json";
 const SESSIONS_DIR: &str = "sessions";
 const EXTENSIONS_DIR: &str = "extensions";
+const SKILLS_DIR: &str = "skills";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EulerHome {
@@ -70,6 +71,12 @@ impl EulerHome {
 
     pub fn extensions_dir(&self) -> PathBuf {
         self.root.join(EXTENSIONS_DIR)
+    }
+
+    /// User-global Euler skills. Discovery treats this as a read-only input
+    /// root; it is not created merely by resolving Euler home.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join(SKILLS_DIR)
     }
 
     pub fn ensure(&self) -> Result<(), EulerHomeError> {

@@ -1,4 +1,49 @@
 use super::*;
+
+#[test]
+fn skill_read_is_exposed_only_when_frozen_skills_exist() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut registry = ToolRegistry::new(temp.path());
+    assert!(!registry
+        .model_tools()
+        .iter()
+        .any(|definition| definition.name == "skill_read"));
+
+    registry.set_frozen_skills([FrozenSkill {
+        name: "commit-writing".to_owned(),
+        scope: "user".to_owned(),
+        body_digest: "digest".to_owned(),
+        body: "Keep commits focused.".to_owned(),
+    }]);
+
+    assert!(registry
+        .model_tools()
+        .iter()
+        .any(|definition| definition.name == "skill_read"));
+}
+
+#[test]
+fn skill_read_returns_only_the_frozen_body_without_a_capability() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut registry = ToolRegistry::new(temp.path());
+    registry.set_frozen_skills([FrozenSkill {
+        name: "commit-writing".to_owned(),
+        scope: "user".to_owned(),
+        body_digest: "digest".to_owned(),
+        body: "frozen body".to_owned(),
+    }]);
+
+    let execution = registry
+        .execute("skill_read", &json!({"name": "commit-writing"}))
+        .expect("read frozen skill");
+    assert!(execution.output.contains("frozen body"));
+    assert!(execution.output.contains("scope=user"));
+    assert_eq!(registry.required_capability("skill_read"), None);
+    assert!(matches!(
+        registry.execute("skill_read", &json!({"name": "missing"})),
+        Err(ToolError::InvalidField("name"))
+    ));
+}
 use serde_json::json;
 use std::env;
 #[cfg(unix)]

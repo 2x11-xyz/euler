@@ -6,6 +6,15 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Project context and skills
+
+- Euler now discovers user-global skills from `${EULER_HOME}/skills/` and
+  project skills from `.euler/skills/`, freezes them in schema-v2 session
+  snapshots, renders a compact catalog, and exposes snapshot-backed
+  `skill_read` with ordinary tool provenance. Project skills use repository
+  acknowledgment; user-global skills remain available when repository context
+  is disabled.
+
 ### ChatGPT subscription compatibility
 
 - GPT-5.6 Luna WebSocket requests again disable parallel tool calls, as

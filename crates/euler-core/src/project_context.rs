@@ -63,10 +63,19 @@ pub(crate) const MAX_MANIFEST_DIAGNOSTICS: usize = 512;
 /// diagnostic — deterministic selection over a truncated listing is
 /// impossible.
 pub const MAX_DIR_ENTRIES: usize = 4096;
+pub const MAX_SKILL_TRAVERSAL_DEPTH: usize = 6;
+pub const MAX_SKILL_DIRECTORIES: usize = 512;
+pub const MAX_SKILLS: usize = 64;
+pub const MAX_SKILL_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_SKILL_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_COMBINED_SKILL_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_SKILL_CATALOG_BYTES: usize = 16 * 1024;
+pub const MAX_SKILL_NAME_BYTES: usize = 64;
+pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 1024;
 
 /// Version of the `project.context.snapshot` / `project.context.diagnostic`
 /// payload schemas.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 /// Deterministic-ordering marker recorded on snapshots.
 const ORDERING_V1: &str = "lexicographic-v1";
@@ -223,10 +232,8 @@ impl PendingAcknowledgment {
         self.preflight.diagnostics.len()
     }
 
-    /// Skills are not part of this phase; always zero. Present so the card's
-    /// contract stays honest as skills land.
     pub fn skill_count(&self) -> usize {
-        0
+        self.preflight.project_skill_count
     }
 
     /// True when a prior acknowledgment for this folder exists but its guidance
@@ -245,7 +252,7 @@ impl PendingAcknowledgment {
             Some(store) => store.record(
                 &self.preflight.canonical_root,
                 &self.preflight.workspace_identity_digest,
-                &self.preflight.candidate_digest,
+                &self.preflight.acknowledgment_digest,
             )?,
             // No resolvable consent directory: fail closed, exactly like the
             // grant stores. Never admit without a durable record.
@@ -430,8 +437,10 @@ struct Preflight {
     canonical_root: PathBuf,
     manifest: CandidateManifest,
     candidate_digest: String,
+    acknowledgment_digest: String,
     workspace_identity_digest: String,
     source_identities: Vec<String>,
+    project_skill_count: usize,
     diagnostics: Vec<ManifestDiagnostic>,
     collapsed: bool,
     boundary_indeterminate: bool,
@@ -439,9 +448,17 @@ struct Preflight {
 
 impl Preflight {
     fn run(workspace_root: &Path, redactor: &SecretRedactor) -> Result<Self, ProjectContextError> {
+        Self::run_with_user_skills(workspace_root, None, redactor)
+    }
+
+    fn run_with_user_skills(
+        workspace_root: &Path,
+        user_skills_root: Option<&Path>,
+        redactor: &SecretRedactor,
+    ) -> Result<Self, ProjectContextError> {
         let canonical =
             std::fs::canonicalize(workspace_root).map_err(ProjectContextError::Workspace)?;
-        let outcome = discovery::discover(&canonical, redactor);
+        let outcome = discovery::discover_with_user_skills(&canonical, user_skills_root, redactor);
         let (manifest, collapsed) = sanitize_preflight(outcome);
         // An indeterminate repository boundary (a level between the workspace
         // and the nearest determinable marker that could not be enumerated)
@@ -452,6 +469,8 @@ impl Preflight {
             .iter()
             .any(|record| record.reason == "marker_indeterminate");
         let candidate_digest = candidate_digest_v1(&manifest.to_canonical_json());
+        let acknowledgment_digest =
+            candidate_digest_v1(&manifest.project_acknowledgment_view().to_canonical_json());
         let workspace_identity_digest = workspace_identity_digest_v1(&canonical);
         let source_identities = manifest
             .sources
@@ -459,13 +478,20 @@ impl Preflight {
             .map(|source| source.path.clone())
             .collect();
         let diagnostics = manifest.diagnostics.clone();
+        let project_skill_count = manifest
+            .skills
+            .iter()
+            .filter(|skill| skill.scope == manifest::SkillScope::Project)
+            .count();
         Ok(Self {
             redactor: redactor.clone(),
             canonical_root: canonical,
             manifest,
             candidate_digest,
+            acknowledgment_digest,
             workspace_identity_digest,
             source_identities,
+            project_skill_count,
             diagnostics,
             collapsed,
             boundary_indeterminate,
@@ -476,7 +502,9 @@ impl Preflight {
     /// could be admitted. A collapse, an indeterminate boundary, or the total
     /// absence of `EULER.md` all make admission impossible.
     fn admissible(&self) -> bool {
-        !self.collapsed && !self.boundary_indeterminate && !self.source_identities.is_empty()
+        !self.collapsed
+            && !self.boundary_indeterminate
+            && (!self.source_identities.is_empty() || self.project_skill_count > 0)
     }
 
     /// The exact core-framed bytes an admitted item would carry, for the
@@ -513,16 +541,33 @@ impl Preflight {
     }
 
     fn into_bootstrap(self, admission: Admission) -> ProjectContextBootstrap {
-        let manifest = admission.admit_manifest.then_some(self.manifest);
+        let manifest = self.manifest.admitted_view(admission.admit_manifest);
+        let manifest = (admission.admit_manifest
+            || !manifest.sources.is_empty()
+            || !manifest.skills.is_empty())
+        .then_some(manifest);
+        let source_identities = manifest
+            .as_ref()
+            .map_or(self.source_identities, |manifest| {
+                manifest
+                    .sources
+                    .iter()
+                    .map(|source| source.path.clone())
+                    .collect()
+            });
+        let candidate_digest = manifest
+            .as_ref()
+            .map(|manifest| candidate_digest_v1(&manifest.to_canonical_json()))
+            .unwrap_or(self.candidate_digest);
         ProjectContextBootstrap {
             redactor: self.redactor,
             status: admission.status,
             policy: admission.policy,
             resolution_reason: admission.resolution_reason,
             acknowledgment_basis: admission.acknowledgment_basis,
-            candidate_digest: self.candidate_digest,
+            candidate_digest,
             workspace_identity_digest: self.workspace_identity_digest,
-            source_identities: self.source_identities,
+            source_identities,
             diagnostics: self.diagnostics,
             manifest,
         }
@@ -588,12 +633,24 @@ impl ProjectContextBootstrap {
         consent_dir: Option<&Path>,
         budget: AdmissionBudget,
     ) -> Result<ProjectContextResolution, ProjectContextError> {
+        Self::resolve_with_user_skills(workspace_root, None, redactor, options, consent_dir, budget)
+    }
+
+    pub fn resolve_with_user_skills(
+        workspace_root: &Path,
+        user_skills_root: Option<&Path>,
+        redactor: &SecretRedactor,
+        options: ProjectContextResolveOptions,
+        consent_dir: Option<&Path>,
+        budget: AdmissionBudget,
+    ) -> Result<ProjectContextResolution, ProjectContextError> {
         let ProjectContextResolveOptions {
             policy,
             session_kind,
             trusted_local,
         } = options;
-        let preflight = Preflight::run(workspace_root, redactor)?;
+        let preflight =
+            Preflight::run_with_user_skills(workspace_root, user_skills_root, redactor)?;
         if !preflight.admissible() {
             let admission = preflight.unadmissible_admission(policy);
             return Ok(ProjectContextResolution::Resolved(Box::new(
@@ -623,7 +680,7 @@ impl ProjectContextBootstrap {
                     store.lookup(
                         &preflight.canonical_root,
                         &preflight.workspace_identity_digest,
-                        &preflight.candidate_digest,
+                        &preflight.acknowledgment_digest,
                     )
                 });
                 match lookup {
@@ -694,7 +751,17 @@ impl ProjectContextBootstrap {
         workspace_root: &Path,
         redactor: &SecretRedactor,
     ) -> Result<Self, ProjectContextError> {
-        let preflight = Preflight::run(workspace_root, redactor)?;
+        Self::admitted_for_tests_with_user_skills(workspace_root, None, redactor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_for_tests_with_user_skills(
+        workspace_root: &Path,
+        user_skills_root: Option<&Path>,
+        redactor: &SecretRedactor,
+    ) -> Result<Self, ProjectContextError> {
+        let preflight =
+            Preflight::run_with_user_skills(workspace_root, user_skills_root, redactor)?;
         // A collapsed or boundary-indeterminate preflight can never be
         // admitted, even by the test hook: the bounded scan could not produce
         // a trustworthy manifest.
@@ -733,7 +800,9 @@ impl ProjectContextBootstrap {
             "resolution_reason": self.resolution_reason,
             "acknowledgment_basis": self.acknowledgment_basis,
             "candidate_digest": self.candidate_digest,
+            "manifest_admitted": self.manifest.is_some(),
             "source_count": self.source_identities.len(),
+            "skill_count": self.manifest.as_ref().map_or(0, |manifest| manifest.skills.len()),
             "diagnostic_count": self.diagnostics.len(),
         })
     }
@@ -752,6 +821,7 @@ impl ProjectContextBootstrap {
             ("resolution_reason", self.resolution_reason.into()),
             ("acknowledgment_basis", self.acknowledgment_basis.into()),
             ("candidate_digest", self.candidate_digest.clone().into()),
+            ("manifest_admitted", self.manifest.is_some().into()),
             (
                 "workspace_identity",
                 json!({
@@ -772,6 +842,13 @@ impl ProjectContextBootstrap {
             ),
             ("diagnostic_count", self.diagnostics.len().into()),
             (
+                "skill_count",
+                self.manifest
+                    .as_ref()
+                    .map_or(0, |manifest| manifest.skills.len())
+                    .into(),
+            ),
+            (
                 "diagnostic_reason_counts",
                 reason_counts_json(&derive_reason_counts(&self.diagnostics)),
             ),
@@ -786,6 +863,24 @@ impl ProjectContextBootstrap {
             payload.insert("manifest".to_owned(), manifest_json.into());
         }
         payload
+    }
+
+    pub(crate) fn frozen_skills(&self) -> Vec<crate::tools::FrozenSkill> {
+        self.manifest
+            .as_ref()
+            .map(|manifest| {
+                manifest
+                    .skills
+                    .iter()
+                    .map(|skill| crate::tools::FrozenSkill {
+                        name: skill.name.clone(),
+                        scope: skill.scope.as_str().to_owned(),
+                        body_digest: skill.body_digest.clone(),
+                        body: skill.body.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// One `project.context.diagnostic` payload per omission, in order, each
@@ -834,6 +929,7 @@ fn sanitize_preflight(outcome: discovery::DiscoveryOutcome) -> (CandidateManifes
         version: MANIFEST_VERSION,
         reason_counts: derive_reason_counts(&outcome.diagnostics),
         sources: outcome.sources,
+        skills: outcome.skills,
         diagnostics: outcome.diagnostics,
     };
     match manifest.validate() {
@@ -856,6 +952,7 @@ fn collapsed_manifest(record: ManifestDiagnostic) -> CandidateManifest {
     let manifest = CandidateManifest {
         version: MANIFEST_VERSION,
         sources: Vec::new(),
+        skills: Vec::new(),
         reason_counts: derive_reason_counts(std::slice::from_ref(&record)),
         diagnostics: vec![record],
     };

@@ -152,6 +152,15 @@ pub struct ToolRegistry {
     root: PathBuf,
     workspace_sandbox: Option<WorkspaceSandbox>,
     agent_euler_home: OnceLock<tempfile::TempDir>,
+    skills: BTreeMap<String, FrozenSkill>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenSkill {
+    pub name: String,
+    pub scope: String,
+    pub body_digest: String,
+    pub body: String,
 }
 
 impl ToolRegistry {
@@ -176,7 +185,15 @@ impl ToolRegistry {
             root,
             workspace_sandbox,
             agent_euler_home: OnceLock::new(),
+            skills: BTreeMap::new(),
         }
+    }
+
+    pub fn set_frozen_skills(&mut self, skills: impl IntoIterator<Item = FrozenSkill>) {
+        self.skills = skills
+            .into_iter()
+            .map(|skill| (skill.name.clone(), skill))
+            .collect();
     }
 
     /// The workspace root every tool executes in (`run_shell` is
@@ -280,6 +297,7 @@ impl ToolRegistry {
             "tool_result_get" => Err(ToolError::InvalidField(
                 "tool_result_get requires session events",
             )),
+            "skill_read" => self.skill_read(input),
             other => Err(ToolError::Unsupported(other.to_owned())),
         }
     }
@@ -299,7 +317,29 @@ impl ToolRegistry {
     pub fn model_tools(&self) -> Vec<ToolDefinition> {
         let mut tools = coding_tool_definitions();
         tools.push(tool_result_get_definition());
+        if !self.skills.is_empty() {
+            tools.push(skill_read_definition());
+        }
         tools
+    }
+
+    fn skill_read(&self, input: &Value) -> Result<ToolExecution, ToolError> {
+        let name = required_str(input, "name")?.trim();
+        let skill = self
+            .skills
+            .get(name)
+            .ok_or(ToolError::InvalidField("name"))?;
+        Ok(ToolExecution {
+            name: "skill_read".to_owned(),
+            output: format!(
+                "[skill name={} scope={} digest={}]\n{}",
+                skill.name, skill.scope, skill.body_digest, skill.body
+            ),
+            output_preview_budget: None,
+            exit_code: None,
+            patch: None,
+            file_changes: Vec::new(),
+        })
     }
 
     fn read_file(&self, input: &Value) -> Result<ToolExecution, ToolError> {
@@ -1228,6 +1268,24 @@ fn tool_result_get_definition() -> ToolDefinition {
                 }
             },
             "required": ["event_id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn skill_read_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "skill_read".to_owned(),
+        description: "Read one accepted skill body from the current session's immutable skill snapshot. Pass the exact name shown in the skill catalog. This reads no live files and grants no permissions.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact accepted skill name from the catalog."
+                }
+            },
+            "required": ["name"],
             "additionalProperties": false
         }),
     }

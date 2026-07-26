@@ -56,6 +56,29 @@ fn manifest_sources(bootstrap: &ProjectContextBootstrap) -> Vec<(String, String)
         .collect()
 }
 
+fn write_skill(root: &Path, name: &str, description: &str, body: &str) {
+    write(
+        &root.join(name).join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: {description}\nallowed-tools: ignored\n---\n{body}"
+        ),
+    );
+}
+
+fn manifest_skill_names(bootstrap: &ProjectContextBootstrap) -> Vec<String> {
+    bootstrap
+        .manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .skills
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Build the durable bootstrap event sequence the session constructor
 /// writes, without a session.
 fn bootstrap_events(bootstrap: &ProjectContextBootstrap) -> Vec<EventEnvelope> {
@@ -935,6 +958,7 @@ fn symlinked_component_in_the_workspace_path_fails_discovery_closed() {
 fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
     let flood = super::discovery::DiscoveryOutcome {
         sources: vec![],
+        skills: vec![],
         diagnostics: (0..MAX_MANIFEST_DIAGNOSTICS + 1)
             .map(|_| {
                 super::discovery::diagnostic(
@@ -962,6 +986,7 @@ fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
     // Exactly at the bound nothing collapses.
     let at_bound = super::discovery::DiscoveryOutcome {
         sources: vec![],
+        skills: vec![],
         diagnostics: (0..MAX_MANIFEST_DIAGNOSTICS)
             .map(|_| {
                 super::discovery::diagnostic(
@@ -1751,6 +1776,192 @@ fn no_discoverable_context_disables_without_a_card() {
         Some(&consent),
     ));
     assert_eq!(tuple_of(&bootstrap).2, "no_project_context".to_owned());
+}
+
+#[test]
+fn project_skills_are_discovered_from_euler_skills_and_require_acknowledgment() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write_skill(
+        &root.join(".euler/skills"),
+        "github-workflow",
+        "Deliver GitHub changes safely.",
+        "Do not push without approval.\n",
+    );
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let consent = temp.path().join("consent");
+    let resolution = ProjectContextBootstrap::resolve_with_user_skills(
+        &canonical,
+        None,
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy: ProjectContextPolicy::Auto,
+            session_kind: SessionKind::Interactive,
+            trusted_local: false,
+        },
+        Some(&consent),
+        generous_budget(),
+    )
+    .expect("resolve");
+    match resolution {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => {
+            assert_eq!(
+                pending.skill_count(),
+                1,
+                "reasons: {:?}",
+                pending
+                    .preflight
+                    .manifest
+                    .diagnostics
+                    .iter()
+                    .map(|record| record.reason.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(pending.source_identities().is_empty());
+        }
+        _ => panic!("project skill should require acknowledgment"),
+    }
+}
+
+#[test]
+fn user_skills_are_admitted_when_project_context_is_off() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write(&root.join("EULER.md"), "project rules");
+    let user_skills = temp.path().join("home/skills");
+    write_skill(
+        &user_skills,
+        "commit-writing",
+        "Write focused commits.",
+        "Keep commits focused.\n",
+    );
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let bootstrap = expect_resolved(
+        ProjectContextBootstrap::resolve_with_user_skills(
+            &canonical,
+            Some(&user_skills),
+            &redactor(),
+            ProjectContextResolveOptions {
+                policy: ProjectContextPolicy::Off,
+                session_kind: SessionKind::Interactive,
+                trusted_local: false,
+            },
+            None,
+            generous_budget(),
+        )
+        .expect("resolve"),
+    );
+    assert_eq!(bootstrap.status(), ProjectContextStatus::Disabled);
+    assert!(bootstrap.source_identities.is_empty());
+    assert_eq!(manifest_skill_names(&bootstrap), vec!["commit-writing"]);
+    let folded = fold_project_context(&bootstrap_events(&bootstrap)).expect("fold");
+    assert!(folded.admitted().is_some());
+}
+
+#[test]
+fn duplicate_skill_names_across_scopes_exclude_both() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write_skill(
+        &root.join(".euler/skills"),
+        "github-workflow",
+        "Project GitHub workflow.",
+        "project body\n",
+    );
+    let user_skills = temp.path().join("home/skills");
+    write_skill(
+        &user_skills,
+        "github-workflow",
+        "User GitHub workflow.",
+        "user body\n",
+    );
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+        &root,
+        Some(&user_skills),
+        &redactor(),
+    )
+    .expect("preflight");
+    assert!(manifest_skill_names(&bootstrap).is_empty());
+    assert_eq!(
+        reasons(&bootstrap)
+            .into_iter()
+            .filter(|reason| reason == "skill_name_ambiguous")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn user_skill_changes_do_not_change_project_acknowledgment_digest() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write(&root.join("EULER.md"), "project rules\n");
+    let user_skills = temp.path().join("home/skills");
+    write_skill(
+        &user_skills,
+        "commit-writing",
+        "Write focused commits.",
+        "first body\n",
+    );
+    let first = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
+        .expect("first preflight");
+    write_skill(
+        &user_skills,
+        "commit-writing",
+        "Write focused commits.",
+        "changed body\n",
+    );
+    let second = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
+        .expect("second preflight");
+
+    assert_eq!(first.acknowledgment_digest, second.acknowledgment_digest);
+    assert_ne!(first.candidate_digest, second.candidate_digest);
+}
+
+#[test]
+fn skill_at_traversal_depth_boundary_is_admitted_without_a_depth_diagnostic() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write_skill(
+        &root.join(".euler/skills/a/b/c/d/e"),
+        "deep-skill",
+        "Skill at the traversal boundary.",
+        "boundary body\n",
+    );
+
+    let bootstrap =
+        ProjectContextBootstrap::admitted_for_tests(&root, &redactor()).expect("preflight");
+
+    assert_eq!(manifest_skill_names(&bootstrap), vec!["deep-skill"]);
+    assert!(!reasons(&bootstrap)
+        .into_iter()
+        .any(|reason| reason == "skill_depth_exceeded"));
+}
+
+#[test]
+fn skill_beyond_traversal_depth_is_omitted() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write_skill(
+        &root.join(".euler/skills/a/b/c/d/e/f"),
+        "too-deep",
+        "Skill beyond the traversal boundary.",
+        "too deep body\n",
+    );
+
+    let bootstrap =
+        ProjectContextBootstrap::admitted_for_tests(&root, &redactor()).expect("preflight");
+
+    assert!(manifest_skill_names(&bootstrap).is_empty());
+    assert!(reasons(&bootstrap)
+        .into_iter()
+        .any(|reason| reason == "skill_depth_exceeded"));
 }
 
 #[test]

@@ -1,5 +1,19 @@
 # Tool Contract
 
+## Skill snapshot reads
+
+`skill_read(name)` reads one accepted skill body from the current session's
+immutable project-context snapshot. The tool is exposed to the model only when
+that snapshot contains at least one accepted skill. The `name` argument must
+exactly match a normalized skill name from the compact catalog.
+
+The tool performs no filesystem access, executes no helper, grants no
+permission, and requires no capability. Its result is the exact frozen body
+plus stable scope and digest metadata. Every read is recorded through ordinary
+`tool.call` and `tool.result` provenance. User-global skills remain available
+when repository context is disabled; project skills follow the repository
+context admission decision recorded in the snapshot.
+
 Core tools are the minimal coding substrate.
 
 Tool calls must be permission checked, provenance logged, and represented cleanly in the active canvas.

@@ -188,8 +188,10 @@ pub(crate) fn resolve_startup_project_context(
             .unwrap_or(config.compaction_reserve_tokens as u64),
         canvas_budget_bytes: config.auto_compaction.budget_bytes,
     };
-    euler_core::ProjectContextBootstrap::resolve(
+    let user_skills_root = EulerHome::resolve().ok().map(|home| home.skills_dir());
+    euler_core::ProjectContextBootstrap::resolve_with_user_skills(
         &config.root,
+        user_skills_root.as_deref(),
         &redactor,
         options,
         config.project_grant_consent_dir.as_deref(),

@@ -3,5 +3,7 @@
 # Local agent/session state — never repo content
 .claude/
 CLAUDE.md
-.euler/
+.euler/*
+!.euler/skills/
+!.euler/skills/**
 docs/scratch/

@@ -1611,12 +1611,12 @@ fn prefolded_assembly_uses_the_callers_project_context_snapshot() {
         EventKind::USER_MESSAGE,
         object([("content", "hello".into())]),
     )];
-    let pinned = PinnedProjectContext {
-        snapshot_event_id: "snapshot-from-caller".to_owned(),
-        candidate_digest: "candidate-digest".to_owned(),
-        rendered: "[euler.project-context.v1]\n  guidance".to_owned(),
-        rendered_digest: "rendered-digest".to_owned(),
-    };
+    let pinned = PinnedProjectContext::for_test(
+        "snapshot-from-caller",
+        "candidate-digest",
+        "[euler.project-context.v1]\n  guidance",
+        "rendered-digest",
+    );
 
     let canvas = assemble_canvas_prefolded(
         &events,

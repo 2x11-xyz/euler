@@ -693,8 +693,11 @@ impl<D> Session<D> {
     }
 
     pub fn new_with_providers(config: SessionConfig, providers: ProviderSet, decider: D) -> Self {
-        let tools =
+        let mut tools =
             ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
+        if let Some(project_context) = config.project_context.as_ref() {
+            tools.set_frozen_skills(project_context.frozen_skills());
+        }
         let active_target = ModelTarget::new(config.provider.clone(), config.model.clone());
         let mut bus = EventBus::new();
         push_session_bootstrap(&mut bus, &config, session_start_payload(&config));
@@ -1177,8 +1180,13 @@ impl<D> Session<D> {
         latest_model_usage_used_tokens: Option<u64>,
         context_limit_emitted: Option<ModelTarget>,
     ) -> Self {
-        let tools =
+        let mut tools =
             ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
+        if let Ok(fold) = crate::project_context::fold_project_context(&events) {
+            if let Some(pinned) = fold.admitted() {
+                tools.set_frozen_skills(pinned.frozen_skills());
+            }
+        }
         let persisted_events = events.len();
         let mut permissions = PermissionGate::new(decider);
         let _ = permissions
