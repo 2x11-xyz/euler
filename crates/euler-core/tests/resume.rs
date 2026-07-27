@@ -509,6 +509,68 @@ fn ambiguous_same_agent_terminal_fails_before_mutating_the_log() {
 }
 
 #[test]
+fn direct_duplicate_model_terminal_fails_before_mutating_the_log() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let call = model_call(None);
+    let first = model_terminal(Some(call.id.clone()), "first");
+    let duplicate = model_terminal(Some(call.id.clone()), "duplicate");
+    write_events(&log, &[call.clone(), first, duplicate.clone()]);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("duplicate terminal must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ResumeError::DuplicateModelTerminal {
+            event_id,
+            call_id,
+            agent
+        } if event_id == duplicate.id && call_id == call.id && agent == "agent"
+    ));
+    assert_eq!(fs::read(&log).expect("read unchanged log"), before);
+}
+
+#[test]
+fn unambiguous_writer_linear_duplicate_model_terminal_fails_closed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let call = model_call(None);
+    let first = model_terminal(Some(call.id.clone()), "first");
+    let duplicate = model_terminal(Some(first.id.clone()), "duplicate");
+    write_events(&log, &[call.clone(), first, duplicate.clone()]);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("writer-linear duplicate must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ResumeError::DuplicateModelTerminal {
+            event_id,
+            call_id,
+            agent
+        } if event_id == duplicate.id && call_id == call.id && agent == "agent"
+    ));
+    assert_eq!(fs::read(&log).expect("read unchanged log"), before);
+}
+
+#[test]
 fn permission_gated_tail_closure_says_tool_never_executed() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
@@ -1549,6 +1611,20 @@ fn model_call(parent: Option<String>) -> EventEnvelope {
             ("provider", "fixture".into()),
             ("model", "fixture".into()),
             ("canvas_items", 0.into()),
+        ]),
+    )
+}
+
+fn model_terminal(parent: Option<String>, content: &str) -> EventEnvelope {
+    EventEnvelope::new(
+        "session",
+        "agent",
+        parent,
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("content", content.to_owned().into()),
         ]),
     )
 }

@@ -948,7 +948,10 @@ fn into_fresh_session_carries_registered_secret_values() {
             .prepare_fresh_project_context()
             .expect("fresh preflight"),
     );
-    let fresh = session.into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()), bootstrap);
+    let fresh = session
+        .into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()), bootstrap)
+        .map_err(|(_, error)| error)
+        .expect("fresh session");
 
     let out = fresh
         .redactor
@@ -3289,7 +3292,10 @@ fn resume_starts_the_reteach_streak_empty() {
             .prepare_fresh_project_context()
             .expect("fresh preflight"),
     );
-    let fresh = session.into_fresh_session("resumed", ScriptedDecider::new(vec![]), bootstrap);
+    let fresh = session
+        .into_fresh_session("resumed", ScriptedDecider::new(vec![]), bootstrap)
+        .map_err(|(_, error)| error)
+        .expect("fresh session");
     assert!(
         fresh.reteach_streak_is_empty(),
         "resume/new must start the reteach tracker empty (process-local)"
@@ -3863,11 +3869,14 @@ mod project_context_seam {
                 .prepare_fresh_project_context()
                 .expect("fresh preflight"),
         );
-        let fresh = resumed.into_fresh_session(
-            "fresh-after-resume",
-            ScriptedDecider::new(Vec::new()),
-            bootstrap,
-        );
+        let fresh = resumed
+            .into_fresh_session(
+                "fresh-after-resume",
+                ScriptedDecider::new(Vec::new()),
+                bootstrap,
+            )
+            .map_err(|(_, error)| error)
+            .expect("fresh session");
         let events = fresh.events();
         assert_eq!(events[0].kind.as_str(), EventKind::SESSION_START);
         assert!(

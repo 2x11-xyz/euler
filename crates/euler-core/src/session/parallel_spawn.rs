@@ -25,6 +25,8 @@ use euler_provider::{
 use euler_sdk::CancellationToken;
 use std::sync::Arc;
 
+const REVIEWER_UNKNOWN_OUTCOME_MESSAGE: &str = "reviewer worker outcome unavailable";
+
 /// One task prepared on the session thread: everything a worker needs, plus
 /// the ids phase three records against.
 struct PreparedReviewer {
@@ -57,6 +59,13 @@ enum WorkerOutcome {
 struct WorkerRunOutcome {
     round: Result<ModelRoundData, SessionError>,
     buffered_error: Option<(JsonObject, String)>,
+}
+
+struct ReviewerRecordContext<'a> {
+    task: &'a AgentTask,
+    target: &'a ModelTarget,
+    child_agent_id: &'a str,
+    model_call_id: &'a str,
 }
 
 impl<D: PermissionDecider> Session<D> {
@@ -354,21 +363,27 @@ impl<D: PermissionDecider> Session<D> {
             }
         };
         let child_agent_id = spawned.child_agent_id().to_owned();
-        if let Some((mut payload, parent)) = buffered_error {
-            // Workers buffer the raw provider error (they carry no
-            // redactor); this session-thread append is the emission
-            // site, so redact here — provider HTTP error bodies can
-            // echo request fragments (secrets contract). Redact before
-            // borrowing the session for the appender.
-            self.redactor
-                .redact_payload_fields(&mut payload, &["message"]);
-            self.appender_as(writer, &child_agent_id).append(
-                EventKind::ERROR,
-                payload,
-                Some(parent),
-            )?;
-        }
-        let result = match round {
+        let result = match (round, buffered_error) {
+            (Ok(data), None) => self.record_successful_reviewer_round(
+                writer,
+                ReviewerRecordContext {
+                    task: &task,
+                    target: &target,
+                    child_agent_id: &child_agent_id,
+                    model_call_id: &model_call_id,
+                },
+                &data,
+            )?,
+            (Ok(_), buffered_error) => {
+                self.append_reviewer_failure_terminal(
+                    writer,
+                    &child_agent_id,
+                    &model_call_id,
+                    buffered_error,
+                    None,
+                )?;
+                companion_failure(REVIEWER_UNKNOWN_OUTCOME_MESSAGE)
+            }
             // The worker's terminal error carries the raw provider
             // message (HTTP error bodies can echo request fragments —
             // secrets contract). This failure string becomes the
@@ -377,31 +392,15 @@ impl<D: PermissionDecider> Session<D> {
             // artifact; redacting at this conversion point makes every
             // downstream sink inherit it. Reviewer findings (success
             // output) are model cognition and stay faithful.
-            Err(error) => companion_failure(self.redactor.redact(&error.to_string())),
-            Ok(data) => {
-                let model_result = model_result_payload(
-                    &ModelResultRecord {
-                        content: &data.content,
-                        tool_calls: &data.tool_calls,
-                        stop_reason: data
-                            .stop_reason
-                            .as_ref()
-                            .expect("validated finished stream"),
-                        usage: data.usage.as_ref(),
-                        target: &target,
-                        parent: model_call_id.clone(),
-                    },
-                    &self.providers,
-                );
-                let mut appender = self.appender_as(writer, &child_agent_id);
-                record_reviewer_round(
-                    &mut appender,
-                    &target,
+            (Err(error), buffered_error) => {
+                self.append_reviewer_failure_terminal(
+                    writer,
+                    &child_agent_id,
                     &model_call_id,
-                    &data,
-                    &task,
-                    model_result,
-                )?
+                    buffered_error,
+                    Some(&error),
+                )?;
+                companion_failure(self.redactor.redact(&error.to_string()))
             }
         };
         let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
@@ -413,6 +412,75 @@ impl<D: PermissionDecider> Session<D> {
             model: target.model,
             result,
         })
+    }
+
+    fn record_successful_reviewer_round(
+        &mut self,
+        writer: &Arc<crate::provenance::ProvenanceWriter>,
+        context: ReviewerRecordContext<'_>,
+        data: &ModelRoundData,
+    ) -> Result<AgentResult, SessionError> {
+        let model_result = model_result_payload(
+            &ModelResultRecord {
+                content: &data.content,
+                tool_calls: &data.tool_calls,
+                stop_reason: data
+                    .stop_reason
+                    .as_ref()
+                    .expect("validated finished stream"),
+                usage: data.usage.as_ref(),
+                target: context.target,
+                parent: context.model_call_id.to_owned(),
+            },
+            &self.providers,
+        );
+        let mut appender = self.appender_as(writer, context.child_agent_id);
+        record_reviewer_round(
+            &mut appender,
+            context.target,
+            context.model_call_id,
+            data,
+            context.task,
+            model_result,
+        )
+    }
+
+    /// Close a prepared reviewer's provider lifecycle exactly once before its
+    /// `agent.result` is recorded. A worker can disappear before RoundLoop
+    /// has a chance to buffer an error (pre-dispatch cancellation or panic);
+    /// those unknown outcomes receive a sanitized session recovery closure.
+    fn append_reviewer_failure_terminal(
+        &mut self,
+        writer: &Arc<crate::provenance::ProvenanceWriter>,
+        child_agent_id: &str,
+        model_call_id: &str,
+        buffered_error: Option<(JsonObject, String)>,
+        error: Option<&SessionError>,
+    ) -> Result<(), SessionError> {
+        let mut payload = match buffered_error {
+            Some((payload, worker_parent)) => {
+                debug_assert_eq!(worker_parent, model_call_id);
+                payload
+            }
+            None if matches!(error, Some(SessionError::Cancelled)) => {
+                super::round_loop::model_call_cancelled_payload()
+            }
+            None => object([
+                ("source", "session".into()),
+                ("message", REVIEWER_UNKNOWN_OUTCOME_MESSAGE.into()),
+                ("recovery_closure", true.into()),
+            ]),
+        };
+        // Workers carry no redactor. Provider error bodies can echo request
+        // fragments, so the session-thread emission site owns redaction.
+        self.redactor
+            .redact_payload_fields(&mut payload, &["message"]);
+        self.appender_as(writer, child_agent_id).append(
+            EventKind::ERROR,
+            payload,
+            Some(model_call_id.to_owned()),
+        )?;
+        Ok(())
     }
 
     fn record_rejected_reviewer(
@@ -682,6 +750,12 @@ impl RoundLoopIo for WorkerIo<'_> {
         error: &ProviderError,
         model_call_id: String,
     ) -> Result<String, SessionError> {
+        if error.request_outcome_unknown() {
+            // The provider request thread disappeared after dispatch may have
+            // begun. Leave the error unbuffered so phase three records the
+            // canonical session recovery closure for an unknown outcome.
+            return Ok(String::new());
+        }
         let mut payload = object([
             ("source", "provider".into()),
             ("message", error.to_string().into()),
@@ -715,6 +789,7 @@ impl RoundLoopIo for WorkerIo<'_> {
         _model_call_id: String,
         data: ModelRoundData,
         _cancellation: &CancellationToken,
+        _another_round_available: bool,
     ) -> Result<RoundOutcome<()>, SessionError> {
         self.round = Some(data);
         Ok(RoundOutcome::Complete(()))
@@ -722,7 +797,7 @@ impl RoundLoopIo for WorkerIo<'_> {
 
     fn round_completed(&mut self) {}
 
-    fn round_limit(&mut self) -> Result<(), SessionError> {
+    fn round_limit(&mut self, _cancellation: &CancellationToken) -> Result<(), SessionError> {
         // Unreachable with max_rounds = 1 and finish_round completing, but
         // the loop contract requires an answer; report it as data-less.
         Ok(())

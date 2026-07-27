@@ -49,6 +49,9 @@ empty-capability briefs, then runs three phases:
   (`model.reasoning*`, `model.result`, `assistant.message` or `error`) and
   the terminal `agent.result` with the same honesty checks as the
   sequential companion path (stop-reason, token budget, output bound).
+  Every prepared `model.call` is closed before `agent.result`: cancellation
+  is a cancelled session error, while a panicked or missing worker outcome is
+  a sanitized session recovery closure reporting that the outcome is unknown.
 
 ## Why this keeps the log replayable
 

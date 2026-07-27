@@ -21,6 +21,10 @@ impl AppCore {
     /// bottom-surface rebuild: listing reads each session's event log, which
     /// is far too slow for the submit hot path.
     pub(super) fn open_resume_picker(&mut self) -> CoreEffect {
+        if self.unresolved_admission_blocks_lifecycle() {
+            return self
+                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        }
         let items = support::resume_items_from_home(self.status.session_id.as_deref());
         self.bottom
             .open_picker(crate::ui::commands::PickerSpec::Resume(items));
@@ -39,6 +43,10 @@ impl AppCore {
                 return self.teach_notice("resume needs an active session".to_owned())
             }
         };
+        if self.unresolved_admission_blocks_lifecycle() {
+            return self
+                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        }
         if current_session_id == session_id {
             return self.teach_notice(format!("already using session {session_id}"));
         }
@@ -173,6 +181,10 @@ impl AppCore {
         session_id: String,
         resume: TuiResume,
     ) -> CoreEffect {
+        if self.unresolved_admission_blocks_lifecycle() {
+            return self
+                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        }
         let reasoning_effort = resume.session.reasoning_effort();
         let primary_agent_id = session_primary_agent_id(&resume.session);
         self.permission_rx = resume.channels.request_rx;

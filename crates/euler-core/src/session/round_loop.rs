@@ -140,6 +140,7 @@ pub(crate) trait RoundLoopIo {
         model_call_id: String,
         data: ModelRoundData,
         cancellation: &CancellationToken,
+        another_round_available: bool,
     ) -> Result<RoundOutcome<Self::Complete>, SessionError>;
     /// Called once per round that finished without error, whether it
     /// completed the turn or continues into another round.
@@ -158,7 +159,10 @@ pub(crate) trait RoundLoopIo {
     fn absorb_steering(&mut self, _cancellation: &CancellationToken) -> Result<(), SessionError> {
         Ok(())
     }
-    fn round_limit(&mut self) -> Result<Self::Complete, SessionError>;
+    fn round_limit(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<Self::Complete, SessionError>;
 }
 
 pub(crate) struct RoundLoop<'a, Io> {
@@ -180,15 +184,18 @@ where
     ) -> Result<Io::Complete, SessionError> {
         let mut completed_rounds = 0usize;
         loop {
+            // Cancellation is the stronger terminal signal when it races an
+            // explicit round ceiling. Escape must never be rewritten as a
+            // successful "limit reached" completion.
+            if cancellation.is_cancelled() {
+                return Err(SessionError::Cancelled);
+            }
             if self
                 .config
                 .max_rounds
                 .is_some_and(|limit| completed_rounds >= limit)
             {
-                return self.io.round_limit();
-            }
-            if cancellation.is_cancelled() {
-                return Err(SessionError::Cancelled);
+                return self.io.round_limit(cancellation);
             }
             self.io.absorb_steering(cancellation)?;
             // Escape may publish cancellation while a previously reserved
@@ -197,7 +204,11 @@ where
             if cancellation.is_cancelled() {
                 return Err(SessionError::Cancelled);
             }
-            match self.run_round(cancellation)? {
+            let another_round_available = self
+                .config
+                .max_rounds
+                .is_none_or(|limit| completed_rounds + 1 < limit);
+            match self.run_round(cancellation, another_round_available)? {
                 RoundOutcome::Complete(done) => {
                     self.io.round_completed();
                     return Ok(done);
@@ -214,6 +225,7 @@ where
     fn run_round(
         &mut self,
         cancellation: &CancellationToken,
+        another_round_available: bool,
     ) -> Result<RoundOutcome<Io::Complete>, SessionError> {
         let target = self.io.target();
         let (model_call_id, request) = self.io.prepare_model_request(&target)?;
@@ -244,8 +256,13 @@ where
             data.usage.as_ref(),
             true,
         );
-        self.io
-            .finish_round(target, model_call_id, data, cancellation)
+        self.io.finish_round(
+            target,
+            model_call_id,
+            data,
+            cancellation,
+            another_round_available,
+        )
     }
 
     fn collect_model_round(

@@ -196,9 +196,14 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   an already-latched context stop leaves every queued row intact. After
   provenance is repaired, retry reuses the retained event identity and accepts
   the head exactly once on both the live bus and durable log, including when
-  the failed sync left a complete physical line behind. Mid-turn absorption
-  uses the same admission transaction without holding the queue lock during
-  persistence. The queue
+  the failed sync left a complete physical line behind. Row identity includes
+  the queue instance as well as the row sequence, so another queue's
+  same-shaped reservation cannot claim or acknowledge it. The pending owner is
+  installed before an older accepted backlog is flushed; a backlog failure
+  therefore protects the same row as a candidate failure. While that admission
+  remains unresolved, `/new`, `/resume`, and queue clear refuse to detach or
+  discard it. Mid-turn absorption uses the same admission transaction without
+  holding the queue lock during persistence. The queue
   hydrates each accepted steering row at the next model-round boundary; it
   never waits for a later tool round when a boundary is already available.
   Completion auto-flush does not start another turn while the context latch is
@@ -207,7 +212,12 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   after the worker's terminal boundary flush into the next turn. The final
   steering check and group close are one named transaction: same-turn idle
   work runs before it, and only a final Stop closes the group. Pending rows
-  show one visual line: the message body is capped at
+  are absorbed there only if another model request is available. When an
+  explicit round ceiling has consumed its final request, the same atomic
+  transaction closes the group without persisting steering the turn cannot
+  observe: input linearized before the close stays deferred, and input after
+  the close is a follow-up. Cancellation has precedence over a coincident
+  round-limit completion. Queued rows show one visual line: the message body is capped at
   64 terminal display cells, truncates at a word boundary with an ASCII
   ` ...` suffix, and never alters the full queued input. Two fallbacks apply at
   tight widths: when the first word alone exceeds the budget there is no word

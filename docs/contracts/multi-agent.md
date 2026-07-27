@@ -186,7 +186,13 @@ the batch sibling of `spawn_agent`, built for reviewer fan-out (issue #32);
   `agent.spawn`, `canvas.snapshot`, `model.call`. Phase two, joining
   workers **in batch order** regardless of completion order: the task's
   round events (`model.reasoning*`, `model.result`, `assistant.message` on
-  success, `error` on provider failure) and its terminal `agent.result`.
+  success, `error` on every failed call) and its terminal `agent.result`.
+  Every phase-one `model.call` receives exactly one semantic terminal before
+  that child's `agent.result`: provider failures retain their provider error;
+  pre-dispatch cancellation records `source: "session", cancelled: true`;
+  and a panicked or otherwise missing worker outcome records the sanitized
+  `source: "session", recovery_closure: true` unknown-outcome error. A
+  reviewer rejected by context admission opens no `model.call`.
   Event order is a pure function of the batch order — never of provider
   completion timing — so fixture-driven logs replay deterministically.
 - **Explicit parent-context policy**: each batch task declares whether it

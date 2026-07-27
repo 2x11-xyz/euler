@@ -2256,7 +2256,13 @@ impl AppCore {
         // is in flight. Re-wired every spawn so /new and /resume sessions
         // always steer the queue this AppCore renders.
         if let Some(input) = queued_input {
-            session.set_steering_queue_for_queued_input(Arc::clone(&self.queued_inputs), input);
+            if let Err(error) =
+                session.set_steering_queue_for_queued_input(Arc::clone(&self.queued_inputs), input)
+            {
+                self.install_state(AppState::Idle { session });
+                self.push_error_item(format!("queued turn failed: {error}"));
+                return;
+            }
         } else {
             session.set_steering_queue(Arc::clone(&self.queued_inputs));
         }
@@ -2429,6 +2435,11 @@ impl AppCore {
         if self.turn_in_flight() {
             return self.notice_item("new session waits for the active turn".to_owned());
         }
+        if self.unresolved_admission_blocks_lifecycle() {
+            return self.notice_item(
+                "new session waits for the unresolved queued input admission".to_owned(),
+            );
+        }
         if let Err(error) = self.cancel_idle_compaction_for_lifecycle("new session") {
             return self.error_item(format!("new session failed: {error}"));
         }
@@ -2477,6 +2488,11 @@ impl AppCore {
         if !matches!(self.state, AppState::Idle { .. }) {
             return self.error_item("new session needs an active session".to_owned());
         }
+        if self.unresolved_admission_blocks_lifecycle() {
+            return self.notice_item(
+                "new session waits for the unresolved queued input admission".to_owned(),
+            );
+        }
         let created = self.session_store().and_then(|store| {
             let record = store.create_session()?;
             Ok((record.id().to_owned(), record.events_path().to_path_buf()))
@@ -2493,9 +2509,16 @@ impl AppCore {
         let active_target = old_session.active_target().clone();
         let reasoning_effort = old_session.reasoning_effort();
         let (decider, channels) = TuiDecider::new();
-        let session = old_session
-            .into_fresh_session(session_id.clone(), decider, project_context)
-            .with_provenance(writer);
+        let session =
+            match old_session.into_fresh_session(session_id.clone(), decider, project_context) {
+                Ok(session) => session.with_provenance(writer),
+                Err((old_session, error)) => {
+                    self.install_state(AppState::Idle {
+                        session: old_session,
+                    });
+                    return self.error_item(format!("new session failed: {error}"));
+                }
+            };
         let events = session.events().to_vec();
         let primary_agent_id = session_primary_agent_id(&session);
 
@@ -2738,6 +2761,14 @@ impl AppCore {
         self.queued_inputs.clear();
         self.queued_selection = None;
         self.queued_inputs.set_paused(false);
+    }
+
+    fn unresolved_admission_blocks_lifecycle(&self) -> bool {
+        self.queued_inputs.has_unresolved_admission()
+            || matches!(
+                &self.state,
+                AppState::Idle { session } if session.has_unresolved_admission()
+            )
     }
 
     fn edit_palette(&mut self, edit: impl FnOnce(&mut BottomSurface)) -> CoreEffect {

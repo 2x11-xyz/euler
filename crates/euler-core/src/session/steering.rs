@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
+use ulid::Ulid;
 
 /// Whether a queue transaction is preparing another model round or deciding
 /// that the current turn is terminal.
@@ -43,8 +44,9 @@ pub(super) enum BoundaryAction {
 ///   active steering group happen under one short lock. Input racing that
 ///   boundary is therefore either reserved by the active turn or classified
 ///   as a follow-up; it cannot fall into the gap between those outcomes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SteeringQueue {
+    namespace: Ulid,
     inner: Mutex<SteeringState>,
     paused: AtomicBool,
 }
@@ -54,20 +56,26 @@ struct SteeringState {
     entries: VecDeque<Entry>,
     current_group: u64,
     group_open: bool,
-    next_id: u64,
-    reserved_dispatch: Option<u64>,
+    next_sequence: u64,
+    reserved_dispatch: Option<QueueEntryId>,
     /// Entry whose durable steering append has linearized. Persistence owns a
     /// clone and runs unlocked; UI mutation cannot remove this id meanwhile.
-    absorbing: Option<u64>,
+    absorbing: Option<QueueEntryId>,
     /// Entry whose `user.message` append returned an ambiguous durability
     /// error. It remains protected and is the next dispatch reservation even
     /// if later urgent input moved ahead of it.
-    unresolved_admission: Option<u64>,
+    unresolved_admission: Option<QueueEntryId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct QueueEntryId {
+    queue: Ulid,
+    sequence: u64,
 }
 
 #[derive(Clone, Debug)]
 struct Entry {
-    id: u64,
+    id: QueueEntryId,
     kind: QueuedInputKind,
     content: String,
 }
@@ -85,13 +93,13 @@ enum QueuedInputKind {
 /// append failure leaves the input queued.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedInput {
-    id: u64,
+    id: QueueEntryId,
     content: String,
     kind: QueuedInputKind,
 }
 
 impl QueuedInput {
-    pub(super) fn id(&self) -> u64 {
+    pub(super) fn id(&self) -> QueueEntryId {
         self.id
     }
 
@@ -104,6 +112,16 @@ impl QueuedInput {
     }
 }
 
+impl Default for SteeringQueue {
+    fn default() -> Self {
+        Self {
+            namespace: Ulid::new(),
+            inner: Mutex::new(SteeringState::default()),
+            paused: AtomicBool::new(false),
+        }
+    }
+}
+
 impl SteeringQueue {
     fn state(&self) -> std::sync::MutexGuard<'_, SteeringState> {
         // A poisoned lock only means another thread panicked during a queue
@@ -111,13 +129,25 @@ impl SteeringQueue {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn push_entry(state: &mut SteeringState, content: String, kind: QueuedInputKind, front: bool) {
+    fn push_entry(
+        &self,
+        state: &mut SteeringState,
+        content: String,
+        kind: QueuedInputKind,
+        front: bool,
+    ) {
         let entry = Entry {
-            id: state.next_id,
+            id: QueueEntryId {
+                queue: self.namespace,
+                sequence: state.next_sequence,
+            },
             kind,
             content,
         };
-        state.next_id = state.next_id.saturating_add(1);
+        state.next_sequence = state
+            .next_sequence
+            .checked_add(1)
+            .expect("steering queue entry id space exhausted");
         if front {
             state.entries.push_front(entry);
         } else {
@@ -138,7 +168,7 @@ impl SteeringQueue {
     pub fn push_steering_back(&self, content: String) {
         let mut state = self.state();
         let kind = Self::active_kind(&state);
-        Self::push_entry(&mut state, content, kind, false);
+        self.push_entry(&mut state, content, kind, false);
     }
 
     /// Queue urgent input for the running model turn, subject to the same
@@ -146,17 +176,17 @@ impl SteeringQueue {
     pub fn push_steering_front(&self, content: String) {
         let mut state = self.state();
         let kind = Self::active_kind(&state);
-        Self::push_entry(&mut state, content, kind, true);
+        self.push_entry(&mut state, content, kind, true);
     }
 
     pub fn push_follow_up_back(&self, content: String) {
         let mut state = self.state();
-        Self::push_entry(&mut state, content, QueuedInputKind::FollowUp, false);
+        self.push_entry(&mut state, content, QueuedInputKind::FollowUp, false);
     }
 
     pub fn push_follow_up_front(&self, content: String) {
         let mut state = self.state();
-        Self::push_entry(&mut state, content, QueuedInputKind::FollowUp, true);
+        self.push_entry(&mut state, content, QueuedInputKind::FollowUp, true);
     }
 
     /// Reserve the front entry for dispatch without removing it.
@@ -195,6 +225,21 @@ impl SteeringQueue {
             content: entry.content.clone(),
             kind: entry.kind,
         }
+    }
+
+    /// Whether `input` is the exact dispatch reservation owned by this queue.
+    ///
+    /// Queue identity is part of the opaque row id, so a same-shaped row from
+    /// another queue can never claim or acknowledge this reservation.
+    pub(super) fn is_current_dispatch(&self, input: &QueuedInput) -> bool {
+        if input.id.queue != self.namespace {
+            return false;
+        }
+        let state = self.state();
+        state.reserved_dispatch == Some(input.id)
+            && state.entries.iter().any(|entry| {
+                entry.id == input.id && entry.content == input.content && entry.kind == input.kind
+            })
     }
 
     /// Remove a dispatch reservation after its initial `user.message` has
@@ -255,6 +300,14 @@ impl SteeringQueue {
         self.state().entries.is_empty()
     }
 
+    /// Whether one queue row owns an ambiguous authoritative admission.
+    ///
+    /// Lifecycle transitions must not detach this queue from its owning
+    /// session until the exact row has reconciled with provenance.
+    pub fn has_unresolved_admission(&self) -> bool {
+        self.state().unresolved_admission.is_some()
+    }
+
     pub fn snapshot(&self) -> Vec<String> {
         self.state()
             .entries
@@ -277,7 +330,10 @@ impl SteeringQueue {
     /// turn, preserving the original stacked-steer semantics.
     pub(super) fn begin_turn(&self, input: Option<&QueuedInput>) {
         let mut state = self.state();
-        state.current_group = state.current_group.saturating_add(1);
+        state.current_group = state
+            .current_group
+            .checked_add(1)
+            .expect("steering group id space exhausted");
         state.group_open = true;
         let replacement_group = state.current_group;
         let Some(QueuedInput {
@@ -304,6 +360,20 @@ impl SteeringQueue {
     /// idempotent safety net for cancellation, errors, and context stops.
     pub(super) fn close_turn(&self) {
         self.state().group_open = false;
+    }
+
+    /// Close a terminal boundary without absorbing any eligible steering.
+    ///
+    /// An explicit round ceiling means the current driver cannot issue
+    /// another request, so persisting a steer here would create durable input
+    /// that this turn can never observe. The lock is the classification
+    /// seam: input queued before it remains deferred steering, while input
+    /// queued after it is an ordinary follow-up.
+    pub(super) fn defer_terminal_boundary(&self, stopped: impl FnOnce() -> bool) -> BoundaryAction {
+        let mut state = self.state();
+        let cancelled = stopped();
+        state.group_open = false;
+        BoundaryAction::Closed { cancelled }
     }
 
     /// Persist and remove at most one eligible steering entry using a
@@ -376,7 +446,7 @@ impl SteeringQueue {
 
     /// Protect a queued-dispatch row after its initial authoritative append
     /// returned an ambiguous durability error.
-    pub(super) fn mark_admission_unresolved(&self, id: u64) {
+    pub(super) fn mark_admission_unresolved(&self, id: QueueEntryId) {
         let mut state = self.state();
         if !state.entries.iter().any(|entry| entry.id == id) {
             return;
@@ -449,6 +519,30 @@ mod tests {
     }
 
     #[test]
+    fn identical_rows_from_distinct_queues_never_share_dispatch_identity() {
+        let queue_a = SteeringQueue::default();
+        let queue_b = SteeringQueue::default();
+        queue_a.push_follow_up_back("same".to_owned());
+        queue_b.push_follow_up_back("same".to_owned());
+        let input_a = queue_a.reserve_front_for_dispatch().expect("queue A row");
+        let input_b = queue_b.reserve_front_for_dispatch().expect("queue B row");
+
+        assert_ne!(input_a.id, input_b.id);
+        assert!(queue_a.is_current_dispatch(&input_a));
+        assert!(queue_b.is_current_dispatch(&input_b));
+        assert!(!queue_a.is_current_dispatch(&input_b));
+        assert!(!queue_b.is_current_dispatch(&input_a));
+
+        queue_a.mark_admission_unresolved(input_a.id);
+        queue_a.acknowledge_dispatch(&input_b);
+        queue_b.acknowledge_dispatch(&input_a);
+        assert_eq!(queue_a.snapshot(), ["same"]);
+        assert_eq!(queue_b.snapshot(), ["same"]);
+        assert!(queue_a.has_unresolved_admission());
+        assert!(!queue_b.has_unresolved_admission());
+    }
+
+    #[test]
     fn follow_up_at_front_blocks_absorption() {
         let queue = SteeringQueue::default();
         queue.push_follow_up_back("leftover".to_owned());
@@ -460,6 +554,26 @@ mod tests {
             BoundaryAction::Drained
         );
         assert_eq!(queue.snapshot(), ["leftover", "steer"]);
+    }
+
+    #[test]
+    fn round_limit_close_defers_prior_steering_and_classifies_later_input_as_follow_up() {
+        let queue = SteeringQueue::default();
+        queue.begin_turn(None);
+        queue.push_steering_back("before close".to_owned());
+
+        assert_eq!(
+            queue.defer_terminal_boundary(|| false),
+            BoundaryAction::Closed { cancelled: false }
+        );
+        queue.push_steering_back("after close".to_owned());
+
+        let state = queue.state();
+        assert!(matches!(
+            state.entries[0].kind,
+            QueuedInputKind::Steering(_)
+        ));
+        assert_eq!(state.entries[1].kind, QueuedInputKind::FollowUp);
     }
 
     #[test]

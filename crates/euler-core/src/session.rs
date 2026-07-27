@@ -320,6 +320,10 @@ pub enum SessionError {
     InvalidModelSwitchEvent(String),
     #[error("invalid session name: {name}")]
     InvalidSessionName { name: String },
+    #[error("queued input is not the current dispatch reservation for this steering queue")]
+    InvalidQueuedInput,
+    #[error("cannot replace a session while a user-message admission is unresolved")]
+    UnresolvedAdmissionTransition,
     #[error(transparent)]
     EventWake(#[from] EventWakeError),
     #[error("event wake requires provenance writer")]
@@ -460,7 +464,7 @@ struct ShadowCompaction {
 
 struct PendingAdmission {
     event: EventEnvelope,
-    queue_id: Option<u64>,
+    queue_id: Option<steering::QueueEntryId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -571,6 +575,7 @@ where
         model_call_id: String,
         data: ModelRoundData,
         cancellation: &CancellationToken,
+        another_round_available: bool,
     ) -> Result<RoundOutcome, SessionError> {
         let stop_reason = data
             .stop_reason
@@ -632,7 +637,12 @@ where
             // contributors before this call; only `Closed` ends the steering
             // group. The queue atomically reserves steering or closes, so
             // post-close input is a follow-up rather than a lost late steer.
-            match self.finish_idle_steering_boundary(cancellation)? {
+            let boundary = if another_round_available {
+                self.finish_idle_steering_boundary(cancellation)?
+            } else {
+                self.defer_idle_steering_boundary(cancellation)
+            };
+            match boundary {
                 steering::BoundaryAction::Persisted => return Ok(RoundOutcome::Continue),
                 steering::BoundaryAction::Closed { cancelled: true } => {
                     return Err(SessionError::Cancelled);
@@ -670,7 +680,13 @@ where
         Ok(())
     }
 
-    fn round_limit(&mut self) -> Result<(), SessionError> {
+    fn round_limit(&mut self, cancellation: &CancellationToken) -> Result<(), SessionError> {
+        if matches!(
+            self.defer_idle_steering_boundary(cancellation),
+            steering::BoundaryAction::Closed { cancelled: true }
+        ) {
+            return Err(SessionError::Cancelled);
+        }
         self.session.emit(
             EventKind::ASSISTANT_MESSAGE,
             object([("content", TOOL_ROUNDS_LIMIT_MESSAGE.into())]),
@@ -729,6 +745,20 @@ where
         cancellation: &CancellationToken,
     ) -> Result<steering::BoundaryAction, SessionError> {
         self.persist_steering(steering::RoundBoundary::Terminal, cancellation)
+    }
+
+    /// Close a terminal round-limit seam without admitting steering that this
+    /// turn has no remaining provider request to observe.
+    fn defer_idle_steering_boundary(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> steering::BoundaryAction {
+        self.session.steering.as_ref().map_or_else(
+            || steering::BoundaryAction::Closed {
+                cancelled: cancellation.is_cancelled(),
+            },
+            |queue| queue.defer_terminal_boundary(|| cancellation.is_cancelled()),
+        )
     }
 
     fn finish_tool_round(
@@ -960,7 +990,10 @@ impl<D> Session<D> {
         session_id: impl Into<String>,
         decider: D,
         project_context: ProjectContextBootstrap,
-    ) -> Self {
+    ) -> Result<Self, (Box<Self>, SessionError)> {
+        if self.has_unresolved_admission() {
+            return Err((Box::new(self), SessionError::UnresolvedAdmissionTransition));
+        }
         let active_target = self.active_target;
         let code_swarm_extension = self.code_swarm_extension;
         let redactor = self.redactor;
@@ -980,7 +1013,7 @@ impl<D> Session<D> {
         // The code-swarm wiring is launch configuration, not session state:
         // a fresh session in the same process keeps the review-gate tool.
         fresh.code_swarm_extension = code_swarm_extension;
-        fresh
+        Ok(fresh)
     }
 
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
@@ -1019,10 +1052,31 @@ impl<D> Session<D> {
         &mut self,
         queue: Arc<steering::SteeringQueue>,
         input: &steering::QueuedInput,
-    ) {
+    ) -> Result<(), SessionError> {
+        if !queue.is_current_dispatch(input) {
+            return Err(SessionError::InvalidQueuedInput);
+        }
+        if self
+            .pending_admission
+            .as_ref()
+            .is_some_and(|pending| pending.queue_id != Some(input.id()))
+        {
+            return Err(pending_admission_error());
+        }
         queue.begin_turn(Some(input));
         self.steering = Some(queue);
         self.queued_dispatch = Some(input.clone());
+        Ok(())
+    }
+
+    /// Whether this live session owns an authoritative user-message append
+    /// whose durability is still ambiguous.
+    pub fn has_unresolved_admission(&self) -> bool {
+        self.pending_admission.is_some()
+            || self
+                .steering
+                .as_ref()
+                .is_some_and(|queue| queue.has_unresolved_admission())
     }
 
     /// Whether a fresh user turn can be admitted before the active target's
@@ -1310,15 +1364,16 @@ impl<D> Session<D> {
     ///
     /// General turn events intentionally retain accepted in-memory evidence
     /// when a later append fails. User messages have a stronger queue
-    /// transaction: a failed admission retains the exact envelope id and
-    /// timestamp, so repair + retry can reconcile an ambiguous complete
-    /// append instead of creating a second event. Drain any older accepted
-    /// backlog, append this candidate, then publish it to the bus and advance
-    /// the cursor. While it is pending, every unrelated append is fenced.
+    /// transaction: the exact envelope id, timestamp, and parent are installed
+    /// before any accepted backlog is written. A failure while reconciling
+    /// that backlog or appending the candidate therefore protects the same
+    /// queue row. Repair + retry can reconcile an ambiguous complete append
+    /// instead of creating a second event. While it is pending, every
+    /// unrelated append is fenced.
     fn admit_user_message(
         &mut self,
         content: &str,
-        queue_id: Option<u64>,
+        queue_id: Option<steering::QueueEntryId>,
     ) -> Result<String, SessionError> {
         self.ensure_terminalization_intact()?;
         let payload = object([("content", content.to_owned().into())]);
@@ -1330,7 +1385,6 @@ impl<D> Session<D> {
                 return Err(pending_admission_error());
             }
         } else {
-            self.persist_new_events()?;
             self.pending_admission = Some(PendingAdmission {
                 event: EventEnvelope::new(
                     self.config.session_id.clone(),
@@ -1342,17 +1396,18 @@ impl<D> Session<D> {
                 queue_id,
             });
         }
+        if let Err(error) = self.persist_pending_admission_backlog() {
+            self.protect_pending_queue_row();
+            return Err(error);
+        }
         let pending = self
             .pending_admission
             .as_ref()
             .expect("admission was matched or created");
         let event = pending.event.clone();
-        let pending_queue_id = pending.queue_id;
         let id = event.id.clone();
         if let Err(error) = self.append_candidate(&event) {
-            if let (Some(queue), Some(queue_id)) = (&self.steering, pending_queue_id) {
-                queue.mark_admission_unresolved(queue_id);
-            }
+            self.protect_pending_queue_row();
             return Err(error);
         }
         self.bus.push(event);
@@ -1361,6 +1416,31 @@ impl<D> Session<D> {
             self.persisted_events = self.bus.events().len();
         }
         Ok(id)
+    }
+
+    /// The sole append path allowed after a pending user admission has been
+    /// installed. It owns only the older accepted bus suffix; the candidate
+    /// itself is appended separately and is not visible in memory yet.
+    fn persist_pending_admission_backlog(&mut self) -> Result<(), SessionError> {
+        debug_assert!(self.pending_admission.is_some());
+        self.ensure_terminalization_intact()?;
+        if self.persisted_events < self.bus.events().len() {
+            if let Some(writer) = &self.provenance {
+                writer.append(&self.bus.events()[self.persisted_events..])?;
+                self.persisted_events = self.bus.events().len();
+            }
+        }
+        Ok(())
+    }
+
+    fn protect_pending_queue_row(&self) {
+        let queue_id = self
+            .pending_admission
+            .as_ref()
+            .and_then(|pending| pending.queue_id);
+        if let (Some(queue), Some(queue_id)) = (&self.steering, queue_id) {
+            queue.mark_admission_unresolved(queue_id);
+        }
     }
 
     fn ensure_no_pending_admission(&self) -> Result<(), SessionError> {

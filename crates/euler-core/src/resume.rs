@@ -58,6 +58,15 @@ pub enum ResumeError {
          model calls"
     )]
     AmbiguousModelTerminal { event_id: String, agent: String },
+    #[error(
+        "resume incompatible: terminal event {event_id} duplicates the closed model call \
+         {call_id} for agent {agent}"
+    )]
+    DuplicateModelTerminal {
+        event_id: String,
+        call_id: String,
+        agent: String,
+    },
     #[error("resume incompatible: missing provenance blob {hash} at {}", path.display())]
     MissingBlob { hash: String, path: PathBuf },
     #[error("resume incompatible: provenance blob hash mismatch for {hash} at {}", path.display())]
@@ -770,6 +779,9 @@ fn recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, Res
         }) {
             // A second terminal naming an already-settled call must not settle
             // a different open call through the actor fallback below.
+            if !calls[direct].open {
+                return Err(duplicate_model_terminal(event, calls[direct].call));
+            }
             calls[direct].open = false;
             continue;
         }
@@ -785,7 +797,26 @@ fn recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, Res
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         match candidates.as_slice() {
-            [] => {}
+            [] => {
+                let settled = calls
+                    .iter()
+                    .filter(|state| {
+                        !state.open
+                            && state.call.agent == event.agent
+                            && model_terminal_metadata_matches(state.call, event)
+                    })
+                    .collect::<Vec<_>>();
+                match settled.as_slice() {
+                    [state] => return Err(duplicate_model_terminal(event, state.call)),
+                    [] => {}
+                    _ => {
+                        return Err(ResumeError::AmbiguousModelTerminal {
+                            event_id: event.id.clone(),
+                            agent: event.agent.clone(),
+                        });
+                    }
+                }
+            }
             [index] => calls[*index].open = false,
             _ => {
                 return Err(ResumeError::AmbiguousModelTerminal {
@@ -805,6 +836,14 @@ fn recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, Res
         closures.push(closure);
     }
     Ok(closures)
+}
+
+fn duplicate_model_terminal(terminal: &EventEnvelope, call: &EventEnvelope) -> ResumeError {
+    ResumeError::DuplicateModelTerminal {
+        event_id: terminal.id.clone(),
+        call_id: call.id.clone(),
+        agent: terminal.agent.clone(),
+    }
 }
 
 fn model_terminal_metadata_matches(call: &EventEnvelope, terminal: &EventEnvelope) -> bool {

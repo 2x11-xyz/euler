@@ -509,6 +509,129 @@ fn cancellation_releases_parallel_reviewers_and_records_terminal_results() {
     assert_eq!(terminals[0].payload["cancelled"], json!(true));
 }
 
+fn assert_one_reviewer_terminal_before_agent_result(events: &[EventEnvelope]) -> &EventEnvelope {
+    let call_index = events
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("reviewer model.call");
+    let call = &events[call_index];
+    let result_index = events
+        .iter()
+        .enumerate()
+        .skip(call_index + 1)
+        .find(|(_, event)| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .map(|(index, _)| index)
+        .expect("reviewer agent.result");
+    let terminals = events[call_index + 1..result_index]
+        .iter()
+        .filter(|event| {
+            event.agent == call.agent && crate::session::event_terminalizes_model_call(event)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "a prepared reviewer must close its model.call exactly once before agent.result"
+    );
+    terminals[0]
+}
+
+fn assert_parallel_resume_adds_no_recovery(temp: &tempfile::TempDir, log: &std::path::Path) {
+    let before = crate::resume::read_resume_prefix(log)
+        .expect("read live log")
+        .len();
+    let mut config = crate::SessionConfig::new(temp.path());
+    config.session_id = "session-parallel".to_owned();
+    config.provider = "p1".to_owned();
+    config.model = "m1".to_owned();
+    let outcome = crate::resume::resume_session_with_outcome(
+        config,
+        ProviderSet::single_named("p1".to_owned(), ScriptedProvider::new(vec![])),
+        ScriptedDecider::new(Vec::new()),
+        log,
+    )
+    .expect("resume terminalized parallel reviewer");
+
+    assert!(!outcome.recovery_closure_appended);
+    assert_eq!(outcome.session.events().len(), before);
+}
+
+#[test]
+fn pre_cancelled_parallel_reviewer_records_one_cancelled_terminal_before_result() {
+    let providers = scripted_set(&[("p1", FixtureResponse::Assistant("must not run".to_owned()))]);
+    let (temp, log, mut session) = session_with_providers(providers);
+    let cancellation = euler_sdk::CancellationSource::new();
+    cancellation.cancel();
+
+    let result = session.spawn_reviewers_parallel(
+        vec![reviewer_task("p1", "m1", "code-swarm-correctness")],
+        &cancellation.token(),
+    );
+
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    let terminal = assert_one_reviewer_terminal_before_agent_result(session.events());
+    assert_eq!(terminal.kind.as_str(), EventKind::ERROR);
+    assert_eq!(terminal.payload["source"], json!("session"));
+    assert_eq!(terminal.payload["cancelled"], json!(true));
+    assert_eq!(
+        terminal.payload.get("recovery_closure"),
+        None,
+        "known cancellation is not an unknown-outcome recovery"
+    );
+    drop(session);
+    assert_parallel_resume_adds_no_recovery(&temp, &log);
+}
+
+struct PanickingReviewProvider;
+
+struct PanickingReviewStream;
+
+impl Iterator for PanickingReviewStream {
+    type Item = Result<ModelStreamEvent, ProviderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        panic!("provider stream panic payload must never enter provenance")
+    }
+}
+
+impl ModelProvider for PanickingReviewProvider {
+    fn name(&self) -> &'static str {
+        "panic-review"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        Ok(Box::new(PanickingReviewStream))
+    }
+}
+
+#[test]
+fn panicking_parallel_reviewer_records_one_sanitized_recovery_terminal() {
+    let providers = ProviderSet::single_named("p1".to_owned(), PanickingReviewProvider);
+    let (temp, log, mut session) = session_with_providers(providers);
+
+    let summaries = session
+        .spawn_reviewers_parallel(
+            vec![reviewer_task("p1", "m1", "code-swarm-correctness")],
+            &CancellationToken::new(),
+        )
+        .expect("panic is isolated as reviewer failure");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    let terminal = assert_one_reviewer_terminal_before_agent_result(session.events());
+    assert_eq!(terminal.kind.as_str(), EventKind::ERROR);
+    assert_eq!(terminal.payload["source"], json!("session"));
+    assert_eq!(terminal.payload["recovery_closure"], json!(true));
+    assert_eq!(
+        terminal.payload["message"],
+        json!(REVIEWER_UNKNOWN_OUTCOME_MESSAGE)
+    );
+    let serialized = serde_json::to_string(session.events()).expect("serialize events");
+    assert!(!serialized.contains("provider stream panic payload"));
+    drop(session);
+    assert_parallel_resume_adds_no_recovery(&temp, &log);
+}
+
 #[test]
 fn buffered_worker_provider_error_is_redacted_before_append() {
     // F8: workers buffer the raw provider error for the session thread to

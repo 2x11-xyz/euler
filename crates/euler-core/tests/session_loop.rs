@@ -3363,6 +3363,31 @@ fn tool_round_exhaustion_allows_follow_up_turn() {
 }
 
 #[test]
+fn cancellation_wins_when_round_limit_is_already_reached() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = SessionConfig::new(temp.path());
+    config.max_tool_rounds = Some(0);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("unused".to_owned())]),
+        ScriptedDecider::new(vec![]),
+    );
+    let cancelled = Arc::new(AtomicBool::new(true));
+
+    let result = session.run_turn_with_sink("cancel at limit", cancelled, |_| {});
+
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert_eq!(count_kind(session.events(), EventKind::MODEL_CALL), 0);
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ASSISTANT_MESSAGE
+            && payload_str(event, "content")
+                == Some(
+                    "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.",
+                )
+    }));
+}
+
+#[test]
 fn provider_stream_without_finished_emits_truncation_error_without_model_result() {
     let temp = tempfile::tempdir().expect("temp dir");
     let provider =
@@ -5702,6 +5727,50 @@ fn stacked_steering_during_a_no_tool_response_continues_before_turn_completion()
 }
 
 #[test]
+fn terminal_round_limit_defers_steering_instead_of_persisting_unobservable_input() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![text_stream("only answer")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    let mut config = SessionConfig::new(temp.path());
+    config.max_tool_rounds = Some(1);
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+    session.set_steering_queue(Arc::clone(&queue));
+    let queued = AtomicBool::new(false);
+
+    session
+        .run_turn_with_sink("start", Arc::new(AtomicBool::new(false)), |event| {
+            if event.kind.as_str() == EventKind::MODEL_DELTA && !queued.swap(true, Ordering::SeqCst)
+            {
+                queue.push_steering_back("defer me".to_owned());
+            }
+        })
+        .expect("terminal round");
+
+    assert_eq!(
+        request_log_guard(&requests).len(),
+        1,
+        "the explicit one-round budget allows exactly one request"
+    );
+    assert_eq!(queue.snapshot(), ["defer me"]);
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::USER_MESSAGE
+            && payload_str(event, "content") == Some("defer me")
+    }));
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ASSISTANT_MESSAGE
+            && payload_str(event, "content")
+                == Some(
+                    "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.",
+                )
+    }));
+}
+
+#[test]
 fn input_after_terminal_boundary_before_surface_done_is_a_follow_up() {
     let temp = tempfile::tempdir().expect("temp dir");
     let requests = request_log();
@@ -5731,7 +5800,9 @@ fn input_after_terminal_boundary_before_surface_done_is_a_follow_up() {
     assert_eq!(queue.snapshot(), ["arrived before TurnDone"]);
 
     let input = queue.reserve_front_for_dispatch().expect("follow-up");
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
+        .expect("wire queued dispatch");
     session.run_turn(input.content()).expect("follow-up turn");
 
     let requests = request_log_guard(&requests);
@@ -5817,7 +5888,9 @@ fn steering_queued_before_the_turn_stays_out_of_it_for_its_own_turn() {
     // turn; the remaining leftover still stays out of that turn's request.
     let input_b = queue.reserve_front_for_dispatch().expect("leftover b");
     let prompt_b = input_b.content().to_owned();
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input_b);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input_b)
+        .expect("wire queued dispatch");
     session.run_turn(&prompt_b).expect("turn b");
     let requests = request_log_guard(&requests);
     assert_eq!(requests.len(), 2);

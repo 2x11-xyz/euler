@@ -222,7 +222,9 @@ fn mid_turn_steering_fail_once_repair_retry_is_exactly_once() {
     let input = queue
         .reserve_front_for_dispatch()
         .expect("retry reservation");
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
+        .expect("wire queued dispatch");
 
     session
         .run_turn(input.content())
@@ -247,6 +249,151 @@ fn queued_dispatch_dir_sync_failure_retries_the_exact_event_once() {
     assert_queued_dispatch_sync_failure(Op::DirSync);
 }
 
+#[test]
+fn backlog_sync_failure_keeps_the_exact_queue_owner_until_reconciliation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log_path = temp.path().join("backlog-sync.jsonl");
+    let writer = sync_test_writer(temp.path(), log_path.clone());
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "backlog-sync".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![
+            FixtureResponse::Assistant("first done".to_owned()),
+            FixtureResponse::Assistant("later done".to_owned()),
+        ]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+
+    // Leave session.start accepted but unpersisted. The admission transaction
+    // must install its owner before attempting to flush this older backlog.
+    let queue_a = Arc::new(SteeringQueue::default());
+    queue_a.push_follow_up_back("original".to_owned());
+    queue_a.push_follow_up_back("later".to_owned());
+    let input_a = queue_a.reserve_front_for_dispatch().expect("queue A row");
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue_a), &input_a)
+        .expect("wire queue A");
+
+    let queue_b = Arc::new(SteeringQueue::default());
+    queue_b.push_follow_up_back("original".to_owned());
+    let input_b = queue_b.reserve_front_for_dispatch().expect("queue B row");
+    let guard = arm_log_sync_fault(Op::FileSync, &log_path);
+
+    let failure = session
+        .run_turn(input_a.content())
+        .expect_err("bootstrap sync must reject admission");
+
+    assert!(matches!(failure, SessionError::Io(_)));
+    assert!(guard.fired(), "the injected backlog sync fault must fire");
+    assert_eq!(
+        session
+            .pending_admission
+            .as_ref()
+            .and_then(|pending| pending.queue_id),
+        Some(input_a.id),
+        "the owner is installed before the older backlog write"
+    );
+    assert!(session.has_unresolved_admission());
+    assert!(queue_a.has_unresolved_admission());
+    assert_eq!(
+        queue_a.remove(0),
+        None,
+        "the ambiguous owner cannot be edited away"
+    );
+    assert_eq!(
+        user_message_count(
+            &crate::resume::read_resume_prefix(&log_path).expect("read failed prefix"),
+            "original",
+        ),
+        0,
+        "the candidate is not appended until backlog reconciliation"
+    );
+
+    let foreign = session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue_b), &input_b)
+        .expect_err("another queue cannot claim the pending admission");
+    assert!(matches!(
+        foreign,
+        SessionError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(queue_b.is_current_dispatch(&input_b));
+    assert_eq!(queue_b.snapshot(), ["original"]);
+
+    let rename = session
+        .rename_session("must-not-append")
+        .expect_err("unrelated control write must be fenced");
+    assert!(matches!(
+        rename,
+        SessionError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    let unrelated = session
+        .run_turn("different")
+        .expect_err("unrelated user input must be fenced");
+    assert!(matches!(
+        unrelated,
+        SessionError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+
+    let bootstrap = match session
+        .prepare_fresh_project_context()
+        .expect("fresh-session preflight")
+    {
+        crate::project_context::ProjectContextResolution::Resolved(bootstrap) => *bootstrap,
+        crate::project_context::ProjectContextResolution::NeedsAcknowledgment(pending) => {
+            pending.unprompted()
+        }
+        crate::project_context::ProjectContextResolution::Budget(error) => {
+            panic!("unexpected project-context budget failure: {error}")
+        }
+    };
+    let (recovered, transition_error) = match session.into_fresh_session(
+        "must-not-replace",
+        ScriptedDecider::new(Vec::new()),
+        bootstrap,
+    ) {
+        Ok(_) => panic!("fresh transition must not orphan pending admission"),
+        Err(failure) => failure,
+    };
+    session = *recovered;
+    assert!(matches!(
+        transition_error,
+        SessionError::UnresolvedAdmissionTransition
+    ));
+
+    drop(guard);
+    let retry = queue_a
+        .reserve_front_for_dispatch()
+        .expect("exact queue A retry");
+    assert_eq!(retry.id, input_a.id);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue_a), &retry)
+        .expect("rewire exact owner");
+    session
+        .run_turn(retry.content())
+        .expect("reconcile backlog and candidate");
+    assert!(!queue_a.has_unresolved_admission());
+
+    let later = queue_a.reserve_front_for_dispatch().expect("later row");
+    assert_eq!(later.content(), "later");
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue_a), &later)
+        .expect("wire later row");
+    session.run_turn(later.content()).expect("later work");
+
+    let accepted: Vec<_> = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .filter_map(|event| event.payload.get("content").and_then(Value::as_str))
+        .collect();
+    assert_eq!(accepted, ["original", "later"]);
+    assert!(queue_a.is_empty());
+    assert_eq!(queue_b.snapshot(), ["original"]);
+    assert_durable_bus_equivalence(&session, &log_path);
+}
+
 fn assert_queued_dispatch_sync_failure(op: Op) {
     let temp = tempfile::tempdir().expect("temp dir");
     let log_path = temp.path().join("events.jsonl");
@@ -269,7 +416,9 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
         let state = queue.state();
         SteeringQueue::queued_input(state.entries.get(1).expect("duplicate row"))
     };
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
+        .expect("wire queued dispatch");
     let guard = arm_log_sync_fault(op, &log_path);
 
     let result = session.run_turn(input.content());
@@ -299,14 +448,12 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
         "the pending event must retain its exact queue-row identity"
     );
     let bytes_after_failure = std::fs::read(&log_path).expect("read failed append");
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &duplicate_input);
     let same_text_wrong_row = session
-        .run_turn(duplicate_input.content())
-        .expect_err("same payload from a different queue row must be fenced");
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &duplicate_input)
+        .expect_err("an unreserved same-text row must be rejected at wiring");
     assert!(matches!(
         same_text_wrong_row,
-        crate::session::SessionError::Io(ref error)
-            if error.kind() == std::io::ErrorKind::WouldBlock
+        crate::session::SessionError::InvalidQueuedInput
     ));
     let unrelated = session
         .run_turn("different input")
@@ -357,7 +504,9 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
         retry.id, input.id,
         "the unresolved row must outrank a later urgent insertion"
     );
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &retry);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &retry)
+        .expect("wire queued retry");
     session
         .run_turn(retry.content())
         .expect("matching retry reconciles");
@@ -396,7 +545,9 @@ fn clear_preserves_only_the_unresolved_duplicate_row() {
     queue.push_follow_up_back("duplicate".to_owned());
     queue.push_follow_up_back("after".to_owned());
     let input = queue.reserve_front_for_dispatch().expect("reservation");
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
+        .expect("wire queued dispatch");
     let guard = arm_log_sync_fault(Op::FileSync, &log_path);
 
     let result = session.run_turn(input.content());
@@ -418,7 +569,9 @@ fn clear_preserves_only_the_unresolved_duplicate_row() {
 
     let retry = queue.reserve_front_for_dispatch().expect("exact retry");
     assert_eq!(retry.id, input.id);
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &retry);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &retry)
+        .expect("wire queued retry");
     session
         .run_turn(retry.content())
         .expect("reconcile exact row");
@@ -512,7 +665,9 @@ fn assert_mid_turn_sync_failure(op: Op) {
         Some(retry.id),
         "the pending event and absorption retry must identify the same row"
     );
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &retry);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &retry)
+        .expect("wire queued retry");
     session
         .run_turn(retry.content())
         .expect("matching retry reconciles");
@@ -779,7 +934,9 @@ fn queued_dispatch_fail_once_repair_retry_is_exactly_once() {
     }
     let input = queue.reserve_front_for_dispatch().expect("reservation");
     let mut session = session_with_broken_log(&temp, "ordinary-dispatch-failure");
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
+        .expect("wire queued dispatch");
 
     let result = session.run_turn(input.content());
 
@@ -800,7 +957,9 @@ fn queued_dispatch_fail_once_repair_retry_is_exactly_once() {
         .reserve_front_for_dispatch()
         .expect("retry reservation");
     assert_eq!(retry.id, input.id, "retry must reserve the retained head");
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &retry);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &retry)
+        .expect("wire queued retry");
 
     session
         .run_turn(retry.content())
@@ -825,7 +984,9 @@ fn interrupted_steering_dispatch_append_failure_keeps_the_group() {
     queue.close_turn();
     let input = queue.reserve_front_for_dispatch().expect("reservation");
     let mut session = session_with_broken_log(&temp, "steering-dispatch-failure");
-    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
+        .expect("wire queued dispatch");
 
     let result = session.run_turn(input.content());
 

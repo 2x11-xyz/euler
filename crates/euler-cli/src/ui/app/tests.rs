@@ -3418,6 +3418,56 @@ fn new_session_reuses_target_and_purges_visual_history() {
 }
 
 #[test]
+fn new_and_resume_refuse_to_orphan_an_unresolved_queued_admission() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let events_path = record.events_path().to_path_buf();
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(&events_path).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    core.session_store = Some(store);
+    let original_session_id = record.id().to_owned();
+
+    core.queued_inputs
+        .push_follow_up_back("must survive".to_owned());
+    let input = core
+        .queued_inputs
+        .reserve_front_for_dispatch()
+        .expect("queued row");
+    std::fs::remove_file(&events_path).expect("remove provenance file");
+    std::fs::create_dir(&events_path).expect("block provenance path");
+    let queue = Arc::clone(&core.queued_inputs);
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("test session must be idle");
+    };
+    session
+        .set_steering_queue_for_queued_input(queue, &input)
+        .expect("wire queued row");
+    session
+        .run_turn(input.content())
+        .expect_err("broken provenance must leave admission unresolved");
+    assert!(core.queued_inputs.has_unresolved_admission());
+
+    assert_eq!(core.start_new_session(), CoreEffect::Render);
+    assert_eq!(core.open_resume_picker(), CoreEffect::Render);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("lifecycle refusal must keep current session");
+    };
+    assert_eq!(session.session_id(), original_session_id);
+    assert!(session.has_unresolved_admission());
+    assert_eq!(core.queued_inputs.snapshot(), ["must survive"]);
+    let text = drain_finalized_visual_text(&mut core, 100);
+    assert!(text.contains("new session waits for the unresolved queued input admission"));
+    assert!(text.contains("resume waits for the unresolved queued input admission"));
+}
+
+#[test]
 fn new_session_settles_or_cancels_idle_shadow_before_replacement() {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");

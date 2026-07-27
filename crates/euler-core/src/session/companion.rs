@@ -990,6 +990,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         model_call_id: String,
         data: ModelRoundData,
         cancellation: &CancellationToken,
+        _another_round_available: bool,
     ) -> Result<RoundOutcome<AgentResult>, SessionError> {
         let stop_reason = data
             .stop_reason
@@ -1066,7 +1067,10 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
 
     fn round_completed(&mut self) {}
 
-    fn round_limit(&mut self) -> Result<AgentResult, SessionError> {
+    fn round_limit(
+        &mut self,
+        _cancellation: &CancellationToken,
+    ) -> Result<AgentResult, SessionError> {
         Ok(companion_failure("budget exhausted: max_turns"))
     }
 }

@@ -56,6 +56,13 @@ confirmed byte offset. A partial, changed, or extra suffix fails closed without
 truncation. Until reconciliation succeeds, unrelated appends, resume-marker
 changes, and log rewrites such as scrub are rejected.
 
+An authoritative queued `user.message` installs its exact pending envelope and
+opaque queue-instance/row identity before flushing any older accepted bus
+suffix. Thus an ambiguous backlog sync has an owner just as an ambiguous
+candidate sync does. Until that exact retry reconciles, unrelated admissions
+and control writes are fenced, the row cannot be edited or cleared, and a live
+session cannot be replaced by `/new` or `/resume`.
+
 The durable tail, append diagnostics, and event-wake notification advance only
 after the matching bytes have passed both file and containing-directory sync.
 An append that externalizes a blob does not open the log until the blob file
@@ -80,7 +87,9 @@ was ambiguous. The closure reports an unknown outcome rather than replaying
 the request or claiming a confirmed cancellation. Terminal-to-call association
 is defined authoritatively by the actor/order rule in
 `docs/contracts/events.md`; provenance readers must not treat a crossed-agent
-writer-linear parent as terminal authority.
+writer-linear parent as terminal authority, and resume rejects a direct or
+otherwise unambiguous writer-linear duplicate terminal before appending any
+recovery mutation.
 
 The owning writer is also the sole owner of the durable parent tail. For every
 post-D2 append, an event without an explicit semantic parent is parented to the

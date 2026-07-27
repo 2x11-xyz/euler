@@ -90,20 +90,27 @@ envelope `v` per `docs/contracts/persistence.md`.
   positions them like any other event, and readers must not assume a turn
   has exactly one leading user message. Queue entries are removed only after
   this event is durable: both mid-turn absorption and queued-turn dispatch
-  reserve by id first, and append failure leaves the entry queued. Admission
-  first drains any older accepted persistence backlog, then appends the
-  candidate before publishing it to the live bus. A rejected candidate is
-  therefore never an accepted in-memory event. The session retains its exact
-  envelope id, timestamp, parent, payload, and originating queue-entry id
-  across an ambiguous post-write failure; only that same queue entry with the
-  same payload may retry it. Remove/edit/clear protect the unresolved entry,
-  and dispatch selects it before any row inserted later, even when another row
-  has identical content. Repair and retry therefore reconcile that event
-  exactly once instead of persisting a failed bus copy or acknowledging a
-  content-equal duplicate.
+  reserve by id first, and append failure leaves the entry queued. A queue-entry
+  id is opaque and includes both the queue instance and its row sequence; a
+  same-position, same-content row from another queue is never the same
+  reservation. Admission installs the pending candidate — including its exact
+  envelope id, timestamp, parent, payload, and originating queue-entry id —
+  before attempting to persist any older accepted backlog. It then reconciles
+  that backlog, appends the candidate, and only then publishes the candidate to
+  the live bus. A failure in either append protects the same pending owner, and
+  a rejected candidate is never an accepted in-memory event. Only that exact
+  queue row with the same payload may retry it. Remove/edit/clear protect the
+  unresolved entry, and dispatch selects it before any row inserted later,
+  even when another row has identical content. Repair and retry therefore
+  reconcile that event exactly once instead of persisting a failed bus copy or
+  acknowledging a content-equal duplicate.
 - `assistant.message`: `content`. It commits the visible content of a
   no-tool model round. Pending steering may keep that same user turn active,
-  append more `user.message` events, and dispatch another model round.
+  append more `user.message` events, and dispatch another model round only
+  when the explicit round budget can admit that request. At the final allowed
+  round, the terminal transaction closes the steering group without persisting
+  queued steering; rows submitted before that close remain deferred, and rows
+  submitted after it are ordinary follow-ups.
 - `model.call`: `provider`, `model`, `canvas_items`,
   `requested_reasoning_effort`; optional resolved `reasoning_effort`,
   `max_output_tokens`, and `project_context_digest`. Every accepted call has
@@ -124,9 +131,13 @@ envelope `v` per `docs/contracts/persistence.md`.
   `provider`/`model` match when the terminal carries those fields and whose
   `purpose` matches exactly (including both sides omitting it). With no
   candidate, the terminal settles no call; multiple candidates make the
-  history incompatible and resume fails closed. This actor/order rule is
-  necessary because sequential companions and parallel reviewers use the
-  writer-owned linear spine:
+  history incompatible and resume fails closed. A direct terminal naming an
+  already closed same-agent call is a duplicate and makes the history
+  incompatible. When no call is open, a writer-linear terminal that uniquely
+  matches an already closed same-agent call is likewise rejected as a
+  duplicate; it is never ignored or allowed to settle later work. This
+  actor/order rule is necessary because sequential companions and parallel
+  reviewers use the writer-owned linear spine:
   reasoning and terminal events may durably parent a preceding reasoning event
   or another reviewer's event rather than their logical call. A crossed-agent
   linear parent is never authority.
@@ -665,6 +676,7 @@ Cardinality and ordering invariants:
   event;
 - exactly one semantically associated terminal `model.result` or `error` per
   `model.call`, under the authoritative actor/order association rule above;
+  resume rejects a second semantic terminal instead of normalizing it away;
 - zero or more `model.reasoning` events per `model.call`, emitted in
   provider order before its terminal event;
 - `assistant.message` is emitted after its `model.result`, and only for
