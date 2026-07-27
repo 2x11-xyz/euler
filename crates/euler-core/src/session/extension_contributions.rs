@@ -30,6 +30,24 @@ pub(super) struct ActiveExtensionTool {
     extension: Arc<dyn Extension>,
 }
 
+pub(super) struct ExtensionToolCatalogSnapshot {
+    definitions: Vec<ToolDefinition>,
+    bindings: BTreeMap<String, ActiveExtensionTool>,
+    diagnostics: Vec<ExtensionToolCatalogDiagnostic>,
+}
+
+struct ExtensionToolCatalogDiagnostic {
+    extension_id: String,
+    command: Option<String>,
+    failure: &'static str,
+}
+
+impl ExtensionToolCatalogSnapshot {
+    pub(super) fn definitions(&self) -> &[ToolDefinition] {
+        &self.definitions
+    }
+}
+
 #[derive(Clone)]
 struct IdleContributor {
     extension_id: String,
@@ -129,9 +147,15 @@ impl<D: PermissionDecider> Session<D> {
         Ok(())
     }
 
-    pub(super) fn refresh_extension_model_tools(&mut self) -> Vec<ToolDefinition> {
-        let mut active = BTreeMap::new();
+    /// Capture one immutable view of enabled, valid extension model tools.
+    ///
+    /// This performs no session mutation and emits no provenance. Speculative
+    /// request accounting can therefore use the exact live tool definitions
+    /// without replacing the bindings that own an already-dispatched call.
+    pub(super) fn extension_tool_catalog_snapshot(&self) -> ExtensionToolCatalogSnapshot {
+        let mut bindings = BTreeMap::new();
         let mut definitions = Vec::new();
+        let mut diagnostics = Vec::new();
         let mut names = self
             .tools
             .model_tools()
@@ -149,7 +173,11 @@ impl<D: PermissionDecider> Session<D> {
             let declaration = match extension_declaration(extension.as_ref()) {
                 Ok(declaration) if declaration.id == wired_id => declaration,
                 _ => {
-                    self.emit_contribution_error(&wired_id, None, "registration");
+                    diagnostics.push(ExtensionToolCatalogDiagnostic {
+                        extension_id: wired_id,
+                        command: None,
+                        failure: "registration",
+                    });
                     continue;
                 }
             };
@@ -158,15 +186,19 @@ impl<D: PermissionDecider> Session<D> {
                     continue;
                 };
                 if model_tool_descriptor_is_secret_tainted(&self.redactor, &model_tool) {
-                    self.emit_contribution_error(
-                        &wired_id,
-                        Some(&command),
-                        "model-tool-secret-tainted",
-                    );
+                    diagnostics.push(ExtensionToolCatalogDiagnostic {
+                        extension_id: wired_id.clone(),
+                        command: Some(command),
+                        failure: "model-tool-secret-tainted",
+                    });
                     continue;
                 }
                 if !names.insert(model_tool.name.clone()) {
-                    self.emit_contribution_error(&wired_id, Some(&command), "model-tool-collision");
+                    diagnostics.push(ExtensionToolCatalogDiagnostic {
+                        extension_id: wired_id.clone(),
+                        command: Some(command),
+                        failure: "model-tool-collision",
+                    });
                     continue;
                 }
                 definitions.push(ToolDefinition {
@@ -174,7 +206,7 @@ impl<D: PermissionDecider> Session<D> {
                     description: model_tool.description.clone(),
                     parameters: model_tool.input_schema.clone(),
                 });
-                active.insert(
+                bindings.insert(
                     model_tool.name.clone(),
                     ActiveExtensionTool {
                         extension_id: wired_id.clone(),
@@ -186,8 +218,35 @@ impl<D: PermissionDecider> Session<D> {
                 );
             }
         }
-        self.active_extension_tools = active;
-        definitions
+        ExtensionToolCatalogSnapshot {
+            definitions,
+            bindings,
+            diagnostics,
+        }
+    }
+
+    /// Emit diagnostics from an admitted live catalog before its model call
+    /// opens, so an extension registration error cannot masquerade as that
+    /// call's terminal child.
+    pub(super) fn emit_extension_tool_catalog_diagnostics(
+        &mut self,
+        snapshot: &ExtensionToolCatalogSnapshot,
+    ) {
+        for diagnostic in &snapshot.diagnostics {
+            self.emit_contribution_error(
+                &diagnostic.extension_id,
+                diagnostic.command.as_deref(),
+                diagnostic.failure,
+            );
+        }
+    }
+
+    /// Install bindings only after the matching model call is admitted.
+    pub(super) fn install_extension_tool_bindings(
+        &mut self,
+        snapshot: &ExtensionToolCatalogSnapshot,
+    ) {
+        self.active_extension_tools = snapshot.bindings.clone();
     }
 
     pub(super) fn extension_tool_attribution(&self, name: &str) -> Option<(&str, &str)> {
@@ -404,6 +463,9 @@ impl<D: PermissionDecider> Session<D> {
         if cancellation.is_cancelled() {
             return self.reject_cancelled_idle_output(&contributor, &output, sink);
         }
+        if self.steering_pending() {
+            return self.reject_user_pending_idle_output(&contributor, &output, sink);
+        }
         let envelope = match parse_idle_envelope(&output, &self.redactor) {
             Ok(envelope) => envelope,
             Err(()) => {
@@ -417,6 +479,30 @@ impl<D: PermissionDecider> Session<D> {
             }
         };
         self.finish_idle_envelope(&contributor, envelope, sink)
+    }
+
+    fn reject_user_pending_idle_output<F>(
+        &mut self,
+        contributor: &IdleContributor,
+        output: &Value,
+        sink: &mut EventSink<'_, F>,
+    ) -> Result<IdleBoundary, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        // User input supersedes the idle result before valid Stop/Continue or
+        // malformed-envelope handling. Preserve a real action when one
+        // exists; a malformed result has no action to attribute and only
+        // suppresses the lower-priority invalid-envelope diagnostic.
+        if let Ok(envelope) = parse_idle_envelope(output, &self.redactor) {
+            let action = match envelope {
+                IdleEnvelope::Continue(_) => "continue",
+                IdleEnvelope::Stop => "stop",
+            };
+            self.emit_idle_contribution(contributor, action, false, None, Some("user-pending"))?;
+        }
+        sink.flush(self.bus.events());
+        Ok(IdleBoundary::Stop)
     }
 
     fn reject_cancelled_idle_output<F>(
@@ -455,17 +541,6 @@ impl<D: PermissionDecider> Session<D> {
                 Ok(IdleBoundary::Stop)
             }
             IdleEnvelope::Continue(content) => {
-                if self.steering_pending() {
-                    self.emit_idle_contribution(
-                        contributor,
-                        "continue",
-                        false,
-                        None,
-                        Some("user-pending"),
-                    )?;
-                    sink.flush(self.bus.events());
-                    return Ok(IdleBoundary::Stop);
-                }
                 self.emit_idle_contribution(contributor, "continue", true, Some(&content), None)?;
                 sink.flush(self.bus.events());
                 Ok(IdleBoundary::Continue)
@@ -551,7 +626,7 @@ impl<D: PermissionDecider> Session<D> {
         contributors.pop()
     }
 
-    fn steering_pending(&self) -> bool {
+    pub(super) fn steering_pending(&self) -> bool {
         self.steering
             .as_ref()
             .is_some_and(|queue| !queue.is_empty())

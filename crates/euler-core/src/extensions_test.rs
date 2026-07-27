@@ -1,4 +1,4 @@
-use super::{hash_bytes, ExtensionHost, ExtensionHostError};
+use super::{canonical_extension_plan_event, hash_bytes, ExtensionHost, ExtensionHostError};
 use crate::{read_provenance, ProvenanceWriter};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_sdk::{
@@ -1805,6 +1805,242 @@ fn extensions_plan_presentation_emits_canonical_attributed_live_event() {
         .drain_after(Some(&start_id))
         .expect("valid queued parent chain");
     assert_eq!(queued.as_slice(), &durable[1..]);
+}
+
+#[test]
+fn extension_plan_retry_fold_rejects_noncanonical_payload_shapes() {
+    let canonical = object([
+        ("source", "extension".into()),
+        ("extension_id", "plan-ext".into()),
+        ("command", "update".into()),
+        ("revision", 1.into()),
+        ("status", "active".into()),
+        ("explanation", Value::Null),
+        (
+            "items",
+            json!([{"step": "Inspect", "status": "in_progress"}]),
+        ),
+        ("summary", "r1 · active · 0/1 completed".into()),
+    ]);
+    let event = EventEnvelope::new(
+        "session-plan",
+        "agent-plan",
+        None,
+        EventKind::PLAN_UPDATE,
+        canonical.clone(),
+    );
+    assert!(canonical_extension_plan_event(&event, "plan-ext").is_some());
+
+    let mut forged = canonical;
+    forged.insert("legacy_content".to_owned(), "looks equivalent".into());
+    let event = EventEnvelope::new(
+        "session-plan",
+        "agent-plan",
+        None,
+        EventKind::PLAN_UPDATE,
+        forged,
+    );
+    assert!(
+        canonical_extension_plan_event(&event, "plan-ext").is_none(),
+        "unknown legacy fields must not suppress a fresh canonical append"
+    );
+}
+
+#[test]
+fn extensions_plan_presentation_exact_retry_is_idempotent_per_extension() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-plan-idempotent";
+    let log = temp.path().join("events.jsonl");
+    let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let redactor = crate::redaction::SecretRedactor::new();
+    redactor.add_value("known-plan-retry-secret");
+    let (mut host, queue) = ExtensionHost::with_queued_artifact_writer(
+        session_id,
+        "agent-plan",
+        Arc::clone(&writer),
+        [Capability::PlanPresentation],
+    );
+    host = host.with_redactor(redactor);
+    host.register_extension(&extension(
+        "plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![
+            ("update", plan_presentation_command),
+            ("idle-repair", plan_presentation_command),
+        ],
+    ))
+    .expect("register plan extension");
+    host.register_extension(&extension(
+        "other-plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![("other-update", plan_presentation_command)],
+    ))
+    .expect("register other extension");
+    let queued_before_updates = queue.len();
+    let initial = json!({
+        "revision": 7,
+        "status": "active",
+        "explanation": "known-plan-retry-secret",
+        "items": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "in_progress"}
+        ]
+    });
+
+    host.execute_command("update", initial.clone())
+        .expect("initial update");
+    assert_eq!(queue.len(), queued_before_updates + 1);
+    host.execute_command("idle-repair", initial.clone())
+        .expect("exact retry from another command");
+    assert_eq!(
+        queue.len(),
+        queued_before_updates + 1,
+        "an exact normalized retry adds nothing to the live queue"
+    );
+
+    let changed = json!({
+        "revision": 7,
+        "status": "active",
+        "explanation": "changed at the same revision",
+        "items": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "in_progress"}
+        ]
+    });
+    host.execute_command("idle-repair", changed.clone())
+        .expect("changed same-revision update");
+    host.execute_command("other-update", changed)
+        .expect("same payload from another extension");
+    assert_eq!(queue.len(), queued_before_updates + 3);
+
+    let durable = read_provenance(&log).expect("events");
+    let plans = events_of_kind(&durable, EventKind::PLAN_UPDATE);
+    assert_eq!(plans.len(), 3);
+    assert_eq!(plans[0].payload["extension_id"], json!("plan-ext"));
+    assert_eq!(plans[0].payload["command"], json!("update"));
+    assert_eq!(plans[1].payload["extension_id"], json!("plan-ext"));
+    assert_eq!(plans[1].payload["command"], json!("idle-repair"));
+    assert_eq!(plans[2].payload["extension_id"], json!("other-plan-ext"));
+    assert_eq!(plans[0].payload["revision"], plans[1].payload["revision"]);
+    assert_ne!(
+        plans[0].payload["explanation"],
+        plans[1].payload["explanation"]
+    );
+}
+
+#[test]
+fn extensions_plan_presentation_retry_deduplicates_ambiguous_persisted_append() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-plan-ambiguous";
+    let log = temp.path().join("events.jsonl");
+    let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let (mut host, queue) = ExtensionHost::with_queued_artifact_writer(
+        session_id,
+        "agent-plan",
+        Arc::clone(&writer),
+        [Capability::PlanPresentation],
+    );
+    host.register_extension(&extension(
+        "plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![
+            ("update", plan_presentation_command),
+            ("idle-repair", plan_presentation_command),
+        ],
+    ))
+    .expect("register");
+    let queued_before_update = queue.len();
+    let presentation = json!({
+        "revision": 1,
+        "status": "active",
+        "explanation": null,
+        "items": [{"step": "Resume safely", "status": "in_progress"}]
+    });
+
+    {
+        let log_path = log.clone();
+        let guard = arm_matching(Op::FileSync, move |path| path == log_path);
+        host.execute_command("update", presentation.clone())
+            .expect_err("post-write sync failure is ambiguous");
+        assert!(guard.fired(), "log sync fault must fire");
+    }
+    assert_eq!(
+        events_of_kind(
+            &read_provenance(&log).expect("physical complete events"),
+            EventKind::PLAN_UPDATE
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        queue.len(),
+        queued_before_update,
+        "a failed append is not published to the live queue"
+    );
+
+    host.execute_command("idle-repair", presentation.clone())
+        .expect_err("same writer remains fenced without the exact event batch");
+
+    assert_eq!(
+        events_of_kind(
+            &read_provenance(&log).expect("events after fenced retry"),
+            EventKind::PLAN_UPDATE
+        )
+        .len(),
+        1
+    );
+    assert_eq!(queue.len(), queued_before_update);
+
+    drop(host);
+    drop(writer);
+    let reopened = Arc::new(ProvenanceWriter::new(&log).expect("reopen settled writer"));
+    let (mut host, queue) = ExtensionHost::with_queued_artifact_writer(
+        session_id,
+        "agent-plan",
+        reopened,
+        [Capability::PlanPresentation],
+    );
+    host.register_extension(&extension(
+        "plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![
+            ("update", plan_presentation_command),
+            ("idle-repair", plan_presentation_command),
+        ],
+    ))
+    .expect("register after reopen");
+    let queued_before_retry = queue.len();
+
+    host.execute_command("idle-repair", presentation)
+        .expect("reopened writer deduplicates durable presentation");
+    assert_eq!(queue.len(), queued_before_retry);
+    host.execute_command(
+        "update",
+        json!({
+            "revision": 1,
+            "status": "active",
+            "explanation": "changed after recovery",
+            "items": [{"step": "Resume safely", "status": "in_progress"}]
+        }),
+    )
+    .expect("writer accepts a later changed update");
+    assert_eq!(queue.len(), queued_before_retry + 1);
+    assert_eq!(
+        events_of_kind(
+            &read_provenance(&log).expect("events after reopen"),
+            EventKind::PLAN_UPDATE
+        )
+        .len(),
+        2
+    );
 }
 
 #[test]

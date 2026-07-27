@@ -12,7 +12,8 @@ use euler_event::{object, EventEnvelope, EventKind};
 use euler_sdk::{
     valid_checkpoint_name, validate_model_tool_descriptor, validate_plan_presentation,
     EventFeedCheckpoint, EventFeedCheckpointError, IdleContributionDescriptor, Invocation,
-    PlanItemStatus, PlanPresentation, MAX_EVENT_FEED_CHECKPOINT_BYTES,
+    PlanItemStatus, PlanPresentation, PlanPresentationItem, PlanPresentationStatus,
+    MAX_EVENT_FEED_CHECKPOINT_BYTES,
 };
 use euler_sdk::{AgentOutcome, SpawnAgentTask};
 use euler_sdk::{ArtifactRecord, ArtifactWrite, Capability, CommandContext, CommandRegistrar};
@@ -862,17 +863,14 @@ impl HostApi for CommandHost<'_> {
             ));
         }
 
-        let completed = presentation
-            .items
-            .iter()
-            .filter(|item| item.status == PlanItemStatus::Completed)
-            .count();
-        let summary = format!(
-            "r{} · {} · {completed}/{} completed",
-            presentation.revision,
-            presentation.status.as_str(),
-            presentation.items.len()
-        );
+        let normalized = CanonicalPlanPresentation::new(presentation.clone());
+        if !recorder.writer.has_unresolved_append()
+            && latest_extension_plan_presentation(&self.log_path, &self.extension_id)?.as_ref()
+                == Some(&normalized)
+        {
+            return Ok(());
+        }
+        let summary = normalized.summary;
         let items = presentation
             .items
             .into_iter()
@@ -1093,6 +1091,128 @@ fn current_context_slots(
         after_event_id = advanced;
     }
     Ok(fold_context_slot_state(&events))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CanonicalPlanPresentation {
+    presentation: PlanPresentation,
+    summary: String,
+}
+
+impl CanonicalPlanPresentation {
+    fn new(presentation: PlanPresentation) -> Self {
+        let completed = presentation
+            .items
+            .iter()
+            .filter(|item| item.status == PlanItemStatus::Completed)
+            .count();
+        let summary = format!(
+            "r{} · {} · {completed}/{} completed",
+            presentation.revision,
+            presentation.status.as_str(),
+            presentation.items.len()
+        );
+        Self {
+            presentation,
+            summary,
+        }
+    }
+}
+
+fn latest_extension_plan_presentation(
+    log_path: &Path,
+    extension_id: &str,
+) -> Result<Option<CanonicalPlanPresentation>, ExtensionError> {
+    // Like context slots, this fold-then-append deduplication relies on
+    // single-threaded extension command execution. It deliberately reads
+    // durable provenance rather than the live queue so a settled/reopened
+    // writer sees the canonical prior presentation. A same-writer ambiguous
+    // append remains fenced by `ProvenanceWriter` and cannot use this dedupe
+    // path as a substitute for its required exact-batch retry.
+    let mut latest = None;
+    let mut after_event_id = None;
+    loop {
+        let page = query_provenance(
+            log_path,
+            ProvenanceQuery {
+                after_event_id: after_event_id.clone(),
+                kinds: vec![EventKind::PLAN_UPDATE.to_owned()],
+                limit: 256,
+                scan_limit: 1024,
+                include_blob_fields: false,
+                blob_byte_limit: 0,
+            },
+        )
+        .map_err(|error| plan_presentation_failed(error.to_string()))?;
+        for event in page.events {
+            if let Some(candidate) = canonical_extension_plan_event(&event, extension_id) {
+                latest = Some(candidate);
+            }
+        }
+        let advanced = page.next_after_event_id;
+        if advanced.is_none() || advanced == after_event_id {
+            break;
+        }
+        after_event_id = advanced;
+    }
+    Ok(latest)
+}
+
+fn canonical_extension_plan_event(
+    event: &EventEnvelope,
+    extension_id: &str,
+) -> Option<CanonicalPlanPresentation> {
+    let payload = &event.payload;
+    const CANONICAL_KEYS: [&str; 8] = [
+        "source",
+        "extension_id",
+        "command",
+        "revision",
+        "status",
+        "explanation",
+        "items",
+        "summary",
+    ];
+    if event.kind.as_str() != EventKind::PLAN_UPDATE
+        || payload.len() != CANONICAL_KEYS.len()
+        || !CANONICAL_KEYS.iter().all(|key| payload.contains_key(*key))
+        || payload.get("source").and_then(Value::as_str) != Some("extension")
+        || payload.get("extension_id").and_then(Value::as_str) != Some(extension_id)
+    {
+        return None;
+    }
+    payload.get("command")?.as_str()?;
+    let status = PlanPresentationStatus::parse(payload.get("status")?.as_str()?)?;
+    let explanation = match payload.get("explanation")? {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        _ => return None,
+    };
+    let items = payload
+        .get("items")?
+        .as_array()?
+        .iter()
+        .map(|item| {
+            let object = item.as_object()?;
+            if object.len() != 2 {
+                return None;
+            }
+            Some(PlanPresentationItem {
+                step: object.get("step")?.as_str()?.to_owned(),
+                status: PlanItemStatus::parse(object.get("status")?.as_str()?)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let presentation = PlanPresentation {
+        revision: payload.get("revision")?.as_u64()?,
+        status,
+        explanation,
+        items,
+    };
+    validate_plan_presentation(&presentation).ok()?;
+    let canonical = CanonicalPlanPresentation::new(presentation);
+    (payload.get("summary").and_then(Value::as_str) == Some(canonical.summary.as_str()))
+        .then_some(canonical)
 }
 
 fn context_slot_failed(error: impl fmt::Display) -> ExtensionError {

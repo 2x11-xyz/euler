@@ -1,9 +1,12 @@
 use super::*;
+use crate::canvas::CanvasItem;
+use crate::compaction::WorkingStateProjection;
 use crate::permissions::{ApprovalMode, DeciderVerdict, ScriptedDecider};
 use crate::provenance::ProvenanceWriter;
+use crate::RoundObserverConfig;
 use euler_provider::{
-    FixtureResponse, ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent,
-    ProviderError, ProviderStream, ScriptedProvider, StopReason, ToolCall,
+    FixtureResponse, ModelInputItem, ModelProvider, ModelRequest, ModelRole, ProviderError,
+    ProviderStream, ScriptedProvider, ToolCall,
 };
 use euler_sdk::{
     CommandContext, CommandRegistrar, ExtensionCommand, ExtensionError, ExtensionManifest, HostApi,
@@ -11,7 +14,7 @@ use euler_sdk::{
 };
 use serde_json::json;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 #[derive(Clone)]
@@ -21,7 +24,7 @@ struct TestExtension {
     has_model_tool: bool,
     has_idle: bool,
     capabilities: Vec<Capability>,
-    model_tool_descriptor: ModelToolDescriptor,
+    model_tool_descriptor: Arc<Mutex<ModelToolDescriptor>>,
 }
 
 struct TestExtensionState {
@@ -46,7 +49,7 @@ impl TestExtension {
             has_model_tool: true,
             has_idle: true,
             capabilities: Vec::new(),
-            model_tool_descriptor: standard_model_tool_descriptor(),
+            model_tool_descriptor: Arc::new(Mutex::new(standard_model_tool_descriptor())),
         }
     }
 
@@ -67,9 +70,19 @@ impl TestExtension {
         self
     }
 
-    fn with_model_tool_descriptor(mut self, descriptor: ModelToolDescriptor) -> Self {
-        self.model_tool_descriptor = descriptor;
+    fn with_model_tool_descriptor(self, descriptor: ModelToolDescriptor) -> Self {
+        *self
+            .model_tool_descriptor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = descriptor;
         self
+    }
+
+    fn set_model_tool_descriptor(&self, descriptor: ModelToolDescriptor) {
+        *self
+            .model_tool_descriptor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = descriptor;
     }
 
     fn cancel_after_idle(self, cancel: Arc<AtomicBool>) -> Self {
@@ -105,7 +118,12 @@ impl Extension for TestExtension {
                     kind: TestCommandKind::ModelTool,
                     state: Arc::clone(&self.state),
                     capabilities: self.capabilities.clone(),
-                    model_tool: Some(self.model_tool_descriptor.clone()),
+                    model_tool: Some(
+                        self.model_tool_descriptor
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .clone(),
+                    ),
                 }),
             );
         }
@@ -215,6 +233,31 @@ fn standard_model_tool_descriptor() -> ModelToolDescriptor {
     }
 }
 
+fn large_model_tool_descriptor(name: &str) -> ModelToolDescriptor {
+    let properties = (0..12)
+        .map(|index| {
+            (
+                format!("field_{index}"),
+                json!({
+                    "type": "string",
+                    "description": "d".repeat(900),
+                    "maxLength": 1024
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    ModelToolDescriptor {
+        name: name.to_owned(),
+        description: "Exercise request-time extension schema accounting.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": properties,
+            "required": [],
+            "additionalProperties": false
+        }),
+    }
+}
+
 struct CapturingProvider {
     scripted: ScriptedProvider,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
@@ -247,8 +290,69 @@ impl ModelProvider for CapturingProvider {
     }
 }
 
+struct RoundObserverFixtureExtension;
+
+impl Extension for RoundObserverFixtureExtension {
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            id: "observer-ext".to_owned(),
+            version: "0.1.0".to_owned(),
+            display_name: "Observer fixture".to_owned(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        registrar.register_command(
+            "brief",
+            Box::new(StaticOutputCommand(json!({
+                "task": "observe the completed root round",
+                "budget": {"max_turns": 1, "max_tool_calls": 0}
+            }))),
+        );
+        registrar.register_command(
+            "apply",
+            Box::new(StaticOutputCommand(json!({"applied": true}))),
+        );
+        Ok(())
+    }
+}
+
+struct StaticOutputCommand(Value);
+
+impl ExtensionCommand for StaticOutputCommand {
+    fn execute(
+        &self,
+        _context: CommandContext,
+        _host: &dyn HostApi,
+    ) -> Result<Value, ExtensionError> {
+        Ok(self.0.clone())
+    }
+}
+
 struct SteeringProvider {
     queue: Arc<super::super::steering::SteeringQueue>,
+    scripted: ScriptedProvider,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+    steering_sent: AtomicBool,
+}
+
+impl SteeringProvider {
+    fn new(
+        queue: Arc<super::super::steering::SteeringQueue>,
+        responses: Vec<FixtureResponse>,
+    ) -> (Self, Arc<Mutex<Vec<ModelRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                queue,
+                scripted: ScriptedProvider::new(responses),
+                requests: Arc::clone(&requests),
+                steering_sent: AtomicBool::new(false),
+            },
+            requests,
+        )
+    }
 }
 
 impl ModelProvider for SteeringProvider {
@@ -256,18 +360,62 @@ impl ModelProvider for SteeringProvider {
         "fixture"
     }
 
-    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
-        self.queue.push_steering_back("user wins".to_owned());
-        Ok(Box::new(
-            vec![
-                Ok(ModelStreamEvent::TextDelta("first".to_owned())),
-                Ok(ModelStreamEvent::Finished {
-                    stop_reason: StopReason::Completed,
-                    usage: None,
-                }),
-            ]
-            .into_iter(),
-        ))
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.clone());
+        if !self.steering_sent.swap(true, Ordering::SeqCst) {
+            self.queue.push_steering_back("user wins".to_owned());
+        }
+        self.scripted.invoke(request)
+    }
+}
+
+struct SteeringAtCallProvider {
+    queue: Arc<super::super::steering::SteeringQueue>,
+    scripted: ScriptedProvider,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+    calls: AtomicUsize,
+    steer_at: usize,
+}
+
+impl SteeringAtCallProvider {
+    fn new(
+        queue: Arc<super::super::steering::SteeringQueue>,
+        responses: Vec<FixtureResponse>,
+        steer_at: usize,
+    ) -> (Self, Arc<Mutex<Vec<ModelRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                queue,
+                scripted: ScriptedProvider::new(responses),
+                requests: Arc::clone(&requests),
+                calls: AtomicUsize::new(0),
+                steer_at,
+            },
+            requests,
+        )
+    }
+}
+
+impl ModelProvider for SteeringAtCallProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.clone());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.steer_at {
+            self.queue
+                .push_steering_back("user wins at the cap".to_owned());
+        }
+        self.scripted.invoke(request)
     }
 }
 
@@ -588,11 +736,25 @@ fn descriptor_tainted_after_wiring_is_rejected_before_advertisement() {
         .redactor
         .detect_value(&Value::Object(event.payload.clone()))
         .is_empty()));
-    assert!(session.events().iter().any(|event| {
-        event.kind.as_str() == EventKind::ERROR
-            && event.payload.get("failure").and_then(Value::as_str)
-                == Some("model-tool-secret-tainted")
-    }));
+    let diagnostic_index = session
+        .events()
+        .iter()
+        .position(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event.payload.get("failure").and_then(Value::as_str)
+                    == Some("model-tool-secret-tainted")
+        })
+        .expect("catalog diagnostic");
+    let model_call_index = session
+        .events()
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("model call");
+    assert!(diagnostic_index < model_call_index);
+    assert_ne!(
+        session.events()[diagnostic_index].parent.as_deref(),
+        Some(session.events()[model_call_index].id.as_str())
+    );
 }
 
 #[test]
@@ -650,6 +812,368 @@ fn model_tool_is_advertised_and_uses_canonical_attributed_braid() {
             .model_tool_calls,
         1
     );
+}
+
+#[test]
+fn rejected_large_schema_request_preserves_prior_live_binding() {
+    let temp = tempfile::tempdir().expect("temp");
+    let extension = TestExtension::new("workflow-ext", [json!({"action": "stop"})]);
+    let (provider, requests) = CapturingProvider::new(vec![
+        FixtureResponse::Assistant("first".to_owned()),
+        FixtureResponse::Assistant("third".to_owned()),
+    ]);
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config.extensions_enabled.insert(extension.id.clone());
+    config.compaction_reserve_tokens = 0;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    session
+        .wire_extension(Arc::new(extension.clone()))
+        .expect("wire extension");
+
+    session.run_turn("first").expect("first request");
+    assert_eq!(
+        session.extension_tool_attribution("update_workflow"),
+        Some(("workflow-ext", "update"))
+    );
+    let pending_id = session
+        .emit(
+            EventKind::EXTENSION_CONTRIBUTION,
+            object([
+                ("extension_id", "workflow-ext".into()),
+                ("command", "idle".into()),
+                ("point", "turn-idle".into()),
+                ("action", "continue".into()),
+                ("accepted", true.into()),
+                ("content", "pending work".into()),
+            ]),
+        )
+        .expect("pending contribution");
+    let snapshots_before_rejection = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .count();
+    let calls_before_rejection = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .count();
+
+    let policy = session.effective_stub_policy();
+    let (canvas, _) = session
+        .assemble_driver_canvas(policy)
+        .expect("current canvas");
+    let small_catalog = session.extension_tool_catalog_snapshot();
+    let small_request =
+        session.driver_model_request(&session.active_target, &canvas, &small_catalog);
+    let small_tokens = crate::project_context::request_required_tokens(&small_request, 0)
+        .expect("small request tokens");
+
+    extension.set_model_tool_descriptor(large_model_tool_descriptor("replacement_workflow"));
+    let large_catalog = session.extension_tool_catalog_snapshot();
+    let large_request =
+        session.driver_model_request(&session.active_target, &canvas, &large_catalog);
+    let large_tokens = crate::project_context::request_required_tokens(&large_request, 0)
+        .expect("large request tokens");
+    assert!(large_tokens > small_tokens + 1_000);
+    assert_eq!(
+        session.extension_tool_attribution("update_workflow"),
+        Some(("workflow-ext", "update")),
+        "speculative catalog capture must not replace live bindings"
+    );
+    assert!(session
+        .extension_tool_attribution("replacement_workflow")
+        .is_none());
+    let limit = small_tokens + (large_tokens - small_tokens) / 2;
+    session.config.context_limit = super::super::ContextLimitConfig::new(limit, 1.0);
+
+    let error = session
+        .run_turn("second")
+        .expect_err("large final request must fail before provider invocation");
+
+    assert!(matches!(error, SessionError::RequestOverTokenBudget { .. }));
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1
+    );
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+            .count(),
+        snapshots_before_rejection,
+        "a rejected request cannot consume one-shot canvas inputs"
+    );
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+            .count(),
+        calls_before_rejection
+    );
+    assert_eq!(
+        session.extension_tool_attribution("update_workflow"),
+        Some(("workflow-ext", "update")),
+        "a rejected request cannot publish replacement bindings"
+    );
+    assert!(session
+        .extension_tool_attribution("replacement_workflow")
+        .is_none());
+    assert!(session
+        .assemble_driver_canvas(policy)
+        .expect("canvas after rejection")
+        .0
+        .iter()
+        .any(|item| matches!(
+            item,
+            CanvasItem::ExtensionContribution { event_id, .. } if event_id == &pending_id
+        )));
+
+    extension.set_model_tool_descriptor(standard_model_tool_descriptor());
+    session.config.context_limit = None;
+    session
+        .run_turn("third")
+        .expect("pending contribution remains consumable");
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].input.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { content, .. }
+            if content.contains("pending work")
+    )));
+    assert_eq!(
+        requests[1]
+            .tools
+            .iter()
+            .filter(|tool| tool.name == "update_workflow")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn shadow_compaction_is_tool_free_and_preserves_pending_driver_contribution() {
+    let temp = tempfile::tempdir().expect("temp");
+    let extension = TestExtension::new("workflow-ext", [json!({"action": "stop"})]);
+    let projection = WorkingStateProjection {
+        goal: "preserve the pending driver input".to_owned(),
+        plan: "Compact the old frontier.".to_owned(),
+        ..WorkingStateProjection::default()
+    };
+    let (mut session, requests) = session_with_extension(
+        &temp,
+        extension,
+        vec![
+            FixtureResponse::Assistant("seed complete".to_owned()),
+            FixtureResponse::Assistant(projection.to_json()),
+            FixtureResponse::Assistant("continued".to_owned()),
+        ],
+        Vec::new(),
+    );
+    session.config.compaction_keep_recent = 0;
+
+    session
+        .run_turn(&format!("seed {}", "x".repeat(20_000)))
+        .expect("seed turn");
+    let pending_id = session
+        .emit(
+            EventKind::EXTENSION_CONTRIBUTION,
+            object([
+                ("extension_id", "workflow-ext".into()),
+                ("command", "idle".into()),
+                ("point", "turn-idle".into()),
+                ("action", "continue".into()),
+                ("accepted", true.into()),
+                ("content", "one-shot post-swap work".into()),
+            ]),
+        )
+        .expect("pending contribution");
+
+    assert_eq!(
+        session.begin_compaction().expect("begin shadow"),
+        super::super::CompactionStatus::InProgress
+    );
+    assert_eq!(
+        session.compact_and_wait().expect("finish shadow"),
+        super::super::CompactionStatus::Applied
+    );
+
+    {
+        let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(requests.len(), 2);
+        let shadow = &requests[1];
+        assert!(shadow.tools.is_empty());
+        assert!(shadow.input.iter().all(|item| !matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if content.contains("one-shot post-swap work")
+        )));
+    }
+    let shadow_snapshot = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::CANVAS_SNAPSHOT
+                && event.payload.get("purpose").and_then(Value::as_str) == Some("compaction")
+        })
+        .expect("shadow snapshot");
+    assert!(shadow_snapshot
+        .payload
+        .get("selected_event_ids")
+        .and_then(Value::as_array)
+        .is_some_and(|ids| ids.iter().all(|id| id.as_str() != Some(&pending_id))));
+
+    session
+        .run_turn("continue after swap")
+        .expect("driver turn");
+
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(requests.len(), 3);
+    let driver = &requests[2];
+    assert!(driver.input.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { content, .. }
+            if content.contains("one-shot post-swap work")
+    )));
+    assert_eq!(
+        driver
+            .tools
+            .iter()
+            .filter(|tool| tool.name == "update_workflow")
+            .count(),
+        1
+    );
+    let selected = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .filter(|event| {
+            event
+                .payload
+                .get("selected_event_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&pending_id)))
+        })
+        .count();
+    assert_eq!(selected, 1);
+}
+
+#[test]
+fn compaction_candidate_accounts_for_large_extension_schema_before_swap() {
+    let temp = tempfile::tempdir().expect("temp");
+    let extension = TestExtension::model_tool_only()
+        .with_model_tool_descriptor(large_model_tool_descriptor("large_workflow_update"));
+    let (mut session, _) = session_with_extension(
+        &temp,
+        extension,
+        vec![FixtureResponse::Assistant("seed complete".to_owned())],
+        Vec::new(),
+    );
+    session.config.compaction_keep_recent = 0;
+    session.config.compaction_reserve_tokens = 0;
+    session
+        .run_turn(&format!("seed {}", "x".repeat(20_000)))
+        .expect("seed turn");
+    let projection = WorkingStateProjection {
+        goal: "continue after compaction".to_owned(),
+        plan: "Retain only bounded working state.".to_owned(),
+        ..WorkingStateProjection::default()
+    };
+    let candidate = crate::compaction::build_compaction_candidate(
+        session.events(),
+        &projection,
+        session.config.compaction_keep_recent,
+    )
+    .expect("candidate");
+    let mut proposed_events = session.events().to_vec();
+    proposed_events.push(EventEnvelope::new(
+        session.config.session_id.clone(),
+        session.config.agent_id.clone(),
+        session.events().last().map(|event| event.id.clone()),
+        EventKind::CANVAS_SWAP,
+        super::super::full_swap_payload(&candidate),
+    ));
+    let policy = session.config.auto_compaction;
+    let proposed_canvas = crate::canvas::assemble_canvas_prefolded(
+        &proposed_events,
+        &policy,
+        &BTreeSet::new(),
+        None,
+        Some(&session.config.extensions_enabled),
+    );
+    let current_canvas = crate::canvas::assemble_canvas_prefolded(
+        session.events(),
+        &policy,
+        &BTreeSet::new(),
+        None,
+        Some(&session.config.extensions_enabled),
+    );
+    session.config.extensions_enabled.remove("workflow-ext");
+    let core_catalog = session.extension_tool_catalog_snapshot();
+    session
+        .config
+        .extensions_enabled
+        .insert("workflow-ext".to_owned());
+    let exact_catalog = session.extension_tool_catalog_snapshot();
+    let core_current =
+        session.driver_model_request(&session.active_target, &current_canvas, &core_catalog);
+    let core_proposed =
+        session.driver_model_request(&session.active_target, &proposed_canvas, &core_catalog);
+    let exact_proposed =
+        session.driver_model_request(&session.active_target, &proposed_canvas, &exact_catalog);
+    let core_current_tokens = crate::project_context::request_required_tokens(&core_current, 0)
+        .expect("core current tokens");
+    let core_proposed_tokens = crate::project_context::request_required_tokens(&core_proposed, 0)
+        .expect("core proposed tokens");
+    let exact_proposed_tokens = crate::project_context::request_required_tokens(&exact_proposed, 0)
+        .expect("exact proposed tokens");
+    let minimum_reduction = (core_current_tokens / 20).clamp(1, 256);
+    assert!(
+        core_current_tokens.saturating_sub(core_proposed_tokens) >= minimum_reduction,
+        "core-only candidate fixture must meaningfully reduce"
+    );
+    assert!(exact_proposed_tokens > core_proposed_tokens + 1_000);
+    let limit = core_proposed_tokens + (exact_proposed_tokens - core_proposed_tokens) / 2;
+    assert!(core_proposed_tokens <= limit);
+    assert!(exact_proposed_tokens > limit);
+    session.config.context_limit = super::super::ContextLimitConfig::new(limit, 1.0);
+    session.latest_model_usage = Some(super::super::ModelUsageSnapshot { used_tokens: 321 });
+    let latched_target = session.active_target.clone();
+    session.context_limit_emitted = Some(latched_target.clone());
+
+    assert!(!session.try_compact(&projection));
+
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::CANVAS_SWAP)
+            .count(),
+        0
+    );
+    let discarded = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED)
+        .expect("discarded candidate");
+    assert_eq!(
+        discarded.payload["reason"],
+        json!("proposed request does not fit the model context window")
+    );
+    assert_eq!(
+        session
+            .latest_model_usage
+            .as_ref()
+            .map(|usage| usage.used_tokens),
+        Some(321)
+    );
+    assert_eq!(session.context_limit_emitted, Some(latched_target));
 }
 
 #[test]
@@ -889,6 +1413,92 @@ fn accepted_idle_continuation_starts_a_fresh_round_without_user_forgery() {
 }
 
 #[test]
+fn round_observer_never_receives_the_idle_continuation_it_precedes() {
+    let temp = tempfile::tempdir().expect("temp");
+    let extension = TestExtension::idle_only(
+        "workflow-ext",
+        [
+            json!({"action": "continue", "input": "root-only observer sentinel"}),
+            json!({"action": "stop"}),
+        ],
+    );
+    let (mut session, requests) = session_with_extension(
+        &temp,
+        extension,
+        vec![
+            FixtureResponse::Assistant("first root completion".to_owned()),
+            FixtureResponse::Assistant("observer completion".to_owned()),
+            FixtureResponse::Assistant("continued root completion".to_owned()),
+        ],
+        Vec::new(),
+    );
+    session.set_extension_enabled("observer-ext", true);
+    session.config.round_observer = Some(RoundObserverConfig {
+        cadence_rounds: std::num::NonZeroU64::new(1).expect("nonzero cadence"),
+        brief_command: "brief".to_owned(),
+        apply_command: "apply".to_owned(),
+    });
+    session.set_observer_extension(Arc::new(RoundObserverFixtureExtension));
+
+    session.run_turn("start").expect("turn");
+
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(requests.len(), 3, "root, observer, continued root");
+    let occurrences = requests
+        .iter()
+        .map(|request| {
+            request
+                .prompt_text()
+                .matches("root-only observer sentinel")
+                .count()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        occurrences,
+        [0, 0, 1],
+        "observer must not see the pending input; the next root request consumes it once"
+    );
+}
+
+#[test]
+fn idle_continuation_is_not_run_without_a_permitted_next_request() {
+    let temp = tempfile::tempdir().expect("temp");
+    let extension = TestExtension::idle_only(
+        "workflow-ext",
+        [json!({"action": "continue", "input": "cannot be consumed"})],
+    );
+    let state = Arc::clone(&extension.state);
+    let (mut session, requests) = session_with_extension(
+        &temp,
+        extension,
+        vec![FixtureResponse::Assistant("done".to_owned())],
+        Vec::new(),
+    );
+    session.config.max_tool_rounds = Some(1);
+
+    session.run_turn("start").expect("final round completes");
+
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1
+    );
+    assert_eq!(
+        state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .idle_calls,
+        0
+    );
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::EXTENSION_CONTRIBUTION));
+}
+
+#[test]
 fn accepted_idle_continuation_is_persisted_and_modeled_after_one_redaction_pass() {
     let temp = tempfile::tempdir().expect("temp");
     let extension = TestExtension::idle_only(
@@ -1048,24 +1658,34 @@ fn default_safe_idle_capabilities_execute_without_prompt() {
 }
 
 #[test]
-fn pending_user_input_wins_before_idle_command_execution() {
-    let temp = tempfile::tempdir().expect("temp");
-    let extension = TestExtension::idle_only(
-        "workflow-ext",
-        [json!({"action": "continue", "input": "extension"})],
+fn pending_user_input_wins_before_idle_continue_command_execution() {
+    assert_pending_user_input_wins_before_idle_command(
+        json!({"action": "continue", "input": "extension"}),
     );
+}
+
+#[test]
+fn pending_user_input_wins_before_idle_stop_command_execution() {
+    assert_pending_user_input_wins_before_idle_command(json!({"action": "stop"}));
+}
+
+fn assert_pending_user_input_wins_before_idle_command(idle_output: Value) {
+    let temp = tempfile::tempdir().expect("temp");
+    let extension = TestExtension::idle_only("workflow-ext", [idle_output]);
     let state = Arc::clone(&extension.state);
     let queue = Arc::new(super::super::steering::SteeringQueue::default());
     let mut config = super::super::SessionConfig::new(temp.path());
     config.extensions_enabled.insert(extension.id.clone());
-    let mut session = Session::new(
-        config,
-        SteeringProvider {
-            queue: Arc::clone(&queue),
-        },
-        ScriptedDecider::new(Vec::new()),
-    )
-    .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    config.max_tool_rounds = Some(2);
+    let (provider, requests) = SteeringProvider::new(
+        Arc::clone(&queue),
+        vec![
+            FixtureResponse::Assistant("first".to_owned()),
+            FixtureResponse::Assistant("second".to_owned()),
+        ],
+    );
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
     session
         .wire_extension(Arc::new(extension))
         .expect("wire extension");
@@ -1080,11 +1700,23 @@ fn pending_user_input_wins_before_idle_command_execution() {
             .idle_calls,
         0
     );
-    assert_eq!(queue.snapshot(), vec!["user wins"]);
-    assert!(!session
-        .events()
-        .iter()
-        .any(|event| event.kind.as_str() == EventKind::EXTENSION_CONTRIBUTION));
+    assert!(queue.is_empty());
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].input.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message {
+            role: ModelRole::User,
+            content
+        } if content == "user wins"
+    )));
+    assert!(
+        session
+            .events()
+            .iter()
+            .all(|event| event.kind.as_str() != EventKind::EXTENSION_CONTRIBUTION),
+        "a command bypassed before execution has no contribution to attribute"
+    );
 }
 
 #[test]
@@ -1162,19 +1794,37 @@ fn cancellation_after_idle_stop_rejects_the_stop_result() {
 
 #[test]
 fn user_input_arriving_during_idle_execution_rejects_returned_continuation() {
+    assert_user_input_arriving_during_idle_wins(
+        json!({"action": "continue", "input": "must not start"}),
+        "continue",
+    );
+}
+
+#[test]
+fn user_input_arriving_during_idle_execution_rejects_returned_stop() {
+    assert_user_input_arriving_during_idle_wins(json!({"action": "stop"}), "stop");
+}
+
+#[test]
+fn user_input_arriving_during_idle_execution_preempts_malformed_output() {
+    assert_user_input_arriving_during_idle_wins(json!({"action": "wait"}), "");
+}
+
+fn assert_user_input_arriving_during_idle_wins(idle_output: Value, expected_action: &str) {
     let temp = tempfile::tempdir().expect("temp");
     let queue = Arc::new(super::super::steering::SteeringQueue::default());
-    let extension = TestExtension::idle_only(
-        "workflow-ext",
-        [json!({"action": "continue", "input": "must not start"})],
-    )
-    .steer_after_idle(Arc::clone(&queue));
+    let extension = TestExtension::idle_only("workflow-ext", [idle_output])
+        .steer_after_idle(Arc::clone(&queue));
     let (mut session, requests) = session_with_extension(
         &temp,
         extension,
-        vec![FixtureResponse::Assistant("first".to_owned())],
+        vec![
+            FixtureResponse::Assistant("first".to_owned()),
+            FixtureResponse::Assistant("second".to_owned()),
+        ],
         Vec::new(),
     );
+    session.config.max_tool_rounds = Some(2);
     session.set_steering_queue(Arc::clone(&queue));
 
     session.run_turn("start").expect("turn");
@@ -1184,17 +1834,38 @@ fn user_input_arriving_during_idle_execution_rejects_returned_continuation() {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len(),
-        1
+        2
     );
-    assert_eq!(queue.snapshot(), vec!["user wins after hook"]);
+    assert!(queue.is_empty());
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(requests[1].input.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message {
+            role: ModelRole::User,
+            content
+        } if content == "user wins after hook"
+    )));
     let contribution = session
         .events()
         .iter()
         .find(|event| event.kind.as_str() == EventKind::EXTENSION_CONTRIBUTION)
-        .expect("rejected contribution");
-    assert_eq!(contribution.payload["accepted"], json!(false));
-    assert_eq!(contribution.payload["reason"], json!("user-pending"));
-    assert!(contribution.payload.get("content").is_none());
+        .map(|event| &event.payload);
+    if expected_action.is_empty() {
+        assert!(
+            contribution.is_none(),
+            "malformed output has no valid contribution action"
+        );
+    } else {
+        let contribution = contribution.expect("rejected contribution");
+        assert_eq!(contribution["action"], json!(expected_action));
+        assert_eq!(contribution["accepted"], json!(false));
+        assert_eq!(contribution["reason"], json!("user-pending"));
+        assert!(contribution.get("content").is_none());
+    }
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ERROR
+            && event.payload.get("failure").and_then(Value::as_str) == Some("invalid-envelope")
+    }));
 }
 
 #[test]
@@ -1231,9 +1902,141 @@ fn automatic_continuation_limit_stops_a_valid_infinite_contributor() {
             .idle_calls,
         automatic
     );
-    assert!(session.events().iter().any(|event| {
-        event.kind.as_str() == EventKind::ERROR
-            && event.payload.get("failure").and_then(Value::as_str) == Some("continuation-limit")
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::ERROR
+                    && event.payload.get("failure").and_then(Value::as_str)
+                        == Some("continuation-limit")
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::EXTENSION_CONTRIBUTION
+                    && event.payload.get("action").and_then(Value::as_str) == Some("continue")
+                    && event.payload.get("accepted").and_then(Value::as_bool) == Some(true)
+            })
+            .count(),
+        automatic
+    );
+}
+
+#[test]
+fn steering_at_automatic_continuation_cap_is_modeled_after_one_cap_event() {
+    let temp = tempfile::tempdir().expect("temp");
+    let automatic = MAX_AUTOMATIC_CONTINUATIONS_PER_RUN;
+    let extension = TestExtension::idle_only(
+        "workflow-ext",
+        (0..automatic).map(|_| json!({"action": "continue", "input": "keep going"})),
+    );
+    let state = Arc::clone(&extension.state);
+    let queue = Arc::new(super::super::steering::SteeringQueue::default());
+    let (provider, requests) = SteeringAtCallProvider::new(
+        Arc::clone(&queue),
+        (0..automatic + 2)
+            .map(|index| FixtureResponse::Assistant(format!("round {index}")))
+            .collect(),
+        automatic + 1,
+    );
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config.extensions_enabled.insert(extension.id.clone());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    session
+        .wire_extension(Arc::new(extension))
+        .expect("wire extension");
+    session.set_steering_queue(Arc::clone(&queue));
+
+    session.run_turn("start").expect("bounded continuation");
+
+    assert!(queue.is_empty());
+    assert_eq!(
+        state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .idle_calls,
+        automatic
+    );
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(requests.len(), automatic + 2);
+    assert!(requests[automatic + 1].input.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message {
+            role: ModelRole::User,
+            content
+        } if content == "user wins at the cap"
+    )));
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::ERROR
+                    && event.payload.get("failure").and_then(Value::as_str)
+                        == Some("continuation-limit")
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cancellation_at_automatic_continuation_cap_wins_over_cap_event() {
+    let temp = tempfile::tempdir().expect("temp");
+    let automatic = MAX_AUTOMATIC_CONTINUATIONS_PER_RUN;
+    let extension = TestExtension::idle_only(
+        "workflow-ext",
+        (0..automatic).map(|_| json!({"action": "continue", "input": "keep going"})),
+    );
+    let state = Arc::clone(&extension.state);
+    let (mut session, requests) = session_with_extension(
+        &temp,
+        extension,
+        (0..automatic + 1)
+            .map(|index| FixtureResponse::Assistant(format!("round {index}")))
+            .collect(),
+        Vec::new(),
+    );
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancel_from_sink = Arc::clone(&cancellation);
+    let results = Arc::new(AtomicUsize::new(0));
+    let results_from_sink = Arc::clone(&results);
+
+    let error = session
+        .run_turn_with_sink("start", cancellation, move |event| {
+            if event.kind.as_str() == EventKind::MODEL_RESULT
+                && results_from_sink.fetch_add(1, Ordering::SeqCst) + 1 == automatic + 1
+            {
+                cancel_from_sink.store(true, Ordering::SeqCst);
+            }
+        })
+        .expect_err("cancellation at cap");
+
+    assert!(matches!(error, SessionError::Cancelled));
+    assert_eq!(results.load(Ordering::SeqCst), automatic + 1);
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        automatic + 1
+    );
+    assert_eq!(
+        state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .idle_calls,
+        automatic
+    );
+    assert!(session.events().iter().all(|event| {
+        event.payload.get("failure").and_then(Value::as_str) != Some("continuation-limit")
     }));
 }
 

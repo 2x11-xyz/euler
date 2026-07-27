@@ -156,8 +156,15 @@ envelope `v` per `docs/contracts/persistence.md`.
   (bounded string or null), a nonempty bounded `items` array of
   `{ step, status }` (`pending` | `in_progress` | `completed`), and a
    host-derived compatibility `summary`. The owning writer parents it to the
-   durable tail at emission. It is transcript presentation, never direct
-   canvas input. Legacy summary/content-only events remain renderable.
+  durable tail at emission. It is transcript presentation, never direct
+  canvas input. The host treats an exact normalized retry of the latest
+  canonical event for the same extension as success without another event;
+  comparison ignores `command` but includes revision, status, explanation,
+  items, and summary. This no-op requires a settled provenance writer; an
+  unresolved same-writer append remains fenced until exact reconciliation or
+  lifecycle reopen. Changed content at the same revision and identical content
+   from a different extension remain distinct events. Legacy summary/content-
+   only events remain renderable.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may

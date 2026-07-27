@@ -204,6 +204,20 @@ context slot. The TUI renders one `Updated Plan` checklist and, when it is the
 causally attributed side effect of an extension model tool, suppresses only
 that tool's successful generic JSON result row. Provenance retains every event.
 
+An exact retry is idempotent after redaction and validation. Before appending,
+the host folds durable canonical extension `plan.update` events and compares
+the latest update for the same `extension_id` by revision, status,
+explanation, items, and derived summary. An exact match succeeds without
+appending or adding to the live queue, even when a different command retries
+it, provided the writer has no unresolved append. A same-writer ambiguous
+durability failure stays honestly fenced because only the exact failed event
+batch can reconcile it; after lifecycle reopen establishes a settled durable
+tail, the canonical physical event may satisfy deduplication. Command
+attribution is provenance for a real transition, not presentation identity.
+The same revision with changed content appends, and the same payload from
+another extension appends. This fold-then-append rule assumes the host's
+single-threaded command execution, as context-slot deduplication does.
+
 ## Private Extension State v0
 
 `HostApi::state_dir()` returns
@@ -377,13 +391,15 @@ is checked at both boundaries. An accepted continuation is recorded as
 attribution into a fresh root `RoundLoop`; it is not a `user.message`. The
 continuation is one-shot: it remains eligible across persistence and resume
 until selected by a same-agent root-driver `canvas.snapshot`, then leaves all
-later canvases. Shadow-compaction snapshots (`purpose: "compaction"`) and child
-agent snapshots cannot consume it. A full `canvas.swap` cannot hide it either:
-core folds pending contributions over the full accepted log and pins any
-pre-frontier contribution ahead of ordered frontier replay. Shadow compaction
-also omits pending contributions from its captured canvas and provider request,
-preventing opaque projection text from persisting or duplicating the one-shot
-driver input. Stop and unaccepted outputs remain provenance-only. The hook is
+later canvases. Child and parallel-reviewer canvases, snapshots, provider
+requests, and pre-request context-budget checks exclude it entirely: child
+models cannot observe or select the text, and root-only input cannot exhaust a
+child request's budget. A full `canvas.swap` cannot hide it either: core folds
+pending contributions over the full accepted log and pins any pre-frontier
+contribution ahead of ordered frontier replay. Shadow compaction likewise omits
+pending contributions from its captured canvas and provider request, preventing
+opaque projection text from persisting or duplicating the one-shot driver input.
+Stop and unaccepted outputs remain provenance-only. The hook is
 skipped after errors, context-limit stops, guardian interruption, explicit
 round ceilings, and cancellation. A per-run host ceiling prevents infinite
 automatic continuation. Acceptance commits the continuation to the current

@@ -293,8 +293,6 @@ fn exec_observe_runs_enabled_linked_python_observer_automatically() {
     let home = isolated_home();
     let root = tempfile::tempdir().expect("root dir");
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../euler-managed-process/tests/fixtures/python_sdk/src");
     let manifest = serde_json::json!({
         "version": 1,
         "id": "python-round-observer",
@@ -332,21 +330,20 @@ fn exec_observe_runs_enabled_linked_python_observer_automatically() {
     .expect("write observer manifest");
     fs::write(
         extension_dir.path().join("extension.py"),
-        format!(
-            r#"import sys
-+from pathlib import Path
-+sys.path.insert(0, {sdk_source:?})
-+from euler_managed_process_sdk import serve
-+
-+def brief(context):
-+    Path("observer-ran").write_text("yes")
-+    return {{"status": "idle"}}
-+
-+serve({{"observer-brief": brief, "observer-apply": lambda context: {{"ok": True}}}})
-+"#,
-            sdk_source = sdk_source.to_string_lossy()
-        )
-        .replace("\n+", "\n"),
+        raw_managed_process_script(
+            r#"
+from pathlib import Path
+
+def brief(_peer, _input):
+    Path("observer-ran").write_text("yes")
+    return {"status": "idle"}
+
+serve({
+    "observer-brief": brief,
+    "observer-apply": lambda _peer, _input: {"ok": True},
+})
+"#,
+        ),
     )
     .expect("write observer process");
     configure_linked_extension(exe, &home, extension_dir.path(), "python-round-observer");
@@ -546,8 +543,6 @@ fn linked_python_session_contributions_run_on_fresh_launch_and_resume() {
 
 #[cfg(unix)]
 fn write_session_contribution_extension(directory: &Path) {
-    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../euler-managed-process/tests/fixtures/python_sdk/src");
     let manifest = serde_json::json!({
         "version": 1,
         "id": "python-session-contribution",
@@ -593,30 +588,26 @@ fn write_session_contribution_extension(directory: &Path) {
     .expect("write session contribution manifest");
     fs::write(
         directory.join("extension.py"),
-        format!(
-            r#"import sys
+        raw_managed_process_script(
+            r#"
 from pathlib import Path
-sys.path.insert(0, {sdk_source:?})
-from euler_managed_process_sdk import serve
 
-def remember(context):
+def remember(_peer, command_input):
     count = Path("model-tool-count")
     count.write_text(str(int(count.read_text()) + 1) if count.exists() else "1")
-    return {{"recorded": context.input["value"]}}
+    return {"recorded": command_input["value"]}
 
-def idle(context):
+def idle(_peer, _input):
     count = Path("idle-count")
     value = int(count.read_text()) + 1 if count.exists() else 1
     count.write_text(str(value))
     if value == 1:
-        return {{"action": "continue", "input": "continue from the extension"}}
-    return {{"action": "stop"}}
+        return {"action": "continue", "input": "continue from the extension"}
+    return {"action": "stop"}
 
-serve({{"remember": remember, "idle": idle}})
+serve({"remember": remember, "idle": idle})
 "#,
-            sdk_source = sdk_source.to_string_lossy()
-        )
-        .replace("\n+", "\n"),
+        ),
     )
     .expect("write session contribution process");
 }
@@ -3272,7 +3263,7 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
 
 #[cfg(unix)]
 #[test]
-fn extension_cli_runs_enabled_linked_python_process_and_reload_revokes_it() {
+fn extension_cli_runs_enabled_linked_raw_peer_and_reload_revokes_it() {
     let python = Command::new("python3")
         .arg("--version")
         .output()
@@ -3282,7 +3273,7 @@ fn extension_cli_runs_enabled_linked_python_process_and_reload_revokes_it() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let python = provision_python_venv(extension_dir.path());
+    let python = PathBuf::from("python3");
     write_managed_process_extension_manifest(
         extension_dir.path(),
         "python-cli-proof",
@@ -3294,27 +3285,40 @@ fn extension_cli_runs_enabled_linked_python_process_and_reload_revokes_it() {
             "extension.py".to_owned(),
         ],
     );
-    let script = r#"import sys
+    let script = raw_managed_process_script(
+        r#"
+import base64
+import sys
 from pathlib import Path
 
-from euler_managed_process_sdk import serve
-
-def inspect(context):
+def inspect(peer, command_input):
     Path("invoked").write_text("yes", encoding="utf-8")
     sys.stderr.write("PYTHON_STDERR_SENTINEL\n")
     sys.stderr.flush()
-    page = context.host.query_provenance(limit=8, scan_limit=32)
-    artifact = context.host.write_artifact(
-        display_name="python-cli-proof.txt",
-        media_type="text/plain",
-        data=b"cli artifact",
-        source_event_ids=[event["id"] for event in page["events"]],
-        metadata={"producer": "python-cli-proof"},
-    )
-    return {"input": context.input, "artifact": artifact, "seen_events": len(page["events"])}
+    page = peer.request("euler/host/query-provenance", {
+        "after_event_id": None,
+        "kinds": [],
+        "limit": 8,
+        "scan_limit": 32,
+        "include_blob_fields": False,
+        "blob_byte_limit": 1024,
+    })
+    artifact = peer.request("euler/host/write-artifact", {
+        "display_name": "python-cli-proof.txt",
+        "media_type": "text/plain",
+        "bytes_base64": base64.b64encode(b"cli artifact").decode("ascii"),
+        "source_event_ids": [event["id"] for event in page["events"]],
+        "metadata": {"producer": "python-cli-proof"},
+    })
+    return {
+        "input": command_input,
+        "artifact": artifact,
+        "seen_events": len(page["events"]),
+    }
 
 serve({"inspect": inspect})
-"#;
+"#,
+    );
     fs::write(extension_dir.path().join("extension.py"), script).expect("write Python extension");
 
     let session_dir = tempfile::tempdir().expect("session dir");
@@ -6317,8 +6321,6 @@ fn tui_pty_escape_closes_slash_menu_then_interrupts_blocked_turn() {
 fn fresh_tui_runs_a_persistently_enabled_linked_process() {
     let home = isolated_home();
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../euler-managed-process/tests/fixtures/python_sdk/src");
     write_managed_process_extension_manifest(
         extension_dir.path(),
         "python-fresh-tui",
@@ -6345,9 +6347,10 @@ fn fresh_tui_runs_a_persistently_enabled_linked_process() {
     .expect("write capability-free manifest");
     fs::write(
         extension_dir.path().join("extension.py"),
-        format!(
-            "import sys\nsys.path.insert(0, {sdk_source:?})\nfrom euler_managed_process_sdk import serve\nserve({{'inspect': lambda context: {{'fresh_tui': True}}}})\n",
-            sdk_source = sdk_source.to_string_lossy()
+        raw_managed_process_script(
+            r#"
+serve({"inspect": lambda _peer, _input: {"fresh_tui": True}})
+"#,
         ),
     )
     .expect("write Python extension");
@@ -6374,8 +6377,6 @@ fn fresh_tui_runs_a_persistently_enabled_linked_process() {
 fn tui_escape_cancels_an_active_managed_process_extension() {
     let home = isolated_home();
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
     write_managed_process_extension_manifest(
         extension_dir.path(),
         "python-cancellable-tui",
@@ -6402,22 +6403,19 @@ fn tui_escape_cancels_an_active_managed_process_extension() {
     .expect("write capability-free manifest");
     fs::write(
         extension_dir.path().join("extension.py"),
-        format!(
-            r#"import sys
+        raw_managed_process_script(
+            r#"
 import time
 from pathlib import Path
-sys.path.insert(0, {sdk_source:?})
-from euler_managed_process_sdk import serve
 
-def inspect(context):
+def inspect(_peer, _input):
     Path("started").write_text("yes", encoding="utf-8")
     time.sleep(30)
     Path("too_late").write_text("late", encoding="utf-8")
-    return {{"unexpected": True}}
+    return {"unexpected": True}
 
-serve({{"inspect": inspect}})
+serve({"inspect": inspect})
 "#,
-            sdk_source = sdk_source.to_string_lossy()
         ),
     )
     .expect("write Python extension");
@@ -7963,6 +7961,15 @@ fn write_managed_process_extension_manifest(
 }
 
 #[cfg(unix)]
+fn raw_managed_process_script(body: &str) -> String {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../euler-managed-process/tests/fixtures")
+        .canonicalize()
+        .expect("managed-process fixture directory");
+    format!("import sys\nsys.path.insert(0, {fixture_dir:?})\nfrom raw_peer import serve\n{body}")
+}
+
+#[cfg(unix)]
 #[test]
 fn headless_extension_run_executes_enabled_linked_python_process_live() {
     let exe = env!("CARGO_BIN_EXE_euler");
@@ -7980,22 +7987,23 @@ fn headless_extension_run_executes_enabled_linked_python_process_live() {
             "extension.py".to_owned(),
         ],
     );
-    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../euler-managed-process/tests/fixtures/python_sdk/src");
     fs::write(
         extension_dir.path().join("extension.py"),
-        format!(
-            r#"import sys
-sys.path.insert(0, {sdk_source:?})
-from euler_managed_process_sdk import serve
+        raw_managed_process_script(
+            r#"
+def inspect(peer, command_input):
+    page = peer.request("euler/host/query-provenance", {
+        "after_event_id": None,
+        "kinds": [],
+        "limit": 16,
+        "scan_limit": 32,
+        "include_blob_fields": False,
+        "blob_byte_limit": 1024,
+    })
+    return {"tag": command_input["tag"], "seen_events": len(page["events"])}
 
-def inspect(context):
-    page = context.host.query_provenance(limit=16, scan_limit=32)
-    return {{"tag": context.input["tag"], "seen_events": len(page["events"])}}
-
-serve({{"inspect": inspect}})
+serve({"inspect": inspect})
 "#,
-            sdk_source = sdk_source.to_string_lossy()
         ),
     )
     .expect("write Python extension");
@@ -8050,72 +8058,6 @@ serve({{"inspect": inspect}})
     assert_eq!(result["extension"], serde_json::json!("python-live-proof"));
     assert_eq!(result["result"]["tag"], serde_json::json!("live"));
     assert!(result["result"]["seen_events"].as_u64().unwrap() >= 1);
-}
-
-#[cfg(unix)]
-fn provision_python_venv(extension_dir: &Path) -> PathBuf {
-    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../euler-managed-process/tests/fixtures/python_sdk");
-    let sdk_copy = extension_dir.join("sdk-package");
-    copy_directory(&sdk_source, &sdk_copy);
-    let venv = extension_dir.join(".venv");
-    let created = Command::new("python3")
-        .args(["-m", "venv"])
-        .arg(&venv)
-        .status()
-        .expect("create Python virtual environment");
-    assert!(created.success(), "python3 -m venv failed: {created}");
-    let python = venv.join("bin/python");
-    // Editable-install equivalent without pip or a build backend (issue
-    // #142): the SDK is pure Python, so path-linking its src/ through a
-    // .pth file in the venv's site-packages is everything `pip install -e`
-    // would achieve here — while staying offline (CI requirement) and
-    // independent of whether the host Python still bundles setuptools.
-    // Python 3.12+ venvs do not, and modern system interpreters (e.g.
-    // Homebrew 3.14) ship none, which made the previous
-    // `--no-build-isolation` editable install fail with
-    // `Cannot import 'setuptools.build_meta'`.
-    let purelib = Command::new(&python)
-        .args([
-            "-c",
-            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
-        ])
-        .output()
-        .expect("resolve venv site-packages");
-    assert!(
-        purelib.status.success(),
-        "resolving venv site-packages failed: {}",
-        String::from_utf8_lossy(&purelib.stderr)
-    );
-    let site_packages = PathBuf::from(String::from_utf8_lossy(&purelib.stdout).trim());
-    fs::write(
-        site_packages.join("euler_managed_process_sdk.pth"),
-        format!("{}\n", sdk_copy.join("src").display()),
-    )
-    .expect("write SDK path link");
-    let imports = Command::new(&python)
-        .args(["-B", "-c", "import euler_managed_process_sdk"])
-        .output()
-        .expect("verify SDK import");
-    assert!(
-        imports.status.success(),
-        "venv python cannot import the SDK: {}",
-        String::from_utf8_lossy(&imports.stderr)
-    );
-    python
-}
-
-fn copy_directory(source: &Path, destination: &Path) {
-    fs::create_dir_all(destination).expect("create copied SDK directory");
-    for entry in fs::read_dir(source).expect("read SDK directory") {
-        let entry = entry.expect("SDK entry");
-        let target = destination.join(entry.file_name());
-        if entry.file_type().expect("SDK entry type").is_dir() {
-            copy_directory(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), target).expect("copy SDK file");
-        }
-    }
 }
 
 /// Like [`run_euler_with_input`], but from an explicit working directory —

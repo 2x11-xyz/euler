@@ -795,7 +795,7 @@ impl<D: PermissionDecider> CompanionLoop<'_, D> {
                 return Err(error);
             }
         };
-        let mut canvas = if self.task.includes_parent_canvas() {
+        let mut canvas = super::child_canvas_boundary(if self.task.includes_parent_canvas() {
             // The fold above is threaded into assembly so the child's event
             // stream is folded for project context exactly once per request.
             assemble_canvas_prefolded(
@@ -807,7 +807,7 @@ impl<D: PermissionDecider> CompanionLoop<'_, D> {
             )
         } else {
             Vec::new()
-        };
+        });
         super::apply_child_project_context_policy(
             &mut canvas,
             self.task.project_context(),

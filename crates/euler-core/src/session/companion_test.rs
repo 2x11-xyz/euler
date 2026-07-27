@@ -1118,6 +1118,73 @@ fn single_spawn_still_inherits_canvas_by_default() {
     );
 }
 
+#[test]
+fn inherited_companion_never_receives_pending_root_continuation() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        RequestCapture {
+            requests: Arc::clone(&requests),
+        },
+        ScriptedDecider::new(vec![]),
+    );
+    let continuation = "root-only continuation sentinel";
+    let contribution_id = session
+        .emit(
+            EventKind::EXTENSION_CONTRIBUTION,
+            object([
+                ("extension_id", "workflow-ext".into()),
+                ("command", "idle".into()),
+                ("point", "turn-idle".into()),
+                ("action", "continue".into()),
+                ("accepted", true.into()),
+                ("content", continuation.into()),
+            ]),
+        )
+        .expect("accepted root continuation");
+
+    session
+        .spawn_companion(
+            AgentTask::new_inheriting_target("summarise the parent canvas", "default")
+                .expect("task"),
+        )
+        .expect("companion");
+    session.run_turn("consume at the root").expect("root turn");
+    session
+        .run_turn("prove one-shot consumption")
+        .expect("later root turn");
+
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 3);
+    let occurrences = requests
+        .iter()
+        .map(|request| request.prompt_text().matches(continuation).count())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        occurrences,
+        [0, 1, 0],
+        "child must not observe root input; the next root request consumes it exactly once"
+    );
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::CANVAS_SNAPSHOT
+                    && event
+                        .payload
+                        .get("selected_event_ids")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ids| {
+                            ids.iter()
+                                .any(|id| id.as_str() == Some(contribution_id.as_str()))
+                        })
+            })
+            .count(),
+        1,
+        "only the consuming root snapshot selects the continuation"
+    );
+}
+
 fn read_note_call() -> ToolCall {
     ToolCall {
         id: "call-read".to_owned(),

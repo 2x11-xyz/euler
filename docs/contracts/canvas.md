@@ -113,6 +113,11 @@ excludes it from every later canvas assembly while it remains in provenance.
 Shadow compaction excludes pending continuations from both its purpose-specific
 canvas snapshot and provider request; a compactor cannot consume one or persist
 its text opaquely into a projection that would duplicate the next driver input.
+Child and parallel-reviewer canvases, snapshots, provider requests, and
+pre-request context-budget checks exclude pending continuations entirely.
+Children cannot observe or select the text, and root-only input cannot exhaust
+a child request's budget. Only the next same-agent root-driver snapshot and
+provider request may select and model it.
 An accepted contribution is already committed input for the current user turn,
 so a later extension disable does not hide it; disablement only prevents future
 contributions. This prevents stale one-shot text from resurfacing after a
