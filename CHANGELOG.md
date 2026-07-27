@@ -6,6 +6,17 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Steering reliability
+
+- Mid-turn steering and queued follow-ups now preserve FIFO order, hydrate at
+  the next model-round boundary, and remain editable while persistence runs.
+  A failed `user.message` append stays queued without entering the live bus, so
+  repairing provenance and retrying the same event identity admits that input
+  exactly once, even when a failed sync left its complete bytes in the log.
+  If that unresolved admission blocks terminalizing a detached shadow call,
+  the live session fails closed and resume records its unknown outcome before
+  accepting more activity.
+
 ### TUI interruption
 
 - Escape now dismisses the active slash menu or picker before a later Escape

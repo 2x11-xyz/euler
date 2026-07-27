@@ -84,11 +84,24 @@ envelope `v` per `docs/contracts/persistence.md`.
 
 - `user.message`: `content`. A turn is not limited to one: mid-turn
   steering (issue #146) appends additional `user.message` events at round
-  boundaries — after a completed round's tool results, always between
+  boundaries — after a completed tool round's results or after the committed
+  `assistant.message` of a no-tool round. They are always between model
   rounds, never inside a streamed assistant message. Request assembly
   positions them like any other event, and readers must not assume a turn
-  has exactly one leading user message.
-- `assistant.message`: `content`.
+  has exactly one leading user message. Queue entries are removed only after
+  this event is durable: both mid-turn absorption and queued-turn dispatch
+  reserve by id first, and append failure leaves the entry queued. Admission
+  first drains any older accepted persistence backlog, then appends the
+  candidate before publishing it to the live bus. A rejected candidate is
+  therefore never an accepted in-memory event. The session retains its exact
+  envelope id, timestamp, parent, and payload across an ambiguous post-write
+  failure; only a matching user-message admission may retry it. The queue keeps
+  the failed entry at its head, so interactive retry preserves queue identity.
+  Repair and retry therefore reconcile that event exactly once instead of
+  persisting a failed bus copy or a newly identified duplicate.
+- `assistant.message`: `content`. It commits the visible content of a
+  no-tool model round. Pending steering may keep that same user turn active,
+  append more `user.message` events, and dispatch another model round.
 - `model.call`: `provider`, `model`, `canvas_items`,
   `requested_reasoning_effort`; optional resolved `reasoning_effort`,
   `max_output_tokens`, and `project_context_digest`. Every accepted call has
@@ -96,7 +109,17 @@ envelope `v` per `docs/contracts/persistence.md`.
   a parented `error`. Cancellation before a result records the safe error
   payload `source: "session"`, `message: "model call cancelled"`, and
   `cancelled: true`. Cancellation after a `model.result` never adds a second
-  terminal child.
+  terminal child. A model-terminal `error` is specifically a provider error,
+  a session error with `cancelled: true`, or a session error with
+  `recovery_closure: true`; an extension, guardian, or ordinary session error
+  that merely receives a linear parent of an asynchronous call does not settle
+  it. Resume closes every accepted call that has no semantic terminal child
+  with a parented `error` carrying `source: "session"` and
+  `recovery_closure: true`; the message says that the call was interrupted and
+  its outcome is unknown. The closure preserves an originating `purpose`
+  (including `"compaction"`), but does not claim `cancelled: true`: restart
+  cannot know whether the remote provider completed. All such closures are
+  durable before the resume marker is armed or a new user turn is admitted.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
@@ -496,7 +519,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   error to that request; it remains provenance-only while the TUI reports the
   compact failure without replacing the driver transcript or driver-failure
   HUD. Session-owned cancellation uses `source: "session"` with the same
-  purpose and terminally closes the shadow `model.call`. When
+  purpose and terminally closes the shadow `model.call`. A resume-time
+  `source: "session"` error may instead carry `recovery_closure: true`; it
+  terminally records the unknown outcome of an interrupted model call and
+  preserves the call's optional `purpose` without asserting `cancelled`. When
   `source` is `extension`, optional `extension_id`, `command`, and
   `failure` (`command_error` | `panic`) fields attribute the host-observed
   failure. Extension error messages in persisted events are host-generated
@@ -616,7 +642,11 @@ Cardinality and ordering invariants:
 - zero or more `model.reasoning` events per `model.call`, emitted in
   provider order before its terminal event;
 - `assistant.message` is emitted after its `model.result`, and only for
-  turns that end without tool calls.
+  model rounds that finish without tool calls. It does not by itself prove
+  that the user turn ended: pending steering or an accepted same-turn idle
+  continuation can continue the turn. The driver closes the steering group
+  only at its explicit terminal transaction after all such continuations
+  return Stop.
 - an accepted `model.switched` is emitted after the previous turn's final
   persisted event and before the next `user.message` is accepted. A switch
   after a new `user.message` starts the next turn is rejected. The next

@@ -1,5 +1,7 @@
 use super::*;
+use crate::durability::fault::{arm_matching, Op};
 use euler_event::{object, JsonObject};
+use euler_sdk::EventWakePoll;
 use std::panic::{self, AssertUnwindSafe};
 
 #[test]
@@ -99,6 +101,359 @@ fn pending_resume_marker_survives_a_failed_append() {
         .expect("retry append");
     let events = read_provenance(&log).expect("read retried append");
     assert_eq!(events, vec![marker, continued]);
+}
+
+#[test]
+fn complete_file_sync_failure_reconciles_exact_batch_once() {
+    assert_complete_sync_failure_reconciles(Op::FileSync);
+}
+
+#[test]
+fn complete_dir_sync_failure_reconciles_exact_batch_once() {
+    assert_complete_sync_failure_reconciles(Op::DirSync);
+}
+
+fn assert_complete_sync_failure_reconciles(op: Op) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let log_dir = temp.path().to_path_buf();
+    let blob_dir = temp.path().join("separate-blob-root").join("blobs");
+    let writer = ProvenanceWriter::with_threshold(log.clone(), blob_dir, DEFAULT_BLOB_THRESHOLD)
+        .expect("provenance writer");
+    let marker = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_RESUMED,
+        object([("events_folded", 1.into())]),
+    );
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "retry me".into())]),
+    );
+    writer
+        .arm_resume_marker(marker.clone())
+        .expect("arm marker");
+    let log_for_match = log.clone();
+    let guard = arm_matching(op, move |path| match op {
+        Op::FileSync => path == log_for_match,
+        // The blob directory has a different parent, so the log directory is
+        // reached only by the final post-write directory sync.
+        Op::DirSync => path == log_dir,
+    });
+    let mut wake = writer.open_event_wake().expect("open wake").wake;
+
+    writer
+        .append(std::slice::from_ref(&event))
+        .expect_err("injected post-write sync failure");
+
+    assert!(guard.fired(), "sync fault must fire");
+    assert_eq!(
+        read_provenance(&log).expect("physical complete lines"),
+        [marker.clone(), event.clone()]
+    );
+    assert_eq!(writer.durable_tail(), None);
+    assert_eq!(wake.try_recv(), EventWakePoll::Empty);
+
+    let mut changed = event.clone();
+    changed
+        .payload
+        .insert("content".to_owned(), "changed".into());
+    let mismatch = writer
+        .append(std::slice::from_ref(&changed))
+        .expect_err("same id with changed payload must be fenced");
+    assert_eq!(mismatch.kind(), io::ErrorKind::WouldBlock);
+
+    let unrelated = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "unrelated".into())]),
+    );
+    let error = writer
+        .append(std::slice::from_ref(&unrelated))
+        .expect_err("unrelated append must be fenced");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    let raw_before_scrub = fs::read(&log).expect("read unresolved log");
+    let scrub_error = writer
+        .scrub_and_audit(&["retry".to_owned()], None, "session", "agent")
+        .expect_err("scrub must not rewrite an unresolved append");
+    assert_eq!(scrub_error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        fs::read(&log).expect("read scrub-fenced log"),
+        raw_before_scrub
+    );
+    assert!(writer
+        .arm_resume_marker(EventEnvelope::new(
+            "session",
+            "agent",
+            None,
+            EventKind::SESSION_RESUMED,
+            object([("events_folded", 2.into())]),
+        ))
+        .is_err());
+
+    drop(guard);
+    writer
+        .append(std::slice::from_ref(&event))
+        .expect("matching retry reconciles");
+
+    assert_eq!(
+        read_provenance(&log).expect("reconciled lines"),
+        [marker, event.clone()]
+    );
+    assert_eq!(writer.durable_tail().as_deref(), Some(event.id.as_str()));
+    assert_eq!(wake.try_recv(), EventWakePoll::Advanced);
+    assert_eq!(wake.try_recv(), EventWakePoll::Empty);
+}
+
+#[test]
+fn append_parented_retries_an_exact_complete_suffix_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let candidate = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_RENAMED,
+        object([("name", "retry parented".into())]),
+    );
+    let log_for_match = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == log_for_match);
+
+    writer
+        .append_parented(|_| vec![candidate.clone()])
+        .expect_err("injected post-write sync failure");
+    assert!(guard.fired());
+    drop(guard);
+
+    let reconciled = writer
+        .append_parented(|_| vec![candidate.clone()])
+        .expect("matching parented retry reconciles");
+
+    assert_eq!(reconciled.as_slice(), std::slice::from_ref(&candidate));
+    assert_eq!(
+        read_provenance(&log).expect("reconciled provenance"),
+        [candidate]
+    );
+}
+
+#[test]
+fn absent_unresolved_suffix_rewrites_only_the_exact_batch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    fs::write(&log, "").expect("materialize empty log");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "zero-byte retry".into())]),
+    );
+    let serialized = serialize_event_batch(std::iter::once(&event)).expect("serialize");
+    let unresolved = UnresolvedAppend {
+        start_offset: 0,
+        byte_len: u64::try_from(serialized.len()).expect("test event fits"),
+        bytes_sha256: hash_bytes(&serialized),
+        logical_sha256: hash_bytes(&serialized),
+        batch_event_ids: vec![event.id.clone()],
+        new_tail: event.id.clone(),
+        event_count: 1,
+        session_id: event.session.clone(),
+    };
+    {
+        let mut state = recover_mutex(&writer.append_lock);
+        writer.remember_unresolved_append(&mut state, unresolved);
+    }
+
+    let unrelated = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "different".into())]),
+    );
+    let error = writer
+        .append(std::slice::from_ref(&unrelated))
+        .expect_err("different batch must stay fenced");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(fs::metadata(&log).expect("metadata").len(), 0);
+
+    writer
+        .append(std::slice::from_ref(&event))
+        .expect("exact absent retry writes and syncs");
+
+    assert_eq!(
+        read_provenance(&log).expect("read retry").as_slice(),
+        std::slice::from_ref(&event)
+    );
+    assert_eq!(writer.durable_tail().as_deref(), Some(event.id.as_str()));
+}
+
+#[test]
+fn partial_unresolved_suffix_fails_closed_without_truncation_or_append() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "partial".into())]),
+    );
+    let log_for_match = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == log_for_match);
+
+    writer
+        .append(std::slice::from_ref(&event))
+        .expect_err("injected sync failure");
+    assert!(guard.fired());
+    drop(guard);
+    let partial_len = fs::metadata(&log).expect("metadata").len() - 1;
+    OpenOptions::new()
+        .write(true)
+        .open(&log)
+        .expect("open log")
+        .set_len(partial_len)
+        .expect("truncate one byte");
+
+    let error = writer
+        .append(std::slice::from_ref(&event))
+        .expect_err("partial suffix must stay fenced");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::metadata(&log).expect("metadata").len(), partial_len);
+    assert_eq!(writer.durable_tail(), None);
+}
+
+#[test]
+fn changed_unresolved_suffix_fails_closed_without_an_append() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "changed suffix".into())]),
+    );
+    let log_for_match = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == log_for_match);
+
+    writer
+        .append(std::slice::from_ref(&event))
+        .expect_err("injected sync failure");
+    assert!(guard.fired());
+    drop(guard);
+    let original_len = fs::metadata(&log).expect("metadata").len();
+    let mut file = OpenOptions::new().write(true).open(&log).expect("open log");
+    file.write_all(b"!").expect("change one byte");
+    file.flush().expect("flush changed suffix");
+
+    let error = writer
+        .append(std::slice::from_ref(&event))
+        .expect_err("changed suffix must stay fenced");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::metadata(&log).expect("metadata").len(), original_len);
+    assert_eq!(writer.durable_tail(), None);
+}
+
+#[test]
+fn writer_refuses_to_append_after_a_torn_existing_suffix() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let existing = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into())]),
+    );
+    fs::write(
+        &log,
+        format!(
+            "{}\n{{\"torn\"",
+            existing.to_json_line().expect("serialize")
+        ),
+    )
+    .expect("write torn log");
+    let original = fs::read(&log).expect("read original");
+    let writer = ProvenanceWriter::new(log.clone()).expect("writer accepts readable prefix");
+    let next = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(existing.id),
+        EventKind::USER_MESSAGE,
+        object([("content", "must not fork".into())]),
+    );
+
+    let scrub_error = writer
+        .scrub_and_audit(&["fixture".to_owned()], None, "session", "agent")
+        .expect_err("torn suffix must fence log rewrites");
+    assert_eq!(scrub_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&log).expect("read after scrub fence"), original);
+
+    let error = writer
+        .append(std::slice::from_ref(&next))
+        .expect_err("torn suffix must fence append");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&log).expect("read unchanged"), original);
+}
+
+#[test]
+fn scrub_rewrite_refreshes_durable_length_before_appending_audit() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let secret = "long-secret-value-that-changes-the-line-length".to_owned();
+    let original = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", format!("before {secret} after").into())]),
+    );
+    writer
+        .append(std::slice::from_ref(&original))
+        .expect("append original");
+
+    let report = writer
+        .scrub_and_audit(std::slice::from_ref(&secret), None, "session", "agent")
+        .expect("rewrite and append audit");
+    let audit_id = report.audit_event_id.expect("audit event id");
+    let next = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(audit_id.clone()),
+        EventKind::SESSION_RENAMED,
+        object([("name", "after scrub".into())]),
+    );
+    writer
+        .append(std::slice::from_ref(&next))
+        .expect("append after scrub");
+
+    let events = read_provenance(&log).expect("read scrubbed provenance");
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].id, original.id);
+    assert!(!events[0]
+        .payload
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .expect("scrubbed content")
+        .contains(&secret));
+    assert_eq!(events[1].id, audit_id);
+    assert_eq!(events[1].kind.as_str(), EventKind::SECRET_SCRUBBED);
+    assert_eq!(events[2], next);
+    assert_eq!(writer.durable_tail(), Some(events[2].id.clone()));
 }
 
 #[test]

@@ -191,6 +191,12 @@ where
                 return Err(SessionError::Cancelled);
             }
             self.io.absorb_steering(cancellation)?;
+            // Escape may publish cancellation while a previously reserved
+            // durable append completes. Never let that late completion
+            // re-enter the provider for another round.
+            if cancellation.is_cancelled() {
+                return Err(SessionError::Cancelled);
+            }
             match self.run_round(cancellation)? {
                 RoundOutcome::Complete(done) => {
                     self.io.round_completed();

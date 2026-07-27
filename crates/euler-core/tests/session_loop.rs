@@ -937,6 +937,81 @@ fn lifecycle_cancellation_closes_pending_compaction_and_rejects_late_output() {
 }
 
 #[test]
+fn unresolved_user_admission_does_not_keep_a_shadow_worker_attached() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let gate = Arc::new(ShadowGate::default());
+    let provider = ShadowBlockingProvider {
+        gate: Arc::clone(&gate),
+        root_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = CompactionTier::Off;
+    config.compaction_keep_recent = 0;
+    let log = temp.path().join("events.jsonl");
+    let backup = temp.path().join("events.backup.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut session =
+        Session::new(config, provider, ScriptedDecider::new(vec![])).with_provenance(writer);
+
+    session
+        .run_turn(&format!("read, then finish {}", "x".repeat(20_000)))
+        .expect("driver turn");
+    assert_eq!(
+        session.begin_compaction().expect("start compaction"),
+        euler_core::CompactionStatus::InProgress
+    );
+    assert!(gate.wait_until_started(), "compactor never reached gate");
+
+    fs::rename(&log, &backup).expect("back up log");
+    fs::create_dir(&log).expect("block log append");
+    let admission = session
+        .run_turn("pending while shadow is active")
+        .expect_err("user admission must surface the broken log");
+    assert!(matches!(admission, SessionError::Io(_)));
+    assert!(session.compaction_in_progress());
+
+    let cancellation = session
+        .cancel_compaction("pending admission")
+        .expect_err("pending admission fences the terminal append");
+    assert!(matches!(
+        cancellation,
+        SessionError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(
+        !session.compaction_in_progress(),
+        "cancellation must drop shadow ownership before surfacing persistence failure"
+    );
+    let event_count = session.events().len();
+
+    gate.release();
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        session.events().len(),
+        event_count,
+        "late shadow output must not re-enter the session"
+    );
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+
+    fs::remove_dir(&log).expect("remove blocking directory");
+    fs::rename(&backup, &log).expect("restore log");
+    let bytes_before_retry = fs::read(&log).expect("read restored log");
+    let retry = session
+        .run_turn("pending while shadow is active")
+        .expect_err("a detached unterminated call poisons the live session");
+    assert!(matches!(
+        retry,
+        SessionError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidData
+    ));
+    assert_eq!(
+        fs::read(&log).expect("read fenced log"),
+        bytes_before_retry,
+        "the live session must append nothing after losing terminal ownership"
+    );
+}
+
+#[test]
 fn turn_cancellation_fences_a_concurrent_shadow_and_both_late_provider_returns() {
     let temp = tempfile::tempdir().expect("temp dir");
     fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
@@ -4376,20 +4451,28 @@ fn failed_switch_append_leaves_previous_target_active_without_accepted_event() {
 #[test]
 fn switch_persists_pending_backlog_before_accepted_switch_event() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let bad_log = temp.path().join("events-dir");
-    fs::create_dir(&bad_log).expect("blocking directory");
     let good_log = temp.path().join("events.jsonl");
     let mut providers = ProviderSet::new();
-    providers.insert(CapturingProvider::new("fixture", Vec::new(), request_log()));
+    providers.insert(CapturingProvider::new(
+        "fixture",
+        vec![vec![
+            Ok(ModelStreamEvent::TextDelta("done".to_owned())),
+            Ok(ModelStreamEvent::Finished {
+                stop_reason: StopReason::Completed,
+                usage: None,
+            }),
+        ]],
+        request_log(),
+    ));
     providers.insert(CapturingProvider::new("other", Vec::new(), request_log()));
     let mut config = SessionConfig::new(temp.path());
     config.provider = "fixture".to_owned();
     config.model = "echo".to_owned();
-    let mut session = Session::new_with_providers(config, providers, ScriptedDecider::new(vec![]))
-        .with_provenance(ProvenanceWriter::new(bad_log).expect("provenance writer"));
+    let mut session = Session::new_with_providers(config, providers, ScriptedDecider::new(vec![]));
 
-    let error = session.run_turn("pending user").expect_err("append fails");
-    assert!(matches!(error, SessionError::Io(_)));
+    session
+        .run_turn("pending user")
+        .expect("accepted in-memory turn");
     assert_eq!(count_kind(session.events(), EventKind::USER_MESSAGE), 1);
 
     session = session
@@ -4399,13 +4482,36 @@ fn switch_persists_pending_backlog_before_accepted_switch_event() {
         .expect("switch"));
 
     let persisted = logged_events(&good_log);
-    assert_eq!(persisted.len(), 3);
     assert_eq!(persisted[0].kind.as_str(), EventKind::SESSION_START);
-    assert_eq!(persisted[1].kind.as_str(), EventKind::USER_MESSAGE);
-    assert_eq!(payload_str(&persisted[1], "content"), Some("pending user"));
-    assert_eq!(persisted[2].kind.as_str(), EventKind::MODEL_SWITCHED);
-    assert_eq!(payload_str(&persisted[2], "to_provider"), Some("other"));
-    assert_eq!(payload_str(&persisted[2], "to_model"), Some("next-model"));
+    let user_index = persisted
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .expect("persisted backlog user");
+    let switch_index = persisted
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::MODEL_SWITCHED)
+        .expect("persisted switch");
+    assert!(user_index < switch_index);
+    assert_eq!(
+        payload_str(&persisted[user_index], "content"),
+        Some("pending user")
+    );
+    assert_eq!(switch_index, persisted.len() - 1);
+    assert_eq!(
+        payload_str(&persisted[switch_index], "to_provider"),
+        Some("other")
+    );
+    assert_eq!(
+        payload_str(&persisted[switch_index], "to_model"),
+        Some("next-model")
+    );
+    let accepted = session
+        .events()
+        .iter()
+        .filter(|event| !euler_core::provenance::event_is_runtime_only(event.kind.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(persisted, accepted);
 }
 
 #[test]
@@ -5425,7 +5531,7 @@ struct SteeringOnAskDecider {
 
 impl PermissionDecider for SteeringOnAskDecider {
     fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
-        self.queue.push_back(self.content.to_owned());
+        self.queue.push_steering_back(self.content.to_owned());
         DeciderVerdict::Allow
     }
 }
@@ -5514,6 +5620,132 @@ fn steering_pushed_mid_round_lands_in_the_next_rounds_request() {
 }
 
 #[test]
+fn stacked_steering_during_a_no_tool_response_continues_before_turn_completion() {
+    // Regression from session 01KYDFP5GQC04ZRAG7MMX1HB1W: steers submitted
+    // while a long final response streamed had no tool boundary to wake the
+    // existing absorber. The worker returned the session first, so the TUI
+    // replayed the stack as separate follow-up turns instead of hydrating the
+    // running turn's next request.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![text_stream("first answer"), text_stream("continued answer")],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+    let queued = AtomicBool::new(false);
+
+    session
+        .run_turn_with_sink("start", Arc::new(AtomicBool::new(false)), |event| {
+            if event.kind.as_str() == EventKind::MODEL_DELTA && !queued.swap(true, Ordering::SeqCst)
+            {
+                queue.push_steering_back("steer one".to_owned());
+                queue.push_steering_back("steer two".to_owned());
+                queue.push_steering_back("steer three".to_owned());
+            }
+        })
+        .expect("steered turn");
+
+    let requests = request_log_guard(&requests);
+    assert_eq!(
+        requests.len(),
+        2,
+        "pending steering must continue the running turn"
+    );
+    for steer in ["steer one", "steer two", "steer three"] {
+        assert!(
+            requests[1].prompt_text().contains(steer),
+            "second request missed {steer:?}"
+        );
+    }
+    drop(requests);
+    assert!(queue.is_empty(), "every persisted steer must be acked");
+
+    let boundary: Vec<(&str, Option<&str>)> = session
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind.as_str() {
+            EventKind::MODEL_RESULT | EventKind::MODEL_CALL => Some((event.kind.as_str(), None)),
+            EventKind::USER_MESSAGE | EventKind::ASSISTANT_MESSAGE => Some((
+                event.kind.as_str(),
+                event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        boundary,
+        [
+            (EventKind::USER_MESSAGE, Some("start")),
+            (EventKind::MODEL_CALL, None),
+            (EventKind::MODEL_RESULT, None),
+            (EventKind::ASSISTANT_MESSAGE, Some("first answer")),
+            (EventKind::USER_MESSAGE, Some("steer one")),
+            (EventKind::USER_MESSAGE, Some("steer two")),
+            (EventKind::USER_MESSAGE, Some("steer three")),
+            (EventKind::MODEL_CALL, None),
+            (EventKind::MODEL_RESULT, None),
+            (EventKind::ASSISTANT_MESSAGE, Some("continued answer")),
+        ],
+        "stacked steering must hydrate once, FIFO, at the terminal round boundary"
+    );
+}
+
+#[test]
+fn input_after_terminal_boundary_before_surface_done_is_a_follow_up() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![
+            text_stream("first complete"),
+            text_stream("unrelated complete"),
+            text_stream("follow-up complete"),
+        ],
+        requests.clone(),
+    );
+    let queue = Arc::new(SteeringQueue::default());
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    );
+    session.set_steering_queue(Arc::clone(&queue));
+    session.run_turn("first").expect("first turn");
+
+    // Core has crossed the worker terminal transaction. In the TUI this is
+    // the window before the worker sends TurnDone back to the surface.
+    queue.push_steering_back("arrived before TurnDone".to_owned());
+    session.set_steering_queue(Arc::clone(&queue));
+    session.run_turn("unrelated").expect("unrelated turn");
+    assert_eq!(queue.snapshot(), ["arrived before TurnDone"]);
+
+    let input = queue.reserve_front_for_dispatch().expect("follow-up");
+    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
+    session.run_turn(input.content()).expect("follow-up turn");
+
+    let requests = request_log_guard(&requests);
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[1]
+        .prompt_text()
+        .contains("arrived before TurnDone"));
+    assert!(requests[2]
+        .prompt_text()
+        .contains("arrived before TurnDone"));
+    assert!(queue.is_empty());
+}
+
+#[test]
 fn paused_steering_stays_queued_and_out_of_the_turn() {
     let temp = tempfile::tempdir().expect("temp dir");
     fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
@@ -5560,8 +5792,8 @@ fn steering_queued_before_the_turn_stays_out_of_it_for_its_own_turn() {
         requests.clone(),
     );
     let queue = Arc::new(SteeringQueue::default());
-    queue.push_back("leftover b".to_owned());
-    queue.push_back("leftover c".to_owned());
+    queue.push_follow_up_back("leftover b".to_owned());
+    queue.push_follow_up_back("leftover c".to_owned());
     let mut session = Session::new(
         SessionConfig::new(temp.path()),
         provider,
@@ -5583,7 +5815,9 @@ fn steering_queued_before_the_turn_stays_out_of_it_for_its_own_turn() {
 
     // The surface's completion flush then runs one leftover as its own
     // turn; the remaining leftover still stays out of that turn's request.
-    let prompt_b = queue.pop_front().expect("leftover b");
+    let input_b = queue.reserve_front_for_dispatch().expect("leftover b");
+    let prompt_b = input_b.content().to_owned();
+    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input_b);
     session.run_turn(&prompt_b).expect("turn b");
     let requests = request_log_guard(&requests);
     assert_eq!(requests.len(), 2);
@@ -5605,7 +5839,8 @@ impl PermissionDecider for SteerThenCancelDecider {
         // Surface ordering contract: pause before publishing cancellation.
         self.queue.set_paused(true);
         self.cancel_flag.store(true, Ordering::SeqCst);
-        self.queue.push_back("typed just before escape".to_owned());
+        self.queue
+            .push_steering_back("typed just before escape".to_owned());
         DeciderVerdict::Allow
     }
 }

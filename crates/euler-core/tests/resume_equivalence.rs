@@ -3,7 +3,7 @@ use euler_core::canvas::{assemble_canvas, canvas_prompt, AutoCompactionPolicy};
 use euler_core::permissions::{DeciderVerdict, PermissionDecider, PermissionRequest};
 use euler_core::{
     read_resume_prefix, resume_session_with_outcome, ApprovalMode, ProvenanceWriter, Session,
-    SessionConfig,
+    SessionConfig, SteeringQueue,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn plain_multi_turn_non_streamed_resume_equivalence() {
@@ -124,6 +124,88 @@ fn streamed_turns_resume_equivalence_over_persisted_projection() {
     };
 
     assert_run_cut_resume_equivalent(case);
+}
+
+#[test]
+fn completed_stacked_steer_turn_resume_equivalence() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let uninterrupted_root = temp.path().join("steer-uninterrupted");
+    let resumed_root = temp.path().join("steer-resumed");
+    fs::create_dir_all(&uninterrupted_root).expect("uninterrupted root");
+    fs::create_dir_all(&resumed_root).expect("resumed root");
+    let uninterrupted_log = uninterrupted_root.join("events.jsonl");
+    let resumed_log = resumed_root.join("events.jsonl");
+
+    let (config, providers) = session_parts(
+        &uninterrupted_root,
+        ProviderPlan::Fixture(vec![
+            FixtureResponse::Assistant("first answer".to_owned()),
+            FixtureResponse::Assistant("steered answer".to_owned()),
+            FixtureResponse::Assistant("after answer".to_owned()),
+        ]),
+    );
+    let mut uninterrupted =
+        Session::new_with_providers(config, providers, CountingDecider::new(Vec::new()))
+            .with_provenance(ProvenanceWriter::new(&uninterrupted_log).expect("writer"));
+    run_completed_stacked_steer(&mut uninterrupted);
+    uninterrupted.run_turn("after").expect("uninterrupted tail");
+    drop(uninterrupted);
+
+    let (config, providers) = session_parts(
+        &resumed_root,
+        ProviderPlan::Fixture(vec![
+            FixtureResponse::Assistant("first answer".to_owned()),
+            FixtureResponse::Assistant("steered answer".to_owned()),
+        ]),
+    );
+    let mut before_cut =
+        Session::new_with_providers(config, providers, CountingDecider::new(Vec::new()))
+            .with_provenance(ProvenanceWriter::new(&resumed_log).expect("writer"));
+    run_completed_stacked_steer(&mut before_cut);
+    drop(before_cut);
+
+    let (config, providers) = session_parts(
+        &resumed_root,
+        ProviderPlan::Fixture(vec![FixtureResponse::Assistant("after answer".to_owned())]),
+    );
+    let mut resumed = resume_session_with_outcome(
+        config,
+        providers,
+        CountingDecider::new(Vec::new()),
+        &resumed_log,
+    )
+    .expect("resume")
+    .session;
+    resumed.run_turn("after").expect("resumed tail");
+    drop(resumed);
+
+    let uninterrupted_events = read_resume_prefix(&uninterrupted_log).expect("uninterrupted read");
+    let resumed_events = read_resume_prefix(&resumed_log).expect("resumed read");
+    assert_equivalent_projections(
+        "completed_stacked_steer_turn",
+        &uninterrupted_events,
+        &resumed_events,
+    );
+}
+
+fn run_completed_stacked_steer<D: PermissionDecider>(session: &mut Session<D>) {
+    let queue = Arc::new(SteeringQueue::default());
+    session.set_steering_queue(Arc::clone(&queue));
+    let queued = Cell::new(false);
+    session
+        .run_turn_with_sink(
+            "start",
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |event| {
+                if event.kind.as_str() == EventKind::MODEL_DELTA && !queued.replace(true) {
+                    for content in ["steer one", "steer two", "steer three"] {
+                        queue.push_steering_back(content.to_owned());
+                    }
+                }
+            },
+        )
+        .expect("completed stacked-steer turn");
+    assert!(queue.is_empty(), "completed stack must be fully durable");
 }
 
 #[test]
@@ -673,26 +755,26 @@ fn interrupted_model_tail_resume_idle_equivalence() {
         },
     );
     let resumed_events = read_resume_prefix(&resumed_log).expect("resumed read");
-    // The only thing appended before the frontier turn is the durable resume
-    // marker (issue #6) — no prior exploration is re-burned.
+    let closure = &resumed_events[cut + 1];
+    assert_model_recovery_closure(closure, &baseline_events[cut]);
     assert_eq!(
-        resumed_events[cut + 1].kind.as_str(),
+        resumed_events[cut + 2].kind.as_str(),
         EventKind::SESSION_RESUMED,
         "interrupted_model_tail records a resume marker at the boundary"
     );
     assert_eq!(
-        resumed_events[cut + 2].kind.as_str(),
+        resumed_events[cut + 3].kind.as_str(),
         EventKind::USER_MESSAGE,
         "interrupted_model_tail frontier turn follows the resume marker"
     );
     assert_eq!(
         recovery_closure_count(&resumed_events),
-        0,
+        1,
         "interrupted_model_tail closure count"
     );
     assert_tail_canonical_projection_equivalent(
         "interrupted_model_tail canonical continuation",
-        canonical_tail_expected_without_closure(&baseline_events, cut + 1, "continue explicitly"),
+        canonical_tail_expected(&baseline_events, cut + 1, closure, "continue explicitly"),
         &resumed_events,
     );
 }
@@ -1237,12 +1319,11 @@ fn recovery_closure_count(events: &[EventEnvelope]) -> usize {
     events
         .iter()
         .filter(|event| {
-            event.kind.as_str() == EventKind::TOOL_RESULT
-                && event
-                    .payload
-                    .get("recovery_closure")
-                    .and_then(Value::as_bool)
-                    == Some(true)
+            event
+                .payload
+                .get("recovery_closure")
+                .and_then(Value::as_bool)
+                == Some(true)
         })
         .count()
 }
@@ -1307,6 +1388,27 @@ fn assert_recovery_closure(
     );
 }
 
+fn assert_model_recovery_closure(closure: &EventEnvelope, call: &EventEnvelope) {
+    assert_eq!(closure.kind.as_str(), EventKind::ERROR);
+    assert_eq!(closure.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(
+        closure.payload.get("source").and_then(Value::as_str),
+        Some("session")
+    );
+    assert_eq!(
+        closure.payload.get("cancelled").and_then(Value::as_bool),
+        None,
+        "an interrupted call has an unknown outcome, not a confirmed cancellation"
+    );
+    assert_eq!(
+        closure
+            .payload
+            .get("recovery_closure")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
 fn canonical_tail_expected(
     baseline_events: &[EventEnvelope],
     cut_len: usize,
@@ -1315,18 +1417,6 @@ fn canonical_tail_expected(
 ) -> Vec<EventEnvelope> {
     let mut expected = baseline_events[..cut_len].to_vec();
     expected.push(closure.clone());
-    expected.extend_from_slice(
-        &baseline_events[find_user_message(baseline_events, continuation_user_message)..],
-    );
-    expected
-}
-
-fn canonical_tail_expected_without_closure(
-    baseline_events: &[EventEnvelope],
-    cut_len: usize,
-    continuation_user_message: &str,
-) -> Vec<EventEnvelope> {
-    let mut expected = baseline_events[..cut_len].to_vec();
     expected.extend_from_slice(
         &baseline_events[find_user_message(baseline_events, continuation_user_message)..],
     );

@@ -2,7 +2,8 @@ use crate::canvas::{AutoCompactionPolicy, CompactionTier};
 use crate::permissions::{permission_prompt_capabilities, ApprovalMode};
 use crate::provenance::{nul_offset_in_line, numbered_accepted_prefix_lines, ProvenanceWriter};
 use crate::session::{
-    fold_model_target, fold_reasoning_effort, ModelTarget, Session, SessionConfig,
+    event_terminalizes_model_call, fold_model_target, fold_reasoning_effort, ModelTarget, Session,
+    SessionConfig,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::ProviderSet;
@@ -547,11 +548,12 @@ pub fn resume_session_from_folded_prefix<D>(
     let warnings = std::mem::take(&mut folded.warnings);
     let mut recovery_closure_appended = false;
 
-    if let Some(closure) = recovery_closure(&folded.events) {
+    let recovery_closures = recovery_closures(&folded.events);
+    if !recovery_closures.is_empty() {
         writer
-            .append(std::slice::from_ref(&closure))
+            .append(&recovery_closures)
             .map_err(ResumeError::Append)?;
-        folded.events.push(closure);
+        folded.events.extend(recovery_closures);
         recovery_closure_appended = true;
     }
     // Durable resume marker (issue #6): the marker is ARMED here but NOT
@@ -733,7 +735,50 @@ fn session_resumed_marker(
     )
 }
 
-fn recovery_closure(events: &[EventEnvelope]) -> Option<EventEnvelope> {
+fn recovery_closures(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    let terminal_parents = events
+        .iter()
+        .filter(|event| event_terminalizes_model_call(event))
+        .filter_map(|event| event.parent.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut closures = events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL
+                && !terminal_parents.contains(event.id.as_str())
+        })
+        .map(model_recovery_closure)
+        .collect::<Vec<_>>();
+    if let Some(closure) = tool_recovery_closure(events) {
+        closures.push(closure);
+    }
+    closures
+}
+
+fn model_recovery_closure(call: &EventEnvelope) -> EventEnvelope {
+    let mut payload = object([
+        ("source", "session".into()),
+        (
+            "message",
+            "accepted prefix ended without a persisted model terminal; the model call was \
+             interrupted and its outcome is unknown"
+                .into(),
+        ),
+        ("recovery_closure", true.into()),
+    ]);
+    if let Some(purpose) = call.payload.get("purpose").and_then(Value::as_str) {
+        payload.insert("purpose".to_owned(), purpose.to_owned().into());
+    }
+    EventEnvelope::new(
+        call.session.clone(),
+        call.agent.clone(),
+        Some(call.id.clone()),
+        EventKind::ERROR,
+        payload,
+    )
+}
+
+fn tool_recovery_closure(events: &[EventEnvelope]) -> Option<EventEnvelope> {
     let call_index = tail_unmatched_tool_call_index(events)?;
     let call = &events[call_index];
     let call_id = payload_str(call, "id")?;

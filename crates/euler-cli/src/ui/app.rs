@@ -50,7 +50,7 @@ use euler_core::{
     event_is_runtime_only, fold_session, load_extension_package, read_resume_prefix,
     resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, CompactionStatus,
     EulerHome, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
-    ProjectContextBootstrap, ProvenanceWriter, ReasoningEffort, ScopePattern, Session,
+    ProjectContextBootstrap, ProvenanceWriter, QueuedInput, ReasoningEffort, ScopePattern, Session,
     SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
@@ -91,6 +91,7 @@ fn inactive_permission_reply_sender() -> Sender<PermissionReply> {
     sender
 }
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
+const MODEL_TURN_IN_FLIGHT_LABEL: &str = "turn";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
 
@@ -269,11 +270,11 @@ pub struct AppCore {
     /// Saved /code-swarm reviewer model set (provider::model), session copy.
     code_swarm_models: Vec<String>,
     /// Pending user inputs, shared with the running turn's worker (issue
-    /// #146): the worker drains it at round boundaries into `user.message`
-    /// events (mid-turn steering), and whatever it never absorbed is flushed
-    /// into the next turn at TurnDone exactly like the old queue. Pause
-    /// state lives inside the queue so the worker respects queue editing
-    /// and interrupts.
+    /// #146). Entries explicitly tagged as steering are drained at model
+    /// round boundaries into `user.message` events; ordinary follow-ups stay
+    /// separate, and an interrupted steering group is preserved for explicit
+    /// continuation. Pause state lives inside the queue so the worker
+    /// respects queue editing and interrupts.
     queued_inputs: Arc<euler_core::SteeringQueue>,
     /// Edge-triggered `/compact` request shared with the root turn worker.
     /// The session consumes it at the next settled model-round boundary.
@@ -2077,7 +2078,7 @@ impl AppCore {
             // audit-only — this queue entry is how the guidance reaches the
             // model: absorbed at the turn's next round boundary (steering),
             // or flushed as the next turn if the denial ended the turn.
-            self.queued_inputs.push_front(draft.clone());
+            self.push_queued_input_front(draft.clone());
             self.queued_selection = Some(0);
             self.reply_to_modal(PermissionReply::DenyWithInstruction(draft))
         }
@@ -2140,25 +2141,49 @@ impl AppCore {
         if prompt.trim().is_empty() {
             return CoreEffect::None;
         }
-        self.queued_inputs.push_back(prompt);
+        self.push_queued_input_back(prompt);
         self.queued_selection = self.queued_inputs.len().checked_sub(1);
         self.bottom.replace_composer_text("");
         self.notice = None;
         CoreEffect::Render
     }
 
+    fn push_queued_input_back(&self, content: String) {
+        if self.running_model_turn_accepts_steering() {
+            self.queued_inputs.push_steering_back(content);
+        } else {
+            self.queued_inputs.push_follow_up_back(content);
+        }
+    }
+
+    fn push_queued_input_front(&self, content: String) {
+        if self.running_model_turn_accepts_steering() {
+            self.queued_inputs.push_steering_front(content);
+        } else {
+            self.queued_inputs.push_follow_up_front(content);
+        }
+    }
+
+    fn running_model_turn_accepts_steering(&self) -> bool {
+        matches!(self.state, AppState::TurnInFlight { .. })
+            && self.in_flight_label.as_deref() == Some(MODEL_TURN_IN_FLIGHT_LABEL)
+    }
+
     fn continue_queued_input(&mut self) -> CoreEffect {
-        let AppState::Idle { .. } = self.state else {
+        let AppState::Idle { session } = &self.state else {
             return CoreEffect::None;
         };
-        let Some(prompt) = self.pop_next_queued_input() else {
+        if !session.can_accept_turn() {
+            return CoreEffect::None;
+        }
+        let Some(input) = self.pop_next_queued_input() else {
             return CoreEffect::None;
         };
         self.queued_inputs.set_paused(false);
         self.visual_scroll_offset = 0;
-        self.bottom.record_submission(&prompt);
+        self.bottom.record_submission(input.content());
         let session = self.take_idle_session();
-        self.spawn_turn(prompt, session);
+        self.spawn_queued_turn(input, session);
         CoreEffect::Render
     }
 
@@ -2210,13 +2235,31 @@ impl AppCore {
         self.status.permission_envelope = Some(permission_envelope_for(session));
     }
 
-    fn spawn_turn(&mut self, prompt: String, mut session: Box<Session<TuiDecider>>) {
+    fn spawn_turn(&mut self, prompt: String, session: Box<Session<TuiDecider>>) {
+        self.spawn_turn_inner(prompt, session, None);
+    }
+
+    fn spawn_queued_turn(&mut self, input: QueuedInput, session: Box<Session<TuiDecider>>) {
+        let prompt = input.content().to_owned();
+        self.spawn_turn_inner(prompt, session, Some(&input));
+    }
+
+    fn spawn_turn_inner(
+        &mut self,
+        prompt: String,
+        mut session: Box<Session<TuiDecider>>,
+        queued_input: Option<&QueuedInput>,
+    ) {
         self.snapshot_permission_envelope(&session);
         // Mid-turn steering (issue #146): the worker drains this queue at
         // round boundaries; we keep pushing into our clone while the turn
         // is in flight. Re-wired every spawn so /new and /resume sessions
         // always steer the queue this AppCore renders.
-        session.set_steering_queue(Arc::clone(&self.queued_inputs));
+        if let Some(input) = queued_input {
+            session.set_steering_queue_for_queued_input(Arc::clone(&self.queued_inputs), input);
+        } else {
+            session.set_steering_queue(Arc::clone(&self.queued_inputs));
+        }
         session.set_compaction_request(Arc::clone(&self.compaction_request));
         let (worker_tx, worker_rx) = mpsc::channel();
         let interrupt_flag = Arc::new(AtomicBool::new(false));
@@ -2239,7 +2282,7 @@ impl AppCore {
             interrupt_flag,
             started_at: Instant::now(),
         });
-        self.in_flight_label = Some("turn".to_owned());
+        self.in_flight_label = Some(MODEL_TURN_IN_FLIGHT_LABEL.to_owned());
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
@@ -2679,8 +2722,8 @@ impl AppCore {
         CoreEffect::Render
     }
 
-    fn pop_next_queued_input(&mut self) -> Option<String> {
-        let prompt = self.queued_inputs.pop_front();
+    fn pop_next_queued_input(&mut self) -> Option<QueuedInput> {
+        let prompt = self.queued_inputs.reserve_front_for_dispatch();
         self.normalize_queue_selection();
         prompt
     }

@@ -183,11 +183,31 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   #21; the deny-with-instruction ghost is separate and stays). While the
   agent works, the rail dims and shows
   working/interrupt copy; typing remains accepted. Mid-turn submits steer:
-  they queue as pending-input rows and the running turn absorbs them at its
-  next round boundary as canonical `user.message` events (the model sees
-  them in-turn; docs/contracts/events.md). Entries the turn never absorbed —
-  paused queue, arrival after the final round — flush into the next turn,
-  as before. Pending rows show one visual line: the message body is capped at
+  they queue as one ordered steering group and the running model turn absorbs
+  them exactly once at its next round boundary as canonical `user.message`
+  events (the model sees them in-turn; docs/contracts/events.md). A completed
+  no-tool response is a boundary too: if steering arrived while its final
+  text streamed, the worker stays active and dispatches the hydrated stack in
+  the next model request. Escape pauses absorption and preserves the whole
+  group. An explicit empty-submit continue dispatches its head and hydrates
+  the contiguous siblings FIFO before that replacement turn's first model
+  call. Dispatch reserves the head without removing it; only the durable
+  initial `user.message` acknowledges the reservation. An append failure or
+  an already-latched context stop leaves every queued row intact. After
+  provenance is repaired, retry reuses the retained event identity and accepts
+  the head exactly once on both the live bus and durable log, including when
+  the failed sync left a complete physical line behind. Mid-turn absorption
+  uses the same admission transaction without holding the queue lock during
+  persistence. The queue
+  hydrates each accepted steering row at the next model-round boundary; it
+  never waits for a later tool round when a boundary is already available.
+  Completion auto-flush does not start another turn while the context latch is
+  active. Ordinary input queued while non-model work is active remains a
+  separate follow-up and is never inferred to be steering. Entries arriving
+  after the worker's terminal boundary flush into the next turn. The final
+  steering check and group close are one named transaction: same-turn idle
+  work runs before it, and only a final Stop closes the group. Pending rows
+  show one visual line: the message body is capped at
   64 terminal display cells, truncates at a word boundary with an ASCII
   ` ...` suffix, and never alters the full queued input. Two fallbacks apply at
   tight widths: when the first word alone exceeds the budget there is no word
@@ -230,9 +250,13 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   One keypress performs one layer transition. Only `Esc` received with the
   composer owning input may interrupt an active turn or an idle shadow
   compaction.
-- Publishing root-turn cancellation pauses the steering queue before setting
-  the shared signal. Steering persistence and pause share one queue boundary:
-  a steer either persists before the pause, or remains queued after Esc.
+- Publishing root-turn cancellation atomically pauses the steering queue
+  before setting the shared signal. Neither operation waits for provenance
+  I/O: absorption reserves an id under a short queue lock, persists its owned
+  copy without the lock, then commits by id. A steer either reserved before
+  the pause and may finish as durable evidence, or remains queued after Esc.
+  The loop rechecks cancellation after that commit, so a late append cannot
+  start another provider round or consume later input.
   Explicitly queued companion/extension activities are cleared with a visible
   notice; queued user/steering text is preserved.
 - The provider request driver and tool supervisor observe that same signal.
