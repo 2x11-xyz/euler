@@ -2602,11 +2602,7 @@ impl<D: PermissionDecider> Session<D> {
             });
         };
         let shadow = self.shadow_compaction.take().expect("shadow checked above");
-        self.finish_detached_shadow(
-            shadow,
-            outcome,
-            CompactionCloseDisposition::ApplyReady,
-        )
+        self.finish_detached_shadow(shadow, outcome, CompactionCloseDisposition::ApplyReady)
     }
 
     fn wait_for_shadow_compaction(

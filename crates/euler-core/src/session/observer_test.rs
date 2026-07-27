@@ -209,6 +209,33 @@ fn cadence_boundaries_run_brief_companion_apply_at_n_and_2n() {
 }
 
 #[test]
+fn final_limited_tool_round_never_runs_the_observer() {
+    let (_temp, mut session) = observer_session(vec![tool_round()], 1);
+    session.config.max_tool_rounds = Some(1);
+    let calls = wire_extension(
+        &mut session,
+        Ok(json!({
+            "task": "this companion must never run",
+            "apply": {"must_not_run": true},
+        })),
+    );
+
+    let events = session.run_turn("go").expect("controlled tool limit");
+
+    assert!(
+        calls.lock().expect("call log").is_empty(),
+        "the final round has no mid-turn observer boundary"
+    );
+    assert_eq!(count_kind(&events, EventKind::AGENT_SPAWN), 0);
+    assert_eq!(count_kind(&events, EventKind::AGENT_RESULT), 0);
+    assert_eq!(count_kind(&events, EventKind::TOOL_RESULT), 1);
+    assert_eq!(
+        last_assistant_content(&events),
+        "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point."
+    );
+}
+
+#[test]
 fn brief_command_failure_is_fail_open_and_does_not_degrade_emission() {
     let (_temp, mut session) = observer_session(
         vec![

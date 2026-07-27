@@ -215,7 +215,9 @@ where
                 }
                 RoundOutcome::Continue => {
                     self.io.round_completed();
-                    self.io.round_boundary(cancellation);
+                    if another_round_available {
+                        self.io.round_boundary(cancellation);
+                    }
                 }
             }
             completed_rounds += 1;
@@ -404,5 +406,148 @@ fn collect_stream_event(event: ModelStreamEvent, data: &mut ModelRoundData) {
             data.stop_reason = Some(stop_reason);
             data.usage = usage;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use euler_provider::{ReasoningEffort, ToolCall};
+    use euler_sdk::CancellationSource;
+    use serde_json::json;
+
+    struct CancelAfterCompletedRound {
+        cancellation: CancellationSource,
+        boundary_calls: usize,
+        limit_calls: usize,
+    }
+
+    impl RoundLoopIo for CancelAfterCompletedRound {
+        type Complete = ();
+
+        fn session_id(&self) -> &str {
+            "round-loop-test"
+        }
+
+        fn target(&self) -> ModelTarget {
+            ModelTarget::new("test", "test")
+        }
+
+        fn prepare_model_request(
+            &mut self,
+            target: &ModelTarget,
+        ) -> Result<(String, ModelRequest), SessionError> {
+            Ok((
+                "model-call".to_owned(),
+                ModelRequest {
+                    model: target.model.clone(),
+                    instructions: String::new(),
+                    input: Vec::new(),
+                    tools: Vec::new(),
+                    reasoning_effort: ReasoningEffort::Medium,
+                    max_output_tokens: None,
+                },
+            ))
+        }
+
+        fn invoke_model(
+            &mut self,
+            _target: &ModelTarget,
+            _request: ModelRequest,
+        ) -> Result<ProviderStream, ProviderError> {
+            Ok(Box::new(
+                vec![
+                    Ok(ModelStreamEvent::ToolCall(ToolCall {
+                        id: "call".to_owned(),
+                        name: "read_file".to_owned(),
+                        input: json!({"path": "note.txt"}),
+                    })),
+                    Ok(ModelStreamEvent::Finished {
+                        stop_reason: StopReason::ToolUse,
+                        usage: None,
+                    }),
+                ]
+                .into_iter(),
+            ))
+        }
+
+        fn emit_provider_error(
+            &mut self,
+            _error: &ProviderError,
+            _model_call_id: String,
+        ) -> Result<String, SessionError> {
+            unreachable!("the scripted stream succeeds")
+        }
+
+        fn emit_model_call_cancelled(
+            &mut self,
+            _model_call_id: String,
+        ) -> Result<String, SessionError> {
+            unreachable!("cancellation happens between rounds")
+        }
+
+        fn after_stream_event(
+            &mut self,
+            _event: &ModelStreamEvent,
+            _model_call_id: &str,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+
+        fn flush_events(&mut self) {}
+
+        fn finish_round(
+            &mut self,
+            _target: ModelTarget,
+            _model_call_id: String,
+            data: ModelRoundData,
+            _cancellation: &CancellationToken,
+            another_round_available: bool,
+        ) -> Result<RoundOutcome<Self::Complete>, SessionError> {
+            assert_eq!(data.tool_calls.len(), 1);
+            assert!(!another_round_available);
+            Ok(RoundOutcome::Continue)
+        }
+
+        fn round_completed(&mut self) {
+            self.cancellation.cancel();
+        }
+
+        fn round_boundary(&mut self, _cancellation: &CancellationToken) {
+            self.boundary_calls += 1;
+        }
+
+        fn round_limit(
+            &mut self,
+            _cancellation: &CancellationToken,
+        ) -> Result<Self::Complete, SessionError> {
+            self.limit_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancellation_after_final_completed_round_wins_at_cap_boundary() {
+        let cancellation = CancellationSource::new();
+        let token = cancellation.token();
+        let mut io = CancelAfterCompletedRound {
+            cancellation,
+            boundary_calls: 0,
+            limit_calls: 0,
+        };
+
+        let result = RoundLoop::new(
+            &mut io,
+            RoundLoopConfig {
+                max_rounds: Some(1),
+                provider_retries: 0,
+                provider_retry_backoff_ms: Vec::new(),
+            },
+        )
+        .run(&token);
+
+        assert!(matches!(result, Err(SessionError::Cancelled)));
+        assert_eq!(io.boundary_calls, 0);
+        assert_eq!(io.limit_calls, 0);
     }
 }

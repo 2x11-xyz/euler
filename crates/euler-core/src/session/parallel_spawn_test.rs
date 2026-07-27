@@ -66,6 +66,13 @@ fn kinds(events: &[EventEnvelope]) -> Vec<&str> {
         .collect()
 }
 
+fn count_kind(events: &[EventEnvelope], kind: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| event.kind.as_str() == kind)
+        .count()
+}
+
 fn batch_events(events: &[EventEnvelope]) -> Vec<&EventEnvelope> {
     events
         .iter()
@@ -842,6 +849,79 @@ fn context_rejected_reviewer_never_opens_a_model_call_lifecycle() {
             .and_then(serde_json::Value::as_bool)
             != Some(true)
     }));
+}
+
+#[test]
+fn reviewer_system_prompt_counts_toward_pre_dispatch_context_admission() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        CapturingProvider {
+            requests: Arc::clone(&requests),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.config.context_limit = Some(ContextLimitConfig::new(100, 1.0).expect("context limit"));
+    let budget = AgentBudget::new(Some(1), Some(0), Some(1)).expect("budget");
+    let task = AgentTask::new("x", "reviewer", "p1", "m1")
+        .expect("task")
+        .with_system_prompt("s".repeat(1_000))
+        .expect("valid large system prompt")
+        .with_parent_canvas(false)
+        .with_budget(budget);
+
+    let summaries = session
+        .spawn_reviewers_parallel(vec![task], &CancellationToken::new())
+        .expect("batch reports a per-reviewer rejection");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    assert!(summaries[0]
+        .result
+        .error()
+        .is_some_and(|error| error.contains("exceeds context limit")));
+    assert_eq!(count_kind(session.events(), EventKind::MODEL_CALL), 0);
+    assert!(
+        requests.lock().expect("requests").is_empty(),
+        "rejected reviewer must not invoke the provider"
+    );
+}
+
+#[test]
+fn session_output_cap_counts_when_reviewer_task_has_no_token_cap() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        CapturingProvider {
+            requests: Arc::clone(&requests),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.config.context_limit = Some(ContextLimitConfig::new(20, 1.0).expect("context limit"));
+    session.config.max_output_tokens = Some(20);
+    let budget = AgentBudget::new(Some(1), Some(0), None).expect("budget");
+    let task = AgentTask::new("x", "reviewer", "p1", "m1")
+        .expect("task")
+        .with_system_prompt("s")
+        .expect("system prompt")
+        .with_parent_canvas(false)
+        .with_budget(budget);
+
+    let summaries = session
+        .spawn_reviewers_parallel(vec![task], &CancellationToken::new())
+        .expect("batch reports a per-reviewer rejection");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    assert!(summaries[0]
+        .result
+        .error()
+        .is_some_and(|error| error.contains("exceeds context limit")));
+    assert_eq!(count_kind(session.events(), EventKind::MODEL_CALL), 0);
+    assert!(
+        requests.lock().expect("requests").is_empty(),
+        "rejected reviewer must not invoke the provider"
+    );
 }
 
 #[test]

@@ -218,11 +218,24 @@ impl<D: PermissionDecider> Session<D> {
             (session_cap, task_cap) => session_cap.or(task_cap),
         };
         let input = reviewer_input(&task_canvas, &task);
+        let request = ModelRequest {
+            model: target.model.clone(),
+            instructions: task
+                .system_prompt()
+                .unwrap_or(SYSTEM_INSTRUCTIONS)
+                .to_owned(),
+            input,
+            // Reviewer briefs are tool-free by contract.
+            tools: Vec::new(),
+            reasoning_effort: self.config.reasoning_effort,
+            max_output_tokens,
+        }
+        .for_target(&target.provider, &target.model);
         // One oversized reviewer must not sink the batch: the swarm's K-of-N
         // summary exists to report exactly this kind of partial failure, so
         // record an error event for this child and let its siblings run. The
         // rejection precedes model.call: no provider lifecycle began.
-        if let Some(message) = self.reviewer_context_overflow(&input, &task) {
+        if let Some(message) = self.reviewer_context_overflow(&request) {
             self.appender_as(writer, &child_agent_id).append(
                 EventKind::ERROR,
                 object([
@@ -248,19 +261,6 @@ impl<D: PermissionDecider> Session<D> {
             .appender_as(writer, &child_agent_id)
             .append(EventKind::MODEL_CALL, model_call, None)?
             .id;
-        let request = ModelRequest {
-            model: target.model.clone(),
-            instructions: task
-                .system_prompt()
-                .unwrap_or(SYSTEM_INSTRUCTIONS)
-                .to_owned(),
-            input,
-            // Reviewer briefs are tool-free by contract.
-            tools: Vec::new(),
-            reasoning_effort: self.config.reasoning_effort,
-            max_output_tokens,
-        }
-        .for_target(&target.provider, &target.model);
         Ok(PreparedReviewer {
             task,
             target,
@@ -301,30 +301,24 @@ impl<D: PermissionDecider> Session<D> {
         model_call
     }
 
-    /// Why this reviewer cannot be dispatched, if its estimated request would
-    /// not fit the configured context window. Estimation is deliberately crude
-    /// (4 bytes per token): it exists to catch briefs that are obviously too
-    /// large before spending a provider call, not to predict tokenizer output.
-    fn reviewer_context_overflow(
-        &self,
-        input: &[ModelInputItem],
-        task: &AgentTask,
-    ) -> Option<String> {
+    /// Why this reviewer cannot be dispatched under the shared deterministic
+    /// request proxy, if the model's context window is known.
+    fn reviewer_context_overflow(&self, request: &ModelRequest) -> Option<String> {
         let limit = self
             .config
             .context_limit
             .as_ref()
             .map(ContextLimitConfig::limit_tokens)?;
-        let input_bytes = input.iter().map(model_input_bytes).sum::<usize>();
-        let estimated_input = u64::try_from(input_bytes.div_ceil(4)).unwrap_or(u64::MAX);
-        let requested_output = task.budget().max_tokens().unwrap_or(0);
-        if estimated_input.saturating_add(requested_output) <= limit {
-            return None;
+        let output_reserve = request.max_output_tokens.unwrap_or(0);
+        match crate::project_context::request_required_tokens(request, output_reserve) {
+            Some(required) if crate::project_context::fits_context_limit(required, limit) => None,
+            Some(required) => Some(format!(
+                "reviewer request exceeds context limit: {required} tokens required > {limit}"
+            )),
+            None => Some(format!(
+                "reviewer request exceeds context limit: token accounting overflowed for {limit} available tokens"
+            )),
         }
-        Some(format!(
-            "reviewer request exceeds context limit: estimated {estimated_input} input \
-             + {requested_output} output tokens > {limit}"
-        ))
     }
 
     fn record_reviewer_outcome(
@@ -807,25 +801,3 @@ impl RoundLoopIo for WorkerIo<'_> {
 #[cfg(test)]
 #[path = "parallel_spawn_test.rs"]
 mod tests;
-
-/// Rough byte size of one request item, for the pre-dispatch context estimate.
-fn model_input_bytes(item: &ModelInputItem) -> usize {
-    match item {
-        ModelInputItem::Message { content, .. } => content.len(),
-        ModelInputItem::ToolCall {
-            name, arguments, ..
-        } => name.len() + arguments.to_string().len(),
-        ModelInputItem::ToolOutput {
-            name,
-            output,
-            error,
-            ..
-        } => {
-            name.len()
-                + output.as_deref().map_or(0, str::len)
-                + error.as_deref().map_or(0, str::len)
-        }
-        ModelInputItem::Reasoning { content, .. } => content.len(),
-        ModelInputItem::ProjectContext { rendered } => rendered.len(),
-    }
-}
