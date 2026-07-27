@@ -427,7 +427,7 @@ pub struct Session<D> {
     /// Exact authoritative event retained across an append failure. The
     /// matching retry reuses its id and timestamp; every unrelated admission
     /// is fenced until the owning writer confirms this candidate.
-    pending_admission: Option<EventEnvelope>,
+    pending_admission: Option<PendingAdmission>,
     /// A shadow worker was detached without an accepted terminal child for
     /// its `model.call`. Further authoritative writes fail closed until the
     /// durable log is reopened and its recovery closure is appended.
@@ -456,6 +456,11 @@ struct ShadowCompaction {
     model_call_id: String,
     worker: compaction_worker::CompactionWorker,
     started_at: Instant,
+}
+
+struct PendingAdmission {
+    event: EventEnvelope,
+    queue_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -696,7 +701,11 @@ where
         let result = queue.persist_next_for_round(
             boundary,
             || cancellation.is_cancelled(),
-            |content| self.session.admit_user_message(content).map(|_| ()),
+            |input| {
+                self.session
+                    .admit_user_message(input.content(), Some(input.id()))
+                    .map(|_| ())
+            },
         );
         if result.is_err() {
             // Prior accepted backlog may remain on the bus if draining it was
@@ -1306,30 +1315,46 @@ impl<D> Session<D> {
     /// append instead of creating a second event. Drain any older accepted
     /// backlog, append this candidate, then publish it to the bus and advance
     /// the cursor. While it is pending, every unrelated append is fenced.
-    fn admit_user_message(&mut self, content: &str) -> Result<String, SessionError> {
+    fn admit_user_message(
+        &mut self,
+        content: &str,
+        queue_id: Option<u64>,
+    ) -> Result<String, SessionError> {
         self.ensure_terminalization_intact()?;
         let payload = object([("content", content.to_owned().into())]);
         if let Some(pending) = &self.pending_admission {
-            if pending.kind.as_str() != EventKind::USER_MESSAGE || pending.payload != payload {
+            if pending.queue_id != queue_id
+                || pending.event.kind.as_str() != EventKind::USER_MESSAGE
+                || pending.event.payload != payload
+            {
                 return Err(pending_admission_error());
             }
         } else {
             self.persist_new_events()?;
-            self.pending_admission = Some(EventEnvelope::new(
-                self.config.session_id.clone(),
-                self.config.agent_id.clone(),
-                self.previous_persisted_event_id(),
-                EventKind::USER_MESSAGE,
-                payload,
-            ));
+            self.pending_admission = Some(PendingAdmission {
+                event: EventEnvelope::new(
+                    self.config.session_id.clone(),
+                    self.config.agent_id.clone(),
+                    self.previous_persisted_event_id(),
+                    EventKind::USER_MESSAGE,
+                    payload,
+                ),
+                queue_id,
+            });
         }
-        let event = self
+        let pending = self
             .pending_admission
             .as_ref()
-            .expect("admission was matched or created")
-            .clone();
+            .expect("admission was matched or created");
+        let event = pending.event.clone();
+        let pending_queue_id = pending.queue_id;
         let id = event.id.clone();
-        self.append_candidate(&event)?;
+        if let Err(error) = self.append_candidate(&event) {
+            if let (Some(queue), Some(queue_id)) = (&self.steering, pending_queue_id) {
+                queue.mark_admission_unresolved(queue_id);
+            }
+            return Err(error);
+        }
         self.bus.push(event);
         self.pending_admission = None;
         if self.provenance.is_some() {
@@ -1891,7 +1916,8 @@ impl<D: PermissionDecider> Session<D> {
         let start = self.bus.events().len();
         crate::diagnostics::turn_start(&self.config.session_id);
         let mut sink = EventSink::new(start, &mut on_event);
-        self.admit_user_message(user_message)?;
+        let queue_id = self.queued_dispatch.as_ref().map(steering::QueuedInput::id);
+        self.admit_user_message(user_message, queue_id)?;
         self.acknowledge_queued_dispatch();
         sink.flush(self.bus.events());
         let settled = self.settle_shadow_at_context_limit(&cancellation);

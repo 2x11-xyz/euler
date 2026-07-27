@@ -812,6 +812,59 @@ fn write_blob_durable_rewrites_mismatched_content() {
     assert_eq!(fs::read(&path).expect("blob"), b"payload");
 }
 
+#[test]
+fn matching_blob_retry_reconfirms_directory_durability_before_log_append() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+    let writer = ProvenanceWriter::with_threshold(log.clone(), blob_dir.clone(), 4)
+        .expect("provenance writer");
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+            ("output", "large payload".into()),
+        ]),
+    );
+
+    {
+        let expected = blob_dir.clone();
+        let guard = arm_matching(Op::DirSync, move |path| path == expected);
+        writer
+            .append(std::slice::from_ref(&event))
+            .expect_err("new blob directory sync fails");
+        assert!(guard.fired());
+    }
+    assert!(
+        !log.exists(),
+        "the provenance log must not open before blob durability"
+    );
+
+    {
+        let expected = blob_dir.clone();
+        let guard = arm_matching(Op::DirSync, move |path| path == expected);
+        writer
+            .append(std::slice::from_ref(&event))
+            .expect_err("matching blob still requires a directory sync");
+        assert!(guard.fired());
+    }
+    assert!(
+        !log.exists(),
+        "a deduplicated retry must not publish an undurable blob reference"
+    );
+
+    writer
+        .append(std::slice::from_ref(&event))
+        .expect("durable retry");
+    let events = read_provenance(&log).expect("rehydrated provenance");
+    assert_eq!(events, vec![event]);
+}
+
 #[cfg(unix)]
 #[test]
 fn write_blob_durable_skips_rewrite_for_matching_content() {

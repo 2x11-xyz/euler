@@ -53,6 +53,11 @@ pub enum ResumeError {
     UnsupportedVersion { found: u16, supported: u16 },
     #[error("resume incompatible: unknown event kind {kind}")]
     UnknownKind { kind: String },
+    #[error(
+        "resume incompatible: terminal event {event_id} for agent {agent} matches multiple open \
+         model calls"
+    )]
+    AmbiguousModelTerminal { event_id: String, agent: String },
     #[error("resume incompatible: missing provenance blob {hash} at {}", path.display())]
     MissingBlob { hash: String, path: PathBuf },
     #[error("resume incompatible: provenance blob hash mismatch for {hash} at {}", path.display())]
@@ -548,7 +553,7 @@ pub fn resume_session_from_folded_prefix<D>(
     let warnings = std::mem::take(&mut folded.warnings);
     let mut recovery_closure_appended = false;
 
-    let recovery_closures = recovery_closures(&folded.events);
+    let recovery_closures = recovery_closures(&folded.events)?;
     if !recovery_closures.is_empty() {
         writer
             .append(&recovery_closures)
@@ -735,24 +740,87 @@ fn session_resumed_marker(
     )
 }
 
-fn recovery_closures(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
-    let terminal_parents = events
-        .iter()
-        .filter(|event| event_terminalizes_model_call(event))
-        .filter_map(|event| event.parent.as_deref())
-        .collect::<BTreeSet<_>>();
-    let mut closures = events
-        .iter()
-        .filter(|event| {
-            event.kind.as_str() == EventKind::MODEL_CALL
-                && !terminal_parents.contains(event.id.as_str())
-        })
-        .map(model_recovery_closure)
+fn recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, ResumeError> {
+    struct ModelCallState<'a> {
+        call: &'a EventEnvelope,
+        open: bool,
+    }
+
+    let mut calls = Vec::<ModelCallState<'_>>::new();
+    for event in events {
+        if event.kind.as_str() == EventKind::MODEL_CALL {
+            calls.push(ModelCallState {
+                call: event,
+                open: true,
+            });
+            continue;
+        }
+        if !event_terminalizes_model_call(event) {
+            continue;
+        }
+
+        // A direct semantic parent is authoritative only within the same
+        // actor. The provenance writer intentionally keeps companion and
+        // parallel streams writer-linear, so their persisted terminal parent
+        // can be a reasoning event or even another reviewer's call.
+        if let Some(direct) = event.parent.as_deref().and_then(|parent| {
+            calls
+                .iter()
+                .position(|state| state.call.id == parent && state.call.agent == event.agent)
+        }) {
+            // A second terminal naming an already-settled call must not settle
+            // a different open call through the actor fallback below.
+            calls[direct].open = false;
+            continue;
+        }
+
+        let candidates = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| {
+                state.open
+                    && state.call.agent == event.agent
+                    && model_terminal_metadata_matches(state.call, event)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [] => {}
+            [index] => calls[*index].open = false,
+            _ => {
+                return Err(ResumeError::AmbiguousModelTerminal {
+                    event_id: event.id.clone(),
+                    agent: event.agent.clone(),
+                });
+            }
+        }
+    }
+
+    let mut closures = calls
+        .into_iter()
+        .filter(|state| state.open)
+        .map(|state| model_recovery_closure(state.call))
         .collect::<Vec<_>>();
     if let Some(closure) = tool_recovery_closure(events) {
         closures.push(closure);
     }
-    closures
+    Ok(closures)
+}
+
+fn model_terminal_metadata_matches(call: &EventEnvelope, terminal: &EventEnvelope) -> bool {
+    // Provider/model are present on successful results but not on every
+    // provider or cancellation error, so use them only when the terminal
+    // honestly carries them.
+    for key in ["provider", "model"] {
+        if let Some(value) = payload_str(terminal, key) {
+            if payload_str(call, key) != Some(value) {
+                return false;
+            }
+        }
+    }
+    // Purpose is a call-lane discriminator: root driver events omit it while
+    // compaction calls and terminals both carry `purpose=compaction`.
+    payload_str(call, "purpose") == payload_str(terminal, "purpose")
 }
 
 fn model_recovery_closure(call: &EventEnvelope) -> EventEnvelope {

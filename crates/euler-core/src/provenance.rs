@@ -952,6 +952,11 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         Ok(existing) if existing == bytes => match OpenOptions::new().read(true).open(path) {
             Ok(file) => {
                 sync_file_data(&file, path)?;
+                // The blob may be the result of an earlier rename whose
+                // directory sync failed. Matching bytes prove identity, not
+                // name durability, so every successful dedupe path must
+                // confirm the containing directory too.
+                sync_dir(containing_dir(path))?;
                 return Ok(());
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}

@@ -59,6 +59,10 @@ struct SteeringState {
     /// Entry whose durable steering append has linearized. Persistence owns a
     /// clone and runs unlocked; UI mutation cannot remove this id meanwhile.
     absorbing: Option<u64>,
+    /// Entry whose `user.message` append returned an ambiguous durability
+    /// error. It remains protected and is the next dispatch reservation even
+    /// if later urgent input moved ahead of it.
+    unresolved_admission: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +91,10 @@ pub struct QueuedInput {
 }
 
 impl QueuedInput {
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn content(&self) -> &str {
         &self.content
     }
@@ -163,6 +171,12 @@ impl SteeringQueue {
             }
             state.reserved_dispatch = None;
         }
+        if let Some(id) = state.unresolved_admission {
+            let entry = state.entries.iter().find(|entry| entry.id == id)?;
+            let input = Self::queued_input(entry);
+            state.reserved_dispatch = Some(input.id);
+            return Some(input);
+        }
         if state
             .entries
             .front()
@@ -194,6 +208,9 @@ impl SteeringQueue {
             state.entries.remove(index);
         }
         state.reserved_dispatch = None;
+        if state.unresolved_admission == Some(input.id) {
+            state.unresolved_admission = None;
+        }
     }
 
     /// Release an unacknowledged reservation when a turn exits before its
@@ -208,7 +225,10 @@ impl SteeringQueue {
     pub fn remove(&self, index: usize) -> Option<String> {
         let mut state = self.state();
         let id = state.entries.get(index)?.id;
-        if state.reserved_dispatch == Some(id) || state.absorbing == Some(id) {
+        if state.reserved_dispatch == Some(id)
+            || state.absorbing == Some(id)
+            || state.unresolved_admission == Some(id)
+        {
             return None;
         }
         let removed = state.entries.remove(index)?;
@@ -219,9 +239,12 @@ impl SteeringQueue {
         let mut state = self.state();
         let reserved = state.reserved_dispatch;
         let absorbing = state.absorbing;
-        state
-            .entries
-            .retain(|entry| Some(entry.id) == reserved || Some(entry.id) == absorbing);
+        let unresolved = state.unresolved_admission;
+        state.entries.retain(|entry| {
+            Some(entry.id) == reserved
+                || Some(entry.id) == absorbing
+                || Some(entry.id) == unresolved
+        });
     }
 
     pub fn len(&self) -> usize {
@@ -258,13 +281,17 @@ impl SteeringQueue {
         state.group_open = true;
         let replacement_group = state.current_group;
         let Some(QueuedInput {
+            id,
             kind: QueuedInputKind::Steering(interrupted_group),
             ..
         }) = input
         else {
             return;
         };
-        for entry in &mut state.entries {
+        let Some(start) = state.entries.iter().position(|entry| entry.id == *id) else {
+            return;
+        };
+        for entry in state.entries.iter_mut().skip(start) {
             if entry.kind != QueuedInputKind::Steering(*interrupted_group) {
                 break;
             }
@@ -285,23 +312,25 @@ impl SteeringQueue {
     /// Phase one reserves the front id under the queue lock. Persistence then
     /// runs without that lock, so Escape, rendering, editing, and submissions
     /// never wait on provenance I/O. Phase three removes exactly that id only
-    /// after success. Remove/clear preserve an in-flight id; failure releases
-    /// it in place.
+    /// after success. Remove/clear preserve an in-flight id; an ambiguous
+    /// failure converts it into a protected exact-dispatch retry.
     pub(super) fn persist_next_for_round<E>(
         &self,
         boundary: RoundBoundary,
         stopped: impl Fn() -> bool,
-        persist: impl FnOnce(&str) -> Result<(), E>,
+        persist: impl FnOnce(&QueuedInput) -> Result<(), E>,
     ) -> Result<BoundaryAction, E> {
-        let (id, content) = {
+        let input = {
             let mut state = self.state();
             let cancelled = stopped();
             if self.paused() || cancelled {
                 return Ok(Self::finish_empty_boundary(&mut state, boundary, cancelled));
             }
-            if state.absorbing.is_some() {
+            if state.absorbing.is_some() || state.unresolved_admission.is_some() {
                 // A Session has one round driver. Concurrent absorption is a
-                // caller bug; fail closed without changing group state.
+                // caller bug, and an unresolved event must be retried through
+                // its exact queued dispatch identity. Fail closed without
+                // changing group state.
                 return Ok(BoundaryAction::Drained);
             }
             let eligible = state.entries.front().is_some_and(|entry| {
@@ -312,26 +341,29 @@ impl SteeringQueue {
                 return Ok(Self::finish_empty_boundary(&mut state, boundary, false));
             }
             let entry = state.entries.front().expect("eligible front");
-            let id = entry.id;
-            let content = entry.content.clone();
-            state.absorbing = Some(id);
-            (id, content)
+            let input = Self::queued_input(entry);
+            state.absorbing = Some(input.id);
+            input
         };
 
-        let persisted = persist(&content);
+        let persisted = persist(&input);
         let cancelled_after = stopped();
         let paused_after = self.paused();
         let mut state = self.state();
-        debug_assert_eq!(state.absorbing, Some(id));
+        debug_assert_eq!(state.absorbing, Some(input.id));
         state.absorbing = None;
         if let Err(error) = persisted {
+            state.unresolved_admission = Some(input.id);
             if boundary == RoundBoundary::Terminal {
                 state.group_open = false;
             }
             return Err(error);
         }
-        if let Some(index) = state.entries.iter().position(|entry| entry.id == id) {
+        if let Some(index) = state.entries.iter().position(|entry| entry.id == input.id) {
             state.entries.remove(index);
+        }
+        if state.unresolved_admission == Some(input.id) {
+            state.unresolved_admission = None;
         }
         if boundary == RoundBoundary::Terminal && (paused_after || cancelled_after) {
             state.group_open = false;
@@ -340,6 +372,20 @@ impl SteeringQueue {
             });
         }
         Ok(BoundaryAction::Persisted)
+    }
+
+    /// Protect a queued-dispatch row after its initial authoritative append
+    /// returned an ambiguous durability error.
+    pub(super) fn mark_admission_unresolved(&self, id: u64) {
+        let mut state = self.state();
+        if !state.entries.iter().any(|entry| entry.id == id) {
+            return;
+        }
+        debug_assert!(
+            state.unresolved_admission.is_none() || state.unresolved_admission == Some(id),
+            "one session cannot own two unresolved user admissions"
+        );
+        state.unresolved_admission = Some(id);
     }
 
     fn finish_empty_boundary(
@@ -385,8 +431,8 @@ mod tests {
                     .persist_next_for_round(
                         RoundBoundary::Intermediate,
                         || false,
-                        |content| {
-                            persisted.push(content.to_owned());
+                        |input| {
+                            persisted.push(input.content().to_owned());
                             Ok::<_, ()>(())
                         },
                     )

@@ -391,6 +391,124 @@ fn nonterminal_error_child_does_not_hide_an_open_model_call_on_resume() {
 }
 
 #[test]
+fn writer_linear_terminal_closes_only_the_matching_agent_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut first_call = model_call(None);
+    first_call.agent = "reviewer-a".to_owned();
+    let mut second_call = model_call(Some(first_call.id.clone()));
+    second_call.agent = "reviewer-b".to_owned();
+    let terminal = EventEnvelope::new(
+        "session",
+        "reviewer-a",
+        Some(second_call.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("content", "reviewer a completed".into()),
+        ]),
+    );
+    write_events(&log, &[first_call.clone(), second_call.clone(), terminal]);
+
+    let outcome = resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    let closures = model_recovery_closures(outcome.session.events());
+    assert_eq!(closures.len(), 1);
+    assert_eq!(closures[0].agent, "reviewer-b");
+    assert_eq!(
+        closures[0].parent.as_deref(),
+        Some(second_call.id.as_str()),
+        "the crossed linear parent must not settle reviewer b's call"
+    );
+}
+
+#[test]
+fn unmatched_terminal_does_not_settle_open_calls_from_other_agents() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut first_call = model_call(None);
+    first_call.agent = "reviewer-a".to_owned();
+    let mut second_call = model_call(Some(first_call.id.clone()));
+    second_call.agent = "reviewer-b".to_owned();
+    let terminal = EventEnvelope::new(
+        "session",
+        "reviewer-c",
+        Some(second_call.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("content", "orphan".into()),
+        ]),
+    );
+    write_events(&log, &[first_call.clone(), second_call.clone(), terminal]);
+
+    let outcome = resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    let closure_parents = model_recovery_closures(outcome.session.events())
+        .into_iter()
+        .filter_map(|event| event.parent.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        closure_parents,
+        vec![first_call.id.as_str(), second_call.id.as_str()]
+    );
+}
+
+#[test]
+fn ambiguous_same_agent_terminal_fails_before_mutating_the_log() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let first_call = model_call(None);
+    let second_call = model_call(Some(first_call.id.clone()));
+    let terminal = EventEnvelope::new(
+        "session",
+        "agent",
+        Some("writer-linear-event".to_owned()),
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("content", "ambiguous".into()),
+        ]),
+    );
+    write_events(&log, &[first_call, second_call, terminal.clone()]);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("ambiguous terminal must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ResumeError::AmbiguousModelTerminal {
+            event_id,
+            agent
+        } if event_id == terminal.id && agent == "agent"
+    ));
+    assert_eq!(fs::read(&log).expect("read unchanged log"), before);
+}
+
+#[test]
 fn permission_gated_tail_closure_says_tool_never_executed() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");

@@ -209,6 +209,11 @@ impl<D> Session<D> {
         &mut self,
         queue: &QueuedExtensionEvents,
     ) -> Result<(), SessionError> {
+        // Deliberately no pending-admission guard here: the extension host
+        // already appended these events through the shared writer. This step
+        // only reconciles that durable suffix into the live bus; fencing it
+        // would strand accepted evidence and force a reload solely because an
+        // unrelated user-message append has an ambiguous outcome.
         if self.provenance.is_none() {
             return Err(SessionError::ExtensionEmissionUnavailable);
         }

@@ -262,7 +262,13 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
     session.persist_new_events().expect("persist bootstrap");
     let queue = Arc::new(SteeringQueue::default());
     queue.push_follow_up_back("queued once".to_owned());
+    queue.push_follow_up_back("queued once".to_owned());
+    queue.push_follow_up_back("after duplicate".to_owned());
     let input = queue.reserve_front_for_dispatch().expect("reservation");
+    let duplicate_input = {
+        let state = queue.state();
+        SteeringQueue::queued_input(state.entries.get(1).expect("duplicate row"))
+    };
     session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
     let guard = arm_log_sync_fault(op, &log_path);
 
@@ -270,15 +276,38 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
 
     assert!(matches!(result, Err(crate::session::SessionError::Io(_))));
     assert!(guard.fired(), "post-write sync fault must fire");
-    assert_eq!(queue.snapshot(), ["queued once"]);
+    assert_eq!(
+        queue.snapshot(),
+        ["queued once", "queued once", "after duplicate"]
+    );
     assert_eq!(user_message_count(session.events(), "queued once"), 0);
     let physical = only_logged_user_message(&log_path, "queued once");
     assert_eq!(
-        session.pending_admission.as_ref().map(|event| &event.id),
+        session
+            .pending_admission
+            .as_ref()
+            .map(|pending| &pending.event.id),
         Some(&physical.id),
         "session must retain the exact rejected envelope"
     );
+    assert_eq!(
+        session
+            .pending_admission
+            .as_ref()
+            .and_then(|pending| pending.queue_id),
+        Some(input.id),
+        "the pending event must retain its exact queue-row identity"
+    );
     let bytes_after_failure = std::fs::read(&log_path).expect("read failed append");
+    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &duplicate_input);
+    let same_text_wrong_row = session
+        .run_turn(duplicate_input.content())
+        .expect_err("same payload from a different queue row must be fenced");
+    assert!(matches!(
+        same_text_wrong_row,
+        crate::session::SessionError::Io(ref error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
     let unrelated = session
         .run_turn("different input")
         .expect_err("different user admission must be fenced");
@@ -300,19 +329,102 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
         bytes_after_failure,
         "fenced operations must append nothing"
     );
+    assert_eq!(
+        queue.remove(0),
+        None,
+        "the unresolved physical admission cannot be edited or removed"
+    );
+    assert_eq!(
+        queue.remove(1).as_deref(),
+        Some("queued once"),
+        "the duplicate row remains independently editable"
+    );
+    queue.push_follow_up_back("edited duplicate".to_owned());
+    queue.push_follow_up_front("urgent after failure".to_owned());
+    assert_eq!(
+        queue.snapshot(),
+        [
+            "urgent after failure",
+            "queued once",
+            "after duplicate",
+            "edited duplicate",
+        ]
+    );
     drop(guard);
 
     let retry = queue.reserve_front_for_dispatch().expect("retry");
-    assert_eq!(retry.id, input.id, "queue identity changed across retry");
+    assert_eq!(
+        retry.id, input.id,
+        "the unresolved row must outrank a later urgent insertion"
+    );
     session.set_steering_queue_for_queued_input(Arc::clone(&queue), &retry);
     session
         .run_turn(retry.content())
         .expect("matching retry reconciles");
 
-    assert!(queue.is_empty());
+    assert_eq!(
+        queue.snapshot(),
+        [
+            "urgent after failure",
+            "after duplicate",
+            "edited duplicate"
+        ],
+        "only the exact reconciled row is removed; remaining order is stable"
+    );
     let accepted = only_user_message(session.events(), "queued once");
     assert_eq!(accepted.id, physical.id, "event identity changed on retry");
     assert_eq!(user_message_count(session.events(), "queued once"), 1);
+    assert_durable_bus_equivalence(&session, &log_path);
+}
+
+#[test]
+fn clear_preserves_only_the_unresolved_duplicate_row() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log_path = temp.path().join("clear-unresolved.jsonl");
+    let writer = sync_test_writer(temp.path(), log_path.clone());
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "clear-unresolved".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    session.persist_new_events().expect("persist bootstrap");
+    let queue = Arc::new(SteeringQueue::default());
+    queue.push_follow_up_back("duplicate".to_owned());
+    queue.push_follow_up_back("duplicate".to_owned());
+    queue.push_follow_up_back("after".to_owned());
+    let input = queue.reserve_front_for_dispatch().expect("reservation");
+    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &input);
+    let guard = arm_log_sync_fault(Op::FileSync, &log_path);
+
+    let result = session.run_turn(input.content());
+
+    assert!(matches!(result, Err(SessionError::Io(_))));
+    assert!(guard.fired());
+    drop(guard);
+    queue.clear();
+    assert_eq!(
+        queue.snapshot(),
+        ["duplicate"],
+        "clear removes every mutable row but retains the unresolved one"
+    );
+    assert_eq!(
+        queue.remove(0),
+        None,
+        "the surviving unresolved row remains protected"
+    );
+
+    let retry = queue.reserve_front_for_dispatch().expect("exact retry");
+    assert_eq!(retry.id, input.id);
+    session.set_steering_queue_for_queued_input(Arc::clone(&queue), &retry);
+    session
+        .run_turn(retry.content())
+        .expect("reconcile exact row");
+
+    assert!(queue.is_empty());
+    assert_eq!(user_message_count(session.events(), "duplicate"), 1);
     assert_durable_bus_equivalence(&session, &log_path);
 }
 
@@ -377,13 +489,29 @@ fn assert_mid_turn_sync_failure(op: Op) {
     assert_eq!(user_message_count(session.events(), "steer one"), 0);
     let physical = only_logged_user_message(&log_path, "steer one");
     assert_eq!(
-        session.pending_admission.as_ref().map(|event| &event.id),
+        session
+            .pending_admission
+            .as_ref()
+            .map(|pending| &pending.event.id),
         Some(&physical.id),
         "session must retain the exact rejected steering envelope"
+    );
+    assert_eq!(
+        queue.remove(0),
+        None,
+        "failed absorption must convert its row into protected unresolved state"
     );
     drop(guard);
 
     let retry = queue.reserve_front_for_dispatch().expect("retry");
+    assert_eq!(
+        session
+            .pending_admission
+            .as_ref()
+            .and_then(|pending| pending.queue_id),
+        Some(retry.id),
+        "the pending event and absorption retry must identify the same row"
+    );
     session.set_steering_queue_for_queued_input(Arc::clone(&queue), &retry);
     session
         .run_turn(retry.content())
