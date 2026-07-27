@@ -215,8 +215,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   exactly this shape onto their wire formats.
   Extension-backed model-tool calls/results additionally carry host-derived
   `extension_id` and `command`. A causally descended, identically attributed
-  `plan.update` lets the TUI suppress the successful generic JSON result row;
-  provenance retains the complete braid and failures remain visible.
+  `plan.update` lets the TUI suppress the successful generic JSON result row
+  only when the originating call and result also carry the same nonempty
+  provider call `id`; provenance retains the complete braid and failures or
+  malformed/mismatched results remain visible.
 - `permission.prompt`: `capability`, `reason`. An operation-level extension
   prompt retains that primary capability for compatibility and adds
   `capabilities` (the complete, ordered, distinct capability list),

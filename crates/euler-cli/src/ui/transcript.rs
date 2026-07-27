@@ -360,19 +360,39 @@ enum ToolCallProjection {
 /// Causally coalesces an extension model tool's successful result into the
 /// canonical plan cell emitted during that invocation. Provenance retains the
 /// full tool.call → plan.update → tool.result braid; this fold is presentation
-/// only and keys on both ancestry and extension attribution, never tool names.
+/// only and keys on ancestry, extension attribution, and the provider call id,
+/// never tool names.
+#[derive(Clone, Debug)]
+struct ExtensionPlanCallMetadata {
+    provider_call_id: String,
+    attribution: (String, String),
+    plan_presented: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ExtensionPlanCoalescer {
     call_by_descendant: HashMap<String, String>,
-    call_attribution: HashMap<String, (String, String)>,
-    presented_calls: HashSet<String>,
+    calls: HashMap<String, ExtensionPlanCallMetadata>,
 }
 
 impl ExtensionPlanCoalescer {
     fn ingest(&mut self, event: &EventEnvelope) -> bool {
         let attribution = extension_attribution(event);
-        let call_id = if event.kind.as_str() == EventKind::TOOL_CALL && attribution.is_some() {
-            Some(event.id.clone())
+        let call_id = if event.kind.as_str() == EventKind::TOOL_CALL {
+            match (nonempty_payload_string(event, "id"), attribution.clone()) {
+                (Some(provider_call_id), Some(attribution)) => {
+                    self.calls.insert(
+                        event.id.clone(),
+                        ExtensionPlanCallMetadata {
+                            provider_call_id,
+                            attribution,
+                            plan_presented: false,
+                        },
+                    );
+                    Some(event.id.clone())
+                }
+                _ => None,
+            }
         } else {
             event
                 .parent
@@ -381,11 +401,6 @@ impl ExtensionPlanCoalescer {
                 .cloned()
         };
 
-        if event.kind.as_str() == EventKind::TOOL_CALL {
-            if let (Some(call_id), Some(attribution)) = (&call_id, attribution.clone()) {
-                self.call_attribution.insert(call_id.clone(), attribution);
-            }
-        }
         if event.kind.as_str() == EventKind::PLAN_UPDATE
             && event
                 .payload
@@ -400,19 +415,23 @@ impl ExtensionPlanCoalescer {
             )
         {
             if let (Some(call_id), Some(attribution)) = (&call_id, attribution.as_ref()) {
-                if self.call_attribution.get(call_id) == Some(attribution) {
-                    self.presented_calls.insert(call_id.clone());
+                if let Some(call) = self.calls.get_mut(call_id) {
+                    if &call.attribution == attribution {
+                        call.plan_presented = true;
+                    }
                 }
             }
         }
 
+        let result_provider_call_id = nonempty_payload_string(event, "id");
         let hide_result = event.kind.as_str() == EventKind::TOOL_RESULT
             && event.payload.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
             && call_id.as_ref().is_some_and(|call_id| {
-                self.presented_calls.contains(call_id)
-                    && attribution
-                        .as_ref()
-                        .is_some_and(|value| self.call_attribution.get(call_id) == Some(value))
+                self.calls.get(call_id).is_some_and(|call| {
+                    call.plan_presented
+                        && attribution.as_ref() == Some(&call.attribution)
+                        && result_provider_call_id.as_ref() == Some(&call.provider_call_id)
+                })
             });
         if let Some(call_id) = call_id {
             self.call_by_descendant.insert(event.id.clone(), call_id);
@@ -426,6 +445,10 @@ fn extension_attribution(event: &EventEnvelope) -> Option<(String, String)> {
         payload_string(event, "extension_id")?,
         payload_string(event, "command")?,
     ))
+}
+
+fn nonempty_payload_string(event: &EventEnvelope, key: &str) -> Option<String> {
+    payload_string(event, key).filter(|value| !value.is_empty())
 }
 
 pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {

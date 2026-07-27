@@ -1061,8 +1061,9 @@ impl<D> Session<D> {
         // Re-point the provider secret sink at the carried redactor: the
         // constructor above bound it to the from_env one just replaced.
         fresh.install_provider_secret_sink();
-        // The code-swarm wiring is launch configuration, not session state:
-        // a fresh session in the same process keeps the review-gate tool.
+        // Extension wiring is launch configuration, not session state: a
+        // fresh session in the same process keeps generic root contributions
+        // and the transitional CodeSwarm review-gate tool.
         fresh.code_swarm_extension = code_swarm_extension;
         fresh.extensions = extensions;
         Ok(fresh)
@@ -2908,8 +2909,7 @@ impl<D: PermissionDecider> Session<D> {
         tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
     ) -> Result<CompactionStatus, SessionError> {
         let model_call_id = shadow.model_call_id.clone();
-        let result =
-            self.finish_shadow_compaction(shadow, outcome, disposition, tool_catalog);
+        let result = self.finish_shadow_compaction(shadow, outcome, disposition, tool_catalog);
         self.fail_closed_if_unterminalized(&model_call_id, &result);
         result
     }

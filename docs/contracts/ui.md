@@ -79,9 +79,11 @@ check marker and cross out only the step text (never the tree gutter);
 `[ ]`. Legacy summary-only events retain the compact `Updated Plan: …` row.
 
 When an extension model tool emits a causally descended, identically
-attributed plan update, its successful generic JSON result row is omitted so
-the checklist is the one coherent UI action. The tool call, plan update, and
-tool result all remain in provenance. A failed result is never hidden.
+attributed plan update, its successful generic JSON result row is omitted only
+when the originating call and result carry the same nonempty provider call
+`id`, so the checklist is the one coherent UI action. The tool call, plan
+update, and tool result all remain in provenance. A failed, malformed, or
+mismatched result is never hidden.
 
 ### Diff rendering
 

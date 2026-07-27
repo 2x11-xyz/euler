@@ -2044,7 +2044,81 @@ fn malformed_structured_plan_update_falls_back_to_legacy_summary() {
 }
 
 #[test]
-fn extension_model_tool_plan_side_effect_coalesces_success_result_by_causality() {
+fn extension_model_tool_plan_side_effect_coalesces_matching_success_result() {
+    let events = extension_model_tool_plan_events(Some("provider-call"));
+
+    let items = project_tui_entries(&events)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::PlanUpdate(_)))
+            .count(),
+        1
+    );
+    assert!(!items.iter().any(
+        |item| matches!(item, TranscriptItem::ToolResult { name, .. } if name == "workflow_update")
+    ));
+
+    let mut state = TranscriptState::default();
+    for event in events {
+        state.push_event(event);
+    }
+    assert_eq!(state.project_latest_for_ui(), None);
+}
+
+#[test]
+fn extension_model_tool_plan_side_effect_keeps_malformed_or_mismatched_result_visible() {
+    for (case, result_call_id) in [
+        ("mismatched", Some("different-provider-call")),
+        ("empty", Some("")),
+        ("missing", None),
+    ] {
+        let events = extension_model_tool_plan_events(result_call_id);
+
+        let items = project_tui_entries(&events)
+            .into_iter()
+            .map(|entry| entry.item)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, TranscriptItem::PlanUpdate(_)))
+                .count(),
+            1,
+            "{case}"
+        );
+        assert!(
+            items.iter().any(
+                |item| matches!(item, TranscriptItem::ToolResult { name, .. } if name == "workflow_update")
+            ),
+            "{case}"
+        );
+        assert!(
+            matches!(
+                replay_latest_event_for_ui(&events),
+                Some(TranscriptItem::ToolResult { name, .. }) if name == "workflow_update"
+            ),
+            "{case}"
+        );
+
+        let mut state = TranscriptState::default();
+        for event in events {
+            state.push_event(event);
+        }
+        assert!(
+            matches!(
+                state.project_latest_for_ui(),
+                Some(TranscriptItem::ToolResult { name, .. }) if name == "workflow_update"
+            ),
+            "{case}"
+        );
+    }
+}
+
+fn extension_model_tool_plan_events(result_call_id: Option<&str>) -> Vec<EventEnvelope> {
     let call = stream_event(
         "tool-call",
         "agent",
@@ -2092,42 +2166,24 @@ fn extension_model_tool_plan_side_effect_coalesces_success_result_by_causality()
             ("summary", "r2 · active · 1/2 completed".into()),
         ]),
     );
+    let mut result_payload = object([
+        ("name", "workflow_update".into()),
+        ("ok", true.into()),
+        ("output", r#"{"updated":true}"#.into()),
+        ("extension_id", "plan-ext".into()),
+        ("command", "update".into()),
+    ]);
+    if let Some(result_call_id) = result_call_id {
+        result_payload.insert("id".to_owned(), result_call_id.into());
+    }
     let result = stream_event(
         "tool-result",
         "agent",
         Some("tool-call"),
         EventKind::TOOL_RESULT,
-        object([
-            ("id", "provider-call".into()),
-            ("name", "workflow_update".into()),
-            ("ok", true.into()),
-            ("output", r#"{"updated":true}"#.into()),
-            ("extension_id", "plan-ext".into()),
-            ("command", "update".into()),
-        ]),
+        result_payload,
     );
-    let events = vec![call, decision, plan, result];
-
-    let items = project_tui_entries(&events)
-        .into_iter()
-        .map(|entry| entry.item)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        items
-            .iter()
-            .filter(|item| matches!(item, TranscriptItem::PlanUpdate(_)))
-            .count(),
-        1
-    );
-    assert!(!items.iter().any(
-        |item| matches!(item, TranscriptItem::ToolResult { name, .. } if name == "workflow_update")
-    ));
-
-    let mut state = TranscriptState::default();
-    for event in events {
-        state.push_event(event);
-    }
-    assert_eq!(state.project_latest_for_ui(), None);
+    vec![call, decision, plan, result]
 }
 
 #[test]
