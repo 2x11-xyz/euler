@@ -45,6 +45,7 @@ struct CompanionLoop<'a, D> {
     redactor: crate::redaction::SecretRedactor,
     workspace_root: std::path::PathBuf,
     auto_compaction: AutoCompactionPolicy,
+    enabled_extension_ids: std::collections::BTreeSet<String>,
     reasoning_effort: ReasoningEffort,
     /// Per-request provider cap inherited from the parent session
     /// (`--max-output-tokens`). The task budget's cumulative output cap is
@@ -244,6 +245,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             task,
             workspace_root: session.config.root.clone(),
             auto_compaction: session.config.auto_compaction,
+            enabled_extension_ids: session.config.extensions_enabled.clone(),
             reasoning_effort: session.config.reasoning_effort,
             session_max_output_tokens: session.config.max_output_tokens,
             provider_retries: session.config.provider_transport_retries,
@@ -801,6 +803,7 @@ impl<D: PermissionDecider> CompanionLoop<'_, D> {
                 &self.auto_compaction,
                 &std::collections::BTreeSet::new(),
                 project_context.admitted(),
+                Some(&self.enabled_extension_ids),
             )
         } else {
             Vec::new()

@@ -6,6 +6,14 @@ Tool calls must be permission checked, provenance logged, and represented cleanl
 
 Extension tools use the same contract as core tools. There should not be a second-class tool path.
 
+An extension model tool is an explicitly advertised `agent-only` extension
+command (ADR 0018). It uses the same `tool.call` / operation-scoped
+`permission.*` / `tool.result` braid as a core tool, with additive
+`extension_id` and `command` attribution. Core validates its closed, bounded
+input schema before approval, and a successful result is a bounded JSON object.
+Extension host events may occur between call and result; the call id remains
+the canonical pair key. Extension tools are root-session only.
+
 ## Tool Ergonomics
 
 Tools define the agent's information contract. A core tool must support

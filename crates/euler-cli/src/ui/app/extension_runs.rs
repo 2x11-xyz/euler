@@ -41,8 +41,14 @@ impl AppCore {
                     session.set_extension_enabled(&id, enable);
                 }
                 self.rebuild_bottom_surface();
-                let verb = if enable { "enabled" } else { "disabled" };
-                self.teach_notice(format!("extension {verb}: {id}"));
+                let notice = if enable {
+                    format!(
+                        "extension enabled: {id} · restart/resume may be required for model tools or idle hooks"
+                    )
+                } else {
+                    format!("extension disabled: {id}")
+                };
+                self.teach_notice(notice);
                 self.bottom.open_extension_manager();
                 CoreEffect::Render
             }
@@ -82,7 +88,7 @@ impl AppCore {
                 }
                 self.rebuild_bottom_surface();
                 self.teach_notice(format!(
-                    "extension installed · {} · enabled for session",
+                    "extension installed · {} · enabled · restart/resume for model tools or idle hooks",
                     report.id
                 ));
                 self.teach_notice(report.steps_text());

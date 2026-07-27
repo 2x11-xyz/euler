@@ -55,6 +55,25 @@ pull requests that landed them; deeper design rationale lives in
   driver with a concurrent shadow terminalizes and fences both calls, so
   neither provider's late return can append events or swap the canvas.
 
+### Extension workflow scaffolding
+
+- Extension commands can declare bounded model tools and one terminal-idle
+  contributor. Implicit idle work never opens a permission prompt: it runs only
+  with standing authority and records an expected rejected stop otherwise.
+- Session-private extension state now has its own `extension-state` capability.
+  Root sessions allow it and bounded, namespaced `context-slot` updates by
+  default so removable workflows can probe absent or resumed state.
+- Extensions can publish bounded typed plan presentation through
+  `plan-presentation`; core emits canonical structured `plan.update` events
+  and renders one checklist cell without taking ownership of workflow policy.
+- Disabled extensions no longer leak durable context slots into live model
+  snapshots; re-enabling restores their retained state. Extension-authored
+  model text consistently rejects Unicode format controls at every admission
+  boundary.
+- The maintained Python managed-process SDK and examples live in
+  `euler-extensions`; Euler retains only an explicitly test-owned protocol
+  fixture.
+
 ### ChatGPT subscription compatibility
 
 - GPT-5.6 Luna WebSocket requests again disable parallel tool calls, as
@@ -175,9 +194,9 @@ but was never published, so everything below ships together in 0.1.3.
 ### Managed-process extensions (#130, #131, #133)
 
 - Out-of-process extension runtime: extensions run as separate processes
-  over stdio JSON-RPC, with a Python SDK
-  (`python/euler_managed_process_sdk`). Linked managed-process extensions
-  run in live sessions, and round observers can be managed processes.
+  over stdio JSON-RPC, with a Python SDK (now maintained in
+  `euler-extensions`). Linked managed-process extensions run in live sessions,
+  and round observers can be managed processes.
 
 ### Permissions, sandbox, compaction (#122, #125–#129)
 

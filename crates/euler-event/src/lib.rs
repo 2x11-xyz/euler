@@ -56,6 +56,7 @@ impl EventKind {
     /// persistent surface. Audit only: carries counts, never the value.
     pub const SECRET_SCRUBBED: &'static str = "secret.scrubbed";
     pub const EXTENSION_ARTIFACT: &'static str = "extension.artifact";
+    pub const EXTENSION_CONTRIBUTION: &'static str = "extension.contribution";
     pub const AGENT_SPAWN: &'static str = "agent.spawn";
     pub const AGENT_MESSAGE: &'static str = "agent.message";
     pub const AGENT_RESULT: &'static str = "agent.result";
@@ -114,6 +115,7 @@ impl EventKind {
         Self::SECRET_EXPOSURE_DETECTED,
         Self::SECRET_SCRUBBED,
         Self::EXTENSION_ARTIFACT,
+        Self::EXTENSION_CONTRIBUTION,
         Self::AGENT_SPAWN,
         Self::AGENT_MESSAGE,
         Self::AGENT_RESULT,
@@ -238,7 +240,22 @@ mod tests {
             EventKind::ASSISTANT_ACTIVITY,
             object([("message", "working".into())]),
         );
-        assert_round_trip(EventKind::PLAN_UPDATE, object([("summary", "plan".into())]));
+        assert_round_trip(
+            EventKind::PLAN_UPDATE,
+            object([
+                ("source", "extension".into()),
+                ("extension_id", "plan-ext".into()),
+                ("command", "update".into()),
+                ("revision", 1.into()),
+                ("status", "active".into()),
+                ("explanation", "Initial plan".into()),
+                (
+                    "items",
+                    json!([{"step": "Inspect", "status": "in_progress"}]),
+                ),
+                ("summary", "r1 · active · 0/1 completed".into()),
+            ]),
+        );
         assert_round_trip(
             EventKind::TOOL_CALL,
             object([("name", "read".into()), ("input", "file".into())]),
@@ -394,6 +411,17 @@ mod tests {
             ]),
         );
         assert_round_trip(
+            EventKind::EXTENSION_CONTRIBUTION,
+            object([
+                ("extension_id", "workflow-ext".into()),
+                ("command", "idle".into()),
+                ("point", "turn-idle".into()),
+                ("action", "continue".into()),
+                ("accepted", true.into()),
+                ("content", "keep going".into()),
+            ]),
+        );
+        assert_round_trip(
             EventKind::AGENT_SPAWN,
             object([("agent", "child".into()), ("task", "review".into())]),
         );
@@ -445,6 +473,15 @@ mod tests {
     }
 
     #[test]
+    fn legacy_plan_update_summary_and_content_round_trip() {
+        assert_round_trip(EventKind::PLAN_UPDATE, object([("summary", "plan".into())]));
+        assert_round_trip(
+            EventKind::PLAN_UPDATE,
+            object([("content", "older plan".into())]),
+        );
+    }
+
+    #[test]
     fn all_event_kinds_lists_every_kind_constant() {
         let constants = [
             EventKind::USER_MESSAGE,
@@ -478,6 +515,7 @@ mod tests {
             EventKind::SECRET_EXPOSURE_DETECTED,
             EventKind::SECRET_SCRUBBED,
             EventKind::EXTENSION_ARTIFACT,
+            EventKind::EXTENSION_CONTRIBUTION,
             EventKind::AGENT_SPAWN,
             EventKind::AGENT_MESSAGE,
             EventKind::AGENT_RESULT,
@@ -531,7 +569,19 @@ mod tests {
             base(EventKind::USER_MESSAGE, json!({"content": "hello"})),
             base(EventKind::ASSISTANT_MESSAGE, json!({"content": "hi"})),
             base(EventKind::ASSISTANT_ACTIVITY, json!({"message": "working"})),
-            base(EventKind::PLAN_UPDATE, json!({"summary": "plan"})),
+            base(
+                EventKind::PLAN_UPDATE,
+                json!({
+                    "source": "extension",
+                    "extension_id": "plan-ext",
+                    "command": "update",
+                    "revision": 1,
+                    "status": "active",
+                    "explanation": "Initial plan",
+                    "items": [{"step": "Inspect", "status": "in_progress"}],
+                    "summary": "r1 · active · 0/1 completed"
+                }),
+            ),
             base(
                 EventKind::TOOL_CALL,
                 json!({"id": "call-1", "name": "read_file", "input": {"path": "a.txt"}}),
@@ -690,6 +740,17 @@ mod tests {
                 }),
             ),
             base(
+                EventKind::EXTENSION_CONTRIBUTION,
+                json!({
+                    "extension_id": "workflow-ext",
+                    "command": "idle",
+                    "point": "turn-idle",
+                    "action": "continue",
+                    "accepted": true,
+                    "content": "keep going"
+                }),
+            ),
+            base(
                 EventKind::AGENT_SPAWN,
                 json!({"agent": "child", "task": "review"}),
             ),
@@ -756,6 +817,16 @@ mod tests {
     fn assert_ratified_fields_present(event: &EventEnvelope) {
         let required = match event.kind.as_str() {
             EventKind::USER_MESSAGE | EventKind::ASSISTANT_MESSAGE => vec!["content"],
+            EventKind::PLAN_UPDATE => vec![
+                "source",
+                "extension_id",
+                "command",
+                "revision",
+                "status",
+                "explanation",
+                "items",
+                "summary",
+            ],
             EventKind::TOOL_CALL => vec!["id", "name", "input"],
             EventKind::TOOL_RESULT => vec!["id", "name", "ok"],
             EventKind::PERMISSION_PROMPT => vec!["capability", "reason"],
@@ -851,6 +922,9 @@ mod tests {
                     "source_event_ids",
                     "metadata",
                 ]
+            }
+            EventKind::EXTENSION_CONTRIBUTION => {
+                vec!["extension_id", "command", "point", "action", "accepted"]
             }
             EventKind::AGENT_MESSAGE => {
                 vec![

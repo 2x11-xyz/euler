@@ -683,6 +683,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
                 CanvasItem::Message { role, .. } => role.as_str(),
                 CanvasItem::Projection { .. } => "projection",
                 CanvasItem::Slot { .. } => "slot",
+                CanvasItem::ExtensionContribution { .. } => "extension.contribution",
                 CanvasItem::Reasoning { .. } => "reasoning",
                 CanvasItem::ToolCall { .. } => "tool.call",
                 CanvasItem::ToolOutput { .. } => "tool.output",
@@ -1013,6 +1014,250 @@ fn canvas_prompt_renders_projection_items() {
 }
 
 #[test]
+fn extension_continuation_survives_resume_until_selected_then_is_one_shot() {
+    let contribution = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            ("content", "continue once".into()),
+        ]),
+    );
+    let resumed_before_selection =
+        assemble_canvas(std::slice::from_ref(&contribution), &off_policy(usize::MAX));
+    assert!(matches!(
+        resumed_before_selection.as_slice(),
+        [CanvasItem::ExtensionContribution { event_id, content, .. }]
+            if event_id == &contribution.id && content == "continue once"
+    ));
+
+    let snapshot = EventEnvelope::new(
+        "s",
+        "a",
+        Some(contribution.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([(
+            "selected_event_ids",
+            serde_json::json!([contribution.id.clone()]),
+        )]),
+    );
+    let after_selection = assemble_canvas(&[contribution, snapshot], &off_policy(usize::MAX));
+
+    assert!(after_selection.is_empty());
+}
+
+#[test]
+fn compaction_or_child_snapshot_cannot_steal_pending_driver_continuation() {
+    let contribution = EventEnvelope::new(
+        "s",
+        "root",
+        None,
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            ("content", "continue after compaction".into()),
+        ]),
+    );
+    let compaction_snapshot = EventEnvelope::new(
+        "s",
+        "root",
+        None,
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            (
+                "selected_event_ids",
+                serde_json::json!([contribution.id.clone()]),
+            ),
+            ("purpose", "compaction".into()),
+        ]),
+    );
+    let child_snapshot = EventEnvelope::new(
+        "s",
+        "child-1",
+        None,
+        EventKind::CANVAS_SNAPSHOT,
+        object([(
+            "selected_event_ids",
+            serde_json::json!([contribution.id.clone()]),
+        )]),
+    );
+    let pending = [contribution.clone(), compaction_snapshot, child_snapshot];
+    let next_driver_canvas = assemble_canvas(&pending, &off_policy(usize::MAX));
+    assert!(matches!(
+        next_driver_canvas.as_slice(),
+        [CanvasItem::ExtensionContribution { event_id, content, .. }]
+            if event_id == &contribution.id && content == "continue after compaction"
+    ));
+
+    let driver_snapshot = EventEnvelope::new(
+        "s",
+        "root",
+        None,
+        EventKind::CANVAS_SNAPSHOT,
+        object([(
+            "selected_event_ids",
+            serde_json::json!([contribution.id.clone()]),
+        )]),
+    );
+    let consumed = assemble_canvas(
+        &pending
+            .into_iter()
+            .chain(std::iter::once(driver_snapshot))
+            .collect::<Vec<_>>(),
+        &off_policy(usize::MAX),
+    );
+    assert!(consumed.is_empty());
+}
+
+#[test]
+fn accepted_extension_continuation_is_committed_even_if_owner_is_now_disabled() {
+    let contribution = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            ("content", "resume after crash".into()),
+        ]),
+    );
+    let resumed = assemble_canvas_with_compaction_for_extensions(
+        std::slice::from_ref(&contribution),
+        &off_policy(usize::MAX),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(matches!(
+        resumed.as_slice(),
+        [CanvasItem::ExtensionContribution { event_id, content, .. }]
+            if event_id == &contribution.id && content == "resume after crash"
+    ));
+
+    let selected_snapshot = EventEnvelope::new(
+        "s",
+        "a",
+        Some(contribution.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([(
+            "selected_event_ids",
+            serde_json::json!([contribution.id.clone()]),
+        )]),
+    );
+    let consumed = assemble_canvas(&[contribution, selected_snapshot], &off_policy(usize::MAX));
+    assert!(consumed.is_empty());
+}
+
+#[test]
+fn pending_extension_continuation_is_pinned_before_an_applied_full_swap_frontier() {
+    let old = EventEnvelope::new(
+        "s",
+        "root",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "old request".into())]),
+    );
+    let contribution = EventEnvelope::new(
+        "s",
+        "root",
+        Some(old.id.clone()),
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            ("content", "resume committed work".into()),
+        ]),
+    );
+    let resumed = EventEnvelope::new(
+        "s",
+        "root",
+        Some(contribution.id.clone()),
+        EventKind::SESSION_RESUMED,
+        object([("events_folded", 2.into())]),
+    );
+    let frontier = EventEnvelope::new(
+        "s",
+        "root",
+        Some(resumed.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "post-swap frontier".into())]),
+    );
+    let answer = EventEnvelope::new(
+        "s",
+        "root",
+        Some(frontier.id.clone()),
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "post-frontier answer".into())]),
+    );
+    let swap = EventEnvelope::new(
+        "s",
+        "root",
+        Some(answer.id.clone()),
+        EventKind::CANVAS_SWAP,
+        object([
+            ("snapshot_start_id", old.id.clone().into()),
+            ("snapshot_end_id", resumed.id.clone().into()),
+            ("frontier_start_id", frontier.id.clone().into()),
+            ("policy_version", "1".into()),
+            ("projection_schema_version", "1".into()),
+            ("projection_blob", "old history compacted".into()),
+            ("validation_result", "pass".into()),
+        ]),
+    );
+    let mut events = vec![old, contribution.clone(), resumed, frontier, answer, swap];
+
+    let applied = assemble_canvas(&events, &off_policy(usize::MAX));
+    assert_eq!(
+        applied.iter().map(CanvasItem::event_id).collect::<Vec<_>>(),
+        vec![
+            events[5].id.as_str(),
+            contribution.id.as_str(),
+            events[3].id.as_str(),
+            events[4].id.as_str(),
+        ],
+        "the pre-frontier continuation stays between the projection and the ordered frontier"
+    );
+
+    events.push(EventEnvelope::new(
+        "s",
+        "root",
+        Some(events[5].id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([(
+            "selected_event_ids",
+            serde_json::json!([contribution.id.clone()]),
+        )]),
+    ));
+    let selected = assemble_canvas(&events, &off_policy(usize::MAX));
+    assert!(
+        selected.iter().all(|item| {
+            !matches!(
+                item,
+                CanvasItem::ExtensionContribution { event_id, .. }
+                    if event_id == &contribution.id
+            )
+        }),
+        "the same-agent root-driver snapshot consumes the pinned one-shot input"
+    );
+}
+
+#[test]
 fn context_slot_survives_compaction_and_renders_after_projection() {
     let old = EventEnvelope::new(
         "s",
@@ -1110,6 +1355,38 @@ fn context_slot_last_update_wins_per_extension_and_slot() {
             },
         ]
     );
+}
+
+#[test]
+fn context_slot_projects_only_while_its_owner_is_enabled() {
+    let update = slot_event("observer", "main", "durable workflow state");
+    let enabled = BTreeSet::from(["observer".to_owned()]);
+    let visible = assemble_canvas_with_compaction_for_extensions(
+        std::slice::from_ref(&update),
+        &AutoCompactionPolicy::default(),
+        &BTreeSet::new(),
+        &enabled,
+    );
+    assert!(matches!(
+        visible.as_slice(),
+        [CanvasItem::Slot { event_id, .. }] if event_id == &update.id
+    ));
+
+    let hidden = assemble_canvas_with_compaction_for_extensions(
+        std::slice::from_ref(&update),
+        &AutoCompactionPolicy::default(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(hidden.is_empty());
+
+    let restored = assemble_canvas_with_compaction_for_extensions(
+        std::slice::from_ref(&update),
+        &AutoCompactionPolicy::default(),
+        &BTreeSet::new(),
+        &enabled,
+    );
+    assert_eq!(restored, visible);
 }
 
 #[test]
@@ -1737,6 +2014,7 @@ fn prefolded_assembly_uses_the_callers_project_context_snapshot() {
         &AutoCompactionPolicy::default(),
         &BTreeSet::new(),
         Some(&pinned),
+        None,
     );
 
     assert!(matches!(

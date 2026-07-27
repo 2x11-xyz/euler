@@ -1,7 +1,8 @@
 //! Extension host registration and host API implementations.
 //! Justification for >1000 lines: this file currently owns native command
 //! registration, capability decisions, artifact writes, checkpoints, agent
-//! records, and context slot updates; split by host API family after SDK registration consolidates.
+//! records, context slot updates, and plan presentation; split by host API
+//! family after SDK registration consolidates.
 use crate::canvas::fold_context_slot_state;
 use crate::durability::sync_dir;
 use crate::home::{containing_dir, ensure_private_dir, private_open_options, set_file_mode_0600};
@@ -9,8 +10,9 @@ use crate::{query_provenance, ProvenanceQuery, ProvenanceWriter};
 use euler_agents::ExtensionAgentRecordContext;
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_sdk::{
-    valid_checkpoint_name, EventFeedCheckpoint, EventFeedCheckpointError, Invocation,
-    MAX_EVENT_FEED_CHECKPOINT_BYTES,
+    valid_checkpoint_name, validate_model_tool_descriptor, validate_plan_presentation,
+    EventFeedCheckpoint, EventFeedCheckpointError, IdleContributionDescriptor, Invocation,
+    PlanItemStatus, PlanPresentation, MAX_EVENT_FEED_CHECKPOINT_BYTES,
 };
 use euler_sdk::{AgentOutcome, SpawnAgentTask};
 use euler_sdk::{ArtifactRecord, ArtifactWrite, Capability, CommandContext, CommandRegistrar};
@@ -75,8 +77,9 @@ pub struct ExtensionHost {
     extensions: BTreeMap<String, ExtensionRecord>,
     commands: BTreeMap<String, CommandRecord>,
     /// Secret redaction for host-API emissions that inject external text
-    /// into the ledger/canvas (context slots). Hosts constructed without an
-    /// explicit redactor still get the token-shape layer via the default.
+    /// into the ledger or canvas (context slots and plan presentation). Hosts
+    /// constructed without an explicit redactor still get the token-shape
+    /// layer via the default.
     redactor: crate::redaction::SecretRedactor,
 }
 
@@ -119,6 +122,13 @@ impl QueuedExtensionEvents {
 
 struct ExtensionRecord {
     disabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExtensionDeclaration {
+    pub(crate) id: String,
+    pub(crate) commands: BTreeMap<String, CommandDescriptor>,
+    pub(crate) idle_contribution: Option<IdleContributionDescriptor>,
 }
 
 impl ExtensionHost {
@@ -183,9 +193,9 @@ impl ExtensionHost {
         (host, queue)
     }
 
-    /// Attach the owning session's secret redactor so host-API emissions
-    /// (context slots) mask registered secret values, not only token
-    /// shapes. Hosts without one keep the shape-only default.
+    /// Attach the owning session's secret redactor so extension-authored
+    /// context slots and plan presentation mask registered secret values,
+    /// not only token shapes. Hosts without one keep the shape-only default.
     pub fn with_redactor(mut self, redactor: crate::redaction::SecretRedactor) -> Self {
         self.redactor = redactor;
         self
@@ -627,7 +637,7 @@ impl HostApi for CommandHost<'_> {
 
     fn state_dir(&self) -> Result<PathBuf, ExtensionError> {
         let _guard = ExtensionPanicSuppressionGuard::suspend_for_host_api();
-        self.require_capability(Capability::FsWrite)?;
+        self.require_capability(Capability::ExtensionState)?;
         ensure_extension_state_dir(&self.log_path, &self.extension_id)
     }
 
@@ -825,6 +835,83 @@ impl HostApi for CommandHost<'_> {
             .map(|_| ())
             .map_err(|error| context_slot_failed(error.to_string()))
     }
+
+    fn update_plan_presentation(
+        &self,
+        mut presentation: PlanPresentation,
+    ) -> Result<(), ExtensionError> {
+        let _guard = ExtensionPanicSuppressionGuard::suspend_for_host_api();
+        self.require_capability(Capability::PlanPresentation)?;
+        // Plan text is extension-authored and reaches the durable transcript.
+        // Redact before validation so replacement inflation is measured
+        // against the same bounds as the exact payload that will persist.
+        if let Some(explanation) = presentation.explanation.as_mut() {
+            *explanation = self.redactor.redact(explanation);
+        }
+        for item in &mut presentation.items {
+            item.step = self.redactor.redact(&item.step);
+        }
+        validate_plan_presentation(&presentation).map_err(plan_presentation_failed)?;
+        let recorder = self
+            .artifact_recorder
+            .as_ref()
+            .ok_or_else(|| plan_presentation_failed("provenance writer unavailable"))?;
+        if !recorder.has_durable_tail() {
+            return Err(plan_presentation_failed(
+                "plan presentation requires a persisted session event",
+            ));
+        }
+
+        let completed = presentation
+            .items
+            .iter()
+            .filter(|item| item.status == PlanItemStatus::Completed)
+            .count();
+        let summary = format!(
+            "r{} · {} · {completed}/{} completed",
+            presentation.revision,
+            presentation.status.as_str(),
+            presentation.items.len()
+        );
+        let items = presentation
+            .items
+            .into_iter()
+            .map(|item| {
+                Value::Object(object([
+                    ("step", item.step.into()),
+                    ("status", item.status.as_str().into()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let session_id = recorder.session_id.clone();
+        let agent_id = recorder.agent_id.clone();
+        let extension_id = self.extension_id.clone();
+        let command = self.command_name.clone();
+        recorder
+            .record_parented_events(|_| {
+                vec![EventEnvelope::new(
+                    session_id,
+                    agent_id,
+                    None,
+                    EventKind::PLAN_UPDATE,
+                    object([
+                        ("source", "extension".into()),
+                        ("extension_id", extension_id.into()),
+                        ("command", command.into()),
+                        ("revision", presentation.revision.into()),
+                        ("status", presentation.status.as_str().into()),
+                        (
+                            "explanation",
+                            presentation.explanation.map_or(Value::Null, Value::String),
+                        ),
+                        ("items", Value::Array(items)),
+                        ("summary", summary.into()),
+                    ]),
+                )]
+            })
+            .map(|_| ())
+            .map_err(|error| plan_presentation_failed(error.to_string()))
+    }
 }
 
 impl ArtifactRecorder {
@@ -961,23 +1048,16 @@ fn validate_context_slot_content(content: &str) -> Result<(), ExtensionError> {
     if content.len() > MAX_CONTEXT_SLOT_CONTENT_BYTES {
         return Err(context_slot_failed("content exceeds 4096 bytes"));
     }
-    if content.chars().any(|character| {
-        (character.is_control() && character != '\n') || is_format_spoof(character)
-    }) {
+    if content
+        .chars()
+        .any(|character| character.is_control() && character != '\n')
+        || !euler_sdk::extension_model_text_is_format_safe(content)
+    {
         return Err(context_slot_failed(
             "content contains unsupported control character",
         ));
     }
     Ok(())
-}
-
-/// Unicode format characters that survive `char::is_control` but can spoof
-/// or reorder rendered canvas text: zero-width class, bidi controls, BOM.
-fn is_format_spoof(character: char) -> bool {
-    matches!(
-        character,
-        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
-    )
 }
 
 fn current_context_slots(
@@ -1017,6 +1097,10 @@ fn current_context_slots(
 
 fn context_slot_failed(error: impl fmt::Display) -> ExtensionError {
     ExtensionError::ContextSlotFailed(error.to_string())
+}
+
+fn plan_presentation_failed(error: impl fmt::Display) -> ExtensionError {
+    ExtensionError::PlanPresentationFailed(error.to_string())
 }
 
 fn diagnostics_read_failed(error: impl fmt::Display) -> ExtensionError {
@@ -1399,6 +1483,20 @@ fn command_capabilities(
     descriptor: &CommandDescriptor,
     manifest_capabilities: &BTreeSet<Capability>,
 ) -> Result<BTreeSet<Capability>, ExtensionHostError> {
+    if let Some(model_tool) = &descriptor.model_tool {
+        if !descriptor.invocation.is_agent_only() {
+            return Err(registration_message(
+                extension_id,
+                format!("command `{command}` model tool must be agent-only"),
+            ));
+        }
+        validate_model_tool_descriptor(model_tool).map_err(|error| {
+            registration_message(
+                extension_id,
+                format!("command `{command}` has invalid model tool: {error}"),
+            )
+        })?;
+    }
     let capabilities = descriptor
         .required_capabilities
         .iter()
@@ -1417,6 +1515,74 @@ fn command_capabilities(
         ));
     }
     Ok(capabilities)
+}
+
+pub(crate) fn extension_declaration(
+    extension: &dyn Extension,
+) -> Result<ExtensionDeclaration, ExtensionHostError> {
+    let manifest = catch_extension_unwind(|| extension.manifest())
+        .map_err(|_| ExtensionHostError::RegistrationPanic(None))?;
+    let id = manifest.id;
+    if !valid_identifier(&id) {
+        return Err(ExtensionHostError::InvalidExtensionId(id));
+    }
+    let capabilities = manifest.capabilities.into_iter().collect::<BTreeSet<_>>();
+    let mut registrar = PendingRegistrar::default();
+    catch_extension_unwind(|| extension.register(&mut registrar))
+        .map_err(|_| ExtensionHostError::RegistrationPanic(Some(id.clone())))?
+        .map_err(|source| ExtensionHostError::RegistrationFailed(id.clone(), source))?;
+    validate_pending_commands(&registrar.0, &BTreeMap::new())?;
+
+    let mut commands = BTreeMap::new();
+    let mut model_tools = BTreeSet::new();
+    for (name, runner) in registrar.0 {
+        let descriptor = command_descriptor(&name, runner.as_ref());
+        command_capabilities(&id, &name, &descriptor, &capabilities)?;
+        if let Some(model_tool) = &descriptor.model_tool {
+            if !model_tools.insert(model_tool.name.clone()) {
+                return Err(registration_message(
+                    &id,
+                    format!("duplicate model tool name: {}", model_tool.name),
+                ));
+            }
+        }
+        commands.insert(name, descriptor);
+    }
+
+    let idle_contribution = catch_extension_unwind(|| extension.idle_contribution())
+        .map_err(|_| ExtensionHostError::RegistrationPanic(Some(id.clone())))?;
+    if let Some(idle) = &idle_contribution {
+        let Some(command) = commands.get(&idle.command) else {
+            return Err(registration_message(
+                &id,
+                format!(
+                    "idle contribution command `{}` is not registered",
+                    idle.command
+                ),
+            ));
+        };
+        if !command.invocation.is_agent_only() {
+            return Err(registration_message(
+                &id,
+                format!(
+                    "idle contribution command `{}` must be agent-only",
+                    idle.command
+                ),
+            ));
+        }
+    }
+    Ok(ExtensionDeclaration {
+        id,
+        commands,
+        idle_contribution,
+    })
+}
+
+fn registration_message(extension_id: &str, message: String) -> ExtensionHostError {
+    ExtensionHostError::RegistrationFailed(
+        extension_id.to_owned(),
+        ExtensionError::Message(message),
+    )
 }
 
 /// The declared invocation of `command` on `extension`, if it registers one.

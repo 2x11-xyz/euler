@@ -3,14 +3,15 @@ use super::{
     text::display_width,
     theme::Theme,
     transcript::{
-        normalized_shell_command, project_events, projection_event_visits,
+        normalized_shell_command, project_events, project_tui_entries, projection_event_visits,
         render_items_for_history, render_items_for_history_with_limit, render_line_oriented,
         replay_latest_event_for_ui, reset_projection_event_visits, transcript_widget,
-        TranscriptItem,
+        PlanUpdateView, TranscriptItem,
     },
 };
 use crate::ui::test_support::{event, event_at, snapshot_text};
 use euler_event::{object, EventEnvelope, EventKind};
+use euler_sdk::{PlanItemStatus, PlanPresentationItem, PlanPresentationStatus};
 use insta::assert_snapshot;
 use ratatui::{layout::Rect, style::Style, text::Line, Terminal};
 
@@ -1856,7 +1857,9 @@ fn projects_slice2_events_without_opaque_reasoning_artifacts() {
     assert_eq!(
         project_events(&events),
         vec![
-            TranscriptItem::PlanUpdate("inspect renderer".to_owned()),
+            TranscriptItem::PlanUpdate(PlanUpdateView::Legacy {
+                summary: "inspect renderer".to_owned(),
+            }),
             TranscriptItem::ModelReasoning {
                 fidelity: "summary".to_owned(),
                 content: "Checked the projection path.".to_owned(),
@@ -1899,6 +1902,353 @@ fn projects_slice2_events_without_opaque_reasoning_artifacts() {
             },
         ]
     );
+}
+
+#[test]
+fn structured_plan_update_projects_and_renders_a_wrapped_status_checklist() {
+    let event = event(
+        EventKind::PLAN_UPDATE,
+        object([
+            ("revision", 4.into()),
+            ("status", "active".into()),
+            (
+                "explanation",
+                "Adjusted after inspecting the runtime boundary.".into(),
+            ),
+            (
+                "items",
+                serde_json::json!([
+                    {"step": "Inspect the boundary", "status": "completed"},
+                    {
+                        "step": "Implement the typed plan presentation path with a deliberately long wrapped checklist row",
+                        "status": "in_progress"
+                    },
+                    {"step": "Run the focused checks", "status": "pending"}
+                ]),
+            ),
+            ("summary", "r4 · active · 1/3 completed".into()),
+        ]),
+    );
+    let expected = PlanUpdateView::Structured {
+        summary: "r4 · active · 1/3 completed".to_owned(),
+        revision: 4,
+        status: PlanPresentationStatus::Active,
+        explanation: Some("Adjusted after inspecting the runtime boundary.".to_owned()),
+        items: vec![
+            PlanPresentationItem {
+                step: "Inspect the boundary".to_owned(),
+                status: PlanItemStatus::Completed,
+            },
+            PlanPresentationItem {
+                step: "Implement the typed plan presentation path with a deliberately long wrapped checklist row".to_owned(),
+                status: PlanItemStatus::InProgress,
+            },
+            PlanPresentationItem {
+                step: "Run the focused checks".to_owned(),
+                status: PlanItemStatus::Pending,
+            },
+        ],
+    };
+
+    assert_eq!(
+        project_events(std::slice::from_ref(&event)),
+        vec![TranscriptItem::PlanUpdate(expected.clone())]
+    );
+    assert_eq!(
+        render_line_oriented(std::slice::from_ref(&event)),
+        concat!(
+            "plan.update: r4 · active · 1/3 completed\n",
+            "plan.explanation: Adjusted after inspecting the runtime boundary.\n",
+            "plan.item: 1: completed: Inspect the boundary\n",
+            "plan.item: 2: in_progress: Implement the typed plan presentation path with a deliberately long wrapped checklist row\n",
+            "plan.item: 3: pending: Run the focused checks\n",
+        )
+    );
+
+    let theme = Theme::default();
+    let lines = render_items_for_history(&[TranscriptItem::PlanUpdate(expected)], &theme, 48);
+    let rendered = line_texts(&lines).join("\n");
+    assert!(rendered.contains("Updated Plan"), "{rendered}");
+    assert!(rendered.contains("1. ✓ Inspect the boundary"), "{rendered}");
+    assert!(
+        rendered.contains("3. [ ] Run the focused checks"),
+        "{rendered}"
+    );
+    assert!(lines.len() > 5, "long active row should wrap");
+
+    let completed_chrome = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .find(|span| span.content.contains("1. ✓"))
+        .expect("completed checklist chrome");
+    assert!(completed_chrome
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::DIM));
+    assert!(!completed_chrome
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::CROSSED_OUT));
+    let completed_step = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .find(|span| span.content.contains("Inspect the boundary"))
+        .expect("completed step text");
+    assert!(completed_step
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::CROSSED_OUT));
+    let in_progress = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .find(|span| span.content.contains("2. "))
+        .expect("active step");
+    assert_eq!(in_progress.style.fg, theme.transcript.warning.fg);
+    assert!(in_progress
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
+    let completed_gutter = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content.contains("1. ✓")))
+        .and_then(|line| line.spans.first())
+        .expect("completed gutter");
+    assert!(!completed_gutter
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::CROSSED_OUT));
+}
+
+#[test]
+fn malformed_structured_plan_update_falls_back_to_legacy_summary() {
+    let events = vec![event(
+        EventKind::PLAN_UPDATE,
+        object([
+            ("revision", 1.into()),
+            ("status", "future-status".into()),
+            ("items", serde_json::json!([])),
+            ("summary", "legacy-compatible summary".into()),
+        ]),
+    )];
+
+    assert_eq!(
+        project_events(&events),
+        vec![TranscriptItem::PlanUpdate(PlanUpdateView::Legacy {
+            summary: "legacy-compatible summary".to_owned(),
+        })]
+    );
+    assert_eq!(
+        render_line_oriented(&events),
+        "plan.update: legacy-compatible summary\n"
+    );
+}
+
+#[test]
+fn extension_model_tool_plan_side_effect_coalesces_success_result_by_causality() {
+    let call = stream_event(
+        "tool-call",
+        "agent",
+        Some("model-result"),
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "provider-call".into()),
+            ("name", "workflow_update".into()),
+            ("input", serde_json::json!({"step": "Implement"})),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+        ]),
+    );
+    let decision = stream_event(
+        "permission-decision",
+        "agent",
+        Some("tool-call"),
+        EventKind::PERMISSION_DECISION,
+        object([
+            ("capability", "plan-presentation".into()),
+            ("allowed", true.into()),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+        ]),
+    );
+    let plan = stream_event(
+        "plan-update",
+        "agent",
+        Some("permission-decision"),
+        EventKind::PLAN_UPDATE,
+        object([
+            ("source", "extension".into()),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+            ("revision", 2.into()),
+            ("status", "active".into()),
+            ("explanation", "Implementation started.".into()),
+            (
+                "items",
+                serde_json::json!([
+                    {"step": "Inspect", "status": "completed"},
+                    {"step": "Implement", "status": "in_progress"}
+                ]),
+            ),
+            ("summary", "r2 · active · 1/2 completed".into()),
+        ]),
+    );
+    let result = stream_event(
+        "tool-result",
+        "agent",
+        Some("tool-call"),
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "provider-call".into()),
+            ("name", "workflow_update".into()),
+            ("ok", true.into()),
+            ("output", r#"{"updated":true}"#.into()),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+        ]),
+    );
+    let events = vec![call, decision, plan, result];
+
+    let items = project_tui_entries(&events)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::PlanUpdate(_)))
+            .count(),
+        1
+    );
+    assert!(!items.iter().any(
+        |item| matches!(item, TranscriptItem::ToolResult { name, .. } if name == "workflow_update")
+    ));
+
+    let mut state = TranscriptState::default();
+    for event in events {
+        state.push_event(event);
+    }
+    assert_eq!(state.project_latest_for_ui(), None);
+}
+
+#[test]
+fn unrelated_plan_update_does_not_hide_extension_tool_result() {
+    let call = stream_event(
+        "tool-call",
+        "agent",
+        None,
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "provider-call".into()),
+            ("name", "workflow_update".into()),
+            ("input", serde_json::json!({})),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+        ]),
+    );
+    let unrelated_plan = stream_event(
+        "plan-update",
+        "agent",
+        None,
+        EventKind::PLAN_UPDATE,
+        object([
+            ("source", "extension".into()),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+            ("summary", "unrelated".into()),
+        ]),
+    );
+    let result = stream_event(
+        "tool-result",
+        "agent",
+        Some("tool-call"),
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "provider-call".into()),
+            ("name", "workflow_update".into()),
+            ("ok", true.into()),
+            ("output", r#"{"updated":true}"#.into()),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+        ]),
+    );
+
+    let items = project_tui_entries(&[call, unrelated_plan, result])
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect::<Vec<_>>();
+    assert!(items.iter().any(
+        |item| matches!(item, TranscriptItem::ToolResult { name, .. } if name == "workflow_update")
+    ));
+}
+
+#[test]
+fn malformed_attributed_plan_update_does_not_hide_extension_tool_result() {
+    let call = stream_event(
+        "tool-call",
+        "agent",
+        None,
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "provider-call".into()),
+            ("name", "workflow_update".into()),
+            ("input", serde_json::json!({})),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+        ]),
+    );
+    let malformed_plan = stream_event(
+        "plan-update",
+        "agent",
+        Some("tool-call"),
+        EventKind::PLAN_UPDATE,
+        object([
+            ("source", "extension".into()),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+            ("revision", 1.into()),
+            ("status", "active".into()),
+            ("explanation", serde_json::Value::Null),
+            (
+                "items",
+                serde_json::json!([{"step": "Missing summary", "status": "in_progress"}]),
+            ),
+        ]),
+    );
+    let result = stream_event(
+        "tool-result",
+        "agent",
+        Some("tool-call"),
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "provider-call".into()),
+            ("name", "workflow_update".into()),
+            ("ok", true.into()),
+            ("output", r#"{"updated":true}"#.into()),
+            ("extension_id", "plan-ext".into()),
+            ("command", "update".into()),
+        ]),
+    );
+    let events = vec![call, malformed_plan, result];
+
+    let items = project_tui_entries(&events)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect::<Vec<_>>();
+    assert!(!items
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::PlanUpdate(_))));
+    assert!(items.iter().any(
+        |item| matches!(item, TranscriptItem::ToolResult { name, .. } if name == "workflow_update")
+    ));
+
+    let mut state = TranscriptState::default();
+    for event in events {
+        state.push_event(event);
+    }
+    assert!(matches!(
+        state.project_latest_for_ui(),
+        Some(TranscriptItem::ToolResult { name, .. }) if name == "workflow_update"
+    ));
 }
 
 #[test]

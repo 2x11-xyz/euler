@@ -30,12 +30,14 @@ Minimum v0 scopes:
 
 - `fs-read`
 - `fs-write`
+- `extension-state`
 - `provenance-read`
 - `diagnostics-read`
 - `artifact-write`
 - `agent-record`
 - `agent-spawn`
 - `context-slot`
+- `plan-presentation`
 - `shell-exec`
 - `network`
 - `config-write`
@@ -111,6 +113,13 @@ into a project or durable user rule. Piped headless runs cannot prompt (stdin
 is the command protocol): there, explicitly invoking a named command grants
 its declared capabilities for that run, announced on stderr — visible, never
 silent.
+
+Terminal-idle contributions are implicit lifecycle work and therefore never
+open this operation prompt. Every required capability must be
+`session-allow`, or be `ask`/unconfigured and covered by an existing grant.
+`always-deny` always rejects. Missing standing authority stops the contribution
+before its command starts; the rejected stop is recorded without an `error`
+event. Explicit model tools retain the ordinary operation-level prompt above.
 
 ## Install consent (extension distribution)
 
@@ -359,7 +368,13 @@ diagnostics log lines. It is not raw filesystem read access.
 
 `artifact-write` gates host-mediated extension artifact writes. It is not raw
 filesystem write access and does not permit arbitrary extension state writes.
-Extension private state directory access remains `fs-write`-gated.
+
+`extension-state` gates `HostApi::state_dir`, which returns the calling
+extension's session-private directory. The directory is namespaced by
+extension id, but it is intentionally one read/write scope: native and
+managed-process extensions are trusted code rather than OS-sandboxed peers, so
+claiming separate host-enforced read and write authority after returning a raw
+path would be dishonest. This does not grant workspace file access.
 
 `agent-record` gates host-mediated immediate child-agent completion records.
 It lets an extension command ask the host to append one validated `agent.spawn`
@@ -411,12 +426,20 @@ extension command to append bounded `context.slot.updated` events for slots
 namespaced to that extension id. It does not grant raw provenance reads,
 arbitrary canvas control, or cross-extension slot writes.
 
+`plan-presentation` gates host-mediated typed plan presentation. It permits an
+extension command to append bounded, attributed `plan.update` events. It does
+not grant arbitrary event emission, context-slot writes, direct canvas
+admission, or authority over another extension's workflow state.
+
 `fs-read` defaults to `session-allow`: read tools execute without prompting,
-but every execution records a permission decision event. `fs-write`,
-`shell-exec`, and root-session `agent-spawn` default to `ask`. Unconfigured
-capabilities remain `always-deny`; child-agent gates start deny-all and inherit
-only their explicit attenuated envelope. Headless auto-approve tiers override
-these root defaults with the explicit mapping above.
+but every execution records a permission decision event. Root-session
+`extension-state`, `context-slot`, and `plan-presentation` also default to
+`session-allow`; each is extension-attributed and bounded as described above.
+`fs-write`, `shell-exec`, and root-session `agent-spawn` default to `ask`.
+Unconfigured capabilities remain `always-deny`; child-agent gates start
+deny-all and inherit only their explicit attenuated envelope. Headless
+auto-approve tiers override these root defaults with the explicit mapping
+above.
 
 **Sensitive-basename ask.** A blanket `session-allow` never covers a tool
 request whose path names a categorically sensitive file. When a path-taking

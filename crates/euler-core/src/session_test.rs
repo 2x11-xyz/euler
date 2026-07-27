@@ -1202,6 +1202,88 @@ fn live_extension_context_slot_update_enters_next_canvas_and_model_input() {
 }
 
 #[test]
+fn disabling_context_slot_owner_hides_next_snapshot_and_reenable_restores_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let captured = Arc::new(Mutex::new(None));
+    let mut config = SessionConfig::new(temp.path());
+    config.provider = "capture".to_owned();
+    config.model = "test-model".to_owned();
+    enable_test_extensions(&mut config, &["slot-ext"]);
+    let mut session = Session::new(
+        config,
+        CapturingProvider::new(Arc::clone(&captured)),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    let extension = test_extension(
+        "slot-ext",
+        vec![Capability::ContextSlot],
+        TestCommandBehavior::Slot {
+            slot: "main",
+            content: "durable context",
+        },
+    );
+    session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::ContextSlot])
+        .expect("write durable slot");
+    let slot_id = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::CONTEXT_SLOT_UPDATED)
+        .expect("slot event")
+        .id
+        .clone();
+
+    session.set_extension_enabled("slot-ext", false);
+    session.run_turn("while disabled").expect("disabled turn");
+    let disabled_snapshot = session
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .expect("disabled snapshot");
+    assert!(!disabled_snapshot.payload["selected_event_ids"]
+        .as_array()
+        .expect("selected ids")
+        .iter()
+        .any(|id| id.as_str() == Some(slot_id.as_str())));
+    assert!(!captured
+        .lock()
+        .expect("captured request")
+        .as_ref()
+        .expect("disabled model request")
+        .input
+        .iter()
+        .any(|item| matches!(item, ModelInputItem::Message { content, .. } if content.contains("[slot slot-ext:main]"))));
+
+    session.set_extension_enabled("slot-ext", true);
+    session
+        .run_turn("after re-enable")
+        .expect("re-enabled turn");
+    let restored_snapshot = session
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .expect("restored snapshot");
+    assert!(restored_snapshot.payload["selected_event_ids"]
+        .as_array()
+        .expect("selected ids")
+        .iter()
+        .any(|id| id.as_str() == Some(slot_id.as_str())));
+    assert!(captured
+        .lock()
+        .expect("captured request")
+        .as_ref()
+        .expect("re-enabled model request")
+        .input
+        .iter()
+        .any(|item| matches!(item, ModelInputItem::Message { content, .. } if content == "[slot slot-ext:main]\n    durable context")));
+}
+
+#[test]
 fn live_extension_agent_records_publish_to_session_and_stay_out_of_canvas() {
     let (_temp, log, mut session) = live_session();
     let start_id = session.events()[0].id.clone();
@@ -3015,6 +3097,7 @@ impl ExtensionCommand for TestCommand {
             required_capabilities,
             args: Vec::new(),
             accepts_session_id: false,
+            model_tool: None,
         }
     }
 

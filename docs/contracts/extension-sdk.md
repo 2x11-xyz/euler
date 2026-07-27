@@ -2,15 +2,17 @@
 
 Extensions register tools, commands, context slots, and workflows through a stable host API. Observer and companion agents are not a core registration category; they are extension compositions of core primitives (agent spawn/result, bounded event subscription, inter-agent message channels).
 
-Implementation status: commands, the bounded event feed, bounded diagnostics
-reads, artifact writes, agent task records, checkpoints, context slot updates,
-the local wake primitive, and a generic managed-process adapter exist today.
+Implementation status: commands, explicitly declared model tools, one
+terminal-idle contribution per root session, the bounded event feed, bounded
+diagnostics reads, artifact writes, agent task records, checkpoints, context
+slot updates, typed plan presentation, the local wake primitive, and a generic
+managed-process adapter exist today.
 Explicitly enabled local packages run through offline and live command surfaces
 and may participate in the generic round-observer composition by declaring an
-observer command pair in their manifest. Extension-registered tools are roadmap
-(Phase 2 of the SDK consolidation);
-nothing in core registers them yet, and this contract's mention of them binds
-their eventual shape, not their present existence.
+ observer command pair in their manifest. The observer chain runs only at a
+ cadence boundary that can be followed by another permitted driver request; an
+ explicit round cap falls through to its limit outcome without running brief,
+ companion, or apply work that no subsequent request could consume.
 
 Core must provide enough SDK surface that extensions do not need to shadow runtime state, parse raw logs directly, or bypass permissions.
 Powerful extensions should be easy because the SDK exposes the right generic
@@ -152,14 +154,65 @@ batch does not duplicate the review subject in every `agent.spawn` event.
 extension; extensions cannot write another extension's slots.
 
 Slot names reuse the event-feed checkpoint grammar below. Content is UTF-8 text
-capped at 4096 bytes; control characters other than newline are rejected. Empty
-content deletes the slot. At most eight active `(extension_id, slot)` pairs are
-allowed per session; a ninth active slot fails without eviction. An identical
-update to the current active content is a no-op and appends no event.
+capped at 4096 bytes; control characters other than newline, Unicode format
+characters (`Cf`), and Unicode line/paragraph separators (`Zl`/`Zp`) are
+rejected. Empty content deletes the slot. At most eight active
+`(extension_id, slot)` pairs are allowed per session; a ninth active slot fails
+without eviction. An identical update to the current active content is a no-op
+and appends no event.
 
 Canvas assembly folds the last update per namespaced slot before compaction
 frontier filtering, renders active slots with core-generated framing, and
-includes the selected slot event ids in `canvas.snapshot`.
+includes the selected slot event ids in `canvas.snapshot`. Live request
+assembly projects a slot only while its owning extension id is currently
+enabled. Disable/removal suppresses it from the next snapshot without erasing
+durable state; re-enabling the same id restores the latest value.
+
+## Plan Presentation v0
+
+`HostApi::update_plan_presentation(presentation)` publishes bounded typed plan
+state without granting arbitrary event-emission or canvas authority. It
+requires `plan-presentation`; the host derives `extension_id` and `command`
+from the active invocation and appends one canonical `plan.update`.
+
+```json
+{
+  "revision": 1,
+  "status": "active",
+  "explanation": "Optional single-line explanation",
+  "items": [
+    {"step": "Inspect the boundary", "status": "completed"},
+    {"step": "Implement the workflow", "status": "in_progress"}
+  ]
+}
+```
+
+`revision` is `1..=i64::MAX`; status is `active`, `blocked`, `waiting`, or
+`completed`; and `items` contains 1..=16 entries whose status is `pending`,
+`in_progress`, or `completed`. Each nonblank step is at most 1024 UTF-8 bytes;
+a non-null explanation is nonblank and at most 4096 bytes. Both are
+single-line and reject ordinary controls, Unicode `Cf`, and `Zl`/`Zp`.
+The host redacts text before validating/persisting it, rejects unknown fields,
+and derives compatibility summary
+`r<revision> · <status> · <completed>/<total> completed`.
+
+Core validates only presentation shape. Revision transitions, in-progress
+cardinality, completion rules, persistence, and whether a plan exists remain
+extension policy. `plan.update` is transcript/provenance presentation, not
+model-canvas state; model-facing workflow state uses an independently gated
+context slot. The TUI renders one `Updated Plan` checklist and, when it is the
+causally attributed side effect of an extension model tool, suppresses only
+that tool's successful generic JSON result row. Provenance retains every event.
+
+## Private Extension State v0
+
+`HostApi::state_dir()` returns
+`<session-dir>/extensions/<extension-id>` and requires `extension-state`.
+The host creates the directory with private permissions where supported.
+Returning a raw directory is one honest read/write scope: extension runtimes
+are trusted code, not OS sandboxes, so the host cannot enforce separate reads
+and writes after returning the path. This capability does not authorize
+workspace reads or writes.
 
 ## Event Feed Checkpoint v0
 
@@ -229,6 +282,118 @@ Command capability rules:
   `register()` method to discover commands, and validates the command names it
   reports. Extension registration must remain side-effect-free.
 
+## Model Tool Registration v0
+
+`CommandDescriptor.model_tool` explicitly exposes an existing command to the
+root session's model. It does not register another executable or bypass command
+capabilities.
+
+- The command must be `agent-only`.
+- The model-visible name is 1..=64 lowercase ASCII bytes using letters,
+  digits, `_`, or `-`, beginning with a letter or `_`.
+- Description, schema descriptions, property names, and string enum values
+  reject controls, Unicode 17 `Cf`, and `Zl`/`Zp`; their respective host
+  bounds apply before advertisement.
+- The input schema uses the host-supported JSON Schema subset. Every object
+  schema is closed with `additionalProperties: false`; unsupported keywords
+  fail registration.
+- Schema bytes, nesting, property counts, and model-supplied input bytes are
+  host-bounded. Input is validated before capability approval or extension
+  execution.
+- Numeric `minimum`/`maximum` ordering and input checks compare the exact
+  canonical JSON decimals represented by `serde_json::Number`, without
+  converting integers through `f64`; adjacent integers above `2^53` therefore
+  remain distinct.
+- Core rejects, rather than rewrites, a descriptor when its model-visible name,
+  description, or schema contains a registered secret value or recognized
+  credential shape. The check runs both at wiring and immediately before
+  advertisement, keeping the advertised schema identical to the schema used
+  for input validation.
+- A successful model-tool result is a bounded JSON object. Core first redacts
+  every string value and object key, retains post-redaction key collisions
+  deterministically with `#N` suffixes, then format-validates, serializes, and
+  bounds that exact model-facing value. The canonical `tool.result` therefore
+  remains valid JSON and active-canvas preview limits retain a
+  `tool_result_get` recovery handle.
+- Failed model-tool results expose only host-generated error text through one
+  bounded projection. Controls and Unicode 17 `Cf`/`Zl`/`Zp` are rendered as
+  visible escapes before the error reaches provenance or model context; raw
+  extension error bodies remain unavailable.
+- Model-tool names must not collide with core tools or another enabled
+  extension tool. Advertisement and execution both require the extension to be
+  wired and enabled.
+- Root sessions alone receive extension model tools. Companions and spawned
+  agents retain their bounded core tool palettes.
+- Root-session contribution wiring is fixed at launch/resume in v0. Disabling
+  a wired extension hides its model tool and idle hook immediately, and
+  re-enabling that same wired extension restores them. Enabling or installing
+  a package that was not wired when the session started updates live
+  enablement, but its model tool and idle hook appear only after restart or
+  resume; the TUI names that limitation instead of implying a hot load.
+
+Native and managed-process extensions use the same descriptor and execution
+path. Managed manifests place `model_tool` on the declaring command.
+
+## Terminal Idle Contribution v0
+
+`Extension::idle_contribution()` may nominate one registered `agent-only`
+command. Managed manifests declare the same shape at top level:
+
+```json
+{"idle_contribution":{"command":"command-id"}}
+```
+
+At most one enabled extension owns this point in a root session. After a normal
+terminal model response, core may invoke the nominated command with `{}`.
+Implicit idle work never prompts: every required capability must be
+`session-allow`, or be `ask`/unconfigured and covered by an existing grant;
+`always-deny` is final. Otherwise core records a rejected stop contribution
+with reason `authority-unavailable`, starts no command or child agent, and
+emits no error. Explicit model-tool calls keep the ordinary permission braid.
+The result of an executed idle command must be exactly one of these closed
+envelopes:
+
+```json
+{"action":"stop"}
+{"action":"continue","input":"bounded UTF-8 text"}
+```
+
+The extension owns why work is complete, what private state it reads, and what
+the continuation text means. Core never infers a goal or workflow from ordinary
+conversation. Core redacts continuation text first, then validates the exact
+accepted content: nonblank UTF-8 capped at 8192 bytes, allowing newline/tab but
+rejecting other ordinary controls, Unicode 17 `Cf`, and `Zl`/`Zp`. That
+once-redacted value is persisted and modeled verbatim; emission does not run a
+second, potentially non-idempotent redaction pass.
+
+Root sessions default `extension-state` and the bounded, extension-namespaced
+`context-slot` and `plan-presentation` capabilities to `session-allow`. This
+permits absent-state/resume probing and bounded presentation without a prompt;
+it does not create a plan, goal, or workflow in core.
+
+Pending user input wins both before and after command execution. Cancellation
+is checked at both boundaries. An accepted continuation is recorded as
+`extension.contribution` and projected with core-generated extension
+attribution into a fresh root `RoundLoop`; it is not a `user.message`. The
+continuation is one-shot: it remains eligible across persistence and resume
+until selected by a same-agent root-driver `canvas.snapshot`, then leaves all
+later canvases. Shadow-compaction snapshots (`purpose: "compaction"`) and child
+agent snapshots cannot consume it. A full `canvas.swap` cannot hide it either:
+core folds pending contributions over the full accepted log and pins any
+pre-frontier contribution ahead of ordered frontier replay. Shadow compaction
+also omits pending contributions from its captured canvas and provider request,
+preventing opaque projection text from persisting or duplicating the one-shot
+driver input. Stop and unaccepted outputs remain provenance-only. The hook is
+skipped after errors, context-limit stops, guardian interruption, explicit
+round ceilings, and cancellation. A per-run host ceiling prevents infinite
+automatic continuation. Acceptance commits the continuation to the current
+user turn. A later registry disable cannot retroactively hide it; disablement
+prevents only new contributions.
+
+Immediate cancellation of an already-running command is governed by the
+generic extension-command cancellation seam; the idle API does not define a
+second mechanism.
+
 ## Managed Process Runtime v0
 
 `runtime_kind: "managed-process"` is a language-neutral package runtime. Its
@@ -269,12 +434,15 @@ The current host request methods map one-for-one to `HostApi`:
 | `euler/host/store-checkpoint` | `{ name, checkpoint }` | `{}` |
 | `euler/host/record-agent-task-result` | `{ task: HostAgentTask, result: HostAgentResult }` | `HostAgentRecord` JSON |
 | `euler/host/update-context-slot` | `{ slot, content }` | `{}` |
+| `euler/host/update-plan-presentation` | `PlanPresentation` JSON | `{}` |
 | `euler/host/spawn-agent` | `SpawnAgentTask` JSON | `AgentOutcome` JSON |
 | `euler/host/spawn-agents` | `{ tasks: SpawnAgentTask[] }` | `AgentOutcome[]` JSON |
 
-The DTO field names are the `serde` names in `euler-sdk`; the Python SDK and
-the raw JSON-RPC conformance test are normative executable examples. Progress
-uses the notification `euler/progress` with
+The DTO field names are the `serde` names in `euler-sdk`; the maintained
+[Python SDK](https://github.com/2x11-xyz/euler-extensions/tree/main/sdks/python/euler-managed-process-sdk)
+in `euler-extensions` is the canonical client implementation, while Euler's
+raw JSON-RPC tests are the protocol conformance fixture. Progress uses the
+notification `euler/progress` with
 `{ message: string, fraction?: number }`; the message is 1–4096 UTF-8 bytes
 and the optional fraction is finite and in `[0, 1]`. All host requests and
 progress notifications are valid only after `euler/command` and before its

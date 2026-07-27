@@ -516,6 +516,7 @@ fn extension_run_on_locked_session_log_fails_without_executing_command() {
         required_capabilities: Vec::new(),
         args: Vec::new(),
         accepts_session_id: false,
+        model_tool: None,
     };
     let error = execute_offline_extension_run(OfflineExtensionRun {
         extension_id: "fake-extension",

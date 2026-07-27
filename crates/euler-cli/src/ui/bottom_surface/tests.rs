@@ -931,7 +931,12 @@ fn permissions_picker_exposes_agent_spawn_controls() {
     surface.open_picker(PickerSpec::PermissionsAdvanced(
         crate::ui::commands::permission_advanced_choices(&[]),
     ));
-    for _ in 0..18 {
+    let agent_spawn_row = Capability::ALL
+        .iter()
+        .position(|capability| *capability == Capability::AgentSpawn)
+        .expect("agent-spawn capability")
+        * 3;
+    for _ in 0..agent_spawn_row {
         surface.move_selection_down();
     }
 

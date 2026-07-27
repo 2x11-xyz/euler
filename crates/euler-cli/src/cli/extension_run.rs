@@ -1,6 +1,6 @@
 use super::permission::CliDecider;
 use anyhow::{anyhow, Result};
-use euler_core::Session;
+use euler_core::{PermissionDecider, Session};
 
 use crate::extension_cli;
 
@@ -59,6 +59,32 @@ pub(crate) fn wire_code_swarm<D>(session: &mut Session<D>) {
             eprintln!("code-swarm tool unavailable: {error}");
         }
     }
+}
+
+/// Attach every enabled linked package that declares generic root-session
+/// contributions, then retain the transitional CodeSwarm special path.
+/// Wiring is inert: descriptor reads revalidate consent, and no managed
+/// process starts until an approved command actually executes.
+pub(crate) fn wire_session_extensions<D: PermissionDecider>(session: &mut Session<D>) {
+    let enabled = session
+        .extensions_enabled()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in enabled {
+        match extension_cli::live_linked_session_extension_arc(&id) {
+            Ok(Some(extension)) => {
+                if let Err(error) = session.wire_extension(extension) {
+                    eprintln!("extension {id} session contributions unavailable: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("extension {id} session contributions unavailable: {error}");
+            }
+        }
+    }
+    wire_code_swarm(session);
 }
 
 /// Refusal text for an agent-only command reached through a control line.

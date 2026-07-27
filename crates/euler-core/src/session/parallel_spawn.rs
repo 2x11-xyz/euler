@@ -108,6 +108,7 @@ impl<D: PermissionDecider> Session<D> {
                 &self.config.auto_compaction,
                 &std::collections::BTreeSet::new(),
                 folded.as_ref().ok().and_then(|fold| fold.admitted()),
+                Some(&self.config.extensions_enabled),
             )
         } else {
             Vec::new()

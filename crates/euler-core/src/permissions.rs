@@ -368,6 +368,9 @@ impl<D> PermissionGate<D> {
                 (Capability::FsWrite, ApprovalMode::Ask),
                 (Capability::ShellExec, ApprovalMode::Ask),
                 (Capability::AgentSpawn, ApprovalMode::Ask),
+                (Capability::ExtensionState, ApprovalMode::SessionAllow),
+                (Capability::ContextSlot, ApprovalMode::SessionAllow),
+                (Capability::PlanPresentation, ApprovalMode::SessionAllow),
             ]),
             session_grants: GrantList::new(),
             project_grants: GrantList::new(),
@@ -1068,6 +1071,23 @@ mod tests {
             Some(ApprovalMode::Ask)
         );
         assert_eq!(gate.mode(Capability::AgentSpawn), ApprovalMode::Ask);
+    }
+
+    #[test]
+    fn root_extension_scaffolding_defaults_to_session_allow() {
+        let gate = PermissionGate::new(PanicDecider);
+
+        for capability in [
+            Capability::ExtensionState,
+            Capability::ContextSlot,
+            Capability::PlanPresentation,
+        ] {
+            assert_eq!(
+                gate.configured_mode(capability),
+                Some(ApprovalMode::SessionAllow)
+            );
+            assert_eq!(gate.mode(capability), ApprovalMode::SessionAllow);
+        }
     }
 
     #[test]

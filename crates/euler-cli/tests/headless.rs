@@ -293,8 +293,8 @@ fn exec_observe_runs_enabled_linked_python_observer_automatically() {
     let home = isolated_home();
     let root = tempfile::tempdir().expect("root dir");
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../euler-managed-process/tests/fixtures/python_sdk/src");
     let manifest = serde_json::json!({
         "version": 1,
         "id": "python-round-observer",
@@ -468,6 +468,226 @@ fn exec_observe_rejects_linked_python_observer_without_launch_consent() {
         "linked extension is not enabled; run `euler extension enable python-disabled-observer` first"
     ));
     assert!(!extension_dir.path().join("observer-ran").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_python_session_contributions_run_on_fresh_launch_and_resume() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_session_contribution_extension(extension_dir.path());
+    configure_linked_extension(
+        exe,
+        &home,
+        extension_dir.path(),
+        "python-session-contribution",
+    );
+    let script = write_session_contribution_fixture(root.path());
+    let log = root.path().join("events.jsonl");
+
+    let fresh = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &format!("event-script={}", path_str(&script)),
+            "--provenance",
+            path_str(&log),
+            "exercise extension contributions",
+        ])
+        .output()
+        .expect("run fresh session");
+    assert!(
+        fresh.status.success(),
+        "fresh stderr: {}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_session_contribution_events(&read_jsonl(&log), 1, 3, 1);
+    assert_eq!(
+        fs::read_to_string(extension_dir.path().join("idle-count")).expect("fresh idle count"),
+        "2"
+    );
+    assert_eq!(
+        fs::read_to_string(extension_dir.path().join("model-tool-count"))
+            .expect("fresh model tool count"),
+        "1"
+    );
+
+    let mut resumed = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .args(["--resume", path_str(&log)])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn resumed session");
+    resumed
+        .stdin
+        .as_mut()
+        .expect("resume stdin")
+        .write_all(b"exercise it after resume\n")
+        .expect("write resumed turn");
+    let resumed = resumed.wait_with_output().expect("wait resumed session");
+    assert!(
+        resumed.status.success(),
+        "resume stderr: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_session_contribution_events(&read_jsonl(&log), 1, 4, 2);
+    assert_eq!(
+        fs::read_to_string(extension_dir.path().join("idle-count")).expect("resumed idle count"),
+        "3"
+    );
+}
+
+#[cfg(unix)]
+fn write_session_contribution_extension(directory: &Path) {
+    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../euler-managed-process/tests/fixtures/python_sdk/src");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "python-session-contribution",
+        "display_name": "Python session contribution",
+        "extension_version": "0.1.0",
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": ["python3", "-B", "-u", "extension.py"]},
+        "capabilities": [],
+        "commands": [
+            {
+                "name": "remember",
+                "display_name": "Remember",
+                "summary": "Record extension-owned workflow state.",
+                "required_capabilities": [],
+                "invocation": "agent-only",
+                "model_tool": {
+                    "name": "remember_work",
+                    "description": "Record extension-owned workflow state.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string", "minLength": 1, "maxLength": 128}
+                        },
+                        "required": ["value"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "name": "idle",
+                "display_name": "Idle",
+                "summary": "Choose whether the workflow should continue.",
+                "required_capabilities": [],
+                "invocation": "agent-only"
+            }
+        ],
+        "idle_contribution": {"command": "idle"}
+    });
+    fs::write(
+        directory.join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write session contribution manifest");
+    fs::write(
+        directory.join("extension.py"),
+        format!(
+            r#"import sys
+from pathlib import Path
+sys.path.insert(0, {sdk_source:?})
+from euler_managed_process_sdk import serve
+
+def remember(context):
+    count = Path("model-tool-count")
+    count.write_text(str(int(count.read_text()) + 1) if count.exists() else "1")
+    return {{"recorded": context.input["value"]}}
+
+def idle(context):
+    count = Path("idle-count")
+    value = int(count.read_text()) + 1 if count.exists() else 1
+    count.write_text(str(value))
+    if value == 1:
+        return {{"action": "continue", "input": "continue from the extension"}}
+    return {{"action": "stop"}}
+
+serve({{"remember": remember, "idle": idle}})
+"#,
+            sdk_source = sdk_source.to_string_lossy()
+        )
+        .replace("\n+", "\n"),
+    )
+    .expect("write session contribution process");
+}
+
+#[cfg(unix)]
+fn write_session_contribution_fixture(directory: &Path) -> PathBuf {
+    write_fixture_script(
+        directory,
+        "session-contribution-loop.json",
+        &r#"{
++  "version": 1,
++  "responses": [
++    {"events": [
++      {"tool_call": {
++        "id": "extension-call",
++        "name": "remember_work",
++        "input": {"value": "from-model"}
++      }},
++      {"finished": {"stop_reason": "tool_use"}}
++    ]},
++    {"events": [
++      {"text_delta": "first completion"},
++      {"finished": {"stop_reason": "completed"}}
++    ]},
++    {"events": [
++      {"text_delta": "continued completion"},
++      {"finished": {"stop_reason": "completed"}}
++    ]}
++  ]
++}"#
+        .replace("\n+", "\n"),
+    )
+}
+
+fn assert_session_contribution_events(
+    events: &[EventEnvelope],
+    expected_tool_results: usize,
+    expected_model_calls: usize,
+    expected_user_messages: usize,
+) {
+    let tool_results = events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT
+                && event.payload.get("extension_id")
+                    == Some(&serde_json::json!("python-session-contribution"))
+                && event.payload.get("command") == Some(&serde_json::json!("remember"))
+        })
+        .count();
+    assert_eq!(tool_results, expected_tool_results);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+            .count(),
+        expected_model_calls
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+            .count(),
+        expected_user_messages
+    );
+    assert!(events.iter().any(|event| {
+        event.kind.as_str() == EventKind::EXTENSION_CONTRIBUTION
+            && event.payload.get("action") == Some(&serde_json::json!("continue"))
+            && event.payload.get("accepted") == Some(&serde_json::json!(true))
+            && event.payload.get("content")
+                == Some(&serde_json::json!("continue from the extension"))
+    }));
 }
 
 #[test]
@@ -6097,8 +6317,8 @@ fn tui_pty_escape_closes_slash_menu_then_interrupts_blocked_turn() {
 fn fresh_tui_runs_a_persistently_enabled_linked_process() {
     let home = isolated_home();
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../euler-managed-process/tests/fixtures/python_sdk/src");
     write_managed_process_extension_manifest(
         extension_dir.path(),
         "python-fresh-tui",
@@ -7760,8 +7980,8 @@ fn headless_extension_run_executes_enabled_linked_python_process_live() {
             "extension.py".to_owned(),
         ],
     );
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../euler-managed-process/tests/fixtures/python_sdk/src");
     fs::write(
         extension_dir.path().join("extension.py"),
         format!(
@@ -7834,8 +8054,8 @@ serve({{"inspect": inspect}})
 
 #[cfg(unix)]
 fn provision_python_venv(extension_dir: &Path) -> PathBuf {
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk");
+    let sdk_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../euler-managed-process/tests/fixtures/python_sdk");
     let sdk_copy = extension_dir.join("sdk-package");
     copy_directory(&sdk_source, &sdk_copy);
     let venv = extension_dir.join(".venv");

@@ -1,8 +1,9 @@
 //! Session state machine: turn loop, tool dispatch, compaction integration.
 //! Justification for >1000 lines: session.rs owns the main turn lifecycle while focused subsystems are extracted.
 use crate::canvas::{
-    active_layer1_compacted_result_ids, assemble_canvas_prefolded, assemble_canvas_with_compaction,
-    canvas_bytes, retention_stats, AutoCompactionPolicy,
+    active_layer1_compacted_result_ids, assemble_canvas_prefolded,
+    assemble_canvas_with_compaction_for_extensions, canvas_bytes, retention_stats,
+    AutoCompactionPolicy,
 };
 use crate::canvas::{render_context_slot, CanvasItem, CanvasRole};
 use crate::checkpoints::{self, list_from_events, WorkspaceCheckpointRef};
@@ -49,6 +50,7 @@ mod background;
 mod compaction_worker;
 mod companion;
 mod extension_bridge;
+mod extension_contributions;
 pub use extension_bridge::MAX_SPAWNS_PER_COMMAND;
 mod observer;
 mod parallel_spawn;
@@ -421,6 +423,13 @@ pub struct Session<D> {
     context_limit_emitted: Option<ModelTarget>,
     open_agent_spawns: BTreeMap<String, String>,
     observer_extension: Option<Arc<dyn Extension>>,
+    /// Generic root-session extensions. These are launch-time handles only:
+    /// wiring starts no process and grants no capability.
+    extensions: BTreeMap<String, Arc<dyn Extension>>,
+    /// Exact extension tool catalog advertised on the most recent root model
+    /// request. Dispatch consults this map so an unadvertised or stale name
+    /// cannot enter the extension path.
+    active_extension_tools: BTreeMap<String, extension_contributions::ActiveExtensionTool>,
     /// Shared mid-turn steering queue (issue #146); drained at round
     /// boundaries into canonical `user.message` events. `None` (headless,
     /// companions) means no steering.
@@ -493,10 +502,17 @@ where
     sink: &'a mut EventSink<'sink, F>,
     turn_state: &'a mut TurnState,
     rounds: &'a mut u64,
+    idle_continuations: &'a mut IdleContinuationState,
     cancellation: CancellationToken,
 }
 
 type RecordedToolCall = (ToolCall, String);
+
+#[derive(Default)]
+struct IdleContinuationState {
+    accepted: usize,
+    limit_emitted: bool,
+}
 
 pub(super) fn provider_cancellation(
     cancellation: CancellationToken,
@@ -633,25 +649,7 @@ where
                 Some(model_result_id),
             )?;
             self.sink.flush(self.session.bus.events());
-            // Explicit terminal transaction seam. PR4a may run same-turn idle
-            // contributors before this call; only `Closed` ends the steering
-            // group. The queue atomically reserves steering or closes, so
-            // post-close input is a follow-up rather than a lost late steer.
-            let boundary = if another_round_available {
-                self.finish_idle_steering_boundary(cancellation)?
-            } else {
-                self.defer_idle_steering_boundary(cancellation)
-            };
-            match boundary {
-                steering::BoundaryAction::Persisted => return Ok(RoundOutcome::Continue),
-                steering::BoundaryAction::Closed { cancelled: true } => {
-                    return Err(SessionError::Cancelled);
-                }
-                steering::BoundaryAction::Closed { cancelled: false }
-                | steering::BoundaryAction::Drained => {
-                    return Ok(RoundOutcome::Complete(()));
-                }
-            }
+            return self.resolve_terminal_idle(cancellation, another_round_available);
         }
 
         self.finish_tool_round(&model_result_id, data.tool_calls, cancellation)
@@ -759,6 +757,36 @@ where
             },
             |queue| queue.defer_terminal_boundary(|| cancellation.is_cancelled()),
         )
+    }
+
+    fn resolve_terminal_idle(
+        &mut self,
+        cancellation: &CancellationToken,
+        next_round_permitted: bool,
+    ) -> Result<RoundOutcome, SessionError> {
+        if self.idle_continuations.accepted
+            < extension_contributions::MAX_AUTOMATIC_CONTINUATIONS_PER_RUN
+        {
+            match self.session.run_idle_boundary(cancellation, self.sink)? {
+                extension_contributions::IdleBoundary::Continue => {
+                    self.idle_continuations.accepted += 1;
+                    return Ok(RoundOutcome::Continue);
+                }
+                extension_contributions::IdleBoundary::Stop => {}
+            }
+        } else if !self.idle_continuations.limit_emitted {
+            self.session.emit_continuation_limit()?;
+            self.sink.flush(self.session.bus.events());
+            self.idle_continuations.limit_emitted = true;
+        }
+
+        match self.finish_idle_steering_boundary(cancellation, next_round_permitted)? {
+            steering::BoundaryAction::Persisted => Ok(RoundOutcome::Continue),
+            steering::BoundaryAction::DeferredByRoundLimit => Ok(RoundOutcome::Continue),
+            steering::BoundaryAction::Closed { cancelled: true } => Err(SessionError::Cancelled),
+            steering::BoundaryAction::Closed { cancelled: false }
+            | steering::BoundaryAction::Drained => Ok(RoundOutcome::Complete(())),
+        }
     }
 
     fn finish_tool_round(
@@ -902,6 +930,8 @@ impl<D> Session<D> {
             context_limit_emitted: None,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            extensions: BTreeMap::new(),
+            active_extension_tools: BTreeMap::new(),
             steering: None,
             queued_dispatch: None,
             pending_admission: None,
@@ -996,6 +1026,7 @@ impl<D> Session<D> {
         }
         let active_target = self.active_target;
         let code_swarm_extension = self.code_swarm_extension;
+        let extensions = self.extensions;
         let redactor = self.redactor;
         let mut config = self.config;
         config.session_id = session_id.into();
@@ -1013,6 +1044,7 @@ impl<D> Session<D> {
         // The code-swarm wiring is launch configuration, not session state:
         // a fresh session in the same process keeps the review-gate tool.
         fresh.code_swarm_extension = code_swarm_extension;
+        fresh.extensions = extensions;
         Ok(fresh)
     }
 
@@ -1155,7 +1187,12 @@ impl<D> Session<D> {
             4, // min_lines
         );
         let policy = self.effective_stub_policy();
-        let canvas = assemble_canvas_with_compaction(self.bus.events(), &policy, &candidates);
+        let canvas = assemble_canvas_with_compaction_for_extensions(
+            self.bus.events(),
+            &policy,
+            &candidates,
+            &self.config.extensions_enabled,
+        );
         let actually_compacted = canvas
             .iter()
             .filter_map(|item| match item {
@@ -1241,6 +1278,7 @@ impl<D> Session<D> {
             &post_swap_policy,
             &BTreeSet::new(),
             pinned,
+            Some(&self.config.extensions_enabled),
         );
         if canvas_bytes(&proposed_canvas) > post_swap_policy.budget_bytes {
             return Err("proposed canvas exceeds the configured byte budget".to_owned());
@@ -1250,6 +1288,7 @@ impl<D> Session<D> {
             &post_swap_policy,
             &BTreeSet::new(),
             pinned,
+            Some(&self.config.extensions_enabled),
         );
         let current_request = self.driver_model_request(&self.active_target, &current_canvas);
         let proposed_request = self.driver_model_request(&self.active_target, &proposed_canvas);
@@ -1294,6 +1333,19 @@ impl<D> Session<D> {
             max_output_tokens: self.config.max_output_tokens,
         }
         .for_target(&target.provider, &target.model)
+    }
+
+    fn live_driver_model_request(
+        &mut self,
+        target: &ModelTarget,
+        canvas: &[CanvasItem],
+    ) -> ModelRequest
+    where
+        D: PermissionDecider,
+    {
+        let mut request = self.driver_model_request(target, canvas);
+        request.tools.extend(self.refresh_extension_model_tools());
+        request
     }
 
     fn emit_control_event(&mut self, kind: &'static str, payload: JsonObject) -> bool {
@@ -1636,6 +1688,8 @@ impl<D> Session<D> {
             context_limit_emitted,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            extensions: BTreeMap::new(),
+            active_extension_tools: BTreeMap::new(),
             steering: None,
             queued_dispatch: None,
             pending_admission: None,
@@ -2057,6 +2111,7 @@ impl<D: PermissionDecider> Session<D> {
     {
         let mut turn_state = TurnState::default();
         let mut rounds = 0_u64;
+        let mut idle_continuations = IdleContinuationState::default();
         let max_rounds = self.config.max_tool_rounds;
         let provider_retries = self.config.provider_transport_retries;
         let provider_retry_backoff_ms = self.config.provider_transport_retry_backoff_ms.clone();
@@ -2065,6 +2120,7 @@ impl<D: PermissionDecider> Session<D> {
             sink,
             turn_state: &mut turn_state,
             rounds: &mut rounds,
+            idle_continuations: &mut idle_continuations,
             cancellation: cancellation.clone(),
         };
         let result = RoundLoop::new(
@@ -2113,7 +2169,8 @@ impl<D: PermissionDecider> Session<D> {
         )?;
         sink.flush(self.bus.events());
 
-        let request = self.driver_model_request(target, &canvas);
+        let request = self.live_driver_model_request(target, &canvas);
+        sink.flush(self.bus.events());
         if let Some(pinned) = &pinned {
             if let Some(error) = self.pinned_context_budget_error(pinned, &request, policy) {
                 self.emit_session_error(&error)?;
@@ -2218,6 +2275,7 @@ impl<D: PermissionDecider> Session<D> {
             &policy,
             &BTreeSet::new(),
             pinned.as_ref(),
+            Some(&self.config.extensions_enabled),
         );
         Ok((canvas, pinned))
     }
@@ -2454,8 +2512,12 @@ impl<D: PermissionDecider> Session<D> {
             select_layer1_candidates(self.bus.events(), self.config.compaction_keep_recent, 4);
         if self.config.auto_compaction.stubs_enabled() {
             let policy = self.effective_stub_policy();
-            let compacted =
-                assemble_canvas_with_compaction(self.bus.events(), &policy, &candidates);
+            let compacted = assemble_canvas_with_compaction_for_extensions(
+                self.bus.events(),
+                &policy,
+                &candidates,
+                &self.config.extensions_enabled,
+            );
             let compacted_ids = compacted
                 .iter()
                 .filter_map(|item| match item {
@@ -2540,7 +2602,9 @@ impl<D: PermissionDecider> Session<D> {
             &policy,
             &BTreeSet::new(),
             project_context.admitted(),
+            Some(&self.config.extensions_enabled),
         );
+        let canvas = shadow_compaction_canvas(canvas);
         let mut snapshot = canvas_snapshot_payload(
             &canvas,
             policy,
@@ -3512,6 +3576,13 @@ fn model_input_item(item: &CanvasItem) -> ModelInputItem {
             role: ModelRole::User,
             content: render_context_slot(extension_id, slot, content),
         },
+        CanvasItem::ExtensionContribution {
+            extension_id,
+            command,
+            point,
+            content,
+            ..
+        } => extension_contribution_model_input(extension_id, command, point, content),
         CanvasItem::Reasoning {
             provider,
             model,
@@ -3558,6 +3629,24 @@ fn model_input_item(item: &CanvasItem) -> ModelInputItem {
         },
     }
 }
+
+fn extension_contribution_model_input(
+    extension_id: &str,
+    command: &str,
+    point: &str,
+    content: &str,
+) -> ModelInputItem {
+    ModelInputItem::Message {
+        role: ModelRole::User,
+        content: crate::canvas::render_extension_contribution(
+            extension_id,
+            command,
+            point,
+            content,
+        ),
+    }
+}
+
 fn reasoning_fidelity(value: &str) -> ReasoningFidelity {
     match value {
         "raw" => ReasoningFidelity::Raw,
@@ -3601,6 +3690,13 @@ fn shadow_model_request(
     }
     .for_target(&target.provider, &target.model);
     (request, effort)
+}
+
+fn shadow_compaction_canvas(canvas: Vec<CanvasItem>) -> Vec<CanvasItem> {
+    canvas
+        .into_iter()
+        .filter(|item| !matches!(item, CanvasItem::ExtensionContribution { .. }))
+        .collect()
 }
 
 fn shadow_model_call_payload(

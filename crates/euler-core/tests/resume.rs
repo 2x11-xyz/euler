@@ -1,9 +1,11 @@
+#![allow(clippy::too_many_lines)] // integration-test exemption for integration test modules
+
 use euler_core::permissions::{DeciderVerdict, PermissionDecider, PermissionRequest};
 use euler_core::{
-    fold_session, read_resume_prefix, resume_session, resume_session_from_prefix,
-    resume_session_with_outcome, AutoCompactionPolicy, CompactionTier, ContextLimitConfig,
-    ModelTarget, ProvenanceWriter, ReasoningEffort, ResumeError, Session, SessionConfig,
-    WorkingStateProjection,
+    assemble_canvas, fold_session, read_resume_prefix, resume_session, resume_session_from_prefix,
+    resume_session_with_outcome, AutoCompactionPolicy, CanvasItem, CompactionStatus,
+    CompactionTier, ContextLimitConfig, ModelTarget, ProvenanceWriter, ReasoningEffort,
+    ResumeError, Session, SessionConfig, WorkingStateProjection,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
@@ -15,6 +17,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn fold_reproduces_live_target_usage_and_context_limit_fields() {
@@ -119,6 +122,235 @@ fn fold_treats_canvas_swap_as_a_new_unknown_usage_window() {
     let folded = fold_session(&config, session.events().to_vec()).expect("fold");
     assert_eq!(folded.latest_model_usage_used_tokens, None);
     assert_eq!(folded.context_limit_emitted, None);
+}
+
+#[test]
+fn resumed_full_swap_keeps_pending_extension_input_in_order_until_root_selection() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let old = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "old request".into())]),
+    );
+    let contribution = EventEnvelope::new(
+        "session",
+        "root",
+        Some(old.id.clone()),
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            ("content", "resume committed work".into()),
+        ]),
+    );
+    let resumed = EventEnvelope::new(
+        "session",
+        "root",
+        Some(contribution.id.clone()),
+        EventKind::SESSION_RESUMED,
+        object([("events_folded", 2.into())]),
+    );
+    let frontier = EventEnvelope::new(
+        "session",
+        "root",
+        Some(resumed.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "post-swap frontier".into())]),
+    );
+    let projection = WorkingStateProjection {
+        goal: "compacted history".to_owned(),
+        ..WorkingStateProjection::default()
+    };
+    let swap = EventEnvelope::new(
+        "session",
+        "root",
+        Some(frontier.id.clone()),
+        EventKind::CANVAS_SWAP,
+        object([
+            ("snapshot_start_id", old.id.clone().into()),
+            ("snapshot_end_id", resumed.id.clone().into()),
+            ("frontier_start_id", frontier.id.clone().into()),
+            ("policy_version", "1".into()),
+            ("projection_schema_version", "1".into()),
+            ("projection_blob", projection.to_json().into()),
+            ("validation_result", "pass".into()),
+        ]),
+    );
+    write_events(&log, &[old, contribution.clone(), resumed, frontier, swap]);
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = CapturingStaticProvider::new(
+        vec![
+            completed_stream("resumed answer"),
+            completed_stream("later answer"),
+        ],
+        Arc::clone(&requests),
+    );
+    let mut session = resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(provider),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    session.run_turn("resume now").expect("resumed turn");
+    {
+        let requests = requests.lock().expect("request log");
+        let prompt = requests[0].prompt_text();
+        let projection_index = prompt.find("compacted history").expect("projection");
+        let contribution_index = prompt
+            .find("resume committed work")
+            .expect("pending contribution");
+        let frontier_index = prompt
+            .find("post-swap frontier")
+            .expect("post-swap frontier");
+        assert!(
+            projection_index < contribution_index && contribution_index < frontier_index,
+            "the resumed driver request must pin pre-frontier input ahead of ordered frontier: {prompt}"
+        );
+    }
+    let driver_snapshot = session
+        .events()
+        .iter()
+        .rfind(|event| {
+            event.kind.as_str() == EventKind::CANVAS_SNAPSHOT
+                && !event.payload.contains_key("purpose")
+        })
+        .expect("root-driver canvas snapshot");
+    assert!(driver_snapshot.payload["selected_event_ids"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id == &contribution.id)));
+
+    session.run_turn("later").expect("later turn");
+    let requests = requests.lock().expect("request log");
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests[1].prompt_text().contains("resume committed work"),
+        "the selected contribution must remain one-shot after resume"
+    );
+}
+
+#[test]
+fn resumed_shadow_compactor_cannot_capture_pending_extension_input() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let old = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::USER_MESSAGE,
+        object([(
+            "content",
+            format!("old context {}", "x".repeat(20_000)).into(),
+        )]),
+    );
+    let answer = EventEnvelope::new(
+        "session",
+        "root",
+        Some(old.id.clone()),
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "settled answer".into())]),
+    );
+    let contribution = EventEnvelope::new(
+        "session",
+        "root",
+        Some(answer.id.clone()),
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            (
+                "content",
+                "one-shot continuation must stay driver-only".into(),
+            ),
+        ]),
+    );
+    let resumed = EventEnvelope::new(
+        "session",
+        "root",
+        Some(contribution.id.clone()),
+        EventKind::SESSION_RESUMED,
+        object([("events_folded", 3.into())]),
+    );
+    write_events(&log, &[old, answer, contribution.clone(), resumed]);
+
+    let projection = WorkingStateProjection {
+        goal: "small shadow projection".to_owned(),
+        ..WorkingStateProjection::default()
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = CapturingStaticProvider::new(
+        vec![completed_stream(&projection.to_json())],
+        Arc::clone(&requests),
+    );
+    let mut config = SessionConfig::new(temp.path());
+    config.compaction_keep_recent = 0;
+    let mut session = resume_session(
+        config,
+        ProviderSet::single(provider),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    assert_eq!(
+        session.begin_compaction().expect("start shadow"),
+        CompactionStatus::InProgress
+    );
+    assert_eq!(
+        session.compact_and_wait().expect("finish shadow"),
+        CompactionStatus::Applied
+    );
+
+    let requests = requests.lock().expect("request log");
+    assert_eq!(requests.len(), 1);
+    let shadow = &requests[0];
+    assert!(
+        shadow.tools.is_empty(),
+        "captured request must be the shadow"
+    );
+    let prompt = shadow.prompt_text();
+    assert!(!prompt.contains("one-shot continuation must stay driver-only"));
+    assert!(!prompt.contains(&contribution.id));
+    drop(requests);
+
+    let snapshot = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::CANVAS_SNAPSHOT
+                && payload_str(event, "purpose") == Some("compaction")
+        })
+        .expect("shadow canvas snapshot");
+    assert!(snapshot.payload["selected_event_ids"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().all(|id| id != &contribution.id)));
+
+    let canvas = assemble_canvas(session.events(), &AutoCompactionPolicy::default());
+    assert_eq!(
+        canvas
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    CanvasItem::ExtensionContribution { event_id, .. }
+                        if event_id == &contribution.id
+                )
+            })
+            .count(),
+        1,
+        "the applied swap keeps exactly one pending driver contribution"
+    );
 }
 
 #[test]
@@ -1779,6 +2011,50 @@ impl PermissionDecider for CountingDecider {
 struct StaticProvider {
     name: &'static str,
     streams: std::sync::Mutex<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+}
+
+struct CapturingStaticProvider {
+    streams: Mutex<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+impl CapturingStaticProvider {
+    fn new(
+        streams: Vec<Vec<Result<ModelStreamEvent, ProviderError>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    ) -> Self {
+        Self {
+            streams: Mutex::new(streams.into()),
+            requests,
+        }
+    }
+}
+
+impl ModelProvider for CapturingStaticProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests.lock().expect("request log").push(request);
+        let events = self
+            .streams
+            .lock()
+            .expect("stream queue")
+            .pop_front()
+            .ok_or_else(|| ProviderError::transport("capturing provider exhausted"))?;
+        Ok(Box::new(events.into_iter()))
+    }
+}
+
+fn completed_stream(content: &str) -> Vec<Result<ModelStreamEvent, ProviderError>> {
+    vec![
+        Ok(ModelStreamEvent::TextDelta(content.to_owned())),
+        Ok(ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: None,
+        }),
+    ]
 }
 
 impl StaticProvider {
