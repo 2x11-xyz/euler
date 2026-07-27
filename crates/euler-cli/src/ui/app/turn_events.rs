@@ -262,6 +262,9 @@ impl AppCore {
             Ok(CompactionStatus::Applied) => {
                 self.push_notice_item("compaction complete".to_owned())
             }
+            Ok(CompactionStatus::Cancelled) => {
+                self.push_notice_item("compaction cancelled · active canvas unchanged".to_owned())
+            }
             Ok(CompactionStatus::Failed) => {
                 self.push_notice_item("compaction failed · active canvas unchanged".to_owned())
             }
@@ -293,6 +296,28 @@ impl AppCore {
                 let start = session.events().len();
                 let outcome = session
                     .cancel_compaction(reason)
+                    .map_err(|error| error.to_string());
+                let events = session.events()[start..].to_vec();
+                Some((outcome, events))
+            }
+            _ => None,
+        };
+        let Some((outcome, events)) = update else {
+            return Ok(CompactionStatus::Unchanged);
+        };
+        self.record_compaction_events(events);
+        outcome
+    }
+
+    pub(super) fn interrupt_idle_compaction(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, String> {
+        let update = match &mut self.state {
+            AppState::Idle { session } if session.compaction_in_progress() => {
+                let start = session.events().len();
+                let outcome = session
+                    .interrupt_compaction(reason)
                     .map_err(|error| error.to_string());
                 let events = session.events()[start..].to_vec();
                 Some((outcome, events))

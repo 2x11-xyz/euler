@@ -56,15 +56,17 @@ candidate instead of dispatching an oversized request or dropping queued
 input. The wait polls the turn-cancellation token and has a finite deadline;
 interrupt terminalizes the shadow call and returns the turn as cancelled.
 
-A shadow job has one session owner. Base-composer `Esc`, root-turn
-cancellation, `/new`, `/resume`, shutdown, and live secret scrub are lifecycle
-barriers: the session actor settles a result that has already crossed the
-worker channel (preserving its usage/cost provenance) or records cancellation
-plus candidate discard before releasing the session. When a root and shadow
-run concurrently, the root's cancellation path closes both canonical calls.
-Workers never append events directly, and output arriving after logical
-cancellation has no route back into the bus, the active canvas, or a
-scrubbed/replaced session.
+A shadow job has one session owner. Base-composer `Esc` and root-turn
+cancellation are interrupt boundaries: the session actor may record a result
+and its usage/cost provenance when they have already crossed the worker
+channel, but it always discards the candidate and never appends `canvas.swap`.
+A still-pending result instead receives one cancellation terminal plus
+candidate discard. `/new`, `/resume`, shutdown, and live secret scrub are
+lifecycle boundaries: the actor settles a ready result or records cancellation
+before releasing the session. When a root and shadow run concurrently, the
+root's cancellation path closes both canonical calls. Workers never append
+events directly, and output arriving after logical cancellation has no route
+back into the bus, the active canvas, or a scrubbed/replaced session.
 Working-state projection V1 bounds are bytes at the host boundary: goal 4,096;
 plan 8,192; compiler state 4,096; each list at most 64 items; each item at most
 1,024; and the serialized projection at most 32,768. The supplied JSON Schema

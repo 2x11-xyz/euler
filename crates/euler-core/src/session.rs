@@ -448,8 +448,15 @@ struct ShadowCompaction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactionCloseDisposition {
+    ApplyReady,
+    DiscardReady,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactionStatus {
     Applied,
+    Cancelled,
     Failed,
     InProgress,
     Unchanged,
@@ -1786,7 +1793,7 @@ impl<D: PermissionDecider> Session<D> {
         )
         .run(&cancellation);
         if matches!(&result, Err(SessionError::Cancelled)) {
-            io.session.cancel_compaction("turn interrupted")?;
+            io.session.interrupt_compaction("turn interrupted")?;
             io.sink.flush(io.session.bus.events());
         }
         drop(io);
@@ -2311,7 +2318,7 @@ impl<D: PermissionDecider> Session<D> {
             });
         };
         let shadow = self.shadow_compaction.take().expect("shadow checked above");
-        self.finish_shadow_compaction(shadow, outcome)
+        self.finish_shadow_compaction(shadow, outcome, CompactionCloseDisposition::ApplyReady)
     }
 
     fn wait_for_shadow_compaction(
@@ -2324,7 +2331,7 @@ impl<D: PermissionDecider> Session<D> {
         let deadline = Instant::now() + COMPACTION_WAIT_LIMIT;
         loop {
             if cancellation.is_cancelled() {
-                self.cancel_compaction("turn interrupted")?;
+                self.interrupt_compaction("turn interrupted")?;
                 return Err(SessionError::Cancelled);
             }
             let now = Instant::now();
@@ -2340,7 +2347,11 @@ impl<D: PermissionDecider> Session<D> {
                 continue;
             };
             let shadow = self.shadow_compaction.take().expect("shadow checked above");
-            return self.finish_shadow_compaction(shadow, outcome);
+            return self.finish_shadow_compaction(
+                shadow,
+                outcome,
+                CompactionCloseDisposition::ApplyReady,
+            );
         }
     }
 
@@ -2353,18 +2364,38 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         reason: &'static str,
     ) -> Result<CompactionStatus, SessionError> {
+        self.close_compaction(reason, CompactionCloseDisposition::ApplyReady)
+    }
+
+    /// Interrupt a pending compaction without granting its candidate authority
+    /// to replace the canvas. A result that has already crossed the worker
+    /// channel still records its model result and usage, but a valid projection
+    /// is discarded rather than committed. This is the user/root-interrupt
+    /// path; lifecycle replacement uses [`Self::cancel_compaction`] instead.
+    pub fn interrupt_compaction(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, SessionError> {
+        self.close_compaction(reason, CompactionCloseDisposition::DiscardReady)
+    }
+
+    fn close_compaction(
+        &mut self,
+        reason: &'static str,
+        disposition: CompactionCloseDisposition,
+    ) -> Result<CompactionStatus, SessionError> {
         let Some(shadow) = self.shadow_compaction.as_ref() else {
             return Ok(CompactionStatus::Unchanged);
         };
         if let Some(outcome) = shadow.worker.try_recv() {
             let shadow = self.shadow_compaction.take().expect("shadow checked above");
-            return self.finish_shadow_compaction(shadow, outcome);
+            return self.finish_shadow_compaction(shadow, outcome, disposition);
         }
         shadow.worker.cancel();
         let outcome = shadow.worker.recv_timeout(COMPACTION_CANCEL_GRACE);
         let shadow = self.shadow_compaction.take().expect("shadow checked above");
         if let Some(outcome) = outcome {
-            return self.finish_shadow_compaction(shadow, outcome);
+            return self.finish_shadow_compaction(shadow, outcome, disposition);
         }
         // The provider may be inside non-cancellable synchronous I/O. Drop
         // the receiver only after terminalizing the canonical model.call;
@@ -2392,13 +2423,14 @@ impl<D: PermissionDecider> Session<D> {
             Some(shadow.model_call_id),
         )?;
         self.discard_shadow_candidate("shadow compaction cancelled")?;
-        Ok(CompactionStatus::Failed)
+        Ok(CompactionStatus::Cancelled)
     }
 
     fn finish_shadow_compaction(
         &mut self,
         mut shadow: ShadowCompaction,
         outcome: compaction_worker::WorkerOutcome,
+        disposition: CompactionCloseDisposition,
     ) -> Result<CompactionStatus, SessionError> {
         shadow.worker.reap_after_terminal();
         let result = match outcome {
@@ -2438,6 +2470,10 @@ impl<D: PermissionDecider> Session<D> {
             return Ok(CompactionStatus::Failed);
         };
         shadow.candidate.projection = projection;
+        if disposition == CompactionCloseDisposition::DiscardReady {
+            self.discard_shadow_candidate("shadow compaction interrupted before apply")?;
+            return Ok(CompactionStatus::Cancelled);
+        }
         let applied = self.commit_compaction_candidate(
             shadow.candidate,
             Some((&shadow.target, shadow.started_at.elapsed())),

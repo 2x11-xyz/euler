@@ -1165,14 +1165,17 @@ impl AppCore {
                 &self.state,
                 AppState::Idle { session } if session.compaction_in_progress()
             );
-            let cancelled = self.cancel_idle_compaction_for_lifecycle("user interrupt");
+            let cancelled = self.interrupt_idle_compaction("user interrupt");
             if !compaction_in_progress {
                 return CoreEffect::None;
             }
             return match cancelled {
                 Ok(CompactionStatus::Applied) => self.notice_item("compaction complete".to_owned()),
-                Ok(CompactionStatus::Failed) => {
+                Ok(CompactionStatus::Cancelled) => {
                     self.notice_item("compaction interrupted · active canvas unchanged".to_owned())
+                }
+                Ok(CompactionStatus::Failed) => {
+                    self.notice_item("compaction failed · active canvas unchanged".to_owned())
                 }
                 Ok(CompactionStatus::Unchanged) => CoreEffect::None,
                 Ok(CompactionStatus::InProgress) => self.error_item(
@@ -1183,6 +1186,7 @@ impl AppCore {
         }
         let cleared = self.pending_runs.len();
         self.pending_runs.clear();
+        self.compaction_request.store(false, Ordering::SeqCst);
         if cleared > 0 {
             let noun = if cleared == 1 {
                 "queued activity"
@@ -1233,6 +1237,7 @@ impl AppCore {
     /// is dropped. Catalog refresh remains a single short call without a
     /// cancellation signal.
     pub fn cancel_in_flight_for_shutdown(&mut self) {
+        self.compaction_request.store(false, Ordering::SeqCst);
         match &self.state {
             AppState::TurnInFlight { interrupt_flag, .. } => {
                 // Same ordering contract as `handle_interrupt`: a worker that

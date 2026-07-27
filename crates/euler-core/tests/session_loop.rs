@@ -916,7 +916,7 @@ fn lifecycle_cancellation_closes_pending_compaction_and_rejects_late_output() {
         session
             .cancel_compaction("session lifecycle test")
             .expect("cancel"),
-        euler_core::CompactionStatus::Failed
+        euler_core::CompactionStatus::Cancelled
     );
     assert!(!session.compaction_in_progress());
     assert_eq!(count_kind(session.events(), EventKind::ERROR), 1);

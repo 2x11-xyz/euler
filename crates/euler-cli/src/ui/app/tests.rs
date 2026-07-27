@@ -374,6 +374,7 @@ impl CompactionRaceState {
 struct CompactionRaceProvider {
     state: Arc<CompactionRaceState>,
     root_calls: AtomicUsize,
+    shadow_fails: bool,
 }
 
 impl ModelProvider for CompactionRaceProvider {
@@ -384,8 +385,12 @@ impl ModelProvider for CompactionRaceProvider {
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         if request.tools.is_empty() {
             self.state.park_shadow();
-            return Ok(Box::new(CompactionRaceStream {
-                events: vec![
+            let events = if self.shadow_fails {
+                vec![Err(ProviderError::rejected(
+                    "fixture shadow projection failed",
+                ))]
+            } else {
+                vec![
                     Ok(ModelStreamEvent::TextDelta(
                         json!({
                             "goal": "keep working",
@@ -410,7 +415,9 @@ impl ModelProvider for CompactionRaceProvider {
                         }),
                     }),
                 ]
-                .into_iter(),
+            };
+            return Ok(Box::new(CompactionRaceStream {
+                events: events.into_iter(),
                 state: Arc::clone(&self.state),
             }));
         }
@@ -431,7 +438,7 @@ impl Iterator for CompactionRaceStream {
 
     fn next(&mut self) -> Option<Self::Item> {
         let event = self.events.next()?;
-        if matches!(&event, Ok(ModelStreamEvent::Finished { .. })) {
+        if event.is_err() || matches!(&event, Ok(ModelStreamEvent::Finished { .. })) {
             self.state.mark_shadow_completed();
         }
         Some(event)
@@ -443,6 +450,17 @@ fn core_with_compaction_race_provider() -> (AppCore, Arc<CompactionRaceState>) {
     let provider = CompactionRaceProvider {
         state: Arc::clone(&state),
         root_calls: AtomicUsize::new(0),
+        shadow_fails: false,
+    };
+    (TestCore::builder().provider(provider).build(), state)
+}
+
+fn core_with_compaction_failure_provider() -> (AppCore, Arc<CompactionRaceState>) {
+    let state = Arc::new(CompactionRaceState::default());
+    let provider = CompactionRaceProvider {
+        state: Arc::clone(&state),
+        root_calls: AtomicUsize::new(0),
+        shadow_fails: true,
     };
     (TestCore::builder().provider(provider).build(), state)
 }
@@ -704,7 +722,7 @@ fn base_escape_cancels_idle_shadow_and_fences_late_output() {
 }
 
 #[test]
-fn base_escape_reports_a_ready_shadow_that_applies_instead_of_claiming_no_change() {
+fn base_escape_records_ready_shadow_usage_but_discards_its_candidate() {
     let (mut core, state) = core_with_compaction_race_provider();
     submit_text_and_wait(&mut core, &"history ".repeat(400));
 
@@ -718,6 +736,62 @@ fn base_escape_reports_a_ready_shadow_that_applies_instead_of_claiming_no_change
         state.wait_for_shadow_completion(),
         "compactor never produced its terminal result"
     );
+    type_text(&mut core, "draft survives");
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert_eq!(core.bottom.composer().submit_text(), "draft survives");
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert!(!session.compaction_in_progress());
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+    let result = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_RESULT
+                && event
+                    .payload
+                    .get("purpose")
+                    .is_some_and(|purpose| purpose == "compaction")
+        })
+        .expect("ready compactor usage must remain canonical");
+    assert_eq!(result.payload["usage"]["input_tokens"], json!(8));
+    assert_eq!(result.payload["usage"]["output_tokens"], json!(2));
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED
+            && event
+                .payload
+                .get("reason")
+                .is_some_and(|reason| reason == "shadow compaction interrupted before apply")
+    }));
+    let text = drain_finalized_visual_text(&mut core, 100);
+    assert!(
+        text.contains("compaction interrupted · active canvas unchanged"),
+        "{text}"
+    );
+    assert!(!text.contains("compaction complete"), "{text}");
+}
+
+#[test]
+fn base_escape_reports_a_ready_provider_failure_as_failure_not_cancellation() {
+    let (mut core, state) = core_with_compaction_failure_provider();
+    submit_text_and_wait(&mut core, &"history ".repeat(400));
+
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(
+        state.wait_for_shadow(),
+        "compactor never reached its provider"
+    );
+    state.release_shadow();
+    assert!(
+        state.wait_for_shadow_completion(),
+        "compactor never produced its terminal failure"
+    );
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
 
@@ -725,16 +799,27 @@ fn base_escape_reports_a_ready_shadow_that_applies_instead_of_claiming_no_change
         panic!("session should remain idle");
     };
     assert!(!session.compaction_in_progress());
-    assert!(session
+    assert!(!session
         .events()
         .iter()
         .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ERROR
+            && event
+                .payload
+                .get("purpose")
+                .is_some_and(|purpose| purpose == "compaction")
+            && event
+                .payload
+                .get("category")
+                .is_some_and(|category| category == "rejected")
+    }));
     let text = drain_finalized_visual_text(&mut core, 100);
-    assert!(text.contains("compaction complete"), "{text}");
     assert!(
-        !text.contains("active canvas unchanged"),
-        "an applied candidate must not be reported as unchanged: {text}"
+        text.contains("compaction failed · active canvas unchanged"),
+        "{text}"
     );
+    assert!(!text.contains("compaction interrupted"), "{text}");
 }
 
 #[test]
@@ -801,6 +886,64 @@ fn escape_cancels_driver_and_shadow_without_late_canvas_swap() {
 }
 
 #[test]
+fn escape_discards_a_ready_shadow_while_cancelling_the_concurrent_driver() {
+    let (mut core, state) = core_with_compaction_race_provider();
+    submit_text_and_wait(&mut core, &"history ".repeat(400));
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(
+        state.wait_for_shadow(),
+        "compactor never reached its provider"
+    );
+
+    submit_without_wait(&mut core, "continue concurrently");
+    assert!(state.wait_for_driver(), "driver never reached its provider");
+    state.release_shadow();
+    assert!(
+        state.wait_for_shadow_completion(),
+        "compactor never produced its terminal result"
+    );
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    wait_for_idle(&mut core);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("cancelled worker should return its session");
+    };
+    assert!(!session.compaction_in_progress());
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::MODEL_RESULT
+            && event
+                .payload
+                .get("purpose")
+                .is_some_and(|purpose| purpose == "compaction")
+    }));
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED
+            && event
+                .payload
+                .get("reason")
+                .is_some_and(|reason| reason == "shadow compaction interrupted before apply")
+    }));
+
+    let event_count = session.events().len();
+    state.release_driver();
+    std::thread::sleep(Duration::from_millis(30));
+    core.drain_background();
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert_eq!(session.events().len(), event_count);
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+}
+
+#[test]
 fn active_turn_compaction_is_edge_triggered_without_interrupting_the_turn() {
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "first");
@@ -845,6 +988,50 @@ fn active_turn_compaction_is_edge_triggered_without_interrupting_the_turn() {
         !rendered.contains("WorkingStateProjection"),
         "shadow model traffic is provenance, not visible transcript text:\n{rendered}"
     );
+}
+
+#[test]
+fn escape_clears_an_active_turn_compaction_request_without_starting_a_shadow() {
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "cancel this turn");
+    for _ in 0..100 {
+        core.drain_background();
+        if core
+            .transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        core.transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL),
+        "driver never reached the provider gate"
+    );
+
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(core.compaction_request.load(Ordering::SeqCst));
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert!(!core.compaction_request.load(Ordering::SeqCst));
+    wait_for_idle(&mut core);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("cancelled worker should return its session");
+    };
+    assert!(!session.compaction_in_progress());
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::MODEL_CALL
+            && event
+                .payload
+                .get("purpose")
+                .is_some_and(|purpose| purpose == "compaction")
+    }));
+    gate.open();
 }
 
 #[test]
@@ -1384,11 +1571,16 @@ fn shutdown_cancellation_sets_in_flight_turn_interrupt_flag() {
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
     assert!(core.turn_in_flight());
+    core.compaction_request.store(true, Ordering::SeqCst);
 
     core.cancel_in_flight_for_shutdown();
 
     // Pause-before-flag, same ordering contract as `handle_interrupt`.
     assert!(core.queued_inputs.paused());
+    assert!(
+        !core.compaction_request.load(Ordering::SeqCst),
+        "shutdown must not leave a manual compaction queued behind the cancelled turn"
+    );
     let AppState::TurnInFlight { interrupt_flag, .. } = &core.state else {
         panic!("turn should still be in flight");
     };

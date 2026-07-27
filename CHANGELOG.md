@@ -34,15 +34,15 @@ pull requests that landed them; deeper design rationale lives in
   context usage only after an accepted swap. At the hard context margin, Euler
   waits for an in-flight candidate and otherwise stops with an honest limit
   event.
-- Shadow jobs now cancel at session lifecycle boundaries, preserve completed
+- Shadow jobs now close at session lifecycle boundaries, preserve completed
   usage and cost records, and cannot publish late output into a replaced or
   scrubbed session. Candidate validation is host-bounded and proves the exact
   post-swap request both shrinks and fits before accounting is reset.
-- Escape at the base composer now settles an already-ready idle shadow or
-  cancels a pending one, reports the actual outcome, and preserves the draft.
-  Interrupting a driver with a concurrent shadow terminalizes and fences both
-  calls, so neither provider's late return can append events or swap the
-  canvas.
+- Escape at the base composer now interrupts an idle shadow without applying
+  its candidate, preserves already-ready usage provenance, reports failure
+  separately from cancellation, and preserves the draft. Interrupting a
+  driver with a concurrent shadow terminalizes and fences both calls, so
+  neither provider's late return can append events or swap the canvas.
 
 ### ChatGPT subscription compatibility
 
