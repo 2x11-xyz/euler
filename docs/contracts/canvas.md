@@ -107,7 +107,13 @@ The continuation is a one-shot input: it folds over the complete accepted log
 and remains eligible across persistence, resume, and an applied full
 `canvas.swap` until an accepted same-agent root-driver `model.call` binds the
 exact purpose-free `canvas.snapshot` that selected its event id through
-`canvas_snapshot_id`. A snapshot alone is prepared request state and consumes
+`canvas_snapshot_id`. Contribution, snapshot, and call must share both envelope
+`session` and `agent`, and the link must name that identity's latest earlier
+purpose-free snapshot. Every involved envelope id must be globally unique; the
+snapshot selection ids must also be unique, with checked length exactly equal
+to both `counts.items` and the call's `canvas_items`. Any duplicate, malformed,
+stale, future, missing, or crossed-identity link fails closed and leaves the
+contribution pending. A snapshot alone is prepared request state and consumes
 nothing; a crash in the snapshot-to-call window leaves the contribution
 eligible on resume. If the contribution lies before the active swap frontier,
 assembly pins it after the projection and durable extension slots but before

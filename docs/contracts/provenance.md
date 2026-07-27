@@ -10,6 +10,13 @@ Derived research structures, such as causal DAGs, are projections or extension a
 
 Provenance uses the canonical session event envelope in `docs/contracts/events.md`. Persistence policy, durability semantics (emitted/appended/durable), and schema versioning are defined in `docs/contracts/persistence.md`.
 
+Accepted event ids are globally unique within a session stream. A duplicate
+makes request links and causal references ambiguous, so resume rejects the
+prefix during canonical preflight before recovery closures, resume markers, or
+continued activity can mutate the log. Inspection projections remain readable
+where possible but must fail closed instead of granting authority to the
+colliding id.
+
 ## Writer Ownership
 
 A live session log has one owning `ProvenanceWriter`. Creating a second writer

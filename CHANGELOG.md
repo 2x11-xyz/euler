@@ -63,7 +63,9 @@ pull requests that landed them; deeper design rationale lives in
   Accepted continuations run under the ordinary `RoundLoop` limit with no
   hidden second cap, and become one-shot only when an admitted `model.call`
   binds their exact prepared canvas snapshot; a snapshot-only crash preserves
-  them for recovery.
+  them for recovery. Request links fail closed on duplicate event ids,
+  malformed snapshot accounting, stale snapshots, or crossed session/agent
+  identity, and resume rejects duplicate ids before appending recovery.
 - Session-private extension state now has its own `extension-state` capability.
   Root sessions allow it and bounded, namespaced `context-slot` updates by
   default so removable workflows can probe absent or resumed state.

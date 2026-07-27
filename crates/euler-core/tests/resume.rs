@@ -1491,6 +1491,52 @@ fn unknown_kind_is_resume_incompatibility_naming_kind() {
 }
 
 #[test]
+fn fold_rejects_duplicate_event_ids_with_a_bounded_incompatibility() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let first = user_message("first");
+    let mut duplicate = user_message("conflicting duplicate");
+    duplicate.id.clone_from(&first.id);
+
+    let error = fold_session(&SessionConfig::new(temp.path()), vec![first, duplicate])
+        .expect_err("duplicate");
+
+    assert!(matches!(error, ResumeError::DuplicateEventId));
+    assert_eq!(
+        error.to_string(),
+        "resume incompatible: duplicate event id in accepted provenance prefix"
+    );
+}
+
+#[test]
+fn resume_rejects_duplicate_event_ids_before_appending_any_recovery() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let call = model_call(Some(start.id.clone()));
+    let mut duplicate = user_message("duplicate call id");
+    duplicate.id.clone_from(&call.id);
+    write_events(&log, &[start, call, duplicate]);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("duplicate event id must reject resume"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, ResumeError::DuplicateEventId));
+    assert_eq!(
+        fs::read(&log).expect("read rejected log"),
+        before,
+        "duplicate-id preflight must run before recovery closure mutation"
+    );
+}
+
+#[test]
 fn fold_accepts_known_canvas_swap_event() {
     let temp = tempfile::tempdir().expect("temp dir");
     let event = EventEnvelope::new("session", "agent", None, EventKind::CANVAS_SWAP, object([]));

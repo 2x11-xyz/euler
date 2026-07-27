@@ -53,6 +53,8 @@ pub enum ResumeError {
     UnsupportedVersion { found: u16, supported: u16 },
     #[error("resume incompatible: unknown event kind {kind}")]
     UnknownKind { kind: String },
+    #[error("resume incompatible: duplicate event id in accepted provenance prefix")]
+    DuplicateEventId,
     #[error(
         "resume incompatible: terminal event {event_id} for agent {agent} matches multiple open \
          model calls"
@@ -484,6 +486,7 @@ pub fn read_resume_prefix(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>, 
         events.push(verify_and_rehydrate_blobs(event, &blob_dir)?);
     }
 
+    preflight_events(&events)?;
     Ok(events)
 }
 
@@ -555,6 +558,9 @@ pub fn resume_session_from_folded_prefix<D>(
     writer: ProvenanceWriter,
     mut folded: FoldedSession,
 ) -> Result<ResumeOutcome<D>, ResumeError> {
+    // This is the mutation boundary: even doc-hidden callers that bypass
+    // `fold_session` cannot append recovery events to an ambiguous prefix.
+    preflight_events(&folded.events)?;
     let events_folded = folded.events.len();
     let active_target = folded.active_target.clone();
     let reasoning_effort = folded.reasoning_effort;
@@ -671,8 +677,12 @@ fn policy_from_object(
 }
 
 fn preflight_events(events: &[EventEnvelope]) -> Result<(), ResumeError> {
+    let mut event_ids = BTreeSet::new();
     for event in events {
         preflight_event(event)?;
+        if !event_ids.insert(event.id.as_str()) {
+            return Err(ResumeError::DuplicateEventId);
+        }
     }
     Ok(())
 }

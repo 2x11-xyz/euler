@@ -45,6 +45,38 @@ fn root_model_call_for_snapshot(snapshot: &EventEnvelope) -> EventEnvelope {
     )
 }
 
+fn accepted_driver_continuation(session: &str, agent: &str) -> EventEnvelope {
+    EventEnvelope::new(
+        session,
+        agent,
+        None,
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            ("content", "continue exactly once".into()),
+        ]),
+    )
+}
+
+fn assert_continuation_pending(case: &str, contribution: &EventEnvelope, events: &[EventEnvelope]) {
+    let canvas = assemble_canvas(events, &off_policy(usize::MAX));
+    assert!(
+        canvas.iter().any(|item| matches!(
+            item,
+            CanvasItem::ExtensionContribution {
+                event_id,
+                content,
+                ..
+            } if event_id == &contribution.id && content == "continue exactly once"
+        )),
+        "{case}: malformed or ambiguous provenance must not consume the contribution: {canvas:#?}"
+    );
+}
+
 #[test]
 fn default_policy_enables_automatic_compaction_and_tool_stubs() {
     let policy = AutoCompactionPolicy::default();
@@ -1085,6 +1117,184 @@ fn extension_continuation_requires_a_request_backed_snapshot_to_become_one_shot(
         &off_policy(usize::MAX),
     );
     assert!(after_call.is_empty());
+}
+
+#[test]
+fn malformed_snapshot_authority_keeps_extension_continuation_pending() {
+    let contribution = accepted_driver_continuation("s", "a");
+
+    let mut count_mismatch = driver_snapshot_selecting(&contribution);
+    count_mismatch
+        .payload
+        .insert("counts".to_owned(), serde_json::json!({"items": 2}));
+    let mut count_mismatch_call = root_model_call_for_snapshot(&count_mismatch);
+    count_mismatch_call
+        .payload
+        .insert("canvas_items".to_owned(), 2.into());
+    assert_continuation_pending(
+        "selected list/count mismatch",
+        &contribution,
+        &[contribution.clone(), count_mismatch, count_mismatch_call],
+    );
+
+    let mut duplicate_selection = driver_snapshot_selecting(&contribution);
+    duplicate_selection.payload.insert(
+        "selected_event_ids".to_owned(),
+        serde_json::json!([contribution.id.clone(), contribution.id.clone()]),
+    );
+    duplicate_selection
+        .payload
+        .insert("counts".to_owned(), serde_json::json!({"items": 2}));
+    let mut duplicate_selection_call = root_model_call_for_snapshot(&duplicate_selection);
+    duplicate_selection_call
+        .payload
+        .insert("canvas_items".to_owned(), 2.into());
+    assert_continuation_pending(
+        "duplicate selected ids",
+        &contribution,
+        &[
+            contribution.clone(),
+            duplicate_selection,
+            duplicate_selection_call,
+        ],
+    );
+}
+
+#[test]
+fn only_the_latest_earlier_driver_snapshot_can_consume_a_continuation() {
+    let contribution = accepted_driver_continuation("s", "a");
+    let stale_snapshot = driver_snapshot_selecting(&contribution);
+    let latest_snapshot = driver_snapshot_selecting(&contribution);
+    let stale_call = root_model_call_for_snapshot(&stale_snapshot);
+    assert_continuation_pending(
+        "stale snapshot link",
+        &contribution,
+        &[
+            contribution.clone(),
+            stale_snapshot,
+            latest_snapshot,
+            stale_call,
+        ],
+    );
+
+    let future_snapshot = driver_snapshot_selecting(&contribution);
+    let future_call = root_model_call_for_snapshot(&future_snapshot);
+    assert_continuation_pending(
+        "future snapshot link",
+        &contribution,
+        &[contribution.clone(), future_call, future_snapshot.clone()],
+    );
+
+    let mut missing_link_call = root_model_call_for_snapshot(&future_snapshot);
+    missing_link_call.payload.remove("canvas_snapshot_id");
+    assert_continuation_pending(
+        "missing snapshot link",
+        &contribution,
+        &[contribution.clone(), future_snapshot, missing_link_call],
+    );
+}
+
+#[test]
+fn duplicate_event_ids_never_authorize_continuation_consumption() {
+    let contribution = accepted_driver_continuation("s", "a");
+    let snapshot = driver_snapshot_selecting(&contribution);
+    let mut conflicting_snapshot = snapshot.clone();
+    conflicting_snapshot
+        .payload
+        .insert("selected_event_ids".to_owned(), serde_json::json!([]));
+    conflicting_snapshot
+        .payload
+        .insert("counts".to_owned(), serde_json::json!({"items": 0}));
+    let call = root_model_call_for_snapshot(&snapshot);
+    assert_continuation_pending(
+        "conflicting duplicate snapshot id",
+        &contribution,
+        &[contribution.clone(), snapshot, conflicting_snapshot, call],
+    );
+
+    let mut duplicate_event = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "colliding envelope".into())]),
+    );
+    duplicate_event.id.clone_from(&contribution.id);
+    let clean_contribution = accepted_driver_continuation("s", "a");
+    let snapshot = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            (
+                "selected_event_ids",
+                serde_json::json!([contribution.id.clone(), clean_contribution.id.clone()]),
+            ),
+            ("counts", serde_json::json!({"items": 2})),
+        ]),
+    );
+    let mut call = root_model_call_for_snapshot(&snapshot);
+    call.payload.insert("canvas_items".to_owned(), 2.into());
+    let duplicate_selection = [
+        contribution.clone(),
+        clean_contribution.clone(),
+        duplicate_event,
+        snapshot,
+        call,
+    ];
+    assert_continuation_pending(
+        "duplicate contribution/event id",
+        &contribution,
+        &duplicate_selection,
+    );
+    assert_continuation_pending(
+        "a collision invalidates the whole snapshot authority",
+        &clean_contribution,
+        &duplicate_selection,
+    );
+
+    let snapshot = driver_snapshot_selecting(&contribution);
+    let call = root_model_call_for_snapshot(&snapshot);
+    let mut duplicate_call = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "call id collision".into())]),
+    );
+    duplicate_call.id.clone_from(&call.id);
+    assert_continuation_pending(
+        "duplicate model call id",
+        &contribution,
+        &[contribution.clone(), snapshot, call, duplicate_call],
+    );
+}
+
+#[test]
+fn request_backed_consumption_requires_matching_session_and_agent() {
+    let contribution = accepted_driver_continuation("session-a", "root");
+    let mut foreign_session_snapshot = driver_snapshot_selecting(&contribution);
+    foreign_session_snapshot.session = "session-b".to_owned();
+    let foreign_session_call = root_model_call_for_snapshot(&foreign_session_snapshot);
+    assert_continuation_pending(
+        "cross-session same-agent link",
+        &contribution,
+        &[
+            contribution.clone(),
+            foreign_session_snapshot,
+            foreign_session_call,
+        ],
+    );
+
+    let snapshot = driver_snapshot_selecting(&contribution);
+    let mut foreign_agent_call = root_model_call_for_snapshot(&snapshot);
+    foreign_agent_call.agent = "child".to_owned();
+    assert_continuation_pending(
+        "foreign-agent link",
+        &contribution,
+        &[contribution.clone(), snapshot, foreign_agent_call],
+    );
 }
 
 #[test]

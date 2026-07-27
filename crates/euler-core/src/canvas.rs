@@ -341,7 +341,7 @@ fn collect_canvas_items(
             EventKind::USER_MESSAGE => push_message(&mut items, CanvasRole::User, event),
             EventKind::ASSISTANT_MESSAGE => push_message(&mut items, CanvasRole::Assistant, event),
             EventKind::EXTENSION_CONTRIBUTION => {
-                if let Some(contribution) = pending_contributions.get(&event.id) {
+                if let Some(contribution) = pending_contributions.get(&index) {
                     items.push(contribution.item.clone());
                 }
             }
@@ -382,7 +382,7 @@ fn initial_canvas_items(
     project_context: Option<&PinnedProjectContext>,
     active_swap: Option<&ActiveSwap>,
     active_slots: Vec<ContextSlot>,
-    pending_contributions: &BTreeMap<String, PendingExtensionContribution>,
+    pending_contributions: &BTreeMap<usize, PendingExtensionContribution>,
 ) -> Vec<CanvasItem> {
     let mut items = Vec::new();
     if let Some(pinned) = project_context {
@@ -703,13 +703,21 @@ fn extension_contribution_item(event: &EventEnvelope) -> Option<CanvasItem> {
 #[derive(Clone, Debug)]
 struct PendingExtensionContribution {
     index: usize,
+    event_id: String,
+    session: String,
     agent: String,
     item: CanvasItem,
 }
 
 struct DriverCanvasSnapshot {
+    event_id: String,
     index: usize,
+    session: String,
     agent: String,
+    authority: Option<DriverSnapshotAuthority>,
+}
+
+struct DriverSnapshotAuthority {
     canvas_items: u64,
     selected_event_ids: Vec<String>,
 }
@@ -721,17 +729,20 @@ struct DriverCanvasSnapshot {
 /// Shadow-compaction and child-agent calls cannot consume root-driver input.
 fn fold_pending_extension_contributions(
     events: &[EventEnvelope],
-) -> BTreeMap<String, PendingExtensionContribution> {
+) -> BTreeMap<usize, PendingExtensionContribution> {
+    let duplicate_ids = duplicated_event_ids(events);
     let mut pending = BTreeMap::new();
-    let mut driver_snapshots = BTreeMap::<String, DriverCanvasSnapshot>::new();
+    let mut latest_driver_snapshots = BTreeMap::<(String, String), DriverCanvasSnapshot>::new();
     for (index, event) in events.iter().enumerate() {
         match event.kind.as_str() {
             EventKind::EXTENSION_CONTRIBUTION => {
                 if let Some(item) = extension_contribution_item(event) {
                     pending.insert(
-                        event.id.clone(),
+                        index,
                         PendingExtensionContribution {
                             index,
+                            event_id: event.id.clone(),
+                            session: event.session.clone(),
                             agent: event.agent.clone(),
                             item,
                         },
@@ -739,12 +750,24 @@ fn fold_pending_extension_contributions(
                 }
             }
             EventKind::CANVAS_SNAPSHOT if !event.payload.contains_key("purpose") => {
-                if let Some(snapshot) = driver_canvas_snapshot(event, index) {
-                    driver_snapshots.insert(event.id.clone(), snapshot);
-                }
+                latest_driver_snapshots.insert(
+                    (event.session.clone(), event.agent.clone()),
+                    driver_canvas_snapshot(
+                        event,
+                        index,
+                        !duplicate_ids.contains(&event.id),
+                        &duplicate_ids,
+                    ),
+                );
             }
             EventKind::MODEL_CALL if !pending.is_empty() => {
-                consume_request_backed_contributions(event, index, &driver_snapshots, &mut pending);
+                consume_request_backed_contributions(
+                    event,
+                    index,
+                    &latest_driver_snapshots,
+                    &duplicate_ids,
+                    &mut pending,
+                );
             }
             _ => {}
         }
@@ -752,7 +775,41 @@ fn fold_pending_extension_contributions(
     pending
 }
 
-fn driver_canvas_snapshot(event: &EventEnvelope, index: usize) -> Option<DriverCanvasSnapshot> {
+fn duplicated_event_ids(events: &[EventEnvelope]) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    events
+        .iter()
+        .filter_map(|event| {
+            if seen.insert(event.id.as_str()) {
+                None
+            } else {
+                Some(event.id.clone())
+            }
+        })
+        .collect()
+}
+
+fn driver_canvas_snapshot(
+    event: &EventEnvelope,
+    index: usize,
+    unique_id: bool,
+    duplicate_ids: &BTreeSet<String>,
+) -> DriverCanvasSnapshot {
+    DriverCanvasSnapshot {
+        event_id: event.id.clone(),
+        index,
+        session: event.session.clone(),
+        agent: event.agent.clone(),
+        authority: unique_id
+            .then(|| driver_snapshot_authority(event, duplicate_ids))
+            .flatten(),
+    }
+}
+
+fn driver_snapshot_authority(
+    event: &EventEnvelope,
+    duplicate_ids: &BTreeSet<String>,
+) -> Option<DriverSnapshotAuthority> {
     let selected_event_ids = event
         .payload
         .get("selected_event_ids")?
@@ -761,9 +818,17 @@ fn driver_canvas_snapshot(event: &EventEnvelope, index: usize) -> Option<DriverC
         .map(|id| id.as_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()?;
     let canvas_items = event.payload.get("counts")?.get("items")?.as_u64()?;
-    Some(DriverCanvasSnapshot {
-        index,
-        agent: event.agent.clone(),
+    let expected_items = usize::try_from(canvas_items).ok()?;
+    let unique_items = selected_event_ids.iter().collect::<BTreeSet<_>>();
+    if selected_event_ids.len() != expected_items
+        || unique_items.len() != selected_event_ids.len()
+        || selected_event_ids
+            .iter()
+            .any(|id| duplicate_ids.contains(id))
+    {
+        return None;
+    }
+    Some(DriverSnapshotAuthority {
         canvas_items,
         selected_event_ids,
     })
@@ -772,10 +837,11 @@ fn driver_canvas_snapshot(event: &EventEnvelope, index: usize) -> Option<DriverC
 fn consume_request_backed_contributions(
     model_call: &EventEnvelope,
     call_index: usize,
-    driver_snapshots: &BTreeMap<String, DriverCanvasSnapshot>,
-    pending: &mut BTreeMap<String, PendingExtensionContribution>,
+    latest_driver_snapshots: &BTreeMap<(String, String), DriverCanvasSnapshot>,
+    duplicate_ids: &BTreeSet<String>,
+    pending: &mut BTreeMap<usize, PendingExtensionContribution>,
 ) {
-    if model_call.payload.contains_key("purpose") {
+    if model_call.payload.contains_key("purpose") || duplicate_ids.contains(&model_call.id) {
         return;
     }
     let Some(snapshot_id) = model_call
@@ -785,26 +851,38 @@ fn consume_request_backed_contributions(
     else {
         return;
     };
-    let Some(snapshot) = driver_snapshots.get(snapshot_id) else {
+    let Some(snapshot) =
+        latest_driver_snapshots.get(&(model_call.session.clone(), model_call.agent.clone()))
+    else {
         return;
     };
-    if snapshot.index >= call_index
+    let Some(authority) = &snapshot.authority else {
+        return;
+    };
+    if snapshot.event_id != snapshot_id
+        || snapshot.index >= call_index
+        || snapshot.session != model_call.session
         || snapshot.agent != model_call.agent
         || model_call
             .payload
             .get("canvas_items")
             .and_then(Value::as_u64)
-            != Some(snapshot.canvas_items)
+            != Some(authority.canvas_items)
     {
         return;
     }
-    for id in &snapshot.selected_event_ids {
-        if pending.get(id).is_some_and(|contribution| {
-            contribution.agent == model_call.agent && contribution.index < snapshot.index
-        }) {
-            pending.remove(id);
-        }
-    }
+    let selected = authority
+        .selected_event_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    pending.retain(|_, contribution| {
+        duplicate_ids.contains(&contribution.event_id)
+            || !selected.contains(contribution.event_id.as_str())
+            || contribution.session != snapshot.session
+            || contribution.agent != snapshot.agent
+            || contribution.index >= snapshot.index
+    });
 }
 
 #[derive(Clone, Debug)]

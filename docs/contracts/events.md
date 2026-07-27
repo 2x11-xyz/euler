@@ -24,6 +24,12 @@ Every session event has:
 
 Large payloads are stored as content-addressed blobs and referenced from `blobs`.
 
+Event ids are globally unique within one accepted session stream. Resume
+rejects a prefix containing any duplicate id before appending recovery or
+continued activity. Projections that can inspect an unresumable stream must
+independently refuse to treat a duplicated id as selection or request-link
+authority.
+
 ## Initial Event Kinds
 
 - `user.message`
@@ -116,9 +122,12 @@ envelope `v` per `docs/contracts/persistence.md`.
   `requested_reasoning_effort`; optional resolved `reasoning_effort`,
   `max_output_tokens`, and `project_context_digest`. A root-driver call also
   carries `canvas_snapshot_id`, naming the exact preceding purpose-free
-  `canvas.snapshot` used to build that request. The linked snapshot has the
-  same envelope `agent`, its `counts.items` equals `model.call.canvas_items`,
-  and it precedes the call. Shadow-compaction calls use `purpose:
+  `canvas.snapshot` used to build that request. It must name the latest earlier
+  purpose-free snapshot for the call's exact envelope `session` and `agent`;
+  stale, future, duplicated, or crossed-identity links have no authority. The
+  snapshot's `selected_event_ids` are unique, their checked length exactly
+  equals `counts.items`, and that count equals `model.call.canvas_items`.
+  Shadow-compaction calls use `purpose:
   "compaction"` and do not carry this root-driver link; companion and reviewer
   calls use their own actors and cannot claim a root snapshot.
   Every accepted call has
@@ -558,7 +567,8 @@ envelope `v` per `docs/contracts/persistence.md`.
   configured context limit are known. Snapshot fields are assembly telemetry
   for the next model request; they do not rewrite provenance history or consume
   one-shot input by themselves. An accepted root-driver `model.call` binds the
-  exact request snapshot through `canvas_snapshot_id`.
+  exact request snapshot through `canvas_snapshot_id` only under the unique,
+  latest, same-session/agent accounting rule above.
   A fixed shadow-compaction snapshot adds `purpose: "compaction"` and
   `shadow_snapshot_end_id`.
 - `canvas.policy.changed`: `automatic`, `stubs`, and `budget_bytes`. It records
