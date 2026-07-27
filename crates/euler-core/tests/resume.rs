@@ -3,6 +3,7 @@ use euler_core::{
     fold_session, read_resume_prefix, resume_session, resume_session_from_prefix,
     resume_session_with_outcome, AutoCompactionPolicy, CompactionTier, ContextLimitConfig,
     ModelTarget, ProvenanceWriter, ReasoningEffort, ResumeError, Session, SessionConfig,
+    WorkingStateProjection,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
@@ -51,6 +52,7 @@ fn fold_reproduces_live_target_usage_and_context_limit_fields() {
     config.provider = "a".to_owned();
     config.model = "model-a".to_owned();
     config.context_limit = Some(ContextLimitConfig::new(100, 0.9).expect("limit"));
+    config.auto_compaction.automatic = false;
     let mut session =
         Session::new_with_providers(config.clone(), providers, CountingDecider::default());
 
@@ -79,6 +81,44 @@ fn fold_reproduces_live_target_usage_and_context_limit_fields() {
         folded.context_limit_emitted.as_ref(),
         session.context_limit_emitted()
     );
+}
+
+#[test]
+fn fold_treats_canvas_swap_as_a_new_unknown_usage_window() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = Some(ContextLimitConfig::new(50_000, 1.0).expect("limit"));
+    config.compaction_reserve_tokens = 1_000;
+    config.auto_compaction.automatic = false;
+    let provider = StaticProvider::new(
+        "fixture",
+        vec![vec![
+            Ok(ModelStreamEvent::TextDelta("done".to_owned())),
+            Ok(ModelStreamEvent::Finished {
+                stop_reason: StopReason::Completed,
+                usage: Some(Usage {
+                    input_tokens: 50_000,
+                    output_tokens: 0,
+                    uncached_input_tokens: None,
+                    cached_tokens: None,
+                    cache_write_5m_tokens: None,
+                    cache_write_1h_tokens: None,
+                    reasoning_tokens: None,
+                }),
+            }),
+        ]],
+    );
+    let mut session = Session::new(config.clone(), provider, CountingDecider::default());
+
+    session
+        .run_turn(&format!("fill context {}", "x".repeat(20_000)))
+        .expect("turn");
+    assert!(session.context_limit_emitted().is_some());
+    assert!(session.try_compact(&WorkingStateProjection::default()));
+
+    let folded = fold_session(&config, session.events().to_vec()).expect("fold");
+    assert_eq!(folded.latest_model_usage_used_tokens, None);
+    assert_eq!(folded.context_limit_emitted, None);
 }
 
 #[test]
@@ -749,6 +789,45 @@ fn fold_accepts_known_canvas_swap_event() {
     let event = EventEnvelope::new("session", "agent", None, EventKind::CANVAS_SWAP, object([]));
 
     fold_session(&SessionConfig::new(temp.path()), vec![event]).expect("fold");
+}
+
+#[test]
+fn malformed_canvas_swap_does_not_reset_folded_usage_or_context_latch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let start = session_start("fixture", "echo");
+    let result = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([("usage", json!({"input_tokens": 90, "output_tokens": 10}))]),
+    );
+    let limit = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(result.id.clone()),
+        EventKind::CONTEXT_LIMIT,
+        object([]),
+    );
+    let malformed = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(limit.id.clone()),
+        EventKind::CANVAS_SWAP,
+        object([]),
+    );
+
+    let folded = fold_session(
+        &SessionConfig::new(temp.path()),
+        vec![start, result, limit, malformed],
+    )
+    .expect("fold");
+
+    assert_eq!(folded.latest_model_usage_used_tokens, Some(100));
+    assert_eq!(
+        folded.context_limit_emitted,
+        Some(ModelTarget::new("fixture", "echo"))
+    );
 }
 
 #[test]

@@ -146,6 +146,61 @@ fn working_state_projection_from_json_rejects_invalid_json() {
 }
 
 #[test]
+fn model_projection_parser_requires_the_exact_schema_shape() {
+    let projection = sample_projection();
+    assert_eq!(
+        WorkingStateProjection::from_model_json(&projection.to_json()),
+        Some(projection)
+    );
+    assert_eq!(
+        WorkingStateProjection::from_model_json(r#"{"goal":"only one field"}"#),
+        None
+    );
+    assert_eq!(
+        WorkingStateProjection::from_model_json(&WorkingStateProjection::json_schema().to_string()),
+        None,
+        "an echoed JSON Schema is not a working-state projection"
+    );
+}
+
+#[test]
+fn model_projection_parser_enforces_host_size_bounds() {
+    let mut projection = sample_projection();
+    projection.goal = "x".repeat(4_097);
+    assert!(
+        WorkingStateProjection::from_model_json(&projection.to_json()).is_none(),
+        "oversized scalar must be rejected"
+    );
+
+    let mut projection = sample_projection();
+    projection.working_set = (0..65).map(|index| format!("file-{index}")).collect();
+    assert!(
+        WorkingStateProjection::from_model_json(&projection.to_json()).is_none(),
+        "oversized list must be rejected"
+    );
+
+    let mut projection = sample_projection();
+    projection.decisions = vec!["x".repeat(1_025)];
+    assert!(
+        WorkingStateProjection::from_model_json(&projection.to_json()).is_none(),
+        "oversized list item must be rejected"
+    );
+}
+
+#[test]
+fn persisted_projection_blob_keeps_legacy_text_but_rejects_unbounded_or_invalid_json() {
+    assert!(WorkingStateProjection::persisted_blob_valid(
+        "bounded legacy summary"
+    ));
+    assert!(!WorkingStateProjection::persisted_blob_valid(
+        &"x".repeat(32_769)
+    ));
+    assert!(!WorkingStateProjection::persisted_blob_valid(
+        r#"{"goal":"missing the other required fields"}"#
+    ));
+}
+
+#[test]
 fn working_state_projection_schema_names_all_six_fields() {
     let schema = WorkingStateProjection::json_schema();
     let required = schema["required"].as_array().expect("required array");

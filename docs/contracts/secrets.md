@@ -200,7 +200,9 @@ One surface-sweeping engine (`euler_core::scrub`), two entry points:
 - **live** — `/scrub [value]` during a session (`Session::scrub_live`). Bare
   form scrubs the buffered detection candidates; an explicit value scrubs that
   string. Also scrubs the in-memory event bus so the running session stops
-  carrying the value.
+  carrying the value. A pending shadow compaction is settled or terminally
+  cancelled before the rewrite begins; its pre-scrub canvas can never publish
+  a late projection into the rewritten bus or log.
 - **post-close** — `printf '%s\n' "$SECRET" | euler scrub <session>`
   (`scrub_closed_session`), for exposure noticed after the session ended. A
   closed session has no live candidate, so exact values are read one per line

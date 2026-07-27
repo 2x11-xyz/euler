@@ -55,6 +55,17 @@ pub(super) fn update_token_usage(
         tokens.canvas_budget_bytes = None;
         return;
     }
+    if event.kind.as_str() == EventKind::CANVAS_SWAP && is_primary {
+        // The provider usage immediately before a swap measured the canvas
+        // that was just replaced. Keep the known window and session cost,
+        // but show the new active context as unknown/empty until its first
+        // driver result instead of pinning the footer at the old limit.
+        tokens.input_tokens = 0;
+        tokens.output_tokens = 0;
+        tokens.reasoning_tokens = None;
+        tokens.canvas_retained_bytes = None;
+        return;
+    }
     if event.kind.as_str() == EventKind::CANVAS_SNAPSHOT && is_primary {
         tokens.canvas_retained_bytes = event.payload.get("retained_bytes").and_then(Value::as_u64);
         tokens.canvas_budget_bytes = event.payload.get("budget_bytes").and_then(Value::as_u64);
@@ -66,7 +77,8 @@ pub(super) fn update_token_usage(
     let Some(usage) = model_result_usage(event) else {
         return;
     };
-    if is_primary {
+    let is_compaction = event.payload.get("purpose").and_then(Value::as_str) == Some("compaction");
+    if is_primary && !is_compaction {
         if let ModelResultUsage::Reported {
             input_tokens,
             output_tokens,

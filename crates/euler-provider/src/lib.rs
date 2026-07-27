@@ -542,6 +542,7 @@ impl ModelProvider for Box<dyn ModelProvider> {
     }
 }
 
+#[derive(Clone)]
 pub struct ProviderSet {
     providers: BTreeMap<String, Arc<dyn ModelProvider>>,
     model_catalog: catalog::MergedModelCatalog,

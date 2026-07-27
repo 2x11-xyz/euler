@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 type RequestLog = Arc<Mutex<Vec<ModelRequest>>>;
 
@@ -511,9 +512,74 @@ fn provider_derived_compaction_threshold_emits_layer1_swap() {
 }
 
 #[test]
+fn repeated_pressure_advances_past_layer1_instead_of_replaying_the_same_swap() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "context line\n".repeat(2_000)).expect("write fixture");
+    let requests = request_log();
+    let mut streams = (0..5)
+        .map(|index| read_tool_stream(&format!("call-read-{index}")))
+        .collect::<Vec<_>>();
+    streams.push(text_stream_with_usage("first done", 99_000, 1));
+    streams.push(text_stream_with_usage("second done", 99_000, 1));
+    streams.push(text_stream(&test_projection().to_json()));
+    let provider = CapturingProvider::new("fixture", streams, requests);
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = ContextLimitConfig::from_catalog_model(100_000, Some(99_000));
+    config.compaction_reserve_tokens = 1_000;
+    config.compaction_keep_recent = 1;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&format!(
+            "read repeatedly {}",
+            "historical instruction ".repeat(2_000)
+        ))
+        .expect("first turn");
+    session.run_turn("continue").expect("second turn");
+    if session.compaction_in_progress() {
+        let status = session.compact_and_wait().expect("finish shadow");
+        let discarded = session
+            .events()
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED)
+            .map(|event| event.payload.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            status,
+            euler_core::CompactionStatus::Applied,
+            "discarded candidates: {discarded:?}"
+        );
+    }
+
+    let swaps = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::CANVAS_SWAP)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        swaps
+            .iter()
+            .filter(|event| payload_str(event, "validation_result") == Some("layer1-pass"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        swaps
+            .iter()
+            .filter(|event| payload_str(event, "validation_result") == Some("pass"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn try_compact_emits_swap_and_next_model_call_uses_projection_frontier_canvas() {
     let temp = tempfile::tempdir().expect("temp dir");
-    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    fs::write(
+        temp.path().join("note.txt"),
+        "historical context\n".repeat(2_000),
+    )
+    .expect("write fixture");
     let requests = request_log();
     let provider = CapturingProvider::new(
         "fixture",
@@ -739,9 +805,9 @@ fn stubs_tier_demotes_in_prompt_and_records_retention_telemetry() {
 }
 
 #[test]
-fn manual_compaction_falls_back_to_projection_when_stubs_exceed_the_budget() {
+fn manual_projection_compaction_applies_when_full_canvas_exceeds_budget() {
     let temp = tempfile::tempdir().expect("temp dir");
-    fs::write(temp.path().join("note.txt"), "x\n".repeat(8)).expect("write fixture");
+    fs::write(temp.path().join("note.txt"), "x\n".repeat(8_000)).expect("write fixture");
     let provider = ScriptedProvider::new(vec![
         FixtureResponse::ToolCalls(vec![ToolCall {
             id: "call-read".to_owned(),
@@ -749,13 +815,14 @@ fn manual_compaction_falls_back_to_projection_when_stubs_exceed_the_budget() {
             input: json!({"path": "note.txt"}),
         }]),
         FixtureResponse::Assistant("done".to_owned()),
+        FixtureResponse::Assistant(test_projection().to_json()),
     ]);
     let mut config = SessionConfig::new(temp.path());
     config.compaction_keep_recent = 0;
     config.auto_compaction = AutoCompactionPolicy {
         automatic: true,
-        tier: CompactionTier::Stubs,
-        budget_bytes: 1,
+        tier: CompactionTier::Off,
+        budget_bytes: 2_000,
     };
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
@@ -772,48 +839,629 @@ fn manual_compaction_falls_back_to_projection_when_stubs_exceed_the_budget() {
 }
 
 #[test]
-fn stubs_tier_reports_over_budget_honestly_when_facts_exceed_budget() {
-    // Facts are indestructible: when even maximal demotion cannot fit the
-    // budget, the round proceeds (stubs is best-effort by design) but the
-    // snapshot must say over_budget rather than look policy-compliant.
+fn shadow_projection_does_not_block_driver_and_swaps_at_a_settled_boundary() {
     let temp = tempfile::tempdir().expect("temp dir");
-    fs::write(temp.path().join("note.txt"), "x".repeat(8000)).expect("write fixture");
-    let requests = request_log();
-    let provider = CapturingProvider::new(
-        "fixture",
-        vec![read_tool_stream("call-read"), text_stream("done")],
-        requests.clone(),
-    );
-    let mut config = SessionConfig::new(temp.path());
-    config.auto_compaction = AutoCompactionPolicy {
-        automatic: true,
-        tier: CompactionTier::Stubs,
-        budget_bytes: 1,
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let gate = Arc::new(ShadowGate::default());
+    let provider = ShadowBlockingProvider {
+        gate: Arc::clone(&gate),
+        root_calls: Arc::new(AtomicUsize::new(0)),
     };
+    let root_calls = Arc::clone(&provider.root_calls);
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = ContextLimitConfig::from_catalog_model(50_000, Some(100));
+    config.compaction_reserve_tokens = 1_000;
+    config.compaction_keep_recent = 0;
+    config.auto_compaction.tier = CompactionTier::Off;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
     session
-        .run_turn("read note")
-        .expect("turn proceeds over budget");
+        .run_turn(&format!("read, then finish {}", "x".repeat(20_000)))
+        .expect("driver turn");
 
-    let snapshot = session
-        .events()
-        .iter()
-        .rfind(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
-        .expect("snapshot");
-    assert_eq!(snapshot.payload["over_budget"], serde_json::json!(true));
-    assert_eq!(snapshot.payload["budget_bytes"], serde_json::json!(1));
-    let retained_bytes = snapshot.payload["retained_bytes"]
-        .as_u64()
-        .expect("retained_bytes");
-    assert!(retained_bytes > 1);
+    assert!(gate.wait_until_started());
+    assert_eq!(root_calls.load(Ordering::SeqCst), 2);
+    assert!(session.compaction_in_progress());
     assert!(
         !session
             .events()
             .iter()
-            .any(|event| event.kind.as_str() == EventKind::ERROR),
-        "stubs tier never fails the round on budget pressure"
+            .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP),
+        "an unfinished shadow candidate cannot change the active canvas"
     );
+
+    gate.release();
+    assert_eq!(
+        session.compact_and_wait().expect("finish compaction"),
+        euler_core::CompactionStatus::Applied
+    );
+    let swap = session
+        .events()
+        .iter()
+        .rfind(|event| event.kind.as_str() == EventKind::CANVAS_SWAP)
+        .expect("atomic canvas swap");
+    assert_eq!(payload_str(swap, "summary_source"), Some("model"));
+    assert_eq!(payload_str(swap, "validation_result"), Some("pass"));
+    assert_eq!(session.latest_model_usage_used_tokens(), None);
+
+    session.run_turn("continue after swap").expect("next turn");
+    assert_eq!(root_calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn lifecycle_cancellation_closes_pending_compaction_and_rejects_late_output() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let gate = Arc::new(ShadowGate::default());
+    let provider = ShadowBlockingProvider {
+        gate: Arc::clone(&gate),
+        root_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = CompactionTier::Off;
+    config.compaction_keep_recent = 0;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&format!("read, then finish {}", "x".repeat(20_000)))
+        .expect("driver turn");
+    assert_eq!(
+        session.begin_compaction().expect("start compaction"),
+        euler_core::CompactionStatus::InProgress
+    );
+    assert!(gate.wait_until_started(), "compactor never reached gate");
+
+    assert_eq!(
+        session
+            .cancel_compaction("session lifecycle test")
+            .expect("cancel"),
+        euler_core::CompactionStatus::Failed
+    );
+    assert!(!session.compaction_in_progress());
+    assert_eq!(count_kind(session.events(), EventKind::ERROR), 1);
+    assert_eq!(
+        count_kind(session.events(), EventKind::CANVAS_CANDIDATE_DISCARDED),
+        1
+    );
+    let event_count = session.events().len();
+
+    gate.release();
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        session.poll_compaction().expect("poll after cancellation"),
+        euler_core::CompactionStatus::Unchanged
+    );
+    assert_eq!(session.events().len(), event_count);
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+}
+
+#[test]
+fn turn_cancellation_fences_a_concurrent_shadow_and_both_late_provider_returns() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let shadow_gate = Arc::new(ShadowGate::default());
+    let driver_gate = Arc::new(ShadowGate::default());
+    let provider = DriverAndShadowBlockingProvider {
+        shadow_gate: Arc::clone(&shadow_gate),
+        driver_gate: Arc::clone(&driver_gate),
+        root_calls: AtomicUsize::new(0),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = CompactionTier::Off;
+    config.compaction_keep_recent = 0;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&format!("read, then finish {}", "x".repeat(20_000)))
+        .expect("seed driver turn");
+    assert_eq!(
+        session.begin_compaction().expect("start compaction"),
+        euler_core::CompactionStatus::InProgress
+    );
+    assert!(
+        shadow_gate.wait_until_started(),
+        "compactor never reached its provider"
+    );
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = session.run_turn_with_sink("continue concurrently", worker_cancel, |_| {});
+        sender.send((result, session)).expect("return session");
+    });
+    assert!(
+        driver_gate.wait_until_started(),
+        "driver never reached its provider"
+    );
+
+    cancel.store(true, Ordering::SeqCst);
+    let (result, session) = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("both logical calls must cancel before provider I/O returns");
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert!(!session.compaction_in_progress());
+
+    let compactor_call = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL
+                && payload_str(event, "purpose") == Some("compaction")
+        })
+        .expect("compactor call");
+    let driver_call = session
+        .events()
+        .iter()
+        .rev()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL && payload_str(event, "purpose").is_none()
+        })
+        .expect("concurrent driver call");
+    for call in [compactor_call, driver_call] {
+        let terminals = session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.parent.as_deref() == Some(call.id.as_str())
+                    && matches!(
+                        event.kind.as_str(),
+                        EventKind::MODEL_RESULT | EventKind::ERROR
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1, "one cancellation terminal per call");
+        assert_eq!(terminals[0].kind.as_str(), EventKind::ERROR);
+        assert_eq!(
+            terminals[0].payload.get("cancelled"),
+            Some(&json!(true)),
+            "call payload: {:?}; terminal payload: {:?}",
+            call.payload,
+            terminals[0].payload
+        );
+    }
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+    let event_count = session.events().len();
+
+    shadow_gate.release();
+    driver_gate.release();
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(session.events().len(), event_count);
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+}
+
+#[test]
+fn lifecycle_barrier_settles_ready_shadow_usage_instead_of_discarding_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let gate = Arc::new(ShadowGate::default());
+    let provider = ShadowBlockingProvider {
+        gate: Arc::clone(&gate),
+        root_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = CompactionTier::Off;
+    config.compaction_keep_recent = 0;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&format!("read, then finish {}", "x".repeat(20_000)))
+        .expect("driver turn");
+    assert_eq!(
+        session.begin_compaction().expect("start compaction"),
+        euler_core::CompactionStatus::InProgress
+    );
+    assert!(gate.wait_until_started(), "compactor never reached gate");
+    gate.release();
+    assert!(gate.wait_until_completed(), "compactor never completed");
+
+    assert_eq!(
+        session
+            .cancel_compaction("session lifecycle test")
+            .expect("settle"),
+        euler_core::CompactionStatus::Applied
+    );
+    let result = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_RESULT
+                && payload_str(event, "purpose") == Some("compaction")
+        })
+        .expect("cost-bearing compactor result");
+    assert_eq!(result.payload["usage"]["input_tokens"], json!(80));
+    assert_eq!(result.payload["usage"]["output_tokens"], json!(10));
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 1);
+}
+
+#[test]
+fn scrub_cancels_pre_scrub_shadow_before_rewriting_session() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let gate = Arc::new(ShadowGate::default());
+    let provider = ShadowBlockingProvider {
+        gate: Arc::clone(&gate),
+        root_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = CompactionTier::Off;
+    config.compaction_keep_recent = 0;
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut session =
+        Session::new(config, provider, ScriptedDecider::new(vec![])).with_provenance(writer);
+    let secret = "sk-shadow-secret-value".to_owned();
+
+    session
+        .run_turn(&format!("{secret} {}", "x".repeat(20_000)))
+        .expect("driver turn");
+    assert_eq!(
+        session.begin_compaction().expect("start compaction"),
+        euler_core::CompactionStatus::InProgress
+    );
+    assert!(gate.wait_until_started(), "compactor never reached gate");
+
+    session
+        .scrub_live(std::slice::from_ref(&secret))
+        .expect("scrub");
+    assert!(!session.compaction_in_progress());
+    assert!(!serde_json::to_string(session.events())
+        .expect("serialize events")
+        .contains(&secret));
+    let event_count = session.events().len();
+
+    gate.release();
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        session.poll_compaction().expect("poll after scrub"),
+        euler_core::CompactionStatus::Unchanged
+    );
+    assert_eq!(session.events().len(), event_count);
+    assert!(!fs::read_to_string(log)
+        .expect("read scrubbed log")
+        .contains(&secret));
+}
+
+#[test]
+fn hard_margin_waits_for_a_valid_shadow_candidate_before_stopping() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = HardMarginProvider {
+        projection: Some(test_projection()),
+        driver_usage_tokens: 50_000,
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = ContextLimitConfig::from_catalog_model(50_000, Some(45_000));
+    config.compaction_reserve_tokens = 1_000;
+    config.compaction_keep_recent = 0;
+    config.auto_compaction.tier = CompactionTier::Off;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&format!("finish near the margin {}", "x".repeat(20_000)))
+        .expect("turn");
+
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 1);
+    assert_eq!(count_kind(session.events(), EventKind::CONTEXT_LIMIT), 0);
+    assert_eq!(session.latest_model_usage_used_tokens(), None);
+    assert!(session.context_limit_emitted().is_none());
+    let compactor_call = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL
+                && payload_str(event, "purpose") == Some("compaction")
+        })
+        .expect("compactor call");
+    let compactor_instructions =
+        payload_str(compactor_call, "system_instructions").expect("compactor instructions");
+    let expected_digest = format!("{:x}", Sha256::digest(compactor_instructions.as_bytes()));
+    assert_eq!(
+        payload_str(compactor_call, "system_instructions_sha256"),
+        Some(expected_digest.as_str())
+    );
+    assert_eq!(
+        compactor_call.payload["system_instructions_bytes"],
+        json!(compactor_instructions.len())
+    );
+    assert_eq!(
+        payload_str(
+            session
+                .events()
+                .iter()
+                .rfind(|event| event.kind.as_str() == EventKind::ASSISTANT_MESSAGE)
+                .expect("driver answer"),
+            "content"
+        ),
+        Some("driver answer")
+    );
+    assert!(
+        !assemble_canvas(session.events(), &AutoCompactionPolicy::default())
+            .iter()
+            .any(|item| matches!(
+                item,
+                CanvasItem::Reasoning { content, .. } if content == "shadow-only reasoning"
+            )),
+        "shadow reasoning is provenance, not driver canvas"
+    );
+}
+
+#[test]
+fn hard_margin_stops_honestly_when_the_shadow_candidate_is_invalid() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = HardMarginProvider {
+        projection: None,
+        driver_usage_tokens: 50_000,
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = ContextLimitConfig::from_catalog_model(50_000, Some(45_000));
+    config.compaction_reserve_tokens = 1_000;
+    config.compaction_keep_recent = 0;
+    config.auto_compaction.tier = CompactionTier::Off;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&format!("finish near the margin {}", "x".repeat(20_000)))
+        .expect("clean stop");
+
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+    assert_eq!(count_kind(session.events(), EventKind::CONTEXT_LIMIT), 1);
+    assert_eq!(
+        count_kind(session.events(), EventKind::CANVAS_CANDIDATE_DISCARDED),
+        1
+    );
+    assert_eq!(session.latest_model_usage_used_tokens(), Some(50_000));
+    assert!(session.context_limit_emitted().is_some());
+    let assistants = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::ASSISTANT_MESSAGE)
+        .filter_map(|event| payload_str(event, "content"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistants,
+        [
+            "driver answer",
+            "Session stopped because the context limit threshold was reached."
+        ]
+    );
+}
+
+#[test]
+fn candidate_that_cannot_fit_full_post_swap_request_does_not_reset_usage() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = HardMarginProvider {
+        projection: Some(test_projection()),
+        driver_usage_tokens: 1_000,
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = ContextLimitConfig::from_catalog_model(1_000, Some(900));
+    config.compaction_reserve_tokens = 1_000;
+    config.compaction_keep_recent = 0;
+    config.auto_compaction.tier = CompactionTier::Off;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&format!("finish near the margin {}", "x".repeat(20_000)))
+        .expect("honest context stop");
+
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+    let discarded = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED)
+        .expect("discarded candidate");
+    assert_eq!(
+        payload_str(discarded, "reason"),
+        Some("proposed request does not fit the model context window")
+    );
+    assert_eq!(session.latest_model_usage_used_tokens(), Some(1_000));
+    assert!(session.context_limit_emitted().is_some());
+}
+
+#[test]
+fn candidate_that_does_not_reduce_full_request_is_discarded() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = HardMarginProvider {
+        projection: Some(test_projection()),
+        driver_usage_tokens: 50_000,
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = ContextLimitConfig::from_catalog_model(50_000, Some(45_000));
+    config.compaction_reserve_tokens = 1_000;
+    config.compaction_keep_recent = 0;
+    config.auto_compaction.tier = CompactionTier::Off;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn("short request")
+        .expect("honest context stop");
+
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+    let discarded = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED)
+        .expect("discarded candidate");
+    assert_eq!(
+        payload_str(discarded, "reason"),
+        Some("proposed canvas does not meaningfully reduce the request")
+    );
+    assert_eq!(session.latest_model_usage_used_tokens(), Some(50_000));
+    assert!(session.context_limit_emitted().is_some());
+}
+
+#[test]
+fn hard_margin_wait_observes_turn_cancellation_and_terminalizes_shadow_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let gate = Arc::new(ShadowGate::default());
+    let provider = HardMarginBlockingProvider {
+        gate: Arc::clone(&gate),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = ContextLimitConfig::from_catalog_model(50_000, Some(45_000));
+    config.compaction_reserve_tokens = 1_000;
+    config.compaction_keep_recent = 0;
+    config.auto_compaction.tier = CompactionTier::Off;
+    let session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let mut session = session;
+        let result = session.run_turn_with_sink(
+            &format!("fill the old canvas {}", "x".repeat(20_000)),
+            worker_cancel,
+            |_| {},
+        );
+        sender.send((result, session)).expect("return session");
+    });
+
+    assert!(gate.wait_until_started(), "compactor never reached gate");
+    cancel.store(true, Ordering::SeqCst);
+    let (result, session) = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cancelled hard-margin wait must return promptly");
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    let compactor_call = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL
+                && payload_str(event, "purpose") == Some("compaction")
+        })
+        .expect("compactor call");
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ERROR
+            && event.parent.as_deref() == Some(compactor_call.id.as_str())
+            && payload_str(event, "purpose") == Some("compaction")
+    }));
+    assert_eq!(
+        count_kind(session.events(), EventKind::CANVAS_CANDIDATE_DISCARDED),
+        1
+    );
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+    gate.release();
+}
+
+#[test]
+fn byte_pressure_without_usage_or_context_waits_for_shadow_before_dispatch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let gate = Arc::new(ShadowGate::default());
+    let root_calls = Arc::new(AtomicUsize::new(0));
+    let provider = BytePressureProvider {
+        gate: Arc::clone(&gate),
+        root_calls: Arc::clone(&root_calls),
+        projection: Some(test_projection()),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction.budget_bytes = 512;
+    config.compaction_keep_recent = 0;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session.run_turn("seed").expect("seed turn");
+    assert_eq!(session.latest_model_usage_used_tokens(), None);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = session.run_turn("continue");
+        sender.send((result, session)).expect("return session");
+    });
+
+    assert!(
+        gate.wait_until_started(),
+        "byte pressure did not start a shadow projection"
+    );
+    assert_eq!(
+        root_calls.load(Ordering::SeqCst),
+        1,
+        "the second driver request must wait at byte-budget admission"
+    );
+    assert!(
+        matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "the turn cannot return or dispatch while its shadow is blocked"
+    );
+
+    gate.release();
+    let (result, session) = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("settled shadow must release the request boundary");
+    result.expect("valid projection should recover the turn");
+
+    assert_eq!(root_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 1);
+    let driver_snapshots = session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::CANVAS_SNAPSHOT
+                && payload_str(event, "purpose").is_none()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        driver_snapshots
+            .iter()
+            .all(|snapshot| snapshot.payload["over_budget"] == json!(false)),
+        "every canvas admitted to the driver must fit: {driver_snapshots:?}"
+    );
+}
+
+#[test]
+fn byte_pressure_with_invalid_shadow_fails_closed_before_driver_dispatch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let gate = Arc::new(ShadowGate::default());
+    let root_calls = Arc::new(AtomicUsize::new(0));
+    let provider = BytePressureProvider {
+        gate: Arc::clone(&gate),
+        root_calls: Arc::clone(&root_calls),
+        projection: None,
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction.budget_bytes = 512;
+    config.compaction_keep_recent = 0;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session.run_turn("seed").expect("seed turn");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = session.run_turn("continue");
+        sender.send((result, session)).expect("return session");
+    });
+
+    assert!(
+        gate.wait_until_started(),
+        "byte pressure did not start a shadow projection"
+    );
+    assert_eq!(root_calls.load(Ordering::SeqCst), 1);
+    gate.release();
+    let (result, session) = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("invalid shadow must fail the request boundary");
+    let error = result.expect_err("invalid projection cannot admit an oversized canvas");
+
+    assert!(matches!(error, SessionError::ContextBudgetExhausted { .. }));
+    assert_eq!(
+        root_calls.load(Ordering::SeqCst),
+        1,
+        "no oversized second driver request may be dispatched"
+    );
+    assert_eq!(count_kind(session.events(), EventKind::CANVAS_SWAP), 0);
+    assert_eq!(
+        count_kind(session.events(), EventKind::CANVAS_CANDIDATE_DISCARDED),
+        1
+    );
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ERROR
+            && payload_str(event, "message")
+                .is_some_and(|message| message.contains("context budget exhausted"))
+    }));
 }
 
 #[test]
@@ -3945,6 +4593,7 @@ fn context_limit_after_switch_uses_new_target_before_provider_call() {
     config.provider = "a".to_owned();
     config.model = "model-a".to_owned();
     config.context_limit = Some(ContextLimitConfig::new(100, 0.9).expect("valid limit"));
+    config.auto_compaction.automatic = false;
     let mut session = Session::new_with_providers(config, providers, ScriptedDecider::new(vec![]))
         .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
 
@@ -4349,6 +4998,7 @@ fn context_limit_after_final_result_records_payload_and_clean_stop_message() {
     ]);
     let mut config = SessionConfig::new(temp.path());
     config.context_limit = Some(ContextLimitConfig::new(50, 0.9).expect("valid limit"));
+    config.auto_compaction.automatic = false;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
     let events = session.run_turn("finish").expect("turn");
@@ -4462,6 +5112,7 @@ fn context_limit_exact_threshold_boundary_emits_limit_event() {
     ]);
     let mut config = SessionConfig::new(temp.path());
     config.context_limit = Some(ContextLimitConfig::new(10, 0.5).expect("valid limit"));
+    config.auto_compaction.automatic = false;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
     session.run_turn("finish").expect("turn");
@@ -4493,6 +5144,7 @@ fn context_limit_after_tool_use_stops_before_tool_execution_or_next_model_call()
     ]);
     let mut config = SessionConfig::new(temp.path());
     config.context_limit = Some(ContextLimitConfig::new(100, 0.9).expect("valid limit"));
+    config.auto_compaction.automatic = false;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
     session.run_turn("run shell").expect("turn");
@@ -4529,6 +5181,7 @@ fn context_limit_usage_below_threshold_does_not_emit_limit_event() {
     ]);
     let mut config = SessionConfig::new(temp.path());
     config.context_limit = Some(ContextLimitConfig::new(100, 0.5).expect("valid limit"));
+    config.auto_compaction.automatic = false;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
     session.run_turn("finish").expect("turn");
@@ -4550,6 +5203,7 @@ fn context_limit_usage_absent_does_not_emit_limit_event() {
     ]);
     let mut config = SessionConfig::new(temp.path());
     config.context_limit = Some(ContextLimitConfig::new(1, 0.1).expect("valid limit"));
+    config.auto_compaction.automatic = false;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
     session.run_turn("finish").expect("turn");
@@ -4601,6 +5255,7 @@ fn context_limit_is_emitted_only_once_after_session_stops() {
     );
     let mut config = SessionConfig::new(temp.path());
     config.context_limit = Some(ContextLimitConfig::new(10, 1.0).expect("valid limit"));
+    config.auto_compaction.automatic = false;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
 
     session.run_turn("first").expect("first turn");
@@ -4609,6 +5264,36 @@ fn context_limit_is_emitted_only_once_after_session_stops() {
     assert!(second_turn_events.is_empty());
     assert_eq!(request_log_guard(&captured_requests).len(), 1);
     assert_eq!(count_kind(session.events(), EventKind::CONTEXT_LIMIT), 1);
+}
+
+#[test]
+fn successful_manual_swap_reopens_the_same_model_after_a_context_stop() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![
+            text_stream_with_usage("first", 50_000, 0),
+            text_stream("continued"),
+        ],
+        requests.clone(),
+    );
+    let mut config = SessionConfig::new(temp.path());
+    config.context_limit = Some(ContextLimitConfig::new(50_000, 1.0).expect("valid limit"));
+    config.compaction_reserve_tokens = 1_000;
+    config.auto_compaction.automatic = false;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&"historical context ".repeat(2_000))
+        .expect("stopped turn");
+    assert!(session.context_limit_emitted().is_some());
+    assert!(session.try_compact(&test_projection()));
+    assert!(session.context_limit_emitted().is_none());
+    assert_eq!(session.latest_model_usage_used_tokens(), None);
+
+    session.run_turn("continue").expect("reopened turn");
+    assert_eq!(request_log_guard(&requests).len(), 2);
 }
 
 #[test]
@@ -5439,7 +6124,8 @@ impl Iterator for CountingStream {
 
 struct CapturingProvider {
     name: &'static str,
-    // providers move between threads but are not shared concurrently.
+    // The mutex also makes stream assignment safe when a shadow compactor
+    // and the driver invoke the fixture concurrently.
     streams: Mutex<VecDeque<Vec<Result<ModelStreamEvent, ProviderError>>>>,
     requests: RequestLog,
 }
@@ -5472,6 +6158,328 @@ impl ModelProvider for CapturingProvider {
             .pop_front()
             .ok_or_else(|| ProviderError::transport("capturing provider exhausted"))?;
         Ok(Box::new(events.into_iter()))
+    }
+}
+
+#[derive(Default)]
+struct ShadowGate {
+    state: Mutex<(bool, bool, bool)>,
+    changed: Condvar,
+}
+
+impl ShadowGate {
+    fn wait_until_started(&self) -> bool {
+        let state = self.state.lock().expect("shadow gate");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(2), |(started, _, _)| !*started)
+            .expect("shadow gate wait");
+        state.0
+    }
+
+    fn wait_for_release(&self) {
+        let state = self.state.lock().expect("shadow gate");
+        let _state = self
+            .changed
+            .wait_while(state, |(_, released, _)| !*released)
+            .expect("shadow release wait");
+    }
+
+    fn mark_started(&self) {
+        let mut state = self.state.lock().expect("shadow gate");
+        state.0 = true;
+        self.changed.notify_all();
+    }
+
+    fn mark_completed(&self) {
+        let mut state = self.state.lock().expect("shadow gate");
+        state.2 = true;
+        self.changed.notify_all();
+    }
+
+    fn wait_until_completed(&self) -> bool {
+        let state = self.state.lock().expect("shadow gate");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(2), |(_, _, completed)| {
+                !*completed
+            })
+            .expect("shadow completion wait");
+        state.2
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("shadow gate");
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+struct ShadowBlockingProvider {
+    gate: Arc<ShadowGate>,
+    root_calls: Arc<AtomicUsize>,
+}
+
+struct BytePressureProvider {
+    gate: Arc<ShadowGate>,
+    root_calls: Arc<AtomicUsize>,
+    projection: Option<WorkingStateProjection>,
+}
+
+impl ModelProvider for BytePressureProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if request.tools.is_empty() {
+            self.gate.mark_started();
+            self.gate.wait_for_release();
+            let content = self.projection.as_ref().map_or_else(
+                || "invalid projection".to_owned(),
+                WorkingStateProjection::to_json,
+            );
+            return Ok(Box::new(
+                vec![
+                    Ok(ModelStreamEvent::TextDelta(content)),
+                    Ok(ModelStreamEvent::Finished {
+                        stop_reason: StopReason::Completed,
+                        usage: None,
+                    }),
+                ]
+                .into_iter(),
+            ));
+        }
+
+        let call = self.root_calls.fetch_add(1, Ordering::SeqCst);
+        let content = if call == 0 {
+            "old context ".repeat(200)
+        } else {
+            "continued after compaction".to_owned()
+        };
+        Ok(Box::new(
+            vec![
+                Ok(ModelStreamEvent::TextDelta(content)),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: None,
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+struct DriverAndShadowBlockingProvider {
+    shadow_gate: Arc<ShadowGate>,
+    driver_gate: Arc<ShadowGate>,
+    root_calls: AtomicUsize,
+}
+
+impl ModelProvider for DriverAndShadowBlockingProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if request.tools.is_empty() {
+            self.shadow_gate.mark_started();
+            self.shadow_gate.wait_for_release();
+            return Ok(Box::new(
+                vec![
+                    Ok(ModelStreamEvent::TextDelta(test_projection().to_json())),
+                    Ok(ModelStreamEvent::Finished {
+                        stop_reason: StopReason::Completed,
+                        usage: Some(test_usage(80, 10)),
+                    }),
+                ]
+                .into_iter(),
+            ));
+        }
+        let call = self.root_calls.fetch_add(1, Ordering::SeqCst);
+        if call >= 2 {
+            self.driver_gate.mark_started();
+            self.driver_gate.wait_for_release();
+        }
+        let events = if call == 0 {
+            vec![
+                Ok(ModelStreamEvent::ToolCall(ToolCall {
+                    id: "dual-gate-read".to_owned(),
+                    name: "read_file".to_owned(),
+                    input: json!({"path": "note.txt"}),
+                })),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Some(test_usage(190, 10)),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(ModelStreamEvent::TextDelta("driver done".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: Some(test_usage(40, 10)),
+                }),
+            ]
+        };
+        Ok(Box::new(events.into_iter()))
+    }
+}
+
+impl ModelProvider for ShadowBlockingProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if request.tools.is_empty() {
+            self.gate.mark_started();
+            self.gate.wait_for_release();
+            return Ok(Box::new(ShadowCompletionStream {
+                events: vec![
+                    Ok(ModelStreamEvent::TextDelta(test_projection().to_json())),
+                    Ok(ModelStreamEvent::Finished {
+                        stop_reason: StopReason::Completed,
+                        usage: Some(test_usage(80, 10)),
+                    }),
+                ]
+                .into_iter(),
+                gate: Arc::clone(&self.gate),
+            }));
+        }
+        let call = self.root_calls.fetch_add(1, Ordering::SeqCst);
+        let events = if call == 0 {
+            vec![
+                Ok(ModelStreamEvent::ToolCall(ToolCall {
+                    id: "shadow-read".to_owned(),
+                    name: "read_file".to_owned(),
+                    input: json!({"path": "note.txt"}),
+                })),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Some(test_usage(190, 10)),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(ModelStreamEvent::TextDelta("driver done".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: Some(test_usage(40, 10)),
+                }),
+            ]
+        };
+        Ok(Box::new(events.into_iter()))
+    }
+}
+
+struct ShadowCompletionStream {
+    events: std::vec::IntoIter<Result<ModelStreamEvent, ProviderError>>,
+    gate: Arc<ShadowGate>,
+}
+
+impl Iterator for ShadowCompletionStream {
+    type Item = Result<ModelStreamEvent, ProviderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let event = self.events.next()?;
+        if matches!(&event, Ok(ModelStreamEvent::Finished { .. })) {
+            self.gate.mark_completed();
+        }
+        Some(event)
+    }
+}
+
+struct HardMarginProvider {
+    projection: Option<WorkingStateProjection>,
+    driver_usage_tokens: u64,
+}
+
+struct HardMarginBlockingProvider {
+    gate: Arc<ShadowGate>,
+}
+
+impl ModelProvider for HardMarginBlockingProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if request.tools.is_empty() {
+            self.gate.mark_started();
+            self.gate.wait_for_release();
+            self.gate.mark_completed();
+            return Ok(Box::new(
+                vec![
+                    Ok(ModelStreamEvent::TextDelta(test_projection().to_json())),
+                    Ok(ModelStreamEvent::Finished {
+                        stop_reason: StopReason::Completed,
+                        usage: Some(test_usage(80, 10)),
+                    }),
+                ]
+                .into_iter(),
+            ));
+        }
+        Ok(Box::new(
+            vec![
+                Ok(ModelStreamEvent::TextDelta("driver answer".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: Some(test_usage(50_000, 0)),
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+impl ModelProvider for HardMarginProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if request.tools.is_empty() {
+            let content = self.projection.as_ref().map_or_else(
+                || "invalid projection".to_owned(),
+                WorkingStateProjection::to_json,
+            );
+            return Ok(Box::new(
+                vec![
+                    Ok(ModelStreamEvent::ReasoningDelta(ReasoningChunk::summary(
+                        "shadow-only reasoning",
+                    ))),
+                    Ok(ModelStreamEvent::TextDelta(content)),
+                    Ok(ModelStreamEvent::Finished {
+                        stop_reason: StopReason::Completed,
+                        usage: Some(test_usage(5, 5)),
+                    }),
+                ]
+                .into_iter(),
+            ));
+        }
+        Ok(Box::new(
+            vec![
+                Ok(ModelStreamEvent::TextDelta("driver answer".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: Some(test_usage(self.driver_usage_tokens, 0)),
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+fn test_usage(input_tokens: u64, output_tokens: u64) -> Usage {
+    Usage {
+        input_tokens,
+        output_tokens,
+        uncached_input_tokens: None,
+        cached_tokens: None,
+        cache_write_5m_tokens: None,
+        cache_write_1h_tokens: None,
+        reasoning_tokens: None,
     }
 }
 

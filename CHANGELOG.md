@@ -21,6 +21,29 @@ pull requests that landed them; deeper design rationale lives in
   boundedly observed file-change evidence. Interrupt also clears queued
   activities visibly while preserving queued user steering.
 
+### Compaction resilience
+
+- Automatic and manual compaction now use a fixed shadow canvas when tool-result
+  stubs cannot recover enough space. The active TUI turn remains usable while
+  the bounded summary runs; only a validated candidate can atomically replace
+  the canvas, and a failed candidate leaves the active history unchanged.
+  Assembled byte pressure is checked independently at provider admission:
+  Euler waits for recovery and never dispatches a driver canvas over budget.
+- Layer-1 compaction advances instead of repeatedly swapping the same tool
+  results, stacks correctly over a prior full projection, and resets stale
+  context usage only after an accepted swap. At the hard context margin, Euler
+  waits for an in-flight candidate and otherwise stops with an honest limit
+  event.
+- Shadow jobs now cancel at session lifecycle boundaries, preserve completed
+  usage and cost records, and cannot publish late output into a replaced or
+  scrubbed session. Candidate validation is host-bounded and proves the exact
+  post-swap request both shrinks and fits before accounting is reset.
+- Escape at the base composer now settles an already-ready idle shadow or
+  cancels a pending one, reports the actual outcome, and preserves the draft.
+  Interrupting a driver with a concurrent shadow terminalizes and fences both
+  calls, so neither provider's late return can append events or swap the
+  canvas.
+
 ### ChatGPT subscription compatibility
 
 - GPT-5.6 Luna WebSocket requests again disable parallel tool calls, as
