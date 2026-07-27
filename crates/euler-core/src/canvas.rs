@@ -707,15 +707,23 @@ struct PendingExtensionContribution {
     item: CanvasItem,
 }
 
+struct DriverCanvasSnapshot {
+    index: usize,
+    agent: String,
+    canvas_items: u64,
+    selected_event_ids: Vec<String>,
+}
+
 /// Accepted continuations are one-shot driver inputs. A contribution remains
-/// eligible across persistence and resume until a later same-agent driver
-/// snapshot names its event id, then stays provenance-only in every subsequent
-/// assembly. Shadow-compaction and child-agent snapshots describe other model
-/// calls and cannot consume root-driver input.
+/// eligible across persistence and resume until an accepted same-agent root
+/// `model.call` binds the exact driver snapshot that selected its event id.
+/// A snapshot without its request is only prepared state and consumes nothing.
+/// Shadow-compaction and child-agent calls cannot consume root-driver input.
 fn fold_pending_extension_contributions(
     events: &[EventEnvelope],
 ) -> BTreeMap<String, PendingExtensionContribution> {
     let mut pending = BTreeMap::new();
+    let mut driver_snapshots = BTreeMap::<String, DriverCanvasSnapshot>::new();
     for (index, event) in events.iter().enumerate() {
         match event.kind.as_str() {
             EventKind::EXTENSION_CONTRIBUTION => {
@@ -730,29 +738,73 @@ fn fold_pending_extension_contributions(
                     );
                 }
             }
-            EventKind::CANVAS_SNAPSHOT
-                if !pending.is_empty() && !event.payload.contains_key("purpose") =>
-            {
-                let Some(ids) = event
-                    .payload
-                    .get("selected_event_ids")
-                    .and_then(Value::as_array)
-                else {
-                    continue;
-                };
-                for id in ids.iter().filter_map(Value::as_str) {
-                    if pending
-                        .get(id)
-                        .is_some_and(|contribution| contribution.agent == event.agent)
-                    {
-                        pending.remove(id);
-                    }
+            EventKind::CANVAS_SNAPSHOT if !event.payload.contains_key("purpose") => {
+                if let Some(snapshot) = driver_canvas_snapshot(event, index) {
+                    driver_snapshots.insert(event.id.clone(), snapshot);
                 }
+            }
+            EventKind::MODEL_CALL if !pending.is_empty() => {
+                consume_request_backed_contributions(event, index, &driver_snapshots, &mut pending);
             }
             _ => {}
         }
     }
     pending
+}
+
+fn driver_canvas_snapshot(event: &EventEnvelope, index: usize) -> Option<DriverCanvasSnapshot> {
+    let selected_event_ids = event
+        .payload
+        .get("selected_event_ids")?
+        .as_array()?
+        .iter()
+        .map(|id| id.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let canvas_items = event.payload.get("counts")?.get("items")?.as_u64()?;
+    Some(DriverCanvasSnapshot {
+        index,
+        agent: event.agent.clone(),
+        canvas_items,
+        selected_event_ids,
+    })
+}
+
+fn consume_request_backed_contributions(
+    model_call: &EventEnvelope,
+    call_index: usize,
+    driver_snapshots: &BTreeMap<String, DriverCanvasSnapshot>,
+    pending: &mut BTreeMap<String, PendingExtensionContribution>,
+) {
+    if model_call.payload.contains_key("purpose") {
+        return;
+    }
+    let Some(snapshot_id) = model_call
+        .payload
+        .get("canvas_snapshot_id")
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let Some(snapshot) = driver_snapshots.get(snapshot_id) else {
+        return;
+    };
+    if snapshot.index >= call_index
+        || snapshot.agent != model_call.agent
+        || model_call
+            .payload
+            .get("canvas_items")
+            .and_then(Value::as_u64)
+            != Some(snapshot.canvas_items)
+    {
+        return;
+    }
+    for id in &snapshot.selected_event_ids {
+        if pending.get(id).is_some_and(|contribution| {
+            contribution.agent == model_call.agent && contribution.index < snapshot.index
+        }) {
+            pending.remove(id);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

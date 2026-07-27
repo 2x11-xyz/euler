@@ -390,21 +390,25 @@ is checked at both boundaries. An accepted continuation is recorded as
 `extension.contribution` and projected with core-generated extension
 attribution into a fresh root `RoundLoop`; it is not a `user.message`. The
 continuation is one-shot: it remains eligible across persistence and resume
-until selected by a same-agent root-driver `canvas.snapshot`, then leaves all
-later canvases. Child and parallel-reviewer canvases, snapshots, provider
-requests, and pre-request context-budget checks exclude it entirely: child
-models cannot observe or select the text, and root-only input cannot exhaust a
-child request's budget. A full `canvas.swap` cannot hide it either: core folds
+until an accepted same-agent root-driver `model.call` binds the exact
+purpose-free `canvas.snapshot` that selected it, then leaves all later
+canvases. A snapshot-only crash consumes nothing; the next admitted request may
+select the contribution again. Child and parallel-reviewer canvases, snapshots,
+provider requests, and pre-request context-budget checks exclude it entirely:
+child models cannot observe or select the text, and root-only input cannot
+exhaust a child request's budget. A full `canvas.swap` cannot hide it either:
+core folds
 pending contributions over the full accepted log and pins any pre-frontier
 contribution ahead of ordered frontier replay. Shadow compaction likewise omits
 pending contributions from its captured canvas and provider request, preventing
 opaque projection text from persisting or duplicating the one-shot driver input.
 Stop and unaccepted outputs remain provenance-only. The hook is
 skipped after errors, context-limit stops, guardian interruption, explicit
-round ceilings, and cancellation. A per-run host ceiling prevents infinite
-automatic continuation. Acceptance commits the continuation to the current
-user turn. A later registry disable cannot retroactively hide it; disablement
-prevents only new contributions.
+round ceilings, and cancellation. Core adds no second, hidden continuation
+ceiling: the configured `RoundLoop` round limit and cancellation are the
+generic owners of resource termination. Acceptance commits the continuation
+to the current user turn. A later registry disable cannot retroactively hide
+it; disablement prevents only new contributions.
 
 Immediate cancellation of an already-running command is governed by the
 generic extension-command cancellation seam; the idle API does not define a

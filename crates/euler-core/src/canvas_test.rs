@@ -17,6 +17,34 @@ fn off_policy(budget_bytes: usize) -> AutoCompactionPolicy {
     }
 }
 
+fn driver_snapshot_selecting(event: &EventEnvelope) -> EventEnvelope {
+    EventEnvelope::new(
+        event.session.clone(),
+        event.agent.clone(),
+        Some(event.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", serde_json::json!([event.id.clone()])),
+            ("counts", serde_json::json!({"items": 1})),
+        ]),
+    )
+}
+
+fn root_model_call_for_snapshot(snapshot: &EventEnvelope) -> EventEnvelope {
+    EventEnvelope::new(
+        snapshot.session.clone(),
+        snapshot.agent.clone(),
+        Some(snapshot.id.clone()),
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("canvas_items", 1.into()),
+            ("canvas_snapshot_id", snapshot.id.clone().into()),
+        ]),
+    )
+}
+
 #[test]
 fn default_policy_enables_automatic_compaction_and_tool_stubs() {
     let policy = AutoCompactionPolicy::default();
@@ -1014,7 +1042,7 @@ fn canvas_prompt_renders_projection_items() {
 }
 
 #[test]
-fn extension_continuation_survives_resume_until_selected_then_is_one_shot() {
+fn extension_continuation_requires_a_request_backed_snapshot_to_become_one_shot() {
     let contribution = EventEnvelope::new(
         "s",
         "a",
@@ -1037,19 +1065,26 @@ fn extension_continuation_survives_resume_until_selected_then_is_one_shot() {
             if event_id == &contribution.id && content == "continue once"
     ));
 
-    let snapshot = EventEnvelope::new(
-        "s",
-        "a",
-        Some(contribution.id.clone()),
-        EventKind::CANVAS_SNAPSHOT,
-        object([(
-            "selected_event_ids",
-            serde_json::json!([contribution.id.clone()]),
-        )]),
+    let snapshot = driver_snapshot_selecting(&contribution);
+    let snapshot_only = assemble_canvas(
+        &[contribution.clone(), snapshot.clone()],
+        &off_policy(usize::MAX),
     );
-    let after_selection = assemble_canvas(&[contribution, snapshot], &off_policy(usize::MAX));
+    assert!(
+        snapshot_only.iter().any(|item| matches!(
+            item,
+            CanvasItem::ExtensionContribution { event_id, .. }
+                if event_id == &contribution.id
+        )),
+        "preparing a snapshot without accepting its model call consumes nothing"
+    );
 
-    assert!(after_selection.is_empty());
+    let model_call = root_model_call_for_snapshot(&snapshot);
+    let after_call = assemble_canvas(
+        &[contribution, snapshot, model_call],
+        &off_policy(usize::MAX),
+    );
+    assert!(after_call.is_empty());
 }
 
 #[test]
@@ -1078,6 +1113,20 @@ fn compaction_or_child_snapshot_cannot_steal_pending_driver_continuation() {
                 "selected_event_ids",
                 serde_json::json!([contribution.id.clone()]),
             ),
+            ("counts", serde_json::json!({"items": 1})),
+            ("purpose", "compaction".into()),
+        ]),
+    );
+    let compaction_call = EventEnvelope::new(
+        "s",
+        "root",
+        Some(compaction_snapshot.id.clone()),
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("canvas_items", 1.into()),
+            ("canvas_snapshot_id", compaction_snapshot.id.clone().into()),
             ("purpose", "compaction".into()),
         ]),
     );
@@ -1086,12 +1135,33 @@ fn compaction_or_child_snapshot_cannot_steal_pending_driver_continuation() {
         "child-1",
         None,
         EventKind::CANVAS_SNAPSHOT,
-        object([(
-            "selected_event_ids",
-            serde_json::json!([contribution.id.clone()]),
-        )]),
+        object([
+            (
+                "selected_event_ids",
+                serde_json::json!([contribution.id.clone()]),
+            ),
+            ("counts", serde_json::json!({"items": 1})),
+        ]),
     );
-    let pending = [contribution.clone(), compaction_snapshot, child_snapshot];
+    let child_call = EventEnvelope::new(
+        "s",
+        "child-1",
+        Some(child_snapshot.id.clone()),
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("canvas_items", 1.into()),
+            ("canvas_snapshot_id", child_snapshot.id.clone().into()),
+        ]),
+    );
+    let pending = [
+        contribution.clone(),
+        compaction_snapshot,
+        compaction_call,
+        child_snapshot,
+        child_call,
+    ];
     let next_driver_canvas = assemble_canvas(&pending, &off_policy(usize::MAX));
     assert!(matches!(
         next_driver_canvas.as_slice(),
@@ -1099,20 +1169,12 @@ fn compaction_or_child_snapshot_cannot_steal_pending_driver_continuation() {
             if event_id == &contribution.id && content == "continue after compaction"
     ));
 
-    let driver_snapshot = EventEnvelope::new(
-        "s",
-        "root",
-        None,
-        EventKind::CANVAS_SNAPSHOT,
-        object([(
-            "selected_event_ids",
-            serde_json::json!([contribution.id.clone()]),
-        )]),
-    );
+    let driver_snapshot = driver_snapshot_selecting(&contribution);
+    let driver_call = root_model_call_for_snapshot(&driver_snapshot);
     let consumed = assemble_canvas(
         &pending
             .into_iter()
-            .chain(std::iter::once(driver_snapshot))
+            .chain([driver_snapshot, driver_call])
             .collect::<Vec<_>>(),
         &off_policy(usize::MAX),
     );
@@ -1147,17 +1209,12 @@ fn accepted_extension_continuation_is_committed_even_if_owner_is_now_disabled() 
             if event_id == &contribution.id && content == "resume after crash"
     ));
 
-    let selected_snapshot = EventEnvelope::new(
-        "s",
-        "a",
-        Some(contribution.id.clone()),
-        EventKind::CANVAS_SNAPSHOT,
-        object([(
-            "selected_event_ids",
-            serde_json::json!([contribution.id.clone()]),
-        )]),
+    let selected_snapshot = driver_snapshot_selecting(&contribution);
+    let model_call = root_model_call_for_snapshot(&selected_snapshot);
+    let consumed = assemble_canvas(
+        &[contribution, selected_snapshot, model_call],
+        &off_policy(usize::MAX),
     );
-    let consumed = assemble_canvas(&[contribution, selected_snapshot], &off_policy(usize::MAX));
     assert!(consumed.is_empty());
 }
 
@@ -1234,16 +1291,10 @@ fn pending_extension_continuation_is_pinned_before_an_applied_full_swap_frontier
         "the pre-frontier continuation stays between the projection and the ordered frontier"
     );
 
-    events.push(EventEnvelope::new(
-        "s",
-        "root",
-        Some(events[5].id.clone()),
-        EventKind::CANVAS_SNAPSHOT,
-        object([(
-            "selected_event_ids",
-            serde_json::json!([contribution.id.clone()]),
-        )]),
-    ));
+    let selected_snapshot = driver_snapshot_selecting(&contribution);
+    let model_call = root_model_call_for_snapshot(&selected_snapshot);
+    events.push(selected_snapshot);
+    events.push(model_call);
     let selected = assemble_canvas(&events, &off_policy(usize::MAX));
     assert!(
         selected.iter().all(|item| {
@@ -1253,7 +1304,7 @@ fn pending_extension_continuation_is_pinned_before_an_applied_full_swap_frontier
                     if event_id == &contribution.id
             )
         }),
-        "the same-agent root-driver snapshot consumes the pinned one-shot input"
+        "the accepted same-agent root request consumes the pinned one-shot input"
     );
 }
 

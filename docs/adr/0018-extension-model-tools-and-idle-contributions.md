@@ -63,8 +63,8 @@ or:
 
 The extension owns the meaning and state behind that decision. Core owns only
 the boundary, validation, standing-authority check, provenance, cancellation
-checks, user-input priority, and a host resource ceiling. Because this is
-implicit lifecycle work, it never opens a permission prompt: all command
+checks, user-input priority, and the existing generic round budget. Because
+this is implicit lifecycle work, it never opens a permission prompt: all command
 capabilities must already be session-allowed, or covered by an existing grant
 when their mode is `ask` or unconfigured; `always-deny` remains final. Missing
 authority records a rejected stop contribution without starting the command or
@@ -76,15 +76,17 @@ Pending user input wins before and after contributor execution. An accepted
 continuation starts another root `RoundLoop` without forging a `user.message`;
 it is recorded as an attributed `extension.contribution` event and projected
 into the next request with core-generated framing. It remains eligible across
-persistence and resume until selected by that request's `canvas.snapshot`,
-then becomes provenance-only so later requests cannot accumulate old
-continuations. A stop, rejected continuation, malformed result, or failure
-does not enter the model canvas.
+persistence and resume until the accepted request's `model.call` binds the
+exact selecting `canvas.snapshot` through `canvas_snapshot_id`, then becomes
+provenance-only so later requests cannot accumulate old continuations. A
+snapshot-only crash does not consume it. A stop, rejected continuation,
+malformed result, or failure does not enter the model canvas.
 
 The hook runs only after a normal terminal model response. It does not run
 after provider failure, context-limit stop, guardian interruption, explicit
-tool-round limit, or cancellation. Automatic continuations are capped per
-user-driven run so a faulty extension cannot create unbounded model spend.
+tool-round limit, or cancellation. Core does not add a second automatic-
+continuation cap: the generic `RoundLoop` limit (when configured) and
+cancellation remain the sole resource owners.
 Root sessions default the session-private `extension-state` and bounded,
 extension-namespaced `context-slot` and `plan-presentation` capabilities to
 `session-allow`, allowing a plan extension to probe absent or resumed state and
@@ -93,8 +95,9 @@ whether any plan exists; core does not infer one.
 
 An accepted continuation is committed input for the current user turn, not
 live extension state. A later disable therefore cannot retroactively hide it;
-the next snapshot consumes it once. This keeps crash/resume from turning a
-temporary disable into stale continuation resurrection.
+the next accepted request consumes it once. This keeps crash/resume from
+turning a temporary disable into stale continuation resurrection while also
+preserving it across the prepared-snapshot crash window.
 
 ## Decision 3: session wiring is generic and revalidated
 

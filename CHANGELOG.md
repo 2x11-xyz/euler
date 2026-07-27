@@ -60,6 +60,10 @@ pull requests that landed them; deeper design rationale lives in
 - Extension commands can declare bounded model tools and one terminal-idle
   contributor. Implicit idle work never opens a permission prompt: it runs only
   with standing authority and records an expected rejected stop otherwise.
+  Accepted continuations run under the ordinary `RoundLoop` limit with no
+  hidden second cap, and become one-shot only when an admitted `model.call`
+  binds their exact prepared canvas snapshot; a snapshot-only crash preserves
+  them for recovery.
 - Session-private extension state now has its own `extension-state` capability.
   Root sessions allow it and bounded, namespaced `context-slot` updates by
   default so removable workflows can probe absent or resumed state.

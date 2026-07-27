@@ -14,7 +14,7 @@ use euler_sdk::{
 };
 use serde_json::json;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 #[derive(Clone)]
@@ -367,53 +367,6 @@ impl ModelProvider for SteeringProvider {
             .push(request.clone());
         if !self.steering_sent.swap(true, Ordering::SeqCst) {
             self.queue.push_steering_back("user wins".to_owned());
-        }
-        self.scripted.invoke(request)
-    }
-}
-
-struct SteeringAtCallProvider {
-    queue: Arc<super::super::steering::SteeringQueue>,
-    scripted: ScriptedProvider,
-    requests: Arc<Mutex<Vec<ModelRequest>>>,
-    calls: AtomicUsize,
-    steer_at: usize,
-}
-
-impl SteeringAtCallProvider {
-    fn new(
-        queue: Arc<super::super::steering::SteeringQueue>,
-        responses: Vec<FixtureResponse>,
-        steer_at: usize,
-    ) -> (Self, Arc<Mutex<Vec<ModelRequest>>>) {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        (
-            Self {
-                queue,
-                scripted: ScriptedProvider::new(responses),
-                requests: Arc::clone(&requests),
-                calls: AtomicUsize::new(0),
-                steer_at,
-            },
-            requests,
-        )
-    }
-}
-
-impl ModelProvider for SteeringAtCallProvider {
-    fn name(&self) -> &'static str {
-        "fixture"
-    }
-
-    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
-        self.requests
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(request.clone());
-        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if call == self.steer_at {
-            self.queue
-                .push_steering_back("user wins at the cap".to_owned());
         }
         self.scripted.invoke(request)
     }
@@ -1394,7 +1347,7 @@ fn accepted_idle_continuation_starts_a_fresh_round_without_user_forgery() {
     assert_eq!(contributions[0].payload["action"], json!("continue"));
     assert_eq!(contributions[0].payload["accepted"], json!(true));
     assert_eq!(contributions[1].payload["action"], json!("stop"));
-    let selected_count = session
+    let selected_snapshots = session
         .events()
         .iter()
         .filter(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
@@ -1408,8 +1361,16 @@ fn accepted_idle_continuation_starts_a_fresh_round_without_user_forgery() {
                         .any(|id| id.as_str() == Some(contributions[0].id.as_str()))
                 })
         })
-        .count();
-    assert_eq!(selected_count, 1);
+        .collect::<Vec<_>>();
+    assert_eq!(selected_snapshots.len(), 1);
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::MODEL_CALL
+            && event
+                .payload
+                .get("canvas_snapshot_id")
+                .and_then(Value::as_str)
+                == Some(selected_snapshots[0].id.as_str())
+    }));
 }
 
 #[test]
@@ -1869,50 +1830,45 @@ fn assert_user_input_arriving_during_idle_wins(idle_output: Value, expected_acti
 }
 
 #[test]
-fn automatic_continuation_limit_stops_a_valid_infinite_contributor() {
+fn explicit_round_limit_is_the_only_idle_continuation_limit() {
     let temp = tempfile::tempdir().expect("temp");
-    let automatic = MAX_AUTOMATIC_CONTINUATIONS_PER_RUN;
     let extension = TestExtension::idle_only(
         "workflow-ext",
-        (0..=automatic).map(|_| json!({"action": "continue", "input": "keep going"})),
+        [
+            json!({"action": "continue", "input": "second request"}),
+            json!({"action": "continue", "input": "third request"}),
+            json!({"action": "continue", "input": "must remain unexecuted"}),
+        ],
     );
     let state = Arc::clone(&extension.state);
     let (mut session, requests) = session_with_extension(
         &temp,
         extension,
-        (0..=automatic)
-            .map(|index| FixtureResponse::Assistant(format!("round {index}")))
-            .collect(),
+        vec![
+            FixtureResponse::Assistant("round 1".to_owned()),
+            FixtureResponse::Assistant("round 2".to_owned()),
+            FixtureResponse::Assistant("round 3".to_owned()),
+        ],
         Vec::new(),
     );
+    session.config.max_tool_rounds = Some(3);
 
-    session.run_turn("start").expect("bounded turn");
+    session.run_turn("start").expect("explicitly bounded turn");
 
     assert_eq!(
         requests
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len(),
-        automatic + 1
+        3
     );
     assert_eq!(
         state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .idle_calls,
-        automatic
-    );
-    assert_eq!(
-        session
-            .events()
-            .iter()
-            .filter(|event| {
-                event.kind.as_str() == EventKind::ERROR
-                    && event.payload.get("failure").and_then(Value::as_str)
-                        == Some("continuation-limit")
-            })
-            .count(),
-        1
+        2,
+        "the final permitted request has no successor, so idle is not run"
     );
     assert_eq!(
         session
@@ -1924,120 +1880,12 @@ fn automatic_continuation_limit_stops_a_valid_infinite_contributor() {
                     && event.payload.get("accepted").and_then(Value::as_bool) == Some(true)
             })
             .count(),
-        automatic
+        2
     );
-}
-
-#[test]
-fn steering_at_automatic_continuation_cap_is_modeled_after_one_cap_event() {
-    let temp = tempfile::tempdir().expect("temp");
-    let automatic = MAX_AUTOMATIC_CONTINUATIONS_PER_RUN;
-    let extension = TestExtension::idle_only(
-        "workflow-ext",
-        (0..automatic).map(|_| json!({"action": "continue", "input": "keep going"})),
-    );
-    let state = Arc::clone(&extension.state);
-    let queue = Arc::new(super::super::steering::SteeringQueue::default());
-    let (provider, requests) = SteeringAtCallProvider::new(
-        Arc::clone(&queue),
-        (0..automatic + 2)
-            .map(|index| FixtureResponse::Assistant(format!("round {index}")))
-            .collect(),
-        automatic + 1,
-    );
-    let mut config = super::super::SessionConfig::new(temp.path());
-    config.extensions_enabled.insert(extension.id.clone());
-    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
-        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
-    session
-        .wire_extension(Arc::new(extension))
-        .expect("wire extension");
-    session.set_steering_queue(Arc::clone(&queue));
-
-    session.run_turn("start").expect("bounded continuation");
-
-    assert!(queue.is_empty());
-    assert_eq!(
-        state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .idle_calls,
-        automatic
-    );
-    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
-    assert_eq!(requests.len(), automatic + 2);
-    assert!(requests[automatic + 1].input.iter().any(|item| matches!(
-        item,
-        ModelInputItem::Message {
-            role: ModelRole::User,
-            content
-        } if content == "user wins at the cap"
-    )));
-    assert_eq!(
-        session
-            .events()
-            .iter()
-            .filter(|event| {
-                event.kind.as_str() == EventKind::ERROR
-                    && event.payload.get("failure").and_then(Value::as_str)
-                        == Some("continuation-limit")
-            })
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn cancellation_at_automatic_continuation_cap_wins_over_cap_event() {
-    let temp = tempfile::tempdir().expect("temp");
-    let automatic = MAX_AUTOMATIC_CONTINUATIONS_PER_RUN;
-    let extension = TestExtension::idle_only(
-        "workflow-ext",
-        (0..automatic).map(|_| json!({"action": "continue", "input": "keep going"})),
-    );
-    let state = Arc::clone(&extension.state);
-    let (mut session, requests) = session_with_extension(
-        &temp,
-        extension,
-        (0..automatic + 1)
-            .map(|index| FixtureResponse::Assistant(format!("round {index}")))
-            .collect(),
-        Vec::new(),
-    );
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let cancel_from_sink = Arc::clone(&cancellation);
-    let results = Arc::new(AtomicUsize::new(0));
-    let results_from_sink = Arc::clone(&results);
-
-    let error = session
-        .run_turn_with_sink("start", cancellation, move |event| {
-            if event.kind.as_str() == EventKind::MODEL_RESULT
-                && results_from_sink.fetch_add(1, Ordering::SeqCst) + 1 == automatic + 1
-            {
-                cancel_from_sink.store(true, Ordering::SeqCst);
-            }
-        })
-        .expect_err("cancellation at cap");
-
-    assert!(matches!(error, SessionError::Cancelled));
-    assert_eq!(results.load(Ordering::SeqCst), automatic + 1);
-    assert_eq!(
-        requests
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len(),
-        automatic + 1
-    );
-    assert_eq!(
-        state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .idle_calls,
-        automatic
-    );
-    assert!(session.events().iter().all(|event| {
-        event.payload.get("failure").and_then(Value::as_str) != Some("continuation-limit")
-    }));
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::ERROR));
 }
 
 #[test]

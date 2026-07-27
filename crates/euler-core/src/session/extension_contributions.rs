@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(super) const MAX_AUTOMATIC_CONTINUATIONS_PER_RUN: usize = 64;
 const MAX_IDLE_CONTINUATION_BYTES: usize = 8 * 1024;
 const MAX_EXTENSION_TOOL_ERROR_BYTES: usize = 4 * 1024;
 const EXTENSION_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
@@ -681,22 +680,6 @@ impl<D: PermissionDecider> Session<D> {
             payload.insert("command".to_owned(), command.into());
         }
         let _ = self.emit(EventKind::ERROR, payload);
-    }
-
-    pub(super) fn emit_continuation_limit(&mut self) -> Result<(), SessionError> {
-        self.emit(
-            EventKind::ERROR,
-            object([
-                ("source", "extension".into()),
-                (
-                    "message",
-                    "automatic continuation limit reached; send a follow-up to continue".into(),
-                ),
-                ("category", "resource-limit".into()),
-                ("failure", "continuation-limit".into()),
-            ]),
-        )?;
-        Ok(())
     }
 }
 

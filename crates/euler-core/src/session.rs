@@ -507,17 +507,10 @@ where
     sink: &'a mut EventSink<'sink, F>,
     turn_state: &'a mut TurnState,
     rounds: &'a mut u64,
-    idle_continuations: &'a mut IdleContinuationState,
     cancellation: CancellationToken,
 }
 
 type RecordedToolCall = (ToolCall, String);
-
-#[derive(Default)]
-struct IdleContinuationState {
-    accepted: usize,
-    limit_emitted: bool,
-}
 
 pub(super) fn provider_cancellation(
     cancellation: CancellationToken,
@@ -777,53 +770,39 @@ where
         // issue the request that consumes it. Do not run implicit extension
         // work at the configured final round.
         if !next_round_permitted {
-            return self.finish_terminal_steering(cancellation, false);
-        }
-
-        if self.idle_continuations.accepted
-            >= extension_contributions::MAX_AUTOMATIC_CONTINUATIONS_PER_RUN
-        {
-            // Cancellation wins over resource-limit narration at the cap.
-            if cancellation.is_cancelled() {
-                return Err(SessionError::Cancelled);
-            }
-            // The terminal queue transaction below may consume pending user
-            // input into the next request, but the automatic source still
-            // reached its own cap and records that fact exactly once.
-            if !self.idle_continuations.limit_emitted {
-                self.session.emit_continuation_limit()?;
-                self.sink.flush(self.session.bus.events());
-                self.idle_continuations.limit_emitted = true;
-            }
-            return self.finish_terminal_steering(cancellation, true);
+            return match self.defer_idle_steering_boundary(cancellation) {
+                steering::BoundaryAction::Closed { cancelled: true } => {
+                    Err(SessionError::Cancelled)
+                }
+                steering::BoundaryAction::Closed { cancelled: false }
+                | steering::BoundaryAction::Drained => Ok(RoundOutcome::Complete(())),
+                steering::BoundaryAction::Persisted => {
+                    unreachable!("a deferred terminal boundary never admits steering")
+                }
+            };
         }
 
         // Existing user steering bypasses implicit idle work entirely. The
         // terminal queue transaction records the real driver; no synthetic
         // extension contribution is invented for a command that never ran.
         if self.session.steering_pending() {
-            return self.finish_terminal_steering(cancellation, true);
+            return self.finish_terminal_steering(cancellation);
         }
 
         match self.session.run_idle_boundary(cancellation, self.sink)? {
-            extension_contributions::IdleBoundary::Continue => {
-                self.idle_continuations.accepted += 1;
-                return Ok(RoundOutcome::Continue);
-            }
+            extension_contributions::IdleBoundary::Continue => return Ok(RoundOutcome::Continue),
             extension_contributions::IdleBoundary::Stop => {}
         }
 
-        self.finish_terminal_steering(cancellation, true)
+        self.finish_terminal_steering(cancellation)
     }
 
     fn finish_terminal_steering(
         &mut self,
         cancellation: &CancellationToken,
-        next_round_permitted: bool,
     ) -> Result<RoundOutcome, SessionError> {
-        match self.finish_idle_steering_boundary(cancellation, next_round_permitted)? {
+        match self.finish_idle_steering_boundary(cancellation)? {
             steering::BoundaryAction::Persisted => Ok(RoundOutcome::Continue),
-            steering::BoundaryAction::DeferredByRoundLimit => Ok(RoundOutcome::Continue),
             steering::BoundaryAction::Closed { cancelled: true } => Err(SessionError::Cancelled),
             steering::BoundaryAction::Closed { cancelled: false }
             | steering::BoundaryAction::Drained => Ok(RoundOutcome::Complete(())),
@@ -2156,7 +2135,6 @@ impl<D: PermissionDecider> Session<D> {
     {
         let mut turn_state = TurnState::default();
         let mut rounds = 0_u64;
-        let mut idle_continuations = IdleContinuationState::default();
         let max_rounds = self.config.max_tool_rounds;
         let provider_retries = self.config.provider_transport_retries;
         let provider_retry_backoff_ms = self.config.provider_transport_retry_backoff_ms.clone();
@@ -2165,7 +2143,6 @@ impl<D: PermissionDecider> Session<D> {
             sink,
             turn_state: &mut turn_state,
             rounds: &mut rounds,
-            idle_continuations: &mut idle_continuations,
             cancellation: cancellation.clone(),
         };
         let result = RoundLoop::new(
@@ -2225,7 +2202,7 @@ impl<D: PermissionDecider> Session<D> {
         // A snapshot is one-shot selection authority. Emit it only after the
         // exact request has passed every admission check, so a rejected
         // request cannot consume a pending extension contribution.
-        self.emit(
+        let canvas_snapshot_id = self.emit(
             EventKind::CANVAS_SNAPSHOT,
             canvas_snapshot_payload(
                 &canvas,
@@ -2254,6 +2231,7 @@ impl<D: PermissionDecider> Session<D> {
         if let Some(max_output_tokens) = self.config.max_output_tokens {
             model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
         }
+        model_call.insert("canvas_snapshot_id".to_owned(), canvas_snapshot_id.into());
         if let Some(pinned) = &pinned {
             // Recorded only because these exact rendered bytes are in the
             // request built above (no TOCTOU between snapshot and prompt

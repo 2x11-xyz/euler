@@ -114,7 +114,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   submitted after it are ordinary follow-ups.
 - `model.call`: `provider`, `model`, `canvas_items`,
   `requested_reasoning_effort`; optional resolved `reasoning_effort`,
-  `max_output_tokens`, and `project_context_digest`. Every accepted call has
+  `max_output_tokens`, and `project_context_digest`. A root-driver call also
+  carries `canvas_snapshot_id`, naming the exact preceding purpose-free
+  `canvas.snapshot` used to build that request. The linked snapshot has the
+  same envelope `agent`, its `counts.items` equals `model.call.canvas_items`,
+  and it precedes the call. Shadow-compaction calls use `purpose:
+  "compaction"` and do not carry this root-driver link; companion and reviewer
+  calls use their own actors and cannot claim a root snapshot.
+  Every accepted call has
   exactly one semantic terminal association: `model.result` on a drained
   finished stream, or a terminal `error`. Cancellation before a result records
   the safe error payload `source: "session"`, `message: "model call
@@ -247,9 +254,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   `"authority-unavailable"`) and no content. Missing standing authority is an
   expected idle stop, not an `error` event.
   Only an accepted continue projects into the model canvas, with core-generated
-  extension framing. It remains eligible until selected by one
-  `canvas.snapshot`, then becomes provenance-only. It is never reclassified as
-  `user.message`.
+  extension framing. It remains eligible until an accepted same-agent
+  root-driver `model.call` binds the exact purpose-free `canvas.snapshot` that
+  selected it, then becomes provenance-only. A prepared snapshot with no
+  accepted call consumes nothing. It is never reclassified as `user.message`.
 - `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file
@@ -314,7 +322,8 @@ envelope `v` per `docs/contracts/persistence.md`.
   name the exact fixed root instructions used for that call. The full text is
   also present when this is the first occurrence of that instruction identity
   in the stream. They are request audit metadata and are not model-canvas
-  content. Optional
+  content. Root-driver calls additionally carry the exact
+  `canvas_snapshot_id`; root-agent shadow calls do not. Optional
   `project_context_digest` (ADR 0017) is the versioned rendered-context
   digest, recorded only when those exact core-framed bytes occur in the
   provider-neutral request being dispatched (no TOCTOU between snapshot and
@@ -547,7 +556,9 @@ envelope `v` per `docs/contracts/persistence.md`.
   `over_budget`, and `pressure` (`none`|`byte`|`token`|`both`). Optional
   `used_tokens` and `limit_tokens` are included when provider usage and a
   configured context limit are known. Snapshot fields are assembly telemetry
-  for the next model request; they do not rewrite provenance history.
+  for the next model request; they do not rewrite provenance history or consume
+  one-shot input by themselves. An accepted root-driver `model.call` binds the
+  exact request snapshot through `canvas_snapshot_id`.
   A fixed shadow-compaction snapshot adds `purpose: "compaction"` and
   `shadow_snapshot_end_id`.
 - `canvas.policy.changed`: `automatic`, `stubs`, and `budget_bytes`. It records

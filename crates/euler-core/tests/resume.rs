@@ -125,6 +125,174 @@ fn fold_treats_canvas_swap_as_a_new_unknown_usage_window() {
 }
 
 #[test]
+fn snapshot_only_crash_keeps_extension_contribution_until_a_replacement_request() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let contribution = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            ("content", "survive the prepared-only snapshot".into()),
+        ]),
+    );
+    let orphaned_snapshot = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(contribution.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", json!([contribution.id.clone()])),
+            ("counts", json!({"items": 1})),
+        ]),
+    );
+    write_events(
+        &log,
+        &[start, contribution.clone(), orphaned_snapshot.clone()],
+    );
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = CapturingStaticProvider::new(
+        vec![
+            completed_stream("replacement request completed"),
+            completed_stream("later request completed"),
+        ],
+        Arc::clone(&requests),
+    );
+    let mut config = SessionConfig::new(temp.path());
+    config.agent_id = "agent".to_owned();
+    let mut session = resume_session(
+        config,
+        ProviderSet::single(provider),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    session
+        .run_turn("resume after crash")
+        .expect("replacement turn");
+    session.run_turn("later").expect("later turn");
+
+    let requests = requests.lock().expect("request log");
+    assert!(requests[0]
+        .prompt_text()
+        .contains("survive the prepared-only snapshot"));
+    assert!(!requests[1]
+        .prompt_text()
+        .contains("survive the prepared-only snapshot"));
+    drop(requests);
+
+    let consuming_call = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL
+                && event
+                    .payload
+                    .get("canvas_snapshot_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id != orphaned_snapshot.id)
+        })
+        .expect("replacement request-backed model call");
+    let consuming_snapshot_id = consuming_call.payload["canvas_snapshot_id"]
+        .as_str()
+        .expect("snapshot id");
+    let consuming_snapshot = session
+        .events()
+        .iter()
+        .find(|event| event.id == consuming_snapshot_id)
+        .expect("linked snapshot");
+    assert!(consuming_snapshot.payload["selected_event_ids"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id == &contribution.id)));
+}
+
+#[test]
+fn recovery_closure_keeps_an_accepted_request_consumption_terminal() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let contribution = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::EXTENSION_CONTRIBUTION,
+        object([
+            ("extension_id", "workflow-ext".into()),
+            ("command", "idle".into()),
+            ("point", "turn-idle".into()),
+            ("action", "continue".into()),
+            ("accepted", true.into()),
+            ("content", "accepted before the crash".into()),
+        ]),
+    );
+    let snapshot = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(contribution.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", json!([contribution.id.clone()])),
+            ("counts", json!({"items": 1})),
+        ]),
+    );
+    let call = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(snapshot.id.clone()),
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("canvas_items", 1.into()),
+            ("canvas_snapshot_id", snapshot.id.clone().into()),
+        ]),
+    );
+    write_events(&log, &[start, contribution.clone(), snapshot, call.clone()]);
+
+    let mut config = SessionConfig::new(temp.path());
+    config.agent_id = "agent".to_owned();
+    let session = resume_session(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    let closure = model_recovery_closures(session.events())
+        .into_iter()
+        .find(|event| event.parent.as_deref() == Some(call.id.as_str()))
+        .expect("recovery closure");
+    assert_eq!(
+        closure
+            .payload
+            .get("recovery_closure")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        assemble_canvas(session.events(), &AutoCompactionPolicy::default())
+            .iter()
+            .all(|item| {
+                !matches!(
+                    item,
+                    CanvasItem::ExtensionContribution { event_id, .. }
+                        if event_id == &contribution.id
+                )
+            })
+    );
+}
+
+#[test]
 fn resumed_full_swap_keeps_pending_extension_input_in_order_until_root_selection() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
