@@ -1275,10 +1275,17 @@ fn interrupt_then_continue_hydrates_the_whole_pending_steer_stack() {
             _ => None,
         })
         .collect();
+    // Depending on whether the worker crossed the durable request boundary
+    // before Escape, the cancelled turn may already have a model.call. The
+    // replacement invariant begins with the first preserved steer.
+    let replacement_turn = user_and_calls
+        .iter()
+        .position(|entry| *entry == (EventKind::USER_MESSAGE, Some("steer one")))
+        .map(|index| &user_and_calls[index..])
+        .expect("replacement turn contains the first preserved steer");
     assert_eq!(
-        user_and_calls,
+        replacement_turn,
         [
-            (EventKind::USER_MESSAGE, Some("active")),
             (EventKind::USER_MESSAGE, Some("steer one")),
             (EventKind::USER_MESSAGE, Some("steer two")),
             (EventKind::USER_MESSAGE, Some("steer three")),

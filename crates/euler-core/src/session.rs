@@ -2199,9 +2199,9 @@ impl<D: PermissionDecider> Session<D> {
             return Err(error);
         }
 
-        // A snapshot is one-shot selection authority. Emit it only after the
-        // exact request has passed every admission check, so a rejected
-        // request cannot consume a pending extension contribution.
+        // Snapshot the admitted selection only after every budget check. The
+        // following accepted driver model.call binds this exact snapshot and
+        // is the one-shot consumption authority.
         let canvas_snapshot_id = self.emit(
             EventKind::CANVAS_SNAPSHOT,
             canvas_snapshot_payload(

@@ -1158,6 +1158,18 @@ fn normalize_events(events: Vec<EventEnvelope>, allowlist: &BTreeSet<&'static st
                 }
             }
             if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
+                if let Some(canvas_snapshot_id) = payload
+                    .get("canvas_snapshot_id")
+                    .and_then(Value::as_str)
+                    .map(|id| mapped_id(&id_map, id))
+                {
+                    replace_allowed(
+                        payload,
+                        allowlist,
+                        "canvas_snapshot_id",
+                        Value::String(canvas_snapshot_id),
+                    );
+                }
                 if let Some(file_change_id) = payload
                     .get("file_change_id")
                     .and_then(Value::as_str)
@@ -1275,6 +1287,7 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "parent",
         "selected_event_ids",
         "event_id",
+        "canvas_snapshot_id",
         "file_change_id",
         "root",
     ])
