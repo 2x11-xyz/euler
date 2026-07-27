@@ -81,7 +81,8 @@ pub use grants::{
 pub use guardian::PermissionReviewer;
 pub use home::{EulerHome, EulerHomeError};
 pub use permissions::{
-    ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,
+    ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider,
+    PermissionDecisionOutcome, PermissionRequest,
 };
 pub use project_context::{
     AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError, AdmissionBudget,

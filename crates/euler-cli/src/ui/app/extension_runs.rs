@@ -4,6 +4,7 @@ use super::*;
 pub(super) enum ExtensionOutcome {
     Complete(serde_json::Value),
     Failed(String),
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -175,6 +176,9 @@ impl AppCore {
         let (worker_tx, worker_rx) = mpsc::channel();
         let mut worker_request = request.clone();
         let label = request.label();
+        let interrupt_flag = Arc::new(AtomicBool::new(false));
+        let worker_cancellation =
+            euler_sdk::CancellationSource::from_shared_flag(Arc::clone(&interrupt_flag)).token();
         std::thread::spawn(move || {
             let start = session.events().len();
             // A request can wait behind an in-flight turn. Re-resolve at actual
@@ -213,15 +217,17 @@ impl AppCore {
             // Gated: declared capabilities become grants only through the
             // permission gate (the approval panel asks; session grants
             // cover later runs). Never pass a descriptor list as authority.
-            let result = session.execute_extension_command_gated(
+            let result = session.execute_extension_command_gated_cancellable(
                 worker_request.extension.as_ref(),
                 &worker_request.command,
                 worker_request.input.clone(),
                 &worker_request.capabilities,
+                &worker_cancellation,
             );
             let events = session.events()[start..].to_vec();
             let outcome = match result {
                 Ok(output) => ExtensionOutcome::Complete(output),
+                Err(euler_core::ExtensionExecutionError::Cancelled) => ExtensionOutcome::Cancelled,
                 Err(error) => ExtensionOutcome::Failed(error.to_string()),
             };
             let _ = worker_tx.send(TurnEvent::ExtensionDone {
@@ -233,12 +239,12 @@ impl AppCore {
         });
         self.install_state(AppState::TurnInFlight {
             worker_rx,
-            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            interrupt_flag,
             started_at: Instant::now(),
         });
         self.in_flight_label = Some(label);
         self.in_flight_companion_name = None;
-        self.in_flight_cancellable = false;
+        self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;

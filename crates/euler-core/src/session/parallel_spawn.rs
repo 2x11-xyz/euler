@@ -22,7 +22,7 @@ use euler_provider::{
     ModelInputItem, ModelRequest, ModelRole, ModelStreamEvent, ProviderError, ProviderSet,
     ProviderStream, ReasoningChunk, StopReason,
 };
-use std::sync::atomic::AtomicBool;
+use euler_sdk::CancellationToken;
 use std::sync::Arc;
 
 /// One task prepared on the session thread: everything a worker needs, plus
@@ -55,7 +55,7 @@ impl<D: PermissionDecider> Session<D> {
     pub fn spawn_reviewers_parallel(
         &mut self,
         tasks: Vec<AgentTask>,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<Vec<AgentResultSummary>, SessionError> {
         if tasks.is_empty() {
             return Ok(Vec::new());
@@ -141,7 +141,7 @@ impl<D: PermissionDecider> Session<D> {
                 provider_retry_backoff_ms: self.config.provider_transport_retry_backoff_ms.clone(),
             },
             &prepared,
-            cancel_flag,
+            cancellation,
         );
 
         // Phase 3 (session thread, batch order): record each reviewer's
@@ -150,6 +150,9 @@ impl<D: PermissionDecider> Session<D> {
         for (reviewer, outcome) in prepared.into_iter().zip(outcomes) {
             let summary = self.record_reviewer_outcome(&writer, reviewer, outcome)?;
             summaries.push(summary);
+        }
+        if cancellation.is_cancelled() {
+            return Err(SessionError::Cancelled);
         }
         Ok(summaries)
     }
@@ -513,7 +516,7 @@ fn run_workers(
     session_id: &str,
     config: RoundLoopConfig,
     prepared: &[PreparedReviewer],
-    cancel_flag: &AtomicBool,
+    cancellation: &CancellationToken,
 ) -> Vec<WorkerOutcome> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = prepared
@@ -524,6 +527,7 @@ fn run_workers(
                     provider_retries: config.provider_retries,
                     provider_retry_backoff_ms: config.provider_retry_backoff_ms.clone(),
                 };
+                let worker_cancellation = cancellation.clone();
                 scope.spawn(move || {
                     // Phase 1 already rejected this reviewer and recorded its
                     // error event; spending a provider call on it would be
@@ -543,8 +547,9 @@ fn run_workers(
                         prepared: Some((reviewer.model_call_id.clone(), reviewer.request.clone())),
                         round: None,
                         buffered_error: None,
+                        cancellation: worker_cancellation.clone(),
                     };
-                    let run = RoundLoop::new(&mut io, worker_config).run(cancel_flag);
+                    let run = RoundLoop::new(&mut io, worker_config).run(&worker_cancellation);
                     WorkerOutcome {
                         round: run.and_then(|()| {
                             io.round.ok_or_else(|| {
@@ -585,6 +590,7 @@ struct WorkerIo<'a> {
     prepared: Option<(String, ModelRequest)>,
     round: Option<ModelRoundData>,
     buffered_error: Option<(JsonObject, String)>,
+    cancellation: CancellationToken,
 }
 
 impl RoundLoopIo for WorkerIo<'_> {
@@ -614,7 +620,11 @@ impl RoundLoopIo for WorkerIo<'_> {
         target: &ModelTarget,
         request: ModelRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        self.providers.invoke(&target.provider, request)
+        self.providers.invoke_interruptibly(
+            &target.provider,
+            request,
+            super::provider_cancellation(self.cancellation.clone()),
+        )
     }
 
     fn emit_provider_error(
@@ -628,6 +638,14 @@ impl RoundLoopIo for WorkerIo<'_> {
         ]);
         payload.insert("category".to_owned(), error.category().as_str().into());
         self.buffered_error = Some((payload, model_call_id));
+        Ok(String::new())
+    }
+
+    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError> {
+        self.buffered_error = Some((
+            super::round_loop::model_call_cancelled_payload(),
+            model_call_id,
+        ));
         Ok(String::new())
     }
 
@@ -646,7 +664,7 @@ impl RoundLoopIo for WorkerIo<'_> {
         _target: ModelTarget,
         _model_call_id: String,
         data: ModelRoundData,
-        _cancel_flag: &AtomicBool,
+        _cancellation: &CancellationToken,
     ) -> Result<RoundOutcome<()>, SessionError> {
         self.round = Some(data);
         Ok(RoundOutcome::Complete(()))

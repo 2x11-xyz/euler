@@ -15,8 +15,8 @@ use euler_sdk::{
 use euler_sdk::{AgentOutcome, SpawnAgentTask};
 use euler_sdk::{ArtifactRecord, ArtifactWrite, Capability, CommandContext, CommandRegistrar};
 use euler_sdk::{
-    CommandDescriptor, Extension, ExtensionCommand, ExtensionError, HostAgentRecord,
-    HostAgentResult, HostAgentTask, HostApi, MAX_CONTEXT_SLOTS_PER_SESSION,
+    CancellationToken, CommandDescriptor, Extension, ExtensionCommand, ExtensionError,
+    HostAgentRecord, HostAgentResult, HostAgentTask, HostApi, MAX_CONTEXT_SLOTS_PER_SESSION,
     MAX_CONTEXT_SLOT_CONTENT_BYTES,
 };
 use euler_sdk::{DiagnosticsPage, DiagnosticsQuery};
@@ -65,6 +65,7 @@ pub enum ExtensionHostError {
     MissingCommand(String),
     ExtensionDisabled(String),
     CommandFailed(String, ExtensionError),
+    CommandCancelled(String),
     CommandPanic(String, String),
 }
 pub struct ExtensionHost {
@@ -330,6 +331,24 @@ impl ExtensionHost {
         input: serde_json::Value,
         spawner: Option<&dyn ExtensionSpawner>,
     ) -> Result<serde_json::Value, ExtensionHostError> {
+        self.execute_command_with_spawner_cancellable(
+            command,
+            input,
+            spawner,
+            &CancellationToken::new(),
+        )
+    }
+
+    /// Cancellable command execution. Cancellation is host-owned and is not
+    /// recorded as an extension failure: cooperative interruption says
+    /// nothing about the extension's health.
+    pub fn execute_command_with_spawner_cancellable(
+        &mut self,
+        command: &str,
+        input: serde_json::Value,
+        spawner: Option<&dyn ExtensionSpawner>,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, ExtensionHostError> {
         let record = self
             .commands
             .get(command)
@@ -354,8 +373,13 @@ impl ExtensionHost {
             spawner,
             redactor: self.redactor.clone(),
         };
-        match catch_extension_unwind(|| runner.execute(CommandContext { input }, &host)) {
+        match catch_extension_unwind(|| {
+            runner.execute_cancellable(CommandContext { input }, &host, cancellation)
+        }) {
             Ok(Ok(output)) => Ok(output),
+            Ok(Err(ExtensionError::Cancelled)) => {
+                Err(ExtensionHostError::CommandCancelled(command.to_owned()))
+            }
             Ok(Err(source)) => {
                 self.record_command_failure(
                     &extension_id,

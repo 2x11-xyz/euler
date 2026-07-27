@@ -3,9 +3,10 @@
 use super::{
     approval_mode_str, canvas_snapshot_payload, context_budget_exhausted, elapsed_ms,
     file_change_payload, file_diff_payload, maybe_store_pre_image, model_input_item,
-    permission_decision_payload, permission_request_for_tool, tool_success_payload,
-    validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig,
-    RoundLoopIo, RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
+    permission_decision_payload, permission_request_for_tool, tool_cancelled_payload,
+    tool_success_payload, validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop,
+    RoundLoopConfig, RoundLoopIo, RoundOutcome, Session, SessionError, TurnState,
+    SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
@@ -16,9 +17,8 @@ use euler_provider::{
     ModelInputItem, ModelRequest, ModelRole, ModelStreamEvent, ProviderError, ProviderSet,
     ProviderStream, ReasoningChunk, ReasoningEffort, StopReason, ToolCall, Usage,
 };
-use euler_sdk::Capability;
+use euler_sdk::{CancellationToken, Capability};
 use serde_json::{json, Value};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -67,6 +67,16 @@ struct CompanionLoop<'a, D> {
     /// Cumulative OUTPUT tokens only (see `add_usage`), checked against
     /// `AgentBudget::max_tokens`.
     tokens: u64,
+    cancellation: CancellationToken,
+}
+
+struct CompanionLoopInit {
+    task: AgentTask,
+    target: ModelTarget,
+    modes: Vec<(Capability, ApprovalMode)>,
+    writer: Arc<crate::provenance::ProvenanceWriter>,
+    agent_id: String,
+    cancellation: CancellationToken,
 }
 
 type CompanionRecordedToolCall = (ToolCall, String);
@@ -114,13 +124,13 @@ impl<D: PermissionDecider> Session<D> {
     pub fn spawn_companion(&mut self, task: AgentTask) -> Result<AgentResultSummary, SessionError> {
         // External callers have no companion cancellation source today; hand
         // the loop a flag that never trips.
-        self.spawn_companion_with_cancel(task, &AtomicBool::new(false))
+        self.spawn_companion_with_cancel(task, CancellationToken::new())
     }
 
-    pub(crate) fn spawn_companion_with_cancel(
+    pub fn spawn_companion_with_cancel(
         &mut self,
         task: AgentTask,
-        cancel_flag: &AtomicBool,
+        cancellation: CancellationToken,
     ) -> Result<AgentResultSummary, SessionError> {
         let target = self.resolve_companion_target(&task)?;
         let parent_capabilities = self
@@ -142,18 +152,24 @@ impl<D: PermissionDecider> Session<D> {
         let mut spawned = self.record_companion_spawn(&task, &target, &writer)?;
         let resolved_provider = target.provider.clone();
         let resolved_model = target.model.clone();
-        let result = {
+        let (result, cancelled) = {
             let mut loop_ = CompanionLoop::new(
                 self,
-                task,
-                target,
-                modes,
-                writer,
-                spawned.child_agent_id().to_owned(),
+                CompanionLoopInit {
+                    task,
+                    target,
+                    modes,
+                    writer,
+                    agent_id: spawned.child_agent_id().to_owned(),
+                    cancellation,
+                },
             );
-            loop_.run(cancel_flag)
+            loop_.run()
         };
         let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
+        if cancelled {
+            return Err(SessionError::Cancelled);
+        }
 
         Ok(AgentResultSummary {
             child_agent_id: spawned.child_agent_id().to_owned(),
@@ -207,14 +223,15 @@ impl<D: PermissionDecider> Session<D> {
 }
 
 impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
-    fn new(
-        session: &'a mut Session<D>,
-        task: AgentTask,
-        target: ModelTarget,
-        modes: Vec<(Capability, ApprovalMode)>,
-        writer: Arc<crate::provenance::ProvenanceWriter>,
-        agent_id: String,
-    ) -> Self {
+    fn new(session: &'a mut Session<D>, init: CompanionLoopInit) -> Self {
+        let CompanionLoopInit {
+            task,
+            target,
+            modes,
+            writer,
+            agent_id,
+            cancellation,
+        } = init;
         let mut permissions = PermissionGate::new_deny_all(session.permissions.decider_mut());
         for (capability, mode) in modes {
             permissions.set_mode(capability, mode);
@@ -241,6 +258,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             reteach: crate::tools::ReteachTracker::default(),
             tool_calls: 0,
             tokens: 0,
+            cancellation,
         }
     }
 
@@ -248,20 +266,21 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     /// companions inherit its transient provider retry (ADR 0009). max_turns
     /// maps onto the loop's round limit: it counts companion model rounds,
     /// and max_turns = 1 means at most one model round total.
-    fn run(&mut self, cancel_flag: &AtomicBool) -> AgentResult {
+    fn run(&mut self) -> (AgentResult, bool) {
         // A zero output budget can never produce a round: fail honestly
         // before spending a provider call on it.
         if self.remaining_output_budget() == Some(0) {
-            return companion_failure("budget exhausted: max_tokens");
+            return (companion_failure("budget exhausted: max_tokens"), false);
         }
         let config = RoundLoopConfig {
             max_rounds: self.task.budget().max_turns().map(|max| max as usize),
             provider_retries: self.provider_retries,
             provider_retry_backoff_ms: self.provider_retry_backoff_ms.clone(),
         };
-        let outcome = RoundLoop::new(self, config).run(cancel_flag);
+        let cancellation = self.cancellation.clone();
+        let outcome = RoundLoop::new(self, config).run(&cancellation);
         match outcome {
-            Ok(result) => result,
+            Ok(result) => (result, false),
             // The loop's terminal error carries the raw provider message
             // (HTTP error bodies can echo request fragments — secrets
             // contract). This failure string becomes the agent.result error
@@ -269,7 +288,13 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             // tool output and consolidated artifact; redacting at this
             // conversion point makes every downstream sink inherit it.
             // Success output is model cognition and stays faithful.
-            Err(error) => companion_failure(self.redactor.redact(&error.to_string())),
+            Err(error) => {
+                let cancelled = matches!(&error, SessionError::Cancelled);
+                (
+                    companion_failure(self.redactor.redact(&error.to_string())),
+                    cancelled,
+                )
+            }
         }
     }
 
@@ -295,7 +320,12 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         &mut self,
         call: ToolCall,
         tool_call_event_id: String,
+        cancellation: &CancellationToken,
     ) -> Result<(), SessionError> {
+        if cancellation.is_cancelled() {
+            self.emit_cancelled_tool_result(call, tool_call_event_id, None)?;
+            return Err(SessionError::Cancelled);
+        }
         if let Some(capability) = self
             .tools
             .required_capability_for_input(&call.name, &call.input)
@@ -331,7 +361,17 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             } else {
                 None
             };
-            let decision = self.permissions.decide_detailed(&request, mode);
+            let decision =
+                match self
+                    .permissions
+                    .decide_detailed_cancellable(&request, mode, cancellation)
+                {
+                    crate::permissions::PermissionDecisionOutcome::Decided(decision) => decision,
+                    crate::permissions::PermissionDecisionOutcome::Cancelled => {
+                        self.emit_cancelled_tool_result(call, tool_call_event_id, None)?;
+                        return Err(SessionError::Cancelled);
+                    }
+                };
             let allowed = decision.allowed();
             let mode_label = approval_mode_str(mode);
             self.append(
@@ -352,7 +392,11 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             }
         }
 
-        self.execute_authorized_tool(call, tool_call_event_id)?;
+        if cancellation.is_cancelled() {
+            self.emit_cancelled_tool_result(call, tool_call_event_id, None)?;
+            return Err(SessionError::Cancelled);
+        }
+        self.execute_authorized_tool(call, tool_call_event_id, cancellation)?;
         Ok(())
     }
 
@@ -381,19 +425,27 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         &mut self,
         call: ToolCall,
         tool_call_event_id: String,
+        cancellation: &CancellationToken,
     ) -> Result<(), SessionError> {
         let tool_name = call.name.clone();
         let tool_started = Instant::now();
-        match self
-            .tools
-            .execute_with_events(&call.name, &call.input, self.bus.events())
-        {
-            Ok(execution) => {
+        match self.tools.execute_with_events_cancellable(
+            &call.name,
+            &call.input,
+            self.bus.events(),
+            cancellation,
+        ) {
+            Ok(crate::tools::ToolExecutionOutcome::Completed(execution)) => {
                 // The input format was accepted: reset this tool's re-teach
                 // streak (issue #94), mirroring the parent session loop.
                 self.reteach
                     .record_success(self.tools.reteach_identity(&call.name, &call.input));
-                if self.record_patch_if_present(&call, &tool_call_event_id, &execution)? {
+                if self.record_patch_if_present(
+                    &call,
+                    &tool_call_event_id,
+                    &execution,
+                    cancellation,
+                )? {
                     crate::diagnostics::tool_exec_end(
                         &self.session_id,
                         &tool_name,
@@ -410,6 +462,27 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                     elapsed_ms(tool_started),
                     true,
                 );
+            }
+            Ok(crate::tools::ToolExecutionOutcome::Cancelled(execution)) => {
+                self.record_observed_file_changes(&call.id, &execution.file_changes)?;
+                self.emit_cancelled_tool_result(call, tool_call_event_id, Some(&execution))?;
+                crate::diagnostics::tool_exec_end(
+                    &self.session_id,
+                    &tool_name,
+                    elapsed_ms(tool_started),
+                    false,
+                );
+                return Err(SessionError::Cancelled);
+            }
+            Err(crate::ToolError::Cancelled) => {
+                self.emit_cancelled_tool_result(call, tool_call_event_id, None)?;
+                crate::diagnostics::tool_exec_end(
+                    &self.session_id,
+                    &tool_name,
+                    elapsed_ms(tool_started),
+                    false,
+                );
+                return Err(SessionError::Cancelled);
             }
             Err(error) => {
                 // Rung-2 re-teaching (issue #94), companion-local streaks.
@@ -436,6 +509,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         call: &ToolCall,
         tool_call_event_id: &str,
         execution: &crate::tools::ToolExecution,
+        cancellation: &CancellationToken,
     ) -> Result<bool, SessionError> {
         let Some(patch) = execution.patch.as_ref() else {
             return Ok(false);
@@ -450,14 +524,25 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let patch_proposed_id = self
             .append(EventKind::PATCH_PROPOSED, payload.clone(), None)?
             .id;
-        if let Err(error) = self.tools.apply_patch(patch) {
-            self.emit_tool_failure(
-                call.id.clone(),
-                execution.name.clone(),
-                error.to_string(),
-                tool_call_event_id.to_owned(),
-            )?;
-            return Ok(true);
+        match self.tools.apply_patch_cancellable(patch, cancellation) {
+            Ok(()) => {}
+            Err(crate::ToolError::Cancelled) => {
+                self.emit_cancelled_tool_result(
+                    call.clone(),
+                    tool_call_event_id.to_owned(),
+                    Some(execution),
+                )?;
+                return Err(SessionError::Cancelled);
+            }
+            Err(error) => {
+                self.emit_tool_failure(
+                    call.id.clone(),
+                    execution.name.clone(),
+                    error.to_string(),
+                    tool_call_event_id.to_owned(),
+                )?;
+                return Ok(true);
+            }
         }
         let patch_applied_id = self
             .append(EventKind::PATCH_APPLIED, payload, Some(patch_proposed_id))?
@@ -531,6 +616,17 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             ]),
             Some(tool_call_event_id),
         )?;
+        Ok(())
+    }
+
+    fn emit_cancelled_tool_result(
+        &mut self,
+        call: ToolCall,
+        tool_call_event_id: String,
+        execution: Option<&crate::tools::ToolExecution>,
+    ) -> Result<(), SessionError> {
+        let payload = tool_cancelled_payload(call.id, call.name, execution, &self.redactor);
+        self.append(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
         Ok(())
     }
 
@@ -716,6 +812,36 @@ impl<D: PermissionDecider> CompanionLoop<'_, D> {
         );
         Ok((canvas, project_context))
     }
+
+    fn finish_tool_free_round(
+        &mut self,
+        content: String,
+        stop_reason: &StopReason,
+    ) -> Result<RoundOutcome<AgentResult>, SessionError> {
+        // A round that stopped for any reason other than natural completion
+        // has not produced the task's answer; reporting it as success would
+        // launder truncation or refusal into ok=true.
+        match stop_reason {
+            StopReason::Completed => {}
+            StopReason::MaxTokens | StopReason::Refusal | StopReason::Error => {
+                return Ok(RoundOutcome::Complete(companion_failure(format!(
+                    "model round stopped without completing: {}",
+                    stop_reason.as_str()
+                ))));
+            }
+            StopReason::ToolUse => {
+                return Ok(RoundOutcome::Complete(companion_failure(
+                    "model round reported tool use without tool calls",
+                )));
+            }
+        }
+        self.append(
+            EventKind::ASSISTANT_MESSAGE,
+            object([("content", content.clone().into())]),
+            None,
+        )?;
+        Ok(RoundOutcome::Complete(companion_success(content)))
+    }
 }
 
 impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
@@ -814,7 +940,11 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         target: &ModelTarget,
         request: ModelRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        self.providers.invoke(&target.provider, request)
+        self.providers.invoke_interruptibly(
+            &target.provider,
+            request,
+            super::provider_cancellation(self.cancellation.clone()),
+        )
     }
 
     fn emit_provider_error(
@@ -834,6 +964,16 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
             .id)
     }
 
+    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError> {
+        Ok(self
+            .append(
+                EventKind::ERROR,
+                super::round_loop::model_call_cancelled_payload(),
+                Some(model_call_id),
+            )?
+            .id)
+    }
+
     fn after_stream_event(
         &mut self,
         _event: &ModelStreamEvent,
@@ -849,7 +989,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         target: ModelTarget,
         model_call_id: String,
         data: ModelRoundData,
-        _cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<RoundOutcome<AgentResult>, SessionError> {
         let stop_reason = data
             .stop_reason
@@ -873,31 +1013,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
             )));
         }
         if data.tool_calls.is_empty() {
-            // A round that stopped for any reason other than natural
-            // completion has not produced the task's answer; reporting it as
-            // success would launder truncation or refusal into ok=true when
-            // reasoning consumed the whole output budget and the empty result
-            // was summarized as "companion completed".
-            match stop_reason {
-                StopReason::Completed => {}
-                StopReason::MaxTokens | StopReason::Refusal | StopReason::Error => {
-                    return Ok(RoundOutcome::Complete(companion_failure(format!(
-                        "model round stopped without completing: {}",
-                        stop_reason.as_str()
-                    ))));
-                }
-                StopReason::ToolUse => {
-                    return Ok(RoundOutcome::Complete(companion_failure(
-                        "model round reported tool use without tool calls",
-                    )));
-                }
-            }
-            self.append(
-                EventKind::ASSISTANT_MESSAGE,
-                object([("content", data.content.clone().into())]),
-                None,
-            )?;
-            return Ok(RoundOutcome::Complete(companion_success(data.content)));
+            return self.finish_tool_free_round(data.content, stop_reason);
         }
         // The round wants to continue (tool calls), but a zero remaining
         // output budget means the next model round could never run. Fail
@@ -919,10 +1035,26 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
             .into_iter()
             .take(accepted_calls)
             .collect::<Vec<_>>();
-        let remaining_calls = self.record_tool_call_batch(recordable_calls)?;
-        for (call, tool_call_event_id) in remaining_calls {
-            self.execute_recorded_tool_call(call, tool_call_event_id)?;
+        let recorded_calls = self.record_tool_call_batch(recordable_calls)?;
+        let mut remaining_calls = recorded_calls.into_iter();
+        while let Some((call, tool_call_event_id)) = remaining_calls.next() {
+            if let Err(error) =
+                self.execute_recorded_tool_call(call, tool_call_event_id, cancellation)
+            {
+                if matches!(&error, SessionError::Cancelled) {
+                    for (pending_call, pending_event_id) in remaining_calls {
+                        self.emit_cancelled_tool_result(pending_call, pending_event_id, None)?;
+                    }
+                }
+                return Err(error);
+            }
             self.tool_calls = self.tool_calls.saturating_add(1);
+            if cancellation.is_cancelled() {
+                for (pending_call, pending_event_id) in remaining_calls {
+                    self.emit_cancelled_tool_result(pending_call, pending_event_id, None)?;
+                }
+                return Err(SessionError::Cancelled);
+            }
         }
         if over_budget_tool_calls || self.tool_budget_exhausted() {
             return Ok(RoundOutcome::Complete(companion_failure(

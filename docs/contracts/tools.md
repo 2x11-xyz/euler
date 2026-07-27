@@ -87,6 +87,16 @@ tools, whose permissions and provenance remain visible at the retrieval step.
 This keeps the review gate's authority honest and its model-facing canvas
 small: reviewers receive only explicit context, not the parent canvas.
 
+Euler-owned shell and Git subprocesses run in a host-owned process group.
+Cancellation or timeout signals that group before reaping its leader, covering
+ordinary descendants that remain in the group; a descendant that deliberately
+escapes it is outside this guarantee. After cancellation, Euler drains only
+immediately available pipe data within a fixed byte budget. Ordinary
+`run_shell` cancellation may then spend bounded time observing file changes
+for evidence: at most 4,096 files, 256 KiB per file, and 64 MiB total. That
+finite evidence pass can delay terminal publication after the process has
+already stopped.
+
 When canvas previews or stubs show `event <id>` (and optional
 `handle event:…` / `blob:…` metadata), prefer `tool_result_get` with that event
 id over re-running the original tool if the original inputs are expensive or

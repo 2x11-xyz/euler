@@ -1548,7 +1548,7 @@ fn active_turn_interrupt_still_wins_when_bottom_surface_owns_input() {
 }
 
 #[test]
-fn active_turn_escape_interrupts_when_bottom_surface_owns_input() {
+fn active_turn_escape_closes_bottom_surface_before_interrupting() {
     let mut core = core();
     core.handle_input(key(KeyCode::Char('/')));
     let interrupt_flag = Arc::new(AtomicBool::new(false));
@@ -1558,6 +1558,12 @@ fn active_turn_escape_interrupts_when_bottom_surface_owns_input() {
         interrupt_flag: Arc::clone(&interrupt_flag),
         started_at: Instant::now(),
     };
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert!(!interrupt_flag.load(Ordering::SeqCst));
+    assert!(!core.interrupted_guidance);
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
 
@@ -4133,6 +4139,37 @@ fn interrupted_live_status_replaces_working_affordance() {
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("■ interrupted — tell euler what to do differently"));
     assert!(!contents.contains("⠋ working"));
+}
+
+#[test]
+fn interrupt_clears_queued_activities_but_preserves_user_input() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+    let request = CompanionRunRequest {
+        task: AgentTask::new("review", "reviewer", "fixture", "echo").expect("task"),
+    };
+    core.pending_runs
+        .push_back(PendingRunRequest::Companion(request.clone()));
+    core.pending_runs
+        .push_back(PendingRunRequest::Companion(request));
+    core.queued_inputs.push_back("keep this steer".to_owned());
+
+    assert_eq!(core.handle_interrupt(), CoreEffect::Render);
+
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.pending_runs.is_empty());
+    assert_eq!(core.queued_inputs.snapshot(), ["keep this steer"]);
+    let finalized = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        finalized.contains("interrupt cleared 2 queued activities"),
+        "{finalized}"
+    );
 }
 
 #[test]

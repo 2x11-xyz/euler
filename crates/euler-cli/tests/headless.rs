@@ -6014,6 +6014,93 @@ fn tui_pty_quit_during_turn_unwinds_and_releases_session_lock() {
     );
 }
 
+#[test]
+fn tui_pty_escape_closes_slash_menu_then_interrupts_blocked_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let script = write_fixture_script(
+        temp.path(),
+        "slow-escape-turn.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        { "sleep_ms": 5000 },
+        { "text_delta": "too late" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+
+    assert!(
+        tui.wait_for_screen("/ commands"),
+        "initial TUI did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("slow turn\r");
+    assert!(
+        tui.wait_for_screen_glimpse("esc to interrupt"),
+        "turn never entered flight:\n{}",
+        tui.screen_text()
+    );
+
+    tui.write("/");
+    assert!(
+        tui.wait_for_screen_glimpse("Esc close"),
+        "slash palette did not open during the turn:\n{}",
+        tui.screen_text()
+    );
+    tui.write("\x1b");
+    assert!(
+        tui.wait_for_stable_screen(Duration::from_secs(2), |screen| {
+            !screen.contains("Esc close") && screen.contains("esc to interrupt")
+        }),
+        "first Escape did not close only the slash palette:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        !tui.screen_text()
+            .contains("interrupted — tell euler what to do differently"),
+        "first Escape interrupted the active turn"
+    );
+
+    let interrupt_started = Instant::now();
+    tui.write("\x1b");
+    assert!(
+        tui.wait_for_stable_screen(Duration::from_secs(2), |screen| {
+            screen_has_ready_composer(screen)
+                && screen.contains("interrupted — tell euler what to do differently")
+        }),
+        "second Escape did not stop the blocked turn promptly:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        interrupt_started.elapsed() < Duration::from_secs(2),
+        "Escape waited for the provider operation to finish"
+    );
+    assert!(
+        !tui.screen_text().contains("too late"),
+        "provider output arrived after interruption:\n{}",
+        tui.screen_text()
+    );
+
+    tui.quit();
+}
+
 #[cfg(unix)]
 #[test]
 fn fresh_tui_runs_a_persistently_enabled_linked_process() {
@@ -6067,6 +6154,97 @@ fn fresh_tui_runs_a_persistently_enabled_linked_process() {
         tui.wait_for_screen("fresh_tui"),
         "persistently enabled linked command did not run:\n{}",
         tui.screen_text()
+    );
+    tui.quit();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_escape_cancels_an_active_managed_process_extension() {
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let sdk_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-cancellable-tui",
+        "0.1.1",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let manifest_path = extension_dir
+        .path()
+        .join(euler_core::EXTENSION_MANIFEST_FILE);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest["capabilities"] = serde_json::json!([]);
+    manifest["commands"][0]["required_capabilities"] = serde_json::json!([]);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write capability-free manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        format!(
+            r#"import sys
+import time
+from pathlib import Path
+sys.path.insert(0, {sdk_source:?})
+from euler_managed_process_sdk import serve
+
+def inspect(context):
+    Path("started").write_text("yes", encoding="utf-8")
+    time.sleep(30)
+    Path("too_late").write_text("late", encoding="utf-8")
+    return {{"unexpected": True}}
+
+serve({{"inspect": inspect}})
+"#,
+            sdk_source = sdk_source.to_string_lossy()
+        ),
+    )
+    .expect("write Python extension");
+    configure_linked_extension(
+        env!("CARGO_BIN_EXE_euler"),
+        &home,
+        extension_dir.path(),
+        "python-cancellable-tui",
+    );
+
+    let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
+    assert!(tui.wait_for_screen("echo(medium) · ctx"));
+    tui.write("/extension run python-cancellable-tui.inspect {}\r");
+    let started = extension_dir.path().join("started");
+    let wait_started = Instant::now();
+    while !started.is_file() && wait_started.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        started.is_file(),
+        "managed extension command did not start:\n{}",
+        tui.screen_text()
+    );
+
+    let interrupt_started = Instant::now();
+    tui.write("\x1b");
+    assert!(
+        tui.wait_for_stable_screen(Duration::from_secs(2), |screen| {
+            screen_has_ready_composer(screen)
+                && screen.contains("interrupted — tell euler what to do differently")
+        }),
+        "Escape did not cancel the managed extension promptly:\n{}",
+        tui.screen_text()
+    );
+    assert!(interrupt_started.elapsed() < Duration::from_secs(2));
+    assert!(
+        !extension_dir.path().join("too_late").exists(),
+        "managed extension survived cancellation"
     );
     tui.quit();
 }

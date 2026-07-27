@@ -4,10 +4,12 @@
 //! bridge.
 use super::{EventSink, Session, SessionError, TurnState};
 use crate::guardian::{self, GuardianRuling, PermissionReviewer};
-use crate::permissions::{ApprovalMode, GrantDecision, PermissionDecider, PermissionRequest};
+use crate::permissions::{
+    ApprovalMode, GrantDecision, PermissionDecider, PermissionDecisionOutcome, PermissionRequest,
+};
 use euler_event::{object, EventKind, JsonObject};
 use euler_provider::ToolCall;
-use euler_sdk::Capability;
+use euler_sdk::{CancellationToken, Capability};
 use serde_json::Value;
 
 /// Outcome of one uncovered permission decision inside tool dispatch.
@@ -55,15 +57,16 @@ impl<D: PermissionDecider> Session<D> {
     pub(super) fn decide_uncovered_permission<F>(
         &mut self,
         request: &PermissionRequest,
-        mode: ApprovalMode,
         tool_call_event_id: &str,
         sink: &mut EventSink<'_, F>,
         turn_state: &mut TurnState,
+        cancellation: &CancellationToken,
     ) -> Result<PermissionRuling, SessionError>
     where
         F: FnMut(&euler_event::EventEnvelope),
     {
         let capability = request.capability;
+        let mode = self.permissions.mode_for_request(request);
         let needs_prompt = mode == ApprovalMode::Ask;
         let prompt_id = if needs_prompt {
             let prompt_id = self.emit(
@@ -87,14 +90,25 @@ impl<D: PermissionDecider> Session<D> {
             && self.config.permission_reviewer == PermissionReviewer::Guardian
             && guardian::adjudicates_verbatim(request)
         {
-            if let Some(ruling) =
-                self.guardian_permission_ruling(request, &decision_parent, sink, turn_state)?
-            {
+            if let Some(ruling) = self.guardian_permission_ruling(
+                request,
+                &decision_parent,
+                sink,
+                turn_state,
+                cancellation,
+            )? {
                 return Ok(ruling);
             }
             // Guardian abstained: fall through to the configured decider.
         }
-        let decision = self.permissions.decide_detailed(request, mode);
+        let decision =
+            match self
+                .permissions
+                .decide_detailed_cancellable(request, mode, cancellation)
+            {
+                PermissionDecisionOutcome::Decided(decision) => decision,
+                PermissionDecisionOutcome::Cancelled => return Err(SessionError::Cancelled),
+            };
         let allowed = decision.allowed();
         let mode_label = approval_mode_str(mode);
         let payload = permission_decision_payload(&decision, mode_label, mode);
@@ -137,14 +151,16 @@ impl<D: PermissionDecider> Session<D> {
         decision_parent: &str,
         sink: &mut EventSink<'_, F>,
         turn_state: &mut TurnState,
+        cancellation: &CancellationToken,
     ) -> Result<Option<PermissionRuling>, SessionError>
     where
         F: FnMut(&euler_event::EventEnvelope),
     {
         let capability = request.capability;
         let ruling = match guardian::guardian_task(request) {
-            Ok(task) => match self.spawn_companion(task) {
+            Ok(task) => match self.spawn_companion_with_cancel(task, cancellation.clone()) {
                 Ok(summary) => guardian::ruling_for_result(&summary.result),
+                Err(SessionError::Cancelled) => return Err(SessionError::Cancelled),
                 Err(error) => {
                     guardian::deny_failure(format!("guardian review failed to run: {error}"))
                 }

@@ -32,7 +32,9 @@ use super::theme::{ColorLevel, Theme, ThemeChoice};
 #[cfg(test)]
 use super::transcript::transcript_items_widget;
 use super::transcript::{self, TranscriptItem, TranscriptState, TOOL_CALL_MAX_LINES};
-use super::tui_decider::{PermissionChannels, PermissionPrompt, PermissionReply, TuiDecider};
+use super::tui_decider::{
+    PermissionChannels, PermissionPrompt, PermissionPromptEnvelope, PermissionReply, TuiDecider,
+};
 use super::visual_canvas::{
     BlockCursor, CanvasComposerSnapshot, CanvasLine, CanvasSpan, CanvasStatusSnapshot, FocusOwner,
     TextRole, VisualBlock, VisualBlockRole, VisualCanvasFrame, VisualCanvasSnapshot,
@@ -65,7 +67,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -76,10 +78,17 @@ use std::time::{Duration, Instant};
 /// immediate once the user lets go.
 const RESIZE_REPLAY_DEBOUNCE: Duration = Duration::from_millis(450);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(2);
 const MIN_WORKED_DURATION: Duration = Duration::from_secs(5);
 /// Working HUD braille spinner cadence (issue #27, spec v2.1 §13.3: 80-100ms).
 const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(90);
+
+fn inactive_permission_reply_sender() -> Sender<PermissionReply> {
+    let (sender, receiver) = mpsc::channel();
+    drop(receiver);
+    sender
+}
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
@@ -194,8 +203,9 @@ pub struct AppCore {
     /// of the `TurnInFlight` state; `install_state` consumes it and
     /// diagnoses any unlicensed replacement.
     in_flight_session_returned: bool,
-    permission_rx: Receiver<PermissionPrompt>,
+    permission_rx: Receiver<PermissionPromptEnvelope>,
     reply_tx: Sender<PermissionReply>,
+    active_permission_cancellation: Option<euler_sdk::CancellationToken>,
     bottom: BottomSurface,
     status: StatusSnapshot,
     /// Last-known authenticated provider ids, refreshed whenever the session
@@ -342,6 +352,7 @@ enum TurnOutcome {
 enum CompanionOutcome {
     Complete(AgentResult),
     Failed(String),
+    Cancelled,
 }
 
 #[derive(Clone, Debug)]
@@ -669,7 +680,12 @@ impl App {
         // Pause/cancel the worker before releasing a permission modal. A deny
         // wakes the blocked worker, which must observe shutdown state before
         // it can process the denial or advance the round.
-        self.core.prepare_for_shutdown();
+        if !self.core.prepare_for_shutdown() {
+            self.core.notice =
+                Some("still stopping active work; quit again after cleanup completes".to_owned());
+            self.request_render(RedrawLevel::Partial);
+            return Ok(false);
+        }
         let lines = self.core.exit_recap_lines();
         // Clean clear (§5.8): drop the live band — the echoed `/quit`
         // composer row included — in native colors, so the recap below is
@@ -920,7 +936,8 @@ impl AppCore {
             },
             in_flight_session_returned: false,
             permission_rx: channels.request_rx,
-            reply_tx: channels.reply_tx,
+            reply_tx: inactive_permission_reply_sender(),
+            active_permission_cancellation: None,
             bottom: BottomSurface::new(boot.initial_context),
             status: boot.status,
             authenticated_providers: boot.authenticated_providers,
@@ -1138,30 +1155,36 @@ impl AppCore {
     }
 
     pub fn handle_interrupt(&mut self) -> CoreEffect {
-        match &self.state {
-            AppState::TurnInFlight { interrupt_flag, .. } => {
-                if self.is_in_flight_cancellable() {
-                    // Pause BEFORE publishing cancellation: once the worker
-                    // observes the flag it must also observe the pause, so an
-                    // interrupt can never race the round loop into absorbing
-                    // input the interrupt was meant to preserve (the worker
-                    // additionally refuses to absorb after the flag is set).
-                    self.queued_inputs.set_paused(true);
-                    interrupt_flag.store(true, Ordering::SeqCst);
-                    self.interrupted_guidance = true;
-                } else {
-                    // The interrupt is dropped, not deferred: extension
-                    // commands do not observe the flag yet. Say so.
-                    self.notice = Some(
-                        "extension command is not cancellable; it will run to completion"
-                            .to_owned(),
-                    );
-                }
-                CoreEffect::Render
-            }
-            AppState::Idle { .. } => CoreEffect::None,
-            AppState::Empty => CoreEffect::None,
+        if !self.turn_in_flight() {
+            return CoreEffect::None;
         }
+        let cleared = self.pending_runs.len();
+        self.pending_runs.clear();
+        if cleared > 0 {
+            let noun = if cleared == 1 {
+                "queued activity"
+            } else {
+                "queued activities"
+            };
+            self.push_notice_item(format!("interrupt cleared {cleared} {noun}"));
+        }
+        if self.is_in_flight_cancellable() {
+            let AppState::TurnInFlight { interrupt_flag, .. } = &self.state else {
+                unreachable!("turn-in-flight state checked above");
+            };
+            // Pause BEFORE publishing cancellation: the queue holds this
+            // boundary across steering persistence, so either a message was
+            // durably absorbed first or it remains queued after this returns.
+            self.queued_inputs.set_paused(true);
+            interrupt_flag.store(true, Ordering::SeqCst);
+            self.interrupted_guidance = true;
+        } else {
+            // The interrupt is dropped, not deferred. Say so for the few
+            // short background operations that have no token.
+            self.notice =
+                Some("current activity is not cancellable; it will finish shortly".to_owned());
+        }
+        CoreEffect::Render
     }
 
     pub fn handle_terminal_interrupt(&mut self) -> CoreEffect {
@@ -1179,16 +1202,13 @@ impl AppCore {
         self.handle_interrupt()
     }
 
-    /// Shutdown hygiene (deep-review P3-d): a /quit mid-turn must not leave
-    /// the detached turn worker driving its provider HTTP round until
-    /// process exit. Publish the exact signal the esc interrupt uses —
-    /// pause the steering queue, then set the turn's cancel flag (the round
-    /// loop polls it at stream and round boundaries) — and return without
-    /// joining, so exit stays prompt. Companion and extension workers carry
-    /// a flag nothing observes yet (`handle_interrupt` reports the same
-    /// gap to the user), and the catalog refresh is a single short HTTP
-    /// call with no cancel signal; those threads run to completion and are
-    /// dropped with the process.
+    /// Shutdown hygiene, publication phase: publish the exact signal the Esc
+    /// interrupt uses — pause the steering queue, then set the turn's cancel
+    /// flag. [`Self::prepare_for_shutdown`] follows this with a bounded wait
+    /// for the worker to return its owned session. The root session drops its
+    /// provider event boundary and kills any active tool process group;
+    /// companion and extension workers observe the same source. Catalog
+    /// refresh remains a single short call without a cancellation signal.
     pub fn cancel_in_flight_for_shutdown(&mut self) {
         if let AppState::TurnInFlight { interrupt_flag, .. } = &self.state {
             // Same ordering contract as `handle_interrupt`: a worker that
@@ -1198,9 +1218,34 @@ impl AppCore {
         }
     }
 
-    fn prepare_for_shutdown(&mut self) {
+    fn prepare_for_shutdown(&mut self) -> bool {
         self.cancel_in_flight_for_shutdown();
+        self.pending_runs.clear();
         self.deny_open_modal();
+        self.await_in_flight_shutdown()
+    }
+
+    fn await_in_flight_shutdown(&mut self) -> bool {
+        let deadline = Instant::now() + SHUTDOWN_CLEANUP_TIMEOUT;
+        loop {
+            let event = {
+                let AppState::TurnInFlight { worker_rx, .. } = &self.state else {
+                    return true;
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                match worker_rx.recv_timeout(remaining) {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => return false,
+                    // The worker and its owned session are already gone. There
+                    // is nothing left for an orderly shutdown to reclaim.
+                    Err(RecvTimeoutError::Disconnected) => return true,
+                }
+            };
+            self.handle_turn_event(event);
+        }
     }
 
     pub fn drain_background(&mut self) -> bool {
@@ -1333,6 +1378,13 @@ impl AppCore {
         }
         if let Some(effect) = self.handle_visual_scroll_key(&key) {
             return effect;
+        }
+        // Escape is dispatched from the topmost UI layer inward. A palette,
+        // picker, search surface, or confirmation prompt gets the first key;
+        // only a later Escape, once the composer owns input again, can
+        // interrupt the active turn.
+        if key.code == KeyCode::Esc && !matches!(self.bottom.owner(), BottomOwner::Composer) {
+            return self.handle_surface_key(key);
         }
         if self.turn_in_flight() {
             return self.handle_key_in_flight(key);
@@ -2366,7 +2418,8 @@ impl AppCore {
         let primary_agent_id = session_primary_agent_id(&session);
 
         self.permission_rx = channels.request_rx;
-        self.reply_tx = channels.reply_tx;
+        self.reply_tx = inactive_permission_reply_sender();
+        self.active_permission_cancellation = None;
         self.primary_agent_id = primary_agent_id;
         self.install_state(AppState::Idle {
             session: Box::new(session),
@@ -2424,12 +2477,17 @@ impl AppCore {
         self.snapshot_permission_envelope(&session);
         let (worker_tx, worker_rx) = mpsc::channel();
         let worker_request = request.clone();
+        let interrupt_flag = Arc::new(AtomicBool::new(false));
+        let worker_cancellation =
+            euler_sdk::CancellationSource::from_shared_flag(Arc::clone(&interrupt_flag)).token();
         std::thread::spawn(move || {
             let start = session.events().len();
-            let result = session.spawn_companion(worker_request.task.clone());
+            let result = session
+                .spawn_companion_with_cancel(worker_request.task.clone(), worker_cancellation);
             let events = session.events()[start..].to_vec();
             let outcome = match result {
                 Ok(summary) => CompanionOutcome::Complete(summary.result),
+                Err(euler_core::SessionError::Cancelled) => CompanionOutcome::Cancelled,
                 Err(error) => CompanionOutcome::Failed(error.to_string()),
             };
             let _ = worker_tx.send(TurnEvent::CompanionDone {
@@ -2441,12 +2499,12 @@ impl AppCore {
         });
         self.install_state(AppState::TurnInFlight {
             worker_rx,
-            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            interrupt_flag,
             started_at: Instant::now(),
         });
         self.in_flight_label = Some("companion run".to_owned());
         self.in_flight_companion_name = Some(request.task.persona().to_owned());
-        self.in_flight_cancellable = false;
+        self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
@@ -2675,14 +2733,29 @@ impl AppCore {
 
     fn drain_permissions(&mut self) -> bool {
         let mut changed = false;
+        if self
+            .active_permission_cancellation
+            .as_ref()
+            .is_some_and(euler_sdk::CancellationToken::is_cancelled)
+        {
+            self.dismiss_cancelled_permission_modal();
+            changed = true;
+        }
         while self.modal.is_none() {
             changed |= self.drain_turn_events();
             match self.permission_rx.try_recv() {
-                Ok(prompt) => {
-                    self.drain_turn_events();
-                    self.open_permission_modal(prompt);
-                    self.queue_notification(NotifyEvent::ApprovalNeeded);
+                Ok(envelope) if envelope.cancellation.is_cancelled() => {
                     changed = true;
+                }
+                Ok(envelope) => {
+                    self.drain_turn_events();
+                    if envelope.cancellation.is_cancelled() {
+                        changed = true;
+                    } else {
+                        self.open_permission_envelope(envelope);
+                        self.queue_notification(NotifyEvent::ApprovalNeeded);
+                        changed = true;
+                    }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -2694,6 +2767,12 @@ impl AppCore {
     /// starts EMPTY: any in-progress composer draft is stashed (and restored
     /// after the decision) so the y/a/p/n hotkeys stay live and a stale
     /// draft can never be consumed as the deny instruction (issue #60).
+    fn open_permission_envelope(&mut self, envelope: PermissionPromptEnvelope) {
+        self.reply_tx = envelope.reply_tx;
+        self.active_permission_cancellation = Some(envelope.cancellation);
+        self.open_permission_modal(envelope.prompt);
+    }
+
     fn open_permission_modal(&mut self, prompt: impl Into<PermissionPrompt>) {
         self.approval_selection = ApprovalOption::default();
         let draft = self.bottom.composer().submit_text();
@@ -2778,6 +2857,7 @@ impl AppCore {
 
     fn reply_to_modal(&mut self, reply: PermissionReply) -> CoreEffect {
         self.modal = None;
+        self.active_permission_cancellation = None;
         self.approval_selection = ApprovalOption::default();
         let _ = self.reply_tx.send(reply);
         self.restore_stashed_draft();
@@ -2796,10 +2876,22 @@ impl AppCore {
 
     fn deny_open_modal(&mut self) {
         if self.modal.take().is_some() {
+            self.active_permission_cancellation = None;
             self.approval_selection = ApprovalOption::default();
             let _ = self.reply_tx.send(PermissionReply::Deny);
             self.restore_stashed_draft();
         }
+    }
+
+    fn dismiss_cancelled_permission_modal(&mut self) {
+        if self.active_permission_cancellation.take().is_none() {
+            return;
+        }
+        self.modal = None;
+        self.approval_selection = ApprovalOption::default();
+        // Cancellation is a distinct gate outcome, not a denial. The prompt's
+        // one-shot receiver is already gone (or will be dropped immediately).
+        self.restore_stashed_draft();
     }
 
     /// Muted, non-error informational line (review v2 §3/§6/§14.4, #53) — no

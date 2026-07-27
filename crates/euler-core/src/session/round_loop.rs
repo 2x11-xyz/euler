@@ -1,12 +1,12 @@
 use super::{elapsed_ms, push_reasoning_chunk, ModelTarget, SessionError};
-use euler_event::EventEnvelope;
+use euler_event::{object, EventEnvelope, JsonObject};
 use euler_provider::{
     ModelRequest, ModelStreamEvent, ProviderError, ProviderErrorCategory, ProviderStream,
     ReasoningChunk, StopReason, ToolCall, Usage,
 };
+use euler_sdk::CancellationToken;
 use euler_sdk::Capability;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 pub(crate) struct EventSink<'a, F>
@@ -127,6 +127,7 @@ pub(crate) trait RoundLoopIo {
         error: &ProviderError,
         model_call_id: String,
     ) -> Result<String, SessionError>;
+    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError>;
     fn after_stream_event(
         &mut self,
         event: &ModelStreamEvent,
@@ -138,7 +139,7 @@ pub(crate) trait RoundLoopIo {
         target: ModelTarget,
         model_call_id: String,
         data: ModelRoundData,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<RoundOutcome<Self::Complete>, SessionError>;
     /// Called once per round that finished without error, whether it
     /// completed the turn or continues into another round.
@@ -147,14 +148,14 @@ pub(crate) trait RoundLoopIo {
     /// continues into another round, never after the turn's final round.
     /// The default no-op keeps non-driver loops (companions) from observing;
     /// that default is the round-observer recursion guard.
-    fn round_boundary(&mut self, _cancel_flag: &AtomicBool) {}
+    fn round_boundary(&mut self, _cancellation: &CancellationToken) {}
     /// Called before every round's model request: absorb pending mid-turn
     /// steering into canonical `user.message` events so this round's request
     /// assembles them (issue #146). The default no-op keeps non-driver loops
     /// (companions, spawned agents) from consuming the session's steering.
     /// Implementations must not absorb once `cancel_flag` is set — an
     /// interrupt keeps queued input for the user.
-    fn absorb_steering(&mut self, _cancel_flag: &AtomicBool) -> Result<(), SessionError> {
+    fn absorb_steering(&mut self, _cancellation: &CancellationToken) -> Result<(), SessionError> {
         Ok(())
     }
     fn round_limit(&mut self) -> Result<Self::Complete, SessionError>;
@@ -173,7 +174,10 @@ where
         Self { io, config }
     }
 
-    pub(crate) fn run(&mut self, cancel_flag: &AtomicBool) -> Result<Io::Complete, SessionError> {
+    pub(crate) fn run(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<Io::Complete, SessionError> {
         let mut completed_rounds = 0usize;
         loop {
             if self
@@ -183,18 +187,18 @@ where
             {
                 return self.io.round_limit();
             }
-            if cancel_flag.load(Ordering::Relaxed) {
+            if cancellation.is_cancelled() {
                 return Err(SessionError::Cancelled);
             }
-            self.io.absorb_steering(cancel_flag)?;
-            match self.run_round(cancel_flag)? {
+            self.io.absorb_steering(cancellation)?;
+            match self.run_round(cancellation)? {
                 RoundOutcome::Complete(done) => {
                     self.io.round_completed();
                     return Ok(done);
                 }
                 RoundOutcome::Continue => {
                     self.io.round_completed();
-                    self.io.round_boundary(cancel_flag);
+                    self.io.round_boundary(cancellation);
                 }
             }
             completed_rounds += 1;
@@ -203,12 +207,12 @@ where
 
     fn run_round(
         &mut self,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<RoundOutcome<Io::Complete>, SessionError> {
         let target = self.io.target();
         let (model_call_id, request) = self.io.prepare_model_request(&target)?;
         let started = Instant::now();
-        let data = match self.collect_model_round(&target, &model_call_id, request, cancel_flag) {
+        let data = match self.collect_model_round(&target, &model_call_id, request, cancellation) {
             Ok(data) => data,
             Err(error) => {
                 crate::diagnostics::model_call_end(
@@ -219,6 +223,10 @@ where
                     None,
                     false,
                 );
+                if matches!(&error, SessionError::Cancelled) {
+                    self.io.emit_model_call_cancelled(model_call_id)?;
+                    self.io.flush_events();
+                }
                 return Err(error);
             }
         };
@@ -231,7 +239,7 @@ where
             true,
         );
         self.io
-            .finish_round(target, model_call_id, data, cancel_flag)
+            .finish_round(target, model_call_id, data, cancellation)
     }
 
     fn collect_model_round(
@@ -239,7 +247,7 @@ where
         target: &ModelTarget,
         model_call_id: &str,
         request: ModelRequest,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<ModelRoundData, SessionError> {
         let mut attempt = 0usize;
         loop {
@@ -248,7 +256,7 @@ where
                 target,
                 model_call_id,
                 request.clone(),
-                cancel_flag,
+                cancellation,
                 &mut events_processed,
             ) {
                 Ok(data) => return Ok(data),
@@ -281,7 +289,7 @@ where
                 attempt as u64,
                 backoff_ms,
             );
-            sleep_with_cancel(backoff_ms, cancel_flag)?;
+            sleep_with_cancel(backoff_ms, cancellation)?;
         }
     }
 
@@ -294,7 +302,7 @@ where
         target: &ModelTarget,
         model_call_id: &str,
         request: ModelRequest,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
         events_processed: &mut bool,
     ) -> Result<ModelRoundData, AttemptFailure> {
         let mut stream = match self.io.invoke_model(target, request) {
@@ -304,10 +312,13 @@ where
         let mut data = ModelRoundData::default();
 
         loop {
-            if cancel_flag.load(Ordering::Relaxed) {
+            if cancellation.is_cancelled() {
                 return Err(AttemptFailure::Session(SessionError::Cancelled));
             }
             let Some(event) = stream.next() else { break };
+            if cancellation.is_cancelled() {
+                return Err(AttemptFailure::Session(SessionError::Cancelled));
+            }
             let event = match event {
                 Ok(event) => event,
                 Err(error) => return Err(AttemptFailure::Provider(error)),
@@ -319,6 +330,9 @@ where
             collect_stream_event(event, &mut data);
         }
 
+        if cancellation.is_cancelled() {
+            return Err(AttemptFailure::Session(SessionError::Cancelled));
+        }
         if data.stop_reason.is_none() {
             return Err(AttemptFailure::Provider(ProviderError::stream_truncation(
                 "provider stream ended before finished event",
@@ -328,23 +342,31 @@ where
     }
 }
 
+pub(crate) fn model_call_cancelled_payload() -> JsonObject {
+    object([
+        ("source", "session".into()),
+        ("message", "model call cancelled".into()),
+        ("cancelled", true.into()),
+    ])
+}
+
 enum AttemptFailure {
     Provider(ProviderError),
     Session(SessionError),
 }
 
-fn sleep_with_cancel(total_ms: u64, cancel_flag: &AtomicBool) -> Result<(), SessionError> {
+fn sleep_with_cancel(total_ms: u64, cancellation: &CancellationToken) -> Result<(), SessionError> {
     const CHUNK_MS: u64 = 25;
     let mut remaining = total_ms;
     while remaining > 0 {
-        if cancel_flag.load(Ordering::Relaxed) {
+        if cancellation.is_cancelled() {
             return Err(SessionError::Cancelled);
         }
         let step = remaining.min(CHUNK_MS);
         std::thread::sleep(std::time::Duration::from_millis(step));
         remaining -= step;
     }
-    if cancel_flag.load(Ordering::Relaxed) {
+    if cancellation.is_cancelled() {
         return Err(SessionError::Cancelled);
     }
     Ok(())

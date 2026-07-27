@@ -29,7 +29,10 @@ use euler_provider::{
     ProviderSet, ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason,
     ToolCall, Usage,
 };
-use euler_sdk::{Capability, EventWakeError, EventWakeRegistration, Extension};
+use euler_sdk::{
+    CancellationSource, CancellationToken, Capability, EventWakeError, EventWakeRegistration,
+    Extension,
+};
 use round_loop::{
     EventSink, ModelRoundData, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, TurnState,
 };
@@ -37,7 +40,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -64,7 +67,8 @@ pub(crate) use permissions_gate::{
     approval_mode_str, permission_decision_payload, permission_request_for_tool, PermissionRuling,
 };
 pub(crate) use tool_dispatch::{
-    file_change_payload, file_diff_payload, maybe_store_pre_image, tool_success_payload,
+    file_change_payload, file_diff_payload, maybe_store_pre_image, tool_cancelled_payload,
+    tool_success_payload,
 };
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
@@ -365,6 +369,10 @@ pub enum ExtensionExecutionError {
     /// The command panicked. Raw panic payloads are not returned or persisted.
     #[error("extension command panicked")]
     CommandPanicked,
+    /// The host cancelled an admitted command. This is not an extension
+    /// failure and must not disable or penalize the extension.
+    #[error("extension command cancelled")]
+    Cancelled,
     /// Live-session infrastructure failed while constructing the host or
     /// publishing already-durable queued extension events into the live bus.
     #[error(transparent)]
@@ -420,9 +428,16 @@ where
     sink: &'a mut EventSink<'sink, F>,
     turn_state: &'a mut TurnState,
     rounds: &'a mut u64,
+    cancellation: CancellationToken,
 }
 
 type RecordedToolCall = (ToolCall, String);
+
+pub(super) fn provider_cancellation(
+    cancellation: CancellationToken,
+) -> euler_provider::CancellationCheck {
+    euler_provider::CancellationCheck::new(move || cancellation.is_cancelled())
+}
 
 impl<F, D> RoundLoopIo for SessionRoundIo<'_, '_, F, D>
 where
@@ -451,7 +466,11 @@ where
         target: &ModelTarget,
         request: ModelRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        self.session.providers.invoke(&target.provider, request)
+        self.session.providers.invoke_interruptibly(
+            &target.provider,
+            request,
+            provider_cancellation(self.cancellation.clone()),
+        )
     }
 
     fn emit_provider_error(
@@ -460,6 +479,14 @@ where
         model_call_id: String,
     ) -> Result<String, SessionError> {
         self.session.emit_provider_error(error, model_call_id)
+    }
+
+    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError> {
+        self.session.emit_with_parent(
+            EventKind::ERROR,
+            round_loop::model_call_cancelled_payload(),
+            Some(model_call_id),
+        )
     }
 
     fn after_stream_event(
@@ -480,7 +507,7 @@ where
         target: ModelTarget,
         model_call_id: String,
         data: ModelRoundData,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<RoundOutcome, SessionError> {
         let stop_reason = data
             .stop_reason
@@ -539,49 +566,43 @@ where
             return Ok(RoundOutcome::Complete(()));
         }
 
-        self.finish_tool_round(&model_result_id, data.tool_calls, cancel_flag)
+        self.finish_tool_round(&model_result_id, data.tool_calls, cancellation)
     }
 
     fn round_completed(&mut self) {
         *self.rounds += 1;
     }
 
-    fn round_boundary(&mut self, cancel_flag: &AtomicBool) {
+    fn round_boundary(&mut self, _cancellation: &CancellationToken) {
         self.session
-            .observe_round_boundary(*self.rounds, cancel_flag);
+            .observe_round_boundary(*self.rounds, self.cancellation.clone());
         self.sink.flush(self.session.bus.events());
     }
 
-    fn absorb_steering(&mut self, cancel_flag: &AtomicBool) -> Result<(), SessionError> {
+    fn absorb_steering(&mut self, cancellation: &CancellationToken) -> Result<(), SessionError> {
         let Some(queue) = self.session.steering.clone() else {
             return Ok(());
         };
         let mut absorbed = false;
-        // Peek → emit → ack: an entry leaves the queue only after its
-        // user.message was durably emitted, so an emission failure keeps the
-        // failed entry and everything behind it queued for the next attempt.
-        while let Some(entry) = queue.next_for_round() {
-            // An interrupt keeps queued input for the user (the surface
-            // pauses the queue before publishing cancellation; this check
-            // closes the remaining race window on the worker side).
-            if cancel_flag.load(Ordering::SeqCst) {
-                break;
-            }
+        loop {
             // Canonical user.message with normal causal chaining: the parent
             // is whatever the turn last emitted (a tool.result, the prior
             // steering message, ...), and the flush below echoes it to the
-            // surface immediately. The next prepare_model_request assembles
-            // it from the bus like any other event — steering needs no
-            // parallel channel into the request.
-            let result = self.session.emit(
-                EventKind::USER_MESSAGE,
-                object([("content", entry.content.into())]),
-            );
-            match result {
-                Ok(_) => {
-                    queue.ack(entry.id);
-                    absorbed = true;
-                }
+            // surface immediately. Holding the queue transaction across this
+            // durable emit makes pause vs emit linearizable.
+            match queue.persist_next_for_round(
+                || cancellation.is_cancelled(),
+                |content| {
+                    self.session
+                        .emit(
+                            EventKind::USER_MESSAGE,
+                            object([("content", content.to_owned().into())]),
+                        )
+                        .map(|_| ())
+                },
+            ) {
+                Ok(true) => absorbed = true,
+                Ok(false) => break,
                 Err(error) => {
                     // Flush whatever did land before surfacing the failure.
                     self.sink.flush(self.session.bus.events());
@@ -614,22 +635,32 @@ where
         &mut self,
         model_result_id: &str,
         tool_calls: Vec<ToolCall>,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<RoundOutcome, SessionError> {
         let recorded_calls = self.record_tool_call_batch(model_result_id, tool_calls)?;
         let mut remaining_calls = recorded_calls.into_iter();
         while let Some((call, tool_call_event_id)) = remaining_calls.next() {
-            self.session.execute_recorded_tool_call(
+            let execution = self.session.execute_recorded_tool_call(
                 call,
                 tool_call_event_id,
                 self.sink,
                 self.turn_state,
-            )?;
+                cancellation,
+            );
+            if let Err(error) = execution {
+                if matches!(&error, SessionError::Cancelled) {
+                    self.finish_cancelled_tool_batch(remaining_calls)?;
+                    self.sink.flush(self.session.bus.events());
+                }
+                return Err(error);
+            }
             self.sink.flush(self.session.bus.events());
             if self.turn_state.guardian_interrupted() {
                 return self.finish_guardian_interrupted_batch(remaining_calls);
             }
-            if cancel_flag.load(Ordering::Relaxed) {
+            if cancellation.is_cancelled() {
+                self.finish_cancelled_tool_batch(remaining_calls)?;
+                self.sink.flush(self.session.bus.events());
                 return Err(SessionError::Cancelled);
             }
         }
@@ -649,6 +680,17 @@ where
             recorded_calls.push((call, tool_call_event_id));
         }
         Ok(recorded_calls)
+    }
+
+    fn finish_cancelled_tool_batch(
+        &mut self,
+        remaining_calls: impl IntoIterator<Item = RecordedToolCall>,
+    ) -> Result<(), SessionError> {
+        for (pending_call, pending_event_id) in remaining_calls {
+            self.session
+                .emit_cancelled_tool_result(pending_call, pending_event_id, None, None)?;
+        }
+        Ok(())
     }
 
     fn finish_guardian_interrupted_batch(
@@ -1524,13 +1566,13 @@ impl<D: PermissionDecider> Session<D> {
             return Ok(self.bus.events()[start..].to_vec());
         }
 
-        self.run_model_rounds(start, &cancel_flag, &mut sink)
+        self.run_model_rounds(start, cancel_flag, &mut sink)
     }
 
     fn run_model_rounds<F>(
         &mut self,
         start: usize,
-        cancel_flag: &AtomicBool,
+        cancel_flag: Arc<AtomicBool>,
         sink: &mut EventSink<'_, F>,
     ) -> Result<Vec<EventEnvelope>, SessionError>
     where
@@ -1541,11 +1583,13 @@ impl<D: PermissionDecider> Session<D> {
         let max_rounds = self.config.max_tool_rounds;
         let provider_retries = self.config.provider_transport_retries;
         let provider_retry_backoff_ms = self.config.provider_transport_retry_backoff_ms.clone();
+        let cancellation = CancellationSource::from_shared_flag(cancel_flag).token();
         let mut io = SessionRoundIo {
             session: self,
             sink,
             turn_state: &mut turn_state,
             rounds: &mut rounds,
+            cancellation: cancellation.clone(),
         };
         let result = RoundLoop::new(
             &mut io,
@@ -1555,7 +1599,7 @@ impl<D: PermissionDecider> Session<D> {
                 provider_retry_backoff_ms,
             },
         )
-        .run(cancel_flag);
+        .run(&cancellation);
         crate::diagnostics::turn_end(&self.config.session_id, rounds);
         result.map(|()| self.bus.events()[start..].to_vec())
     }

@@ -2,7 +2,7 @@ use crate::grants::{
     bound_command, bound_instruction, ActiveGrant, GrantList, GrantScope, ProjectGrantError,
     ProjectGrantStore, ScopePattern,
 };
-use euler_sdk::Capability;
+use euler_sdk::{CancellationToken, Capability};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -292,6 +292,53 @@ pub trait PermissionDecider {
             _ => DeciderVerdict::Deny,
         }
     }
+
+    /// Cancellation-aware ask boundary. Synchronous deciders retain their
+    /// existing implementation through this default; interactive deciders
+    /// override it so a published turn cancellation releases the wait itself.
+    fn decide_cancellable(
+        &mut self,
+        request: &PermissionRequest,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
+        if cancellation.is_cancelled() {
+            return PermissionDecisionOutcome::Cancelled;
+        }
+        let verdict = self.decide(request);
+        if cancellation.is_cancelled() {
+            PermissionDecisionOutcome::Cancelled
+        } else {
+            PermissionDecisionOutcome::Decided(verdict)
+        }
+    }
+
+    /// Batch sibling of [`Self::decide_cancellable`].
+    fn decide_batch_cancellable(
+        &mut self,
+        batch: &PermissionRequestBatch,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
+        if cancellation.is_cancelled() {
+            return PermissionDecisionOutcome::Cancelled;
+        }
+        let verdict = self.decide_batch(batch);
+        if cancellation.is_cancelled() {
+            PermissionDecisionOutcome::Cancelled
+        } else {
+            PermissionDecisionOutcome::Decided(verdict)
+        }
+    }
+}
+
+/// Result of waiting at the permission-decider seam.
+///
+/// Cancellation is not a denial: it installs no grant and emits no
+/// `permission.decision`. The owning operation closes through its canonical
+/// cancellation path instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PermissionDecisionOutcome<T> {
+    Decided(T),
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -656,6 +703,22 @@ impl<D: PermissionDecider + ?Sized> PermissionDecider for &mut D {
     fn decide_batch(&mut self, batch: &PermissionRequestBatch) -> DeciderVerdict {
         (**self).decide_batch(batch)
     }
+
+    fn decide_cancellable(
+        &mut self,
+        request: &PermissionRequest,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
+        (**self).decide_cancellable(request, cancellation)
+    }
+
+    fn decide_batch_cancellable(
+        &mut self,
+        batch: &PermissionRequestBatch,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
+        (**self).decide_batch_cancellable(batch, cancellation)
+    }
 }
 
 impl<D: PermissionDecider> PermissionGate<D> {
@@ -675,17 +738,49 @@ impl<D: PermissionDecider> PermissionGate<D> {
         request: &PermissionRequest,
         mode: ApprovalMode,
     ) -> GrantDecision {
+        match self.decide_detailed_cancellable(request, mode, &CancellationToken::new()) {
+            PermissionDecisionOutcome::Decided(decision) => decision,
+            PermissionDecisionOutcome::Cancelled => {
+                unreachable!("a private never-cancelled permission decision cannot cancel")
+            }
+        }
+    }
+
+    /// Cancellation-aware form of [`Self::decide_detailed`]. A cancelled ask
+    /// is distinct from deny and cannot install a grant.
+    pub fn decide_detailed_cancellable(
+        &mut self,
+        request: &PermissionRequest,
+        mode: ApprovalMode,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<GrantDecision> {
+        if cancellation.is_cancelled() {
+            return PermissionDecisionOutcome::Cancelled;
+        }
         match mode {
-            ApprovalMode::AlwaysDeny => GrantDecision::deny(request.capability, None),
-            ApprovalMode::SessionAllow => GrantDecision::allow(
+            ApprovalMode::AlwaysDeny => {
+                PermissionDecisionOutcome::Decided(GrantDecision::deny(request.capability, None))
+            }
+            ApprovalMode::SessionAllow => PermissionDecisionOutcome::Decided(GrantDecision::allow(
                 request.capability,
                 GrantScope::Session(ScopePattern::unscoped()),
-            ),
+            )),
             ApprovalMode::Ask => {
                 if self.is_granted(request) {
-                    return GrantDecision::allow(request.capability, GrantScope::Once);
+                    return PermissionDecisionOutcome::Decided(GrantDecision::allow(
+                        request.capability,
+                        GrantScope::Once,
+                    ));
                 }
-                let verdict = self.decider.decide(request);
+                let verdict = match self.decider.decide_cancellable(request, cancellation) {
+                    PermissionDecisionOutcome::Decided(verdict) => verdict,
+                    PermissionDecisionOutcome::Cancelled => {
+                        return PermissionDecisionOutcome::Cancelled;
+                    }
+                };
+                if cancellation.is_cancelled() {
+                    return PermissionDecisionOutcome::Cancelled;
+                }
                 let decision = verdict.as_grant_decision(request.capability);
                 if decision.allowed() {
                     // Durable-store persist failure (project or user): still
@@ -694,11 +789,14 @@ impl<D: PermissionDecider> PermissionGate<D> {
                         self.install_grant(request.capability, decision.scope.clone())
                     {
                         if matches!(decision.scope, GrantScope::Project(_) | GrantScope::User(_)) {
-                            return GrantDecision::allow(request.capability, GrantScope::Once);
+                            return PermissionDecisionOutcome::Decided(GrantDecision::allow(
+                                request.capability,
+                                GrantScope::Once,
+                            ));
                         }
                     }
                 }
-                decision
+                PermissionDecisionOutcome::Decided(decision)
             }
         }
     }
@@ -715,11 +813,25 @@ impl<D: PermissionDecider> PermissionGate<D> {
     /// It intentionally does not install grants. The bridge first persists
     /// every individual decision, then calls [`Self::commit_batch_decisions`]
     /// so a failed event write cannot leave a live partial authorization.
-    pub(crate) fn decide_batch_detailed(
+    /// Resolve one operation-level decision. The batch remains entirely
+    /// uncommitted when its interactive wait is cancelled.
+    pub(crate) fn decide_batch_detailed_cancellable(
         &mut self,
         batch: &PermissionRequestBatch,
-    ) -> Vec<GrantDecision> {
-        let verdict = self.decider.decide_batch(batch);
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<Vec<GrantDecision>> {
+        if cancellation.is_cancelled() {
+            return PermissionDecisionOutcome::Cancelled;
+        }
+        let verdict = match self.decider.decide_batch_cancellable(batch, cancellation) {
+            PermissionDecisionOutcome::Decided(verdict) => verdict,
+            PermissionDecisionOutcome::Cancelled => {
+                return PermissionDecisionOutcome::Cancelled;
+            }
+        };
+        if cancellation.is_cancelled() {
+            return PermissionDecisionOutcome::Cancelled;
+        }
         let scope = match verdict.grant_scope() {
             Some(GrantScope::Session(pattern)) if pattern.is_unscoped() => {
                 Some(GrantScope::Session(pattern))
@@ -735,7 +847,7 @@ impl<D: PermissionDecider> PermissionGate<D> {
             })
             .collect::<Vec<_>>();
 
-        decisions
+        PermissionDecisionOutcome::Decided(decisions)
     }
 
     /// Commit the session-wide portion of a fully persisted batch. Batch
@@ -822,7 +934,11 @@ mod tests {
             verdict: DeciderVerdict::AllowSession,
         });
 
-        let decisions = gate.decide_batch_detailed(&batch);
+        let PermissionDecisionOutcome::Decided(decisions) =
+            gate.decide_batch_detailed_cancellable(&batch, &CancellationToken::new())
+        else {
+            panic!("never-cancelled batch");
+        };
 
         assert_eq!(gate.decider_mut().calls, 1);
         assert_eq!(decisions.len(), 2);
@@ -860,7 +976,11 @@ mod tests {
             )),
         });
 
-        let decisions = gate.decide_batch_detailed(&batch);
+        let PermissionDecisionOutcome::Decided(decisions) =
+            gate.decide_batch_detailed_cancellable(&batch, &CancellationToken::new())
+        else {
+            panic!("never-cancelled batch");
+        };
 
         assert_eq!(gate.decider_mut().calls, 1);
         assert!(decisions

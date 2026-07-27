@@ -51,6 +51,11 @@ A capability decision is one of:
 
 Permission prompts and decisions are session events and are recorded in provenance. Privileged secret/config edits always require explicit approval even if broader write access was granted.
 
+Cancelling an operation while it awaits an `ask` is neither an allow nor a
+deny: Euler records no permission decision or grant, closes the owning
+operation through its canonical cancellation path, and invalidates that
+prompt's reply route so a late answer cannot decide a later request.
+
 ## Permission reviewer (guardian)
 
 The session has one **permission reviewer** for uncovered `ask` decisions:
