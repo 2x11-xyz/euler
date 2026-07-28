@@ -195,6 +195,13 @@ envelope `v` per `docs/contracts/persistence.md`.
   fits, so a later secret-scrub rewrite cannot bypass the projection bound.
   Large `output` strings are content-addressed in the durable log and
   rehydrated at the session boundary.
+  Optional `project_context_snapshot_digest` is the candidate digest of the
+  immutable project-context snapshot from which this result derived bytes.
+  It classifies `skill_read` and every `tool_result_get` rehydration of a
+  classified result; canvas projection preserves it and child request/tool
+  execution enforce the recorded `none | inherit` policy against it. This is
+  distinct from the rendered-context digest recorded as
+  `model.call.project_context_digest`.
   Optional `recovery_closure: true` marks a resume-time canonical closure for
   an interrupted tail `tool.call`; it records the resume observation, not the
   original tool outcome.
@@ -495,11 +502,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   older streams without the object use the launching configuration. The
   legacy `tier` field remains for compatibility and is normalized at resume.
   Optional `project_context` is the compact bootstrap summary (ADR 0017):
-  `{ "expected": true, "schema_version": 1, "status", "policy",
+  `{ "expected": true, "schema_version": 2, "status", "policy",
   "resolution_reason", "acknowledgment_basis", "candidate_digest",
-  "source_count", "diagnostic_count" }`. Present exactly when the session
-  was created with a project-context bootstrap; it announces that one
-  `project.context.snapshot` follows immediately. Absent means the legacy
+  "manifest_admitted", "source_count", "skill_count",
+  "diagnostic_count" }`. Version-1 summaries (no `manifest_admitted` or
+  `skill_count`) remain resumable; legacy manifests cannot contain skills.
+  Present exactly when the session was created with a project-context
+  bootstrap; it announces that one `project.context.snapshot` follows
+  immediately. Absent means the legacy
   shape: no snapshot events exist and resume treats project context as
   disabled. A summary without its snapshot (or vice versa) is an invalid
   mixed shape and resume fails closed. The summary is validated like the
@@ -529,7 +539,7 @@ envelope `v` per `docs/contracts/persistence.md`.
   outside its integrity model. Any event append or log rewrite moves the key
   and forces re-projection, and integrity failures (`invalid` status) are
   never cached, so they are re-checked on every listing.
-- `project.context.snapshot` (schema version 1; ADR 0017,
+- `project.context.snapshot` (current schema version 2; ADR 0017,
   `docs/contracts/project-context.md`): `schema_version`, `status`
   (`admitted` | `disabled` | `declined` | `unacknowledged`, each gated by the
   permitted policy-tuple table in the project-context contract),
@@ -539,15 +549,23 @@ envelope `v` per `docs/contracts/persistence.md`.
   (`{ "algorithm": "unix-raw-osstr", "version": 1, "digest" }` over the raw
   canonicalized workspace-root bytes), `ordering` (`lexicographic-v1`),
   `source_identities` (bounded normalized project-root-relative paths),
-  `diagnostic_count`, and `diagnostic_reason_counts`. An admitted snapshot
+  `manifest_admitted`, `skill_count`, `diagnostic_count`, and
+  `diagnostic_reason_counts`. A snapshot with `manifest_admitted: true`
   additionally carries `framing_version`, `manifest_len`, and `manifest` —
   the complete canonical UTF-8 manifest JSON as one top-level payload string,
   externalized as one content-addressed blob above the provenance threshold.
-  A disabled snapshot persists NO source body, per-source content hash, exact
-  content length, or parser excerpt. The durable bootstrap order is exactly
+  Repository-disabled snapshots may retain a manifest containing only
+  user-global skills; they persist no repository source body, project-skill
+  body, per-source content hash, exact content length, or parser excerpt.
+  Version-1 snapshots omit `manifest_admitted` and `skill_count`; their
+  admitted status alone controls manifest presence and their legacy manifests
+  cannot contain skills. Each schema has an exact key whitelist: v1 records
+  carrying v2-only fields, partial v2 records, and mixed-version bootstraps
+  reject rather than being normalized. The durable bootstrap order is exactly
   `session.start`, one snapshot, then the declared diagnostics, all persisted
   before any provider dispatch; the latest snapshot in durable sequence is
-  authoritative, and a disabled snapshot is a tombstone. Rehydration verifies
+  authoritative, and a snapshot without an admitted manifest is a tombstone.
+  Rehydration verifies
   the blob address and length and rejects invalid UTF-8, duplicate keys,
   trailing data, unsupported versions, limit violations, and digest
   mismatches; it never falls back to current project files. Both shapes are
@@ -556,11 +574,12 @@ envelope `v` per `docs/contracts/persistence.md`.
   algorithms, count inconsistencies, and status/policy/reason/basis
   combinations outside the contract's permitted-tuple table reject resume
   and request assembly.
-- `project.context.diagnostic` (schema version 1): `schema_version`,
+- `project.context.diagnostic` (current schema version 2): `schema_version`,
   `snapshot_event_id`, `reason` (stable content-free code), optional bounded
   `path` (normalized relative identity), optional numeric `observed`. Never
   carries excerpts, raw parser errors, outside-workspace paths, or exception
-  strings derived from a candidate.
+  strings derived from a candidate. Its schema version must exactly match its
+  owning snapshot; v1 diagnostics remain valid only in a v1 bootstrap.
 - `canvas.snapshot`: `selected_event_ids`, `counts`, retention telemetry
   `retained_items`, `retained_bytes`, `demoted_items`, `automatic`, `stubs`,
   `tier`, `budget_bytes`,

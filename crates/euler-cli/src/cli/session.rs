@@ -147,6 +147,7 @@ fn finalize_project_context_tui(
                 pending.content_changed(),
                 pending.source_identities(),
                 pending.skipped_count(),
+                pending.skill_count(),
                 theme_choice,
             )?;
             Ok(finalize_pending_choice(&pending, choice))
@@ -170,9 +171,26 @@ fn finalize_project_context_line(
             if pending.content_changed() {
                 eprintln!("The project guidance in {label} changed since you last loaded it.");
             } else {
-                eprintln!(
-                    "{label} ships an EULER.md with instructions for how Euler should work here."
-                );
+                // Name exactly what acceptance loads (EULER.md, project
+                // skills, or both) — never claim a file that isn't there.
+                let ships = match (
+                    pending.source_identities().is_empty(),
+                    pending.skill_count(),
+                ) {
+                    (false, 0) => {
+                        "an EULER.md with instructions for how Euler should work here".to_owned()
+                    }
+                    (true, n) => format!(
+                        "{n} project skill{} (.euler/skills/) the model can load on demand",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    (false, n) => format!(
+                        "an EULER.md and {n} project skill{} (.euler/skills/) with instructions \
+                         for how Euler should work here",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                };
+                eprintln!("{label} ships {ships}.");
             }
             eprintln!(
                 "It's guidance for the model only. It can't grant permissions or run anything."

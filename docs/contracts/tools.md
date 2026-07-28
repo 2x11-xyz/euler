@@ -1,5 +1,36 @@
 # Tool Contract
 
+## Skill snapshot reads
+
+`skill_read(name)` reads one accepted skill body from the current session's
+immutable project-context snapshot. The tool is exposed to the model only when
+that snapshot contains at least one accepted skill. The `name` argument must
+exactly match a normalized skill name from the compact catalog; Euler performs
+no trimming or other argument normalization.
+
+The tool performs no filesystem access, executes no helper, grants no
+permission, and requires no capability. Its result carries stable scope,
+source path, and body-digest metadata in a core-owned header, followed by the
+frozen body with a core-owned indent on every line. Removing that indent
+reproduces the body bytes; body text can never occupy a core marker position.
+Every read is recorded through ordinary `tool.call` and `tool.result`
+provenance. Its result carries `project_context_snapshot_digest`, the candidate
+digest of the immutable snapshot that supplied the bytes. User-global skills
+remain available when repository context is disabled; project skills follow
+the repository context admission decision recorded in the snapshot.
+
+`skill_read` and the skill catalog are root-driver-only: companion and
+spawned agents are advertised the coding substrate without `skill_read`, and
+a companion call to it is refused — children default to project-context
+`none` and receive no skill surface until `inherit` wiring lands
+(docs/contracts/project-context.md).
+
+The classification survives canvas projection, compaction, and
+`tool_result_get`. Child retrieval is policy-aware even though retrieval reads
+the canonical session event stream: `none` rejects every classified result,
+while `inherit` accepts only an exact candidate-snapshot-digest match and
+propagates the same classification to the new result.
+
 Core tools are the minimal coding substrate.
 
 Tool calls must be permission checked, provenance logged, and represented cleanly in the active canvas.
@@ -71,7 +102,7 @@ Semantics:
 | `apply_patch` | FsWrite | Structured single-file patch |
 | `run_shell` | ShellExec | Workspace root; timeout bounds. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
 | `git_status` / `git_diff` | FsRead | Workspace git views. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
-| `tool_result_get` | FsRead | Rehydrate a demoted, compacted, or previewed tool result from the **current session** by `event_id` (required); optional `offset_bytes` (default `0`) and `max_bytes` (default 64 KiB) select a byte window. Session-local only. |
+| `tool_result_get` | FsRead | Rehydrate a demoted, compacted, or previewed tool result from the **current session** by `event_id` (required); optional `offset_bytes` (default `0`) and `max_bytes` (default 64 KiB) select a byte window. Session-local and project-context-policy-aware for children. |
 | `code_swarm_review` | AgentSpawn | Session-level review gate over required explicit `focus` (≤7 KiB) and `context` (≤256 KiB). The calling agent gathers material first through ordinary tools, so this gate has no hidden file, git, GitHub, or network authority. It forwards only that supplied context and a small reviewer brief — never ambient session canvas — fans out the persisted reviewer set, and returns every finding for caller adjudication. Optional: `personas`, `models` (non-empty one-off override; an empty model-facing list is omission), `max_tokens`. Advertised only in the root session when the `code-swarm` extension is wired and enabled; companions never see it (depth one). Config, result shape, and failure honesty: multi-agent contract. |
 
 Under ordinary host execution, agent-controlled shell and Git subprocesses

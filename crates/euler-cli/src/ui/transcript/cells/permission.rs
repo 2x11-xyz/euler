@@ -270,6 +270,9 @@ pub(crate) struct AcknowledgmentCardView<'a> {
     pub(crate) sources: &'a [String],
     /// How many discovered files were skipped (shown only when non-zero).
     pub(crate) skipped_count: usize,
+    /// How many project skills the acknowledgment covers (shown when
+    /// non-zero — the card must disclose every repository-authored input).
+    pub(crate) skill_count: usize,
     /// Whether the Load option is highlighted (default: Skip, the safe bias).
     pub(crate) load_selected: bool,
 }
@@ -290,21 +293,48 @@ pub(crate) fn render_acknowledgment_card(
     ];
     if view.content_changed {
         rows.push(PermissionPanelRow::body(
-            "The EULER.md guidance in this folder changed since you last loaded it.",
+            "The project guidance in this folder changed since you last loaded it.",
         ));
     } else {
-        rows.push(PermissionPanelRow::body(
-            "This folder ships an EULER.md with instructions for how Euler should work here.",
-        ));
+        // Name exactly what acceptance loads: an EULER.md, project skills
+        // (.euler/skills/), or both — never claim a file that isn't there.
+        let ships = match (view.sources.is_empty(), view.skill_count == 0) {
+            (false, true) => {
+                "This folder ships an EULER.md with instructions for how Euler should work here."
+            }
+            (true, false) => {
+                "This folder ships project skills (.euler/skills/) — repository-authored \
+                 instructions the model can load on demand."
+            }
+            _ => {
+                "This folder ships an EULER.md and project skills (.euler/skills/) with \
+                 instructions for how Euler should work here."
+            }
+        };
+        rows.push(PermissionPanelRow::body(ships));
     }
     rows.push(PermissionPanelRow::body(
         "It's guidance for the model only. It can't grant permissions, run commands, or change \
          what Euler is allowed to do.",
     ));
-    rows.push(PermissionPanelRow::body(String::new()));
-    rows.push(PermissionPanelRow::body("Files:"));
-    for source in view.sources {
-        rows.push(PermissionPanelRow::body(format!("  {source}")));
+    if !view.sources.is_empty() {
+        rows.push(PermissionPanelRow::body(String::new()));
+        rows.push(PermissionPanelRow::body("Files:"));
+        for source in view.sources {
+            rows.push(PermissionPanelRow::body(format!("  {source}")));
+        }
+    }
+    if view.skill_count > 0 {
+        rows.push(PermissionPanelRow::body(String::new()));
+        let skills = if view.skill_count == 1 {
+            "skill"
+        } else {
+            "skills"
+        };
+        rows.push(PermissionPanelRow::body(format!(
+            "Skills: {} project {skills} (.euler/skills/)",
+            view.skill_count
+        )));
     }
     if view.skipped_count > 0 {
         rows.push(PermissionPanelRow::body(String::new()));
@@ -563,6 +593,7 @@ mod acknowledgment_card_tests {
             content_changed: false,
             sources: &sources,
             skipped_count: 2,
+            skill_count: 0,
             load_selected: false,
         };
         let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));
@@ -586,6 +617,7 @@ mod acknowledgment_card_tests {
             content_changed: true,
             sources: &sources,
             skipped_count: 0,
+            skill_count: 0,
             load_selected: true,
         };
         let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));

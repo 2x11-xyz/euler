@@ -68,6 +68,10 @@ struct CompanionLoop<'a, D> {
     /// Cumulative OUTPUT tokens only (see `add_usage`), checked against
     /// `AgentBudget::max_tokens`.
     tokens: u64,
+    /// Snapshot digest admitted into the current child request. Tool-result
+    /// rehydration uses the same value so excluded context cannot be fetched
+    /// by event id after request assembly filtered it.
+    active_project_context_snapshot_digest: Option<String>,
     cancellation: CancellationToken,
 }
 
@@ -260,6 +264,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             reteach: crate::tools::ReteachTracker::default(),
             tool_calls: 0,
             tokens: 0,
+            active_project_context_snapshot_digest: None,
             cancellation,
         }
     }
@@ -431,12 +436,22 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     ) -> Result<(), SessionError> {
         let tool_name = call.name.clone();
         let tool_started = Instant::now();
-        match self.tools.execute_with_events_cancellable(
-            &call.name,
-            &call.input,
-            self.bus.events(),
-            cancellation,
-        ) {
+        // The registry is the parent's; `skill_read` is never advertised to
+        // companions (`child_model_tools`), so a call here is the model
+        // improvising off the parent transcript — refuse rather than serve
+        // frozen skill bodies across the child boundary.
+        let outcome = if call.name == "skill_read" {
+            Err(crate::tools::ToolError::Unsupported(call.name.clone()))
+        } else {
+            self.tools.execute_with_events_cancellable_for_child(
+                &call.name,
+                &call.input,
+                self.bus.events(),
+                cancellation,
+                self.active_project_context_snapshot_digest.as_deref(),
+            )
+        };
+        match outcome {
             Ok(crate::tools::ToolExecutionOutcome::Completed(execution)) => {
                 // The input format was accepted: reset this tool's re-teach
                 // streak (issue #94), mirroring the parent session loop.
@@ -808,6 +823,12 @@ impl<D: PermissionDecider> CompanionLoop<'_, D> {
         } else {
             Vec::new()
         });
+        self.active_project_context_snapshot_digest = match self.task.project_context() {
+            euler_agents::ProjectContextPolicy::None => None,
+            euler_agents::ProjectContextPolicy::Inherit => project_context
+                .admitted()
+                .map(|pinned| pinned.candidate_digest.clone()),
+        };
         super::apply_child_project_context_policy(
             &mut canvas,
             self.task.project_context(),
@@ -929,7 +950,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
             tools: if self.task.budget().max_tool_calls() == Some(0) {
                 Vec::new()
             } else {
-                self.tools.model_tools()
+                self.tools.child_model_tools()
             },
             reasoning_effort: self.reasoning_effort,
             max_output_tokens: round_max_output_tokens,

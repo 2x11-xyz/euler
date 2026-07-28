@@ -29,16 +29,21 @@
 //! A platform without no-follow reads omits every source with a
 //! `no_follow_unsupported` diagnostic instead of following symlinks.
 
-use super::digest::source_digest_v1;
-use super::manifest::{ManifestDiagnostic, ManifestSource};
+use super::digest::{skill_digest_v1, source_digest_v1};
+use super::manifest::{
+    validate_skill_description, validate_skill_name, ManifestDiagnostic, ManifestSkill,
+    ManifestSource, SkillScope,
+};
 use super::{
-    MAX_CHAIN_LEVELS, MAX_COMBINED_EULER_MD_BYTES, MAX_DIR_ENTRIES, MAX_EULER_MD_BYTES,
-    MAX_EULER_MD_SOURCES, MAX_IDENTITY_BYTES,
+    MAX_CHAIN_LEVELS, MAX_COMBINED_EULER_MD_BYTES, MAX_COMBINED_SKILL_BODY_BYTES, MAX_DIR_ENTRIES,
+    MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES, MAX_IDENTITY_BYTES, MAX_SKILLS,
+    MAX_SKILL_DIRECTORIES, MAX_SKILL_FILE_BYTES, MAX_SKILL_TRAVERSAL_DEPTH,
 };
 use crate::redaction::SecretRedactor;
 use std::path::Path;
 
 pub(crate) const EULER_MD_FILE_NAME: &str = "EULER.md";
+pub(crate) const SKILL_FILE_NAME: &str = "SKILL.md";
 
 /// Stable, content-free diagnostic reason codes. These are recorded in
 /// provenance and inside the candidate manifest; changing one changes
@@ -75,6 +80,15 @@ pub(crate) enum DiagnosticReason {
     /// its own validation. Nothing was admitted.
     PreflightInvalid,
     IoError,
+    SkillDepthExceeded,
+    SkillDirectoryCountExceeded,
+    SkillCountExceeded,
+    SkillCatalogLimitExceeded,
+    SkillFrontmatterInvalid,
+    SkillNameInvalid,
+    SkillNameMismatch,
+    SkillDescriptionInvalid,
+    SkillNameAmbiguous,
     /// Constructed only on platforms without a ratified no-follow read path.
     #[cfg_attr(unix, allow(dead_code))]
     NoFollowUnsupported,
@@ -99,6 +113,15 @@ impl DiagnosticReason {
             Self::DiagnosticOverflow => "diagnostic_overflow",
             Self::PreflightInvalid => "preflight_invalid",
             Self::IoError => "io_error",
+            Self::SkillDepthExceeded => "skill_depth_exceeded",
+            Self::SkillDirectoryCountExceeded => "skill_directory_count_exceeded",
+            Self::SkillCountExceeded => "skill_count_exceeded",
+            Self::SkillCatalogLimitExceeded => "skill_catalog_limit_exceeded",
+            Self::SkillFrontmatterInvalid => "skill_frontmatter_invalid",
+            Self::SkillNameInvalid => "skill_name_invalid",
+            Self::SkillNameMismatch => "skill_name_mismatch",
+            Self::SkillDescriptionInvalid => "skill_description_invalid",
+            Self::SkillNameAmbiguous => "skill_name_ambiguous",
             Self::NoFollowUnsupported => "no_follow_unsupported",
         }
     }
@@ -109,6 +132,8 @@ pub(crate) struct DiscoveryOutcome {
     /// Accepted sources in rendering order (project root first), frozen
     /// post-redaction.
     pub sources: Vec<ManifestSource>,
+    /// Accepted user- and project-scope skills, sorted by normalized name.
+    pub skills: Vec<ManifestSkill>,
     /// Ordered content-free diagnostics for everything omitted.
     pub diagnostics: Vec<ManifestDiagnostic>,
 }
@@ -128,8 +153,17 @@ pub(crate) fn diagnostic(
 /// Discover `EULER.md` sources for an already canonicalized workspace root.
 /// Never fails: every problem becomes a typed diagnostic and startup
 /// continues with whatever was safely admitted.
+pub(crate) fn discover_with_user_skills(
+    canonical_workspace: &Path,
+    user_skills_root: Option<&Path>,
+    redactor: &SecretRedactor,
+) -> DiscoveryOutcome {
+    imp::discover(canonical_workspace, user_skills_root, redactor)
+}
+
+#[cfg(test)]
 pub(crate) fn discover(canonical_workspace: &Path, redactor: &SecretRedactor) -> DiscoveryOutcome {
-    imp::discover(canonical_workspace, redactor)
+    discover_with_user_skills(canonical_workspace, None, redactor)
 }
 
 #[cfg(unix)]
@@ -144,6 +178,22 @@ mod imp {
     struct Candidate {
         rel_path: String,
         content: String,
+    }
+
+    struct SkillCandidate {
+        name: String,
+        description: String,
+        scope: SkillScope,
+        path: String,
+        body: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SkillFrontmatter {
+        name: String,
+        description: String,
+        #[serde(flatten)]
+        _inert: std::collections::BTreeMap<String, serde_yaml::Value>,
     }
 
     /// One directory on the anchored workspace chain.
@@ -166,11 +216,35 @@ mod imp {
         Failed,
     }
 
+    /// Shared mutable state threaded through the skill-tree scan: the
+    /// redactor plus the diagnostic, directory-count, and candidate sinks.
+    struct SkillScan<'a> {
+        redactor: &'a SecretRedactor,
+        diagnostics: &'a mut Vec<ManifestDiagnostic>,
+        directories_examined: &'a mut usize,
+        candidates: &'a mut Vec<SkillCandidate>,
+    }
+
     pub(super) fn discover(
         canonical_workspace: &Path,
+        user_skills_root: Option<&Path>,
         redactor: &SecretRedactor,
     ) -> DiscoveryOutcome {
         let mut diagnostics = Vec::new();
+        // User-global skills are independent of repository-context discovery.
+        // Scan them first so a repository boundary failure can fail project
+        // context closed without suppressing user-owned guidance.
+        let mut skill_candidates = Vec::new();
+        let mut skill_directories_examined = 0usize;
+        if let Some(root) = user_skills_root {
+            let mut scan = SkillScan {
+                redactor,
+                diagnostics: &mut diagnostics,
+                directories_examined: &mut skill_directories_examined,
+                candidates: &mut skill_candidates,
+            };
+            scan_user_skills_root(root, &mut scan);
+        }
         // Anchor: open every component of the canonical workspace path from
         // the filesystem root with no-follow semantics, retaining handles
         // for the marker-search window (the last MAX_CHAIN_LEVELS
@@ -179,10 +253,12 @@ mod imp {
             match open_workspace_chain(canonical_workspace, &mut diagnostics) {
                 Some(walk) => walk,
                 None => {
+                    let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
                     return DiscoveryOutcome {
                         sources: Vec::new(),
+                        skills,
                         diagnostics,
-                    }
+                    };
                 }
             };
         // Nearest marker inside the window (workspace upward). A level whose
@@ -207,8 +283,10 @@ mod imp {
                     None,
                     observed,
                 ));
+                let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
                 return DiscoveryOutcome {
                     sources: Vec::new(),
+                    skills,
                     diagnostics,
                 };
             }
@@ -224,10 +302,20 @@ mod imp {
             }
             MarkerSearch::Found(index) => index,
         };
-        let candidates = scan_chain(&mut window[root_index..], redactor, &mut diagnostics);
+        let project_chain = &mut window[root_index..];
+        let candidates = scan_chain(project_chain, redactor, &mut diagnostics);
         let sources = admit_candidates(candidates, &mut diagnostics);
+        scan_project_skills(
+            project_chain,
+            redactor,
+            &mut diagnostics,
+            &mut skill_directories_examined,
+            &mut skill_candidates,
+        );
+        let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
         DiscoveryOutcome {
             sources,
+            skills,
             diagnostics,
         }
     }
@@ -532,6 +620,353 @@ mod imp {
             .collect()
     }
 
+    fn scan_project_skills(
+        project_chain: &mut [ChainDir],
+        redactor: &SecretRedactor,
+        diagnostics: &mut Vec<ManifestDiagnostic>,
+        directories_examined: &mut usize,
+        candidates: &mut Vec<SkillCandidate>,
+    ) {
+        let mut scan = SkillScan {
+            redactor,
+            diagnostics,
+            directories_examined,
+            candidates,
+        };
+        let mut rel_dir = String::new();
+        for (depth, dir) in project_chain.iter_mut().enumerate() {
+            if depth > 0 {
+                let Some(name) = dir.name.as_deref().and_then(OsStr::to_str) else {
+                    scan.diagnostics
+                        .push(diagnostic(DiagnosticReason::NonUtf8Path, None, None));
+                    break;
+                };
+                rel_dir = join_rel(&rel_dir, name);
+            }
+            ensure_enumerated(dir);
+            let Some(Enumeration::Names(names)) = dir.entries.as_ref() else {
+                continue;
+            };
+            scan_project_skills_entry(&dir.fd, names, &rel_dir, &mut scan);
+        }
+    }
+
+    fn scan_user_skills_root(root: &Path, scan: &mut SkillScan<'_>) {
+        if !root.exists() {
+            return;
+        }
+        let Some(fd) = open_absolute_dir_nofollow(root) else {
+            scan.diagnostics.push(diagnostic(
+                DiagnosticReason::SymlinkRejected,
+                Some("user/skills".to_owned()),
+                None,
+            ));
+            return;
+        };
+        scan_skills_tree(&fd, false, "user/skills", SkillScope::User, 0, scan);
+    }
+
+    fn scan_project_skills_entry(
+        parent: &OwnedFd,
+        names: &[Vec<u8>],
+        rel_dir: &str,
+        scan: &mut SkillScan<'_>,
+    ) {
+        if !names.iter().any(|name| name.as_slice() == b".euler") {
+            return;
+        }
+        let identity = join_rel(rel_dir, ".euler/skills");
+        let Ok(euler_dir) = open_component_dir(parent, OsStr::new(".euler")) else {
+            scan.diagnostics.push(diagnostic(
+                DiagnosticReason::SymlinkRejected,
+                Some(join_rel(rel_dir, ".euler")),
+                None,
+            ));
+            return;
+        };
+        let Enumeration::Names(euler_names) =
+            enumerate_bounded(&euler_dir.fd, euler_dir.traversal_only)
+        else {
+            scan.diagnostics
+                .push(diagnostic(DiagnosticReason::IoError, Some(identity), None));
+            return;
+        };
+        if !euler_names.iter().any(|name| name.as_slice() == b"skills") {
+            return;
+        }
+        let Ok(skills_dir) = open_component_dir(&euler_dir.fd, OsStr::new("skills")) else {
+            scan.diagnostics.push(diagnostic(
+                DiagnosticReason::SymlinkRejected,
+                Some(identity),
+                None,
+            ));
+            return;
+        };
+        scan_skills_tree(
+            &skills_dir.fd,
+            skills_dir.traversal_only,
+            &join_rel(rel_dir, ".euler/skills"),
+            SkillScope::Project,
+            0,
+            scan,
+        );
+    }
+
+    fn scan_skills_tree(
+        dir: &OwnedFd,
+        traversal_only: bool,
+        identity: &str,
+        scope: SkillScope,
+        depth: usize,
+        scan: &mut SkillScan<'_>,
+    ) {
+        if *scan.directories_examined >= MAX_SKILL_DIRECTORIES {
+            scan.diagnostics.push(diagnostic(
+                DiagnosticReason::SkillDirectoryCountExceeded,
+                Some(identity.to_owned()),
+                Some(*scan.directories_examined as u64),
+            ));
+            return;
+        }
+        *scan.directories_examined += 1;
+        let enumeration = enumerate_bounded(dir, traversal_only);
+        let Enumeration::Names(names) = enumeration else {
+            scan.diagnostics.push(diagnostic(
+                DiagnosticReason::DirEntriesExceeded,
+                Some(identity.to_owned()),
+                None,
+            ));
+            return;
+        };
+        if names
+            .iter()
+            .any(|name| name.as_slice() == SKILL_FILE_NAME.as_bytes())
+        {
+            read_skill_candidate(
+                dir,
+                identity,
+                scope,
+                scan.redactor,
+                scan.diagnostics,
+                scan.candidates,
+            );
+        }
+        if depth >= MAX_SKILL_TRAVERSAL_DEPTH {
+            let has_child_directory = names.iter().any(|name| {
+                fstatat_nofollow(dir, OsStr::from_bytes(name))
+                    .is_ok_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+            });
+            if has_child_directory {
+                scan.diagnostics.push(diagnostic(
+                    DiagnosticReason::SkillDepthExceeded,
+                    Some(identity.to_owned()),
+                    Some(depth as u64),
+                ));
+            }
+            return;
+        }
+        for name in names {
+            if name == b"." || name == b".." || name.as_slice() == SKILL_FILE_NAME.as_bytes() {
+                continue;
+            }
+            let Some(name_text) = std::str::from_utf8(&name).ok() else {
+                scan.diagnostics.push(diagnostic(
+                    DiagnosticReason::NonUtf8Path,
+                    Some(identity.to_owned()),
+                    None,
+                ));
+                continue;
+            };
+            let Ok(stat) = fstatat_nofollow(dir, OsStr::new(name_text)) else {
+                continue;
+            };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                continue;
+            }
+            let child_identity = join_rel(identity, name_text);
+            match open_component_dir(dir, OsStr::new(name_text)) {
+                Ok(child) => scan_skills_tree(
+                    &child.fd,
+                    child.traversal_only,
+                    &child_identity,
+                    scope,
+                    depth + 1,
+                    scan,
+                ),
+                Err(_) => scan.diagnostics.push(diagnostic(
+                    DiagnosticReason::SymlinkRejected,
+                    Some(child_identity),
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn read_skill_candidate(
+        dir: &OwnedFd,
+        directory_identity: &str,
+        scope: SkillScope,
+        redactor: &SecretRedactor,
+        diagnostics: &mut Vec<ManifestDiagnostic>,
+        candidates: &mut Vec<SkillCandidate>,
+    ) {
+        let path = join_rel(directory_identity, SKILL_FILE_NAME);
+        match read_named_candidate_stable(dir, SKILL_FILE_NAME, MAX_SKILL_FILE_BYTES) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => match parse_skill_package(&text, directory_identity, scope, redactor) {
+                    Ok(candidate) => candidates.push(candidate),
+                    Err(reason) => diagnostics.push(diagnostic(reason, Some(path), None)),
+                },
+                Err(_) => {
+                    diagnostics.push(diagnostic(DiagnosticReason::InvalidUtf8, Some(path), None))
+                }
+            },
+            Err(error) => {
+                let (reason, observed) = read_error_diagnostic(error);
+                diagnostics.push(diagnostic(reason, Some(path), observed));
+            }
+        }
+    }
+
+    fn parse_skill_package(
+        text: &str,
+        directory_identity: &str,
+        scope: SkillScope,
+        redactor: &SecretRedactor,
+    ) -> Result<SkillCandidate, DiagnosticReason> {
+        let normalized = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let Some(rest) = normalized.strip_prefix("---\n") else {
+            return Err(DiagnosticReason::SkillFrontmatterInvalid);
+        };
+        let Some((frontmatter, body)) = rest.split_once("\n---\n") else {
+            return Err(DiagnosticReason::SkillFrontmatterInvalid);
+        };
+        let parsed: SkillFrontmatter = serde_yaml::from_str(frontmatter)
+            .map_err(|_| DiagnosticReason::SkillFrontmatterInvalid)?;
+        validate_skill_name(&parsed.name).map_err(|_| DiagnosticReason::SkillNameInvalid)?;
+        validate_skill_description(&parsed.description)
+            .map_err(|_| DiagnosticReason::SkillDescriptionInvalid)?;
+        let basename = directory_identity.rsplit('/').next().unwrap_or("");
+        if basename != parsed.name {
+            return Err(DiagnosticReason::SkillNameMismatch);
+        }
+        let body = redactor.redact(body);
+        if body.len() > super::super::MAX_SKILL_BODY_BYTES {
+            return Err(DiagnosticReason::SourceTooLarge);
+        }
+        Ok(SkillCandidate {
+            name: parsed.name,
+            description: redactor.redact(&parsed.description),
+            scope,
+            path: join_rel(directory_identity, SKILL_FILE_NAME),
+            body,
+        })
+    }
+
+    fn read_error_diagnostic(error: ReadCandidateError) -> (DiagnosticReason, Option<u64>) {
+        match error {
+            ReadCandidateError::Symlink => (DiagnosticReason::SymlinkRejected, None),
+            ReadCandidateError::NotRegular => (DiagnosticReason::NotRegularFile, None),
+            ReadCandidateError::TooLarge(size) => (DiagnosticReason::SourceTooLarge, Some(size)),
+            ReadCandidateError::Unstable => (DiagnosticReason::ChangedDuringRead, None),
+            ReadCandidateError::Io => (DiagnosticReason::IoError, None),
+        }
+    }
+
+    fn admit_skill_candidates(
+        mut candidates: Vec<SkillCandidate>,
+        diagnostics: &mut Vec<ManifestDiagnostic>,
+    ) -> Vec<ManifestSkill> {
+        candidates.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.scope.cmp(&right.scope))
+                .then(left.path.cmp(&right.path))
+        });
+        let mut admitted = Vec::new();
+        let mut combined = 0usize;
+        let mut index = 0usize;
+        while index < candidates.len() {
+            let end = candidates[index..]
+                .iter()
+                .position(|candidate| candidate.name != candidates[index].name)
+                .map_or(candidates.len(), |offset| index + offset);
+            if end - index > 1 {
+                for candidate in &candidates[index..end] {
+                    diagnostics.push(diagnostic(
+                        DiagnosticReason::SkillNameAmbiguous,
+                        Some(candidate.path.clone()),
+                        None,
+                    ));
+                }
+                index = end;
+                continue;
+            }
+            let candidate = &candidates[index];
+            if admitted.len() >= MAX_SKILLS {
+                diagnostics.push(diagnostic(
+                    DiagnosticReason::SkillCountExceeded,
+                    Some(candidate.path.clone()),
+                    None,
+                ));
+            } else if combined.saturating_add(candidate.body.len()) > MAX_COMBINED_SKILL_BODY_BYTES
+            {
+                diagnostics.push(diagnostic(
+                    DiagnosticReason::CombinedLimitExceeded,
+                    Some(candidate.path.clone()),
+                    Some(candidate.body.len() as u64),
+                ));
+            } else {
+                let skill = ManifestSkill {
+                    name: candidate.name.clone(),
+                    description: candidate.description.clone(),
+                    scope: candidate.scope,
+                    path: candidate.path.clone(),
+                    body_len: candidate.body.len() as u64,
+                    body_digest: skill_digest_v1(
+                        candidate.scope,
+                        &candidate.name,
+                        &candidate.path,
+                        &candidate.body,
+                    ),
+                    body: candidate.body.clone(),
+                };
+                admitted.push(skill);
+                if super::super::framing::skill_catalog_fits(&admitted) {
+                    combined += candidate.body.len();
+                } else {
+                    admitted.pop();
+                    diagnostics.push(diagnostic(
+                        DiagnosticReason::SkillCatalogLimitExceeded,
+                        Some(candidate.path.clone()),
+                        None,
+                    ));
+                }
+            }
+            index = end;
+        }
+        admitted
+    }
+
+    fn open_absolute_dir_nofollow(path: &Path) -> Option<OwnedFd> {
+        let canonical = path.canonicalize().ok()?;
+        if canonical != path {
+            return None;
+        }
+        let mut components = canonical.components();
+        if components.next() != Some(Component::RootDir) {
+            return None;
+        }
+        let mut current = open_filesystem_root().ok()?;
+        for component in components {
+            let Component::Normal(name) = component else {
+                return None;
+            };
+            current = open_component_dir(&current, name).ok()?.fd;
+        }
+        Some(current)
+    }
+
     fn join_rel(rel_dir: &str, name: &str) -> String {
         if rel_dir.is_empty() {
             name.to_owned()
@@ -732,10 +1167,14 @@ mod imp {
     /// no-follow (O_NONBLOCK so a FIFO cannot block startup), verify the
     /// opened handle is a bounded regular file, read, then compare stable
     /// metadata before and after the read as a fast-path instability reject.
-    fn read_candidate_once(dir: &OwnedFd) -> Result<Vec<u8>, ReadCandidateError> {
+    fn read_named_candidate_once(
+        dir: &OwnedFd,
+        file_name: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ReadCandidateError> {
         let fd = openat(
             dir,
-            OsStr::new(EULER_MD_FILE_NAME),
+            OsStr::new(file_name),
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
         .map_err(|error| match error.raw_os_error() {
@@ -746,16 +1185,16 @@ mod imp {
         if before.st_mode & libc::S_IFMT != libc::S_IFREG {
             return Err(ReadCandidateError::NotRegular);
         }
-        if before.st_size < 0 || before.st_size as u64 > MAX_EULER_MD_BYTES as u64 {
+        if before.st_size < 0 || before.st_size as u64 > max_bytes as u64 {
             return Err(ReadCandidateError::TooLarge(before.st_size.max(0) as u64));
         }
         let mut file = std::fs::File::from(fd);
         let mut bytes = Vec::new();
         file.by_ref()
-            .take(MAX_EULER_MD_BYTES as u64 + 1)
+            .take(max_bytes as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| ReadCandidateError::Io)?;
-        if bytes.len() > MAX_EULER_MD_BYTES {
+        if bytes.len() > max_bytes {
             return Err(ReadCandidateError::TooLarge(bytes.len() as u64));
         }
         #[cfg(test)]
@@ -772,9 +1211,13 @@ mod imp {
     /// rapid same-size rewrite, so byte equality across two verified handles
     /// is the admission criterion; the per-handle metadata comparison is
     /// only a fast-path reject.
-    fn read_candidate_verified(dir: &OwnedFd) -> Result<Vec<u8>, ReadCandidateError> {
-        let first = read_candidate_once(dir)?;
-        let second = read_candidate_once(dir)?;
+    fn read_named_candidate_verified(
+        dir: &OwnedFd,
+        file_name: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ReadCandidateError> {
+        let first = read_named_candidate_once(dir, file_name, max_bytes)?;
+        let second = read_named_candidate_once(dir, file_name, max_bytes)?;
         if first == second {
             Ok(second)
         } else {
@@ -785,14 +1228,24 @@ mod imp {
     /// Stable-read protocol: retry an unstable source at most once, then
     /// omit it with `changed_during_read`. Errors other than instability
     /// abort immediately.
-    fn read_candidate_stable(dir: &OwnedFd) -> Result<Vec<u8>, ReadCandidateError> {
-        match read_candidate_verified(dir) {
-            Err(ReadCandidateError::Unstable) => match read_candidate_verified(dir) {
-                Err(ReadCandidateError::Unstable) => Err(ReadCandidateError::Unstable),
-                other => other,
-            },
+    fn read_named_candidate_stable(
+        dir: &OwnedFd,
+        file_name: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ReadCandidateError> {
+        match read_named_candidate_verified(dir, file_name, max_bytes) {
+            Err(ReadCandidateError::Unstable) => {
+                match read_named_candidate_verified(dir, file_name, max_bytes) {
+                    Err(ReadCandidateError::Unstable) => Err(ReadCandidateError::Unstable),
+                    other => other,
+                }
+            }
             other => other,
         }
+    }
+
+    fn read_candidate_stable(dir: &OwnedFd) -> Result<Vec<u8>, ReadCandidateError> {
+        read_named_candidate_stable(dir, EULER_MD_FILE_NAME, MAX_EULER_MD_BYTES)
     }
 }
 
@@ -804,10 +1257,12 @@ mod imp {
     /// rather than follow a link (project-context contract, containment).
     pub(super) fn discover(
         _canonical_workspace: &Path,
+        _user_skills_root: Option<&Path>,
         _redactor: &SecretRedactor,
     ) -> DiscoveryOutcome {
         DiscoveryOutcome {
             sources: Vec::new(),
+            skills: Vec::new(),
             diagnostics: vec![diagnostic(
                 DiagnosticReason::NoFollowUnsupported,
                 None,

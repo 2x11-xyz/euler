@@ -235,6 +235,11 @@ pub struct SessionConfig {
     /// dispatch. Phase 2: the only public constructor resolves disabled, so
     /// no repository text can reach a model.
     pub project_context: Option<ProjectContextBootstrap>,
+    /// User-global skills root (`<euler-home>/skills`). `None` (default)
+    /// disables user-scope skill discovery. Carried in the config so an
+    /// in-process fresh session (`/new`) re-resolves with the same root the
+    /// startup bootstrap used — user skills must survive `/new`.
+    pub user_skills_root: Option<PathBuf>,
 }
 
 impl SessionConfig {
@@ -263,6 +268,7 @@ impl SessionConfig {
             user_grant_dir: None,
             permission_reviewer: PermissionReviewer::default(),
             project_context: None,
+            user_skills_root: None,
         }
     }
 }
@@ -913,8 +919,11 @@ impl<D> Session<D> {
     }
 
     pub fn new_with_providers(config: SessionConfig, providers: ProviderSet, decider: D) -> Self {
-        let tools =
+        let mut tools =
             ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
+        if let Some(project_context) = config.project_context.as_ref() {
+            tools.set_frozen_skills(project_context.frozen_skills());
+        }
         let active_target = ModelTarget::new(config.provider.clone(), config.model.clone());
         let mut bus = EventBus::new();
         push_session_bootstrap(&mut bus, &config, session_start_payload(&config));
@@ -1011,8 +1020,9 @@ impl<D> Session<D> {
                 .unwrap_or(self.config.compaction_reserve_tokens as u64),
             canvas_budget_bytes: self.config.auto_compaction.budget_bytes,
         };
-        ProjectContextBootstrap::resolve(
+        ProjectContextBootstrap::resolve_with_user_skills(
             &self.config.root,
+            self.config.user_skills_root.as_deref(),
             &self.redactor,
             options,
             self.config.project_grant_consent_dir.as_deref(),
@@ -1689,8 +1699,13 @@ impl<D> Session<D> {
         latest_model_usage_used_tokens: Option<u64>,
         context_limit_emitted: Option<ModelTarget>,
     ) -> Self {
-        let tools =
+        let mut tools =
             ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
+        if let Ok(fold) = crate::project_context::fold_project_context(&events) {
+            if let Some(pinned) = fold.admitted() {
+                tools.set_frozen_skills(pinned.frozen_skills());
+            }
+        }
         let persisted_events = events.len();
         let mut permissions = PermissionGate::new(decider);
         let _ = permissions
@@ -3673,17 +3688,24 @@ fn apply_child_project_context_policy(
     policy: euler_agents::ProjectContextPolicy,
     fold: &crate::project_context::ProjectContextFold,
 ) {
-    match policy {
-        euler_agents::ProjectContextPolicy::None => {
-            canvas.retain(|item| !matches!(item, CanvasItem::ProjectContext { .. }));
-        }
-        euler_agents::ProjectContextPolicy::Inherit => {
-            let already_present = canvas
-                .iter()
-                .any(|item| matches!(item, CanvasItem::ProjectContext { .. }));
-            if already_present {
-                return;
-            }
+    let allowed_snapshot_digest = match policy {
+        euler_agents::ProjectContextPolicy::None => None,
+        euler_agents::ProjectContextPolicy::Inherit => fold
+            .admitted()
+            .map(|pinned| pinned.candidate_digest.as_str()),
+    };
+    filter_project_context_tool_rounds(canvas, allowed_snapshot_digest);
+    canvas.retain(|item| match item {
+        CanvasItem::ProjectContext {
+            snapshot_digest, ..
+        } => allowed_snapshot_digest == Some(snapshot_digest.as_str()),
+        _ => true,
+    });
+    if policy == euler_agents::ProjectContextPolicy::Inherit {
+        let already_present = canvas
+            .iter()
+            .any(|item| matches!(item, CanvasItem::ProjectContext { .. }));
+        if !already_present {
             if let Some(pinned) = fold.admitted() {
                 canvas.insert(
                     0,
@@ -3696,6 +3718,40 @@ fn apply_child_project_context_policy(
             }
         }
     }
+}
+
+/// Filter both halves of every classified tool round. Keeping only the result
+/// would violate provider tool-pair shape; keeping only the call would invite
+/// the child to recover bytes its policy excluded.
+fn filter_project_context_tool_rounds(
+    canvas: &mut Vec<CanvasItem>,
+    allowed_snapshot_digest: Option<&str>,
+) {
+    let rejected_call_ids = canvas
+        .iter()
+        .filter_map(|item| match item {
+            CanvasItem::ToolOutput {
+                call_id,
+                project_context_snapshot_digest: Some(digest),
+                ..
+            } if allowed_snapshot_digest != Some(digest.as_str()) => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    canvas.retain(|item| match item {
+        CanvasItem::ToolCall { call_id, .. } => !rejected_call_ids.contains(call_id),
+        CanvasItem::ToolOutput {
+            call_id,
+            project_context_snapshot_digest,
+            ..
+        } => {
+            !rejected_call_ids.contains(call_id)
+                && project_context_snapshot_digest
+                    .as_deref()
+                    .is_none_or(|digest| allowed_snapshot_digest == Some(digest))
+        }
+        _ => true,
+    });
 }
 
 /// Rendered-context digest to record on `model.call` when (and only when)

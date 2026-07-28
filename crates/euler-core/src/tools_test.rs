@@ -1,4 +1,92 @@
 use super::*;
+
+#[test]
+fn skill_read_is_exposed_only_when_frozen_skills_exist() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut registry = ToolRegistry::new(temp.path());
+    assert!(!registry
+        .model_tools()
+        .iter()
+        .any(|definition| definition.name == "skill_read"));
+
+    registry.set_frozen_skills([FrozenSkill {
+        snapshot_digest: "a".repeat(64),
+        name: "commit-writing".to_owned(),
+        scope: "user".to_owned(),
+        path: "user/commit-writing/SKILL.md".to_owned(),
+        body_digest: "digest".to_owned(),
+        body: "Keep commits focused.".to_owned(),
+    }]);
+
+    assert!(registry
+        .model_tools()
+        .iter()
+        .any(|definition| definition.name == "skill_read"));
+}
+
+#[test]
+fn skill_read_is_never_advertised_to_children() {
+    // Companions default to project-context `none`: even with frozen skills
+    // present, the child tool surface must not carry `skill_read`
+    // (docs/contracts/project-context.md).
+    let temp = tempfile::tempdir().expect("temp");
+    let mut registry = ToolRegistry::new(temp.path());
+    registry.set_frozen_skills([FrozenSkill {
+        snapshot_digest: "b".repeat(64),
+        name: "commit-writing".to_owned(),
+        scope: "project".to_owned(),
+        path: ".euler/skills/commit-writing/SKILL.md".to_owned(),
+        body_digest: "digest".to_owned(),
+        body: "Keep commits focused.".to_owned(),
+    }]);
+    assert!(registry
+        .model_tools()
+        .iter()
+        .any(|definition| definition.name == "skill_read"));
+    assert!(!registry
+        .child_model_tools()
+        .iter()
+        .any(|definition| definition.name == "skill_read"));
+}
+
+#[test]
+fn skill_read_returns_only_the_frozen_body_without_a_capability() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut registry = ToolRegistry::new(temp.path());
+    registry.set_frozen_skills([FrozenSkill {
+        snapshot_digest: "c".repeat(64),
+        name: "commit-writing".to_owned(),
+        scope: "user".to_owned(),
+        path: "user/commit-writing/SKILL.md".to_owned(),
+        body_digest: "digest".to_owned(),
+        body: "frozen body".to_owned(),
+    }]);
+
+    let execution = registry
+        .execute("skill_read", &json!({"name": "commit-writing"}))
+        .expect("read frozen skill");
+    assert_eq!(
+        execution.output,
+        concat!(
+            "[euler.project-context.v1] skill body: name=commit-writing scope=user ",
+            "source=user/commit-writing/SKILL.md digest=digest\n",
+            "    frozen body\n",
+            "[euler.project-context.v1] end skill body: name=commit-writing ",
+            "source=user/commit-writing/SKILL.md",
+        )
+    );
+    assert_eq!(
+        execution.project_context_snapshot_digest,
+        Some("c".repeat(64))
+    );
+    assert_eq!(registry.required_capability("skill_read"), None);
+    for invalid_name in ["missing", " commit-writing", "commit-writing "] {
+        assert!(matches!(
+            registry.execute("skill_read", &json!({"name": invalid_name})),
+            Err(ToolError::InvalidField("name"))
+        ));
+    }
+}
 use serde_json::json;
 use std::env;
 #[cfg(unix)]
@@ -1626,6 +1714,59 @@ fn tool_result_get_rehydrates_session_tool_result_by_event_id() {
         .expect("rehydrate");
     assert!(execution.output.contains("full file body"));
     assert!(execution.output.contains("rehydrated read_file"));
+}
+
+#[test]
+fn child_tool_result_get_enforces_and_preserves_project_context_classification() {
+    use euler_event::{object, EventEnvelope, EventKind};
+    let digest = "d".repeat(64);
+    let event = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "skill-call".into()),
+            ("name", "skill_read".into()),
+            ("ok", true.into()),
+            ("output", "classified frozen body".into()),
+            ("project_context_snapshot_digest", digest.clone().into()),
+        ]),
+    );
+    let input = json!({"event_id": event.id});
+    let registry = ToolRegistry::new(".");
+    let cancellation = CancellationToken::new();
+
+    let root = registry
+        .execute_with_events("tool_result_get", &input, std::slice::from_ref(&event))
+        .expect("root may rehydrate its result");
+    assert_eq!(root.project_context_snapshot_digest, Some(digest.clone()));
+
+    for allowed_digest in [None, Some("e".repeat(64))] {
+        let denied = registry.execute_with_events_cancellable_for_child(
+            "tool_result_get",
+            &input,
+            std::slice::from_ref(&event),
+            &cancellation,
+            allowed_digest.as_deref(),
+        );
+        assert!(matches!(denied, Err(ToolError::InvalidField("event_id"))));
+    }
+
+    let inherited = registry
+        .execute_with_events_cancellable_for_child(
+            "tool_result_get",
+            &input,
+            &[event],
+            &cancellation,
+            Some(&digest),
+        )
+        .expect("matching inherited snapshot may be rehydrated");
+    let ToolExecutionOutcome::Completed(inherited) = inherited else {
+        panic!("never-cancelled lookup completed");
+    };
+    assert!(inherited.output.contains("classified frozen body"));
+    assert_eq!(inherited.project_context_snapshot_digest, Some(digest));
 }
 
 #[test]

@@ -3400,7 +3400,9 @@ fn reteach_escalation_is_deterministic_across_sessions() {
 
 mod project_context_seam {
     use super::*;
-    use crate::project_context::ProjectContextBootstrap;
+    use crate::project_context::{
+        PinnedProjectContext, ProjectContextBootstrap, ProjectContextFold,
+    };
     use crate::redaction::SecretRedactor;
     use crate::resume::{fold_session, read_resume_prefix, resume_session_with_outcome};
     use euler_agents::{AgentBudget, ProjectContextPolicy};
@@ -3645,6 +3647,84 @@ mod project_context_seam {
             .find(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
             .expect("agent.spawn");
         assert_eq!(spawn.payload["project_context"], json!("none"));
+    }
+
+    #[test]
+    fn child_policy_filters_both_halves_of_classified_tool_rounds() {
+        let digest = "d".repeat(64);
+        let fold = ProjectContextFold::Admitted(Box::new(PinnedProjectContext::for_test(
+            "snapshot",
+            digest.clone(),
+            "rendered",
+            "e".repeat(64),
+        )));
+        let classified_call = CanvasItem::ToolCall {
+            event_id: "classified-call-event".to_owned(),
+            call_id: "classified-call".to_owned(),
+            name: "skill_read".to_owned(),
+            input: json!({"name": "review"}),
+        };
+        let classified_output = CanvasItem::ToolOutput {
+            event_id: "classified-output-event".to_owned(),
+            call_id: "classified-call".to_owned(),
+            name: "skill_read".to_owned(),
+            ok: true,
+            output: "frozen project guidance".to_owned(),
+            error: None,
+            exit_code: None,
+            project_context_snapshot_digest: Some(digest.clone()),
+            compacted: false,
+            demoted: false,
+        };
+        let ordinary_call = CanvasItem::ToolCall {
+            event_id: "ordinary-call-event".to_owned(),
+            call_id: "ordinary-call".to_owned(),
+            name: "read_file".to_owned(),
+            input: json!({"path": "README.md"}),
+        };
+        let ordinary_output = CanvasItem::ToolOutput {
+            event_id: "ordinary-output-event".to_owned(),
+            call_id: "ordinary-call".to_owned(),
+            name: "read_file".to_owned(),
+            ok: true,
+            output: "ordinary result".to_owned(),
+            error: None,
+            exit_code: None,
+            project_context_snapshot_digest: None,
+            compacted: false,
+            demoted: false,
+        };
+        let base = vec![
+            classified_call,
+            classified_output,
+            ordinary_call,
+            ordinary_output,
+        ];
+
+        let mut isolated = base.clone();
+        apply_child_project_context_policy(&mut isolated, ProjectContextPolicy::None, &fold);
+        assert_eq!(isolated.len(), 2);
+        assert!(isolated.iter().all(|item| {
+            matches!(
+                item,
+                CanvasItem::ToolCall { call_id, .. }
+                    | CanvasItem::ToolOutput { call_id, .. }
+                    if call_id == "ordinary-call"
+            )
+        }));
+
+        let mut inherited = base;
+        apply_child_project_context_policy(&mut inherited, ProjectContextPolicy::Inherit, &fold);
+        assert_eq!(
+            inherited
+                .iter()
+                .filter(|item| matches!(item, CanvasItem::ToolCall { .. }))
+                .count(),
+            2
+        );
+        assert!(inherited
+            .iter()
+            .any(|item| matches!(item, CanvasItem::ProjectContext { .. })));
     }
 
     #[test]

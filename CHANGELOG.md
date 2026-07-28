@@ -6,6 +6,24 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Project context and skills
+
+- Euler now discovers user-global skills from `${EULER_HOME}/skills/` and
+  project skills from `.euler/skills/`, freezes them in schema-v2 session
+  snapshots, renders a compact catalog, and exposes snapshot-backed
+  `skill_read` with ordinary tool provenance. Project skills use repository
+  acknowledgment; user-global skills remain available when repository context
+  is disabled. The catalog and `skill_read` are root-driver-only until
+  `inherit` child wiring lands. The acknowledgment digest now covers only the
+  project-scoped view of the manifest, so every previously acknowledged
+  repository re-prompts once after upgrading (fail closed — nothing loads
+  until re-accepted); afterwards user-skill changes never re-prompt.
+  Catalog bounds now omit whole skills with explicit diagnostics instead of
+  silently hiding accepted entries, frozen bodies use spoof-resistant
+  core framing, user-only manifests receive the same context-budget checks,
+  and child `none | inherit` policy is enforced for prior skill-result canvas
+  rounds and `tool_result_get` rehydration.
+
 ### Steering reliability
 
 - Mid-turn steering and queued follow-ups now preserve FIFO order, hydrate at

@@ -15,17 +15,18 @@ store ("Acknowledgment record" section in full), the interactive
 acknowledgment card and non-interactive fail-closed behavior, and resume
 relocation consent ("Resume relocation and consent" in full: the relocation
 card, `--accept-relocation`, the `project.context.relocated` event, the
-permission epoch, and the `new_root` projection). NOT yet implemented (still
-bound shape): skills and `skill_read` ("Skills" section, the skill rows of
-the bounds table, and skill fields of the snapshot), the always-on catalog,
-explicit reload, and guardian/worker `inherit` wiring (the child policy
-field exists, but today every child uses the `none` default). Issue #180
+permission epoch, and the `new_root` projection), skills and `skill_read`
+("Skills" section, the skill rows of the bounds table, skill fields of the
+snapshot, and the always-on catalog). NOT yet implemented (still bound
+shape): explicit reload, and guardian/worker `inherit` wiring (the child
+policy field exists, but today every child uses the `none` default — so the
+catalog and `skill_read` are root-driver-only in practice). Issue #180
 tracks the remaining slices, and this paragraph shrinks as they land.
 
 ## Definition and non-authority
 
 Project context is repository-authored guidance (`EULER.md` files and
-`.agents/skills/` skills) admitted to a root driver session under
+`.euler/skills/` skills) admitted to a root driver session under
 core-controlled discovery, framing, bounds, redaction, persistence, and
 replay. It is data, never authority: no project-context text or frontmatter
 can grant or widen a capability, approve a tool invocation, install a grant,
@@ -36,7 +37,7 @@ permission machinery as one suggested by an ordinary user message.
 
 ## Discovery and precedence
 
-- Recognized paths: `EULER.md` (exact case) and `.agents/skills/<name>/SKILL.md`
+- Recognized paths: `EULER.md` (exact case) and `.euler/skills/<name>/SKILL.md`
   along the ordered directory chain from the project discovery root (nearest
   ancestor with an exact regular `.git` file or directory; a symlinked `.git`
   is not a marker) through `SessionConfig.root`, inclusive. No Git marker
@@ -95,6 +96,10 @@ Selection and diagnostics are deterministic: lexicographic ordering of
 normalized relative paths, no dependence on filesystem iteration order,
 duplicate detection before catalog admission, and more-specific sources win
 admission priority when the aggregate instruction budget forces a choice.
+Catalog selection measures the exact core-rendered catalog entry, including
+scope and source identity. Every admitted skill appears in the rendered
+catalog; a skill that would cross the catalog bound is omitted whole with
+`skill_catalog_limit_exceeded`, never accepted and then silently hidden.
 
 ## Preflight and redaction
 
@@ -182,14 +187,18 @@ per-project trust store.
 - `project.context.snapshot` (durable, versioned) carries at least: load
   policy and resolution reason, acknowledgment basis, portable candidate
   digest, local workspace identity, deterministic ordering, diagnostic counts,
-  and schema version. An admitted snapshot additionally carries accepted
+  and schema version. Schema v2 additionally carries `manifest_admitted` and
+  `skill_count`; the v1 and v2 key sets are exact, diagnostics must use the
+  same schema version as their owning snapshot, and mixed-version or
+  version-inappropriate fields reject replay. A model-facing manifest carries accepted
   `EULER.md` sources (relative path, effective byte length, domain-separated
   SHA-256 digest, effective content) and accepted skills (name, description,
-  relative path, body length, body digest, frozen body). A disabled, declined,
-  or unacknowledged snapshot persists no candidate body, per-source content
-  hash, exact content length, parser excerpt, or other reversible content;
-  only the portable candidate digest, bounded normalized identities, counts,
-  and content-free reason codes remain.
+  scope, relative path, body length, body digest, frozen body). A disabled,
+  declined, or unacknowledged project persists no repository-owned body,
+  per-source content hash, exact content length, parser excerpt, or other
+  reversible repository content. It may retain admitted user-global skills;
+  otherwise only the portable candidate digest, bounded normalized identities,
+  counts, and content-free reason codes remain.
 - The admitted manifest is serialized once as versioned UTF-8 snapshot JSON in
   one top-level payload string. When it exceeds the provenance threshold that
   complete string is one content-addressed blob; individual bodies are not
@@ -255,10 +264,12 @@ per-project trust store.
   consent (see "Resume relocation and consent" below); headless resume and the
   phase-2 interim fail closed with the plain-language remediation. Older Euler
   versions fail safe on the unknown event kind and cannot resume such sessions.
-- The latest snapshot event in durable sequence is authoritative. An admitted
-  latest snapshot yields exactly one pinned item; a later disabled or declined
-  snapshot is a tombstone and yields none. A malformed latest snapshot rejects
-  resume or request assembly and never resurrects an older admitted snapshot.
+- The latest snapshot event in durable sequence is authoritative. A latest
+  snapshot with a model-facing manifest yields exactly one pinned item,
+  including a repository-disabled snapshot containing user-global skills. A
+  snapshot without a manifest is a tombstone and yields none. A malformed
+  latest snapshot rejects resume or request assembly and never resurrects an
+  older manifest.
 - Independent sessions get independent snapshots; there is no process-global
   or workspace-global mutable project-context cache.
 
@@ -404,17 +415,17 @@ and it carries no old-root approvals forward.
 
 ## Framing and canvas admission
 
-Repository bytes never enter `ModelRequest.instructions`; that field is
-byte-identical with or without project context. Project context is a typed,
-provider-neutral input with a pinned canvas projection, rendered below
-system/developer policy as attributed context. Core owns framing on all
-three admission paths, and the rules are identical for each:
+Guidance bytes never enter `ModelRequest.instructions`; that field is
+byte-identical with or without project context or user-global skills. The
+admitted guidance is a typed, provider-neutral input with a pinned canvas
+projection, rendered below system/developer policy as attributed context.
+Core owns framing on all three admission paths:
 
 1. `EULER.md` sources: core-generated header with normalized path and
    repository-guidance classification; every content line indented/escaped so
    source text can never occupy a core marker position.
-2. The always-on skill catalog: compact core-framed name, description, and
-   source identity only.
+2. The always-on skill catalog: compact core-framed name, scope, description,
+   and source identity only; every admitted skill has exactly one row.
 3. `skill_read` results: the frozen body returns through ordinary
    `tool.call`/`tool.result` events with the same core-framed header (skill
    name, source identity) and indentation rules as startup sources.
@@ -426,8 +437,9 @@ but must not trim, normalize, combine, silently omit, or reorder its content.
 An adapter unable to represent the item fails before dispatch. Core framing is
 versioned and performed once before the rendered-context digest is computed.
 
-Pinned project context counts against both the canvas byte budget and a known
-model context limit and does not silently vanish under compaction. The
+Pinned guidance, including a user-skill-only manifest when repository context
+is off, counts against both the canvas byte budget and a known model context
+limit and does not silently vanish under compaction. The
 deterministic context-limit proxy is four rendered UTF-8 bytes per token. At
 snapshot admission, required tokens are
 `ceil((fixed_instruction_bytes + framed_project_context_bytes) / 4) + 1024 +
@@ -451,11 +463,14 @@ truncated or demoted to make either equation pass.
   unknown fields are inert.
 - Duplicate normalized names exclude every claimant with an ambiguity
   diagnostic naming their paths; no first-wins or nearest-wins.
-- `skill_read` accepts a catalogued name (never a path) and returns the
-  session's frozen body and source identity. It re-reads nothing, executes
-  nothing, grants nothing, and is permission-ungated because it returns
-  already-admitted snapshot bytes; call and result are ordinary provenance
-  events. Supporting files stay governed by existing tools and permissions.
+- `skill_read` accepts an exact catalogued name (never a path and with no
+  whitespace normalization) and returns the session's frozen body beneath a
+  core-owned header and indentation, so hostile body text cannot occupy a
+  core marker position. It re-reads nothing, executes nothing, grants nothing,
+  and is permission-ungated because it returns already-admitted snapshot
+  bytes; call and result are ordinary provenance events carrying the owning
+  candidate snapshot digest. Supporting files stay governed by existing tools
+  and permissions.
 
 ## Child agents and the guardian
 
@@ -474,6 +489,11 @@ Every startup instruction item, catalog item, and `skill_read` result carries
 a project-context classification and snapshot digest through its event and
 canvas projection. Child request assembly filters that complete class unless
 `project_context` is `inherit`, even when `include_parent_canvas` is true. A
+filtered tool result removes its paired call as well, preserving provider
+tool-pair shape. `tool_result_get` enforces the same boundary against the
+canonical event stream: a `none` child cannot rehydrate a classified result,
+and an inheriting child can rehydrate only results carrying its exact snapshot
+digest; the rehydrated result preserves that classification. A
 missing policy field in an event written before this field existed decodes as
 `none`; an unknown value is invalid and never falls through to inheritance.
 Parallel inheriting children share one immutable pre-fan-out snapshot.

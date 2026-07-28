@@ -768,6 +768,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
             output: "alpha".to_owned(),
             error: None,
             exit_code: None,
+            project_context_snapshot_digest: None,
             compacted: false,
             demoted: false,
         }
@@ -782,6 +783,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
             output: "beta".to_owned(),
             error: None,
             exit_code: None,
+            project_context_snapshot_digest: None,
             compacted: false,
             demoted: false,
         }
@@ -1970,6 +1972,7 @@ fn pairs_tool_call_with_selected_output() {
                 output: "hello world".to_owned(),
                 error: None,
                 exit_code: None,
+                project_context_snapshot_digest: None,
                 compacted: false,
                 demoted: false,
             },
@@ -2139,6 +2142,7 @@ fn duplicate_call_ids_keep_first_pair() {
                 output: "first".to_owned(),
                 error: None,
                 exit_code: None,
+                project_context_snapshot_digest: None,
                 compacted: false,
                 demoted: false,
             },
@@ -2263,12 +2267,12 @@ fn prefolded_assembly_uses_the_callers_project_context_snapshot() {
         EventKind::USER_MESSAGE,
         object([("content", "hello".into())]),
     )];
-    let pinned = PinnedProjectContext {
-        snapshot_event_id: "snapshot-from-caller".to_owned(),
-        candidate_digest: "candidate-digest".to_owned(),
-        rendered: "[euler.project-context.v1]\n  guidance".to_owned(),
-        rendered_digest: "rendered-digest".to_owned(),
-    };
+    let pinned = PinnedProjectContext::for_test(
+        "snapshot-from-caller",
+        "candidate-digest",
+        "[euler.project-context.v1]\n  guidance",
+        "rendered-digest",
+    );
 
     let canvas = assemble_canvas_prefolded(
         &events,

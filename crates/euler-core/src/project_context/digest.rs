@@ -8,6 +8,8 @@
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+use super::manifest::SkillScope;
+
 /// Domain tag for the portable candidate digest over the canonical manifest
 /// encoding (version 1).
 pub(crate) const CANDIDATE_DOMAIN_V1: &str = "euler.project-context.candidate.v1";
@@ -15,6 +17,8 @@ pub(crate) const CANDIDATE_DOMAIN_V1: &str = "euler.project-context.candidate.v1
 pub(crate) const SOURCE_DOMAIN_V1: &str = "euler.project-context.source.v1";
 /// Domain tag for the rendered (core-framed) context digest (version 1).
 pub(crate) const RENDERED_DOMAIN_V1: &str = "euler.project-context.rendered.v1";
+/// Domain tag for one frozen skill body and its stable catalog identity.
+pub(crate) const SKILL_DOMAIN_V1: &str = "euler.project-context.skill.v1";
 /// Domain tag for the local workspace identity digest. The algorithm hashes
 /// the raw `OsStr` bytes of the canonicalized workspace root on Unix hosts
 /// with no lossy display conversion or Unicode normalization. A future host
@@ -45,6 +49,18 @@ pub(crate) fn candidate_digest_v1(manifest_json: &str) -> String {
 /// post-redaction content.
 pub(crate) fn source_digest_v1(rel_path: &str, content: &str) -> String {
     domain_separated_digest(SOURCE_DOMAIN_V1, &[rel_path.as_bytes(), content.as_bytes()])
+}
+
+pub(crate) fn skill_digest_v1(scope: SkillScope, name: &str, path: &str, body: &str) -> String {
+    domain_separated_digest(
+        SKILL_DOMAIN_V1,
+        &[
+            scope.as_str().as_bytes(),
+            name.as_bytes(),
+            path.as_bytes(),
+            body.as_bytes(),
+        ],
+    )
 }
 
 /// Digest of the exact rendered (core-framed) project-context bytes included

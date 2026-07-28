@@ -48,12 +48,10 @@ A repository can commit an ignored path deliberately, and users can choose a
 different ignore policy. Therefore `.gitignore` is convenience, never an
 authorization boundary. This decision does not redesign `.euler/`.
 
-Multiple coding agents already discover the cross-agent `.agents/skills/`
-convention alongside their own product-specific skill directories, using
-`SKILL.md` packages and progressive disclosure: compact name/description
-metadata is always available, while the complete procedure is loaded on
-demand. Using the shared convention lets one committed skill work across every
-tool that follows it.
+Euler needs both user-global skills that follow one Euler installation and
+project skills that can be reviewed and shared with a repository. Both use the
+same `SKILL.md` package format while preserving Euler's stricter permission,
+provenance, event-sourcing, and multi-agent boundaries.
 
 Euler has stronger replay requirements than a conventional prompt loader. The
 next model request should be reconstructable from the canonical session event
@@ -105,7 +103,7 @@ field has no authorization meaning in Euler.
 The fixed Euler-owned model instructions will state this precedence compactly.
 Enforcement remains mechanical; prompt wording is not the security boundary.
 
-### 2. Use `EULER.md` and `.agents/skills/`
+### 2. Use `EULER.md` and Euler-native skill roots
 
 The first release will recognize:
 
@@ -121,15 +119,24 @@ EULER.md
 ```
 
 `EULER.md` is the canonical, exact-case repository instruction filename.
-`.agents/skills/` is the canonical shareable project-skill location.
+The canonical roots are:
 
-The first release will not discover:
+- user-global: `${EULER_HOME}/skills/<name>/SKILL.md` (normally
+  `~/.euler/skills/<name>/SKILL.md`);
+- project: `<project>/.euler/skills/<name>/SKILL.md`.
 
-- `.euler/skills/`;
+Both roots use the same package grammar. User-global skills are user-owned and
+do not require project acknowledgment. Project skills are project-authored
+context and use the same acknowledgment boundary as `EULER.md`. A project
+skill may be tracked and shared through Git or ignored for a private checkout;
+version-control state does not affect discovery.
+
+This slice does not discover:
+
 - other tools' product-native skill roots;
 - `AGENTS.md` or `CLAUDE.md` as instruction fallbacks;
 - a user-global `EULER.md`;
-- user-global `~/.agents/skills/`.
+- `.agents/skills/` compatibility roots.
 
 Those are compatibility or user-configuration decisions that can be added
 later without changing the repository format selected here.
@@ -301,8 +308,10 @@ redacted project content is identical.
 
 There is no implicit reload in the first release. A future explicit reload may
 append a new snapshot event; it must never rewrite the earlier snapshot.
-The latest snapshot event is authoritative: a disabled snapshot is a tombstone
-and cannot resurrect an older admitted snapshot after compaction or resume.
+The latest snapshot event is authoritative: a snapshot without a model-facing
+manifest is a tombstone and cannot resurrect an older admitted manifest after
+compaction or resume. A repository-disabled snapshot may still pin
+user-global skills under the owner amendment below.
 
 ### 7. Resume from provenance, never from current project files
 
@@ -421,11 +430,11 @@ identity through ordinary `tool.call` and `tool.result` events. It does not
 re-read the filesystem, grant a capability, execute a script, install a
 dependency, or automatically read references and assets.
 
-A `skill_read` result is repository-authored text entering the canvas
-mid-session, so the returned body receives the same core-generated framing and
-repository-guidance classification as startup sources: a core-framed header
-carrying the skill's name and source identity, content indented so body text
-can never occupy a core marker position, and the same adversarial
+A `skill_read` result is user- or repository-authored guidance entering the
+canvas mid-session, so the returned body receives the same core-generated
+framing and project-context classification as startup sources: a core-framed
+header carrying the skill's name and source identity, content indented so body
+text can never occupy a core marker position, and the same adversarial
 fake-framing tests. `skill_read` itself is permission-ungated: it returns
 already-admitted frozen snapshot bytes and reads nothing from the filesystem,
 so there is no new authority to gate; the call and result remain ordinary
@@ -696,6 +705,34 @@ The implementation is not complete without tests covering:
   permission events naming the real policy basis;
 - regression that repository `.euler/grants.json` remains inert without
   matching user-owned consent.
+
+
+### 2026-07-25 owner amendment: Euler-native skill scopes
+
+This amendment supersedes the earlier `.agents/skills/` path choice for the
+implemented slice. Euler discovers user-global skills from
+`${EULER_HOME}/skills/` and project skills from `<project>/.euler/skills/`.
+`.agents/skills/` compatibility is deferred.
+
+User-global and project skills share the same package grammar but differ in
+trust and acknowledgment:
+
+- user-global skills are user-owned, remain available when project context is
+  off, and never participate in a project's acknowledgment digest;
+- project skills are repository-authored context, participate in the project
+  acknowledgment digest, and are admitted or excluded with project context;
+- duplicate normalized names across either root exclude every claimant as
+  ambiguous; neither root overrides the other;
+- both scopes are frozen in snapshot schema v2. Repository status and admitted
+  manifest presence are separate fields so a disabled project can still carry
+  user-global skills;
+- `skill_read(name)` reads only the frozen snapshot body, requires no
+  capability, records ordinary tool provenance, and never rereads disk.
+
+The implementation bounds one `SKILL.md` at 64 KiB, all admitted skill bodies
+at 1 MiB, accepted skills at 64, traversed skill directories at 512, traversal
+depth at 6, normalized names at 64 bytes, descriptions at 1 KiB, and the
+always-on catalog at 16 KiB. These are safety limits, not permission grants.
 
 ## Consequences
 
