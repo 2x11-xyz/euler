@@ -7,6 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Schema version for the working-state projection.
 pub const PROJECTION_SCHEMA_VERSION: &str = "1";
 pub const COMPACTION_POLICY_VERSION: &str = "1";
+const MAX_GOAL_BYTES: usize = 4_096;
+const MAX_PLAN_BYTES: usize = 8_192;
+const MAX_COMPILER_STATE_BYTES: usize = 4_096;
+const MAX_PROJECTION_LIST_ITEMS: usize = 64;
+const MAX_PROJECTION_LIST_ITEM_BYTES: usize = 1_024;
+const MAX_PROJECTION_JSON_BYTES: usize = 32_768;
 
 /// Check if compaction should be triggered based on token usage.
 ///
@@ -58,6 +64,29 @@ impl WorkingStateProjection {
         serde_json::from_str(json).ok()
     }
 
+    /// Parse a model-produced projection only when every schema field is
+    /// present and no unrelated fields are mixed in. The general replay
+    /// parser above remains tolerant of older persisted projection blobs,
+    /// but a shadow candidate must not mistake an echoed JSON Schema (or
+    /// some other arbitrary object) for an empty valid summary.
+    pub(crate) fn from_model_json(json: &str) -> Option<Self> {
+        const FIELDS: [&str; 6] = [
+            "goal",
+            "plan",
+            "compiler_state",
+            "modified_files",
+            "decisions",
+            "working_set",
+        ];
+        let value = serde_json::from_str::<Value>(json).ok()?;
+        let object = value.as_object()?;
+        if object.len() != FIELDS.len() || !FIELDS.iter().all(|field| object.contains_key(*field)) {
+            return None;
+        }
+        let projection: Self = serde_json::from_value(value).ok()?;
+        projection.model_bounds_valid().then_some(projection)
+    }
+
     /// Serialize to JSON for storage in projection_blob.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("projection serialization")
@@ -80,34 +109,76 @@ impl WorkingStateProjection {
             "properties": {
                 "goal": {
                     "type": "string",
+                    "maxLength": MAX_GOAL_BYTES,
                     "description": "The user's overriding objective for this session."
                 },
                 "plan": {
                     "type": "string",
+                    "maxLength": MAX_PLAN_BYTES,
                     "description": "Steps done, in progress, and blocked."
                 },
                 "compiler_state": {
                     "type": "string",
+                    "maxLength": MAX_COMPILER_STATE_BYTES,
                     "description": "Unresolved compiler/build errors, or empty if clean."
                 },
                 "modified_files": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "maxItems": MAX_PROJECTION_LIST_ITEMS,
+                    "items": {
+                        "type": "string",
+                        "maxLength": MAX_PROJECTION_LIST_ITEM_BYTES
+                    },
                     "description": "Files modified during this session."
                 },
                 "decisions": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "maxItems": MAX_PROJECTION_LIST_ITEMS,
+                    "items": {
+                        "type": "string",
+                        "maxLength": MAX_PROJECTION_LIST_ITEM_BYTES
+                    },
                     "description": "Key decisions and constraints established."
                 },
                 "working_set": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "maxItems": MAX_PROJECTION_LIST_ITEMS,
+                    "items": {
+                        "type": "string",
+                        "maxLength": MAX_PROJECTION_LIST_ITEM_BYTES
+                    },
                     "description": "Files currently relevant to the working context."
                 }
             }
         })
     }
+
+    pub(crate) fn model_bounds_valid(&self) -> bool {
+        self.goal.len() <= MAX_GOAL_BYTES
+            && self.plan.len() <= MAX_PLAN_BYTES
+            && self.compiler_state.len() <= MAX_COMPILER_STATE_BYTES
+            && projection_list_is_bounded(&self.modified_files)
+            && projection_list_is_bounded(&self.decisions)
+            && projection_list_is_bounded(&self.working_set)
+            && self.to_json().len() <= MAX_PROJECTION_JSON_BYTES
+    }
+
+    pub(crate) fn persisted_blob_valid(blob: &str) -> bool {
+        if blob.len() > MAX_PROJECTION_JSON_BYTES {
+            return false;
+        }
+        // V1 predates structured projection JSON and permits bounded inline
+        // text. JSON-shaped V1 blobs, however, must satisfy the current host
+        // parser rather than bypassing field bounds as opaque text.
+        !blob.trim_start().starts_with('{') || Self::from_model_json(blob).is_some()
+    }
+}
+
+fn projection_list_is_bounded(items: &[String]) -> bool {
+    items.len() <= MAX_PROJECTION_LIST_ITEMS
+        && items
+            .iter()
+            .all(|item| item.len() <= MAX_PROJECTION_LIST_ITEM_BYTES)
 }
 
 /// Returns the system prompt fragment for requesting a working-state
@@ -119,7 +190,8 @@ pub fn projection_prompt(event_summary: &str) -> String {
 }
 
 /// Build a best-effort projection from structured event payloads.
-/// This is a temporary non-model fallback for automatic compaction.
+/// Callers may use this as an explicit deterministic fallback; the automatic
+/// pipeline uses the validated shadow-model path instead.
 pub fn heuristic_projection(events: &[EventEnvelope]) -> WorkingStateProjection {
     let goal = events
         .iter()
@@ -158,8 +230,19 @@ pub fn build_compaction_candidate(
         return None;
     }
 
+    // Retain up to the configured number of recent tool results. Requiring
+    // exactly `keep_recent_tokens` made projection compaction impossible for
+    // conversational sessions (and for early coding sessions with fewer
+    // tools), even when their model context was already exhausted.
+    let retained_tool_results = keep_recent_tokens.min(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+            .count(),
+    );
     let boundary = (1..events.len() - 1).rev().find(|index| {
-        is_safe_boundary(events, *index) && tool_results_after(events, *index) >= keep_recent_tokens
+        is_safe_boundary(events, *index)
+            && tool_results_after(events, *index) >= retained_tool_results
     })?;
 
     Some(CompactionCandidate {

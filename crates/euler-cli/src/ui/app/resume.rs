@@ -42,6 +42,9 @@ impl AppCore {
         if current_session_id == session_id {
             return self.teach_notice(format!("already using session {session_id}"));
         }
+        if let Err(error) = self.cancel_idle_compaction_for_lifecycle("session resume") {
+            return self.error_item(format!("resume failed: {error}"));
+        }
 
         match self.build_tui_resume(&session_id) {
             Ok(resume) => self.accept_tui_resume(session_id, resume),

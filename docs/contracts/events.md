@@ -237,6 +237,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   digest, recorded only when those exact core-framed bytes occur in the
   provider-neutral request being dispatched (no TOCTOU between snapshot and
   prompt assembly); absent whenever the request carries no project context.
+  A shadow projection request adds `purpose: "compaction"`,
+  `tools_enabled: false`, and `shadow_snapshot_end_id`. It is canonical
+  provenance and cost-bearing model activity, but is excluded from the driver
+  transcript/canvas and active-context usage reading.
 - `model.effort.changed`: `from_effort`, `to_effort`, `reason`.
   (provider-scoped string, emitted and stored verbatim — core does not
   normalize; examples non-exhaustive: `"low"` | `"medium"` | `"high"`, with
@@ -252,6 +256,9 @@ envelope `v` per `docs/contracts/persistence.md`.
   leaves all four buckets absent when the provider reports only an aggregate
   cache-write count whose TTL cannot be established; it must not assign that
   count to a cheaper bucket. Optional
+  `purpose: "compaction"` matches the originating shadow `model.call`; its
+  usage contributes to session cost but never replaces the driver canvas's
+  active-context reading. Optional
   `cost` is a V1 persisted quote with `schema_version: 1`, `currency: "USD"`,
   `unit: "picodollar"`, exact integer `input_picos`, `output_picos`,
   `cache_read_picos`, `cache_write_5m_picos`, `cache_write_1h_picos`, and
@@ -272,7 +279,8 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `model.reasoning`: `provider`, `model`, `fidelity`
   (`raw` | `summary` | `opaque`), `content` (empty for opaque),
   optional provider-opaque `artifact` (signature/encrypted item,
-  blob-externalized when large).
+  blob-externalized when large), and optional `purpose: "compaction"` when
+  parented to a shadow projection call.
 - `model.delta`: `kind` (`text` | `reasoning`), `delta`. Runtime-only.
 - `model.switched`: `from_provider`, `from_model`, `to_provider`,
   `to_model`, `reason`. Provider fields are stable provider ids; model
@@ -291,8 +299,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   latest `model.result.usage`; `limit_tokens` is the model's context
   window from provider/model configuration; `threshold` is the configured
   fraction of `limit_tokens` that triggers the stop. Emitted once; the
-  session then stops cleanly (survivability first; automatic compaction follows). If a
-  provider stops with `max_tokens` mid-call, that is recorded in
+  session then stops cleanly. Automatic compaction is attempted before this
+  stop; an already-running shadow candidate is awaited at the hard margin,
+  and only a failed, invalid, or unavailable candidate falls through to
+  `context.limit`. If a provider stops with `max_tokens` mid-call, that is recorded in
   `model.result.stop_reason`; `context.limit` may still follow at the
   boundary.
 - `context.slot.updated`: `extension_id`, `slot`, `content`. Records a
@@ -454,6 +464,8 @@ envelope `v` per `docs/contracts/persistence.md`.
   `used_tokens` and `limit_tokens` are included when provider usage and a
   configured context limit are known. Snapshot fields are assembly telemetry
   for the next model request; they do not rewrite provenance history.
+  A fixed shadow-compaction snapshot adds `purpose: "compaction"` and
+  `shadow_snapshot_end_id`.
 - `canvas.policy.changed`: `automatic`, `stubs`, and `budget_bytes`. It records
   a user/configuration change to the two live retention switches. The event is
   session-level control metadata; it does not change or delete provenance.
@@ -465,7 +477,13 @@ envelope `v` per `docs/contracts/persistence.md`.
   the first event kept verbatim after the projection, policy/schema versions
   name the compaction and projection formats, `projection_blob` carries the
   projection text or hash reference, and `validation_result` is `pass` or a
-  short validation outcome.
+  short validation outcome. Layer-1 swaps add
+  `layer1_compacted_event_ids`; those IDs accumulate after the latest full
+  projection. A model-produced full projection adds `summary_source: "model"`,
+  `compactor_provider`, `compactor_model`, and `compaction_elapsed_ms`.
+  Only a structurally valid swap invalidates the preceding provider-usage
+  sample and context-limit latch. Live canvas assembly, live accounting, and
+  resume folding share one validator; malformed swaps remain inert provenance.
 - `canvas.candidate.discarded`: `reason`, `policy_version`. It records a
   rejected shadow compaction candidate at the turn boundary; `reason` is a
   short non-secret validation failure and `policy_version` names the
@@ -474,6 +492,11 @@ envelope `v` per `docs/contracts/persistence.md`.
   `transport` | `rate_limit` | `rejected` | `stream_truncation` |
   `internal`) carrying the provider error taxonomy from
   `docs/contracts/provider.md` when the source is a provider. When
+  a shadow projection request fails, `purpose: "compaction"` attributes the
+  error to that request; it remains provenance-only while the TUI reports the
+  compact failure without replacing the driver transcript or driver-failure
+  HUD. Session-owned cancellation uses `source: "session"` with the same
+  purpose and terminally closes the shadow `model.call`. When
   `source` is `extension`, optional `extension_id`, `command`, and
   `failure` (`command_error` | `panic`) fields attribute the host-observed
   failure. Extension error messages in persisted events are host-generated
@@ -589,9 +612,9 @@ Cardinality and ordering invariants:
 
 - exactly one `session.start` per session, always the first persisted
   event;
-- exactly one `model.result` per `model.call`;
+- exactly one terminal `model.result` or `error` per `model.call`;
 - zero or more `model.reasoning` events per `model.call`, emitted in
-  provider order before their `model.result`;
+  provider order before its terminal event;
 - `assistant.message` is emitted after its `model.result`, and only for
   turns that end without tool calls.
 - an accepted `model.switched` is emitted after the previous turn's final
@@ -603,7 +626,9 @@ Cardinality and ordering invariants:
   tool-execution round, or already-started user turn.
 - zero or more `canvas.swap` events may appear per session; each marks a
   compaction boundary and is replay-critical for reconstructing which canvas
-  range was active.
+  range was active. The latest valid full projection owns the compacted prefix;
+  subsequent layer-1 swaps accumulate over its retained frontier until another
+  full projection supersedes it.
 - zero or more `agent.message` events may appear for a live background spawn
   while its `BackgroundAgent` handle exists. Queue acceptance is volatile; only
   drained `agent.message` events are durable and queryable after resume.

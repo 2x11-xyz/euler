@@ -645,6 +645,46 @@ fn transcript_model_result_fallback_dedupes_only_same_content_assistant_message(
 }
 
 #[test]
+fn shadow_compaction_model_activity_never_owns_visible_transcript_state() {
+    let mut state = TranscriptState::default();
+    state.push_event(event(
+        EventKind::MODEL_RESULT,
+        object([("content", "driver answer".into())]),
+    ));
+    state.push_event(event(
+        EventKind::MODEL_RESULT,
+        object([
+            ("content", "WorkingStateProjection internals".into()),
+            ("purpose", "compaction".into()),
+        ]),
+    ));
+    state.push_event(event(
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("message", "shadow request failed".into()),
+            ("purpose", "compaction".into()),
+        ]),
+    ));
+
+    assert_eq!(state.project_latest_for_ui(), None);
+    assert_eq!(
+        state.items(),
+        vec![TranscriptItem::AssistantMessage("driver answer".to_owned())]
+    );
+
+    state.push_event(event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "driver answer".into())]),
+    ));
+    assert_eq!(
+        state.items(),
+        vec![TranscriptItem::AssistantMessage("driver answer".to_owned())],
+        "hidden compaction results do not break driver fallback deduplication"
+    );
+}
+
+#[test]
 fn transcript_model_result_same_content_then_followup_assistant_keeps_order() {
     let mut state = TranscriptState::default();
     state.push_event(event(

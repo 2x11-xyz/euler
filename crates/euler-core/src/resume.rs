@@ -138,7 +138,21 @@ pub fn fold_session(
                     fold_reasoning_effort(reasoning_effort, std::slice::from_ref(event))?;
             }
             EventKind::MODEL_RESULT => {
-                latest_model_usage_used_tokens = event.payload.get("usage").and_then(used_tokens);
+                if event.payload.get("purpose").and_then(Value::as_str) != Some("compaction") {
+                    latest_model_usage_used_tokens =
+                        event.payload.get("usage").and_then(used_tokens);
+                }
+            }
+            // Provider usage describes the request that just finished. A
+            // successful atomic canvas replacement establishes a new input
+            // whose size is unknown until its first model result; carrying
+            // the old reading across the swap can immediately re-stop an
+            // already-compacted session on resume.
+            EventKind::CANVAS_SWAP => {
+                if crate::canvas::canvas_swap_is_valid(&events, event) {
+                    latest_model_usage_used_tokens = None;
+                    context_limit_emitted = None;
+                }
             }
             EventKind::CONTEXT_LIMIT => context_limit_emitted = Some(target_at_event.clone()),
             EventKind::PERMISSION_DECISION => fold_session_permission_decision(

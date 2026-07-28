@@ -48,9 +48,10 @@ use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseE
 use euler_core::permissions::{PermissionRequest, PermissionRequestBatch};
 use euler_core::{
     event_is_runtime_only, fold_session, load_extension_package, read_resume_prefix,
-    resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, EulerHome,
-    ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget, ProjectContextBootstrap,
-    ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
+    resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, CompactionStatus,
+    EulerHome, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
+    ProjectContextBootstrap, ProvenanceWriter, ReasoningEffort, ScopePattern, Session,
+    SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -274,6 +275,9 @@ pub struct AppCore {
     /// state lives inside the queue so the worker respects queue editing
     /// and interrupts.
     queued_inputs: Arc<euler_core::SteeringQueue>,
+    /// Edge-triggered `/compact` request shared with the root turn worker.
+    /// The session consumes it at the next settled model-round boundary.
+    compaction_request: Arc<AtomicBool>,
     queued_selection: Option<usize>,
     in_flight_label: Option<String>,
     /// Persona/name of the in-flight companion run, for approval panel tagging.
@@ -977,6 +981,7 @@ impl AppCore {
             pending_runs: VecDeque::new(),
             code_swarm_models: load_code_swarm_models_startup(),
             queued_inputs: Arc::new(euler_core::SteeringQueue::default()),
+            compaction_request: Arc::new(AtomicBool::new(false)),
             queued_selection: None,
             in_flight_label: None,
             in_flight_companion_name: None,
@@ -1156,10 +1161,32 @@ impl AppCore {
 
     pub fn handle_interrupt(&mut self) -> CoreEffect {
         if !self.turn_in_flight() {
-            return CoreEffect::None;
+            let compaction_in_progress = matches!(
+                &self.state,
+                AppState::Idle { session } if session.compaction_in_progress()
+            );
+            let cancelled = self.interrupt_idle_compaction("user interrupt");
+            if !compaction_in_progress {
+                return CoreEffect::None;
+            }
+            return match cancelled {
+                Ok(CompactionStatus::Applied) => self.notice_item("compaction complete".to_owned()),
+                Ok(CompactionStatus::Cancelled) => {
+                    self.notice_item("compaction interrupted · active canvas unchanged".to_owned())
+                }
+                Ok(CompactionStatus::Failed) => {
+                    self.notice_item("compaction failed · active canvas unchanged".to_owned())
+                }
+                Ok(CompactionStatus::Unchanged) => CoreEffect::None,
+                Ok(CompactionStatus::InProgress) => self.error_item(
+                    "compaction interruption failed: compaction is still in progress".to_owned(),
+                ),
+                Err(error) => self.error_item(format!("compaction interruption failed: {error}")),
+            };
         }
         let cleared = self.pending_runs.len();
         self.pending_runs.clear();
+        self.compaction_request.store(false, Ordering::SeqCst);
         if cleared > 0 {
             let noun = if cleared == 1 {
                 "queued activity"
@@ -1202,19 +1229,26 @@ impl AppCore {
         self.handle_interrupt()
     }
 
-    /// Shutdown hygiene, publication phase: publish the exact signal the Esc
-    /// interrupt uses — pause the steering queue, then set the turn's cancel
-    /// flag. [`Self::prepare_for_shutdown`] follows this with a bounded wait
-    /// for the worker to return its owned session. The root session drops its
-    /// provider event boundary and kills any active tool process group;
-    /// companion and extension workers observe the same source. Catalog
-    /// refresh remains a single short call without a cancellation signal.
+    /// Shutdown hygiene, publication phase: an active driver receives the
+    /// same signal as Escape, then [`Self::prepare_for_shutdown`] waits
+    /// boundedly for its owned session. An idle shadow compaction instead
+    /// crosses the session lifecycle barrier, settling an already-finished
+    /// result or terminally cancelling its canonical call before the session
+    /// is dropped. Catalog refresh remains a single short call without a
+    /// cancellation signal.
     pub fn cancel_in_flight_for_shutdown(&mut self) {
-        if let AppState::TurnInFlight { interrupt_flag, .. } = &self.state {
-            // Same ordering contract as `handle_interrupt`: a worker that
-            // observes the flag must also observe the pause.
-            self.queued_inputs.set_paused(true);
-            interrupt_flag.store(true, Ordering::SeqCst);
+        self.compaction_request.store(false, Ordering::SeqCst);
+        match &self.state {
+            AppState::TurnInFlight { interrupt_flag, .. } => {
+                // Same ordering contract as `handle_interrupt`: a worker that
+                // observes the flag must also observe the pause.
+                self.queued_inputs.set_paused(true);
+                interrupt_flag.store(true, Ordering::SeqCst);
+            }
+            AppState::Idle { .. } => {
+                let _ = self.cancel_idle_compaction_for_lifecycle("session shutdown");
+            }
+            AppState::Empty => {}
         }
     }
 
@@ -1251,6 +1285,7 @@ impl AppCore {
     pub fn drain_background(&mut self) -> bool {
         let mut changed = self.drain_catalog_refresh();
         changed |= self.drain_permissions();
+        changed |= self.drain_idle_compaction();
         while let Some(event) = self.next_turn_event() {
             changed = true;
             self.handle_turn_event(event);
@@ -1757,7 +1792,7 @@ impl AppCore {
             {
                 Some(self.open_transcript_search())
             }
-            KeyCode::Esc => Some(CoreEffect::None),
+            KeyCode::Esc => Some(self.handle_interrupt()),
             _ => None,
         }
     }
@@ -2182,6 +2217,7 @@ impl AppCore {
         // is in flight. Re-wired every spawn so /new and /resume sessions
         // always steer the queue this AppCore renders.
         session.set_steering_queue(Arc::clone(&self.queued_inputs));
+        session.set_compaction_request(Arc::clone(&self.compaction_request));
         let (worker_tx, worker_rx) = mpsc::channel();
         let interrupt_flag = Arc::new(AtomicBool::new(false));
         let worker_interrupt = Arc::clone(&interrupt_flag);
@@ -2349,6 +2385,9 @@ impl AppCore {
     fn start_new_session(&mut self) -> CoreEffect {
         if self.turn_in_flight() {
             return self.notice_item("new session waits for the active turn".to_owned());
+        }
+        if let Err(error) = self.cancel_idle_compaction_for_lifecycle("new session") {
+            return self.error_item(format!("new session failed: {error}"));
         }
         let AppState::Idle { session } = &self.state else {
             return self.notice_item("new session needs an active session".to_owned());

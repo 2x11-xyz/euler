@@ -8,6 +8,7 @@ use euler_event::{EventEnvelope, EventKind};
 use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 10;
@@ -443,17 +444,19 @@ impl Default for TranscriptState {
 
 impl TranscriptState {
     pub fn push_event(&mut self, event: EventEnvelope) {
-        match event.kind.as_str() {
-            EventKind::MODEL_DELTA => self.push_delta(&event),
-            EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::ERROR => {
-                self.clear_transient_live_tail();
+        if !is_compaction_activity(&event) {
+            match event.kind.as_str() {
+                EventKind::MODEL_DELTA => self.push_delta(&event),
+                EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::ERROR => {
+                    self.clear_transient_live_tail();
+                }
+                // The finalized thought item replaces the live thinking line.
+                EventKind::MODEL_REASONING => {
+                    self.reasoning_live = None;
+                    self.reasoning_body.clear();
+                }
+                _ => {}
             }
-            // The finalized thought item replaces the live thinking line.
-            EventKind::MODEL_REASONING => {
-                self.reasoning_live = None;
-                self.reasoning_body.clear();
-            }
-            _ => {}
         }
         self.projection.ingest(&event);
         self.events.push(event);
@@ -681,6 +684,9 @@ fn project_event_with_checkpoints(
     event: &EventEnvelope,
     checkpoint_ids: &std::collections::HashSet<String>,
 ) -> Option<TranscriptItem> {
+    if is_compaction_activity(event) {
+        return None;
+    }
     match event.kind.as_str() {
         EventKind::USER_MESSAGE => {
             payload_string(event, "content").map(TranscriptItem::UserMessage)
@@ -915,7 +921,8 @@ impl StreamProjection {
         if matches!(
             event.kind.as_str(),
             EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
-        ) {
+        ) && !is_compaction_activity(event)
+        {
             self.last_owner_fallback = match model_result_fallback_item(event) {
                 Some(TranscriptItem::AssistantMessage(content)) => Some(content),
                 _ => None,
@@ -1356,12 +1363,23 @@ fn push_tui_entry(
 }
 
 fn model_result_fallback_item(event: &EventEnvelope) -> Option<TranscriptItem> {
-    if event.kind.as_str() != EventKind::MODEL_RESULT {
+    if event.kind.as_str() != EventKind::MODEL_RESULT || is_compaction_activity(event) {
         return None;
     }
     payload_string(event, "content")
         .filter(|content| !content.is_empty())
         .map(TranscriptItem::AssistantMessage)
+}
+
+fn is_compaction_activity(event: &EventEnvelope) -> bool {
+    event.payload.get("purpose").and_then(Value::as_str) == Some("compaction")
+        && matches!(
+            event.kind.as_str(),
+            EventKind::MODEL_CALL
+                | EventKind::MODEL_RESULT
+                | EventKind::MODEL_REASONING
+                | EventKind::ERROR
+        )
 }
 
 fn model_result_has_matching_assistant_message(
@@ -1376,10 +1394,13 @@ fn model_result_has_matching_assistant_message(
         .iter()
         .skip(model_result_index + 1)
         .find(|event| {
-            matches!(
-                event.kind.as_str(),
-                EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
-            )
+            !is_compaction_activity(event)
+                && matches!(
+                    event.kind.as_str(),
+                    EventKind::MODEL_RESULT
+                        | EventKind::ASSISTANT_MESSAGE
+                        | EventKind::USER_MESSAGE
+                )
         })
         .is_some_and(|event| {
             event.kind.as_str() == EventKind::ASSISTANT_MESSAGE
@@ -1401,10 +1422,11 @@ fn assistant_duplicates_model_result_fallback(
         return false;
     };
     let Some(previous_owner) = earlier.iter().rev().find(|event| {
-        matches!(
-            event.kind.as_str(),
-            EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
-        )
+        !is_compaction_activity(event)
+            && matches!(
+                event.kind.as_str(),
+                EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
+            )
     }) else {
         return false;
     };

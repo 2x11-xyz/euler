@@ -1,7 +1,10 @@
 //! Canvas assembly: projects events into the model-facing canvas.
 
 use crate::apply_patch::{parse_single_file_apply_patch, ApplyPatchDocument};
-use crate::compaction::{compact_tool_output, is_layer1_eligible, WorkingStateProjection};
+use crate::compaction::{
+    compact_tool_output, is_layer1_eligible, validate_candidate, CompactionCandidate,
+    WorkingStateProjection, COMPACTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION,
+};
 use crate::project_context::{PinnedProjectContext, ProjectContextFold};
 use euler_event::{EventEnvelope, EventKind};
 use euler_sdk::MAX_CONTEXT_SLOTS_PER_SESSION;
@@ -276,10 +279,10 @@ fn collect_canvas_items(
     // sits before the active canvas.swap frontier, so slots survive compaction by
     // construction instead of depending on raw pre-frontier replay.
     let active_slots = fold_context_slots(events);
-    // V1: only the last canvas.swap is active. Pre-snapshot events are
-    // all excluded (snapshot_start_id is forensic metadata; stacked
-    // compaction is deferred to later slices). projection_blob is inline
-    // text or v1 structured JSON; blob-ref resolution is deferred.
+    // The latest valid full projection owns the frontier. Layer-1 swaps after
+    // it accumulate additional compacted-result ids without displacing that
+    // frontier. projection_blob is inline text or v1 structured JSON;
+    // blob-ref resolution is deferred.
     let mut items = Vec::new();
     // Pinned project context is folded over the full event slice, like
     // context slots: the latest admitted snapshot stays pinned across
@@ -421,44 +424,145 @@ struct ActiveSwap {
     compacted_result_ids: BTreeSet<String>,
 }
 
-fn active_swap(events: &[EventEnvelope]) -> Option<ActiveSwap> {
-    events
-        .iter()
-        .rev()
-        .find(|event| event.kind.as_str() == EventKind::CANVAS_SWAP)
-        .and_then(|event| {
-            let compacted_result_ids = string_array_field(event, "layer1_compacted_event_ids");
-            let full_swap = full_swap_frontier(events, event);
-            if full_swap.is_none() && compacted_result_ids.is_empty() {
-                return None;
-            }
-            Some(ActiveSwap {
-                event_id: event.id.clone(),
-                projection: full_swap,
-                compacted_result_ids,
-            })
-        })
+#[derive(Clone, Debug)]
+enum ValidatedCanvasSwap {
+    Full {
+        frontier: (usize, String, String),
+    },
+    Layer1 {
+        compacted_result_ids: BTreeSet<String>,
+    },
 }
 
-fn full_swap_frontier(
-    events: &[EventEnvelope],
-    event: &EventEnvelope,
-) -> Option<(usize, String, String)> {
-    let snapshot_end_id = string_field(event, "snapshot_end_id")?;
-    let frontier_start_id = string_field(event, "frontier_start_id")?;
-    let (snapshot_end_index, frontier_start_index) =
-        event_index_pair(events, &snapshot_end_id, &frontier_start_id)?;
-    (snapshot_end_index < frontier_start_index).then_some(())?;
-    let blob = string_field(event, "projection_blob")?;
-    if blob.is_empty() {
+fn active_swap(events: &[EventEnvelope]) -> Option<ActiveSwap> {
+    let validated = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind.as_str() == EventKind::CANVAS_SWAP)
+        .filter_map(|(index, event)| {
+            validated_canvas_swap(events, event).map(|swap| (index, event, swap))
+        })
+        .collect::<Vec<_>>();
+    let full = validated.iter().rev().find_map(|(index, event, swap)| {
+        let ValidatedCanvasSwap::Full { frontier } = swap else {
+            return None;
+        };
+        Some((*index, *event, frontier.clone()))
+    });
+    let layer1_start = full.as_ref().map_or(0, |(index, _, _)| index + 1);
+    let compacted_result_ids = validated
+        .iter()
+        .filter(|(index, _, _)| *index >= layer1_start)
+        .filter_map(|(_, _, swap)| match swap {
+            ValidatedCanvasSwap::Layer1 {
+                compacted_result_ids,
+            } => Some(compacted_result_ids.iter().cloned()),
+            ValidatedCanvasSwap::Full { .. } => None,
+        })
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    let (event_id, projection) = match full {
+        Some((_, event, projection)) => (event.id.clone(), Some(projection)),
+        None => {
+            let (_, event, _) = validated
+                .iter()
+                .rev()
+                .find(|(_, _, swap)| matches!(swap, ValidatedCanvasSwap::Layer1 { .. }))?;
+            (event.id.clone(), None)
+        }
+    };
+    if projection.is_none() && compacted_result_ids.is_empty() {
         return None;
     }
+    Some(ActiveSwap {
+        event_id,
+        projection,
+        compacted_result_ids,
+    })
+}
+
+pub(crate) fn active_layer1_compacted_result_ids(events: &[EventEnvelope]) -> BTreeSet<String> {
+    active_swap(events).map_or_else(BTreeSet::new, |swap| swap.compacted_result_ids)
+}
+
+pub(crate) fn canvas_swap_is_valid(events: &[EventEnvelope], event: &EventEnvelope) -> bool {
+    validated_canvas_swap(events, event).is_some()
+}
+
+fn validated_canvas_swap(
+    events: &[EventEnvelope],
+    event: &EventEnvelope,
+) -> Option<ValidatedCanvasSwap> {
+    let swap_index = events
+        .iter()
+        .position(|candidate| candidate.id == event.id)?;
+    let first_id = events.first()?.id.as_str();
+    let snapshot_start_id = string_field(event, "snapshot_start_id")?;
+    let snapshot_end_id = string_field(event, "snapshot_end_id")?;
+    let frontier_start_id = string_field(event, "frontier_start_id")?;
+    let policy_version = string_field(event, "policy_version")?;
     let schema_version = string_field(event, "projection_schema_version")?;
-    Some((
-        frontier_start_index,
-        render_projection_blob(&blob, &schema_version),
-        schema_version,
-    ))
+    if snapshot_start_id != first_id
+        || policy_version != COMPACTION_POLICY_VERSION
+        || schema_version != PROJECTION_SCHEMA_VERSION
+    {
+        return None;
+    }
+    let validation_result = string_field(event, "validation_result")?;
+    let blob = string_field(event, "projection_blob")?;
+    if validation_result == "layer1-pass" {
+        if snapshot_end_id != first_id || frontier_start_id != first_id || !blob.is_empty() {
+            return None;
+        }
+        let compacted_result_ids = strict_string_array_field(event, "layer1_compacted_event_ids")?;
+        if compacted_result_ids.is_empty()
+            || !compacted_result_ids.iter().all(|id| {
+                events
+                    .iter()
+                    .take(swap_index)
+                    .find(|candidate| candidate.id == *id)
+                    .is_some_and(|candidate| {
+                        candidate.kind.as_str() == EventKind::TOOL_RESULT
+                            && string_field(candidate, "name")
+                                .is_some_and(|name| crate::compaction::is_layer1_eligible(&name))
+                    })
+            })
+        {
+            return None;
+        }
+        return Some(ValidatedCanvasSwap::Layer1 {
+            compacted_result_ids,
+        });
+    }
+    if validation_result != "pass"
+        || blob.is_empty()
+        || !WorkingStateProjection::persisted_blob_valid(&blob)
+    {
+        return None;
+    }
+    let (snapshot_end_index, frontier_start_index) =
+        event_index_pair(events, &snapshot_end_id, &frontier_start_id)?;
+    if frontier_start_index != snapshot_end_index + 1 || frontier_start_index >= swap_index {
+        return None;
+    }
+    validate_candidate(
+        events,
+        &CompactionCandidate {
+            snapshot_start_id,
+            snapshot_end_id,
+            frontier_start_id,
+            projection: WorkingStateProjection::default(),
+            policy_version,
+        },
+    )
+    .ok()?;
+    Some(ValidatedCanvasSwap::Full {
+        frontier: (
+            frontier_start_index,
+            render_projection_blob(&blob, &schema_version),
+            schema_version,
+        ),
+    })
 }
 
 fn render_projection_blob(blob: &str, schema_version: &str) -> String {
@@ -762,6 +866,11 @@ fn included_model_call_ids(
     events
         .iter()
         .filter(|event| event.kind.as_str() == EventKind::MODEL_RESULT)
+        // Shadow compaction traffic is exhaustive provenance, not active
+        // conversation. In particular, provider reasoning attached to the
+        // compactor call must not leak back into the driver canvas beside
+        // the validated projection it produced.
+        .filter(|event| event.payload.get("purpose").and_then(Value::as_str) != Some("compaction"))
         .filter_map(|event| {
             let has_tool_calls = event
                 .payload
@@ -896,16 +1005,14 @@ fn string_field(event: &EventEnvelope, key: &str) -> Option<String> {
     event.payload.get(key)?.as_str().map(str::to_owned)
 }
 
-fn string_array_field(event: &EventEnvelope, key: &str) -> BTreeSet<String> {
-    event
-        .payload
-        .get(key)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect()
+fn strict_string_array_field(event: &EventEnvelope, key: &str) -> Option<BTreeSet<String>> {
+    let values = event.payload.get(key)?.as_array()?;
+    let strings = values
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    let unique = strings.iter().copied().collect::<BTreeSet<_>>();
+    (unique.len() == strings.len()).then(|| unique.into_iter().map(str::to_owned).collect())
 }
 
 pub fn canvas_prompt(items: &[CanvasItem]) -> String {

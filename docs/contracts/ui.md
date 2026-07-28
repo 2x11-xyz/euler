@@ -228,7 +228,8 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   When a slash palette, picker, search surface, prompt, or modal owns input,
   `Esc` dismisses exactly that layer and cannot publish turn cancellation.
   One keypress performs one layer transition. Only `Esc` received with the
-  composer owning input may interrupt an active turn.
+  composer owning input may interrupt an active turn or an idle shadow
+  compaction.
 - Publishing root-turn cancellation pauses the steering queue before setting
   the shared signal. Steering persistence and pause share one queue boundary:
   a steer either persists before the pause, or remains queued after Esc.
@@ -243,7 +244,10 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   A `model.call` that had no `model.result` receives exactly one parented,
   cancellation-attributed session error. That error is canonical provenance,
   while the TUI renders its ordinary interruption row instead of treating it
-  as a driver failure.
+  as a driver failure. If the root turn and a shadow compaction are both
+  running, root cancellation also terminalizes and fences the shadow before
+  the session returns; late output from either provider call cannot append
+  events or swap the canvas.
 - A permission ask observes the same signal. Cancellation closes the active
   prompt without converting it into denial, installs no grant, and cannot let a
   stale modal reply satisfy a later ask. Write tools recheck cancellation at

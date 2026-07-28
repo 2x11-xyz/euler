@@ -930,10 +930,17 @@ fn canvas_swap_with_json_projection_blob_renders_working_state_projection() {
         EventKind::USER_MESSAGE,
         object([("content", "old request".into())]),
     );
-    let frontier = EventEnvelope::new(
+    let old_answer = EventEnvelope::new(
         "s",
         "a",
         Some(old.id.clone()),
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "old answer".into())]),
+    );
+    let frontier = EventEnvelope::new(
+        "s",
+        "a",
+        Some(old_answer.id.clone()),
         EventKind::USER_MESSAGE,
         object([("content", "new request".into())]),
     );
@@ -952,7 +959,7 @@ fn canvas_swap_with_json_projection_blob_renders_working_state_projection() {
         EventKind::CANVAS_SWAP,
         object([
             ("snapshot_start_id", old.id.clone().into()),
-            ("snapshot_end_id", old.id.clone().into()),
+            ("snapshot_end_id", old_answer.id.clone().into()),
             ("frontier_start_id", frontier.id.clone().into()),
             ("policy_version", "1".into()),
             ("projection_schema_version", "1".into()),
@@ -960,14 +967,14 @@ fn canvas_swap_with_json_projection_blob_renders_working_state_projection() {
             ("validation_result", "pass".into()),
         ]),
     );
-    let events = vec![old, frontier, swap];
+    let events = vec![old, old_answer, frontier, swap];
 
     let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
 
     assert_eq!(
         canvas[0],
         CanvasItem::Projection {
-            event_id: events[2].id.clone(),
+            event_id: events[3].id.clone(),
             content: projection.render(),
             schema_version: "1".to_owned(),
         }
@@ -1270,6 +1277,113 @@ fn latest_canvas_swap_wins_over_earlier_swap() {
             },
         ]
     );
+}
+
+#[test]
+fn layer1_swap_after_full_swap_preserves_projection_and_frontier() {
+    let old = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "old".into())]),
+    );
+    let old_answer = EventEnvelope::new(
+        "s",
+        "a",
+        Some(old.id.clone()),
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "old answer".into())]),
+    );
+    let frontier = EventEnvelope::new(
+        "s",
+        "a",
+        Some(old_answer.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "frontier".into())]),
+    );
+    let call = EventEnvelope::new(
+        "s",
+        "a",
+        Some(frontier.id.clone()),
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "read-1".into()),
+            ("name", "read_file".into()),
+            ("input", serde_json::json!({"path": "note.txt"})),
+        ]),
+    );
+    let result = EventEnvelope::new(
+        "s",
+        "a",
+        Some(call.id.clone()),
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "read-1".into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+            ("output", "one\ntwo\nthree\nfour\nfive".into()),
+        ]),
+    );
+    let full_swap = EventEnvelope::new(
+        "s",
+        "a",
+        Some(result.id.clone()),
+        EventKind::CANVAS_SWAP,
+        object([
+            ("snapshot_start_id", old.id.clone().into()),
+            ("snapshot_end_id", old_answer.id.clone().into()),
+            ("frontier_start_id", frontier.id.clone().into()),
+            ("policy_version", "1".into()),
+            ("projection_schema_version", "1".into()),
+            ("projection_blob", "summary".into()),
+            ("validation_result", "pass".into()),
+        ]),
+    );
+    let layer1_swap = EventEnvelope::new(
+        "s",
+        "a",
+        Some(full_swap.id.clone()),
+        EventKind::CANVAS_SWAP,
+        object([
+            ("snapshot_start_id", old.id.clone().into()),
+            ("snapshot_end_id", old.id.clone().into()),
+            ("frontier_start_id", old.id.clone().into()),
+            ("policy_version", "1".into()),
+            ("projection_schema_version", "1".into()),
+            ("projection_blob", "".into()),
+            ("validation_result", "layer1-pass".into()),
+            ("layer1_compacted_event_ids", vec![result.id.clone()].into()),
+        ]),
+    );
+    let events = vec![
+        old,
+        old_answer,
+        frontier,
+        call,
+        result,
+        full_swap,
+        layer1_swap,
+    ];
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert!(matches!(
+        canvas.first(),
+        Some(CanvasItem::Projection { content, .. }) if content == "summary"
+    ));
+    assert!(canvas.iter().any(|item| matches!(
+        item,
+        CanvasItem::Message { content, .. } if content == "frontier"
+    )));
+    assert!(canvas.iter().any(|item| matches!(
+        item,
+        CanvasItem::ToolOutput {
+            call_id,
+            compacted: true,
+            ..
+        } if call_id == "read-1"
+    )));
 }
 
 #[test]

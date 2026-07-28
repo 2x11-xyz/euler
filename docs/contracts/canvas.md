@@ -34,9 +34,53 @@ than re-running the original tool when possible. The live policy has two
 independent controls: automatic threshold compaction and recoverable tool
 stubs. Both default to on. Turning automatic compaction off stops the
 threshold-driven projection pipeline; it does not silently override the
-separately selected stub setting. The structured projection fallback remains
-deterministic in core; model-assisted projection is a later extension of this
-contract.
+separately selected stub setting. Under the automatic-plus-stubs policy, byte
+pressure is an admission signal independent of provider usage or a known
+context window: when stubs cannot create enough room, core captures one
+immutable shadow canvas and asks the active provider/model for a bounded
+structured working-state projection with no tools. A manually started shadow
+receives the same request-boundary treatment under every policy. The driver may
+continue from the active canvas while that request runs, but an over-budget
+request is never dispatched: at its next provider boundary the driver waits,
+reassembles after settlement, and fails closed if no valid candidate made the
+canvas fit. The candidate enters the active canvas only after core validates
+its original event frontier,
+host-enforced scalar/list/total projection bounds, meaningful request-size
+reduction, and the exact proposed post-swap driver request. That request-time
+check includes fixed instructions, tool definitions, pinned context, the
+retained frontier, and the configured output reserve; it must fit both the
+canvas byte budget and any known model context window before core atomically
+appends `canvas.swap`. Failure leaves the previous canvas and usage reading
+unchanged. At the hard context margin the driver waits for an already-running
+candidate instead of dispatching an oversized request or dropping queued
+input. The wait polls the turn-cancellation token and has a finite deadline;
+interrupt terminalizes the shadow call and returns the turn as cancelled.
+
+A shadow job has one session owner. Base-composer `Esc` and root-turn
+cancellation are interrupt boundaries: the session actor may record a result
+and its usage/cost provenance when they have already crossed the worker
+channel, but it always discards the candidate and never appends `canvas.swap`.
+A still-pending result instead receives one cancellation terminal plus
+candidate discard. `/new`, `/resume`, shutdown, and live secret scrub are
+lifecycle boundaries: the actor settles a ready result or records cancellation
+before releasing the session. When a root and shadow run concurrently, the
+root's cancellation path closes both canonical calls. Workers never append
+events directly, and output arriving after logical cancellation has no route
+back into the bus, the active canvas, or a scrubbed/replaced session.
+Working-state projection V1 bounds are bytes at the host boundary: goal 4,096;
+plan 8,192; compiler state 4,096; each list at most 64 items; each item at most
+1,024; and the serialized projection at most 32,768. The supplied JSON Schema
+advertises the corresponding string/list limits, but host validation remains
+authoritative.
+
+A successful, structurally valid `canvas.swap` starts a new usage window:
+provider usage measured against the canvas that was replaced must not
+immediately re-trigger compaction or
+keep a prior `context.limit` latch closed. Layer-1 swaps after a full projection
+stack on that projection and frontier; they must not resurrect the compacted
+prefix. Repeated layer-1 passes emit only newly compacted result IDs. Live
+assembly and resume accounting use the same swap validator; malformed swaps
+are ignored and never reset usage or the context-limit latch.
 
 Write-shaped facts (edits, patches, artifact creations) demote last, and
 their stubs always carry the artifact path.
