@@ -9,10 +9,16 @@ exactly match a normalized skill name from the compact catalog.
 
 The tool performs no filesystem access, executes no helper, grants no
 permission, and requires no capability. Its result is the exact frozen body
-plus stable scope and digest metadata. Every read is recorded through ordinary
-`tool.call` and `tool.result` provenance. User-global skills remain available
-when repository context is disabled; project skills follow the repository
-context admission decision recorded in the snapshot.
+plus stable scope, source path, and digest metadata. Every read is recorded
+through ordinary `tool.call` and `tool.result` provenance. User-global skills
+remain available when repository context is disabled; project skills follow
+the repository context admission decision recorded in the snapshot.
+
+`skill_read` and the skill catalog are root-driver-only: companion and
+spawned agents are advertised the coding substrate without `skill_read`, and
+a companion call to it is refused — children default to project-context
+`none` and receive no skill surface until `inherit` wiring lands
+(docs/contracts/project-context.md).
 
 Core tools are the minimal coding substrate.
 

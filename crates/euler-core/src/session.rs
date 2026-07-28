@@ -216,6 +216,11 @@ pub struct SessionConfig {
     /// dispatch. Phase 2: the only public constructor resolves disabled, so
     /// no repository text can reach a model.
     pub project_context: Option<ProjectContextBootstrap>,
+    /// User-global skills root (`<euler-home>/skills`). `None` (default)
+    /// disables user-scope skill discovery. Carried in the config so an
+    /// in-process fresh session (`/new`) re-resolves with the same root the
+    /// startup bootstrap used — user skills must survive `/new`.
+    pub user_skills_root: Option<PathBuf>,
 }
 
 impl SessionConfig {
@@ -244,6 +249,7 @@ impl SessionConfig {
             user_grant_dir: None,
             permission_reviewer: PermissionReviewer::default(),
             project_context: None,
+            user_skills_root: None,
         }
     }
 }
@@ -787,8 +793,9 @@ impl<D> Session<D> {
                 .unwrap_or(self.config.compaction_reserve_tokens as u64),
             canvas_budget_bytes: self.config.auto_compaction.budget_bytes,
         };
-        ProjectContextBootstrap::resolve(
+        ProjectContextBootstrap::resolve_with_user_skills(
             &self.config.root,
+            self.config.user_skills_root.as_deref(),
             &self.redactor,
             options,
             self.config.project_grant_consent_dir.as_deref(),

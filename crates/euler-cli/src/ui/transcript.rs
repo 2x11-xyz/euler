@@ -136,6 +136,7 @@ pub enum TranscriptItem {
         content_changed: bool,
         sources: Vec<String>,
         skipped_count: usize,
+        skill_count: usize,
         load_selected: bool,
     },
     PermissionDecision {

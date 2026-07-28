@@ -384,10 +384,17 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     ) -> Result<(), SessionError> {
         let tool_name = call.name.clone();
         let tool_started = Instant::now();
-        match self
-            .tools
-            .execute_with_events(&call.name, &call.input, self.bus.events())
-        {
+        // The registry is the parent's; `skill_read` is never advertised to
+        // companions (`child_model_tools`), so a call here is the model
+        // improvising off the parent transcript — refuse rather than serve
+        // frozen skill bodies across the child boundary.
+        let outcome = if call.name == "skill_read" {
+            Err(crate::tools::ToolError::Unsupported(call.name.clone()))
+        } else {
+            self.tools
+                .execute_with_events(&call.name, &call.input, self.bus.events())
+        };
+        match outcome {
             Ok(execution) => {
                 // The input format was accepted: reset this tool's re-teach
                 // streak (issue #94), mirroring the parent session loop.
@@ -800,7 +807,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
             tools: if self.task.budget().max_tool_calls() == Some(0) {
                 Vec::new()
             } else {
-                self.tools.model_tools()
+                self.tools.child_model_tools()
             },
             reasoning_effort: self.reasoning_effort,
             max_output_tokens: round_max_output_tokens,

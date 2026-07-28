@@ -1997,3 +1997,143 @@ fn oversized_guidance_fails_the_admission_budget_before_any_card() {
         _ => panic!("expected a budget failure before any card"),
     }
 }
+
+#[test]
+fn decline_excludes_project_skills_from_frozen_set_and_fold() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write_skill(
+        &root.join(".euler/skills"),
+        "proj-skill",
+        "Project skill.",
+        "project body\n",
+    );
+    let user_skills = temp.path().join("home/skills");
+    write_skill(&user_skills, "user-skill", "User skill.", "user body\n");
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let consent = temp.path().join("consent");
+    let resolution = ProjectContextBootstrap::resolve_with_user_skills(
+        &canonical,
+        Some(&user_skills),
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy: ProjectContextPolicy::Auto,
+            session_kind: SessionKind::Interactive,
+            trusted_local: false,
+        },
+        Some(&consent),
+        generous_budget(),
+    )
+    .expect("resolve");
+    let pending = match resolution {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => pending,
+        _ => panic!("expected acknowledgment card"),
+    };
+    let declined = pending.decline();
+    let names: Vec<String> = declined
+        .frozen_skills()
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["user-skill"],
+        "decline must drop project skills"
+    );
+    let folded = fold_project_context(&bootstrap_events(&declined)).expect("fold");
+    let pinned = folded.admitted().expect("user-skill manifest");
+    let frozen: Vec<String> = pinned
+        .frozen_skills()
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect();
+    assert_eq!(frozen, vec!["user-skill"], "fold must drop project skills");
+    assert!(
+        !pinned.rendered.contains("proj-skill"),
+        "declined project skill leaked into rendered context"
+    );
+}
+
+#[test]
+fn fold_rejects_forged_project_scope_skill_in_declined_snapshot() {
+    use super::manifest::{ManifestSkill, SkillScope};
+    // Start from a genuine declined snapshot carrying one user skill.
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write_skill(
+        &root.join(".euler/skills"),
+        "proj-skill",
+        "Project skill.",
+        "project body\n",
+    );
+    let user_skills = temp.path().join("home/skills");
+    write_skill(&user_skills, "user-skill", "User skill.", "user body\n");
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let consent = temp.path().join("consent");
+    let resolution = ProjectContextBootstrap::resolve_with_user_skills(
+        &canonical,
+        Some(&user_skills),
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy: ProjectContextPolicy::Auto,
+            session_kind: SessionKind::Interactive,
+            trusted_local: false,
+        },
+        Some(&consent),
+        generous_budget(),
+    )
+    .expect("resolve");
+    let pending = match resolution {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => pending,
+        _ => panic!("expected acknowledgment card"),
+    };
+    let declined = pending.decline();
+    let mut events = bootstrap_events(&declined);
+    // Forge: rewrite the snapshot manifest so the skill claims project scope,
+    // with internally consistent digests and lengths.
+    for event in &mut events {
+        if event.kind.as_str() != EventKind::PROJECT_CONTEXT_SNAPSHOT {
+            continue;
+        }
+        let manifest_json = event
+            .payload
+            .get("manifest")
+            .and_then(serde_json::Value::as_str)
+            .expect("manifest json")
+            .to_owned();
+        let mut manifest = CandidateManifest::from_canonical_json(&manifest_json).expect("parse");
+        let old = manifest.skills[0].clone();
+        let forged = ManifestSkill {
+            scope: SkillScope::Project,
+            body_digest: super::digest::skill_digest_v1(
+                SkillScope::Project,
+                &old.name,
+                &old.path,
+                &old.body,
+            ),
+            ..old
+        };
+        manifest.skills[0] = forged;
+        let forged_json = manifest.to_canonical_json();
+        let forged_digest = candidate_digest_v1(&forged_json);
+        event
+            .payload
+            .insert("manifest_len".to_owned(), (forged_json.len() as u64).into());
+        event
+            .payload
+            .insert("manifest".to_owned(), forged_json.into());
+        event
+            .payload
+            .insert("candidate_digest".to_owned(), forged_digest.into());
+    }
+    // The summary in session.start still carries the old digest; drop the
+    // start event so only the snapshot guard is under test.
+    let error = fold_project_context(&events[..])
+        .expect_err("a declined snapshot smuggling a project-scope skill must be rejected");
+    assert!(
+        error.to_string().contains("project-owned guidance"),
+        "unexpected error: {error}"
+    );
+}

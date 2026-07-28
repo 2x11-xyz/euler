@@ -12,6 +12,7 @@ fn skill_read_is_exposed_only_when_frozen_skills_exist() {
     registry.set_frozen_skills([FrozenSkill {
         name: "commit-writing".to_owned(),
         scope: "user".to_owned(),
+        path: "user/commit-writing/SKILL.md".to_owned(),
         body_digest: "digest".to_owned(),
         body: "Keep commits focused.".to_owned(),
     }]);
@@ -23,12 +24,37 @@ fn skill_read_is_exposed_only_when_frozen_skills_exist() {
 }
 
 #[test]
+fn skill_read_is_never_advertised_to_children() {
+    // Companions default to project-context `none`: even with frozen skills
+    // present, the child tool surface must not carry `skill_read`
+    // (docs/contracts/project-context.md).
+    let temp = tempfile::tempdir().expect("temp");
+    let mut registry = ToolRegistry::new(temp.path());
+    registry.set_frozen_skills([FrozenSkill {
+        name: "commit-writing".to_owned(),
+        scope: "project".to_owned(),
+        path: ".euler/skills/commit-writing/SKILL.md".to_owned(),
+        body_digest: "digest".to_owned(),
+        body: "Keep commits focused.".to_owned(),
+    }]);
+    assert!(registry
+        .model_tools()
+        .iter()
+        .any(|definition| definition.name == "skill_read"));
+    assert!(!registry
+        .child_model_tools()
+        .iter()
+        .any(|definition| definition.name == "skill_read"));
+}
+
+#[test]
 fn skill_read_returns_only_the_frozen_body_without_a_capability() {
     let temp = tempfile::tempdir().expect("temp");
     let mut registry = ToolRegistry::new(temp.path());
     registry.set_frozen_skills([FrozenSkill {
         name: "commit-writing".to_owned(),
         scope: "user".to_owned(),
+        path: "user/commit-writing/SKILL.md".to_owned(),
         body_digest: "digest".to_owned(),
         body: "frozen body".to_owned(),
     }]);

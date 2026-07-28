@@ -365,11 +365,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   older streams without the object use the launching configuration. The
   legacy `tier` field remains for compatibility and is normalized at resume.
   Optional `project_context` is the compact bootstrap summary (ADR 0017):
-  `{ "expected": true, "schema_version": 1, "status", "policy",
+  `{ "expected": true, "schema_version": 2, "status", "policy",
   "resolution_reason", "acknowledgment_basis", "candidate_digest",
-  "source_count", "diagnostic_count" }`. Present exactly when the session
-  was created with a project-context bootstrap; it announces that one
-  `project.context.snapshot` follows immediately. Absent means the legacy
+  "manifest_admitted", "source_count", "skill_count",
+  "diagnostic_count" }`. Version-1 summaries (no `manifest_admitted` or
+  `skill_count`) remain resumable; legacy manifests cannot contain skills.
+  Present exactly when the session was created with a project-context
+  bootstrap; it announces that one `project.context.snapshot` follows
+  immediately. Absent means the legacy
   shape: no snapshot events exist and resume treats project context as
   disabled. A summary without its snapshot (or vice versa) is an invalid
   mixed shape and resume fails closed. The summary is validated like the

@@ -15,17 +15,18 @@ store ("Acknowledgment record" section in full), the interactive
 acknowledgment card and non-interactive fail-closed behavior, and resume
 relocation consent ("Resume relocation and consent" in full: the relocation
 card, `--accept-relocation`, the `project.context.relocated` event, the
-permission epoch, and the `new_root` projection). NOT yet implemented (still
-bound shape): skills and `skill_read` ("Skills" section, the skill rows of
-the bounds table, and skill fields of the snapshot), the always-on catalog,
-explicit reload, and guardian/worker `inherit` wiring (the child policy
-field exists, but today every child uses the `none` default). Issue #180
+permission epoch, and the `new_root` projection), skills and `skill_read`
+("Skills" section, the skill rows of the bounds table, skill fields of the
+snapshot, and the always-on catalog). NOT yet implemented (still bound
+shape): explicit reload, and guardian/worker `inherit` wiring (the child
+policy field exists, but today every child uses the `none` default — so the
+catalog and `skill_read` are root-driver-only in practice). Issue #180
 tracks the remaining slices, and this paragraph shrinks as they land.
 
 ## Definition and non-authority
 
 Project context is repository-authored guidance (`EULER.md` files and
-`.agents/skills/` skills) admitted to a root driver session under
+`.euler/skills/` skills) admitted to a root driver session under
 core-controlled discovery, framing, bounds, redaction, persistence, and
 replay. It is data, never authority: no project-context text or frontmatter
 can grant or widen a capability, approve a tool invocation, install a grant,
@@ -36,7 +37,7 @@ permission machinery as one suggested by an ordinary user message.
 
 ## Discovery and precedence
 
-- Recognized paths: `EULER.md` (exact case) and `.agents/skills/<name>/SKILL.md`
+- Recognized paths: `EULER.md` (exact case) and `.euler/skills/<name>/SKILL.md`
   along the ordered directory chain from the project discovery root (nearest
   ancestor with an exact regular `.git` file or directory; a symlinked `.git`
   is not a marker) through `SessionConfig.root`, inclusive. No Git marker

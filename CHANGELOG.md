@@ -13,7 +13,11 @@ pull requests that landed them; deeper design rationale lives in
   snapshots, renders a compact catalog, and exposes snapshot-backed
   `skill_read` with ordinary tool provenance. Project skills use repository
   acknowledgment; user-global skills remain available when repository context
-  is disabled.
+  is disabled. The catalog and `skill_read` are root-driver-only until
+  `inherit` child wiring lands. The acknowledgment digest now covers only the
+  project-scoped view of the manifest, so every previously acknowledged
+  repository re-prompts once after upgrading (fail closed — nothing loads
+  until re-accepted); afterwards user-skill changes never re-prompt.
 
 ### ChatGPT subscription compatibility
 

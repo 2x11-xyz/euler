@@ -86,12 +86,14 @@ where
 }
 
 /// Present the acknowledgment card. `content_changed` selects the changed
-/// headline; `sources` and `skipped_count` populate the file list.
+/// headline; `sources`, `skipped_count`, and `skill_count` populate the
+/// disclosure lists.
 pub(crate) fn prompt_acknowledgment(
     folder_label: &str,
     content_changed: bool,
     sources: &[String],
     skipped_count: usize,
+    skill_count: usize,
     theme_choice: ThemeChoice,
 ) -> Result<ConsentChoice> {
     prompt(
@@ -102,6 +104,7 @@ pub(crate) fn prompt_acknowledgment(
                     content_changed,
                     sources,
                     skipped_count,
+                    skill_count,
                     load_selected,
                 },
                 theme,

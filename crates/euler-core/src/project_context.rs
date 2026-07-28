@@ -875,6 +875,7 @@ impl ProjectContextBootstrap {
                     .map(|skill| crate::tools::FrozenSkill {
                         name: skill.name.clone(),
                         scope: skill.scope.as_str().to_owned(),
+                        path: skill.path.clone(),
                         body_digest: skill.body_digest.clone(),
                         body: skill.body.clone(),
                     })

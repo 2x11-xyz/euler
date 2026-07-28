@@ -450,6 +450,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 content_changed,
                 sources,
                 skipped_count,
+                skill_count,
                 load_selected,
             } => {
                 lines.extend(render_acknowledgment_card(
@@ -458,6 +459,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                         content_changed: *content_changed,
                         sources,
                         skipped_count: *skipped_count,
+                        skill_count: *skill_count,
                         load_selected: *load_selected,
                     },
                     theme,

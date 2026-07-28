@@ -159,6 +159,9 @@ pub struct ToolRegistry {
 pub struct FrozenSkill {
     pub name: String,
     pub scope: String,
+    /// Source identity (workspace-relative or `user/` path) echoed in the
+    /// `skill_read` result header; never re-read from disk.
+    pub path: String,
     pub body_digest: String,
     pub body: String,
 }
@@ -323,6 +326,16 @@ impl ToolRegistry {
         tools
     }
 
+    /// Tools advertised to companion/spawned agents. Children default to
+    /// project-context `none`, so the skill catalog and `skill_read` never
+    /// reach them; only the root driver (or an `inherit` child, once that
+    /// lands) is eligible (docs/contracts/project-context.md).
+    pub fn child_model_tools(&self) -> Vec<ToolDefinition> {
+        let mut tools = coding_tool_definitions();
+        tools.push(tool_result_get_definition());
+        tools
+    }
+
     fn skill_read(&self, input: &Value) -> Result<ToolExecution, ToolError> {
         let name = required_str(input, "name")?.trim();
         let skill = self
@@ -332,8 +345,8 @@ impl ToolRegistry {
         Ok(ToolExecution {
             name: "skill_read".to_owned(),
             output: format!(
-                "[skill name={} scope={} digest={}]\n{}",
-                skill.name, skill.scope, skill.body_digest, skill.body
+                "[skill name={} scope={} path={} digest={}]\n{}",
+                skill.name, skill.scope, skill.path, skill.body_digest, skill.body
             ),
             output_preview_budget: None,
             exit_code: None,

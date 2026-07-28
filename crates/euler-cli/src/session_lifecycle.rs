@@ -241,6 +241,9 @@ pub(crate) fn session_config(
     config.code_swarm_user_config_path = EulerHome::resolve()
         .ok()
         .map(|home| home.code_swarm_config_path());
+    // Same root the startup bootstrap discovers user skills from, carried in
+    // the config so `/new` re-resolves with user skills intact.
+    config.user_skills_root = EulerHome::resolve().ok().map(|home| home.skills_dir());
     config.project_grant_consent_dir = euler_home.clone();
     config.user_grant_dir = euler_home;
     config
