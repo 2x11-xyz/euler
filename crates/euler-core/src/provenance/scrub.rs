@@ -1,6 +1,6 @@
 use super::{
     containing_dir, hash_bytes, nul_offset_in_line, numbered_accepted_prefix_lines, recover_mutex,
-    sync_dir, ProvenanceWriter,
+    sync_dir, unresolved_append_fence, ProvenanceWriter,
 };
 use crate::redaction::{scrub_secrets_in_bytes, scrub_secrets_in_object};
 use crate::scrub::{scrub_json_file, write_private_atomic, ScrubReport};
@@ -27,6 +27,20 @@ impl ProvenanceWriter {
         agent: &str,
     ) -> io::Result<ScrubReport> {
         let mut append_state = recover_mutex(&self.append_lock);
+        if append_state.unresolved_append.is_some() {
+            return Err(unresolved_append_fence());
+        }
+        let raw_len = match fs::metadata(&self.log_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if raw_len != append_state.durable_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provenance log has bytes beyond its confirmed durable tail",
+            ));
+        }
         let content = match fs::read_to_string(&self.log_path) {
             Ok(content) => content,
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -64,6 +78,7 @@ impl ProvenanceWriter {
 
         if pass.log_changed {
             self.commit_scrubbed_log(&events)?;
+            append_state.durable_len = fs::metadata(&self.log_path)?.len();
         }
         pass.retire_old_files()?;
 

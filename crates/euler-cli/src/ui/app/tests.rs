@@ -1044,7 +1044,7 @@ fn queued_steer_preview_is_visual_only() {
         interrupt_flag: Arc::new(AtomicBool::new(false)),
         started_at: Instant::now(),
     };
-    core.queued_inputs.push_back(full.to_owned());
+    core.queued_inputs.push_steering_back(full.to_owned());
 
     let queued_line = core
         .visual_canvas_frame(120)
@@ -1084,13 +1084,12 @@ fn queued_inputs_auto_flush_fifo_after_normal_completion() {
 
 #[test]
 fn queued_leftovers_run_as_their_own_turns() {
-    // Review blocker (PR #147): leftovers queued BEFORE a turn spawns must
-    // never fold into that turn's request. Queued directly while idle, the
-    // entries predate the first spawn's steering generation, so each must
-    // flush as its own turn: user → its model.call, three times.
+    // Review blocker (PR #147): ordinary follow-ups queued BEFORE a turn
+    // spawns must never fold into that turn's request. Each must flush as its
+    // own turn: user → its model.call, three times.
     let (mut core, gate) = core_gated();
-    core.queued_inputs.push_back("second".to_owned());
-    core.queued_inputs.push_back("third".to_owned());
+    core.queued_inputs.push_follow_up_back("second".to_owned());
+    core.queued_inputs.push_follow_up_back("third".to_owned());
     submit_without_wait(&mut core, "first");
 
     gate.open();
@@ -1124,6 +1123,89 @@ fn queued_leftovers_run_as_their_own_turns() {
 }
 
 #[test]
+fn context_stopped_turn_preserves_three_queued_inputs_without_auto_flush() {
+    let response = FixtureResponse::Stream(vec![
+        ScriptedStreamStep::SleepMs(500),
+        ScriptedStreamStep::Event(ModelStreamEvent::TextDelta("at limit".to_owned())),
+        ScriptedStreamStep::Event(ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 1,
+                uncached_input_tokens: None,
+                cached_tokens: None,
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
+            }),
+        }),
+    ]);
+    let mut core = TestCore::builder()
+        .provider(ScriptedProvider::new(vec![response]))
+        .build();
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("test session must start idle");
+    };
+    session.set_context_limit(euler_core::ContextLimitConfig::new(10, 0.5));
+    session
+        .set_auto_compaction_policy(false, true)
+        .expect("disable automatic compaction");
+
+    submit_without_wait(&mut core, "active");
+    for _ in 0..100 {
+        core.drain_background();
+        if core
+            .transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        core.transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL),
+        "first request must be in flight before queuing context-stopped work"
+    );
+    submit_without_wait(&mut core, "queued one");
+    submit_without_wait(&mut core, "queued two");
+    submit_without_wait(&mut core, "queued three");
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["active"]);
+    assert_eq!(
+        core.queued_inputs.snapshot(),
+        ["queued one", "queued two", "queued three"],
+        "a context latch must not reserve or drain auto-flush work"
+    );
+    let AppState::Idle { session } = &core.state else {
+        panic!("context-stopped worker must return its session");
+    };
+    assert!(!session.can_accept_turn());
+}
+
+#[test]
+fn composer_input_during_non_model_work_is_an_ordinary_follow_up() {
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "active");
+    // A companion/extension worker shares the TurnInFlight shell but is not
+    // a steerable model turn. Its composer input must not inherit the active
+    // model-turn group merely because the queue still remembers that group.
+    core.in_flight_label = Some("companion run".to_owned());
+    submit_without_wait(&mut core, "ordinary follow-up");
+
+    assert_eq!(core.queued_inputs.snapshot(), ["ordinary follow-up"]);
+
+    gate.open();
+    wait_for_idle(&mut core);
+    assert_eq!(user_messages(&core), ["active", "ordinary follow-up"]);
+}
+
+#[test]
 fn interrupt_keeps_queue_until_user_continues() {
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "first");
@@ -1142,6 +1224,68 @@ fn interrupt_keeps_queue_until_user_continues() {
     wait_for_idle(&mut core);
 
     assert_eq!(user_messages(&core), ["first", "queued"]);
+}
+
+#[test]
+fn interrupt_then_continue_hydrates_the_whole_pending_steer_stack() {
+    // The reported TUI session showed three numbered pending steers after an
+    // interrupt. Continuing popped only the first; the old steering
+    // generation then made the two siblings stale, so each waited for a later
+    // turn.
+    // An interrupt must preserve the stack, and the explicit continue must
+    // rebind that one stack to the replacement turn without touching ordinary
+    // follow-up entries.
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "active");
+    submit_without_wait(&mut core, "steer one");
+    submit_without_wait(&mut core, "steer two");
+    submit_without_wait(&mut core, "steer three");
+
+    core.handle_input(key(KeyCode::Esc));
+    gate.open();
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        core.queued_inputs.snapshot(),
+        ["steer one", "steer two", "steer three"]
+    );
+    assert_eq!(user_messages(&core), ["active"]);
+
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        user_messages(&core),
+        ["active", "steer one", "steer two", "steer three"]
+    );
+    assert!(core.queued_inputs.is_empty());
+    let user_and_calls: Vec<(&str, Option<&str>)> = core
+        .transcript
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind.as_str() {
+            EventKind::MODEL_CALL => Some((EventKind::MODEL_CALL, None)),
+            EventKind::USER_MESSAGE => Some((
+                EventKind::USER_MESSAGE,
+                event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        user_and_calls,
+        [
+            (EventKind::USER_MESSAGE, Some("active")),
+            (EventKind::USER_MESSAGE, Some("steer one")),
+            (EventKind::USER_MESSAGE, Some("steer two")),
+            (EventKind::USER_MESSAGE, Some("steer three")),
+            (EventKind::MODEL_CALL, None),
+        ],
+        "the replacement turn must receive the preserved stack before its first model call"
+    );
 }
 
 #[test]
@@ -3274,6 +3418,56 @@ fn new_session_reuses_target_and_purges_visual_history() {
 }
 
 #[test]
+fn new_and_resume_refuse_to_orphan_an_unresolved_queued_admission() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let events_path = record.events_path().to_path_buf();
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(&events_path).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    core.session_store = Some(store);
+    let original_session_id = record.id().to_owned();
+
+    core.queued_inputs
+        .push_follow_up_back("must survive".to_owned());
+    let input = core
+        .queued_inputs
+        .reserve_front_for_dispatch()
+        .expect("queued row");
+    std::fs::remove_file(&events_path).expect("remove provenance file");
+    std::fs::create_dir(&events_path).expect("block provenance path");
+    let queue = Arc::clone(&core.queued_inputs);
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("test session must be idle");
+    };
+    session
+        .set_steering_queue_for_queued_input(queue, &input)
+        .expect("wire queued row");
+    session
+        .run_turn(input.content())
+        .expect_err("broken provenance must leave admission unresolved");
+    assert!(core.queued_inputs.has_unresolved_admission());
+
+    assert_eq!(core.start_new_session(), CoreEffect::Render);
+    assert_eq!(core.open_resume_picker(), CoreEffect::Render);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("lifecycle refusal must keep current session");
+    };
+    assert_eq!(session.session_id(), original_session_id);
+    assert!(session.has_unresolved_admission());
+    assert_eq!(core.queued_inputs.snapshot(), ["must survive"]);
+    let text = drain_finalized_visual_text(&mut core, 100);
+    assert!(text.contains("new session waits for the unresolved queued input admission"));
+    assert!(text.contains("resume waits for the unresolved queued input admission"));
+}
+
+#[test]
 fn new_session_settles_or_cancels_idle_shadow_before_replacement() {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
@@ -4860,7 +5054,8 @@ fn interrupt_clears_queued_activities_but_preserves_user_input() {
         .push_back(PendingRunRequest::Companion(request.clone()));
     core.pending_runs
         .push_back(PendingRunRequest::Companion(request));
-    core.queued_inputs.push_back("keep this steer".to_owned());
+    core.queued_inputs
+        .push_steering_back("keep this steer".to_owned());
 
     assert_eq!(core.handle_interrupt(), CoreEffect::Render);
 

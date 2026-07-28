@@ -110,7 +110,7 @@ pub use sandbox::{
 pub use session::{
     fold_model_target, fold_reasoning_effort, system_instruction_bytes, AgentReporter,
     AgentResultSummary, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
-    CompactionStatus, ContextLimitConfig, ExtensionExecutionError, ModelTarget,
+    CompactionStatus, ContextLimitConfig, ExtensionExecutionError, ModelTarget, QueuedInput,
     RoundObserverConfig, Session, SessionConfig, SessionError, SteeringQueue,
     WorkspaceRestoreOutcome,
 };

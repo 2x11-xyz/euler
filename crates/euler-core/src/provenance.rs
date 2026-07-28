@@ -35,7 +35,39 @@ pub struct ProvenanceWriter {
 #[derive(Debug)]
 struct AppendState {
     durable_tail: Option<EventId>,
+    durable_len: u64,
     pending_resume_marker: Option<EventEnvelope>,
+    unresolved_append: Option<UnresolvedAppend>,
+}
+
+/// One append whose bytes may be complete but whose sync outcome is unknown.
+///
+/// Payload bytes are represented only by length + digest: writer debug output
+/// must never become another path for event contents or secrets.
+#[derive(Debug)]
+struct UnresolvedAppend {
+    start_offset: u64,
+    byte_len: u64,
+    bytes_sha256: String,
+    logical_sha256: String,
+    batch_event_ids: Vec<EventId>,
+    new_tail: EventId,
+    event_count: usize,
+    session_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppendSuffix {
+    Absent,
+    Complete,
+    Divergent,
+}
+
+fn unresolved_append_fence() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "an unresolved provenance append must be retried with the exact event batch",
+    )
 }
 
 impl ProvenanceWriter {
@@ -54,13 +86,15 @@ impl ProvenanceWriter {
         threshold: usize,
     ) -> Result<Self, ProvenanceWriterError> {
         let lock = SessionLock::acquire(&log_path)?;
-        let durable_tail = match latest_accepted_event_id(&log_path) {
-            Ok(tail) => tail,
+        let (durable_tail, durable_len) = match latest_accepted_state(&log_path) {
+            Ok(state) => state,
             // A directory at the log path opens with an empty tail on purpose:
             // failure-path tests (and the failure surface they pin) expect
             // writer construction to succeed and the APPEND to fail with the
             // real I/O error. See session_loop.rs failed-switch coverage.
-            Err(EventWakeError::Io(source)) if source.kind() == io::ErrorKind::IsADirectory => None,
+            Err(EventWakeError::Io(source)) if source.kind() == io::ErrorKind::IsADirectory => {
+                (None, 0)
+            }
             Err(EventWakeError::Io(source)) => return Err(ProvenanceWriterError::Io(source)),
             Err(EventWakeError::InvalidLine { source }) => {
                 return Err(ProvenanceWriterError::InvalidLine { source });
@@ -78,7 +112,9 @@ impl ProvenanceWriter {
             policy: PersistPolicy,
             append_lock: Mutex::new(AppendState {
                 durable_tail,
+                durable_len,
                 pending_resume_marker: None,
+                unresolved_append: None,
             }),
             event_wakes: EventWakeRegistry::default(),
             _lock: lock,
@@ -95,6 +131,11 @@ impl ProvenanceWriter {
     /// no writer/session/host callbacks, I/O, or blocking work. Builder panic
     /// appends nothing and leaves the tail unchanged. Persisted non-semantic
     /// events are chained linearly; closed-list semantic parents are preserved.
+    ///
+    /// If a prior append has an unresolved sync outcome, the builder must
+    /// reproduce that exact batch (including ids) so the writer can reconcile
+    /// it. Clients that do not retain their envelopes must treat such a
+    /// failure as session-fatal and reopen from the durable log.
     pub fn append_parented(
         &self,
         build: impl FnOnce(Option<EventId>) -> Vec<EventEnvelope>,
@@ -126,6 +167,9 @@ impl ProvenanceWriter {
             ));
         }
         let mut state = recover_mutex(&self.append_lock);
+        if state.unresolved_append.is_some() {
+            return Err(unresolved_append_fence());
+        }
         if state.pending_resume_marker.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -152,10 +196,18 @@ impl ProvenanceWriter {
             .iter()
             .filter(|event| self.policy.classify(event.kind.as_str()) == PersistDecision::Persist)
             .collect::<Vec<_>>();
+        if state.unresolved_append.is_some() {
+            return self.reconcile_unresolved_append(state, &persisted_events, started);
+        }
         if persisted_events.is_empty() {
             return Ok(0);
         }
         let pending_resume_marker = state.pending_resume_marker.clone();
+        let logical = serialize_event_batch(
+            pending_resume_marker
+                .iter()
+                .chain(persisted_events.iter().copied()),
+        )?;
         let session_id = pending_resume_marker
             .as_ref()
             .or_else(|| persisted_events.first().copied())
@@ -169,38 +221,180 @@ impl ProvenanceWriter {
             .chain(persisted_events)
             .map(|event| self.externalize_large_payloads(event))
             .collect::<io::Result<Vec<_>>>()?;
-        let new_tail = events.last().map(|event| event.id.clone());
+        let new_tail = events
+            .last()
+            .map(|event| event.id.clone())
+            .expect("persisted append is non-empty");
+        let serialized = serialize_event_batch(events.iter())?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)?;
-        let mut bytes = 0_u64;
-        for event in events {
-            let line = event.to_json_line().map_err(io::Error::other)?;
-            file.write_all(line.as_bytes())?;
-            file.write_all(b"\n")?;
-            bytes = bytes.saturating_add(line.len() as u64).saturating_add(1);
+        let start_offset = file.metadata()?.len();
+        if start_offset != state.durable_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provenance log has bytes beyond its confirmed durable tail",
+            ));
         }
-        file.flush()?;
-        sync_file_data(&file, &self.log_path)?;
-        // Keep a newly created log name durable; this dir fsync is cheap
-        // relative to the log fsync and harmless for later appends.
-        sync_dir(log_dir)?;
-        // Not transactional: if an I/O failure occurs after bytes reached the
-        // file but before this point, the in-memory tail stays at the
-        // pre-append value and the writer surfaces the error. Callers treat
-        // append failure as session-fatal, so the stale-tail window is never
-        // built upon.
-        state.durable_tail = new_tail;
+        let byte_len = u64::try_from(serialized.len())
+            .map_err(|_| io::Error::other("provenance append is too large"))?;
+        let unresolved = UnresolvedAppend {
+            start_offset,
+            byte_len,
+            bytes_sha256: hash_bytes(&serialized),
+            logical_sha256: hash_bytes(&logical),
+            batch_event_ids: events.iter().map(|event| event.id.clone()).collect(),
+            new_tail,
+            event_count,
+            session_id: session_id.to_owned(),
+        };
+        let write = file
+            .write_all(&serialized)
+            .and_then(|()| file.flush())
+            .and_then(|()| sync_file_data(&file, &self.log_path))
+            // Keep a newly created log name durable; this dir fsync is cheap
+            // relative to the log fsync and harmless for later appends.
+            .and_then(|()| sync_dir(log_dir));
+        if let Err(error) = write {
+            self.remember_unresolved_append(state, unresolved);
+            return Err(error);
+        }
+        self.commit_append(state, &unresolved, started);
+        Ok(event_count)
+    }
+
+    fn remember_unresolved_append(&self, state: &mut AppendState, append: UnresolvedAppend) {
+        // Even an absent suffix retains its fingerprint. That lets the exact
+        // caller retry a zero-byte write while fencing every different batch.
+        // Complete bytes are re-synced; partial/divergent bytes fail closed.
+        state.unresolved_append = Some(append);
+    }
+
+    fn reconcile_unresolved_append(
+        &self,
+        state: &mut AppendState,
+        persisted_events: &[&EventEnvelope],
+        started: Instant,
+    ) -> io::Result<usize> {
+        let pending = state
+            .unresolved_append
+            .as_ref()
+            .expect("reconciliation requires an unresolved append");
+        let logical = serialize_event_batch(
+            state
+                .pending_resume_marker
+                .iter()
+                .chain(persisted_events.iter().copied()),
+        )?;
+        let retry_ids = state
+            .pending_resume_marker
+            .iter()
+            .map(|event| event.id.as_str())
+            .chain(persisted_events.iter().map(|event| event.id.as_str()));
+        if !retry_ids.eq(pending.batch_event_ids.iter().map(String::as_str))
+            || hash_bytes(&logical) != pending.logical_sha256
+        {
+            return Err(unresolved_append_fence());
+        }
+        let events = state
+            .pending_resume_marker
+            .iter()
+            .chain(persisted_events.iter().copied())
+            .map(|event| self.externalize_large_payloads(event))
+            .collect::<io::Result<Vec<_>>>()?;
+        let serialized = serialize_event_batch(events.iter())?;
+        if u64::try_from(serialized.len()).ok() != Some(pending.byte_len)
+            || hash_bytes(&serialized) != pending.bytes_sha256
+        {
+            return Err(unresolved_append_fence());
+        }
+        match self.inspect_unresolved_append(pending)? {
+            AppendSuffix::Complete => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.log_path)?;
+                sync_file_data(&file, &self.log_path)?;
+                sync_dir(containing_dir(&self.log_path))?;
+            }
+            AppendSuffix::Absent => {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.log_path)?;
+                if file.metadata()?.len() != pending.start_offset {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unresolved provenance append changed during reconciliation",
+                    ));
+                }
+                file.write_all(&serialized)?;
+                file.flush()?;
+                sync_file_data(&file, &self.log_path)?;
+                sync_dir(containing_dir(&self.log_path))?;
+            }
+            AppendSuffix::Divergent => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unresolved provenance append has a partial or divergent tail",
+                ));
+            }
+        }
+        let event_count = pending.event_count;
+        let committed = UnresolvedAppend {
+            start_offset: pending.start_offset,
+            byte_len: pending.byte_len,
+            bytes_sha256: pending.bytes_sha256.clone(),
+            logical_sha256: pending.logical_sha256.clone(),
+            batch_event_ids: pending.batch_event_ids.clone(),
+            new_tail: pending.new_tail.clone(),
+            event_count,
+            session_id: pending.session_id.clone(),
+        };
+        self.commit_append(state, &committed, started);
+        Ok(event_count)
+    }
+
+    fn inspect_unresolved_append(&self, append: &UnresolvedAppend) -> io::Result<AppendSuffix> {
+        let file_len = fs::metadata(&self.log_path)?.len();
+        if file_len == append.start_offset {
+            return Ok(AppendSuffix::Absent);
+        }
+        let expected_end = append
+            .start_offset
+            .checked_add(append.byte_len)
+            .ok_or_else(|| io::Error::other("provenance append offset overflow"))?;
+        if file_len != expected_end {
+            return Ok(AppendSuffix::Divergent);
+        }
+        let mut file = File::open(&self.log_path)?;
+        file.seek(std::io::SeekFrom::Start(append.start_offset))?;
+        let mut bytes = Vec::new();
+        file.take(append.byte_len).read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).ok() != Some(append.byte_len)
+            || hash_bytes(&bytes) != append.bytes_sha256
+        {
+            return Ok(AppendSuffix::Divergent);
+        }
+        Ok(AppendSuffix::Complete)
+    }
+
+    fn commit_append(&self, state: &mut AppendState, append: &UnresolvedAppend, started: Instant) {
+        state.durable_tail = Some(append.new_tail.clone());
+        state.durable_len = append
+            .start_offset
+            .checked_add(append.byte_len)
+            .expect("validated provenance append length");
         state.pending_resume_marker = None;
+        state.unresolved_append = None;
         self.event_wakes.notify_advanced();
         crate::diagnostics::provenance_append_end(
-            session_id,
-            persisted_events_count(event_count),
-            bytes,
+            &append.session_id,
+            persisted_events_count(append.event_count),
+            append.byte_len,
             elapsed_ms(started),
         );
-        Ok(event_count)
     }
 
     pub fn open_event_wake(&self) -> Result<EventWakeRegistration, EventWakeError> {
@@ -293,18 +487,37 @@ fn persisted_events_count(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
 
+fn serialize_event_batch<'a>(
+    events: impl IntoIterator<Item = &'a EventEnvelope>,
+) -> io::Result<Vec<u8>> {
+    let mut serialized = Vec::new();
+    for event in events {
+        let line = event.to_json_line().map_err(io::Error::other)?;
+        serialized.extend_from_slice(line.as_bytes());
+        serialized.push(b'\n');
+    }
+    Ok(serialized)
+}
+
 impl Drop for ProvenanceWriter {
     fn drop(&mut self) {
         self.event_wakes.close_all();
     }
 }
 
-fn latest_accepted_event_id(path: &Path) -> Result<Option<String>, EventWakeError> {
+fn latest_accepted_state(path: &Path) -> Result<(Option<String>, u64), EventWakeError> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, 0)),
         Err(error) => return Err(error.into()),
     };
+    let durable_len = if content.ends_with('\n') {
+        content.len()
+    } else {
+        content.rfind('\n').map_or(0, |index| index + 1)
+    };
+    let durable_len = u64::try_from(durable_len)
+        .map_err(|_| EventWakeError::Io(io::Error::other("provenance log is too large")))?;
     let mut latest = None;
     for line in numbered_accepted_prefix_lines(&content) {
         if let Some(nul) = nul_offset_in_line(line.text) {
@@ -324,7 +537,7 @@ fn latest_accepted_event_id(path: &Path) -> Result<Option<String>, EventWakeErro
             .map_err(|source| EventWakeError::InvalidLine { source })?;
         latest = Some(event.id);
     }
-    Ok(latest)
+    Ok((latest, durable_len))
 }
 
 pub fn read_provenance(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>, ProvenanceReadError> {
@@ -739,6 +952,11 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         Ok(existing) if existing == bytes => match OpenOptions::new().read(true).open(path) {
             Ok(file) => {
                 sync_file_data(&file, path)?;
+                // The blob may be the result of an earlier rename whose
+                // directory sync failed. Matching bytes prove identity, not
+                // name durability, so every successful dedupe path must
+                // confirm the containing directory too.
+                sync_dir(containing_dir(path))?;
                 return Ok(());
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}

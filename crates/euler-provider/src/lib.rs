@@ -439,6 +439,7 @@ impl ProviderErrorCategory {
 pub struct ProviderError {
     category: ProviderErrorCategory,
     message: String,
+    request_outcome_unknown: bool,
 }
 
 impl ProviderError {
@@ -446,6 +447,7 @@ impl ProviderError {
         Self {
             category,
             message: message.into(),
+            request_outcome_unknown: false,
         }
     }
 
@@ -469,12 +471,25 @@ impl ProviderError {
         Self::new(ProviderErrorCategory::StreamTruncation, message)
     }
 
+    /// The detached provider request thread panicked after dispatch may have
+    /// begun. Callers must not interpret this as an ordinary provider
+    /// rejection or replay the request: the remote outcome is unknown.
+    pub fn request_worker_panicked() -> Self {
+        let mut error = Self::stream_truncation("provider request worker panicked");
+        error.request_outcome_unknown = true;
+        error
+    }
+
     pub fn category(&self) -> ProviderErrorCategory {
         self.category
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn request_outcome_unknown(&self) -> bool {
+        self.request_outcome_unknown
     }
 }
 
@@ -728,31 +743,38 @@ impl ProviderSet {
         std::thread::Builder::new()
             .name("euler-provider-call".to_owned())
             .spawn(move || {
-                if cancellation.is_cancelled() {
-                    return;
-                }
-                let mut stream = match provider.invoke(request) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        if !cancellation.is_cancelled() {
-                            let _ = event_sender.send(Err(error));
-                        }
-                        return;
-                    }
-                };
-                loop {
-                    if demand_receiver.recv().is_err() {
-                        return;
-                    }
+                let panic_sender = event_sender.clone();
+                let panic_cancellation = cancellation.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     if cancellation.is_cancelled() {
                         return;
                     }
-                    let Some(event) = stream.next() else {
-                        return;
+                    let mut stream = match provider.invoke(request) {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            if !cancellation.is_cancelled() {
+                                let _ = event_sender.send(Err(error));
+                            }
+                            return;
+                        }
                     };
-                    if cancellation.is_cancelled() || event_sender.send(event).is_err() {
-                        return;
+                    loop {
+                        if demand_receiver.recv().is_err() {
+                            return;
+                        }
+                        if cancellation.is_cancelled() {
+                            return;
+                        }
+                        let Some(event) = stream.next() else {
+                            return;
+                        };
+                        if cancellation.is_cancelled() || event_sender.send(event).is_err() {
+                            return;
+                        }
                     }
+                }));
+                if outcome.is_err() && !panic_cancellation.is_cancelled() {
+                    let _ = panic_sender.send(Err(ProviderError::request_worker_panicked()));
                 }
             })
             .map_err(|_| ProviderError::transport("failed to start provider request"))?;

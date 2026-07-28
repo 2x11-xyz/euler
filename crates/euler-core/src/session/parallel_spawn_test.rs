@@ -66,6 +66,13 @@ fn kinds(events: &[EventEnvelope]) -> Vec<&str> {
         .collect()
 }
 
+fn count_kind(events: &[EventEnvelope], kind: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| event.kind.as_str() == kind)
+        .count()
+}
+
 fn batch_events(events: &[EventEnvelope]) -> Vec<&EventEnvelope> {
     events
         .iter()
@@ -161,6 +168,68 @@ fn batch_returns_outcomes_in_task_order_with_ordered_events() {
             spawn.payload["child_agent_id"]
         );
     }
+}
+
+#[test]
+fn completed_parallel_reviewers_resume_without_model_recovery_closures() {
+    let providers = scripted_set(&[
+        ("p1", FixtureResponse::Assistant("finding one".to_owned())),
+        ("p2", FixtureResponse::Assistant("finding two".to_owned())),
+    ]);
+    let (temp, log, mut session) = session_with_providers(providers);
+    session
+        .spawn_reviewers_parallel(
+            vec![
+                reviewer_task("p1", "m1", "code-swarm-correctness"),
+                reviewer_task("p2", "m2", "code-swarm-safety"),
+            ],
+            &CancellationToken::new(),
+        )
+        .expect("completed review batch");
+
+    let calls = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .collect::<Vec<_>>();
+    let results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::MODEL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].parent.as_deref(),
+        Some(calls[1].id.as_str()),
+        "the durable writer-linear parent crosses reviewer actors"
+    );
+    drop(session);
+
+    let mut resume_providers = ProviderSet::new();
+    resume_providers.insert_named("p1".to_owned(), ScriptedProvider::new(vec![]));
+    resume_providers.insert_named("p2".to_owned(), ScriptedProvider::new(vec![]));
+    let mut config = crate::SessionConfig::new(temp.path());
+    config.session_id = "session-parallel".to_owned();
+    config.provider = "p1".to_owned();
+    config.model = "m1".to_owned();
+    let outcome = crate::resume::resume_session_with_outcome(
+        config,
+        resume_providers,
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("resume completed batch");
+
+    assert!(!outcome.recovery_closure_appended);
+    assert!(!outcome.session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ERROR
+            && event
+                .payload
+                .get("recovery_closure")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    }));
 }
 
 struct CapturingProvider {
@@ -447,6 +516,129 @@ fn cancellation_releases_parallel_reviewers_and_records_terminal_results() {
     assert_eq!(terminals[0].payload["cancelled"], json!(true));
 }
 
+fn assert_one_reviewer_terminal_before_agent_result(events: &[EventEnvelope]) -> &EventEnvelope {
+    let call_index = events
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("reviewer model.call");
+    let call = &events[call_index];
+    let result_index = events
+        .iter()
+        .enumerate()
+        .skip(call_index + 1)
+        .find(|(_, event)| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .map(|(index, _)| index)
+        .expect("reviewer agent.result");
+    let terminals = events[call_index + 1..result_index]
+        .iter()
+        .filter(|event| {
+            event.agent == call.agent && crate::session::event_terminalizes_model_call(event)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "a prepared reviewer must close its model.call exactly once before agent.result"
+    );
+    terminals[0]
+}
+
+fn assert_parallel_resume_adds_no_recovery(temp: &tempfile::TempDir, log: &std::path::Path) {
+    let before = crate::resume::read_resume_prefix(log)
+        .expect("read live log")
+        .len();
+    let mut config = crate::SessionConfig::new(temp.path());
+    config.session_id = "session-parallel".to_owned();
+    config.provider = "p1".to_owned();
+    config.model = "m1".to_owned();
+    let outcome = crate::resume::resume_session_with_outcome(
+        config,
+        ProviderSet::single_named("p1".to_owned(), ScriptedProvider::new(vec![])),
+        ScriptedDecider::new(Vec::new()),
+        log,
+    )
+    .expect("resume terminalized parallel reviewer");
+
+    assert!(!outcome.recovery_closure_appended);
+    assert_eq!(outcome.session.events().len(), before);
+}
+
+#[test]
+fn pre_cancelled_parallel_reviewer_records_one_cancelled_terminal_before_result() {
+    let providers = scripted_set(&[("p1", FixtureResponse::Assistant("must not run".to_owned()))]);
+    let (temp, log, mut session) = session_with_providers(providers);
+    let cancellation = euler_sdk::CancellationSource::new();
+    cancellation.cancel();
+
+    let result = session.spawn_reviewers_parallel(
+        vec![reviewer_task("p1", "m1", "code-swarm-correctness")],
+        &cancellation.token(),
+    );
+
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    let terminal = assert_one_reviewer_terminal_before_agent_result(session.events());
+    assert_eq!(terminal.kind.as_str(), EventKind::ERROR);
+    assert_eq!(terminal.payload["source"], json!("session"));
+    assert_eq!(terminal.payload["cancelled"], json!(true));
+    assert_eq!(
+        terminal.payload.get("recovery_closure"),
+        None,
+        "known cancellation is not an unknown-outcome recovery"
+    );
+    drop(session);
+    assert_parallel_resume_adds_no_recovery(&temp, &log);
+}
+
+struct PanickingReviewProvider;
+
+struct PanickingReviewStream;
+
+impl Iterator for PanickingReviewStream {
+    type Item = Result<ModelStreamEvent, ProviderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        panic!("provider stream panic payload must never enter provenance")
+    }
+}
+
+impl ModelProvider for PanickingReviewProvider {
+    fn name(&self) -> &'static str {
+        "panic-review"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        Ok(Box::new(PanickingReviewStream))
+    }
+}
+
+#[test]
+fn panicking_parallel_reviewer_records_one_sanitized_recovery_terminal() {
+    let providers = ProviderSet::single_named("p1".to_owned(), PanickingReviewProvider);
+    let (temp, log, mut session) = session_with_providers(providers);
+
+    let summaries = session
+        .spawn_reviewers_parallel(
+            vec![reviewer_task("p1", "m1", "code-swarm-correctness")],
+            &CancellationToken::new(),
+        )
+        .expect("panic is isolated as reviewer failure");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    let terminal = assert_one_reviewer_terminal_before_agent_result(session.events());
+    assert_eq!(terminal.kind.as_str(), EventKind::ERROR);
+    assert_eq!(terminal.payload["source"], json!("session"));
+    assert_eq!(terminal.payload["recovery_closure"], json!(true));
+    assert_eq!(
+        terminal.payload["message"],
+        json!(REVIEWER_UNKNOWN_OUTCOME_MESSAGE)
+    );
+    let serialized = serde_json::to_string(session.events()).expect("serialize events");
+    assert!(!serialized.contains("provider stream panic payload"));
+    drop(session);
+    assert_parallel_resume_adds_no_recovery(&temp, &log);
+}
+
 #[test]
 fn buffered_worker_provider_error_is_redacted_before_append() {
     // F8: workers buffer the raw provider error for the session thread to
@@ -599,6 +791,169 @@ fn one_reviewer_failure_is_isolated_and_recorded_honestly() {
     assert_eq!(results.len(), 2, "both reviewers record terminal results");
     assert_eq!(results[0].payload["ok"], json!(true));
     assert_eq!(results[1].payload["ok"], json!(false));
+}
+
+#[test]
+fn context_rejected_reviewer_never_opens_a_model_call_lifecycle() {
+    let providers = scripted_set(&[(
+        "p1",
+        FixtureResponse::Assistant("must not be invoked".to_owned()),
+    )]);
+    let (temp, log, mut session) = session_with_providers(providers);
+    session.config.context_limit = Some(ContextLimitConfig::new(100, 1.0).expect("context limit"));
+
+    let summaries = session
+        .spawn_reviewers_parallel(
+            vec![reviewer_task("p1", "m1", "code-swarm-correctness")],
+            &CancellationToken::new(),
+        )
+        .expect("batch reports a per-reviewer rejection");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    assert!(summaries[0]
+        .result
+        .error()
+        .is_some_and(|error| error.contains("exceeds context limit")));
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::MODEL_CALL));
+    assert_eq!(
+        kinds(session.events()),
+        vec![
+            EventKind::AGENT_SPAWN,
+            EventKind::CANVAS_SNAPSHOT,
+            EventKind::ERROR,
+            EventKind::AGENT_RESULT,
+        ]
+    );
+    drop(session);
+
+    let mut config = crate::SessionConfig::new(temp.path());
+    config.session_id = "session-parallel".to_owned();
+    config.provider = "p1".to_owned();
+    config.model = "m1".to_owned();
+    let outcome = crate::resume::resume_session_with_outcome(
+        config,
+        ProviderSet::single_named("p1".to_owned(), ScriptedProvider::new(vec![])),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("resume rejected reviewer");
+    assert!(!outcome.recovery_closure_appended);
+    assert!(outcome.session.events().iter().all(|event| {
+        event
+            .payload
+            .get("recovery_closure")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    }));
+}
+
+#[test]
+fn reviewer_system_prompt_counts_toward_pre_dispatch_context_admission() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        CapturingProvider {
+            requests: Arc::clone(&requests),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.config.context_limit = Some(ContextLimitConfig::new(100, 1.0).expect("context limit"));
+    let budget = AgentBudget::new(Some(1), Some(0), Some(1)).expect("budget");
+    let task = AgentTask::new("x", "reviewer", "p1", "m1")
+        .expect("task")
+        .with_system_prompt("s".repeat(1_000))
+        .expect("valid large system prompt")
+        .with_parent_canvas(false)
+        .with_budget(budget);
+
+    let summaries = session
+        .spawn_reviewers_parallel(vec![task], &CancellationToken::new())
+        .expect("batch reports a per-reviewer rejection");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    assert!(summaries[0]
+        .result
+        .error()
+        .is_some_and(|error| error.contains("exceeds context limit")));
+    assert_eq!(count_kind(session.events(), EventKind::MODEL_CALL), 0);
+    assert!(
+        requests.lock().expect("requests").is_empty(),
+        "rejected reviewer must not invoke the provider"
+    );
+}
+
+#[test]
+fn session_output_cap_counts_when_reviewer_task_has_no_token_cap() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        CapturingProvider {
+            requests: Arc::clone(&requests),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.config.context_limit = Some(ContextLimitConfig::new(20, 1.0).expect("context limit"));
+    session.config.max_output_tokens = Some(20);
+    let budget = AgentBudget::new(Some(1), Some(0), None).expect("budget");
+    let task = AgentTask::new("x", "reviewer", "p1", "m1")
+        .expect("task")
+        .with_system_prompt("s")
+        .expect("system prompt")
+        .with_parent_canvas(false)
+        .with_budget(budget);
+
+    let summaries = session
+        .spawn_reviewers_parallel(vec![task], &CancellationToken::new())
+        .expect("batch reports a per-reviewer rejection");
+
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].result.ok());
+    assert!(summaries[0]
+        .result
+        .error()
+        .is_some_and(|error| error.contains("exceeds context limit")));
+    assert_eq!(count_kind(session.events(), EventKind::MODEL_CALL), 0);
+    assert!(
+        requests.lock().expect("requests").is_empty(),
+        "rejected reviewer must not invoke the provider"
+    );
+}
+
+#[test]
+fn context_rejection_skips_only_the_oversized_reviewer() {
+    let providers = scripted_set(&[
+        ("p1", FixtureResponse::Assistant("must not run".to_owned())),
+        ("p2", FixtureResponse::Assistant("finding".to_owned())),
+    ]);
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.config.context_limit = Some(ContextLimitConfig::new(100, 1.0).expect("context limit"));
+    let small_budget = AgentBudget::new(Some(1), Some(0), Some(10)).expect("budget");
+    let oversized = reviewer_task("p1", "m1", "code-swarm-correctness")
+        .with_budget(small_budget.clone())
+        .with_explicit_context("x".repeat(1_000))
+        .expect("explicit context");
+    let ready = reviewer_task("p2", "m2", "code-swarm-safety").with_budget(small_budget);
+
+    let summaries = session
+        .spawn_reviewers_parallel(vec![oversized, ready], &CancellationToken::new())
+        .expect("partial review batch");
+
+    assert!(!summaries[0].result.ok());
+    assert!(summaries[1].result.ok());
+    assert_eq!(summaries[1].result.output(), Some("finding"));
+    let calls = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].agent, summaries[1].child_agent_id);
+    assert_eq!(calls[0].payload["provider"], json!("p2"));
 }
 
 #[test]

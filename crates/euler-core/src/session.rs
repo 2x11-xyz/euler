@@ -56,7 +56,7 @@ mod permissions_gate;
 mod round_loop;
 mod steering;
 
-pub use steering::SteeringQueue;
+pub use steering::{QueuedInput, SteeringQueue};
 mod swarm_tool;
 mod tool_dispatch;
 pub use background::{
@@ -320,6 +320,10 @@ pub enum SessionError {
     InvalidModelSwitchEvent(String),
     #[error("invalid session name: {name}")]
     InvalidSessionName { name: String },
+    #[error("queued input is not the current dispatch reservation for this steering queue")]
+    InvalidQueuedInput,
+    #[error("cannot replace a session while a user-message admission is unresolved")]
+    UnresolvedAdmissionTransition,
     #[error(transparent)]
     EventWake(#[from] EventWakeError),
     #[error("event wake requires provenance writer")]
@@ -421,6 +425,17 @@ pub struct Session<D> {
     /// boundaries into canonical `user.message` events. `None` (headless,
     /// companions) means no steering.
     steering: Option<Arc<steering::SteeringQueue>>,
+    /// Queued input reserved for this turn. The queue retains it until the
+    /// initial `user.message` has been durably emitted.
+    queued_dispatch: Option<steering::QueuedInput>,
+    /// Exact authoritative event retained across an append failure. The
+    /// matching retry reuses its id and timestamp; every unrelated admission
+    /// is fenced until the owning writer confirms this candidate.
+    pending_admission: Option<PendingAdmission>,
+    /// A shadow worker was detached without an accepted terminal child for
+    /// its `model.call`. Further authoritative writes fail closed until the
+    /// durable log is reopened and its recovery closure is appended.
+    terminalization_failed: bool,
     /// Shared edge-triggered request from an interactive surface. The active
     /// driver consumes it only at a round boundary, where a fixed shadow
     /// canvas can be taken without interrupting the provider stream.
@@ -445,6 +460,11 @@ struct ShadowCompaction {
     model_call_id: String,
     worker: compaction_worker::CompactionWorker,
     started_at: Instant,
+}
+
+struct PendingAdmission {
+    event: EventEnvelope,
+    queue_id: Option<steering::QueueEntryId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +575,7 @@ where
         model_call_id: String,
         data: ModelRoundData,
         cancellation: &CancellationToken,
+        another_round_available: bool,
     ) -> Result<RoundOutcome, SessionError> {
         let stop_reason = data
             .stop_reason
@@ -612,7 +633,25 @@ where
                 Some(model_result_id),
             )?;
             self.sink.flush(self.session.bus.events());
-            return Ok(RoundOutcome::Complete(()));
+            // Explicit terminal transaction seam. PR4a may run same-turn idle
+            // contributors before this call; only `Closed` ends the steering
+            // group. The queue atomically reserves steering or closes, so
+            // post-close input is a follow-up rather than a lost late steer.
+            let boundary = if another_round_available {
+                self.finish_idle_steering_boundary(cancellation)?
+            } else {
+                self.defer_idle_steering_boundary(cancellation)
+            };
+            match boundary {
+                steering::BoundaryAction::Persisted => return Ok(RoundOutcome::Continue),
+                steering::BoundaryAction::Closed { cancelled: true } => {
+                    return Err(SessionError::Cancelled);
+                }
+                steering::BoundaryAction::Closed { cancelled: false }
+                | steering::BoundaryAction::Drained => {
+                    return Ok(RoundOutcome::Complete(()));
+                }
+            }
         }
 
         self.finish_tool_round(&model_result_id, data.tool_calls, cancellation)
@@ -629,35 +668,11 @@ where
     }
 
     fn absorb_steering(&mut self, cancellation: &CancellationToken) -> Result<(), SessionError> {
-        let Some(queue) = self.session.steering.clone() else {
-            return Ok(());
-        };
         let mut absorbed = false;
-        loop {
-            // Canonical user.message with normal causal chaining: the parent
-            // is whatever the turn last emitted (a tool.result, the prior
-            // steering message, ...), and the flush below echoes it to the
-            // surface immediately. Holding the queue transaction across this
-            // durable emit makes pause vs emit linearizable.
-            match queue.persist_next_for_round(
-                || cancellation.is_cancelled(),
-                |content| {
-                    self.session
-                        .emit(
-                            EventKind::USER_MESSAGE,
-                            object([("content", content.to_owned().into())]),
-                        )
-                        .map(|_| ())
-                },
-            ) {
-                Ok(true) => absorbed = true,
-                Ok(false) => break,
-                Err(error) => {
-                    // Flush whatever did land before surfacing the failure.
-                    self.sink.flush(self.session.bus.events());
-                    return Err(error);
-                }
-            }
+        while let steering::BoundaryAction::Persisted =
+            self.persist_steering(steering::RoundBoundary::Intermediate, cancellation)?
+        {
+            absorbed = true;
         }
         if absorbed {
             self.sink.flush(self.session.bus.events());
@@ -665,7 +680,13 @@ where
         Ok(())
     }
 
-    fn round_limit(&mut self) -> Result<(), SessionError> {
+    fn round_limit(&mut self, cancellation: &CancellationToken) -> Result<(), SessionError> {
+        if matches!(
+            self.defer_idle_steering_boundary(cancellation),
+            steering::BoundaryAction::Closed { cancelled: true }
+        ) {
+            return Err(SessionError::Cancelled);
+        }
         self.session.emit(
             EventKind::ASSISTANT_MESSAGE,
             object([("content", TOOL_ROUNDS_LIMIT_MESSAGE.into())]),
@@ -680,6 +701,66 @@ where
     F: FnMut(&EventEnvelope),
     D: PermissionDecider,
 {
+    fn persist_steering(
+        &mut self,
+        boundary: steering::RoundBoundary,
+        cancellation: &CancellationToken,
+    ) -> Result<steering::BoundaryAction, SessionError> {
+        let Some(queue) = self.session.steering.clone() else {
+            return Ok(match boundary {
+                steering::RoundBoundary::Intermediate => steering::BoundaryAction::Drained,
+                steering::RoundBoundary::Terminal => {
+                    steering::BoundaryAction::Closed { cancelled: false }
+                }
+            });
+        };
+        let result = queue.persist_next_for_round(
+            boundary,
+            || cancellation.is_cancelled(),
+            |input| {
+                self.session
+                    .admit_user_message(input.content(), Some(input.id()))
+                    .map(|_| ())
+            },
+        );
+        if result.is_err() {
+            // Prior accepted backlog may remain on the bus if draining it was
+            // the append that failed. Flush that evidence while the queue
+            // retains its reserved id. The rejected user.message itself is
+            // never accepted onto the bus.
+            self.sink.flush(self.session.bus.events());
+        }
+        result
+    }
+
+    /// Named terminal steering-group transaction.
+    ///
+    /// This is deliberately separate from no-tool response recording. A
+    /// same-turn idle contributor may run first and return Continue; only
+    /// calling this seam after idle Stop may close the group. `Persisted`
+    /// requests another model round, while `Closed` makes subsequent input a
+    /// follow-up.
+    fn finish_idle_steering_boundary(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<steering::BoundaryAction, SessionError> {
+        self.persist_steering(steering::RoundBoundary::Terminal, cancellation)
+    }
+
+    /// Close a terminal round-limit seam without admitting steering that this
+    /// turn has no remaining provider request to observe.
+    fn defer_idle_steering_boundary(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> steering::BoundaryAction {
+        self.session.steering.as_ref().map_or_else(
+            || steering::BoundaryAction::Closed {
+                cancelled: cancellation.is_cancelled(),
+            },
+            |queue| queue.defer_terminal_boundary(|| cancellation.is_cancelled()),
+        )
+    }
+
     fn finish_tool_round(
         &mut self,
         model_result_id: &str,
@@ -822,6 +903,9 @@ impl<D> Session<D> {
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
             steering: None,
+            queued_dispatch: None,
+            pending_admission: None,
+            terminalization_failed: false,
             compaction_request: None,
             shadow_compaction: None,
             code_swarm_extension: None,
@@ -906,7 +990,10 @@ impl<D> Session<D> {
         session_id: impl Into<String>,
         decider: D,
         project_context: ProjectContextBootstrap,
-    ) -> Self {
+    ) -> Result<Self, (Box<Self>, SessionError)> {
+        if self.has_unresolved_admission() {
+            return Err((Box::new(self), SessionError::UnresolvedAdmissionTransition));
+        }
         let active_target = self.active_target;
         let code_swarm_extension = self.code_swarm_extension;
         let redactor = self.redactor;
@@ -926,7 +1013,7 @@ impl<D> Session<D> {
         // The code-swarm wiring is launch configuration, not session state:
         // a fresh session in the same process keeps the review-gate tool.
         fresh.code_swarm_extension = code_swarm_extension;
-        fresh
+        Ok(fresh)
     }
 
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
@@ -946,15 +1033,57 @@ impl<D> Session<D> {
     /// into `user.message` events, so the next model call sees steering
     /// in-turn.
     ///
-    /// Arming opens a new steering generation ON THE CALLER'S THREAD,
-    /// before the turn's worker exists: everything pushed after this call
-    /// steers the upcoming turn, everything pushed before it is a leftover
-    /// that flushes as its own turn. Ordering the generation with the
-    /// surface's own pushes (same thread) is what makes that boundary
-    /// race-free — re-wire the queue on every spawn.
+    /// Arming opens a new steering group ON THE CALLER'S THREAD, before the
+    /// turn's worker exists. Everything explicitly tagged as steering after
+    /// this call belongs to the upcoming turn; ordinary follow-ups remain
+    /// separate. Ordering the group with the surface's own pushes (same
+    /// thread) makes that boundary race-free — re-wire on every spawn.
     pub fn set_steering_queue(&mut self, queue: Arc<steering::SteeringQueue>) {
-        queue.begin_turn();
+        queue.begin_turn(None);
         self.steering = Some(queue);
+        self.queued_dispatch = None;
+    }
+
+    /// Wire steering for a queued input selected as the next turn. If the
+    /// input is the head of an interrupted steering group, its contiguous
+    /// siblings are rebound to this replacement turn; an ordinary follow-up
+    /// opens a clean group and absorbs nothing already queued.
+    pub fn set_steering_queue_for_queued_input(
+        &mut self,
+        queue: Arc<steering::SteeringQueue>,
+        input: &steering::QueuedInput,
+    ) -> Result<(), SessionError> {
+        if !queue.is_current_dispatch(input) {
+            return Err(SessionError::InvalidQueuedInput);
+        }
+        if self
+            .pending_admission
+            .as_ref()
+            .is_some_and(|pending| pending.queue_id != Some(input.id()))
+        {
+            return Err(pending_admission_error());
+        }
+        queue.begin_turn(Some(input));
+        self.steering = Some(queue);
+        self.queued_dispatch = Some(input.clone());
+        Ok(())
+    }
+
+    /// Whether this live session owns an authoritative user-message append
+    /// whose durability is still ambiguous.
+    pub fn has_unresolved_admission(&self) -> bool {
+        self.pending_admission.is_some()
+            || self
+                .steering
+                .as_ref()
+                .is_some_and(|queue| queue.has_unresolved_admission())
+    }
+
+    /// Whether a fresh user turn can be admitted before the active target's
+    /// context latch. TUI auto-flush must leave queued work untouched when
+    /// this is false.
+    pub fn can_accept_turn(&self) -> bool {
+        self.context_limit_emitted.as_ref() != Some(&self.active_target)
     }
 
     /// Wire the interactive surface's edge-triggered manual-compaction
@@ -1219,10 +1348,116 @@ impl<D> Session<D> {
     }
 
     fn append_before_accept(&self, event: &EventEnvelope) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission()?;
+        self.append_candidate(event)
+    }
+
+    fn append_candidate(&self, event: &EventEnvelope) -> Result<(), SessionError> {
         if let Some(writer) = &self.provenance {
             writer.append(std::slice::from_ref(event))?;
         }
         Ok(())
+    }
+
+    /// Admit one authoritative user message without exposing an event that
+    /// provenance rejected.
+    ///
+    /// General turn events intentionally retain accepted in-memory evidence
+    /// when a later append fails. User messages have a stronger queue
+    /// transaction: the exact envelope id, timestamp, and parent are installed
+    /// before any accepted backlog is written. A failure while reconciling
+    /// that backlog or appending the candidate therefore protects the same
+    /// queue row. Repair + retry can reconcile an ambiguous complete append
+    /// instead of creating a second event. While it is pending, every
+    /// unrelated append is fenced.
+    fn admit_user_message(
+        &mut self,
+        content: &str,
+        queue_id: Option<steering::QueueEntryId>,
+    ) -> Result<String, SessionError> {
+        self.ensure_terminalization_intact()?;
+        let payload = object([("content", content.to_owned().into())]);
+        if let Some(pending) = &self.pending_admission {
+            if pending.queue_id != queue_id
+                || pending.event.kind.as_str() != EventKind::USER_MESSAGE
+                || pending.event.payload != payload
+            {
+                return Err(pending_admission_error());
+            }
+        } else {
+            self.pending_admission = Some(PendingAdmission {
+                event: EventEnvelope::new(
+                    self.config.session_id.clone(),
+                    self.config.agent_id.clone(),
+                    self.previous_persisted_event_id(),
+                    EventKind::USER_MESSAGE,
+                    payload,
+                ),
+                queue_id,
+            });
+        }
+        if let Err(error) = self.persist_pending_admission_backlog() {
+            self.protect_pending_queue_row();
+            return Err(error);
+        }
+        let pending = self
+            .pending_admission
+            .as_ref()
+            .expect("admission was matched or created");
+        let event = pending.event.clone();
+        let id = event.id.clone();
+        if let Err(error) = self.append_candidate(&event) {
+            self.protect_pending_queue_row();
+            return Err(error);
+        }
+        self.bus.push(event);
+        self.pending_admission = None;
+        if self.provenance.is_some() {
+            self.persisted_events = self.bus.events().len();
+        }
+        Ok(id)
+    }
+
+    /// The sole append path allowed after a pending user admission has been
+    /// installed. It owns only the older accepted bus suffix; the candidate
+    /// itself is appended separately and is not visible in memory yet.
+    fn persist_pending_admission_backlog(&mut self) -> Result<(), SessionError> {
+        debug_assert!(self.pending_admission.is_some());
+        self.ensure_terminalization_intact()?;
+        if self.persisted_events < self.bus.events().len() {
+            if let Some(writer) = &self.provenance {
+                writer.append(&self.bus.events()[self.persisted_events..])?;
+                self.persisted_events = self.bus.events().len();
+            }
+        }
+        Ok(())
+    }
+
+    fn protect_pending_queue_row(&self) {
+        let queue_id = self
+            .pending_admission
+            .as_ref()
+            .and_then(|pending| pending.queue_id);
+        if let (Some(queue), Some(queue_id)) = (&self.steering, queue_id) {
+            queue.mark_admission_unresolved(queue_id);
+        }
+    }
+
+    fn ensure_no_pending_admission(&self) -> Result<(), SessionError> {
+        self.ensure_terminalization_intact()?;
+        if self.pending_admission.is_some() {
+            Err(pending_admission_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_terminalization_intact(&self) -> Result<(), SessionError> {
+        if self.terminalization_failed {
+            Err(terminalization_failed_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn previous_persisted_event_id(&self) -> Option<String> {
@@ -1235,6 +1470,7 @@ impl<D> Session<D> {
     }
 
     fn persist_new_events(&mut self) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission()?;
         if let Some(writer) = &self.provenance {
             writer.append(&self.bus.events()[self.persisted_events..])?;
             self.persisted_events = self.bus.events().len();
@@ -1401,6 +1637,9 @@ impl<D> Session<D> {
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
             steering: None,
+            queued_dispatch: None,
+            pending_admission: None,
+            terminalization_failed: false,
             compaction_request: None,
             shadow_compaction: None,
             code_swarm_extension: None,
@@ -1429,6 +1668,7 @@ impl<D: PermissionDecider> Session<D> {
     /// interactive surfaces should use `begin_compaction` plus
     /// `poll_compaction` so the composer remains usable while it waits.
     pub fn compact_and_wait(&mut self) -> Result<CompactionStatus, SessionError> {
+        self.ensure_no_pending_admission()?;
         let started = self.begin_compaction()?;
         if started == CompactionStatus::InProgress {
             self.wait_for_shadow_compaction(&CancellationToken::new())
@@ -1441,12 +1681,14 @@ impl<D: PermissionDecider> Session<D> {
     /// projection. The session remains usable by the active driver while a
     /// shadow candidate is pending.
     pub fn begin_compaction(&mut self) -> Result<CompactionStatus, SessionError> {
+        self.ensure_no_pending_admission()?;
         let target_tokens = self.effective_stub_policy().budget_bytes.div_ceil(4);
         self.compact_for_threshold(target_tokens)
     }
 
     /// Poll a pending shadow candidate without blocking.
     pub fn poll_compaction(&mut self) -> Result<CompactionStatus, SessionError> {
+        self.ensure_no_pending_admission()?;
         self.poll_shadow_compaction()
     }
 
@@ -1658,6 +1900,7 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         checkpoint_event_id: &str,
     ) -> Result<WorkspaceRestoreOutcome, SessionError> {
+        self.ensure_no_pending_admission()?;
         let checkpoint = self
             .bus
             .events()
@@ -1721,12 +1964,30 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         user_message: &str,
         cancel_flag: Arc<AtomicBool>,
-        mut on_event: F,
+        on_event: F,
     ) -> Result<Vec<EventEnvelope>, SessionError>
     where
         F: FnMut(&EventEnvelope),
     {
         let cancellation = CancellationSource::from_shared_flag(cancel_flag).token();
+        let result = self.run_turn_with_sink_open(user_message, cancellation, on_event);
+        self.release_queued_dispatch();
+        // Error, cancellation, and an early context latch do not cross the
+        // named no-tool terminal seam. Close them before returning the worker
+        // session; normal completion already closed and this is idempotent.
+        self.close_steering_turn();
+        result
+    }
+
+    fn run_turn_with_sink_open<F>(
+        &mut self,
+        user_message: &str,
+        cancellation: CancellationToken,
+        mut on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
         if self.context_limit_emitted.as_ref() == Some(&self.active_target) {
             return Ok(Vec::new());
         }
@@ -1735,10 +1996,9 @@ impl<D: PermissionDecider> Session<D> {
         let start = self.bus.events().len();
         crate::diagnostics::turn_start(&self.config.session_id);
         let mut sink = EventSink::new(start, &mut on_event);
-        self.emit(
-            EventKind::USER_MESSAGE,
-            object([("content", user_message.into())]),
-        )?;
+        let queue_id = self.queued_dispatch.as_ref().map(steering::QueuedInput::id);
+        self.admit_user_message(user_message, queue_id)?;
+        self.acknowledge_queued_dispatch();
         sink.flush(self.bus.events());
         let settled = self.settle_shadow_at_context_limit(&cancellation);
         sink.flush(self.bus.events());
@@ -1760,6 +2020,30 @@ impl<D: PermissionDecider> Session<D> {
         }
 
         self.run_model_rounds(start, cancellation, &mut sink)
+    }
+
+    fn acknowledge_queued_dispatch(&mut self) {
+        let Some(input) = self.queued_dispatch.take() else {
+            return;
+        };
+        if let Some(queue) = &self.steering {
+            queue.acknowledge_dispatch(&input);
+        }
+    }
+
+    fn release_queued_dispatch(&mut self) {
+        let Some(input) = self.queued_dispatch.take() else {
+            return;
+        };
+        if let Some(queue) = &self.steering {
+            queue.release_dispatch(&input);
+        }
+    }
+
+    fn close_steering_turn(&self) {
+        if let Some(queue) = &self.steering {
+            queue.close_turn();
+        }
     }
 
     fn run_model_rounds<F>(
@@ -2318,7 +2602,7 @@ impl<D: PermissionDecider> Session<D> {
             });
         };
         let shadow = self.shadow_compaction.take().expect("shadow checked above");
-        self.finish_shadow_compaction(shadow, outcome, CompactionCloseDisposition::ApplyReady)
+        self.finish_detached_shadow(shadow, outcome, CompactionCloseDisposition::ApplyReady)
     }
 
     fn wait_for_shadow_compaction(
@@ -2347,7 +2631,7 @@ impl<D: PermissionDecider> Session<D> {
                 continue;
             };
             let shadow = self.shadow_compaction.take().expect("shadow checked above");
-            return self.finish_shadow_compaction(
+            return self.finish_detached_shadow(
                 shadow,
                 outcome,
                 CompactionCloseDisposition::ApplyReady,
@@ -2389,19 +2673,58 @@ impl<D: PermissionDecider> Session<D> {
         };
         if let Some(outcome) = shadow.worker.try_recv() {
             let shadow = self.shadow_compaction.take().expect("shadow checked above");
-            return self.finish_shadow_compaction(shadow, outcome, disposition);
+            return self.finish_detached_shadow(shadow, outcome, disposition);
         }
         shadow.worker.cancel();
         let outcome = shadow.worker.recv_timeout(COMPACTION_CANCEL_GRACE);
         let shadow = self.shadow_compaction.take().expect("shadow checked above");
         if let Some(outcome) = outcome {
-            return self.finish_shadow_compaction(shadow, outcome, disposition);
+            return self.finish_detached_shadow(shadow, outcome, disposition);
         }
         // The provider may be inside non-cancellable synchronous I/O. Drop
         // the receiver only after terminalizing the canonical model.call;
         // late worker output then has no writer and cannot re-enter the bus.
         shadow.worker.cancel();
-        self.finish_cancelled_shadow(shadow, reason)
+        self.finish_detached_cancelled_shadow(shadow, reason)
+    }
+
+    fn finish_detached_shadow(
+        &mut self,
+        shadow: ShadowCompaction,
+        outcome: compaction_worker::WorkerOutcome,
+        disposition: CompactionCloseDisposition,
+    ) -> Result<CompactionStatus, SessionError> {
+        let model_call_id = shadow.model_call_id.clone();
+        let result = self.finish_shadow_compaction(shadow, outcome, disposition);
+        self.fail_closed_if_unterminalized(&model_call_id, &result);
+        result
+    }
+
+    fn finish_detached_cancelled_shadow(
+        &mut self,
+        shadow: ShadowCompaction,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, SessionError> {
+        let model_call_id = shadow.model_call_id.clone();
+        let result = self.finish_cancelled_shadow(shadow, reason);
+        self.fail_closed_if_unterminalized(&model_call_id, &result);
+        result
+    }
+
+    fn fail_closed_if_unterminalized(
+        &mut self,
+        model_call_id: &str,
+        result: &Result<CompactionStatus, SessionError>,
+    ) {
+        if result.is_err() && !self.model_call_has_terminal(model_call_id) {
+            self.terminalization_failed = true;
+        }
+    }
+
+    fn model_call_has_terminal(&self, model_call_id: &str) -> bool {
+        self.bus.events().iter().any(|event| {
+            event.parent.as_deref() == Some(model_call_id) && event_terminalizes_model_call(event)
+        })
     }
 
     fn finish_cancelled_shadow(
@@ -2700,6 +3023,7 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         secrets: &[String],
     ) -> Result<crate::scrub::ScrubReport, SessionError> {
+        self.ensure_no_pending_admission()?;
         let Some(writer) = self.provenance.clone() else {
             return Err(SessionError::ScrubRequiresProvenance);
         };
@@ -2741,6 +3065,10 @@ impl<D: PermissionDecider> Session<D> {
         payload: JsonObject,
         parent: Option<String>,
     ) -> Result<String, SessionError> {
+        self.ensure_no_pending_admission()?;
+        if self.provenance.is_some() && self.persisted_events < self.bus.events().len() {
+            self.persist_new_events()?;
+        }
         self.bus.push(EventEnvelope::new(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
@@ -2758,6 +3086,44 @@ impl<D: PermissionDecider> Session<D> {
         self.persist_new_events()?;
         Ok(id)
     }
+}
+
+fn pending_admission_error() -> SessionError {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "a prior authoritative event admission is unresolved; retry the same operation",
+    )
+    .into()
+}
+
+fn terminalization_failed_error() -> SessionError {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "a detached model call has no accepted terminal event; reopen the session to recover it",
+    )
+    .into()
+}
+
+/// Whether an event is a semantic terminal for the `model.call` it parents.
+///
+/// Other errors follow the linear event parent and can therefore happen to
+/// parent an asynchronous shadow call without settling it.
+pub(crate) fn event_terminalizes_model_call(event: &EventEnvelope) -> bool {
+    if event.kind.as_str() == EventKind::MODEL_RESULT {
+        return true;
+    }
+    if event.kind.as_str() != EventKind::ERROR {
+        return false;
+    }
+    let source = event.payload.get("source").and_then(Value::as_str);
+    source == Some("provider")
+        || (source == Some("session")
+            && (event.payload.get("cancelled").and_then(Value::as_bool) == Some(true)
+                || event
+                    .payload
+                    .get("recovery_closure")
+                    .and_then(Value::as_bool)
+                    == Some(true)))
 }
 
 /// Canvas-budget admission guard. Stub demotion and shadow projection may

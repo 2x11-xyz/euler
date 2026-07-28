@@ -4864,12 +4864,12 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
 }
 
 #[test]
-fn tui_pty_mid_turn_input_steers_before_the_next_round() {
-    // Issue #146: a message typed while a turn is in flight is absorbed at
-    // the next round boundary as a canonical user.message — the model sees
-    // it in-turn — instead of waiting for the turn to complete. The fixture
-    // holds round 1 open with a sleep so the steering keystrokes land
-    // deterministically mid-round.
+fn tui_pty_stacked_steering_during_final_stream_hydrates_the_next_request() {
+    // Issue #146 follow-up: the original PTY covered only a tool boundary.
+    // The dogfood failure was a long no-tool response with several steers
+    // already visible in the composer queue. Without a terminal-round
+    // boundary check, those entries became separate turns after the response
+    // completed. Hold that final stream open and reproduce the whole stack.
     let temp = tempfile::tempdir().expect("temp dir");
     let script = write_fixture_script(
         temp.path(),
@@ -4878,17 +4878,12 @@ fn tui_pty_mid_turn_input_steers_before_the_next_round() {
             "version": 1,
             "responses": [
                 {"events": [
-                    {"text_delta": "phase one underway\n"},
+                    {"text_delta": "phase one final stream\n"},
                     {"sleep_ms": 4000},
-                    {"tool_call": {
-                        "id": "call-read",
-                        "name": "read_file",
-                        "input": {"path": "Cargo.toml"}
-                    }},
-                    {"finished": {"stop_reason": "tool_use"}}
+                    {"finished": {"stop_reason": "completed"}}
                 ]},
                 {"events": [
-                    {"text_delta": "final answer after steering"},
+                    {"text_delta": "continued after stacked steering"},
                     {"finished": {"stop_reason": "completed"}}
                 ]}
             ]
@@ -4907,66 +4902,62 @@ fn tui_pty_mid_turn_input_steers_before_the_next_round() {
         ],
     );
     assert!(tui.wait_for_screen("/ commands"));
-    // Steering is typed immediately behind the submit: the app processes
-    // serial PTY input in order, so by the time these keystrokes are
-    // handled the turn is in flight and its steering generation is armed
-    // (spawn arms it on the UI thread before the worker exists). The
-    // scripted 4s sleep in round 1 then dwarfs any scheduling jitter, so
-    // the entry is queued long before the turn's next round boundary — no
-    // wall-clock screen-wait involved. (The `⏎ steer` footer copy is
-    // asserted by the status unit test; waiting on that glyph row proved
-    // flaky on CI renderers and is not what this test is about.)
+    // Wait until the first response is visibly streaming before submitting
+    // the stack. The fixture then holds the stream open for 4s, making these
+    // entries unambiguously steering for an already-dispatched model round.
     tui.write("start the task\r");
-    tui.write("steer toward the tests\r");
     assert!(
-        tui.wait_for_screen("phase one underway"),
+        tui.wait_for_screen("phase one final stream"),
         "round 1 did not start:\n{}",
         tui.screen_text()
     );
+    tui.write("steer one\r");
+    tui.write("steer two\r");
+    tui.write("steer three\r");
     assert!(
-        tui.wait_for_screen("final answer after steering"),
+        tui.wait_for_screen("continued after stacked steering"),
         "turn did not finish:\n{}",
         tui.screen_text()
     );
     tui.quit();
 
-    // The durable stream shows the steering user.message inside the turn:
-    // after round 1's tool result, before round 2's model call.
+    // The durable stream shows the entire stack after round 1 committed and
+    // before round 2's model call, in the same order and exactly once.
     let session_id = only_home_session_id(temp.path());
     let events = read_jsonl(&home_session_log(temp.path(), &session_id));
-    let steering_index = events
+    let steering: Vec<(usize, &str)> = events
         .iter()
-        .position(|event| {
-            event.kind.as_str() == "user.message"
-                && event
-                    .payload
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("steer toward the tests")
+        .enumerate()
+        .filter_map(|(index, event)| {
+            if event.kind.as_str() != "user.message" {
+                return None;
+            }
+            let content = event.payload.get("content")?.as_str()?;
+            content.starts_with("steer ").then_some((index, content))
         })
-        .expect("steering user.message persisted");
+        .collect();
+    assert_eq!(
+        steering.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+        ["steer one", "steer two", "steer three"]
+    );
     let model_call_indexes: Vec<usize> = events
         .iter()
         .enumerate()
         .filter(|(_, event)| event.kind.as_str() == "model.call")
         .map(|(index, _)| index)
         .collect();
-    // Absorbed at whichever round boundary came first after the keystrokes
-    // (round 1's on fast machines, round 2's on slow ones) — and never as
-    // a turn of its own: exactly two model calls proves the pre-steering
-    // failure mode (queue flushed into a third turn after completion) did
-    // not happen.
     assert_eq!(
         model_call_indexes.len(),
         2,
-        "steering must not spawn its own turn"
+        "the stack must continue one running turn, not spawn follow-up turns"
     );
-    assert!(
-        steering_index < model_call_indexes[1],
-        "steering was not absorbed in-turn: user.message at {steering_index}, \
-         second model.call at {}",
-        model_call_indexes[1]
-    );
+    let first_result = events
+        .iter()
+        .position(|event| event.kind.as_str() == "model.result")
+        .expect("first model result");
+    assert!(steering
+        .iter()
+        .all(|(index, _)| first_result < *index && *index < model_call_indexes[1]));
 }
 
 #[test]

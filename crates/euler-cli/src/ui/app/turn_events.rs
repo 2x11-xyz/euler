@@ -210,10 +210,10 @@ impl AppCore {
             }
             return;
         }
-        if auto_flush && !self.queued_inputs.paused() {
-            if let Some(prompt) = self.pop_next_queued_input() {
-                self.bottom.record_submission(&prompt);
-                self.spawn_turn(prompt, session);
+        if auto_flush && !self.queued_inputs.paused() && session.can_accept_turn() {
+            if let Some(input) = self.pop_next_queued_input() {
+                self.bottom.record_submission(input.content());
+                self.spawn_queued_turn(input, session);
                 return;
             }
         }

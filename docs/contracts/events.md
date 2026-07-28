@@ -84,19 +84,71 @@ envelope `v` per `docs/contracts/persistence.md`.
 
 - `user.message`: `content`. A turn is not limited to one: mid-turn
   steering (issue #146) appends additional `user.message` events at round
-  boundaries — after a completed round's tool results, always between
+  boundaries — after a completed tool round's results or after the committed
+  `assistant.message` of a no-tool round. They are always between model
   rounds, never inside a streamed assistant message. Request assembly
   positions them like any other event, and readers must not assume a turn
-  has exactly one leading user message.
-- `assistant.message`: `content`.
+  has exactly one leading user message. Queue entries are removed only after
+  this event is durable: both mid-turn absorption and queued-turn dispatch
+  reserve by id first, and append failure leaves the entry queued. A queue-entry
+  id is opaque and includes both the queue instance and its row sequence; a
+  same-position, same-content row from another queue is never the same
+  reservation. Admission installs the pending candidate — including its exact
+  envelope id, timestamp, parent, payload, and originating queue-entry id —
+  before attempting to persist any older accepted backlog. It then reconciles
+  that backlog, appends the candidate, and only then publishes the candidate to
+  the live bus. A failure in either append protects the same pending owner, and
+  a rejected candidate is never an accepted in-memory event. Only that exact
+  queue row with the same payload may retry it. Remove/edit/clear protect the
+  unresolved entry, and dispatch selects it before any row inserted later,
+  even when another row has identical content. Repair and retry therefore
+  reconcile that event exactly once instead of persisting a failed bus copy or
+  acknowledging a content-equal duplicate.
+- `assistant.message`: `content`. It commits the visible content of a
+  no-tool model round. Pending steering may keep that same user turn active,
+  append more `user.message` events, and dispatch another model round only
+  when the explicit round budget can admit that request. At the final allowed
+  round, the terminal transaction closes the steering group without persisting
+  queued steering; rows submitted before that close remain deferred, and rows
+  submitted after it are ordinary follow-ups.
 - `model.call`: `provider`, `model`, `canvas_items`,
   `requested_reasoning_effort`; optional resolved `reasoning_effort`,
   `max_output_tokens`, and `project_context_digest`. Every accepted call has
-  exactly one terminal child: `model.result` on a drained finished stream, or
-  a parented `error`. Cancellation before a result records the safe error
-  payload `source: "session"`, `message: "model call cancelled"`, and
-  `cancelled: true`. Cancellation after a `model.result` never adds a second
-  terminal child.
+  exactly one semantic terminal association: `model.result` on a drained
+  finished stream, or a terminal `error`. Cancellation before a result records
+  the safe error payload `source: "session"`, `message: "model call
+  cancelled"`, and `cancelled: true`. Cancellation after a `model.result`
+  never adds a second terminal. A model-terminal `error` is specifically a
+  provider error, a session error with `cancelled: true`, or a session error with
+  `recovery_closure: true`; an extension, guardian, or ordinary session error
+  that merely receives a linear parent of an asynchronous call does not settle
+  it.
+
+  **Authoritative terminal association rule:** scan accepted events in order
+  while tracking open `model.call` events. A terminal whose `parent` names an
+  open call from the same envelope `agent` settles that call. Otherwise it may
+  settle only the unique open call from the same `agent` whose recorded
+  `provider`/`model` match when the terminal carries those fields and whose
+  `purpose` matches exactly (including both sides omitting it). With no
+  candidate, the terminal settles no call; multiple candidates make the
+  history incompatible and resume fails closed. A direct terminal naming an
+  already closed same-agent call is a duplicate and makes the history
+  incompatible. When no call is open, a writer-linear terminal that uniquely
+  matches an already closed same-agent call is likewise rejected as a
+  duplicate; it is never ignored or allowed to settle later work. This
+  actor/order rule is necessary because sequential companions and parallel
+  reviewers use the writer-owned linear spine:
+  reasoning and terminal events may durably parent a preceding reasoning event
+  or another reviewer's event rather than their logical call. A crossed-agent
+  linear parent is never authority.
+
+  Resume applies this rule and closes every call left open
+  with a parented `error` carrying `source: "session"` and
+  `recovery_closure: true`; the message says that the call was interrupted and
+  its outcome is unknown. The closure preserves an originating `purpose`
+  (including `"compaction"`), but does not claim `cancelled: true`: restart
+  cannot know whether the remote provider completed. All such closures are
+  durable before the resume marker is armed or a new user turn is admitted.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
@@ -496,7 +548,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   error to that request; it remains provenance-only while the TUI reports the
   compact failure without replacing the driver transcript or driver-failure
   HUD. Session-owned cancellation uses `source: "session"` with the same
-  purpose and terminally closes the shadow `model.call`. When
+  purpose and terminally closes the shadow `model.call`. A resume-time
+  `source: "session"` error may instead carry `recovery_closure: true`; it
+  terminally records the unknown outcome of an interrupted model call and
+  preserves the call's optional `purpose` without asserting `cancelled`. When
   `source` is `extension`, optional `extension_id`, `command`, and
   `failure` (`command_error` | `panic`) fields attribute the host-observed
   failure. Extension error messages in persisted events are host-generated
@@ -560,8 +615,12 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `file.diff` parents the same event as the matching `file.change`. It is a
   sibling display projection, not the parent of `tool.result`. Its
   `file_change_id` references the matching `file.change`.
-- `model.result`, `model.reasoning`, and `model.delta` parent their
-  `model.call`.
+- Root-driver `model.result`, `model.reasoning`, and runtime-only
+  `model.delta` directly parent their logical `model.call`. Sequential
+  companion and parallel-reviewer persisted events instead follow the
+  writer-owned linear spine and may parent preceding reasoning or another
+  reviewer's event. Model terminal identity is governed only by the
+  authoritative association rule in the `model.call` schema above.
 - `assistant.message` parents its `model.result`.
 - `model.switched`, `model.effort.changed`, `context.limit`,
   `context.slot.updated`, `canvas.policy.changed`, `canvas.swap`, and
@@ -600,8 +659,11 @@ envelope `v` per `docs/contracts/persistence.md`.
   ordering.
 - `agent.result` parents its matching `agent.spawn` event. V0 has no child
   session event stream to join.
-- `error` parents the `model.call` when the source is a provider failure
-  during that call; otherwise the previous persisted event.
+- A root-driver provider/cancellation `error` directly parents its
+  `model.call`. Companion and parallel-reviewer errors follow the writer-owned
+  linear spine; the `model.call` association rule above determines whether
+  they terminalize a call. Other errors parent the previous persisted event
+  unless a closed semantic-parent exception applies.
 - Events with no specific causal parent (e.g. `user.message`) parent the
   previous persisted event in the session, or null at session start.
 - A persisted event must never parent a runtime-only event (e.g.
@@ -612,11 +674,17 @@ Cardinality and ordering invariants:
 
 - exactly one `session.start` per session, always the first persisted
   event;
-- exactly one terminal `model.result` or `error` per `model.call`;
+- exactly one semantically associated terminal `model.result` or `error` per
+  `model.call`, under the authoritative actor/order association rule above;
+  resume rejects a second semantic terminal instead of normalizing it away;
 - zero or more `model.reasoning` events per `model.call`, emitted in
   provider order before its terminal event;
 - `assistant.message` is emitted after its `model.result`, and only for
-  turns that end without tool calls.
+  model rounds that finish without tool calls. It does not by itself prove
+  that the user turn ended: pending steering or an accepted same-turn idle
+  continuation can continue the turn. The driver closes the steering group
+  only at its explicit terminal transaction after all such continuations
+  return Stop.
 - an accepted `model.switched` is emitted after the previous turn's final
   persisted event and before the next `user.message` is accepted. A switch
   after a new `user.message` starts the next turn is rejected. The next

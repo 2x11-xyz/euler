@@ -284,6 +284,293 @@ fn interrupted_tool_tail_appends_one_side_effect_recovery_closure() {
 }
 
 #[test]
+fn resume_closes_an_unterminated_shadow_model_call_behind_later_events() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let mut shadow_call = model_call(Some(start.id.clone()));
+    shadow_call
+        .payload
+        .insert("purpose".to_owned(), "compaction".into());
+    let admitted_user = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(shadow_call.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "accepted after shadow start".into())]),
+    );
+    let driver_call = model_call(Some(admitted_user.id.clone()));
+    let driver_result = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(driver_call.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([("content", "driver completed".into())]),
+    );
+    write_events(
+        &log,
+        &[
+            start,
+            shadow_call.clone(),
+            admitted_user,
+            driver_call,
+            driver_result,
+        ],
+    );
+
+    let first = resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("first resume");
+    assert!(first.recovery_closure_appended);
+    let closure = model_recovery_closures(first.session.events())
+        .into_iter()
+        .next()
+        .expect("model recovery closure");
+    assert_eq!(
+        closure.parent.as_deref(),
+        Some(shadow_call.id.as_str()),
+        "the closure identifies the exact outstanding call even when it is not the tail"
+    );
+    assert_eq!(payload_str(closure, "source"), Some("session"));
+    assert_eq!(payload_str(closure, "purpose"), Some("compaction"));
+    assert_eq!(
+        payload_bool(closure, "cancelled"),
+        None,
+        "resume observes an unknown outcome rather than claiming cancellation"
+    );
+
+    drop(first.session);
+    let second = resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("second resume");
+    assert!(
+        !second.recovery_closure_appended,
+        "the accepted closure makes subsequent resume idempotent"
+    );
+    assert_eq!(model_recovery_closures(second.session.events()).len(), 1);
+}
+
+#[test]
+fn nonterminal_error_child_does_not_hide_an_open_model_call_on_resume() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let call = model_call(Some(start.id.clone()));
+    let extension_error = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::ERROR,
+        object([
+            ("source", "extension".into()),
+            ("message", "observer failed".into()),
+            ("extension_id", "observer".into()),
+        ]),
+    );
+    write_events(&log, &[start, call.clone(), extension_error]);
+
+    let session = resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    let closures = model_recovery_closures(session.events());
+    assert_eq!(closures.len(), 1);
+    assert_eq!(closures[0].parent.as_deref(), Some(call.id.as_str()));
+}
+
+#[test]
+fn writer_linear_terminal_closes_only_the_matching_agent_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut first_call = model_call(None);
+    first_call.agent = "reviewer-a".to_owned();
+    let mut second_call = model_call(Some(first_call.id.clone()));
+    second_call.agent = "reviewer-b".to_owned();
+    let terminal = EventEnvelope::new(
+        "session",
+        "reviewer-a",
+        Some(second_call.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("content", "reviewer a completed".into()),
+        ]),
+    );
+    write_events(&log, &[first_call.clone(), second_call.clone(), terminal]);
+
+    let outcome = resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    let closures = model_recovery_closures(outcome.session.events());
+    assert_eq!(closures.len(), 1);
+    assert_eq!(closures[0].agent, "reviewer-b");
+    assert_eq!(
+        closures[0].parent.as_deref(),
+        Some(second_call.id.as_str()),
+        "the crossed linear parent must not settle reviewer b's call"
+    );
+}
+
+#[test]
+fn unmatched_terminal_does_not_settle_open_calls_from_other_agents() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut first_call = model_call(None);
+    first_call.agent = "reviewer-a".to_owned();
+    let mut second_call = model_call(Some(first_call.id.clone()));
+    second_call.agent = "reviewer-b".to_owned();
+    let terminal = EventEnvelope::new(
+        "session",
+        "reviewer-c",
+        Some(second_call.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("content", "orphan".into()),
+        ]),
+    );
+    write_events(&log, &[first_call.clone(), second_call.clone(), terminal]);
+
+    let outcome = resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    let closure_parents = model_recovery_closures(outcome.session.events())
+        .into_iter()
+        .filter_map(|event| event.parent.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        closure_parents,
+        vec![first_call.id.as_str(), second_call.id.as_str()]
+    );
+}
+
+#[test]
+fn ambiguous_same_agent_terminal_fails_before_mutating_the_log() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let first_call = model_call(None);
+    let second_call = model_call(Some(first_call.id.clone()));
+    let terminal = EventEnvelope::new(
+        "session",
+        "agent",
+        Some("writer-linear-event".to_owned()),
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("content", "ambiguous".into()),
+        ]),
+    );
+    write_events(&log, &[first_call, second_call, terminal.clone()]);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("ambiguous terminal must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ResumeError::AmbiguousModelTerminal {
+            event_id,
+            agent
+        } if event_id == terminal.id && agent == "agent"
+    ));
+    assert_eq!(fs::read(&log).expect("read unchanged log"), before);
+}
+
+#[test]
+fn direct_duplicate_model_terminal_fails_before_mutating_the_log() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let call = model_call(None);
+    let first = model_terminal(Some(call.id.clone()), "first");
+    let duplicate = model_terminal(Some(call.id.clone()), "duplicate");
+    write_events(&log, &[call.clone(), first, duplicate.clone()]);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("duplicate terminal must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ResumeError::DuplicateModelTerminal {
+            event_id,
+            call_id,
+            agent
+        } if event_id == duplicate.id && call_id == call.id && agent == "agent"
+    ));
+    assert_eq!(fs::read(&log).expect("read unchanged log"), before);
+}
+
+#[test]
+fn unambiguous_writer_linear_duplicate_model_terminal_fails_closed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let call = model_call(None);
+    let first = model_terminal(Some(call.id.clone()), "first");
+    let duplicate = model_terminal(Some(first.id.clone()), "duplicate");
+    write_events(&log, &[call.clone(), first, duplicate.clone()]);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session_with_outcome(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("writer-linear duplicate must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ResumeError::DuplicateModelTerminal {
+            event_id,
+            call_id,
+            agent
+        } if event_id == duplicate.id && call_id == call.id && agent == "agent"
+    ));
+    assert_eq!(fs::read(&log).expect("read unchanged log"), before);
+}
+
+#[test]
 fn permission_gated_tail_closure_says_tool_never_executed() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
@@ -602,10 +889,12 @@ fn closure_append_failure_leaves_log_at_accepted_prefix() {
 }
 
 #[test]
-fn model_call_tail_appends_nothing() {
+fn model_call_tail_appends_a_recovery_closure() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
-    write_events(&log, &[model_call(None)]);
+    let start = session_start("fixture", "fixture");
+    let call = model_call(Some(start.id.clone()));
+    write_events(&log, &[start, call.clone()]);
 
     let session = resume_session(
         SessionConfig::new(temp.path()),
@@ -615,8 +904,13 @@ fn model_call_tail_appends_nothing() {
     )
     .expect("resume");
 
-    assert_eq!(session.events().len(), 1);
-    assert_eq!(line_count(&log), 1);
+    let closure = model_recovery_closures(session.events())
+        .into_iter()
+        .next()
+        .expect("model recovery closure");
+    assert_eq!(closure.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(session.events().len(), 3);
+    assert_eq!(line_count(&log), 3);
 }
 
 #[test]
@@ -628,9 +922,11 @@ fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
     // continued turn (so the causal chain matches an uninterrupted run).
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
-    let seed = model_call(None);
+    let start = session_start("fixture", "fixture");
+    let mut seed = user_message("seed");
+    seed.parent = Some(start.id.clone());
     let seed_id = seed.id.clone();
-    write_events(&log, &[seed]);
+    write_events(&log, &[start, seed]);
 
     let mut session = resume_session(
         SessionConfig::new(temp.path()),
@@ -667,7 +963,10 @@ fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
     // sibling leaf, never the parent of the conversation.
     let user_message = logged
         .iter()
-        .find(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .find(|event| {
+            event.kind.as_str() == EventKind::USER_MESSAGE
+                && payload_str(event, "content") == Some("continue")
+        })
         .expect("continued user message");
     assert_eq!(user_message.parent.as_deref(), Some(seed_id.as_str()));
     assert!(marker
@@ -696,9 +995,11 @@ fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
 fn resume_marker_precedes_non_turn_control_activity() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
-    let seed = model_call(None);
+    let start = session_start("fixture", "fixture");
+    let mut seed = user_message("seed");
+    seed.parent = Some(start.id.clone());
     let seed_id = seed.id.clone();
-    write_events(&log, &[seed]);
+    write_events(&log, &[start, seed]);
 
     let mut session = resume_session(
         SessionConfig::new(temp.path()),
@@ -734,12 +1035,13 @@ fn resume_marker_precedes_non_turn_control_activity() {
 }
 
 #[test]
-fn model_call_then_reasoning_tail_appends_nothing() {
+fn model_call_then_reasoning_tail_appends_a_recovery_closure() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
-    let call = model_call(None);
+    let start = session_start("fixture", "fixture");
+    let call = model_call(Some(start.id.clone()));
     let reasoning = model_reasoning(Some(call.id.clone()));
-    write_events(&log, &[call, reasoning]);
+    write_events(&log, &[start, call.clone(), reasoning]);
 
     let session = resume_session(
         SessionConfig::new(temp.path()),
@@ -750,8 +1052,13 @@ fn model_call_then_reasoning_tail_appends_nothing() {
     .expect("resume");
 
     assert!(recovery_closures(session.events()).is_empty());
-    assert_eq!(session.events().len(), 2);
-    assert_eq!(line_count(&log), 2);
+    let closure = model_recovery_closures(session.events())
+        .into_iter()
+        .next()
+        .expect("model recovery closure");
+    assert_eq!(closure.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(session.events().len(), 4);
+    assert_eq!(line_count(&log), 4);
 }
 
 #[test]
@@ -1308,6 +1615,20 @@ fn model_call(parent: Option<String>) -> EventEnvelope {
     )
 }
 
+fn model_terminal(parent: Option<String>, content: &str) -> EventEnvelope {
+    EventEnvelope::new(
+        "session",
+        "agent",
+        parent,
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("content", content.to_owned().into()),
+        ]),
+    )
+}
+
 fn model_reasoning(parent: Option<String>) -> EventEnvelope {
     EventEnvelope::new(
         "session",
@@ -1399,6 +1720,16 @@ fn recovery_closures(events: &[EventEnvelope]) -> Vec<&EventEnvelope> {
         .iter()
         .filter(|event| {
             event.kind.as_str() == EventKind::TOOL_RESULT
+                && payload_bool(event, "recovery_closure") == Some(true)
+        })
+        .collect()
+}
+
+fn model_recovery_closures(events: &[EventEnvelope]) -> Vec<&EventEnvelope> {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::ERROR
                 && payload_bool(event, "recovery_closure") == Some(true)
         })
         .collect()
