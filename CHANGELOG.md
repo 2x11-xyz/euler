@@ -6,6 +6,21 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### TUI interruption
+
+- Escape now dismisses the active slash menu or picker before a later Escape
+  interrupts the running turn. Root-turn cancellation releases the session
+  from blocked provider reads and rejects late provider events; a synchronous
+  adapter thread can remain until its OS or network call returns. Euler kills
+  owned shell or Git process groups before reaping their leaders, without
+  waiting for the command timeout. Explicit companion runs, permission asks,
+  guardian reviews, and managed-process extension commands share the same
+  cancellation source. An open model call closes with one parented session
+  cancellation error, and recorded tool calls without an earlier result close
+  with exactly one cancelled result, retaining collected partial output and
+  boundedly observed file-change evidence. Interrupt also clears queued
+  activities visibly while preserving queued user steering.
+
 ### ChatGPT subscription compatibility
 
 - GPT-5.6 Luna WebSocket requests again disable parallel tool calls, as

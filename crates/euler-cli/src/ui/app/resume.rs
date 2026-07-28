@@ -173,7 +173,8 @@ impl AppCore {
         let reasoning_effort = resume.session.reasoning_effort();
         let primary_agent_id = session_primary_agent_id(&resume.session);
         self.permission_rx = resume.channels.request_rx;
-        self.reply_tx = resume.channels.reply_tx;
+        self.reply_tx = inactive_permission_reply_sender();
+        self.active_permission_cancellation = None;
         self.primary_agent_id = primary_agent_id;
         self.install_state(AppState::Idle {
             session: Box::new(resume.session),

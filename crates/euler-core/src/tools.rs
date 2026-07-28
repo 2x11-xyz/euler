@@ -6,7 +6,7 @@ use crate::{
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::ToolDefinition;
-use euler_sdk::Capability;
+use euler_sdk::{CancellationToken, Capability};
 use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -78,6 +78,8 @@ pub enum ToolError {
     UpdateHunkOverlap { hunk: usize, previous_hunk: usize },
     #[error("{0}")]
     SandboxUnavailable(SandboxUnavailableReason),
+    #[error("tool cancelled")]
+    Cancelled,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -93,6 +95,18 @@ pub struct ToolExecution {
     pub exit_code: Option<i32>,
     pub patch: Option<PatchEvents>,
     pub file_changes: Vec<ObservedFileChange>,
+}
+
+/// Result of a tool invocation that was admitted before cancellation.
+///
+/// A cancelled subprocess may already have produced output and changed the
+/// workspace before its process group was stopped. Keep that evidence as a
+/// normal [`ToolExecution`] while distinguishing it from completion so the
+/// session can emit an honest failed `tool.result`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ToolExecutionOutcome {
+    Completed(ToolExecution),
+    Cancelled(ToolExecution),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,19 +283,37 @@ impl ToolRegistry {
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<ToolExecution, ToolError> {
-        match name {
+        match self.execute_cancellable(name, input, &CancellationToken::new())? {
+            ToolExecutionOutcome::Completed(execution) => Ok(execution),
+            ToolExecutionOutcome::Cancelled(_) => {
+                unreachable!("a private never-cancelled invocation cannot be cancelled")
+            }
+        }
+    }
+
+    pub(crate) fn execute_cancellable(
+        &self,
+        name: &str,
+        input: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolExecutionOutcome, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let execution = match name {
             "read_file" => self.read_file(input),
             "edit_file" => self.edit_file(input),
             "write_file" => self.write_file(input),
             "apply_patch" => self.apply_patch_tool(input),
-            "run_shell" => self.run_shell(input),
-            "git_status" => self.git(&["status", "--short"], "git_status"),
-            "git_diff" => self.git(&["diff", "--"], "git_diff"),
+            "run_shell" => return self.run_shell(input, cancellation),
+            "git_status" => return self.git(&["status", "--short"], "git_status", cancellation),
+            "git_diff" => return self.git(&["diff", "--"], "git_diff", cancellation),
             "tool_result_get" => Err(ToolError::InvalidField(
                 "tool_result_get requires session events",
             )),
             other => Err(ToolError::Unsupported(other.to_owned())),
-        }
+        }?;
+        Ok(ToolExecutionOutcome::Completed(execution))
     }
 
     pub fn execute_with_events(
@@ -290,10 +322,33 @@ impl ToolRegistry {
         input: &Value,
         events: &[EventEnvelope],
     ) -> Result<ToolExecution, ToolError> {
-        if name == "tool_result_get" {
-            return tool_result_get(events, input);
+        match self.execute_with_events_cancellable(
+            name,
+            input,
+            events,
+            &CancellationToken::new(),
+        )? {
+            ToolExecutionOutcome::Completed(execution) => Ok(execution),
+            ToolExecutionOutcome::Cancelled(_) => {
+                unreachable!("a private never-cancelled invocation cannot be cancelled")
+            }
         }
-        self.execute(name, input)
+    }
+
+    pub(crate) fn execute_with_events_cancellable(
+        &self,
+        name: &str,
+        input: &Value,
+        events: &[EventEnvelope],
+        cancellation: &CancellationToken,
+    ) -> Result<ToolExecutionOutcome, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        if name == "tool_result_get" {
+            return tool_result_get(events, input).map(ToolExecutionOutcome::Completed);
+        }
+        self.execute_cancellable(name, input, cancellation)
     }
 
     pub fn model_tools(&self) -> Vec<ToolDefinition> {
@@ -477,6 +532,20 @@ impl ToolRegistry {
     }
 
     pub fn apply_patch(&self, patch: &PatchEvents) -> Result<(), ToolError> {
+        self.apply_patch_cancellable(patch, &CancellationToken::new())
+    }
+
+    pub(crate) fn apply_patch_cancellable(
+        &self,
+        patch: &PatchEvents,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ToolError> {
+        // This is the final check before the filesystem mutation. Patch
+        // parsing, permission review, and `patch.proposed` emission may all
+        // have taken time during which the user pressed Esc.
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
         fs::write(&patch.write_path, &patch.write_content)?;
         Ok(())
     }
@@ -488,16 +557,22 @@ impl ToolRegistry {
         Ok(())
     }
 
-    fn run_shell(&self, input: &Value) -> Result<ToolExecution, ToolError> {
+    fn run_shell(
+        &self,
+        input: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolExecutionOutcome, ToolError> {
         let command = required_str(input, "command")?;
         let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(DEFAULT_MAX_BYTES);
         if command_begins_apply_patch(command) {
             // Strict apply_patch interception must return before spawning a shell.
-            return self.apply_patch_text(
-                &strict_apply_patch_heredoc(command)?,
-                "run_shell:apply_patch",
-                "run_shell",
-            );
+            return self
+                .apply_patch_text(
+                    &strict_apply_patch_heredoc(command)?,
+                    "run_shell:apply_patch",
+                    "run_shell",
+                )
+                .map(ToolExecutionOutcome::Completed);
         }
         let timeout_ms = match optional_positive_usize(input, "timeout_ms")? {
             None => DEFAULT_SHELL_TIMEOUT_MS,
@@ -512,30 +587,39 @@ impl ToolRegistry {
         let before = capture_workspace_snapshot(&self.root).ok();
         let child = self.agent_subprocess("sh", &["-c", command])?;
         let sandboxed = child.sandboxed;
-        let outcome = run_with_timeout(child.command, timeout_ms)
+        let outcome = run_process(child.command, Some(timeout_ms), cancellation)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let text = collected_agent_output(
             outcome.stdout,
             outcome.stderr,
             sandboxed,
-            outcome.status.is_none(),
+            matches!(
+                outcome.termination,
+                ProcessTermination::TimedOut | ProcessTermination::Cancelled
+            ),
         )?;
         let after = capture_workspace_snapshot(&self.root).ok();
         let file_changes = before
             .zip(after)
             .map_or_else(Vec::new, |(before, after)| before.changes_to(&after));
-        let (status, header) = match outcome.status {
-            Some(status) => (status, format!("exit {status}")),
-            None => (
+        let (status, header, cancelled) = match outcome.termination {
+            ProcessTermination::Exited(status) => (status, format!("exit {status}"), false),
+            ProcessTermination::TimedOut => (
                 -1,
                 format!(
                     "exit -1 (command timed out after {timeout_ms} ms and was killed; \
 pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
                 ),
+                false,
+            ),
+            ProcessTermination::Cancelled => (
+                -1,
+                "exit -1 (command cancelled and process group killed)".to_owned(),
+                true,
             ),
         };
         let output = format!("{header}\n{text}");
-        Ok(ToolExecution {
+        let execution = ToolExecution {
             name: "run_shell".to_owned(),
             output,
             output_preview_budget: Some(OutputPreviewBudget {
@@ -545,25 +629,32 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             exit_code: Some(status),
             patch: None,
             file_changes,
+        };
+        Ok(if cancelled {
+            ToolExecutionOutcome::Cancelled(execution)
+        } else {
+            ToolExecutionOutcome::Completed(execution)
         })
     }
 
-    fn git(&self, args: &[&str], name: &str) -> Result<ToolExecution, ToolError> {
-        let mut child = self.agent_subprocess("git", args)?;
+    fn git(
+        &self,
+        args: &[&str],
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolExecutionOutcome, ToolError> {
+        let child = self.agent_subprocess("git", args)?;
         let sandboxed = child.sandboxed;
-        let output = child
-            .command
-            .output()
-            .map_err(ToolError::Io)
+        let outcome = run_process(child.command, None, cancellation)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
-        let text = collected_agent_output(
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-            sandboxed,
-            false,
-        )?;
-        let status = output.status.code().unwrap_or(-1);
-        Ok(ToolExecution {
+        let cancelled = outcome.termination == ProcessTermination::Cancelled;
+        let text = collected_agent_output(outcome.stdout, outcome.stderr, sandboxed, cancelled)?;
+        let status = match outcome.termination {
+            ProcessTermination::Exited(status) => status,
+            ProcessTermination::Cancelled => -1,
+            ProcessTermination::TimedOut => unreachable!("git has no timeout"),
+        };
+        let execution = ToolExecution {
             name: name.to_owned(),
             output: text,
             output_preview_budget: Some(OutputPreviewBudget {
@@ -573,6 +664,11 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             exit_code: Some(status),
             patch: None,
             file_changes: Vec::new(),
+        };
+        Ok(if cancelled {
+            ToolExecutionOutcome::Cancelled(execution)
+        } else {
+            ToolExecutionOutcome::Completed(execution)
         })
     }
 
@@ -695,15 +791,15 @@ fn collected_agent_output(
     stdout: String,
     stderr: String,
     sandboxed: bool,
-    timed_out: bool,
+    interrupted: bool,
 ) -> Result<String, ToolError> {
     let stdout = if sandboxed {
         match crate::sandbox::strip_sandbox_ready_marker(&stdout) {
             Ok(stdout) => stdout,
-            // A requested timeout can kill the launcher before it is ready.
-            // It is still a timeout, but its raw stdout/stderr must remain
-            // hidden because neither came from the agent command.
-            Err(_) if timed_out => return Ok(String::new()),
+            // Timeout or cancellation can kill the launcher before it is
+            // ready. Raw stdout/stderr must remain hidden because neither
+            // came from the agent command.
+            Err(_) if interrupted => return Ok(String::new()),
             Err(reason) => return Err(ToolError::SandboxUnavailable(reason)),
         }
     } else {
@@ -797,22 +893,29 @@ fn optional_usize(input: &Value, key: &'static str) -> Result<Option<usize>, Too
         .map_err(|_| ToolError::InvalidField(key))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessTermination {
+    Exited(i32),
+    TimedOut,
+    Cancelled,
+}
+
 struct ShellOutcome {
-    /// `None` means the command was killed at the timeout deadline.
-    status: Option<i32>,
+    termination: ProcessTermination,
     stdout: String,
     stderr: String,
 }
 
-/// Runs the child in its own process group, polling for completion and
-/// killing the whole group at the deadline so grandchildren (e.g. a python
-/// computation spawned by `sh -c`) cannot outlive the tool call. Partial
-/// stdout/stderr captured before the kill is preserved for the model.
-fn run_with_timeout(mut child: Command, timeout_ms: u64) -> Result<ShellOutcome, ToolError> {
-    use std::io::Read;
+struct SupervisedProcess {
+    handle: std::process::Child,
+    pid: i32,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+}
+
+fn spawn_supervised_process(mut child: Command) -> Result<SupervisedProcess, ToolError> {
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
-    use std::time::{Duration, Instant};
 
     child
         .stdin(Stdio::null())
@@ -821,48 +924,195 @@ fn run_with_timeout(mut child: Command, timeout_ms: u64) -> Result<ShellOutcome,
         .process_group(0);
     let mut handle = child.spawn()?;
     let pid = handle.id() as i32;
-    let reader = |stream: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            if let Some(mut stream) = stream {
-                let _ = stream.read_to_end(&mut buffer);
-            }
-            buffer
-        })
-    };
-    let stdout = reader(
-        handle
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    let stderr = reader(
-        handle
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
+    let stdout = handle
+        .stdout
+        .take()
+        .expect("stdout was configured as a pipe");
+    let stderr = handle
+        .stderr
+        .take()
+        .expect("stderr was configured as a pipe");
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        kill_process_group(pid);
+        let _ = handle.wait();
+        return Err(error.into());
+    }
+    Ok(SupervisedProcess {
+        handle,
+        pid,
+        stdout,
+        stderr,
+    })
+}
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let status = loop {
-        match handle.try_wait()? {
-            Some(status) => break Some(status.code().unwrap_or(-1)),
-            None if Instant::now() >= deadline => {
-                // SAFETY: plain libc kill on the process group we created.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-                let _ = handle.wait();
-                break None;
-            }
-            None => std::thread::sleep(Duration::from_millis(25)),
+/// Runs the child in its own process group, polling for completion,
+/// cancellation, and an optional deadline. Cancellation and timeout kill and
+/// reap the still-owned process group before reaping its leader. That covers
+/// the leader and ordinary descendants that remain in the group; a descendant
+/// that deliberately moves itself into another process group is outside this
+/// ownership guarantee.
+fn run_process(
+    child: Command,
+    timeout_ms: Option<u64>,
+    cancellation: &CancellationToken,
+) -> Result<ShellOutcome, ToolError> {
+    use std::time::{Duration, Instant};
+
+    if cancellation.is_cancelled() {
+        return Err(ToolError::Cancelled);
+    }
+    let SupervisedProcess {
+        mut handle,
+        pid,
+        mut stdout,
+        mut stderr,
+    } = spawn_supervised_process(child)?;
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+
+    let deadline = timeout_ms.map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms));
+    let termination = loop {
+        if let Err(error) = drain_process_pipe(
+            &mut stdout,
+            &mut stdout_open,
+            &mut stdout_bytes,
+            PROCESS_PIPE_DRAIN_BUDGET,
+        )
+        .and_then(|()| {
+            drain_process_pipe(
+                &mut stderr,
+                &mut stderr_open,
+                &mut stderr_bytes,
+                PROCESS_PIPE_DRAIN_BUDGET,
+            )
+        }) {
+            kill_process_group(pid);
+            let _ = handle.wait();
+            return Err(error.into());
         }
+
+        if cancellation.is_cancelled() {
+            kill_process_group(pid);
+            let _ = handle.wait();
+            drain_immediately_available(
+                &mut stdout,
+                &mut stdout_open,
+                &mut stdout_bytes,
+                &mut stderr,
+                &mut stderr_open,
+                &mut stderr_bytes,
+            );
+            break ProcessTermination::Cancelled;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            kill_process_group(pid);
+            let _ = handle.wait();
+            drain_immediately_available(
+                &mut stdout,
+                &mut stdout_open,
+                &mut stdout_bytes,
+                &mut stderr,
+                &mut stderr_open,
+                &mut stderr_bytes,
+            );
+            break ProcessTermination::TimedOut;
+        }
+
+        // Do not reap (or even `try_wait`) while a descendant can still own a
+        // pipe. Keeping the leader unreaped pins its pid/process-group id, so
+        // a later cancellation cannot signal an unrelated reused group.
+        if !stdout_open && !stderr_open {
+            match handle.try_wait() {
+                Ok(Some(status)) => {
+                    break ProcessTermination::Exited(status.code().unwrap_or(-1));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    kill_process_group(pid);
+                    let _ = handle.wait();
+                    return Err(error.into());
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
     };
     Ok(ShellOutcome {
-        status,
-        stdout: String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned(),
+        termination,
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
     })
+}
+
+const PROCESS_PIPE_DRAIN_BUDGET: usize = 256 * 1024;
+
+fn set_nonblocking(stream: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    let fd = stream.as_raw_fd();
+    // SAFETY: `fd` is borrowed from a live child pipe for the duration of
+    // both calls. `F_GETFL` returns the current descriptor status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: preserves every existing status flag and adds O_NONBLOCK to the
+    // same live descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_process_pipe(
+    stream: &mut impl std::io::Read,
+    open: &mut bool,
+    output: &mut Vec<u8>,
+    budget: usize,
+) -> std::io::Result<()> {
+    if !*open {
+        return Ok(());
+    }
+    let mut remaining = budget;
+    let mut chunk = [0_u8; 8192];
+    while remaining > 0 {
+        let read_len = remaining.min(chunk.len());
+        match stream.read(&mut chunk[..read_len]) {
+            Ok(0) => {
+                *open = false;
+                return Ok(());
+            }
+            Ok(read) => {
+                output.extend_from_slice(&chunk[..read]);
+                remaining -= read;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn drain_immediately_available(
+    stdout: &mut impl std::io::Read,
+    stdout_open: &mut bool,
+    stdout_bytes: &mut Vec<u8>,
+    stderr: &mut impl std::io::Read,
+    stderr_open: &mut bool,
+    stderr_bytes: &mut Vec<u8>,
+) {
+    // Once the owned group is dead, retain only bytes already waiting in the
+    // two kernel pipes. Each drain is capped so a deliberately escaped writer
+    // cannot keep cancellation stuck by continuously refilling a pipe.
+    let _ = drain_process_pipe(stdout, stdout_open, stdout_bytes, PROCESS_PIPE_DRAIN_BUDGET);
+    let _ = drain_process_pipe(stderr, stderr_open, stderr_bytes, PROCESS_PIPE_DRAIN_BUDGET);
+}
+
+fn kill_process_group(pid: i32) {
+    // SAFETY: plain libc kill on the process group created for this child.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
 }
 
 fn optional_positive_usize(input: &Value, key: &'static str) -> Result<Option<usize>, ToolError> {

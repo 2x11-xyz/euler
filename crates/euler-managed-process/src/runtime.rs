@@ -8,10 +8,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use euler_sdk::{
     managed_process_entrypoint_from_manifest_bytes, AgentOutcome, ArtifactRecord, ArtifactWrite,
-    Capability, CommandContext, CommandDescriptor, CommandRegistrar, DiagnosticsPage,
-    EventFeedCheckpoint, Extension, ExtensionCommand, ExtensionError, ExtensionManifest,
-    HostAgentRecord, HostAgentResult, HostAgentTask, HostApi, LoadedExtensionPackage,
-    ManagedProcessEntrypoint, ProvenancePage, SpawnAgentTask, StaticExtensionDescriptor,
+    CancellationToken, Capability, CommandContext, CommandDescriptor, CommandRegistrar,
+    DiagnosticsPage, EventFeedCheckpoint, Extension, ExtensionCommand, ExtensionError,
+    ExtensionManifest, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
+    LoadedExtensionPackage, ManagedProcessEntrypoint, ProvenancePage, SpawnAgentTask,
+    StaticExtensionDescriptor,
 };
 use io::{finish_io_thread, spawn_stderr_drain, spawn_stdin_writer, spawn_stdout_reader, IoThread};
 use serde::Deserialize;
@@ -94,11 +95,17 @@ pub enum ManagedProcessRuntimeError {
     ShutdownTimedOut,
     #[error("managed-process extension command failed")]
     CommandFailed,
+    #[error("managed-process extension command cancelled")]
+    Cancelled,
 }
 
 impl ManagedProcessRuntimeError {
     fn into_extension_error(self) -> ExtensionError {
-        ExtensionError::Message(self.to_string())
+        if self == Self::Cancelled {
+            ExtensionError::Cancelled
+        } else {
+            ExtensionError::Message(self.to_string())
+        }
     }
 }
 
@@ -233,6 +240,15 @@ impl ExtensionCommand for ManagedProcessCommand {
         context: CommandContext,
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
+        self.execute_cancellable(context, host, &CancellationToken::new())
+    }
+
+    fn execute_cancellable(
+        &self,
+        context: CommandContext,
+        host: &dyn HostApi,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, ExtensionError> {
         execute_managed_process(
             ProcessInvocation {
                 package_dir: &self.package_dir,
@@ -244,6 +260,7 @@ impl ExtensionCommand for ManagedProcessCommand {
                 limits: &self.limits,
             },
             host,
+            cancellation,
         )
         .map_err(ManagedProcessRuntimeError::into_extension_error)
     }
@@ -269,20 +286,17 @@ struct ProcessInvocation<'a> {
 fn execute_managed_process(
     invocation: ProcessInvocation<'_>,
     host: &dyn HostApi,
+    cancellation: &CancellationToken,
 ) -> Result<Value, ManagedProcessRuntimeError> {
+    if cancellation.is_cancelled() {
+        return Err(ManagedProcessRuntimeError::Cancelled);
+    }
     let mut process = RunningProcess::spawn(
         invocation.package_dir,
         invocation.entrypoint,
         invocation.limits,
     )?;
-    let outcome = run_protocol(
-        &mut process,
-        invocation.extension_id,
-        invocation.extension_version,
-        invocation.command_name,
-        invocation.input,
-        host,
-    );
+    let outcome = run_protocol(&mut process, invocation, host, cancellation);
     match outcome {
         Ok(result) => Ok(result),
         Err(error) => {
@@ -294,19 +308,23 @@ fn execute_managed_process(
 
 fn run_protocol(
     process: &mut RunningProcess,
-    extension_id: &str,
-    extension_version: &str,
-    command_name: &str,
-    input: Value,
+    invocation: ProcessInvocation<'_>,
     host: &dyn HostApi,
+    cancellation: &CancellationToken,
 ) -> Result<Value, ManagedProcessRuntimeError> {
+    if cancellation.is_cancelled() {
+        return Err(ManagedProcessRuntimeError::Cancelled);
+    }
     let initialize_id = Value::String("euler-initialize-1".to_owned());
     process.send(request(
         initialize_id.clone(),
         "initialize",
         json!({
             "protocol_versions": [MANAGED_PROCESS_PROTOCOL_VERSION],
-            "extension": {"id": extension_id, "version": extension_version},
+            "extension": {
+                "id": invocation.extension_id,
+                "version": invocation.extension_version
+            },
             "limits": {"max_message_bytes": process.limits.max_message_bytes},
         }),
     ))?;
@@ -315,6 +333,7 @@ fn run_protocol(
         Instant::now() + process.limits.handshake_timeout,
         CallPhase::Handshake,
         host,
+        cancellation,
     )?;
     validate_initialize_result(&initialized)?;
     process.send(notification("initialized", Value::Object(Map::new())))?;
@@ -324,13 +343,14 @@ fn run_protocol(
     process.send(request(
         command_id.clone(),
         "euler/command",
-        json!({"command": command_name, "input": input}),
+        json!({"command": invocation.command_name, "input": invocation.input}),
     ))?;
     let command_response = process.await_response_body(
         &command_id,
         Instant::now() + process.limits.invocation_timeout,
         CallPhase::Invocation,
         host,
+        cancellation,
     )?;
     let result = match command_response {
         ResponseBody::Result(result) if result.is_object() => Some(result),
@@ -341,14 +361,18 @@ fn run_protocol(
         ResponseBody::Error => None,
     };
 
-    shutdown_process(process, host)?;
+    shutdown_process(process, host, cancellation)?;
     result.ok_or(ManagedProcessRuntimeError::CommandFailed)
 }
 
 fn shutdown_process(
     process: &mut RunningProcess,
     host: &dyn HostApi,
+    cancellation: &CancellationToken,
 ) -> Result<(), ManagedProcessRuntimeError> {
+    if cancellation.is_cancelled() {
+        return Err(ManagedProcessRuntimeError::Cancelled);
+    }
     let shutdown_id = Value::String("euler-shutdown-1".to_owned());
     process.send(request(
         shutdown_id.clone(),
@@ -360,12 +384,13 @@ fn shutdown_process(
         Instant::now() + process.limits.shutdown_timeout,
         CallPhase::Shutdown,
         host,
+        cancellation,
     )?;
     if !shutdown.is_object() {
         return Err(ManagedProcessRuntimeError::ProtocolViolation);
     }
     process.send(notification("exit", Value::Object(Map::new())))?;
-    process.close_cleanly()?;
+    process.close_cleanly(cancellation)?;
     Ok(())
 }
 
@@ -511,8 +536,9 @@ impl RunningProcess {
         deadline: Instant,
         phase: CallPhase,
         host: &dyn HostApi,
+        cancellation: &CancellationToken,
     ) -> Result<Value, ManagedProcessRuntimeError> {
-        match self.await_response_body(expected_id, deadline, phase, host)? {
+        match self.await_response_body(expected_id, deadline, phase, host, cancellation)? {
             ResponseBody::Result(result) => Ok(result),
             ResponseBody::Error => Err(ManagedProcessRuntimeError::CommandFailed),
         }
@@ -524,8 +550,12 @@ impl RunningProcess {
         deadline: Instant,
         phase: CallPhase,
         host: &dyn HostApi,
+        cancellation: &CancellationToken,
     ) -> Result<ResponseBody, ManagedProcessRuntimeError> {
         loop {
+            if cancellation.is_cancelled() {
+                return Err(ManagedProcessRuntimeError::Cancelled);
+            }
             if self.stdout_limit_reached.load(Ordering::Relaxed) {
                 return Err(ManagedProcessRuntimeError::OutputLimitExceeded);
             }
@@ -631,9 +661,15 @@ impl RunningProcess {
         self.progress.record(message, &self.limits)
     }
 
-    fn close_cleanly(&mut self) -> Result<(), ManagedProcessRuntimeError> {
+    fn close_cleanly(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ManagedProcessRuntimeError> {
         self.close_input();
-        self.wait_for_exit(Instant::now() + self.limits.shutdown_timeout)?;
+        self.wait_for_exit(
+            Instant::now() + self.limits.shutdown_timeout,
+            Some(cancellation),
+        )?;
         self.finish_io();
         if self.output_limit_reached() {
             return Err(ManagedProcessRuntimeError::OutputLimitExceeded);
@@ -706,8 +742,15 @@ impl RunningProcess {
         }
     }
 
-    fn wait_for_exit(&mut self, deadline: Instant) -> Result<(), ManagedProcessRuntimeError> {
+    fn wait_for_exit(
+        &mut self,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), ManagedProcessRuntimeError> {
         loop {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(ManagedProcessRuntimeError::Cancelled);
+            }
             match self.child.try_wait() {
                 Ok(Some(status)) => {
                     self.child_reaped = true;

@@ -19,10 +19,17 @@ in v0.
 The v0 multi-agent surface is spawn/result provenance, validation, a
 current-process background execution handle, and a bounded parent-drained
 child-to-parent report queue. It is not a durable scheduler, live await system,
-passive background runtime, timeout system, cancellation API, wakeup mechanism,
-or recovery lease. A stream with `agent.spawn` and no `agent.result` is a valid
-incomplete historical record after resume; core does not reconstruct live child
-state in v0, and that historical incomplete spawn cannot be completed through
+passive background runtime, timeout system, wakeup mechanism, or recovery
+lease. Interactive synchronous companion and parallel-review calls do accept
+the host's read-only cancellation token and still record terminal
+`agent.result` events before returning cancellation. This does not add
+cancellation to detached background handles. A synchronous provider adapter
+may still have an OS or network call running on its adapter thread after the
+parent stops waiting; cancellation detaches that call from the live session
+and rejects its late events rather than claiming physical I/O preemption. A
+stream with `agent.spawn` and no `agent.result` is a valid incomplete
+historical record after resume; core does not reconstruct live child state in
+v0, and that historical incomplete spawn cannot be completed through
 `record_agent_result` after resume.
 
 Current v0 invariants:

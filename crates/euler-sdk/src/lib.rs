@@ -7,6 +7,8 @@ pub mod extension_package;
 use euler_event::{EventEnvelope, JsonObject};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 pub use event_checkpoint::{
@@ -28,6 +30,60 @@ pub use extension_package::{
 
 pub const MAX_CONTEXT_SLOT_CONTENT_BYTES: usize = 4096;
 pub const MAX_CONTEXT_SLOTS_PER_SESSION: usize = 8;
+
+/// One cloneable cancellation source shared by a host and extension command.
+///
+/// Core owns publication; extensions only observe this token. Native commands that
+/// perform long blocking work can override `execute_cancellable`, while the
+/// default preserves source compatibility and rejects work not yet started.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// Host-side controller for a [`CancellationToken`].
+///
+/// Keeping publication on a distinct type prevents an extension that receives
+/// the read-only token from cancelling its own host operation.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationSource {
+    token: CancellationToken,
+}
+
+impl CancellationSource {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn from_shared_flag(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            token: CancellationToken { cancelled },
+        }
+    }
+
+    #[must_use]
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.token.cancelled.store(true, Ordering::Release);
+    }
+}
 
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -389,6 +445,8 @@ pub enum ExtensionError {
     AgentTaskFailed(String),
     #[error("context slot update failed: {0}")]
     ContextSlotFailed(String),
+    #[error("extension command cancelled")]
+    Cancelled,
 }
 
 pub trait HostApi {
@@ -472,6 +530,18 @@ pub trait ExtensionCommand: Send + Sync {
         context: CommandContext,
         host: &dyn HostApi,
     ) -> Result<serde_json::Value, ExtensionError>;
+
+    fn execute_cancellable(
+        &self,
+        context: CommandContext,
+        host: &dyn HostApi,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, ExtensionError> {
+        if cancellation.is_cancelled() {
+            return Err(ExtensionError::Cancelled);
+        }
+        self.execute(context, host)
+    }
 }
 
 pub trait Extension: Send + Sync {
@@ -482,6 +552,18 @@ pub trait Extension: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_source_publishes_to_read_only_token_clones() {
+        let source = CancellationSource::new();
+        let first = source.token();
+        let second = first.clone();
+
+        assert!(!first.is_cancelled());
+        source.cancel();
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+    }
 
     #[test]
     fn host_agent_result_constructors_shape_terminal_status() {

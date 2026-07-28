@@ -261,6 +261,7 @@ impl AppCore {
                     request.id, request.command
                 ));
             }
+            ExtensionOutcome::Cancelled => self.record_auxiliary_interruption(),
         }
     }
 
@@ -291,7 +292,17 @@ impl AppCore {
                 });
                 self.notice = Some(format!("companion run failed: {message}"));
             }
+            CompanionOutcome::Cancelled => self.record_auxiliary_interruption(),
         }
+    }
+
+    fn record_auxiliary_interruption(&mut self) {
+        self.queued_inputs.set_paused(true);
+        self.transcript.clear_transient_live_tail();
+        self.interrupted_guidance = false;
+        self.in_flight_error = None;
+        self.push_finalized_visual_item(TranscriptItem::Interrupted);
+        self.notice = None;
     }
 
     fn refresh_patch_modal_preview(&mut self) {
@@ -311,7 +322,14 @@ impl AppCore {
     }
 
     fn record_in_flight_error(&mut self, event: &EventEnvelope) {
-        if !self.turn_in_flight() || event.kind.as_str() != EventKind::ERROR {
+        if !self.turn_in_flight()
+            || event.kind.as_str() != EventKind::ERROR
+            || event
+                .payload
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
             return;
         }
         let source = event

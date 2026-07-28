@@ -89,6 +89,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   positions them like any other event, and readers must not assume a turn
   has exactly one leading user message.
 - `assistant.message`: `content`.
+- `model.call`: `provider`, `model`, `canvas_items`,
+  `requested_reasoning_effort`; optional resolved `reasoning_effort`,
+  `max_output_tokens`, and `project_context_digest`. Every accepted call has
+  exactly one terminal child: `model.result` on a drained finished stream, or
+  a parented `error`. Cancellation before a result records the safe error
+  payload `source: "session"`, `message: "model call cancelled"`, and
+  `cancelled: true`. Cancellation after a `model.result` never adds a second
+  terminal child.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
@@ -106,6 +114,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   Optional `recovery_closure: true` marks a resume-time canonical closure for
   an interrupted tail `tool.call`; it records the resume observation, not the
   original tool outcome.
+  Optional `cancelled: true` marks a live cancellation closure. Every
+  `tool.call` already accepted from one provider batch that has no terminal
+  result receives exactly one terminal failed result in batch order, including
+  calls that had not started and a call cancelled while waiting for permission.
+  A running subprocess result retains collected partial output, exit code, and
+  any observed file changes completed before its owned process group was
+  stopped. The ordinary-shell workspace observation remains bounded by the
+  frozen file-snapshot limits in the tool/UI contracts.
   Optional `grant_source` (`"session"` | `"project"`) marks a run covered by
   an existing scoped grant; optional `static_safe: true` marks a run
   auto-approved by static command-safety analysis (see

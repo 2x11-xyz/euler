@@ -88,7 +88,7 @@ fn batch_returns_outcomes_in_task_order_with_ordered_events() {
     ];
 
     let summaries = session
-        .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+        .spawn_reviewers_parallel(tasks, &CancellationToken::new())
         .expect("batch");
 
     assert_eq!(summaries.len(), 3);
@@ -204,7 +204,7 @@ fn explicit_review_brief_does_not_receive_parent_canvas() {
             vec![explicit_reviewer_task("p1", "m1", "code-swarm-correctness")
                 .with_explicit_context("explicit diff context")
                 .expect("explicit context")],
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
         )
         .expect("review batch");
 
@@ -237,7 +237,7 @@ fn event_sequence_is_deterministic_across_runs() {
             reviewer_task("p2", "m2", "code-swarm-safety"),
         ];
         session
-            .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+            .spawn_reviewers_parallel(tasks, &CancellationToken::new())
             .expect("batch");
         session
             .events()
@@ -332,6 +332,121 @@ impl ModelProvider for RejectingProvider {
     }
 }
 
+#[derive(Default)]
+struct BlockingReviewState {
+    entered: bool,
+    released: bool,
+}
+
+struct BlockingReviewProvider {
+    state: Arc<(Mutex<BlockingReviewState>, Condvar)>,
+}
+
+impl ModelProvider for BlockingReviewProvider {
+    fn name(&self) -> &'static str {
+        "blocking-review"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("blocking review state");
+        state.entered = true;
+        wake.notify_all();
+        while !state.released {
+            state = wake.wait(state).expect("blocking review wait");
+        }
+        Ok(Box::new(
+            vec![
+                Ok(ModelStreamEvent::TextDelta("too late".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: None,
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+#[test]
+fn cancellation_releases_parallel_reviewers_and_records_terminal_results() {
+    let state = Arc::new((Mutex::new(BlockingReviewState::default()), Condvar::new()));
+    let providers = ProviderSet::single_named(
+        "blocking-review".to_owned(),
+        BlockingReviewProvider {
+            state: Arc::clone(&state),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    let tasks = vec![reviewer_task(
+        "blocking-review",
+        "m1",
+        "code-swarm-correctness",
+    )];
+    let cancellation = euler_sdk::CancellationSource::new();
+    let worker_token = cancellation.token();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = session.spawn_reviewers_parallel(tasks, &worker_token);
+        done_tx
+            .send((session, result))
+            .expect("review result receiver");
+    });
+
+    let (lock, wake) = &*state;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut provider_state = lock.lock().expect("blocking review state");
+    while !provider_state.entered && std::time::Instant::now() < deadline {
+        let (next, _) = wake
+            .wait_timeout(provider_state, Duration::from_millis(10))
+            .expect("blocking review entry wait");
+        provider_state = next;
+    }
+    assert!(provider_state.entered, "review provider did not start");
+    drop(provider_state);
+
+    let cancelled_at = std::time::Instant::now();
+    cancellation.cancel();
+    let completed = done_rx.recv_timeout(Duration::from_secs(1));
+
+    let mut provider_state = lock.lock().expect("blocking review state");
+    provider_state.released = true;
+    wake.notify_all();
+    drop(provider_state);
+
+    let (session, result) = completed.expect("parallel cancellation should return promptly");
+    worker.join().expect("parallel review worker");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert!(
+        session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::AGENT_RESULT),
+        "cancelled reviewer needs a terminal result"
+    );
+    let model_call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("reviewer model.call");
+    let terminals = session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.parent.as_deref() == Some(model_call.id.as_str())
+                && matches!(
+                    event.kind.as_str(),
+                    EventKind::MODEL_RESULT | EventKind::ERROR
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].kind.as_str(), EventKind::ERROR);
+    assert_eq!(terminals[0].payload["source"], json!("session"));
+    assert_eq!(terminals[0].payload["cancelled"], json!(true));
+}
+
 #[test]
 fn buffered_worker_provider_error_is_redacted_before_append() {
     // F8: workers buffer the raw provider error for the session thread to
@@ -350,7 +465,7 @@ fn buffered_worker_provider_error_is_redacted_before_append() {
     let tasks = vec![reviewer_task("rejecting", "m1", "code-swarm-correctness")];
 
     let summaries = session
-        .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+        .spawn_reviewers_parallel(tasks, &CancellationToken::new())
         .expect("batch");
 
     assert_eq!(summaries.len(), 1);
@@ -389,7 +504,7 @@ fn reviewer_provider_failure_result_carries_redacted_error() {
     let tasks = vec![reviewer_task("rejecting", "m1", "code-swarm-correctness")];
 
     let summaries = session
-        .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+        .spawn_reviewers_parallel(tasks, &CancellationToken::new())
         .expect("batch");
 
     assert_eq!(summaries.len(), 1);
@@ -428,7 +543,7 @@ fn provider_invocations_actually_overlap() {
     ];
 
     let summaries = session
-        .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+        .spawn_reviewers_parallel(tasks, &CancellationToken::new())
         .expect("batch");
 
     for summary in &summaries {
@@ -457,7 +572,7 @@ fn one_reviewer_failure_is_isolated_and_recorded_honestly() {
     ];
 
     let summaries = session
-        .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+        .spawn_reviewers_parallel(tasks, &CancellationToken::new())
         .expect("batch call succeeds; failure is per reviewer");
 
     assert!(summaries[0].result.ok());
@@ -505,7 +620,7 @@ fn batch_rejects_non_review_briefs_before_any_event() {
         let providers = scripted_set(&[("p1", FixtureResponse::Assistant("x".to_owned()))]);
         let (_temp, _log, mut session) = session_with_providers(providers);
         let error = session
-            .spawn_reviewers_parallel(vec![task], &AtomicBool::new(false))
+            .spawn_reviewers_parallel(vec![task], &CancellationToken::new())
             .expect_err("non-review brief must be rejected");
         assert!(matches!(error, SessionError::InvalidCompanionTask(_)));
         assert!(
@@ -525,7 +640,7 @@ fn batch_rejects_unknown_provider_before_any_event() {
     ];
 
     let error = session
-        .spawn_reviewers_parallel(tasks, &AtomicBool::new(false))
+        .spawn_reviewers_parallel(tasks, &CancellationToken::new())
         .expect_err("unknown provider");
 
     assert!(error
@@ -546,7 +661,7 @@ fn token_budget_exhaustion_fails_the_reviewer_honestly() {
         .with_budget(AgentBudget::new(Some(1), Some(0), Some(1)).expect("budget"));
 
     let summaries = session
-        .spawn_reviewers_parallel(vec![task], &AtomicBool::new(false))
+        .spawn_reviewers_parallel(vec![task], &CancellationToken::new())
         .expect("batch");
 
     assert!(!summaries[0].result.ok());
@@ -615,7 +730,7 @@ fn budget_counts_output_tokens_not_input() {
     );
     let (_temp, _log, mut session) = session_with_providers(providers);
     let results = session
-        .spawn_reviewers_parallel(vec![usage_task(8_192)], &AtomicBool::new(false))
+        .spawn_reviewers_parallel(vec![usage_task(8_192)], &CancellationToken::new())
         .expect("batch");
     assert!(
         results[0].result.ok(),
@@ -635,7 +750,7 @@ fn budget_fails_when_output_exceeds_cap() {
     );
     let (_temp, _log, mut session) = session_with_providers(providers);
     let results = session
-        .spawn_reviewers_parallel(vec![usage_task(8_192)], &AtomicBool::new(false))
+        .spawn_reviewers_parallel(vec![usage_task(8_192)], &CancellationToken::new())
         .expect("batch");
     assert!(!results[0].result.ok());
     assert!(format!("{:?}", results[0].result).contains("budget exhausted: max_tokens"));
@@ -652,7 +767,7 @@ fn zero_output_budget_is_rejected_before_any_call() {
     );
     let (_temp, _log, mut session) = session_with_providers(providers);
     let error = session
-        .spawn_reviewers_parallel(vec![usage_task(0)], &AtomicBool::new(false))
+        .spawn_reviewers_parallel(vec![usage_task(0)], &CancellationToken::new())
         .expect_err("zero budget");
     assert!(error.to_string().contains("at least one output token"));
     assert!(batch_events(session.events()).is_empty());

@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn cancelled_active_permission_modal_closes_without_reply() {
+    let mut core = core();
+    let cancellation = euler_sdk::CancellationSource::new();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.open_permission_envelope(PermissionPromptEnvelope {
+        prompt: PermissionPrompt::Request(PermissionRequest::new(Capability::FsWrite, "edit file")),
+        cancellation: cancellation.token(),
+        reply_tx,
+    });
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+
+    cancellation.cancel();
+    assert!(core.drain_permissions());
+
+    assert!(core.modal.is_none());
+    assert!(
+        reply_rx.try_recv().is_err(),
+        "cancellation must not be converted into a deny reply"
+    );
+}
+
+#[test]
 fn permission_prompt_renders_inline_with_command_body() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();

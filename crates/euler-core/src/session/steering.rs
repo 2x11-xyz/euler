@@ -22,10 +22,10 @@ use std::sync::{Mutex, PoisonError};
 ///   Leftovers are never folded into a later turn's request; each becomes
 ///   its own turn via the surface's completion flush, exactly as queued
 ///   input behaved before steering existed.
-/// - **Ack after persist**: absorption is peek → emit → ack. An entry
-///   leaves the queue only after its `user.message` was durably emitted;
-///   an emission failure leaves the failed entry and everything behind it
-///   queued for the next attempt.
+/// - **Remove after persist**: absorption holds the queue boundary across
+///   persistence and removes an entry only after its `user.message` was
+///   durably emitted. An emission failure leaves the failed entry and
+///   everything behind it queued for the next attempt.
 /// - **Pause**: while paused (queue editing, interrupts) nothing is
 ///   absorbed and entries stay queued.
 #[derive(Debug, Default)]
@@ -40,24 +40,12 @@ struct SteeringState {
     /// Generation of the currently running turn. Entries stamped with an
     /// older generation predate the turn and are not absorbable by it.
     turn_generation: u64,
-    next_id: u64,
 }
 
 #[derive(Debug)]
 struct Entry {
-    id: u64,
     generation: u64,
     content: String,
-}
-
-/// One absorbable entry, handed out by [`SteeringQueue::next_for_round`].
-/// The `id` names exactly the entry that was peeked, so the post-persist
-/// [`SteeringQueue::ack`] removes that entry and only that entry even if the
-/// surface reordered the queue in between.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SteeringEntry {
-    pub id: u64,
-    pub content: String,
 }
 
 impl SteeringQueue {
@@ -69,11 +57,9 @@ impl SteeringQueue {
 
     fn push_entry(state: &mut SteeringState, content: String, front: bool) {
         let entry = Entry {
-            id: state.next_id,
             generation: state.turn_generation,
             content,
         };
-        state.next_id += 1;
         if front {
             state.entries.push_front(entry);
         } else {
@@ -140,35 +126,32 @@ impl SteeringQueue {
         self.state().turn_generation += 1;
     }
 
-    /// The next absorbable entry — the FRONT entry, and only when it is
-    /// stamped with the current turn generation — or `None` when paused,
-    /// empty, or when an older-generation leftover holds the front. A
-    /// leftover blocks absorption instead of being skipped: steering must
-    /// never overtake earlier queued input, so everything behind a queued
-    /// next-turn message waits its turn. The entry stays queued until
-    /// [`Self::ack`].
-    pub fn next_for_round(&self) -> Option<SteeringEntry> {
-        let state = self.state();
-        if state.paused {
-            return None;
+    /// Persist the front entry, then remove it, as one queue transaction.
+    ///
+    /// Returns `Ok(false)` when absorption is paused/stopped, the queue is
+    /// empty, or an older-generation leftover owns the front. The queue lock
+    /// stays held while `persist` runs. Therefore `set_paused(true)` either
+    /// linearizes before this method (the entry stays queued) or after its
+    /// durable emission/removal; there is no peek→pause→emit gap.
+    pub fn persist_next_for_round<E>(
+        &self,
+        stopped: impl FnOnce() -> bool,
+        persist: impl FnOnce(&str) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let mut state = self.state();
+        if state.paused || stopped() {
+            return Ok(false);
         }
-        state
+        let Some(entry) = state
             .entries
             .front()
             .filter(|entry| entry.generation == state.turn_generation)
-            .map(|entry| SteeringEntry {
-                id: entry.id,
-                content: entry.content.clone(),
-            })
-    }
-
-    /// Acknowledge a durably absorbed entry: removes it by id. A stale ack
-    /// (the surface removed the entry meanwhile) is a no-op.
-    pub fn ack(&self, id: u64) {
-        let mut state = self.state();
-        if let Some(index) = state.entries.iter().position(|entry| entry.id == id) {
-            state.entries.remove(index);
-        }
+        else {
+            return Ok(false);
+        };
+        persist(&entry.content)?;
+        state.entries.pop_front();
+        Ok(true)
     }
 }
 
@@ -181,24 +164,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absorption_is_peek_ack_in_arrival_order() {
+    fn absorption_persists_then_removes_in_arrival_order() {
         let queue = SteeringQueue::default();
         queue.begin_turn();
         queue.push_back("first".to_owned());
         queue.push_back("second".to_owned());
 
-        let first = queue.next_for_round().expect("first entry");
-        assert_eq!(first.content, "first");
-        // Not yet acked: still queued, and peeking again returns the same
-        // entry (a failed persist retries it).
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue.next_for_round().expect("same entry").id, first.id);
-
-        queue.ack(first.id);
-        let second = queue.next_for_round().expect("second entry");
-        assert_eq!(second.content, "second");
-        queue.ack(second.id);
-        assert!(queue.next_for_round().is_none());
+        let mut persisted = Vec::new();
+        assert!(queue
+            .persist_next_for_round(
+                || false,
+                |content| {
+                    persisted.push(content.to_owned());
+                    Ok::<_, ()>(())
+                }
+            )
+            .expect("persist first"));
+        assert!(queue
+            .persist_next_for_round(
+                || false,
+                |content| {
+                    persisted.push(content.to_owned());
+                    Ok::<_, ()>(())
+                }
+            )
+            .expect("persist second"));
+        assert_eq!(persisted, ["first", "second"]);
+        assert!(!queue
+            .persist_next_for_round(|| false, |_| Ok::<_, ()>(()))
+            .expect("empty"));
         assert!(queue.is_empty());
     }
 
@@ -208,18 +202,28 @@ mod tests {
         queue.push_back("leftover a".to_owned());
         queue.begin_turn();
 
-        assert!(queue.next_for_round().is_none());
+        assert!(!queue
+            .persist_next_for_round(|| false, |_| Ok::<_, ()>(()))
+            .expect("blocked"));
         // Fresh steering behind a queued leftover stays blocked: absorbing
         // it would let later input overtake earlier input.
         queue.push_back("steer".to_owned());
-        assert!(queue.next_for_round().is_none());
+        assert!(!queue
+            .persist_next_for_round(|| false, |_| Ok::<_, ()>(()))
+            .expect("still blocked"));
 
         // Once the surface flushes the leftover (its own turn), the fresh
         // entry becomes absorbable — order preserved end to end.
         assert_eq!(queue.pop_front().as_deref(), Some("leftover a"));
-        let entry = queue.next_for_round().expect("front entry, current gen");
-        assert_eq!(entry.content, "steer");
-        queue.ack(entry.id);
+        assert!(queue
+            .persist_next_for_round(
+                || false,
+                |content| {
+                    assert_eq!(content, "steer");
+                    Ok::<_, ()>(())
+                }
+            )
+            .expect("persist steer"));
         assert!(queue.is_empty());
     }
 
@@ -230,29 +234,77 @@ mod tests {
         queue.push_back("held".to_owned());
         queue.set_paused(true);
 
-        assert!(queue.next_for_round().is_none());
+        assert!(!queue
+            .persist_next_for_round(|| false, |_| Ok::<_, ()>(()))
+            .expect("paused"));
         assert_eq!(queue.len(), 1);
 
         queue.set_paused(false);
-        assert_eq!(
-            queue.next_for_round().expect("resumed entry").content,
-            "held"
-        );
+        assert!(queue
+            .persist_next_for_round(
+                || false,
+                |content| {
+                    assert_eq!(content, "held");
+                    Ok::<_, ()>(())
+                }
+            )
+            .expect("resumed"));
     }
 
     #[test]
-    fn ack_is_id_addressed_and_stale_acks_are_noops() {
+    fn failed_persistence_keeps_the_entry() {
         let queue = SteeringQueue::default();
         queue.begin_turn();
         queue.push_back("steer".to_owned());
-        let entry = queue.next_for_round().expect("entry");
-        // The surface pushes an urgent entry to the front between peek and
-        // ack; the ack still removes exactly the absorbed entry.
-        queue.push_front("urgent".to_owned());
-        queue.ack(entry.id);
-        assert_eq!(queue.snapshot(), vec!["urgent"]);
-        queue.ack(entry.id);
-        assert_eq!(queue.snapshot(), vec!["urgent"]);
+
+        let result = queue.persist_next_for_round(|| false, |_| Err("persist failed"));
+
+        assert_eq!(result, Err("persist failed"));
+        assert_eq!(queue.snapshot(), ["steer"]);
+    }
+
+    #[test]
+    fn pause_and_persist_are_linearizable() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let queue = Arc::new(SteeringQueue::default());
+        queue.begin_turn();
+        queue.push_back("steer".to_owned());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_queue = Arc::clone(&queue);
+        let worker = std::thread::spawn(move || {
+            worker_queue.persist_next_for_round(
+                || false,
+                |_| {
+                    entered_tx.send(()).expect("entered");
+                    release_rx.recv().expect("release");
+                    Ok::<_, ()>(())
+                },
+            )
+        });
+        entered_rx.recv().expect("worker entered persistence");
+
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let pausing_queue = Arc::clone(&queue);
+        let pauser = std::thread::spawn(move || {
+            pausing_queue.set_paused(true);
+            paused_tx.send(()).expect("paused");
+        });
+        assert!(
+            paused_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "pause must wait for an already-linearized persistence transaction"
+        );
+
+        release_tx.send(()).expect("release");
+        assert!(worker.join().expect("worker").expect("persisted"));
+        paused_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pause completed");
+        pauser.join().expect("pauser");
+        assert!(queue.paused());
+        assert!(queue.is_empty());
     }
 
     #[test]

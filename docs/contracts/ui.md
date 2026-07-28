@@ -222,6 +222,48 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   and tier, remains canonical `canvas.snapshot` provenance (events contract),
   not footer state. No second status row; detail lives under `/status`.
 
+### Escape and interruption
+
+- Keyboard input is dispatched from the topmost interactive layer inward.
+  When a slash palette, picker, search surface, prompt, or modal owns input,
+  `Esc` dismisses exactly that layer and cannot publish turn cancellation.
+  One keypress performs one layer transition. Only `Esc` received with the
+  composer owning input may interrupt an active turn.
+- Publishing root-turn cancellation pauses the steering queue before setting
+  the shared signal. Steering persistence and pause share one queue boundary:
+  a steer either persists before the pause, or remains queued after Esc.
+  Explicitly queued companion/extension activities are cleared with a visible
+  notice; queued user/steering text is preserved.
+- The provider request driver and tool supervisor observe that same signal.
+  The session/UI stops waiting even when a synchronous provider adapter is
+  blocked, and provider events observed after cancellation are rejected at the
+  request boundary. This detaches the cancelled session; it does not physically
+  abort an adapter's synchronous network/OS call. Its request thread may remain
+  alive until that underlying I/O returns, with no route back into the session.
+  A `model.call` that had no `model.result` receives exactly one parented,
+  cancellation-attributed session error. That error is canonical provenance,
+  while the TUI renders its ordinary interruption row instead of treating it
+  as a driver failure.
+- A permission ask observes the same signal. Cancellation closes the active
+  prompt without converting it into denial, installs no grant, and cannot let a
+  stale modal reply satisfy a later ask. Write tools recheck cancellation at
+  their final filesystem-mutation boundary.
+- Explicit companion runs and managed-process extension commands observe the
+  same signal. The host makes a best-effort protocol cancellation notification
+  to a managed peer before killing its process group; a cancelled companion
+  still records its terminal `agent.result`.
+- Agent subprocesses run in their own process group. Cancellation kills the
+  still-owned group before reaping its leader, covering the leader and ordinary
+  descendants that remain in that group, without waiting for the tool timeout.
+  A descendant that deliberately moves to another process group is outside
+  this ownership guarantee. Every already-recorded call without a terminal
+  result receives exactly one cancelled `tool.result`; partial subprocess
+  output and workspace changes completed before termination remain canonical
+  evidence and are never reported as successful completion. After process
+  termination, ordinary `run_shell` performs its existing bounded evidence
+  scan (4,096 files, 256 KiB per file, 64 MiB total) before closing the result;
+  that finite scan may make transcript closure follow the process stop.
+
 ### Streaming, scroll, motion
 
 - Prose streams with progressive markdown styling; once a line has painted it

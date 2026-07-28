@@ -1,11 +1,12 @@
 use euler_core::permissions::{DeciderVerdict, PermissionRequest, PermissionRequestBatch};
-use euler_core::{GrantScope, PermissionDecider, ScopePattern};
-use std::sync::mpsc::{self, Receiver, Sender};
+use euler_core::{GrantScope, PermissionDecider, PermissionDecisionOutcome, ScopePattern};
+use euler_sdk::CancellationToken;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct TuiDecider {
-    request_tx: Sender<PermissionPrompt>,
-    reply_rx: Receiver<PermissionReply>,
+    request_tx: Sender<PermissionPromptEnvelope>,
 }
 
 /// A single capability request or an operation-level request batch waiting for
@@ -41,26 +42,27 @@ pub enum PermissionReply {
     DenyWithInstruction(String),
 }
 
+/// One prompt plus its unique reply route and cancellation identity.
+///
+/// A fresh one-shot channel per prompt prevents a late reply from an old
+/// modal from satisfying a later ask. The UI observes the same token as the
+/// waiting decider and drops a prompt that is already stale.
+#[derive(Clone, Debug)]
+pub struct PermissionPromptEnvelope {
+    pub prompt: PermissionPrompt,
+    pub cancellation: CancellationToken,
+    pub reply_tx: Sender<PermissionReply>,
+}
+
 #[derive(Debug)]
 pub struct PermissionChannels {
-    pub request_rx: Receiver<PermissionPrompt>,
-    pub reply_tx: Sender<PermissionReply>,
+    pub request_rx: Receiver<PermissionPromptEnvelope>,
 }
 
 impl TuiDecider {
     pub fn new() -> (Self, PermissionChannels) {
         let (request_tx, request_rx) = mpsc::channel();
-        let (reply_tx, reply_rx) = mpsc::channel();
-        (
-            Self {
-                request_tx,
-                reply_rx,
-            },
-            PermissionChannels {
-                request_rx,
-                reply_tx,
-            },
-        )
+        (Self { request_tx }, PermissionChannels { request_rx })
     }
 }
 
@@ -72,38 +74,102 @@ impl PermissionDecider for TuiDecider {
     fn decide_batch(&mut self, batch: &PermissionRequestBatch) -> DeciderVerdict {
         self.decide_prompt(PermissionPrompt::Batch(batch.clone()))
     }
+
+    fn decide_cancellable(
+        &mut self,
+        request: &PermissionRequest,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
+        self.decide_prompt_cancellable(
+            PermissionPrompt::Request(request.clone()),
+            cancellation.clone(),
+        )
+    }
+
+    fn decide_batch_cancellable(
+        &mut self,
+        batch: &PermissionRequestBatch,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
+        self.decide_prompt_cancellable(PermissionPrompt::Batch(batch.clone()), cancellation.clone())
+    }
 }
 
 impl TuiDecider {
     fn decide_prompt(&mut self, prompt: PermissionPrompt) -> DeciderVerdict {
-        if self.request_tx.send(prompt).is_err() {
-            return DeciderVerdict::Deny;
+        match self.decide_prompt_cancellable(prompt, CancellationToken::new()) {
+            PermissionDecisionOutcome::Decided(verdict) => verdict,
+            PermissionDecisionOutcome::Cancelled => {
+                unreachable!("a private never-cancelled TUI prompt cannot cancel")
+            }
         }
-        match self.reply_rx.recv().unwrap_or(PermissionReply::Deny) {
-            PermissionReply::AllowOnce => DeciderVerdict::Allow,
-            PermissionReply::AllowSessionScope(pattern) => match ScopePattern::new(pattern) {
-                Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::Session(pattern)),
-                // Invalid pattern never broadens to whole-capability; allow once.
-                Err(_) => DeciderVerdict::Allow,
-            },
-            PermissionReply::AllowProjectScope(pattern) => match ScopePattern::new(pattern) {
-                Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::Project(pattern)),
-                Err(_) => DeciderVerdict::Allow,
-            },
-            PermissionReply::AllowUserScope(pattern) => {
-                if pattern.is_empty() {
-                    // A user rule is never unscoped: empty would broaden a
-                    // prefix rule to the whole capability forever.
-                    return DeciderVerdict::Allow;
+    }
+
+    fn decide_prompt_cancellable(
+        &mut self,
+        prompt: PermissionPrompt,
+        cancellation: CancellationToken,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
+        if cancellation.is_cancelled() {
+            return PermissionDecisionOutcome::Cancelled;
+        }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self
+            .request_tx
+            .send(PermissionPromptEnvelope {
+                prompt,
+                cancellation: cancellation.clone(),
+                reply_tx,
+            })
+            .is_err()
+        {
+            return PermissionDecisionOutcome::Decided(DeciderVerdict::Deny);
+        }
+        loop {
+            if cancellation.is_cancelled() {
+                return PermissionDecisionOutcome::Cancelled;
+            }
+            match reply_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(_) if cancellation.is_cancelled() => {
+                    return PermissionDecisionOutcome::Cancelled;
                 }
-                match ScopePattern::new(pattern) {
-                    Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::User(pattern)),
-                    Err(_) => DeciderVerdict::Allow,
+                Ok(reply) => {
+                    return PermissionDecisionOutcome::Decided(reply_to_verdict(reply));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return PermissionDecisionOutcome::Decided(DeciderVerdict::Deny);
                 }
             }
-            PermissionReply::Deny => DeciderVerdict::Deny,
-            PermissionReply::DenyWithInstruction(text) => DeciderVerdict::DenyWithInstruction(text),
         }
+    }
+}
+
+fn reply_to_verdict(reply: PermissionReply) -> DeciderVerdict {
+    match reply {
+        PermissionReply::AllowOnce => DeciderVerdict::Allow,
+        PermissionReply::AllowSessionScope(pattern) => match ScopePattern::new(pattern) {
+            Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::Session(pattern)),
+            // Invalid pattern never broadens to whole-capability; allow once.
+            Err(_) => DeciderVerdict::Allow,
+        },
+        PermissionReply::AllowProjectScope(pattern) => match ScopePattern::new(pattern) {
+            Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::Project(pattern)),
+            Err(_) => DeciderVerdict::Allow,
+        },
+        PermissionReply::AllowUserScope(pattern) => {
+            if pattern.is_empty() {
+                // A user rule is never unscoped: empty would broaden a prefix
+                // rule to the whole capability forever.
+                return DeciderVerdict::Allow;
+            }
+            match ScopePattern::new(pattern) {
+                Ok(pattern) => DeciderVerdict::AllowScoped(GrantScope::User(pattern)),
+                Err(_) => DeciderVerdict::Allow,
+            }
+        }
+        PermissionReply::Deny => DeciderVerdict::Deny,
+        PermissionReply::DenyWithInstruction(text) => DeciderVerdict::DenyWithInstruction(text),
     }
 }
 
@@ -121,15 +187,18 @@ mod tests {
         PermissionRequest::new(Capability::FsWrite, "edit file".to_owned())
     }
 
+    fn next_prompt(channels: &PermissionChannels) -> PermissionPromptEnvelope {
+        channels.request_rx.recv().expect("request")
+    }
+
     #[test]
     fn decide_sends_request_and_returns_reply() {
         let (mut decider, channels) = TuiDecider::new();
         let handle = thread::spawn(move || decider.decide(&request()));
 
-        let sent = channels.request_rx.recv().expect("request");
-        assert_eq!(sent, PermissionPrompt::Request(request()));
-        channels
-            .reply_tx
+        let sent = next_prompt(&channels);
+        assert_eq!(sent.prompt, PermissionPrompt::Request(request()));
+        sent.reply_tx
             .send(PermissionReply::AllowOnce)
             .expect("reply");
 
@@ -159,7 +228,7 @@ mod tests {
             .request_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("one operation prompt");
-        let PermissionPrompt::Batch(batch) = prompt else {
+        let PermissionPrompt::Batch(batch) = &prompt.prompt else {
             panic!("extension capabilities must use one batch prompt");
         };
         assert_eq!(batch.operation(), "extension example.run");
@@ -167,7 +236,7 @@ mod tests {
             batch.capabilities().collect::<Vec<_>>(),
             vec![Capability::FsWrite, Capability::Network]
         );
-        channels
+        prompt
             .reply_tx
             .send(PermissionReply::AllowSessionScope(String::new()))
             .expect("reply");
@@ -196,13 +265,11 @@ mod tests {
             (session, project)
         });
 
-        let _ = channels.request_rx.recv().expect("request");
-        channels
+        next_prompt(&channels)
             .reply_tx
             .send(PermissionReply::AllowSessionScope("cargo".into()))
             .expect("reply");
-        let _ = channels.request_rx.recv().expect("request");
-        channels
+        next_prompt(&channels)
             .reply_tx
             .send(PermissionReply::AllowProjectScope("src".into()))
             .expect("reply");
@@ -232,18 +299,15 @@ mod tests {
             (user, empty, control)
         });
 
-        let _ = channels.request_rx.recv().expect("request");
-        channels
+        next_prompt(&channels)
             .reply_tx
             .send(PermissionReply::AllowUserScope("cargo".into()))
             .expect("reply");
-        let _ = channels.request_rx.recv().expect("request");
-        channels
+        next_prompt(&channels)
             .reply_tx
             .send(PermissionReply::AllowUserScope(String::new()))
             .expect("reply");
-        let _ = channels.request_rx.recv().expect("request");
-        channels
+        next_prompt(&channels)
             .reply_tx
             .send(PermissionReply::AllowUserScope("cargo\u{0001}".into()))
             .expect("reply");
@@ -266,8 +330,7 @@ mod tests {
         let (mut decider, channels) = TuiDecider::new();
         let handle = thread::spawn(move || decider.decide(&request()));
 
-        let _ = channels.request_rx.recv().expect("request");
-        channels
+        next_prompt(&channels)
             .reply_tx
             .send(PermissionReply::DenyWithInstruction(
                 "use apply_patch".into(),
@@ -285,10 +348,43 @@ mod tests {
         let (mut decider, channels) = TuiDecider::new();
         let handle = thread::spawn(move || decider.decide(&request()));
 
-        let _ = channels.request_rx.recv().expect("request");
-        drop(channels.reply_tx);
+        let prompt = next_prompt(&channels);
+        drop(prompt.reply_tx);
 
         assert_eq!(handle.join().expect("join"), DeciderVerdict::Deny);
+    }
+
+    #[test]
+    fn cancellation_releases_prompt_and_late_reply_cannot_poison_next_ask() {
+        let (mut decider, channels) = TuiDecider::new();
+        let cancellation = euler_sdk::CancellationSource::new();
+        let token = cancellation.token();
+        let handle = thread::spawn(move || {
+            let cancelled = decider.decide_cancellable(&request(), &token);
+            let next = decider.decide(&request());
+            (cancelled, next)
+        });
+
+        let stale = channels
+            .request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first prompt");
+        cancellation.cancel();
+        let next = channels
+            .request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("next prompt after cancellation");
+        assert!(
+            stale.reply_tx.send(PermissionReply::AllowOnce).is_err(),
+            "the cancelled prompt's one-shot receiver must be gone"
+        );
+        next.reply_tx
+            .send(PermissionReply::Deny)
+            .expect("reply to current prompt");
+
+        let (cancelled, next) = handle.join().expect("join");
+        assert_eq!(cancelled, PermissionDecisionOutcome::Cancelled);
+        assert_eq!(next, DeciderVerdict::Deny);
     }
 
     #[test]
@@ -300,13 +396,11 @@ mod tests {
             (control, oversize)
         });
 
-        let _ = channels.request_rx.recv().expect("request");
-        channels
+        next_prompt(&channels)
             .reply_tx
             .send(PermissionReply::AllowSessionScope("cargo\u{0001}".into()))
             .expect("reply");
-        let _ = channels.request_rx.recv().expect("request");
-        channels
+        next_prompt(&channels)
             .reply_tx
             .send(PermissionReply::AllowProjectScope(
                 "x".repeat(euler_core::MAX_SCOPE_PATTERN_BYTES + 1),

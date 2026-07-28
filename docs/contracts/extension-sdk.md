@@ -296,12 +296,17 @@ transcript. Default ceilings are 1 MiB per JSON payload, 4 MiB/512 messages of
 total peer output, 64 host requests, 128 progress messages, and 64 KiB stderr.
 
 Process transport writes are isolated from the session loop, so a peer that
-stops reading stdin cannot block the command deadline. `HostApi` calls remain
-the existing synchronous core contract shared with native extensions: their own
-host quotas and operation deadlines govern their duration, and they cannot be
-forcibly preempted by the managed-process transport. A cancellable host-call
-SDK boundary is a separate core design change, not a hidden process-runtime
-exception.
+stops reading stdin cannot block the command deadline. Every admitted command
+receives a host-owned `CancellationToken`. The default native-command method
+checks it before calling the legacy synchronous `execute`; native extensions
+with long work override `execute_cancellable` and cooperate at their own safe
+boundaries. The managed-process adapter observes the token while waiting on
+handshake, invocation, and shutdown: it makes a best-effort
+`$/cancelRequest` notification, then kills and reaps the process group after
+the bounded grace period. Notification delivery is not a cancellation
+precondition. Host calls remain synchronous and cannot be forcibly preempted;
+the host stops admitting their late output after cancellation. Child-agent
+calls launched through the live session inherit the same token.
 
 The child environment is deliberately minimal: package directory as current
 directory, inherited `PATH`, and `EULER_MANAGED_PROCESS_PROTOCOL`. No ambient

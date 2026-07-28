@@ -779,6 +779,15 @@ fn project_event_with_checkpoints(
             .map(TranscriptItem::SessionSummary),
         // SESSION_RESUMED is a durable provenance-only audit marker (issue #6);
         // it is not rendered into the conversation transcript.
+        EventKind::ERROR
+            if event
+                .payload
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            None
+        }
         EventKind::ERROR => Some(TranscriptItem::Error {
             source: payload_string(event, "source").unwrap_or_default(),
             message: payload_string(event, "message").unwrap_or_default(),

@@ -1582,6 +1582,20 @@ fn transcript_state_clears_live_tail_on_error_before_later_turn() {
 }
 
 #[test]
+fn cancelled_model_call_error_is_provenance_only_in_the_transcript() {
+    let events = vec![event(
+        EventKind::ERROR,
+        object([
+            ("source", "session".into()),
+            ("message", "model call cancelled".into()),
+            ("cancelled", true.into()),
+        ]),
+    )];
+
+    assert!(project_events(&events).is_empty());
+}
+
+#[test]
 fn transcript_state_clear_transient_live_tail_handles_cancel_before_later_turn() {
     let mut state = TranscriptState::default();
     state.push_event(event(

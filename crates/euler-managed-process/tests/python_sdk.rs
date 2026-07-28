@@ -5,9 +5,9 @@ use euler_managed_process::{
     ManagedProcessExtension, ManagedProcessLimits, ManagedProcessRuntimeError,
 };
 use euler_sdk::{
-    AgentOutcome, ArtifactRecord, ArtifactWrite, Capability, CommandContext, CommandRegistrar,
-    DiagnosticsPage, DiagnosticsQuery, EventFeedCheckpoint, Extension, ExtensionCommand,
-    ExtensionError, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
+    AgentOutcome, ArtifactRecord, ArtifactWrite, CancellationToken, Capability, CommandContext,
+    CommandRegistrar, DiagnosticsPage, DiagnosticsQuery, EventFeedCheckpoint, Extension,
+    ExtensionCommand, ExtensionError, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
     ManagedProcessEntrypoint, ProvenancePage, ProvenanceQuery, SpawnAgentTask,
     StaticCommandDescriptor, StaticExtensionDescriptor,
 };
@@ -593,6 +593,80 @@ if cancellation.get("method") == "$/cancelRequest" and cancellation.get("params"
 }
 
 #[test]
+fn host_cancellation_stops_an_active_managed_process_command() {
+    require_python();
+    let temp = TempDir::new().expect("temp package");
+    let started = temp.path().join("started");
+    let cancelled = temp.path().join("cancelled");
+    write_script(
+        temp.path(),
+        "extension.py",
+        r#"import json
+import sys
+from pathlib import Path
+
+def read():
+    line = sys.stdin.buffer.readline()
+    if not line:
+        raise SystemExit(2)
+    return json.loads(line)
+
+def write(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+initialize = read()
+write({"jsonrpc": "2.0", "id": initialize["id"], "result": {"protocol_version": "euler-managed-process/1"}})
+read()
+command = read()
+Path("started").write_text("yes", encoding="utf-8")
+cancellation = read()
+if cancellation.get("method") == "$/cancelRequest" and cancellation.get("params", {}).get("id") == command["id"]:
+    Path("cancelled").write_text("yes", encoding="utf-8")
+"#,
+    );
+    let limits = ManagedProcessLimits {
+        invocation_timeout: Duration::from_secs(30),
+        cancel_grace: Duration::from_millis(250),
+        ..ManagedProcessLimits::default()
+    };
+    let extension = extension(temp.path(), "exercise", Vec::new()).with_limits(limits);
+    let cancellation = euler_sdk::CancellationSource::new();
+    let worker_cancellation = cancellation.token();
+    let worker = std::thread::spawn(move || {
+        execute_cancellable(
+            &extension,
+            "exercise",
+            json!({}),
+            &FakeHost::default(),
+            &worker_cancellation,
+        )
+    });
+
+    let wait_started = Instant::now();
+    while !started.is_file() && wait_started.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(started.is_file(), "managed command did not start");
+    let cancelled_at = Instant::now();
+    cancellation.cancel();
+    let error = worker
+        .join()
+        .expect("managed process worker")
+        .expect_err("cancelled command");
+
+    assert_eq!(error, ExtensionError::Cancelled);
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(1),
+        "host cancellation waited for the invocation timeout"
+    );
+    assert!(
+        cancelled.is_file(),
+        "managed peer did not observe the cancellation request"
+    );
+}
+
+#[test]
 fn oversized_protocol_line_is_rejected_before_json_allocation() {
     require_python();
     let temp = TempDir::new().expect("temp package");
@@ -930,6 +1004,24 @@ fn execute_with_input(
         .expect("command")
         .1;
     command.execute(CommandContext { input }, host)
+}
+
+fn execute_cancellable(
+    extension: &ManagedProcessExtension,
+    command: &str,
+    input: Value,
+    host: &dyn HostApi,
+    cancellation: &CancellationToken,
+) -> Result<Value, ExtensionError> {
+    let mut registrar = TestRegistrar::default();
+    extension.register(&mut registrar).expect("register");
+    let command = registrar
+        .commands
+        .into_iter()
+        .find(|(name, _)| name == command)
+        .expect("command")
+        .1;
+    command.execute_cancellable(CommandContext { input }, host, cancellation)
 }
 
 fn boundary_sized_input(max_message_bytes: usize) -> Value {
