@@ -68,6 +68,10 @@ struct CompanionLoop<'a, D> {
     /// Cumulative OUTPUT tokens only (see `add_usage`), checked against
     /// `AgentBudget::max_tokens`.
     tokens: u64,
+    /// Snapshot digest admitted into the current child request. Tool-result
+    /// rehydration uses the same value so excluded context cannot be fetched
+    /// by event id after request assembly filtered it.
+    active_project_context_snapshot_digest: Option<String>,
     cancellation: CancellationToken,
 }
 
@@ -260,6 +264,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             reteach: crate::tools::ReteachTracker::default(),
             tool_calls: 0,
             tokens: 0,
+            active_project_context_snapshot_digest: None,
             cancellation,
         }
     }
@@ -438,11 +443,12 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let outcome = if call.name == "skill_read" {
             Err(crate::tools::ToolError::Unsupported(call.name.clone()))
         } else {
-            self.tools.execute_with_events_cancellable(
+            self.tools.execute_with_events_cancellable_for_child(
                 &call.name,
                 &call.input,
                 self.bus.events(),
                 cancellation,
+                self.active_project_context_snapshot_digest.as_deref(),
             )
         };
         match outcome {
@@ -817,6 +823,12 @@ impl<D: PermissionDecider> CompanionLoop<'_, D> {
         } else {
             Vec::new()
         });
+        self.active_project_context_snapshot_digest = match self.task.project_context() {
+            euler_agents::ProjectContextPolicy::None => None,
+            euler_agents::ProjectContextPolicy::Inherit => project_context
+                .admitted()
+                .map(|pinned| pinned.candidate_digest.clone()),
+        };
         super::apply_child_project_context_policy(
             &mut canvas,
             self.task.project_context(),

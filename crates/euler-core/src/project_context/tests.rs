@@ -850,6 +850,80 @@ fn partial_and_mixed_bootstrap_shapes_fail_closed() {
     assert!(validate_bootstrap_shape(&miscited).is_err());
 }
 
+#[test]
+fn schema_v1_rejects_v2_only_snapshot_and_summary_fields() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    let bootstrap = dormant(&repo);
+
+    let mut v1_snapshot_with_v2_fields = bootstrap.snapshot_payload();
+    v1_snapshot_with_v2_fields.insert("schema_version".to_owned(), 1.into());
+    let snapshot = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::PROJECT_CONTEXT_SNAPSHOT,
+        v1_snapshot_with_v2_fields,
+    );
+    assert!(fold_project_context(&[snapshot]).is_err());
+
+    let mut events = bootstrap_events(&bootstrap);
+    let summary = events[0]
+        .payload
+        .get_mut("project_context")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("summary");
+    summary.insert("schema_version".to_owned(), 1.into());
+    summary.remove("manifest_admitted");
+    summary.remove("skill_count");
+    events[1]
+        .payload
+        .insert("schema_version".to_owned(), 1.into());
+    events[1].payload.remove("manifest_admitted");
+    events[1].payload.remove("skill_count");
+    validate_bootstrap_shape(&events).expect("genuine v1-shaped bootstrap");
+
+    events[0]
+        .payload
+        .get_mut("project_context")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("summary")
+        .insert("skill_count".to_owned(), 0.into());
+    assert!(validate_bootstrap_shape(&events).is_err());
+}
+
+#[test]
+fn schema_v2_rejects_skill_counts_without_an_admitted_manifest() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    let mut payload = dormant(&repo).snapshot_payload();
+    payload.insert("skill_count".to_owned(), 1.into());
+    let snapshot = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::PROJECT_CONTEXT_SNAPSHOT,
+        payload,
+    );
+    assert!(fold_project_context(&[snapshot]).is_err());
+}
+
+#[test]
+fn diagnostic_schema_must_match_its_snapshot_schema() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    write(&repo.join("euler.md"), "wrong case");
+    let mut events = bootstrap_events(&dormant(&repo));
+    assert!(events.len() > 2, "fixture must emit a diagnostic");
+    events[2]
+        .payload
+        .insert("schema_version".to_owned(), 1.into());
+    assert!(validate_bootstrap_shape(&events).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Workspace identity
 // ---------------------------------------------------------------------------
@@ -1922,6 +1996,150 @@ fn user_skill_changes_do_not_change_project_acknowledgment_digest() {
     assert_ne!(first.candidate_digest, second.candidate_digest);
 }
 
+#[cfg(unix)]
+#[test]
+fn user_skill_path_diagnostics_do_not_change_project_acknowledgment_digest() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write(&root.join("EULER.md"), "project rules\n");
+    let user_skills = temp.path().join("home/skills");
+    fs::create_dir_all(&user_skills).expect("user skill root");
+    let first = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
+        .expect("first preflight");
+
+    fs::create_dir(user_skills.join(OsString::from_vec(vec![0xff]))).expect("non-UTF-8 user entry");
+    let second = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
+        .expect("second preflight");
+
+    assert_eq!(first.acknowledgment_digest, second.acknowledgment_digest);
+    assert_ne!(first.candidate_digest, second.candidate_digest);
+    assert!(second.manifest.diagnostics.iter().any(|record| {
+        record.reason == "non_utf8_path"
+            && record
+                .path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("user/"))
+    }));
+}
+
+#[test]
+fn rendered_catalog_admits_every_listed_skill_or_reports_its_omission() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    let user_skills = temp.path().join("home/skills");
+    for index in 0..30 {
+        let name = format!("skill-{index:02}");
+        write_skill(&user_skills, &name, &"description ".repeat(75), "body\n");
+    }
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+        &root,
+        Some(&user_skills),
+        &redactor(),
+    )
+    .expect("preflight");
+    let manifest = bootstrap.manifest.as_ref().expect("user skill manifest");
+    assert!(!manifest.skills.is_empty());
+    assert!(
+        manifest.skills.len() < 30,
+        "catalog bound must omit whole skills"
+    );
+    assert!(super::framing::skill_catalog_fits(&manifest.skills));
+    let rendered = super::framing::render_project_context(manifest);
+    for skill in &manifest.skills {
+        assert!(
+            rendered.contains(&format!(
+                "skill: name={} scope={} source={}",
+                skill.name,
+                skill.scope.as_str(),
+                skill.path
+            )),
+            "admitted skill {} is missing from the catalog",
+            skill.name
+        );
+    }
+    assert!(manifest
+        .diagnostics
+        .iter()
+        .any(|record| record.reason == "skill_catalog_limit_exceeded"));
+}
+
+#[test]
+fn persisted_manifest_rejects_an_oversized_rendered_skill_catalog() {
+    let skills = (0..30)
+        .map(|index| {
+            let name = format!("skill-{index:02}");
+            let path = format!("user/skills/{name}/SKILL.md");
+            let body = "body\n".to_owned();
+            super::manifest::ManifestSkill {
+                body_digest: super::digest::skill_digest_v1(
+                    super::manifest::SkillScope::User,
+                    &name,
+                    &path,
+                    &body,
+                ),
+                name,
+                description: "description ".repeat(75),
+                scope: super::manifest::SkillScope::User,
+                path,
+                body_len: body.len() as u64,
+                body,
+            }
+        })
+        .collect();
+    let manifest = super::manifest::CandidateManifest {
+        version: super::manifest::MANIFEST_VERSION,
+        sources: Vec::new(),
+        skills,
+        diagnostics: Vec::new(),
+        reason_counts: Default::default(),
+    };
+
+    let error = manifest.validate().expect_err("oversized catalog rejected");
+    assert!(error.to_string().contains("skill catalog exceeds"));
+}
+
+#[cfg(unix)]
+#[test]
+fn user_skills_survive_indeterminate_repository_boundary_discovery() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    fs::create_dir_all(&root).expect("repo");
+    for index in 0..=MAX_DIR_ENTRIES {
+        write(&root.join(format!("entry-{index:04}")), "");
+    }
+    let user_skills = temp.path().join("home/skills");
+    write_skill(
+        &user_skills,
+        "commit-writing",
+        "Write focused commits.",
+        "Keep commits focused.\n",
+    );
+    let canonical = fs::canonicalize(&root).expect("canonical root");
+
+    let outcome =
+        super::discovery::discover_with_user_skills(&canonical, Some(&user_skills), &redactor());
+
+    assert!(outcome.sources.is_empty());
+    assert_eq!(
+        outcome
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["commit-writing"]
+    );
+    assert!(outcome
+        .diagnostics
+        .iter()
+        .any(|record| record.reason == "marker_indeterminate"));
+}
+
 #[test]
 fn skill_at_traversal_depth_boundary_is_admitted_without_a_depth_diagnostic() {
     let temp = tempfile::tempdir().expect("temp");
@@ -1996,6 +2214,44 @@ fn oversized_guidance_fails_the_admission_budget_before_any_card() {
         }
         _ => panic!("expected a budget failure before any card"),
     }
+}
+
+#[test]
+fn user_only_skills_obey_the_admission_budget_when_project_context_is_off() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    let user_skills = temp.path().join("home/skills");
+    write_skill(
+        &user_skills,
+        "commit-writing",
+        "Write focused commits.",
+        "Keep commits focused.\n",
+    );
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let resolution = ProjectContextBootstrap::resolve_with_user_skills(
+        &canonical,
+        Some(&user_skills),
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy: ProjectContextPolicy::Off,
+            session_kind: SessionKind::Interactive,
+            trusted_local: false,
+        },
+        None,
+        AdmissionBudget {
+            fixed_instruction_bytes: 0,
+            context_limit_tokens: Some(1_000_000),
+            output_reserve_tokens: 0,
+            canvas_budget_bytes: 1,
+        },
+    )
+    .expect("resolve");
+
+    assert!(matches!(
+        resolution,
+        ProjectContextResolution::Budget(ProjectContextBudgetError::OverByteBudget { .. })
+    ));
 }
 
 #[test]

@@ -419,6 +419,12 @@ pub(crate) fn tool_success_payload(
             budget.max_lines.into(),
         );
     }
+    if let Some(digest) = &execution.project_context_snapshot_digest {
+        payload.insert(
+            "project_context_snapshot_digest".to_owned(),
+            digest.clone().into(),
+        );
+    }
     if let Some(exit_code) = execution.exit_code {
         payload.insert("exit_code".to_owned(), exit_code.into());
     }
@@ -454,6 +460,12 @@ pub(crate) fn tool_cancelled_payload(
             payload.insert(
                 "output_preview_max_lines".to_owned(),
                 budget.max_lines.into(),
+            );
+        }
+        if let Some(digest) = &execution.project_context_snapshot_digest {
+            payload.insert(
+                "project_context_snapshot_digest".to_owned(),
+                digest.clone().into(),
             );
         }
     }

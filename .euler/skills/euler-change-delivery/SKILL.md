@@ -4,7 +4,7 @@ description: "Deliver a focused Euler change through branch setup, implementatio
 ---
 # Euler change delivery
 
-1. Read `AGENTS.md`, `EULER.md`, and the contracts or ADRs governing the changed surface.
+1. Read `EULER.md`, `docs/vision.md`, and the contracts or ADRs governing the changed surface.
 2. Start from current `origin/main` on a focused branch. Use a separate worktree when independent writing or review work is already active.
 3. Keep the change within one architectural owner. If ownership is unclear, apply `docs/contracts/boundaries.md` before coding.
 4. Update implementation, deterministic tests, and the owning contract together. Amend an ADR when the decision itself changes.

@@ -2,10 +2,11 @@
 //!
 //! Resume performs no filesystem rediscovery: the latest
 //! `project.context.snapshot` event in durable sequence is authoritative.
-//! An admitted latest snapshot yields exactly one pinned item; a disabled or
-//! declined snapshot is a tombstone and yields none; a malformed latest
-//! snapshot rejects resume or request assembly and never resurrects an
-//! older admitted snapshot.
+//! A latest snapshot with a model-facing manifest yields exactly one pinned
+//! item, including a repository-disabled snapshot that retains user-global
+//! skills. A snapshot without a manifest is a tombstone and yields none; a
+//! malformed latest snapshot rejects resume or request assembly and never
+//! resurrects an older manifest.
 
 use super::digest::{candidate_digest_v1, rendered_digest_v1, workspace_identity_digest_v1};
 use super::framing::{render_project_context, FRAMING_VERSION};
@@ -18,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-/// The one pinned model-input item an admitted snapshot yields.
+/// The one pinned model-input item a model-facing manifest yields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PinnedProjectContext {
     pub snapshot_event_id: String,
@@ -61,6 +62,7 @@ impl PinnedProjectContext {
             .skills
             .iter()
             .map(|skill| crate::tools::FrozenSkill {
+                snapshot_digest: self.candidate_digest.clone(),
                 name: skill.name.clone(),
                 scope: skill.scope.as_str().to_owned(),
                 path: skill.path.clone(),
@@ -76,7 +78,7 @@ pub(crate) enum ProjectContextFold {
     /// No snapshot events: a legacy session or a session built without a
     /// bootstrap. Project context is disabled.
     Absent,
-    /// The latest snapshot is a disabled/declined tombstone.
+    /// The latest snapshot carries no model-facing manifest.
     Disabled,
     Admitted(Box<PinnedProjectContext>),
 }
@@ -169,10 +171,24 @@ struct SnapshotSummary {
     reason_counts: BTreeMap<String, u64>,
 }
 
-/// Payload keys the version-1 snapshot schema permits. Everything else is
-/// rejected: recorded payloads are untrusted input on resume, and an
-/// unknown field is exactly where forged content-bearing data would hide.
-const SNAPSHOT_COMMON_KEYS: &[&str] = &[
+/// Payload keys frozen by each snapshot schema. Recorded payloads are
+/// untrusted input on resume, so compatibility is an exact versioned grammar:
+/// a v1 record cannot smuggle v2 fields and a v2 record must carry its new
+/// declarations.
+const SNAPSHOT_V1_COMMON_KEYS: &[&str] = &[
+    "schema_version",
+    "status",
+    "policy",
+    "resolution_reason",
+    "acknowledgment_basis",
+    "candidate_digest",
+    "workspace_identity",
+    "ordering",
+    "source_identities",
+    "diagnostic_count",
+    "diagnostic_reason_counts",
+];
+const SNAPSHOT_V2_COMMON_KEYS: &[&str] = &[
     "schema_version",
     "status",
     "policy",
@@ -209,9 +225,10 @@ fn validate_snapshot_payload(
         ));
     }
     let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
-    // Phase 3 recognizes four statuses. `admitted` yields a pinned item;
-    // `disabled`, `declined`, and `unacknowledged` are tombstones that yield
-    // none. Each combination is still gated by the permitted-tuple table below.
+    // Phase 3 recognizes four repository-admission statuses. Whether the
+    // snapshot yields a pinned item is declared separately by
+    // `manifest_admitted`, because user-global skills can remain after
+    // repository guidance is disabled, declined, or unacknowledged.
     let admitted = match status {
         "admitted" => true,
         "disabled" | "declined" | "unacknowledged" => false,
@@ -221,7 +238,8 @@ fn validate_snapshot_payload(
             ))
         }
     };
-    let manifest_admitted = if schema_version == Some(1) {
+    let legacy_schema = schema_version == Some(1);
+    let manifest_admitted = if legacy_schema {
         admitted
     } else {
         payload
@@ -233,8 +251,18 @@ fn validate_snapshot_payload(
                 )
             })?
     };
+    if admitted && !manifest_admitted {
+        return Err(ProjectContextFoldError::new(
+            "an admitted snapshot cannot omit its manifest",
+        ));
+    }
+    let common_keys = if legacy_schema {
+        SNAPSHOT_V1_COMMON_KEYS
+    } else {
+        SNAPSHOT_V2_COMMON_KEYS
+    };
     for key in payload.keys() {
-        let known = SNAPSHOT_COMMON_KEYS.contains(&key.as_str())
+        let known = common_keys.contains(&key.as_str())
             || (manifest_admitted && SNAPSHOT_ADMITTED_KEYS.contains(&key.as_str()));
         if !known {
             return Err(ProjectContextFoldError::new(format!(
@@ -243,8 +271,13 @@ fn validate_snapshot_payload(
         }
     }
     validate_policy_tuple(payload, status)?;
-    let summary = validate_snapshot_summary(payload, schema_version == Some(1))?;
+    let summary = validate_snapshot_summary(payload, legacy_schema)?;
     if !manifest_admitted {
+        if summary.skill_count != 0 {
+            return Err(ProjectContextFoldError::new(
+                "a snapshot without a manifest cannot declare admitted skills",
+            ));
+        }
         return Ok(ValidatedSnapshot::Disabled);
     }
     let manifest = validate_admitted_manifest(
@@ -345,6 +378,11 @@ fn validate_admitted_manifest(
     }
     let manifest = CandidateManifest::from_canonical_json(manifest_json)
         .map_err(|error| ProjectContextFoldError::new(error.to_string()))?;
+    if manifest.sources.is_empty() && manifest.skills.is_empty() {
+        return Err(ProjectContextFoldError::new(
+            "an admitted manifest contains no model-facing guidance",
+        ));
+    }
     let manifest_paths: Vec<&str> = manifest
         .sources
         .iter()
@@ -533,7 +571,7 @@ fn validate_reason_counts(
     Ok(counts)
 }
 
-/// Diagnostic-event payload keys the version-1 schema permits.
+/// Diagnostic-event payload keys shared by the frozen v1 and v2 schemas.
 const DIAGNOSTIC_KEYS: &[&str] = &[
     "schema_version",
     "snapshot_event_id",
@@ -545,7 +583,10 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
 /// Validate one recorded `project.context.diagnostic` payload against the
 /// content-free schema: a stable reason code, an optional bounded
 /// normalized identity, optional numeric metadata, and nothing else.
-fn validate_diagnostic_payload(payload: &JsonObject) -> Result<(), String> {
+fn validate_diagnostic_payload(
+    payload: &JsonObject,
+    expected_schema_version: u64,
+) -> Result<(), String> {
     for key in payload.keys() {
         if !DIAGNOSTIC_KEYS.contains(&key.as_str()) {
             return Err(format!(
@@ -554,8 +595,10 @@ fn validate_diagnostic_payload(payload: &JsonObject) -> Result<(), String> {
         }
     }
     let version = payload.get("schema_version").and_then(Value::as_u64);
-    if version != Some(1) && version != Some(u64::from(SNAPSHOT_SCHEMA_VERSION)) {
-        return Err("a diagnostic was written by a different Euler version".to_owned());
+    if version != Some(expected_schema_version) {
+        return Err(
+            "a diagnostic schema version does not match its project-context snapshot".to_owned(),
+        );
     }
     let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("");
     if validate_reason_code(reason).is_err() {
@@ -654,9 +697,20 @@ pub(crate) fn validate_bootstrap_shape(events: &[EventEnvelope]) -> Result<(), S
     Ok(())
 }
 
-/// Payload keys the version-1 `session.start` project-context summary
-/// permits.
-const SUMMARY_KEYS: &[&str] = &[
+/// Exact key sets frozen by each `session.start` project-context summary
+/// schema.
+const SUMMARY_V1_KEYS: &[&str] = &[
+    "expected",
+    "schema_version",
+    "status",
+    "policy",
+    "resolution_reason",
+    "acknowledgment_basis",
+    "candidate_digest",
+    "source_count",
+    "diagnostic_count",
+];
+const SUMMARY_V2_KEYS: &[&str] = &[
     "expected",
     "schema_version",
     "status",
@@ -680,17 +734,6 @@ fn validate_summary_against_snapshot(summary: &Value, snapshot: &JsonObject) -> 
     let Some(summary) = summary.as_object() else {
         return Err("the session.start project-context summary is not an object".to_owned());
     };
-    for key in summary.keys() {
-        if !SUMMARY_KEYS.contains(&key.as_str()) {
-            return Err(format!(
-                "the project-context summary carries a field this Euler version does not \
-                 record: {key}"
-            ));
-        }
-    }
-    if summary.get("expected") != Some(&Value::Bool(true)) {
-        return Err("the project-context summary does not expect its snapshot".to_owned());
-    }
     let summary_version = summary.get("schema_version").and_then(Value::as_u64);
     let snapshot_version = snapshot.get("schema_version").and_then(Value::as_u64);
     if summary_version != snapshot_version
@@ -700,6 +743,22 @@ fn validate_summary_against_snapshot(summary: &Value, snapshot: &JsonObject) -> 
         return Err(
             "the project-context summary was written by a different Euler version".to_owned(),
         );
+    }
+    let summary_keys = if summary_version == Some(1) {
+        SUMMARY_V1_KEYS
+    } else {
+        SUMMARY_V2_KEYS
+    };
+    for key in summary.keys() {
+        if !summary_keys.contains(&key.as_str()) {
+            return Err(format!(
+                "the project-context summary carries a field this Euler version does not \
+                 record: {key}"
+            ));
+        }
+    }
+    if summary.get("expected") != Some(&Value::Bool(true)) {
+        return Err("the project-context summary does not expect its snapshot".to_owned());
     }
     // Overlapping snapshot fields must agree exactly. The snapshot side has
     // already passed full payload validation, so equality inherits its
@@ -756,6 +815,11 @@ fn validate_bootstrap_diagnostics(
     snapshot: &EventEnvelope,
     declared: usize,
 ) -> Result<(), String> {
+    let snapshot_schema_version = snapshot
+        .payload
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "the snapshot does not declare its schema version".to_owned())?;
     let mut recorded_counts: BTreeMap<String, u64> = BTreeMap::new();
     for (index, event) in events.iter().enumerate().skip(2).take(declared) {
         if event.kind.as_str() != EventKind::PROJECT_CONTEXT_DIAGNOSTIC {
@@ -771,7 +835,7 @@ fn validate_bootstrap_diagnostics(
         {
             return Err("a diagnostic does not cite the session's snapshot".to_owned());
         }
-        validate_diagnostic_payload(&event.payload)?;
+        validate_diagnostic_payload(&event.payload, snapshot_schema_version)?;
         let reason = event
             .payload
             .get("reason")

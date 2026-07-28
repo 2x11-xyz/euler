@@ -92,6 +92,10 @@ pub struct ToolExecution {
     /// Optional display budget applied only after session redaction. The
     /// complete `output` remains recoverable by event id.
     pub output_preview_budget: Option<OutputPreviewBudget>,
+    /// Snapshot digest when this output contains project-context-classified
+    /// bytes. The session persists it on `tool.result`; canvas filtering and
+    /// rehydration must preserve it so child policy cannot be bypassed.
+    pub project_context_snapshot_digest: Option<String>,
     pub exit_code: Option<i32>,
     pub patch: Option<PatchEvents>,
     pub file_changes: Vec<ObservedFileChange>,
@@ -107,6 +111,14 @@ pub struct ToolExecution {
 pub(crate) enum ToolExecutionOutcome {
     Completed(ToolExecution),
     Cancelled(ToolExecution),
+}
+
+#[derive(Clone, Copy)]
+enum ToolResultAccess<'a> {
+    All,
+    Child {
+        allowed_project_context_snapshot_digest: Option<&'a str>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +183,8 @@ pub struct ToolRegistry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrozenSkill {
+    /// Candidate digest of the immutable snapshot that owns this body.
+    pub snapshot_digest: String,
     pub name: String,
     pub scope: String,
     /// Source identity (workspace-relative or `user/` path) echoed in the
@@ -363,11 +377,52 @@ impl ToolRegistry {
         events: &[EventEnvelope],
         cancellation: &CancellationToken,
     ) -> Result<ToolExecutionOutcome, ToolError> {
+        self.execute_with_events_cancellable_access(
+            name,
+            input,
+            events,
+            cancellation,
+            ToolResultAccess::All,
+        )
+    }
+
+    /// Child execution preserves the ordinary coding tool surface while
+    /// enforcing the request's project-context data-flow policy on result
+    /// rehydration. `None` denies every classified result; an inherited digest
+    /// admits only bytes from that exact immutable snapshot.
+    pub(crate) fn execute_with_events_cancellable_for_child(
+        &self,
+        name: &str,
+        input: &Value,
+        events: &[EventEnvelope],
+        cancellation: &CancellationToken,
+        allowed_project_context_snapshot_digest: Option<&str>,
+    ) -> Result<ToolExecutionOutcome, ToolError> {
+        self.execute_with_events_cancellable_access(
+            name,
+            input,
+            events,
+            cancellation,
+            ToolResultAccess::Child {
+                allowed_project_context_snapshot_digest,
+            },
+        )
+    }
+
+    fn execute_with_events_cancellable_access(
+        &self,
+        name: &str,
+        input: &Value,
+        events: &[EventEnvelope],
+        cancellation: &CancellationToken,
+        result_access: ToolResultAccess<'_>,
+    ) -> Result<ToolExecutionOutcome, ToolError> {
         if cancellation.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
         if name == "tool_result_get" {
-            return tool_result_get(events, input).map(ToolExecutionOutcome::Completed);
+            return tool_result_get(events, input, result_access)
+                .map(ToolExecutionOutcome::Completed);
         }
         self.execute_cancellable(name, input, cancellation)
     }
@@ -392,18 +447,22 @@ impl ToolRegistry {
     }
 
     fn skill_read(&self, input: &Value) -> Result<ToolExecution, ToolError> {
-        let name = required_str(input, "name")?.trim();
+        let name = required_str(input, "name")?;
         let skill = self
             .skills
             .get(name)
             .ok_or(ToolError::InvalidField("name"))?;
         Ok(ToolExecution {
             name: "skill_read".to_owned(),
-            output: format!(
-                "[skill name={} scope={} path={} digest={}]\n{}",
-                skill.name, skill.scope, skill.path, skill.body_digest, skill.body
+            output: crate::project_context::render_skill_result(
+                &skill.name,
+                &skill.scope,
+                &skill.path,
+                &skill.body_digest,
+                &skill.body,
             ),
             output_preview_budget: None,
+            project_context_snapshot_digest: Some(skill.snapshot_digest.clone()),
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
@@ -421,6 +480,7 @@ impl ToolRegistry {
             name: "read_file".to_owned(),
             output,
             output_preview_budget: None,
+            project_context_snapshot_digest: None,
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
@@ -448,6 +508,7 @@ impl ToolRegistry {
             name: "edit_file".to_owned(),
             output: format!("edited {relative}"),
             output_preview_budget: None,
+            project_context_snapshot_digest: None,
             exit_code: None,
             patch: Some(PatchEvents {
                 path: relative.to_owned(),
@@ -492,6 +553,7 @@ impl ToolRegistry {
             name: origin.to_owned(),
             output: format!("created {relative}"),
             output_preview_budget: None,
+            project_context_snapshot_digest: None,
             exit_code: None,
             patch: Some(PatchEvents {
                 path: relative.to_owned(),
@@ -535,6 +597,7 @@ impl ToolRegistry {
                     name: name.to_owned(),
                     output: format!("{label} prepared add {path}"),
                     output_preview_budget: None,
+                    project_context_snapshot_digest: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
                         path,
@@ -561,6 +624,7 @@ impl ToolRegistry {
                     name: name.to_owned(),
                     output: format!("{label} prepared update {path}"),
                     output_preview_budget: None,
+                    project_context_snapshot_digest: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
                         path,
@@ -679,6 +743,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
                 max_bytes,
                 max_lines: DEFAULT_MAX_LINES,
             }),
+            project_context_snapshot_digest: None,
             exit_code: Some(status),
             patch: None,
             file_changes,
@@ -714,6 +779,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
                 max_bytes: DEFAULT_MAX_BYTES,
                 max_lines: DEFAULT_MAX_LINES,
             }),
+            project_context_snapshot_digest: None,
             exit_code: Some(status),
             patch: None,
             file_changes: Vec::new(),
@@ -1554,10 +1620,25 @@ fn skill_read_definition() -> ToolDefinition {
     }
 }
 
-fn tool_result_get(events: &[EventEnvelope], input: &Value) -> Result<ToolExecution, ToolError> {
+fn tool_result_get(
+    events: &[EventEnvelope],
+    input: &Value,
+    access: ToolResultAccess<'_>,
+) -> Result<ToolExecution, ToolError> {
     let offset_bytes = optional_usize(input, "offset_bytes")?.unwrap_or(0);
     let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(64 * 1024);
     let event = find_tool_result_event(events, input)?;
+    let project_context_snapshot_digest = tool_result_project_context_snapshot_digest(event)?;
+    if let ToolResultAccess::Child {
+        allowed_project_context_snapshot_digest,
+    } = access
+    {
+        if project_context_snapshot_digest.is_some()
+            && project_context_snapshot_digest != allowed_project_context_snapshot_digest
+        {
+            return Err(ToolError::InvalidField("event_id"));
+        }
+    }
     let name = event
         .payload
         .get("name")
@@ -1585,10 +1666,28 @@ fn tool_result_get(events: &[EventEnvelope], input: &Value) -> Result<ToolExecut
         name: "tool_result_get".to_owned(),
         output,
         output_preview_budget: None,
+        project_context_snapshot_digest: project_context_snapshot_digest.map(str::to_owned),
         exit_code: None,
         patch: None,
         file_changes: Vec::new(),
     })
+}
+
+fn tool_result_project_context_snapshot_digest(
+    event: &EventEnvelope,
+) -> Result<Option<&str>, ToolError> {
+    match event.payload.get("project_context_snapshot_digest") {
+        None => Ok(None),
+        Some(Value::String(digest))
+            if digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            Ok(Some(digest))
+        }
+        Some(_) => Err(ToolError::InvalidField("event_id")),
+    }
 }
 
 fn find_tool_result_event<'a>(

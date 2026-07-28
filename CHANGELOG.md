@@ -18,6 +18,11 @@ pull requests that landed them; deeper design rationale lives in
   project-scoped view of the manifest, so every previously acknowledged
   repository re-prompts once after upgrading (fail closed — nothing loads
   until re-accepted); afterwards user-skill changes never re-prompt.
+  Catalog bounds now omit whole skills with explicit diagnostics instead of
+  silently hiding accepted entries, frozen bodies use spoof-resistant
+  core framing, user-only manifests receive the same context-budget checks,
+  and child `none | inherit` policy is enforced for prior skill-result canvas
+  rounds and `tool_result_get` rehydration.
 
 ### Steering reliability
 

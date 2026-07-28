@@ -106,7 +106,7 @@ impl CandidateManifest {
                     record
                         .path
                         .as_deref()
-                        .is_none_or(|path| !path.starts_with("user/"))
+                        .is_none_or(|path| path != "user" && !path.starts_with("user/"))
                 })
                 .cloned()
                 .collect(),
@@ -281,6 +281,11 @@ impl CandidateManifest {
         if combined_skill_body > MAX_COMBINED_SKILL_BODY_BYTES {
             return Err(ManifestError(
                 "combined skill bodies exceed the aggregate limit".to_owned(),
+            ));
+        }
+        if !super::framing::skill_catalog_fits(&self.skills) {
+            return Err(ManifestError(
+                "rendered skill catalog exceeds the catalog limit".to_owned(),
             ));
         }
         Ok(())

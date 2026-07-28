@@ -768,6 +768,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
             output: "alpha".to_owned(),
             error: None,
             exit_code: None,
+            project_context_snapshot_digest: None,
             compacted: false,
             demoted: false,
         }
@@ -782,6 +783,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
             output: "beta".to_owned(),
             error: None,
             exit_code: None,
+            project_context_snapshot_digest: None,
             compacted: false,
             demoted: false,
         }
@@ -1970,6 +1972,7 @@ fn pairs_tool_call_with_selected_output() {
                 output: "hello world".to_owned(),
                 error: None,
                 exit_code: None,
+                project_context_snapshot_digest: None,
                 compacted: false,
                 demoted: false,
             },
@@ -2139,6 +2142,7 @@ fn duplicate_call_ids_keep_first_pair() {
                 output: "first".to_owned(),
                 error: None,
                 exit_code: None,
+                project_context_snapshot_digest: None,
                 compacted: false,
                 demoted: false,
             },

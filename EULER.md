@@ -2,10 +2,9 @@
 
 ## Start here
 
-Read `AGENTS.md` before editing code; it is the canonical engineering policy for
-this repository. For architecture-affecting work, also read `docs/VISION.md`,
-`docs/ARCHITECTURE.md`, the relevant contracts under `docs/contracts/`, and any
-governing ADRs.
+Read `docs/vision.md` before editing code. For architecture-affecting work,
+also read `docs/contracts/boundaries.md`, the relevant contracts under
+`docs/contracts/`, and any governing ADRs under `docs/adr/`.
 
 Contracts describe implemented behavior. Update the owning contract in the same
 patch when behavior changes. Add or amend an ADR before changing a system

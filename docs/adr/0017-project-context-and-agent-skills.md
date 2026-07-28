@@ -308,8 +308,10 @@ redacted project content is identical.
 
 There is no implicit reload in the first release. A future explicit reload may
 append a new snapshot event; it must never rewrite the earlier snapshot.
-The latest snapshot event is authoritative: a disabled snapshot is a tombstone
-and cannot resurrect an older admitted snapshot after compaction or resume.
+The latest snapshot event is authoritative: a snapshot without a model-facing
+manifest is a tombstone and cannot resurrect an older admitted manifest after
+compaction or resume. A repository-disabled snapshot may still pin
+user-global skills under the owner amendment below.
 
 ### 7. Resume from provenance, never from current project files
 
@@ -428,11 +430,11 @@ identity through ordinary `tool.call` and `tool.result` events. It does not
 re-read the filesystem, grant a capability, execute a script, install a
 dependency, or automatically read references and assets.
 
-A `skill_read` result is repository-authored text entering the canvas
-mid-session, so the returned body receives the same core-generated framing and
-repository-guidance classification as startup sources: a core-framed header
-carrying the skill's name and source identity, content indented so body text
-can never occupy a core marker position, and the same adversarial
+A `skill_read` result is user- or repository-authored guidance entering the
+canvas mid-session, so the returned body receives the same core-generated
+framing and project-context classification as startup sources: a core-framed
+header carrying the skill's name and source identity, content indented so body
+text can never occupy a core marker position, and the same adversarial
 fake-framing tests. `skill_read` itself is permission-ungated: it returns
 already-admitted frozen snapshot bytes and reads nothing from the filesystem,
 so there is no new authority to gate; the call and result remain ordinary

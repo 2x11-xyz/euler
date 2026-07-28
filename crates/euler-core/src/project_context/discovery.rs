@@ -83,6 +83,7 @@ pub(crate) enum DiagnosticReason {
     SkillDepthExceeded,
     SkillDirectoryCountExceeded,
     SkillCountExceeded,
+    SkillCatalogLimitExceeded,
     SkillFrontmatterInvalid,
     SkillNameInvalid,
     SkillNameMismatch,
@@ -115,6 +116,7 @@ impl DiagnosticReason {
             Self::SkillDepthExceeded => "skill_depth_exceeded",
             Self::SkillDirectoryCountExceeded => "skill_directory_count_exceeded",
             Self::SkillCountExceeded => "skill_count_exceeded",
+            Self::SkillCatalogLimitExceeded => "skill_catalog_limit_exceeded",
             Self::SkillFrontmatterInvalid => "skill_frontmatter_invalid",
             Self::SkillNameInvalid => "skill_name_invalid",
             Self::SkillNameMismatch => "skill_name_mismatch",
@@ -229,6 +231,20 @@ mod imp {
         redactor: &SecretRedactor,
     ) -> DiscoveryOutcome {
         let mut diagnostics = Vec::new();
+        // User-global skills are independent of repository-context discovery.
+        // Scan them first so a repository boundary failure can fail project
+        // context closed without suppressing user-owned guidance.
+        let mut skill_candidates = Vec::new();
+        let mut skill_directories_examined = 0usize;
+        if let Some(root) = user_skills_root {
+            let mut scan = SkillScan {
+                redactor,
+                diagnostics: &mut diagnostics,
+                directories_examined: &mut skill_directories_examined,
+                candidates: &mut skill_candidates,
+            };
+            scan_user_skills_root(root, &mut scan);
+        }
         // Anchor: open every component of the canonical workspace path from
         // the filesystem root with no-follow semantics, retaining handles
         // for the marker-search window (the last MAX_CHAIN_LEVELS
@@ -237,11 +253,12 @@ mod imp {
             match open_workspace_chain(canonical_workspace, &mut diagnostics) {
                 Some(walk) => walk,
                 None => {
+                    let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
                     return DiscoveryOutcome {
                         sources: Vec::new(),
-                        skills: Vec::new(),
+                        skills,
                         diagnostics,
-                    }
+                    };
                 }
             };
         // Nearest marker inside the window (workspace upward). A level whose
@@ -266,9 +283,10 @@ mod imp {
                     None,
                     observed,
                 ));
+                let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
                 return DiscoveryOutcome {
                     sources: Vec::new(),
-                    skills: Vec::new(),
+                    skills,
                     diagnostics,
                 };
             }
@@ -287,7 +305,14 @@ mod imp {
         let project_chain = &mut window[root_index..];
         let candidates = scan_chain(project_chain, redactor, &mut diagnostics);
         let sources = admit_candidates(candidates, &mut diagnostics);
-        let skills = discover_skills(project_chain, user_skills_root, redactor, &mut diagnostics);
+        scan_project_skills(
+            project_chain,
+            redactor,
+            &mut diagnostics,
+            &mut skill_directories_examined,
+            &mut skill_candidates,
+        );
+        let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
         DiscoveryOutcome {
             sources,
             skills,
@@ -595,23 +620,19 @@ mod imp {
             .collect()
     }
 
-    fn discover_skills(
+    fn scan_project_skills(
         project_chain: &mut [ChainDir],
-        user_skills_root: Option<&Path>,
         redactor: &SecretRedactor,
         diagnostics: &mut Vec<ManifestDiagnostic>,
-    ) -> Vec<ManifestSkill> {
-        let mut candidates = Vec::new();
-        let mut directories_examined = 0usize;
+        directories_examined: &mut usize,
+        candidates: &mut Vec<SkillCandidate>,
+    ) {
         let mut scan = SkillScan {
             redactor,
             diagnostics,
-            directories_examined: &mut directories_examined,
-            candidates: &mut candidates,
+            directories_examined,
+            candidates,
         };
-        if let Some(root) = user_skills_root {
-            scan_user_skills_root(root, &mut scan);
-        }
         let mut rel_dir = String::new();
         for (depth, dir) in project_chain.iter_mut().enumerate() {
             if depth > 0 {
@@ -628,12 +649,6 @@ mod imp {
             };
             scan_project_skills_entry(&dir.fd, names, &rel_dir, &mut scan);
         }
-        let SkillScan {
-            diagnostics,
-            candidates,
-            ..
-        } = scan;
-        admit_skill_candidates(std::mem::take(candidates), diagnostics)
     }
 
     fn scan_user_skills_root(root: &Path, scan: &mut SkillScan<'_>) {
@@ -755,8 +770,11 @@ mod imp {
                 continue;
             }
             let Some(name_text) = std::str::from_utf8(&name).ok() else {
-                scan.diagnostics
-                    .push(diagnostic(DiagnosticReason::NonUtf8Path, None, None));
+                scan.diagnostics.push(diagnostic(
+                    DiagnosticReason::NonUtf8Path,
+                    Some(identity.to_owned()),
+                    None,
+                ));
                 continue;
             };
             let Ok(stat) = fstatat_nofollow(dir, OsStr::new(name_text)) else {
@@ -899,8 +917,7 @@ mod imp {
                     Some(candidate.body.len() as u64),
                 ));
             } else {
-                combined += candidate.body.len();
-                admitted.push(ManifestSkill {
+                let skill = ManifestSkill {
                     name: candidate.name.clone(),
                     description: candidate.description.clone(),
                     scope: candidate.scope,
@@ -913,7 +930,18 @@ mod imp {
                         &candidate.body,
                     ),
                     body: candidate.body.clone(),
-                });
+                };
+                admitted.push(skill);
+                if super::super::framing::skill_catalog_fits(&admitted) {
+                    combined += candidate.body.len();
+                } else {
+                    admitted.pop();
+                    diagnostics.push(diagnostic(
+                        DiagnosticReason::SkillCatalogLimitExceeded,
+                        Some(candidate.path.clone()),
+                        None,
+                    ));
+                }
             }
             index = end;
         }

@@ -186,6 +186,10 @@ pub enum CanvasItem {
         output: String,
         error: Option<String>,
         exit_code: Option<i64>,
+        /// Candidate digest when this result carries bytes derived from a
+        /// project-context snapshot. Child request assembly filters the whole
+        /// owning tool round according to its recorded context policy.
+        project_context_snapshot_digest: Option<String>,
         compacted: bool,
         /// True when budget pressure replaced the result content with a
         /// single-line stub. The fact (call, outcome, stub) stays in canvas.
@@ -1212,6 +1216,14 @@ fn tool_output_item_with_compaction(event: &EventEnvelope, compact: bool) -> Opt
     };
     // compacted flag is true only when the output was actually transformed
     let compacted = should_compact && output != projected_output;
+    let project_context_snapshot_digest = match event.payload.get("project_context_snapshot_digest")
+    {
+        None => None,
+        Some(Value::String(digest)) => Some(digest.clone()),
+        // Treat a malformed classification as classified-but-unmatchable.
+        // Root replay keeps the evidence; no child can inherit it.
+        Some(_) => Some(String::new()),
+    };
     Some(CanvasItem::ToolOutput {
         event_id: event.id.clone(),
         call_id: string_field(event, "id")?,
@@ -1224,6 +1236,7 @@ fn tool_output_item_with_compaction(event: &EventEnvelope, compact: bool) -> Opt
         output,
         error: string_field(event, "error"),
         exit_code: event.payload.get("exit_code").and_then(Value::as_i64),
+        project_context_snapshot_digest,
         compacted,
         demoted: false,
     })

@@ -3688,17 +3688,24 @@ fn apply_child_project_context_policy(
     policy: euler_agents::ProjectContextPolicy,
     fold: &crate::project_context::ProjectContextFold,
 ) {
-    match policy {
-        euler_agents::ProjectContextPolicy::None => {
-            canvas.retain(|item| !matches!(item, CanvasItem::ProjectContext { .. }));
-        }
-        euler_agents::ProjectContextPolicy::Inherit => {
-            let already_present = canvas
-                .iter()
-                .any(|item| matches!(item, CanvasItem::ProjectContext { .. }));
-            if already_present {
-                return;
-            }
+    let allowed_snapshot_digest = match policy {
+        euler_agents::ProjectContextPolicy::None => None,
+        euler_agents::ProjectContextPolicy::Inherit => fold
+            .admitted()
+            .map(|pinned| pinned.candidate_digest.as_str()),
+    };
+    filter_project_context_tool_rounds(canvas, allowed_snapshot_digest);
+    canvas.retain(|item| match item {
+        CanvasItem::ProjectContext {
+            snapshot_digest, ..
+        } => allowed_snapshot_digest == Some(snapshot_digest.as_str()),
+        _ => true,
+    });
+    if policy == euler_agents::ProjectContextPolicy::Inherit {
+        let already_present = canvas
+            .iter()
+            .any(|item| matches!(item, CanvasItem::ProjectContext { .. }));
+        if !already_present {
             if let Some(pinned) = fold.admitted() {
                 canvas.insert(
                     0,
@@ -3711,6 +3718,40 @@ fn apply_child_project_context_policy(
             }
         }
     }
+}
+
+/// Filter both halves of every classified tool round. Keeping only the result
+/// would violate provider tool-pair shape; keeping only the call would invite
+/// the child to recover bytes its policy excluded.
+fn filter_project_context_tool_rounds(
+    canvas: &mut Vec<CanvasItem>,
+    allowed_snapshot_digest: Option<&str>,
+) {
+    let rejected_call_ids = canvas
+        .iter()
+        .filter_map(|item| match item {
+            CanvasItem::ToolOutput {
+                call_id,
+                project_context_snapshot_digest: Some(digest),
+                ..
+            } if allowed_snapshot_digest != Some(digest.as_str()) => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    canvas.retain(|item| match item {
+        CanvasItem::ToolCall { call_id, .. } => !rejected_call_ids.contains(call_id),
+        CanvasItem::ToolOutput {
+            call_id,
+            project_context_snapshot_digest,
+            ..
+        } => {
+            !rejected_call_ids.contains(call_id)
+                && project_context_snapshot_digest
+                    .as_deref()
+                    .is_none_or(|digest| allowed_snapshot_digest == Some(digest))
+        }
+        _ => true,
+    });
 }
 
 /// Rendered-context digest to record on `model.call` when (and only when)

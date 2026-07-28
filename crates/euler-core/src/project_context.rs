@@ -34,6 +34,7 @@ pub(crate) use fold::{
     fold_project_context, validate_bootstrap_shape, verify_workspace_identity,
     PinnedProjectContext, ProjectContextFold, WorkspaceIdentityIssue,
 };
+pub(crate) use framing::render_skill_result;
 
 use crate::redaction::SecretRedactor;
 use crate::session_kind::SessionKind;
@@ -498,27 +499,33 @@ impl Preflight {
         })
     }
 
-    /// True when the preflight produced a trustworthy, non-empty manifest that
-    /// could be admitted. A collapse, an indeterminate boundary, or the total
-    /// absence of `EULER.md` all make admission impossible.
-    fn admissible(&self) -> bool {
+    /// True when repository-authored guidance could be admitted. User-global
+    /// skills are independent and may still survive any false result here.
+    fn project_admissible(&self) -> bool {
         !self.collapsed
             && !self.boundary_indeterminate
             && (!self.source_identities.is_empty() || self.project_skill_count > 0)
     }
 
-    /// The exact core-framed bytes an admitted item would carry, for the
-    /// admission-time budget check.
-    fn framed_bytes(&self) -> usize {
-        render_project_context(&self.manifest).len()
+    /// Exact core-framed bytes the selected admission would carry. `None`
+    /// means neither repository guidance nor user-global skills reach the
+    /// model, so there is no pinned item to budget.
+    fn framed_bytes(&self, admit_project: bool) -> Option<usize> {
+        let admitted = self.manifest.admitted_view(admit_project);
+        (!admitted.sources.is_empty() || !admitted.skills.is_empty())
+            .then(|| render_project_context(&admitted).len())
     }
 
     /// Run the admission-time budget formula (project-context contract,
     /// "Framing and canvas admission"). Returns the honest error to surface
     /// before any card acceptance or provider dispatch is wasted, or `None`
     /// when the item fits.
-    fn budget_error(&self, budget: &AdmissionBudget) -> Option<ProjectContextBudgetError> {
-        let framed = self.framed_bytes();
+    fn budget_error(
+        &self,
+        budget: &AdmissionBudget,
+        admit_project: bool,
+    ) -> Option<ProjectContextBudgetError> {
+        let framed = self.framed_bytes(admit_project)?;
         if framed > budget.canvas_budget_bytes {
             return Some(ProjectContextBudgetError::OverByteBudget {
                 rendered_bytes: framed,
@@ -537,6 +544,18 @@ impl Preflight {
                 limit_tokens,
             }),
             None => Some(ProjectContextBudgetError::Overflow),
+        }
+    }
+
+    fn finish_admission(
+        self,
+        admission: Admission,
+        budget: &AdmissionBudget,
+    ) -> ProjectContextResolution {
+        if let Some(error) = self.budget_error(budget, admission.admit_manifest) {
+            ProjectContextResolution::Budget(error)
+        } else {
+            ProjectContextResolution::Resolved(Box::new(self.into_bootstrap(admission)))
         }
     }
 
@@ -605,9 +624,8 @@ pub struct ProjectContextBootstrap {
     workspace_identity_digest: String,
     source_identities: Vec<String>,
     diagnostics: Vec<ManifestDiagnostic>,
-    /// Present only when admitted. A disabled/declined/unacknowledged bootstrap
-    /// drops every frozen body immediately, so nothing content-bearing survives
-    /// in memory, events, or provenance.
+    /// Present when model-facing guidance remains. A non-admitted project
+    /// drops repository-owned bodies but may retain frozen user-global skills.
     manifest: Option<CandidateManifest>,
 }
 
@@ -651,29 +669,23 @@ impl ProjectContextBootstrap {
         } = options;
         let preflight =
             Preflight::run_with_user_skills(workspace_root, user_skills_root, redactor)?;
-        if !preflight.admissible() {
+        if !preflight.project_admissible() {
             let admission = preflight.unadmissible_admission(policy);
-            return Ok(ProjectContextResolution::Resolved(Box::new(
-                preflight.into_bootstrap(admission),
-            )));
+            return Ok(preflight.finish_admission(admission, &budget));
         }
         match policy {
-            ProjectContextPolicy::Off => Ok(ProjectContextResolution::Resolved(Box::new(
-                preflight.into_bootstrap(Admission::disabled_by_flag()),
-            ))),
+            ProjectContextPolicy::Off => {
+                let admission = Admission::disabled_by_flag();
+                Ok(preflight.finish_admission(admission, &budget))
+            }
             ProjectContextPolicy::On => {
-                if let Some(error) = preflight.budget_error(&budget) {
-                    return Ok(ProjectContextResolution::Budget(error));
-                }
-                Ok(ProjectContextResolution::Resolved(Box::new(
-                    preflight.into_bootstrap(Admission::explicit_on()),
-                )))
+                let admission = Admission::explicit_on();
+                Ok(preflight.finish_admission(admission, &budget))
             }
             ProjectContextPolicy::Auto => {
                 if trusted_local {
-                    return Ok(ProjectContextResolution::Resolved(Box::new(
-                        preflight.into_bootstrap(Admission::trusted_local_off()),
-                    )));
+                    let admission = Admission::trusted_local_off();
+                    return Ok(preflight.finish_admission(admission, &budget));
                 }
                 let store = consent_dir.map(AcknowledgmentStore::new);
                 let lookup = store.as_ref().map(|store| {
@@ -685,12 +697,8 @@ impl ProjectContextBootstrap {
                 });
                 match lookup {
                     Some(AcknowledgmentLookup::Match) => {
-                        if let Some(error) = preflight.budget_error(&budget) {
-                            return Ok(ProjectContextResolution::Budget(error));
-                        }
-                        Ok(ProjectContextResolution::Resolved(Box::new(
-                            preflight.into_bootstrap(Admission::acknowledged()),
-                        )))
+                        let admission = Admission::acknowledged();
+                        Ok(preflight.finish_admission(admission, &budget))
                     }
                     // Not acknowledged (absent, changed, or an untrustworthy
                     // record we refuse to trust): headless never prompts;
@@ -706,11 +714,10 @@ impl ProjectContextBootstrap {
                         // record a decision, so auto admission is disabled and
                         // no card is offered (fail closed, like project grants).
                         if store.is_none() || session_kind != SessionKind::Interactive {
-                            return Ok(ProjectContextResolution::Resolved(Box::new(
-                                preflight.into_bootstrap(Admission::unacknowledged()),
-                            )));
+                            let admission = Admission::unacknowledged();
+                            return Ok(preflight.finish_admission(admission, &budget));
                         }
-                        if let Some(error) = preflight.budget_error(&budget) {
+                        if let Some(error) = preflight.budget_error(&budget, true) {
                             return Ok(ProjectContextResolution::Budget(error));
                         }
                         Ok(ProjectContextResolution::NeedsAcknowledgment(Box::new(
@@ -807,12 +814,10 @@ impl ProjectContextBootstrap {
         })
     }
 
-    /// The `project.context.snapshot` payload. An admitted snapshot carries
-    /// the canonical manifest as one top-level payload string (blob-eligible
-    /// through ordinary provenance externalization); a disabled snapshot
-    /// carries no body, per-source content hash, exact content length, or
-    /// parser excerpt — only the candidate digest, bounded identities,
-    /// counts, and content-free reason codes.
+    /// The `project.context.snapshot` payload. A model-facing manifest is one
+    /// canonical top-level string (blob-eligible through ordinary provenance
+    /// externalization). Non-admitted repository context drops all project
+    /// bodies and hashes; a manifest may remain only for user-global skills.
     pub(crate) fn snapshot_payload(&self) -> JsonObject {
         let mut payload = euler_event::object([
             ("schema_version", SNAPSHOT_SCHEMA_VERSION.into()),
@@ -873,6 +878,7 @@ impl ProjectContextBootstrap {
                     .skills
                     .iter()
                     .map(|skill| crate::tools::FrozenSkill {
+                        snapshot_digest: self.candidate_digest.clone(),
                         name: skill.name.clone(),
                         scope: skill.scope.as_str().to_owned(),
                         path: skill.path.clone(),
