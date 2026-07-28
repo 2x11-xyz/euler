@@ -32,7 +32,8 @@ use euler_sdk::{
     HostAgentTask, HostApi, SpawnAgentTask,
 };
 use serde_json::Map;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, Mutex};
 
 #[test]
 fn max_output_tokens_propagates_to_model_request_and_model_call() {
@@ -91,6 +92,477 @@ impl ModelProvider for ErroringProvider {
     fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
         Err(ProviderError::rejected(self.message.clone()))
     }
+}
+
+#[derive(Debug, Default)]
+struct BlockingProviderState {
+    entered: bool,
+    released: bool,
+}
+
+#[derive(Debug)]
+struct BlockingLateProvider {
+    state: Arc<(Mutex<BlockingProviderState>, Condvar)>,
+}
+
+#[derive(Debug)]
+struct CancellingPermissionDecider {
+    cancellation: euler_sdk::CancellationSource,
+}
+
+impl crate::permissions::PermissionDecider for CancellingPermissionDecider {
+    fn decide(
+        &mut self,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::DeciderVerdict {
+        self.cancellation.cancel();
+        crate::permissions::DeciderVerdict::Deny
+    }
+
+    fn decide_batch(
+        &mut self,
+        _batch: &crate::permissions::PermissionRequestBatch,
+    ) -> crate::permissions::DeciderVerdict {
+        self.cancellation.cancel();
+        crate::permissions::DeciderVerdict::Deny
+    }
+
+    fn decide_cancellable(
+        &mut self,
+        _request: &crate::permissions::PermissionRequest,
+        cancellation: &CancellationToken,
+    ) -> crate::permissions::PermissionDecisionOutcome<crate::permissions::DeciderVerdict> {
+        self.cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        crate::permissions::PermissionDecisionOutcome::Cancelled
+    }
+
+    fn decide_batch_cancellable(
+        &mut self,
+        _batch: &crate::permissions::PermissionRequestBatch,
+        cancellation: &CancellationToken,
+    ) -> crate::permissions::PermissionDecisionOutcome<crate::permissions::DeciderVerdict> {
+        self.cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        crate::permissions::PermissionDecisionOutcome::Cancelled
+    }
+}
+
+impl ModelProvider for BlockingLateProvider {
+    fn name(&self) -> &'static str {
+        "blocking-late"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("blocking provider state");
+        state.entered = true;
+        wake.notify_all();
+        while !state.released {
+            state = wake.wait(state).expect("blocking provider wait");
+        }
+        Ok(Box::new(
+            vec![
+                Ok(ModelStreamEvent::TextDelta("too late".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: None,
+                }),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
+fn assert_cancelled_model_call_terminal(events: &[EventEnvelope], model_call_id: &str) {
+    let terminals = events
+        .iter()
+        .filter(|event| {
+            event.parent.as_deref() == Some(model_call_id)
+                && matches!(
+                    event.kind.as_str(),
+                    EventKind::MODEL_RESULT | EventKind::ERROR
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "one model.call needs exactly one terminal model.result or error"
+    );
+    let terminal = terminals[0];
+    assert_eq!(terminal.kind.as_str(), EventKind::ERROR);
+    assert_eq!(terminal.payload["source"], json!("session"));
+    assert_eq!(terminal.payload["message"], json!("model call cancelled"));
+    assert_eq!(terminal.payload["cancelled"], json!(true));
+}
+
+fn assert_completed_model_call_terminal(events: &[EventEnvelope], model_call_id: &str) {
+    let terminals = events
+        .iter()
+        .filter(|event| {
+            event.parent.as_deref() == Some(model_call_id)
+                && matches!(
+                    event.kind.as_str(),
+                    EventKind::MODEL_RESULT | EventKind::ERROR
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].kind.as_str(), EventKind::MODEL_RESULT);
+}
+
+#[test]
+fn cancellation_releases_session_before_blocked_provider_and_rejects_late_events() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state = Arc::new((Mutex::new(BlockingProviderState::default()), Condvar::new()));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let mut config = SessionConfig::new(temp.path());
+    config.provider = "blocking-late".to_owned();
+    let mut session = Session::new(
+        config,
+        BlockingLateProvider {
+            state: Arc::clone(&state),
+        },
+        ScriptedDecider::new(Vec::new()),
+    );
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let turn_cancel = Arc::clone(&cancel_flag);
+    let worker = std::thread::spawn(move || {
+        let result = session.run_turn_with_sink("wait", turn_cancel, |_| {});
+        done_tx
+            .send((session, result))
+            .expect("turn result receiver");
+    });
+
+    let (lock, wake) = &*state;
+    let entered_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut provider_state = lock.lock().expect("blocking provider state");
+    while !provider_state.entered && std::time::Instant::now() < entered_deadline {
+        let (next, _) = wake
+            .wait_timeout(provider_state, std::time::Duration::from_millis(10))
+            .expect("blocking provider entry wait");
+        provider_state = next;
+    }
+    assert!(provider_state.entered, "provider call did not start");
+    drop(provider_state);
+
+    let cancelled_at = std::time::Instant::now();
+    cancel_flag.store(true, Ordering::SeqCst);
+    let completed = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+
+    let mut provider_state = lock.lock().expect("blocking provider state");
+    provider_state.released = true;
+    wake.notify_all();
+    drop(provider_state);
+
+    let (session, result) =
+        completed.expect("cancelled turn should return before provider unblocks");
+    worker.join().expect("turn worker");
+    assert!(
+        cancelled_at.elapsed() < std::time::Duration::from_secs(1),
+        "cancelled turn should return promptly"
+    );
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    let model_call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("model.call");
+    assert_cancelled_model_call_terminal(session.events(), &model_call.id);
+    assert!(
+        session.events().iter().all(|event| {
+            event.kind.as_str() != EventKind::MODEL_DELTA
+                && event.kind.as_str() != EventKind::MODEL_RESULT
+        }),
+        "late provider events must not mutate the transcript"
+    );
+}
+
+#[test]
+fn cancellation_releases_a_blocked_companion_provider() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("companion-cancel");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let writer = ProvenanceWriter::new(session_dir.join("events.jsonl")).expect("writer");
+    let state = Arc::new((Mutex::new(BlockingProviderState::default()), Condvar::new()));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancellation =
+        euler_sdk::CancellationSource::from_shared_flag(Arc::clone(&cancel_flag)).token();
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "companion-cancel".to_owned();
+    config.provider = "blocking-late".to_owned();
+    let mut session = Session::new(
+        config,
+        BlockingLateProvider {
+            state: Arc::clone(&state),
+        },
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    let task = AgentTask::new_inheriting_target("wait", "cancel-proof").expect("companion task");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = session.spawn_companion_with_cancel(task, cancellation);
+        done_tx
+            .send((session, result))
+            .expect("companion result receiver");
+    });
+
+    let (lock, wake) = &*state;
+    let entered_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut provider_state = lock.lock().expect("blocking provider state");
+    while !provider_state.entered && std::time::Instant::now() < entered_deadline {
+        let (next, _) = wake
+            .wait_timeout(provider_state, std::time::Duration::from_millis(10))
+            .expect("blocking provider entry wait");
+        provider_state = next;
+    }
+    assert!(provider_state.entered, "companion provider did not start");
+    drop(provider_state);
+
+    let cancelled_at = std::time::Instant::now();
+    cancel_flag.store(true, Ordering::SeqCst);
+    let completed = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+
+    let mut provider_state = lock.lock().expect("blocking provider state");
+    provider_state.released = true;
+    wake.notify_all();
+    drop(provider_state);
+
+    let (session, result) = completed.expect("companion cancellation should return promptly");
+    worker.join().expect("companion worker");
+    assert!(cancelled_at.elapsed() < std::time::Duration::from_secs(1));
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert!(
+        session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::AGENT_RESULT),
+        "cancelled companion still needs a terminal child result"
+    );
+    let model_call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("companion model.call");
+    assert_cancelled_model_call_terminal(session.events(), &model_call.id);
+}
+
+#[test]
+fn cancellation_while_root_permission_waits_closes_the_tool_without_a_decision() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancellation = euler_sdk::CancellationSource::from_shared_flag(Arc::clone(&cancel_flag));
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![
+        euler_provider::ToolCall {
+            id: "call-write".to_owned(),
+            name: "write_file".to_owned(),
+            input: json!({"path": "must-not-exist", "content": "late"}),
+        },
+    ])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        CancellingPermissionDecider {
+            cancellation: cancellation.clone(),
+        },
+    );
+
+    let result = session.run_turn_with_sink("write", cancel_flag, |_| {});
+
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert!(!temp.path().join("must-not-exist").exists());
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
+            .count(),
+        1
+    );
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+            .count(),
+        0,
+        "cancellation is not a denial decision"
+    );
+    let results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].payload["id"], json!("call-write"));
+    assert_eq!(results[0].payload["cancelled"], json!(true));
+    let model_call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("model.call");
+    assert_completed_model_call_terminal(session.events(), &model_call.id);
+}
+
+#[test]
+fn cancellation_while_companion_permission_waits_records_both_terminal_results() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp
+        .path()
+        .join("sessions")
+        .join("companion-permission-cancel");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let writer = ProvenanceWriter::new(session_dir.join("events.jsonl")).expect("writer");
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancellation = euler_sdk::CancellationSource::from_shared_flag(Arc::clone(&cancel_flag));
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![
+        euler_provider::ToolCall {
+            id: "child-write".to_owned(),
+            name: "write_file".to_owned(),
+            input: json!({"path": "must-not-exist", "content": "late"}),
+        },
+    ])]);
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "companion-permission-cancel".to_owned();
+    let mut session = Session::new(
+        config,
+        provider,
+        CancellingPermissionDecider {
+            cancellation: cancellation.clone(),
+        },
+    )
+    .with_provenance(writer);
+    let task = AgentTask::new_inheriting_target("write", "worker")
+        .expect("task")
+        .with_capabilities([Capability::FsWrite]);
+
+    let result = session.spawn_companion_with_cancel(task, cancellation.token());
+
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert!(!temp.path().join("must-not-exist").exists());
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+            .count(),
+        0
+    );
+    let tool_results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0].payload["cancelled"], json!(true));
+    let agent_results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(agent_results.len(), 1);
+    assert_eq!(agent_results[0].payload["ok"], json!(false));
+    let model_call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("companion model.call");
+    assert_completed_model_call_terminal(session.events(), &model_call.id);
+}
+
+#[test]
+fn cancellation_closes_a_recorded_tool_batch_and_preserves_partial_shell_evidence() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let responses = vec![
+        FixtureResponse::ToolCalls(vec![
+            euler_provider::ToolCall {
+                id: "call-running".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({
+                    "command": "touch started; (sleep 0.5; touch too_late) & sleep 30"
+                }),
+            },
+            euler_provider::ToolCall {
+                id: "call-pending".to_owned(),
+                name: "write_file".to_owned(),
+                input: json!({"path": "should-not-exist", "content": "late"}),
+            },
+        ]),
+        FixtureResponse::Assistant("continued cleanly".to_owned()),
+    ];
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(responses),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let turn_cancel = Arc::clone(&cancel_flag);
+    let worker = std::thread::spawn(move || {
+        let result = session.run_turn_with_sink("run the batch", turn_cancel, |_| {});
+        done_tx
+            .send((session, result))
+            .expect("turn result receiver");
+    });
+
+    let started = temp.path().join("started");
+    let wait_started = std::time::Instant::now();
+    while !started.exists() && wait_started.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(started.exists(), "fixture command did not start");
+    cancel_flag.store(true, Ordering::SeqCst);
+
+    let (mut session, result) = done_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("cancelled tool turn should return promptly");
+    worker.join().expect("turn worker");
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert!(
+        !temp.path().join("should-not-exist").exists(),
+        "an unattempted batched call ran after cancellation"
+    );
+
+    let results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2, "every recorded call needs one closure");
+    assert_eq!(results[0].payload["id"], json!("call-running"));
+    assert_eq!(results[0].payload["ok"], json!(false));
+    assert_eq!(results[0].payload["cancelled"], json!(true));
+    assert!(results[0].payload["output"]
+        .as_str()
+        .is_some_and(|output| output.contains("command cancelled")));
+    assert_eq!(results[1].payload["id"], json!("call-pending"));
+    assert_eq!(results[1].payload["ok"], json!(false));
+    assert_eq!(results[1].payload["cancelled"], json!(true));
+    assert!(results[1].payload.get("output").is_none());
+    let model_call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        .expect("model.call");
+    assert_completed_model_call_terminal(session.events(), &model_call.id);
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::FILE_CHANGE && event.payload["path"] == json!("started")
+    }));
+
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    assert!(
+        !temp.path().join("too_late").exists(),
+        "a shell descendant survived cancellation"
+    );
+    let continued = session
+        .run_turn("continue")
+        .expect("the same live session remains provider-valid");
+    assert!(continued.iter().any(|event| {
+        event.kind.as_str() == EventKind::ASSISTANT_MESSAGE
+            && event.payload["content"] == json!("continued cleanly")
+    }));
 }
 
 #[test]
@@ -476,7 +948,10 @@ fn into_fresh_session_carries_registered_secret_values() {
             .prepare_fresh_project_context()
             .expect("fresh preflight"),
     );
-    let fresh = session.into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()), bootstrap);
+    let fresh = session
+        .into_fresh_session("fresh-id", ScriptedDecider::new(Vec::new()), bootstrap)
+        .map_err(|(_, error)| error)
+        .expect("fresh session");
 
     let out = fresh
         .redactor
@@ -724,6 +1199,88 @@ fn live_extension_context_slot_update_enters_next_canvas_and_model_input() {
         .input
         .iter()
         .any(|item| matches!(item, ModelInputItem::Message { content, .. } if content == "[slot slot-ext:main]\n    live context")));
+}
+
+#[test]
+fn disabling_context_slot_owner_hides_next_snapshot_and_reenable_restores_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let captured = Arc::new(Mutex::new(None));
+    let mut config = SessionConfig::new(temp.path());
+    config.provider = "capture".to_owned();
+    config.model = "test-model".to_owned();
+    enable_test_extensions(&mut config, &["slot-ext"]);
+    let mut session = Session::new(
+        config,
+        CapturingProvider::new(Arc::clone(&captured)),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    let extension = test_extension(
+        "slot-ext",
+        vec![Capability::ContextSlot],
+        TestCommandBehavior::Slot {
+            slot: "main",
+            content: "durable context",
+        },
+    );
+    session
+        .execute_extension_command(&extension, "write", json!(null), [Capability::ContextSlot])
+        .expect("write durable slot");
+    let slot_id = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::CONTEXT_SLOT_UPDATED)
+        .expect("slot event")
+        .id
+        .clone();
+
+    session.set_extension_enabled("slot-ext", false);
+    session.run_turn("while disabled").expect("disabled turn");
+    let disabled_snapshot = session
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .expect("disabled snapshot");
+    assert!(!disabled_snapshot.payload["selected_event_ids"]
+        .as_array()
+        .expect("selected ids")
+        .iter()
+        .any(|id| id.as_str() == Some(slot_id.as_str())));
+    assert!(!captured
+        .lock()
+        .expect("captured request")
+        .as_ref()
+        .expect("disabled model request")
+        .input
+        .iter()
+        .any(|item| matches!(item, ModelInputItem::Message { content, .. } if content.contains("[slot slot-ext:main]"))));
+
+    session.set_extension_enabled("slot-ext", true);
+    session
+        .run_turn("after re-enable")
+        .expect("re-enabled turn");
+    let restored_snapshot = session
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .expect("restored snapshot");
+    assert!(restored_snapshot.payload["selected_event_ids"]
+        .as_array()
+        .expect("selected ids")
+        .iter()
+        .any(|id| id.as_str() == Some(slot_id.as_str())));
+    assert!(captured
+        .lock()
+        .expect("captured request")
+        .as_ref()
+        .expect("re-enabled model request")
+        .input
+        .iter()
+        .any(|item| matches!(item, ModelInputItem::Message { content, .. } if content == "[slot slot-ext:main]\n    durable context")));
 }
 
 #[test]
@@ -2309,6 +2866,72 @@ fn test_extension(
 }
 
 #[test]
+fn cancellation_while_extension_batch_permission_waits_never_executes_or_commits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join(".euler").join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let writer = ProvenanceWriter::new(session_dir.join("events.jsonl")).expect("writer");
+    let cancellation = euler_sdk::CancellationSource::new();
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "extension-permission-cancel".to_owned();
+    enable_test_extensions(&mut config, &["cancel-ext"]);
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        CancellingPermissionDecider {
+            cancellation: cancellation.clone(),
+        },
+    )
+    .with_provenance(writer);
+    let extension = test_extension(
+        "cancel-ext",
+        vec![Capability::ArtifactWrite, Capability::Network],
+        TestCommandBehavior::Write {
+            chunks: vec![b"must not be written".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    let error = session
+        .execute_extension_command_gated_cancellable(
+            &extension,
+            "write",
+            json!(null),
+            &[Capability::ArtifactWrite, Capability::Network],
+            &cancellation.token(),
+        )
+        .expect_err("cancelled approval must stop the command");
+
+    assert!(matches!(error, ExtensionExecutionError::Cancelled));
+    let prompts = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].payload["batch"], json!(true));
+    assert_eq!(
+        prompts[0].payload["capabilities"],
+        json!(["artifact-write", "network"])
+    );
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+            .count(),
+        0
+    );
+    assert!(
+        !session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::EXTENSION_ARTIFACT),
+        "cancelled command must not execute"
+    );
+}
+
+#[test]
 fn gated_extension_run_refuses_an_agent_only_command() {
     // Every user-driven extension run funnels through the gated bridge, so
     // agent-only is enforced here and not only at whichever surfaces happen
@@ -2474,6 +3097,7 @@ impl ExtensionCommand for TestCommand {
             required_capabilities,
             args: Vec::new(),
             accepts_session_id: false,
+            model_tool: None,
         }
     }
 
@@ -2751,7 +3375,10 @@ fn resume_starts_the_reteach_streak_empty() {
             .prepare_fresh_project_context()
             .expect("fresh preflight"),
     );
-    let fresh = session.into_fresh_session("resumed", ScriptedDecider::new(vec![]), bootstrap);
+    let fresh = session
+        .into_fresh_session("resumed", ScriptedDecider::new(vec![]), bootstrap)
+        .map_err(|(_, error)| error)
+        .expect("fresh session");
     assert!(
         fresh.reteach_streak_is_empty(),
         "resume/new must start the reteach tracker empty (process-local)"
@@ -2779,7 +3406,6 @@ mod project_context_seam {
     use euler_agents::{AgentBudget, ProjectContextPolicy};
     use euler_provider::ProviderSet;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicBool;
 
     const REPO_TEXT: &str = "always run cargo nextest before pushing";
 
@@ -3097,7 +3723,7 @@ mod project_context_seam {
                     brief("inheriting two", ProjectContextPolicy::Inherit),
                     brief("isolated", ProjectContextPolicy::None),
                 ],
-                &AtomicBool::new(false),
+                &CancellationToken::new(),
             )
             .expect("batch");
         assert!(summaries.iter().all(|summary| summary.result.ok()));
@@ -3326,11 +3952,14 @@ mod project_context_seam {
                 .prepare_fresh_project_context()
                 .expect("fresh preflight"),
         );
-        let fresh = resumed.into_fresh_session(
-            "fresh-after-resume",
-            ScriptedDecider::new(Vec::new()),
-            bootstrap,
-        );
+        let fresh = resumed
+            .into_fresh_session(
+                "fresh-after-resume",
+                ScriptedDecider::new(Vec::new()),
+                bootstrap,
+            )
+            .map_err(|(_, error)| error)
+            .expect("fresh session");
         let events = fresh.events();
         assert_eq!(events[0].kind.as_str(), EventKind::SESSION_START);
         assert!(

@@ -70,6 +70,21 @@ emission + unrelated renderers.
   lowercase `explore · N steps · Ts` phrasing (design review v3 §R3).
 - Fold marker language: `… N more lines · ctrl+o expand` (and matching collapse).
 
+### Plan updates
+
+A structured `plan.update` renders as one `Updated Plan` ledger cell: optional
+explanation first, then ordered `├`/`└` checklist rows. Completed rows use a
+check marker and cross out only the step text (never the tree gutter);
+`in_progress` uses the activity marker and attention color; pending uses
+`[ ]`. Legacy summary-only events retain the compact `Updated Plan: …` row.
+
+When an extension model tool emits a causally descended, identically
+attributed plan update, its successful generic JSON result row is omitted only
+when the originating call and result carry the same nonempty provider call
+`id`, so the checklist is the one coherent UI action. The tool call, plan
+update, and tool result all remain in provenance. A failed, malformed, or
+mismatched result is never hidden.
+
 ### Diff rendering
 
 Diffs use a **sign + luminance** model with **no background fills**, so they
@@ -147,6 +162,9 @@ promotes, or reorders lines.
   The verb is a **closed set** (`CODEX_VERBS`) — capitalization alone does not
   earn bold, or titles like `File added …` and uppercase filenames would take
   it. Only the verb is bold; the target keeps the row’s own weight.
+- **Plan exception:** the active `in_progress` checklist step is bold so the
+  next action is scannable; completed/pending steps are dim, and completed
+  step text is crossed out.
 - **No bold inside code.**
 - Italic only where specified (e.g. reasoning, hunk headers, comments).
 
@@ -183,11 +201,41 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   #21; the deny-with-instruction ghost is separate and stays). While the
   agent works, the rail dims and shows
   working/interrupt copy; typing remains accepted. Mid-turn submits steer:
-  they queue as pending-input rows and the running turn absorbs them at its
-  next round boundary as canonical `user.message` events (the model sees
-  them in-turn; docs/contracts/events.md). Entries the turn never absorbed —
-  paused queue, arrival after the final round — flush into the next turn,
-  as before. Pending rows show one visual line: the message body is capped at
+  they queue as one ordered steering group and the running model turn absorbs
+  them exactly once at its next round boundary as canonical `user.message`
+  events (the model sees them in-turn; docs/contracts/events.md). A completed
+  no-tool response is a boundary too: if steering arrived while its final
+  text streamed, the worker stays active and dispatches the hydrated stack in
+  the next model request. Escape pauses absorption and preserves the whole
+  group. An explicit empty-submit continue dispatches its head and hydrates
+  the contiguous siblings FIFO before that replacement turn's first model
+  call. Dispatch reserves the head without removing it; only the durable
+  initial `user.message` acknowledges the reservation. An append failure or
+  an already-latched context stop leaves every queued row intact. After
+  provenance is repaired, retry reuses the retained event identity and accepts
+  the head exactly once on both the live bus and durable log, including when
+  the failed sync left a complete physical line behind. Row identity includes
+  the queue instance as well as the row sequence, so another queue's
+  same-shaped reservation cannot claim or acknowledge it. The pending owner is
+  installed before an older accepted backlog is flushed; a backlog failure
+  therefore protects the same row as a candidate failure. While that admission
+  remains unresolved, `/new`, `/resume`, and queue clear refuse to detach or
+  discard it. Mid-turn absorption uses the same admission transaction without
+  holding the queue lock during persistence. The queue
+  hydrates each accepted steering row at the next model-round boundary; it
+  never waits for a later tool round when a boundary is already available.
+  Completion auto-flush does not start another turn while the context latch is
+  active. Ordinary input queued while non-model work is active remains a
+  separate follow-up and is never inferred to be steering. Entries arriving
+  after the worker's terminal boundary flush into the next turn. The final
+  steering check and group close are one named transaction: same-turn idle
+  work runs before it, and only a final Stop closes the group. Pending rows
+  are absorbed there only if another model request is available. When an
+  explicit round ceiling has consumed its final request, the same atomic
+  transaction closes the group without persisting steering the turn cannot
+  observe: input linearized before the close stays deferred, and input after
+  the close is a follow-up. Cancellation has precedence over a coincident
+  round-limit completion. Queued rows show one visual line: the message body is capped at
   64 terminal display cells, truncates at a word boundary with an ASCII
   ` ...` suffix, and never alters the full queued input. Two fallbacks apply at
   tight widths: when the first word alone exceeds the budget there is no word
@@ -221,6 +269,56 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   ≥70% and failure at ≥85%. Canvas compaction data, including demotion counts
   and tier, remains canonical `canvas.snapshot` provenance (events contract),
   not footer state. No second status row; detail lives under `/status`.
+
+### Escape and interruption
+
+- Keyboard input is dispatched from the topmost interactive layer inward.
+  When a slash palette, picker, search surface, prompt, or modal owns input,
+  `Esc` dismisses exactly that layer and cannot publish turn cancellation.
+  One keypress performs one layer transition. Only `Esc` received with the
+  composer owning input may interrupt an active turn or an idle shadow
+  compaction.
+- Publishing root-turn cancellation atomically pauses the steering queue
+  before setting the shared signal. Neither operation waits for provenance
+  I/O: absorption reserves an id under a short queue lock, persists its owned
+  copy without the lock, then commits by id. A steer either reserved before
+  the pause and may finish as durable evidence, or remains queued after Esc.
+  The loop rechecks cancellation after that commit, so a late append cannot
+  start another provider round or consume later input.
+  Explicitly queued companion/extension activities are cleared with a visible
+  notice; queued user/steering text is preserved.
+- The provider request driver and tool supervisor observe that same signal.
+  The session/UI stops waiting even when a synchronous provider adapter is
+  blocked, and provider events observed after cancellation are rejected at the
+  request boundary. This detaches the cancelled session; it does not physically
+  abort an adapter's synchronous network/OS call. Its request thread may remain
+  alive until that underlying I/O returns, with no route back into the session.
+  A `model.call` that had no `model.result` receives exactly one parented,
+  cancellation-attributed session error. That error is canonical provenance,
+  while the TUI renders its ordinary interruption row instead of treating it
+  as a driver failure. If the root turn and a shadow compaction are both
+  running, root cancellation also terminalizes and fences the shadow before
+  the session returns; late output from either provider call cannot append
+  events or swap the canvas.
+- A permission ask observes the same signal. Cancellation closes the active
+  prompt without converting it into denial, installs no grant, and cannot let a
+  stale modal reply satisfy a later ask. Write tools recheck cancellation at
+  their final filesystem-mutation boundary.
+- Explicit companion runs and managed-process extension commands observe the
+  same signal. The host makes a best-effort protocol cancellation notification
+  to a managed peer before killing its process group; a cancelled companion
+  still records its terminal `agent.result`.
+- Agent subprocesses run in their own process group. Cancellation kills the
+  still-owned group before reaping its leader, covering the leader and ordinary
+  descendants that remain in that group, without waiting for the tool timeout.
+  A descendant that deliberately moves to another process group is outside
+  this ownership guarantee. Every already-recorded call without a terminal
+  result receives exactly one cancelled `tool.result`; partial subprocess
+  output and workspace changes completed before termination remain canonical
+  evidence and are never reported as successful completion. After process
+  termination, ordinary `run_shell` performs its existing bounded evidence
+  scan (4,096 files, 256 KiB per file, 64 MiB total) before closing the result;
+  that finite scan may make transcript closure follow the process stop.
 
 ### Streaming, scroll, motion
 

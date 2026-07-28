@@ -5,9 +5,14 @@ use crate::ui::markdown_stream::MarkdownStreamCollector;
 use chrono::{DateTime, Local};
 use euler_core::canvas::projected_tool_output;
 use euler_event::{EventEnvelope, EventKind};
+use euler_sdk::{
+    validate_plan_presentation, PlanItemStatus, PlanPresentation, PlanPresentationItem,
+    PlanPresentationStatus,
+};
 use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 10;
@@ -38,6 +43,20 @@ use render::{bottom_aligned, bottom_aligned_with_offset, render_projected_entrie
 use render::{render_projected_items, TranscriptRenderLimits, TranscriptRenderParams};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanUpdateView {
+    Legacy {
+        summary: String,
+    },
+    Structured {
+        summary: String,
+        revision: u64,
+        status: PlanPresentationStatus,
+        explanation: Option<String>,
+        items: Vec<PlanPresentationItem>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptItem {
     Banner {
         session_id: Option<String>,
@@ -46,7 +65,7 @@ pub enum TranscriptItem {
     UserMessage(String),
     AssistantMessage(String),
     AssistantActivity(String),
-    PlanUpdate(String),
+    PlanUpdate(PlanUpdateView),
     ModelCall {
         provider: String,
         model: String,
@@ -339,6 +358,100 @@ enum ToolCallProjection {
     Edit { path: String },
 }
 
+/// Causally coalesces an extension model tool's successful result into the
+/// canonical plan cell emitted during that invocation. Provenance retains the
+/// full tool.call → plan.update → tool.result braid; this fold is presentation
+/// only and keys on ancestry, extension attribution, and the provider call id,
+/// never tool names.
+#[derive(Clone, Debug)]
+struct ExtensionPlanCallMetadata {
+    provider_call_id: String,
+    attribution: (String, String),
+    plan_presented: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExtensionPlanCoalescer {
+    call_by_descendant: HashMap<String, String>,
+    calls: HashMap<String, ExtensionPlanCallMetadata>,
+}
+
+impl ExtensionPlanCoalescer {
+    fn ingest(&mut self, event: &EventEnvelope) -> bool {
+        let attribution = extension_attribution(event);
+        let call_id = if event.kind.as_str() == EventKind::TOOL_CALL {
+            match (nonempty_payload_string(event, "id"), attribution.clone()) {
+                (Some(provider_call_id), Some(attribution)) => {
+                    self.calls.insert(
+                        event.id.clone(),
+                        ExtensionPlanCallMetadata {
+                            provider_call_id,
+                            attribution,
+                            plan_presented: false,
+                        },
+                    );
+                    Some(event.id.clone())
+                }
+                _ => None,
+            }
+        } else {
+            event
+                .parent
+                .as_ref()
+                .and_then(|parent| self.call_by_descendant.get(parent))
+                .cloned()
+        };
+
+        if event.kind.as_str() == EventKind::PLAN_UPDATE
+            && event
+                .payload
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                == Some("extension")
+            && matches!(
+                project_plan_update(event),
+                Some(TranscriptItem::PlanUpdate(
+                    PlanUpdateView::Structured { .. }
+                ))
+            )
+        {
+            if let (Some(call_id), Some(attribution)) = (&call_id, attribution.as_ref()) {
+                if let Some(call) = self.calls.get_mut(call_id) {
+                    if &call.attribution == attribution {
+                        call.plan_presented = true;
+                    }
+                }
+            }
+        }
+
+        let result_provider_call_id = nonempty_payload_string(event, "id");
+        let hide_result = event.kind.as_str() == EventKind::TOOL_RESULT
+            && event.payload.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+            && call_id.as_ref().is_some_and(|call_id| {
+                self.calls.get(call_id).is_some_and(|call| {
+                    call.plan_presented
+                        && attribution.as_ref() == Some(&call.attribution)
+                        && result_provider_call_id.as_ref() == Some(&call.provider_call_id)
+                })
+            });
+        if let Some(call_id) = call_id {
+            self.call_by_descendant.insert(event.id.clone(), call_id);
+        }
+        hide_result
+    }
+}
+
+fn extension_attribution(event: &EventEnvelope) -> Option<(String, String)> {
+    Some((
+        payload_string(event, "extension_id")?,
+        payload_string(event, "command")?,
+    ))
+}
+
+fn nonempty_payload_string(event: &EventEnvelope, key: &str) -> Option<String> {
+    payload_string(event, key).filter(|value| !value.is_empty())
+}
+
 pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
     let checkpoint_ids = checkpoint_event_ids(events);
     let mut spawn_times: HashMap<String, String> = HashMap::new();
@@ -444,17 +557,19 @@ impl Default for TranscriptState {
 
 impl TranscriptState {
     pub fn push_event(&mut self, event: EventEnvelope) {
-        match event.kind.as_str() {
-            EventKind::MODEL_DELTA => self.push_delta(&event),
-            EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::ERROR => {
-                self.clear_transient_live_tail();
+        if !is_compaction_activity(&event) {
+            match event.kind.as_str() {
+                EventKind::MODEL_DELTA => self.push_delta(&event),
+                EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::ERROR => {
+                    self.clear_transient_live_tail();
+                }
+                // The finalized thought item replaces the live thinking line.
+                EventKind::MODEL_REASONING => {
+                    self.reasoning_live = None;
+                    self.reasoning_body.clear();
+                }
+                _ => {}
             }
-            // The finalized thought item replaces the live thinking line.
-            EventKind::MODEL_REASONING => {
-                self.reasoning_live = None;
-                self.reasoning_body.clear();
-            }
-            _ => {}
         }
         self.projection.ingest(&event);
         self.events.push(event);
@@ -682,6 +797,9 @@ fn project_event_with_checkpoints(
     event: &EventEnvelope,
     checkpoint_ids: &std::collections::HashSet<String>,
 ) -> Option<TranscriptItem> {
+    if is_compaction_activity(event) {
+        return None;
+    }
     match event.kind.as_str() {
         EventKind::USER_MESSAGE => {
             payload_string(event, "content").map(TranscriptItem::UserMessage)
@@ -689,9 +807,7 @@ fn project_event_with_checkpoints(
         EventKind::ASSISTANT_MESSAGE => {
             payload_string(event, "content").map(TranscriptItem::AssistantMessage)
         }
-        EventKind::PLAN_UPDATE => payload_string(event, "summary")
-            .or_else(|| payload_string(event, "content"))
-            .map(TranscriptItem::PlanUpdate),
+        EventKind::PLAN_UPDATE => project_plan_update(event),
         EventKind::MODEL_CALL => Some(TranscriptItem::ModelCall {
             provider: payload_string(event, "provider").unwrap_or_default(),
             model: payload_string(event, "model").unwrap_or_default(),
@@ -780,6 +896,15 @@ fn project_event_with_checkpoints(
             .map(TranscriptItem::SessionSummary),
         // SESSION_RESUMED is a durable provenance-only audit marker (issue #6);
         // it is not rendered into the conversation transcript.
+        EventKind::ERROR
+            if event
+                .payload
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            None
+        }
         EventKind::ERROR => Some(TranscriptItem::Error {
             source: payload_string(event, "source").unwrap_or_default(),
             message: payload_string(event, "message").unwrap_or_default(),
@@ -791,6 +916,80 @@ fn project_event_with_checkpoints(
         EventKind::SECRET_SCRUBBED => Some(TranscriptItem::Notice(scrub_notice_text(event))),
         _ => None,
     }
+}
+
+fn project_plan_update(event: &EventEnvelope) -> Option<TranscriptItem> {
+    let legacy = || {
+        payload_string(event, "summary")
+            .or_else(|| payload_string(event, "content"))
+            .map(|summary| TranscriptItem::PlanUpdate(PlanUpdateView::Legacy { summary }))
+    };
+    let Some(summary) = payload_string(event, "summary") else {
+        return legacy();
+    };
+    let Some(revision) = event
+        .payload
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return legacy();
+    };
+    let Some(status) = event
+        .payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .and_then(PlanPresentationStatus::parse)
+    else {
+        return legacy();
+    };
+    let explanation = match event.payload.get("explanation") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => return legacy(),
+    };
+    let Some(items) = event
+        .payload
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|values| {
+            values
+                .iter()
+                .map(project_plan_item)
+                .collect::<Option<Vec<_>>>()
+        })
+    else {
+        return legacy();
+    };
+    let presentation = PlanPresentation {
+        revision,
+        status,
+        explanation: explanation.clone(),
+        items: items.clone(),
+    };
+    if validate_plan_presentation(&presentation).is_err() {
+        return legacy();
+    }
+    Some(TranscriptItem::PlanUpdate(PlanUpdateView::Structured {
+        summary,
+        revision,
+        status,
+        explanation,
+        items,
+    }))
+}
+
+fn project_plan_item(value: &serde_json::Value) -> Option<PlanPresentationItem> {
+    let object = value.as_object()?;
+    if object.len() != 2 {
+        return None;
+    }
+    Some(PlanPresentationItem {
+        step: object.get("step")?.as_str()?.to_owned(),
+        status: object
+            .get("status")?
+            .as_str()
+            .and_then(PlanItemStatus::parse)?,
+    })
 }
 
 /// Non-blocking heads-up for a credential detected in a faithful tool-call
@@ -888,6 +1087,8 @@ struct StreamProjection {
     /// earlier event (not just agent.spawn), so parity needs all ids; the
     /// map stays small next to the event vec the state already retains.
     event_ts_by_id: HashMap<String, String>,
+    /// Causal fold for extension plan-tool presentation coalescing.
+    plan_tools: ExtensionPlanCoalescer,
     /// Projection of the most recently ingested event, computed exactly once
     /// at ingest — repeated reads can never re-project (or re-count) it.
     latest_item: Option<TranscriptItem>,
@@ -898,7 +1099,8 @@ impl StreamProjection {
     /// everything ingested before it, then folds the event into that context
     /// for the events after it. Call exactly once per appended event.
     fn ingest(&mut self, event: &EventEnvelope) {
-        self.latest_item = self.project(event);
+        let hide_tool_result = self.plan_tools.ingest(event);
+        self.latest_item = self.project(event, hide_tool_result);
         if event.kind.as_str() == EventKind::AGENT_SPAWN {
             if let Some(child) = payload_string(event, "child_agent_id") {
                 self.child_agents.insert(child);
@@ -907,7 +1109,8 @@ impl StreamProjection {
         if matches!(
             event.kind.as_str(),
             EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
-        ) {
+        ) && !is_compaction_activity(event)
+        {
             self.last_owner_fallback = match model_result_fallback_item(event) {
                 Some(TranscriptItem::AssistantMessage(content)) => Some(content),
                 _ => None,
@@ -917,14 +1120,14 @@ impl StreamProjection {
             .insert(event.id.clone(), event.ts.clone());
     }
 
-    fn project(&mut self, event: &EventEnvelope) -> Option<TranscriptItem> {
+    fn project(&mut self, event: &EventEnvelope, hide_tool_result: bool) -> Option<TranscriptItem> {
         if self.is_child_agent_event(event) {
             // Child-agent tool/model events are not a joinable live nested
             // ledger in v0 presentation; companion block owns
             // spawn/message/result only. The full replay still folded child
             // tool.calls into the call context — preserve that so a later
             // result can resolve them.
-            let _ = project_tui_event_with_context(event, &mut self.calls);
+            let _ = project_tui_event_with_context(event, &mut self.calls, hide_tool_result);
             return None;
         }
         if self.assistant_duplicates_last_fallback(event) {
@@ -941,7 +1144,7 @@ impl StreamProjection {
             ..
         } = self;
         let spawn_ts = companion_spawn_ts_lookup(event, event_ts_by_id);
-        project_tui_event_with_context_and_spawn_ts(event, calls, spawn_ts)
+        project_tui_event_with_context_and_spawn_ts(event, calls, spawn_ts, hide_tool_result)
     }
 
     fn is_child_agent_event(&self, event: &EventEnvelope) -> bool {
@@ -980,11 +1183,14 @@ pub(crate) fn replay_latest_event_for_ui(events: &[EventEnvelope]) -> Option<Tra
         return Some(item);
     }
     let mut calls = HashMap::new();
+    let mut plan_tools = ExtensionPlanCoalescer::default();
     for event in earlier {
-        let _ = project_tui_event_with_context(event, &mut calls);
+        let hide_tool_result = plan_tools.ingest(event);
+        let _ = project_tui_event_with_context(event, &mut calls, hide_tool_result);
     }
     let spawn_ts = companion_spawn_ts_for_event(latest, earlier);
-    project_tui_event_with_context_and_spawn_ts(latest, &mut calls, spawn_ts)
+    let hide_tool_result = plan_tools.ingest(latest);
+    project_tui_event_with_context_and_spawn_ts(latest, &mut calls, spawn_ts, hide_tool_result)
 }
 
 pub(crate) fn render_items_for_history(
@@ -1143,12 +1349,14 @@ pub(crate) fn project_tui_entries(events: &[EventEnvelope]) -> Vec<ProjectedEntr
 /// as of the last stamped entry (see `TranscriptState::timed_items`).
 fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEntry>, TimingClock) {
     let mut calls = HashMap::new();
+    let mut plan_tools = ExtensionPlanCoalescer::default();
     let mut entries = Vec::new();
     let mut user_turns = 0usize;
     let mut child_agents: HashMap<String, String> = HashMap::new();
     let mut spawn_times: HashMap<String, String> = HashMap::new();
     let mut clock = TimingClock::default();
     for (index, event) in events.iter().enumerate() {
+        let hide_tool_result = plan_tools.ingest(event);
         if event.kind.as_str() == EventKind::AGENT_SPAWN {
             if let Some(child) = payload_string(event, "child_agent_id") {
                 child_agents.insert(child, event.id.clone());
@@ -1171,8 +1379,12 @@ fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEnt
             continue;
         }
         let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
-        if let Some(item) = project_tui_event_with_context_and_spawn_ts(event, &mut calls, spawn_ts)
-        {
+        if let Some(item) = project_tui_event_with_context_and_spawn_ts(
+            event,
+            &mut calls,
+            spawn_ts,
+            hide_tool_result,
+        ) {
             let timing = clock.stamp_at(&event.ts);
             if matches!(item, TranscriptItem::UserMessage(_)) {
                 if user_turns > 0 {
@@ -1192,14 +1404,16 @@ fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEnt
 fn project_tui_event_with_context(
     event: &EventEnvelope,
     calls: &mut HashMap<String, ToolCallProjection>,
+    hide_tool_result: bool,
 ) -> Option<TranscriptItem> {
-    project_tui_event_with_context_and_spawn_ts(event, calls, None)
+    project_tui_event_with_context_and_spawn_ts(event, calls, None, hide_tool_result)
 }
 
 fn project_tui_event_with_context_and_spawn_ts(
     event: &EventEnvelope,
     calls: &mut HashMap<String, ToolCallProjection>,
     spawn_ts: Option<&str>,
+    hide_tool_result: bool,
 ) -> Option<TranscriptItem> {
     #[cfg(test)]
     note_projection_event_visit();
@@ -1213,6 +1427,7 @@ fn project_tui_event_with_context_and_spawn_ts(
             }
             None
         }
+        EventKind::TOOL_RESULT if hide_tool_result => None,
         EventKind::TOOL_RESULT => project_tui_tool_result(event, calls),
         EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
         EventKind::AGENT_MESSAGE => project_agent_message(event, spawn_ts),
@@ -1348,12 +1563,23 @@ fn push_tui_entry(
 }
 
 fn model_result_fallback_item(event: &EventEnvelope) -> Option<TranscriptItem> {
-    if event.kind.as_str() != EventKind::MODEL_RESULT {
+    if event.kind.as_str() != EventKind::MODEL_RESULT || is_compaction_activity(event) {
         return None;
     }
     payload_string(event, "content")
         .filter(|content| !content.is_empty())
         .map(TranscriptItem::AssistantMessage)
+}
+
+fn is_compaction_activity(event: &EventEnvelope) -> bool {
+    event.payload.get("purpose").and_then(Value::as_str) == Some("compaction")
+        && matches!(
+            event.kind.as_str(),
+            EventKind::MODEL_CALL
+                | EventKind::MODEL_RESULT
+                | EventKind::MODEL_REASONING
+                | EventKind::ERROR
+        )
 }
 
 fn model_result_has_matching_assistant_message(
@@ -1368,10 +1594,13 @@ fn model_result_has_matching_assistant_message(
         .iter()
         .skip(model_result_index + 1)
         .find(|event| {
-            matches!(
-                event.kind.as_str(),
-                EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
-            )
+            !is_compaction_activity(event)
+                && matches!(
+                    event.kind.as_str(),
+                    EventKind::MODEL_RESULT
+                        | EventKind::ASSISTANT_MESSAGE
+                        | EventKind::USER_MESSAGE
+                )
         })
         .is_some_and(|event| {
             event.kind.as_str() == EventKind::ASSISTANT_MESSAGE
@@ -1393,10 +1622,11 @@ fn assistant_duplicates_model_result_fallback(
         return false;
     };
     let Some(previous_owner) = earlier.iter().rev().find(|event| {
-        matches!(
-            event.kind.as_str(),
-            EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
-        )
+        !is_compaction_activity(event)
+            && matches!(
+                event.kind.as_str(),
+                EventKind::MODEL_RESULT | EventKind::ASSISTANT_MESSAGE | EventKind::USER_MESSAGE
+            )
     }) else {
         return false;
     };

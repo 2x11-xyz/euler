@@ -17,7 +17,8 @@ use ratatui::{
 };
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Condvar, Mutex};
 
 mod chrome_tests;
 mod live_memoization_tests;
@@ -282,6 +283,188 @@ fn core_gated() -> (AppCore, Gate) {
     (TestCore::builder().provider(provider).build(), gate)
 }
 
+#[derive(Default)]
+struct CompactionRaceFlags {
+    shadow_started: bool,
+    shadow_released: bool,
+    shadow_completed: bool,
+    driver_started: bool,
+    driver_released: bool,
+}
+
+#[derive(Default)]
+struct CompactionRaceState {
+    flags: Mutex<CompactionRaceFlags>,
+    changed: Condvar,
+}
+
+impl CompactionRaceState {
+    fn park_shadow(&self) {
+        let mut flags = self.flags.lock().expect("compaction race lock");
+        flags.shadow_started = true;
+        self.changed.notify_all();
+        while !flags.shadow_released {
+            flags = self.changed.wait(flags).expect("compaction race wait");
+        }
+    }
+
+    fn park_driver(&self) {
+        let mut flags = self.flags.lock().expect("compaction race lock");
+        flags.driver_started = true;
+        self.changed.notify_all();
+        while !flags.driver_released {
+            flags = self.changed.wait(flags).expect("compaction race wait");
+        }
+    }
+
+    fn wait_for_shadow(&self) -> bool {
+        let flags = self.flags.lock().expect("compaction race lock");
+        let (flags, _) = self
+            .changed
+            .wait_timeout_while(flags, Duration::from_secs(2), |flags| !flags.shadow_started)
+            .expect("compaction race wait");
+        flags.shadow_started
+    }
+
+    fn wait_for_driver(&self) -> bool {
+        let flags = self.flags.lock().expect("compaction race lock");
+        let (flags, _) = self
+            .changed
+            .wait_timeout_while(flags, Duration::from_secs(2), |flags| !flags.driver_started)
+            .expect("compaction race wait");
+        flags.driver_started
+    }
+
+    fn wait_for_shadow_completion(&self) -> bool {
+        let flags = self.flags.lock().expect("compaction race lock");
+        let (flags, _) = self
+            .changed
+            .wait_timeout_while(flags, Duration::from_secs(2), |flags| {
+                !flags.shadow_completed
+            })
+            .expect("compaction race wait");
+        flags.shadow_completed
+    }
+
+    fn mark_shadow_completed(&self) {
+        self.flags
+            .lock()
+            .expect("compaction race lock")
+            .shadow_completed = true;
+        self.changed.notify_all();
+    }
+
+    fn release_shadow(&self) {
+        self.flags
+            .lock()
+            .expect("compaction race lock")
+            .shadow_released = true;
+        self.changed.notify_all();
+    }
+
+    fn release_driver(&self) {
+        self.flags
+            .lock()
+            .expect("compaction race lock")
+            .driver_released = true;
+        self.changed.notify_all();
+    }
+}
+
+struct CompactionRaceProvider {
+    state: Arc<CompactionRaceState>,
+    root_calls: AtomicUsize,
+    shadow_fails: bool,
+}
+
+impl ModelProvider for CompactionRaceProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if request.tools.is_empty() {
+            self.state.park_shadow();
+            let events = if self.shadow_fails {
+                vec![Err(ProviderError::rejected(
+                    "fixture shadow projection failed",
+                ))]
+            } else {
+                vec![
+                    Ok(ModelStreamEvent::TextDelta(
+                        json!({
+                            "goal": "keep working",
+                            "plan": "",
+                            "compiler_state": "",
+                            "modified_files": [],
+                            "decisions": [],
+                            "working_set": [],
+                        })
+                        .to_string(),
+                    )),
+                    Ok(ModelStreamEvent::Finished {
+                        stop_reason: StopReason::Completed,
+                        usage: Some(Usage {
+                            input_tokens: 8,
+                            output_tokens: 2,
+                            uncached_input_tokens: None,
+                            cached_tokens: None,
+                            cache_write_5m_tokens: None,
+                            cache_write_1h_tokens: None,
+                            reasoning_tokens: None,
+                        }),
+                    }),
+                ]
+            };
+            return Ok(Box::new(CompactionRaceStream {
+                events: events.into_iter(),
+                state: Arc::clone(&self.state),
+            }));
+        }
+        if self.root_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+            self.state.park_driver();
+        }
+        EchoProvider.invoke(request)
+    }
+}
+
+struct CompactionRaceStream {
+    events: std::vec::IntoIter<Result<ModelStreamEvent, ProviderError>>,
+    state: Arc<CompactionRaceState>,
+}
+
+impl Iterator for CompactionRaceStream {
+    type Item = Result<ModelStreamEvent, ProviderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let event = self.events.next()?;
+        if event.is_err() || matches!(&event, Ok(ModelStreamEvent::Finished { .. })) {
+            self.state.mark_shadow_completed();
+        }
+        Some(event)
+    }
+}
+
+fn core_with_compaction_race_provider() -> (AppCore, Arc<CompactionRaceState>) {
+    let state = Arc::new(CompactionRaceState::default());
+    let provider = CompactionRaceProvider {
+        state: Arc::clone(&state),
+        root_calls: AtomicUsize::new(0),
+        shadow_fails: false,
+    };
+    (TestCore::builder().provider(provider).build(), state)
+}
+
+fn core_with_compaction_failure_provider() -> (AppCore, Arc<CompactionRaceState>) {
+    let state = Arc::new(CompactionRaceState::default());
+    let provider = CompactionRaceProvider {
+        state: Arc::clone(&state),
+        root_calls: AtomicUsize::new(0),
+        shadow_fails: true,
+    };
+    (TestCore::builder().provider(provider).build(), state)
+}
+
 struct ChatGptEchoProvider;
 
 impl ModelProvider for ChatGptEchoProvider {
@@ -377,6 +560,22 @@ fn user_messages(core: &AppCore) -> Vec<String> {
         .collect()
 }
 
+fn assert_cancelled_model_call(events: &[EventEnvelope], call_id: &str) {
+    let terminals = events
+        .iter()
+        .filter(|event| {
+            event.parent.as_deref() == Some(call_id)
+                && matches!(
+                    event.kind.as_str(),
+                    EventKind::MODEL_RESULT | EventKind::ERROR
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1, "one terminal per cancelled call");
+    assert_eq!(terminals[0].kind.as_str(), EventKind::ERROR);
+    assert_eq!(terminals[0].payload["cancelled"], json!(true));
+}
+
 fn shell_artifact_with_lines(total: usize) -> TranscriptItem {
     TranscriptItem::ToolRun {
         command: "printf lines".to_owned(),
@@ -444,6 +643,398 @@ fn submit_starts_in_flight_and_second_submit_queues() {
 }
 
 #[test]
+fn idle_compaction_keeps_composer_live_and_allows_a_new_driver_turn() {
+    let mut core = core();
+    submit_text_and_wait(&mut core, "seed");
+
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(!core.turn_in_flight());
+    assert!(matches!(
+        &core.state,
+        AppState::Idle { session } if session.compaction_in_progress()
+    ));
+    assert!(drain_finalized_visual_text(&mut core, 100)
+        .contains("compaction in progress · you can keep typing"));
+
+    for character in "started during compaction".chars() {
+        core.handle_input(key(KeyCode::Char(character)));
+    }
+    core.handle_input(key(KeyCode::Enter));
+    assert!(core.turn_in_flight());
+    assert!(core.queued_inputs.is_empty());
+
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["seed", "started during compaction"]);
+    assert!(core.queued_inputs.is_empty());
+}
+
+#[test]
+fn base_escape_cancels_idle_shadow_and_fences_late_output() {
+    let (mut core, state) = core_with_compaction_race_provider();
+    submit_text_and_wait(&mut core, "seed");
+
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(
+        state.wait_for_shadow(),
+        "compactor never reached its provider"
+    );
+    type_text(&mut core, "draft survives");
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert_eq!(core.bottom.composer().submit_text(), "draft survives");
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert!(!session.compaction_in_progress());
+    let compactor_call = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL
+                && event
+                    .payload
+                    .get("purpose")
+                    .is_some_and(|purpose| purpose == "compaction")
+        })
+        .expect("compactor call");
+    assert_cancelled_model_call(session.events(), &compactor_call.id);
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+    let event_count = session.events().len();
+
+    assert!(drain_finalized_visual_text(&mut core, 100)
+        .contains("compaction interrupted · active canvas unchanged"));
+    state.release_shadow();
+    std::thread::sleep(Duration::from_millis(30));
+    core.drain_background();
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert_eq!(session.events().len(), event_count);
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+}
+
+#[test]
+fn base_escape_records_ready_shadow_usage_but_discards_its_candidate() {
+    let (mut core, state) = core_with_compaction_race_provider();
+    submit_text_and_wait(&mut core, &"history ".repeat(400));
+
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(
+        state.wait_for_shadow(),
+        "compactor never reached its provider"
+    );
+    state.release_shadow();
+    assert!(
+        state.wait_for_shadow_completion(),
+        "compactor never produced its terminal result"
+    );
+    type_text(&mut core, "draft survives");
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert_eq!(core.bottom.composer().submit_text(), "draft survives");
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert!(!session.compaction_in_progress());
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+    let result = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_RESULT
+                && event
+                    .payload
+                    .get("purpose")
+                    .is_some_and(|purpose| purpose == "compaction")
+        })
+        .expect("ready compactor usage must remain canonical");
+    assert_eq!(result.payload["usage"]["input_tokens"], json!(8));
+    assert_eq!(result.payload["usage"]["output_tokens"], json!(2));
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED
+            && event
+                .payload
+                .get("reason")
+                .is_some_and(|reason| reason == "shadow compaction interrupted before apply")
+    }));
+    let text = drain_finalized_visual_text(&mut core, 100);
+    assert!(
+        text.contains("compaction interrupted · active canvas unchanged"),
+        "{text}"
+    );
+    assert!(!text.contains("compaction complete"), "{text}");
+}
+
+#[test]
+fn base_escape_reports_a_ready_provider_failure_as_failure_not_cancellation() {
+    let (mut core, state) = core_with_compaction_failure_provider();
+    submit_text_and_wait(&mut core, &"history ".repeat(400));
+
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(
+        state.wait_for_shadow(),
+        "compactor never reached its provider"
+    );
+    state.release_shadow();
+    assert!(
+        state.wait_for_shadow_completion(),
+        "compactor never produced its terminal failure"
+    );
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert!(!session.compaction_in_progress());
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ERROR
+            && event
+                .payload
+                .get("purpose")
+                .is_some_and(|purpose| purpose == "compaction")
+            && event
+                .payload
+                .get("category")
+                .is_some_and(|category| category == "rejected")
+    }));
+    let text = drain_finalized_visual_text(&mut core, 100);
+    assert!(
+        text.contains("compaction failed · active canvas unchanged"),
+        "{text}"
+    );
+    assert!(!text.contains("compaction interrupted"), "{text}");
+}
+
+#[test]
+fn escape_cancels_driver_and_shadow_without_late_canvas_swap() {
+    let (mut core, state) = core_with_compaction_race_provider();
+    submit_text_and_wait(&mut core, "seed");
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(
+        state.wait_for_shadow(),
+        "compactor never reached its provider"
+    );
+
+    submit_without_wait(&mut core, "continue concurrently");
+    assert!(state.wait_for_driver(), "driver never reached its provider");
+    assert!(core.turn_in_flight());
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    wait_for_idle(&mut core);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("cancelled worker should return its session");
+    };
+    assert!(!session.compaction_in_progress());
+    let compactor_call = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL
+                && event
+                    .payload
+                    .get("purpose")
+                    .is_some_and(|purpose| purpose == "compaction")
+        })
+        .expect("compactor call");
+    let driver_call = session
+        .events()
+        .iter()
+        .rev()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL && event.payload.get("purpose").is_none()
+        })
+        .expect("concurrent driver call");
+    assert_cancelled_model_call(session.events(), &compactor_call.id);
+    assert_cancelled_model_call(session.events(), &driver_call.id);
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+    let event_count = session.events().len();
+
+    state.release_shadow();
+    state.release_driver();
+    std::thread::sleep(Duration::from_millis(30));
+    core.drain_background();
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert_eq!(session.events().len(), event_count);
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+}
+
+#[test]
+fn escape_discards_a_ready_shadow_while_cancelling_the_concurrent_driver() {
+    let (mut core, state) = core_with_compaction_race_provider();
+    submit_text_and_wait(&mut core, &"history ".repeat(400));
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(
+        state.wait_for_shadow(),
+        "compactor never reached its provider"
+    );
+
+    submit_without_wait(&mut core, "continue concurrently");
+    assert!(state.wait_for_driver(), "driver never reached its provider");
+    state.release_shadow();
+    assert!(
+        state.wait_for_shadow_completion(),
+        "compactor never produced its terminal result"
+    );
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    wait_for_idle(&mut core);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("cancelled worker should return its session");
+    };
+    assert!(!session.compaction_in_progress());
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::MODEL_RESULT
+            && event
+                .payload
+                .get("purpose")
+                .is_some_and(|purpose| purpose == "compaction")
+    }));
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::CANVAS_CANDIDATE_DISCARDED
+            && event
+                .payload
+                .get("reason")
+                .is_some_and(|reason| reason == "shadow compaction interrupted before apply")
+    }));
+
+    let event_count = session.events().len();
+    state.release_driver();
+    std::thread::sleep(Duration::from_millis(30));
+    core.drain_background();
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert_eq!(session.events().len(), event_count);
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::CANVAS_SWAP));
+}
+
+#[test]
+fn active_turn_compaction_is_edge_triggered_without_interrupting_the_turn() {
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "first");
+    for _ in 0..100 {
+        core.drain_background();
+        if core
+            .transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        core.transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL),
+        "driver never reached the provider gate"
+    );
+    let interrupt_flag = match &core.state {
+        AppState::TurnInFlight { interrupt_flag, .. } => Arc::clone(interrupt_flag),
+        _ => panic!("turn must be in flight"),
+    };
+
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(core.compaction_request.load(Ordering::SeqCst));
+    assert!(!interrupt_flag.load(Ordering::SeqCst));
+    assert!(drain_finalized_visual_text(&mut core, 100)
+        .contains("compaction in progress · active turn continues"));
+
+    submit_without_wait(&mut core, "queued");
+    gate.open();
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["first", "queued"]);
+    assert!(core.queued_inputs.is_empty());
+    let rendered = drain_finalized_visual_text(&mut core, 120);
+    assert!(
+        !rendered.contains("WorkingStateProjection"),
+        "shadow model traffic is provenance, not visible transcript text:\n{rendered}"
+    );
+}
+
+#[test]
+fn escape_clears_an_active_turn_compaction_request_without_starting_a_shadow() {
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "cancel this turn");
+    for _ in 0..100 {
+        core.drain_background();
+        if core
+            .transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        core.transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL),
+        "driver never reached the provider gate"
+    );
+
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(core.compaction_request.load(Ordering::SeqCst));
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert!(!core.compaction_request.load(Ordering::SeqCst));
+    wait_for_idle(&mut core);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("cancelled worker should return its session");
+    };
+    assert!(!session.compaction_in_progress());
+    assert!(!session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::MODEL_CALL
+            && event
+                .payload
+                .get("purpose")
+                .is_some_and(|purpose| purpose == "compaction")
+    }));
+    gate.open();
+}
+
+#[test]
 fn queued_steer_preview_is_visual_only() {
     let full = "Right but don't mention anywhere in any doc that we're not mentioning other services or other products.";
     let mut core = core();
@@ -453,7 +1044,7 @@ fn queued_steer_preview_is_visual_only() {
         interrupt_flag: Arc::new(AtomicBool::new(false)),
         started_at: Instant::now(),
     };
-    core.queued_inputs.push_back(full.to_owned());
+    core.queued_inputs.push_steering_back(full.to_owned());
 
     let queued_line = core
         .visual_canvas_frame(120)
@@ -493,13 +1084,12 @@ fn queued_inputs_auto_flush_fifo_after_normal_completion() {
 
 #[test]
 fn queued_leftovers_run_as_their_own_turns() {
-    // Review blocker (PR #147): leftovers queued BEFORE a turn spawns must
-    // never fold into that turn's request. Queued directly while idle, the
-    // entries predate the first spawn's steering generation, so each must
-    // flush as its own turn: user → its model.call, three times.
+    // Review blocker (PR #147): ordinary follow-ups queued BEFORE a turn
+    // spawns must never fold into that turn's request. Each must flush as its
+    // own turn: user → its model.call, three times.
     let (mut core, gate) = core_gated();
-    core.queued_inputs.push_back("second".to_owned());
-    core.queued_inputs.push_back("third".to_owned());
+    core.queued_inputs.push_follow_up_back("second".to_owned());
+    core.queued_inputs.push_follow_up_back("third".to_owned());
     submit_without_wait(&mut core, "first");
 
     gate.open();
@@ -533,6 +1123,89 @@ fn queued_leftovers_run_as_their_own_turns() {
 }
 
 #[test]
+fn context_stopped_turn_preserves_three_queued_inputs_without_auto_flush() {
+    let response = FixtureResponse::Stream(vec![
+        ScriptedStreamStep::SleepMs(500),
+        ScriptedStreamStep::Event(ModelStreamEvent::TextDelta("at limit".to_owned())),
+        ScriptedStreamStep::Event(ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 1,
+                uncached_input_tokens: None,
+                cached_tokens: None,
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
+            }),
+        }),
+    ]);
+    let mut core = TestCore::builder()
+        .provider(ScriptedProvider::new(vec![response]))
+        .build();
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("test session must start idle");
+    };
+    session.set_context_limit(euler_core::ContextLimitConfig::new(10, 0.5));
+    session
+        .set_auto_compaction_policy(false, true)
+        .expect("disable automatic compaction");
+
+    submit_without_wait(&mut core, "active");
+    for _ in 0..100 {
+        core.drain_background();
+        if core
+            .transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        core.transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL),
+        "first request must be in flight before queuing context-stopped work"
+    );
+    submit_without_wait(&mut core, "queued one");
+    submit_without_wait(&mut core, "queued two");
+    submit_without_wait(&mut core, "queued three");
+    wait_for_idle(&mut core);
+
+    assert_eq!(user_messages(&core), ["active"]);
+    assert_eq!(
+        core.queued_inputs.snapshot(),
+        ["queued one", "queued two", "queued three"],
+        "a context latch must not reserve or drain auto-flush work"
+    );
+    let AppState::Idle { session } = &core.state else {
+        panic!("context-stopped worker must return its session");
+    };
+    assert!(!session.can_accept_turn());
+}
+
+#[test]
+fn composer_input_during_non_model_work_is_an_ordinary_follow_up() {
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "active");
+    // A companion/extension worker shares the TurnInFlight shell but is not
+    // a steerable model turn. Its composer input must not inherit the active
+    // model-turn group merely because the queue still remembers that group.
+    core.in_flight_label = Some("companion run".to_owned());
+    submit_without_wait(&mut core, "ordinary follow-up");
+
+    assert_eq!(core.queued_inputs.snapshot(), ["ordinary follow-up"]);
+
+    gate.open();
+    wait_for_idle(&mut core);
+    assert_eq!(user_messages(&core), ["active", "ordinary follow-up"]);
+}
+
+#[test]
 fn interrupt_keeps_queue_until_user_continues() {
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "first");
@@ -551,6 +1224,75 @@ fn interrupt_keeps_queue_until_user_continues() {
     wait_for_idle(&mut core);
 
     assert_eq!(user_messages(&core), ["first", "queued"]);
+}
+
+#[test]
+fn interrupt_then_continue_hydrates_the_whole_pending_steer_stack() {
+    // The reported TUI session showed three numbered pending steers after an
+    // interrupt. Continuing popped only the first; the old steering
+    // generation then made the two siblings stale, so each waited for a later
+    // turn.
+    // An interrupt must preserve the stack, and the explicit continue must
+    // rebind that one stack to the replacement turn without touching ordinary
+    // follow-up entries.
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "active");
+    submit_without_wait(&mut core, "steer one");
+    submit_without_wait(&mut core, "steer two");
+    submit_without_wait(&mut core, "steer three");
+
+    core.handle_input(key(KeyCode::Esc));
+    gate.open();
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        core.queued_inputs.snapshot(),
+        ["steer one", "steer two", "steer three"]
+    );
+    assert_eq!(user_messages(&core), ["active"]);
+
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_idle(&mut core);
+
+    assert_eq!(
+        user_messages(&core),
+        ["active", "steer one", "steer two", "steer three"]
+    );
+    assert!(core.queued_inputs.is_empty());
+    let user_and_calls: Vec<(&str, Option<&str>)> = core
+        .transcript
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind.as_str() {
+            EventKind::MODEL_CALL => Some((EventKind::MODEL_CALL, None)),
+            EventKind::USER_MESSAGE => Some((
+                EventKind::USER_MESSAGE,
+                event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str),
+            )),
+            _ => None,
+        })
+        .collect();
+    // Depending on whether the worker crossed the durable request boundary
+    // before Escape, the cancelled turn may already have a model.call. The
+    // replacement invariant begins with the first preserved steer.
+    let replacement_turn = user_and_calls
+        .iter()
+        .position(|entry| *entry == (EventKind::USER_MESSAGE, Some("steer one")))
+        .map(|index| &user_and_calls[index..])
+        .expect("replacement turn contains the first preserved steer");
+    assert_eq!(
+        replacement_turn,
+        [
+            (EventKind::USER_MESSAGE, Some("steer one")),
+            (EventKind::USER_MESSAGE, Some("steer two")),
+            (EventKind::USER_MESSAGE, Some("steer three")),
+            (EventKind::MODEL_CALL, None),
+        ],
+        "the replacement turn must receive the preserved stack before its first model call"
+    );
 }
 
 #[test]
@@ -980,11 +1722,16 @@ fn shutdown_cancellation_sets_in_flight_turn_interrupt_flag() {
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
     assert!(core.turn_in_flight());
+    core.compaction_request.store(true, Ordering::SeqCst);
 
     core.cancel_in_flight_for_shutdown();
 
     // Pause-before-flag, same ordering contract as `handle_interrupt`.
     assert!(core.queued_inputs.paused());
+    assert!(
+        !core.compaction_request.load(Ordering::SeqCst),
+        "shutdown must not leave a manual compaction queued behind the cancelled turn"
+    );
     let AppState::TurnInFlight { interrupt_flag, .. } = &core.state else {
         panic!("turn should still be in flight");
     };
@@ -1058,6 +1805,43 @@ fn shutdown_cancellation_is_a_no_op_when_idle() {
     core.cancel_in_flight_for_shutdown();
     assert!(matches!(core.state, AppState::Idle { .. }));
     assert!(!core.queued_inputs.paused());
+}
+
+#[test]
+fn shutdown_settles_or_cancels_idle_shadow_compaction() {
+    let mut core = core();
+    submit_text_and_wait(&mut core, "seed");
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(matches!(
+        &core.state,
+        AppState::Idle { session } if session.compaction_in_progress()
+    ));
+
+    core.cancel_in_flight_for_shutdown();
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("session should remain idle");
+    };
+    assert!(!session.compaction_in_progress());
+    let compactor_call = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL
+                && event
+                    .payload
+                    .get("purpose")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("compaction")
+        })
+        .expect("compactor call");
+    assert!(session.events().iter().any(|event| {
+        event.parent.as_deref() == Some(compactor_call.id.as_str())
+            && matches!(
+                event.kind.as_str(),
+                EventKind::MODEL_RESULT | EventKind::ERROR
+            )
+    }));
 }
 
 #[test]
@@ -1548,7 +2332,7 @@ fn active_turn_interrupt_still_wins_when_bottom_surface_owns_input() {
 }
 
 #[test]
-fn active_turn_escape_interrupts_when_bottom_surface_owns_input() {
+fn active_turn_escape_closes_bottom_surface_before_interrupting() {
     let mut core = core();
     core.handle_input(key(KeyCode::Char('/')));
     let interrupt_flag = Arc::new(AtomicBool::new(false));
@@ -1558,6 +2342,12 @@ fn active_turn_escape_interrupts_when_bottom_surface_owns_input() {
         interrupt_flag: Arc::clone(&interrupt_flag),
         started_at: Instant::now(),
     };
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert!(!interrupt_flag.load(Ordering::SeqCst));
+    assert!(!core.interrupted_guidance);
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
 
@@ -1648,6 +2438,28 @@ fn active_turn_live_transcript_prefix_stays_after_commit_boundary() {
         .expect("live line");
     assert!(first_live >= frame.committable_rows);
     assert!(frame.committable_rows < frame.active_frame_lines().len());
+}
+
+#[test]
+fn shadow_compaction_error_does_not_poison_driver_hud() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("purpose", "compaction".into()),
+            ("message", "shadow failed".into()),
+        ]),
+    )));
+
+    assert_eq!(core.in_flight_error, None);
 }
 
 #[test]
@@ -2613,6 +3425,81 @@ fn new_session_reuses_target_and_purges_visual_history() {
 }
 
 #[test]
+fn new_and_resume_refuse_to_orphan_an_unresolved_queued_admission() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let record = store.create_session().expect("session record");
+    let events_path = record.events_path().to_path_buf();
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = record.id().to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(&events_path).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    core.session_store = Some(store);
+    let original_session_id = record.id().to_owned();
+
+    core.queued_inputs
+        .push_follow_up_back("must survive".to_owned());
+    let input = core
+        .queued_inputs
+        .reserve_front_for_dispatch()
+        .expect("queued row");
+    std::fs::remove_file(&events_path).expect("remove provenance file");
+    std::fs::create_dir(&events_path).expect("block provenance path");
+    let queue = Arc::clone(&core.queued_inputs);
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("test session must be idle");
+    };
+    session
+        .set_steering_queue_for_queued_input(queue, &input)
+        .expect("wire queued row");
+    session
+        .run_turn(input.content())
+        .expect_err("broken provenance must leave admission unresolved");
+    assert!(core.queued_inputs.has_unresolved_admission());
+
+    assert_eq!(core.start_new_session(), CoreEffect::Render);
+    assert_eq!(core.open_resume_picker(), CoreEffect::Render);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("lifecycle refusal must keep current session");
+    };
+    assert_eq!(session.session_id(), original_session_id);
+    assert!(session.has_unresolved_admission());
+    assert_eq!(core.queued_inputs.snapshot(), ["must survive"]);
+    let text = drain_finalized_visual_text(&mut core, 100);
+    assert!(text.contains("new session waits for the unresolved queued input admission"));
+    assert!(text.contains("resume waits for the unresolved queued input admission"));
+}
+
+#[test]
+fn new_session_settles_or_cancels_idle_shadow_before_replacement() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    let store = SessionStore::new(home).expect("store");
+    let mut core = core();
+    core.session_store = Some(store);
+    submit_text_and_wait(&mut core, "seed");
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(matches!(
+        &core.state,
+        AppState::Idle { session } if session.compaction_in_progress()
+    ));
+
+    assert_eq!(
+        core.start_new_session(),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+
+    assert!(matches!(
+        &core.state,
+        AppState::Idle { session } if !session.compaction_in_progress()
+    ));
+}
+
+#[test]
 fn export_session_writes_current_events_json() {
     let temp = tempfile::tempdir().expect("temp dir");
     let out = temp.path().join("session.json");
@@ -3077,6 +3964,28 @@ fn resume_refusal_for_already_active_session_is_a_neutral_notice() {
         !text.contains("ui:"),
         "resume refusal is a neutral notice, not a \"ui:\" error: {text}"
     );
+}
+
+#[test]
+fn failed_resume_still_closes_idle_shadow_compaction() {
+    let mut core = core();
+    submit_text_and_wait(&mut core, "seed");
+    assert_eq!(core.compact_session(), CoreEffect::Render);
+    assert!(matches!(
+        &core.state,
+        AppState::Idle { session } if session.compaction_in_progress()
+    ));
+
+    assert_eq!(
+        core.resume_session_from_picker("01KW3M3QN4JYHPW1Y82VW9K7K1".to_owned()),
+        CoreEffect::Render
+    );
+
+    assert!(matches!(
+        &core.state,
+        AppState::Idle { session } if !session.compaction_in_progress()
+    ));
+    assert!(drain_finalized_visual_text(&mut core, 80).contains("resume failed"));
 }
 
 #[test]
@@ -4133,6 +5042,38 @@ fn interrupted_live_status_replaces_working_affordance() {
     let contents = terminal.backend().screen_contents();
     assert!(contents.contains("■ interrupted — tell euler what to do differently"));
     assert!(!contents.contains("⠋ working"));
+}
+
+#[test]
+fn interrupt_clears_queued_activities_but_preserves_user_input() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+    let request = CompanionRunRequest {
+        task: AgentTask::new("review", "reviewer", "fixture", "echo").expect("task"),
+    };
+    core.pending_runs
+        .push_back(PendingRunRequest::Companion(request.clone()));
+    core.pending_runs
+        .push_back(PendingRunRequest::Companion(request));
+    core.queued_inputs
+        .push_steering_back("keep this steer".to_owned());
+
+    assert_eq!(core.handle_interrupt(), CoreEffect::Render);
+
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.pending_runs.is_empty());
+    assert_eq!(core.queued_inputs.snapshot(), ["keep this steer"]);
+    let finalized = drain_finalized_visual_text(&mut core, 80);
+    assert!(
+        finalized.contains("interrupt cleared 2 queued activities"),
+        "{finalized}"
+    );
 }
 
 #[test]

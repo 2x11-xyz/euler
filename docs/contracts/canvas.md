@@ -34,9 +34,53 @@ than re-running the original tool when possible. The live policy has two
 independent controls: automatic threshold compaction and recoverable tool
 stubs. Both default to on. Turning automatic compaction off stops the
 threshold-driven projection pipeline; it does not silently override the
-separately selected stub setting. The structured projection fallback remains
-deterministic in core; model-assisted projection is a later extension of this
-contract.
+separately selected stub setting. Under the automatic-plus-stubs policy, byte
+pressure is an admission signal independent of provider usage or a known
+context window: when stubs cannot create enough room, core captures one
+immutable shadow canvas and asks the active provider/model for a bounded
+structured working-state projection with no tools. A manually started shadow
+receives the same request-boundary treatment under every policy. The driver may
+continue from the active canvas while that request runs, but an over-budget
+request is never dispatched: at its next provider boundary the driver waits,
+reassembles after settlement, and fails closed if no valid candidate made the
+canvas fit. The candidate enters the active canvas only after core validates
+its original event frontier,
+host-enforced scalar/list/total projection bounds, meaningful request-size
+reduction, and the exact proposed post-swap driver request. That request-time
+check includes fixed instructions, tool definitions, pinned context, the
+retained frontier, and the configured output reserve; it must fit both the
+canvas byte budget and any known model context window before core atomically
+appends `canvas.swap`. Failure leaves the previous canvas and usage reading
+unchanged. At the hard context margin the driver waits for an already-running
+candidate instead of dispatching an oversized request or dropping queued
+input. The wait polls the turn-cancellation token and has a finite deadline;
+interrupt terminalizes the shadow call and returns the turn as cancelled.
+
+A shadow job has one session owner. Base-composer `Esc` and root-turn
+cancellation are interrupt boundaries: the session actor may record a result
+and its usage/cost provenance when they have already crossed the worker
+channel, but it always discards the candidate and never appends `canvas.swap`.
+A still-pending result instead receives one cancellation terminal plus
+candidate discard. `/new`, `/resume`, shutdown, and live secret scrub are
+lifecycle boundaries: the actor settles a ready result or records cancellation
+before releasing the session. When a root and shadow run concurrently, the
+root's cancellation path closes both canonical calls. Workers never append
+events directly, and output arriving after logical cancellation has no route
+back into the bus, the active canvas, or a scrubbed/replaced session.
+Working-state projection V1 bounds are bytes at the host boundary: goal 4,096;
+plan 8,192; compiler state 4,096; each list at most 64 items; each item at most
+1,024; and the serialized projection at most 32,768. The supplied JSON Schema
+advertises the corresponding string/list limits, but host validation remains
+authoritative.
+
+A successful, structurally valid `canvas.swap` starts a new usage window:
+provider usage measured against the canvas that was replaced must not
+immediately re-trigger compaction or
+keep a prior `context.limit` latch closed. Layer-1 swaps after a full projection
+stack on that projection and frontier; they must not resurrect the compacted
+prefix. Repeated layer-1 passes emit only newly compacted result IDs. Live
+assembly and resume accounting use the same swap validator; malformed swaps
+are ignored and never reset usage or the context-limit latch.
 
 Write-shaped facts (edits, patches, artifact creations) demote last, and
 their stubs always carry the artifact path.
@@ -44,7 +88,55 @@ their stubs always carry the artifact path.
 Extensions may contribute bounded context through named slots. Slot content is
 rendered under core-generated `[slot <extension-id>:<slot>]` headers with every
 content line indented, so extension text cannot spoof canvas section markers.
+Live request assembly projects only slots whose owning extension id is
+currently enabled. Disabling/removing an extension hides its slots on the next
+snapshot without deleting durable state; re-enabling restores the latest slot.
 Raw provenance must not be dumped into the canvas.
+
+Structured `plan.update` is a transcript/provenance presentation event and
+never enters the model canvas directly. Workflow state reaches the model only
+through an independently capability-gated, bounded context slot.
+
+An accepted terminal-idle continuation (`extension.contribution`, ADR 0018)
+is also canvas-eligible. It is rendered under the core-generated
+`[extension <extension-id>:<command> at turn-idle]` header with every content
+line indented. The canonical actor remains the extension; core maps the framed
+item to a provider user role only because the provider-neutral protocol has no
+extension role. It must never be persisted or replayed as `user.message`.
+The continuation is a one-shot input: it folds over the complete accepted log
+and remains eligible across persistence, resume, and an applied full
+`canvas.swap` until an accepted same-agent root-driver `model.call` binds the
+exact purpose-free `canvas.snapshot` that selected its event id through
+`canvas_snapshot_id`. Contribution, snapshot, and call must share both envelope
+`session` and `agent`, and the link must name that identity's latest earlier
+purpose-free snapshot. Every involved envelope id must be globally unique; the
+snapshot selection ids must also be unique, with checked length exactly equal
+to both `counts.items` and the call's `canvas_items`. Any duplicate, malformed,
+stale, future, missing, or crossed-identity link fails closed and leaves the
+contribution pending. A snapshot alone is prepared request state and consumes
+nothing; a crash in the snapshot-to-call window leaves the contribution
+eligible on resume. If the contribution lies before the active swap frontier,
+assembly pins it after the projection and durable extension slots but before
+replaying the frontier, preserving the order of every post-frontier item.
+Selection then excludes it from every later canvas assembly while it remains
+in provenance.
+Shadow compaction excludes pending continuations from both its purpose-specific
+canvas snapshot and provider request; a compactor cannot consume one or persist
+its text opaquely into a projection that would duplicate the next driver input.
+Child and parallel-reviewer canvases, snapshots, provider requests, and
+pre-request context-budget checks exclude pending continuations entirely.
+Children cannot observe or select the text, and root-only input cannot exhaust
+a child request's budget. Only the next accepted same-agent root-driver
+snapshot/request pair may select and model it. Once its linked `model.call` is
+durable, either the ordinary model terminal or a resume recovery closure
+completes that request lifecycle without making the contribution eligible
+again.
+An accepted contribution is already committed input for the current user turn,
+so a later extension disable does not hide it; disablement only prevents future
+contributions. This prevents stale one-shot text from resurfacing after a
+disable/re-enable cycle around crash recovery.
+Stops, malformed outputs, failures, cancelled outputs, and continuations
+superseded by pending user input remain provenance-only.
 
 ## Pinned Project Context
 

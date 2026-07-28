@@ -19,10 +19,17 @@ in v0.
 The v0 multi-agent surface is spawn/result provenance, validation, a
 current-process background execution handle, and a bounded parent-drained
 child-to-parent report queue. It is not a durable scheduler, live await system,
-passive background runtime, timeout system, cancellation API, wakeup mechanism,
-or recovery lease. A stream with `agent.spawn` and no `agent.result` is a valid
-incomplete historical record after resume; core does not reconstruct live child
-state in v0, and that historical incomplete spawn cannot be completed through
+passive background runtime, timeout system, wakeup mechanism, or recovery
+lease. Interactive synchronous companion and parallel-review calls do accept
+the host's read-only cancellation token and still record terminal
+`agent.result` events before returning cancellation. This does not add
+cancellation to detached background handles. A synchronous provider adapter
+may still have an OS or network call running on its adapter thread after the
+parent stops waiting; cancellation detaches that call from the live session
+and rejects its late events rather than claiming physical I/O preemption. A
+stream with `agent.spawn` and no `agent.result` is a valid incomplete
+historical record after resume; core does not reconstruct live child state in
+v0, and that historical incomplete spawn cannot be completed through
 `record_agent_result` after resume.
 
 Current v0 invariants:
@@ -179,7 +186,13 @@ the batch sibling of `spawn_agent`, built for reviewer fan-out (issue #32);
   `agent.spawn`, `canvas.snapshot`, `model.call`. Phase two, joining
   workers **in batch order** regardless of completion order: the task's
   round events (`model.reasoning*`, `model.result`, `assistant.message` on
-  success, `error` on provider failure) and its terminal `agent.result`.
+  success, `error` on every failed call) and its terminal `agent.result`.
+  Every phase-one `model.call` receives exactly one semantic terminal before
+  that child's `agent.result`: provider failures retain their provider error;
+  pre-dispatch cancellation records `source: "session", cancelled: true`;
+  and a panicked or otherwise missing worker outcome records the sanitized
+  `source: "session", recovery_closure: true` unknown-outcome error. A
+  reviewer rejected by context admission opens no `model.call`.
   Event order is a pure function of the batch order — never of provider
   completion timing — so fixture-driven logs replay deterministically.
 - **Explicit parent-context policy**: each batch task declares whether it

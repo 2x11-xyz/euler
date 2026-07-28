@@ -6,10 +6,15 @@ use crate::extensions::{
     ExtensionHost, ExtensionHostError, ExtensionSpawner, QueuedExtensionEvents,
 };
 use crate::permissions::PermissionDecider;
-use crate::permissions::{ApprovalMode, PermissionRequest, PermissionRequestBatch};
+use crate::permissions::{
+    ApprovalMode, PermissionDecisionOutcome, PermissionRequest, PermissionRequestBatch,
+};
 use euler_agents::{AgentBudget, AgentError, AgentTask};
 use euler_event::{object, EventKind};
-use euler_sdk::{AgentOutcome, Capability, Extension, ExtensionError, Invocation, SpawnAgentTask};
+use euler_sdk::{
+    AgentOutcome, CancellationToken, Capability, Extension, ExtensionError, Invocation,
+    SpawnAgentTask,
+};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -21,7 +26,7 @@ use std::time::Instant;
 pub const MAX_SPAWNS_PER_COMMAND: usize = 16;
 
 impl ExtensionExecutionError {
-    fn from_host_error(error: ExtensionHostError) -> Self {
+    pub(super) fn from_host_error(error: ExtensionHostError) -> Self {
         match error {
             ExtensionHostError::CapabilityDenied(_, capability)
             | ExtensionHostError::CommandFailed(
@@ -29,6 +34,7 @@ impl ExtensionExecutionError {
                 euler_sdk::ExtensionError::CapabilityDenied { capability },
             ) => Self::CapabilityDenied { capability },
             ExtensionHostError::CommandFailed(_, _) => Self::CommandFailed,
+            ExtensionHostError::CommandCancelled(_) => Self::Cancelled,
             ExtensionHostError::CommandPanic(_, _) => Self::CommandPanicked,
             ExtensionHostError::ExtensionDisabled(_) => Self::CommandFailed,
             ExtensionHostError::InvalidExtensionId(_)
@@ -49,6 +55,7 @@ struct SessionSpawner<'s, D> {
     session: RefCell<&'s mut Session<D>>,
     queue: Arc<QueuedExtensionEvents>,
     spawned: Cell<usize>,
+    cancellation: CancellationToken,
 }
 
 impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
@@ -66,7 +73,9 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
         session
             .publish_queued_extension_events(&self.queue)
             .map_err(spawn_failed)?;
-        let summary = session.spawn_companion(agent_task).map_err(spawn_failed)?;
+        let summary = session
+            .spawn_companion_with_cancel(agent_task, self.cancellation.clone())
+            .map_err(spawn_extension_error)?;
         self.spawned.set(self.spawned.get() + 1);
         Ok(outcome_from_summary(summary))
     }
@@ -94,8 +103,8 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
             .publish_queued_extension_events(&self.queue)
             .map_err(spawn_failed)?;
         let summaries = session
-            .spawn_reviewers_parallel(agent_tasks, &std::sync::atomic::AtomicBool::new(false))
-            .map_err(spawn_failed)?;
+            .spawn_reviewers_parallel(agent_tasks, &self.cancellation)
+            .map_err(spawn_extension_error)?;
         self.spawned.set(self.spawned.get() + batch_len);
         Ok(summaries.into_iter().map(outcome_from_summary).collect())
     }
@@ -117,6 +126,14 @@ fn outcome_from_summary(summary: super::AgentResultSummary) -> AgentOutcome {
 
 fn spawn_failed(error: SessionError) -> ExtensionError {
     ExtensionError::Message(format!("agent spawn failed: {error}"))
+}
+
+fn spawn_extension_error(error: SessionError) -> ExtensionError {
+    if matches!(error, SessionError::Cancelled) {
+        ExtensionError::Cancelled
+    } else {
+        spawn_failed(error)
+    }
 }
 
 fn invalid_spawn_task(error: AgentError) -> ExtensionError {
@@ -192,6 +209,11 @@ impl<D> Session<D> {
         &mut self,
         queue: &QueuedExtensionEvents,
     ) -> Result<(), SessionError> {
+        // Deliberately no pending-admission guard here: the extension host
+        // already appended these events through the shared writer. This step
+        // only reconciles that durable suffix into the live bus; fencing it
+        // would strand accepted evidence and force a reload solely because an
+        // unrelated user-message append has an ambiguous outcome.
         if self.provenance.is_none() {
             return Err(SessionError::ExtensionEmissionUnavailable);
         }
@@ -231,7 +253,22 @@ impl<D> Session<D> {
     where
         D: crate::permissions::PermissionDecider,
     {
-        let operation = format!("extension {extension_id}.{command}");
+        self.approve_extension_capabilities_cancellable(
+            extension_id,
+            command,
+            required,
+            &CancellationToken::new(),
+        )
+    }
+
+    fn extension_permission_batch(
+        &self,
+        operation: String,
+        required: &[Capability],
+    ) -> Result<Option<PermissionRequestBatch>, ExtensionExecutionError>
+    where
+        D: crate::permissions::PermissionDecider,
+    {
         let mut pending = Vec::new();
         for &capability in required {
             let mode = self
@@ -255,12 +292,30 @@ impl<D> Session<D> {
                 }
             }
         }
+        Ok((!pending.is_empty()).then(|| PermissionRequestBatch::new(operation, pending)))
+    }
 
-        if pending.is_empty() {
-            return Ok(());
+    pub(super) fn approve_extension_capabilities_cancellable(
+        &mut self,
+        extension_id: &str,
+        command: &str,
+        required: &[Capability],
+        cancellation: &CancellationToken,
+    ) -> Result<(), ExtensionExecutionError>
+    where
+        D: crate::permissions::PermissionDecider,
+    {
+        if cancellation.is_cancelled() {
+            return Err(ExtensionExecutionError::Cancelled);
         }
-
-        let batch = PermissionRequestBatch::new(operation, pending);
+        let operation = format!("extension {extension_id}.{command}");
+        let Some(batch) = self.extension_permission_batch(operation, required)? else {
+            return if cancellation.is_cancelled() {
+                Err(ExtensionExecutionError::Cancelled)
+            } else {
+                Ok(())
+            };
+        };
         let primary = batch.requests()[0].capability;
         let capabilities = Value::Array(
             batch
@@ -284,7 +339,15 @@ impl<D> Session<D> {
             .map_err(|_| ExtensionExecutionError::CapabilityDenied {
                 capability: primary,
             })?;
-        let decisions = self.permissions.decide_batch_detailed(&batch);
+        let decisions = match self
+            .permissions
+            .decide_batch_detailed_cancellable(&batch, cancellation)
+        {
+            PermissionDecisionOutcome::Decided(decisions) => decisions,
+            PermissionDecisionOutcome::Cancelled => {
+                return Err(ExtensionExecutionError::Cancelled);
+            }
+        };
         let denied = decisions
             .iter()
             .find(|decision| !decision.allowed())
@@ -332,6 +395,29 @@ impl<D> Session<D> {
     where
         D: crate::permissions::PermissionDecider,
     {
+        self.execute_extension_command_gated_cancellable(
+            extension,
+            command,
+            input,
+            required,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn execute_extension_command_gated_cancellable(
+        &mut self,
+        extension: &dyn Extension,
+        command: &str,
+        input: Value,
+        required: &[Capability],
+        cancellation: &CancellationToken,
+    ) -> Result<Value, ExtensionExecutionError>
+    where
+        D: crate::permissions::PermissionDecider,
+    {
+        if cancellation.is_cancelled() {
+            return Err(ExtensionExecutionError::Cancelled);
+        }
         let extension_id = extension.manifest().id;
         if !self.extension_enabled(&extension_id) {
             return Err(ExtensionExecutionError::Disabled { id: extension_id });
@@ -350,8 +436,22 @@ impl<D> Session<D> {
                 "{extension_id}.{command} is agent-only: it is run by the agent on your behalf.                  Ask for it in ordinary turn text."
             )));
         }
-        self.approve_extension_capabilities(&extension_id, command, required)?;
-        self.execute_extension_command(extension, command, input, required.iter().copied())
+        self.approve_extension_capabilities_cancellable(
+            &extension_id,
+            command,
+            required,
+            cancellation,
+        )?;
+        if cancellation.is_cancelled() {
+            return Err(ExtensionExecutionError::Cancelled);
+        }
+        self.execute_extension_command_cancellable(
+            extension,
+            command,
+            input,
+            required.iter().copied(),
+            cancellation,
+        )
     }
 
     /// Execute one extension command through this live session's owning writer.
@@ -371,6 +471,29 @@ impl<D> Session<D> {
     where
         D: PermissionDecider,
     {
+        self.execute_extension_command_cancellable(
+            extension,
+            command,
+            input,
+            granted,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn execute_extension_command_cancellable(
+        &mut self,
+        extension: &dyn Extension,
+        command: &str,
+        input: Value,
+        granted: impl IntoIterator<Item = Capability>,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, ExtensionExecutionError>
+    where
+        D: PermissionDecider,
+    {
+        if cancellation.is_cancelled() {
+            return Err(ExtensionExecutionError::Cancelled);
+        }
         let extension_id = extension.manifest().id;
         if !self.extension_enabled(&extension_id) {
             return Err(ExtensionExecutionError::Disabled { id: extension_id });
@@ -382,9 +505,17 @@ impl<D> Session<D> {
                 session: RefCell::new(&mut *self),
                 queue: Arc::clone(&queue),
                 spawned: Cell::new(0),
+                cancellation: cancellation.clone(),
             };
             host.register_extension_for_command(extension, command)
-                .and_then(|()| host.execute_command_with_spawner(command, input, Some(&spawner)))
+                .and_then(|()| {
+                    host.execute_command_with_spawner_cancellable(
+                        command,
+                        input,
+                        Some(&spawner),
+                        cancellation,
+                    )
+                })
                 .map_err(ExtensionExecutionError::from_host_error)
         };
         // If command execution and queued-event publication both fail, publication

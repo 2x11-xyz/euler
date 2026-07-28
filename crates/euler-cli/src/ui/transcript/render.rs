@@ -10,13 +10,14 @@ use super::cells::{
 };
 use super::file_diff::{render_file_diff_cell, FileDiffRender};
 use super::{
-    EventTiming, ProjectedEntry, TranscriptItem, EXPLORED_GROUP_VERB, TOOL_CALL_MAX_LINES,
+    EventTiming, PlanUpdateView, ProjectedEntry, TranscriptItem, EXPLORED_GROUP_VERB,
+    TOOL_CALL_MAX_LINES,
 };
 use crate::ui::glyphs::{self, user_line_prefix};
 use crate::ui::markdown;
 use crate::ui::text::{
     blank_gutter, content_width, display_width, gutter_width, is_ledger_gutter, timestamp_gutter,
-    timestamp_gutter_shown, tree_gutter_hairline, wrap_text,
+    timestamp_gutter_shown, tree_gutter_hairline, tree_gutter_last, tree_gutter_mid, wrap_text,
 };
 use crate::ui::theme::Theme;
 use ratatui::style::{Modifier, Style};
@@ -196,14 +197,8 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             TranscriptItem::AssistantActivity(content) => {
                 push_cell_parent(&mut lines, content, theme.transcript.control, theme, width);
             }
-            TranscriptItem::PlanUpdate(summary) => {
-                push_cell_parent(
-                    &mut lines,
-                    &format!("Updated Plan: {summary}"),
-                    theme.transcript.control,
-                    theme,
-                    width,
-                );
+            TranscriptItem::PlanUpdate(update) => {
+                render_plan_update(&mut lines, update, theme, width);
             }
             TranscriptItem::ModelCall { provider, model } => {
                 push_wrapped(
@@ -785,6 +780,130 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
     }
 
     (lines, item_end_offsets)
+}
+
+fn render_plan_update(
+    lines: &mut Vec<Line<'static>>,
+    update: &PlanUpdateView,
+    theme: &Theme,
+    width: u16,
+) {
+    let PlanUpdateView::Structured {
+        explanation, items, ..
+    } = update
+    else {
+        let PlanUpdateView::Legacy { summary } = update else {
+            unreachable!("plan update variants are exhaustive")
+        };
+        push_cell_parent(
+            lines,
+            &format!("Updated Plan: {summary}"),
+            theme.transcript.control,
+            theme,
+            width,
+        );
+        return;
+    };
+
+    push_cell_parent(
+        lines,
+        "Updated Plan",
+        theme.transcript.control,
+        theme,
+        width,
+    );
+    let row_count = items.len() + usize::from(explanation.is_some());
+    let mut row_index = 0usize;
+    if let Some(explanation) = explanation {
+        row_index += 1;
+        push_wrapped(
+            lines,
+            plan_row_prefix(row_index, row_count),
+            explanation,
+            theme.transcript.body,
+            theme,
+            width,
+        );
+    }
+    for (index, item) in items.iter().enumerate() {
+        row_index += 1;
+        let (marker, chrome_style, step_style) = match item.status {
+            euler_sdk::PlanItemStatus::Completed => (
+                glyphs::check(),
+                theme.transcript.muted.add_modifier(Modifier::DIM),
+                theme
+                    .transcript
+                    .muted
+                    .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT),
+            ),
+            euler_sdk::PlanItemStatus::InProgress => (
+                glyphs::thinking(),
+                theme.transcript.warning.add_modifier(Modifier::BOLD),
+                theme.transcript.warning.add_modifier(Modifier::BOLD),
+            ),
+            euler_sdk::PlanItemStatus::Pending => (
+                "[ ]",
+                theme.transcript.muted.add_modifier(Modifier::DIM),
+                theme.transcript.muted.add_modifier(Modifier::DIM),
+            ),
+        };
+        push_plan_item(
+            lines,
+            PlanItemRender {
+                gutter: plan_row_prefix(row_index, row_count),
+                chrome: format!("{}. {marker} ", index + 1),
+                step: &item.step,
+                chrome_style,
+                step_style,
+            },
+            theme,
+            width,
+        );
+    }
+}
+
+struct PlanItemRender<'a> {
+    gutter: &'static str,
+    chrome: String,
+    step: &'a str,
+    chrome_style: Style,
+    step_style: Style,
+}
+
+fn push_plan_item(
+    lines: &mut Vec<Line<'static>>,
+    item: PlanItemRender<'_>,
+    theme: &Theme,
+    width: u16,
+) {
+    debug_assert!(
+        is_ledger_gutter(item.gutter),
+        "invalid ledger gutter: {:?}",
+        item.gutter
+    );
+    let step_width = gutter_relative_width(width, item.gutter)
+        .saturating_sub(display_width(&item.chrome))
+        .max(1);
+    for (index, segment) in wrap_text(item.step, step_width).into_iter().enumerate() {
+        let chrome = if index == 0 {
+            item.chrome.clone()
+        } else {
+            " ".repeat(display_width(&item.chrome))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(item.gutter.to_owned(), theme.transcript.gutter),
+            Span::styled(chrome, item.chrome_style),
+            Span::styled(segment, item.step_style),
+        ]));
+    }
+}
+
+fn plan_row_prefix(index: usize, count: usize) -> &'static str {
+    if index == count {
+        tree_gutter_last()
+    } else {
+        tree_gutter_mid()
+    }
 }
 
 fn is_meaningful_ledger_item(item: &TranscriptItem) -> bool {

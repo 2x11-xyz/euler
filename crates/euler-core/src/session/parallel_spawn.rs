@@ -22,8 +22,10 @@ use euler_provider::{
     ModelInputItem, ModelRequest, ModelRole, ModelStreamEvent, ProviderError, ProviderSet,
     ProviderStream, ReasoningChunk, StopReason,
 };
-use std::sync::atomic::AtomicBool;
+use euler_sdk::CancellationToken;
 use std::sync::Arc;
+
+const REVIEWER_UNKNOWN_OUTCOME_MESSAGE: &str = "reviewer worker outcome unavailable";
 
 /// One task prepared on the session thread: everything a worker needs, plus
 /// the ids phase three records against.
@@ -31,21 +33,39 @@ struct PreparedReviewer {
     task: AgentTask,
     target: ModelTarget,
     spawned: SpawnedAgent,
-    model_call_id: String,
-    request: ModelRequest,
-    /// Set when phase 1 rejected this reviewer before any provider call (its
-    /// `error` event is already recorded). Its worker is skipped and its
-    /// terminal `agent.result` carries this message, so one bad reviewer
-    /// fails alone instead of sinking the batch.
-    prepare_failure: Option<String>,
+    preparation: ReviewerPreparation,
+}
+
+/// Context admission either produces one honest provider call lifecycle or
+/// rejects the reviewer before that lifecycle begins.
+enum ReviewerPreparation {
+    Ready {
+        model_call_id: String,
+        request: ModelRequest,
+    },
+    Rejected {
+        message: String,
+    },
 }
 
 /// What a worker hands back: the drained round or the terminal error, plus
 /// any error event it buffered instead of appending (determinism: workers
 /// never append).
-struct WorkerOutcome {
+enum WorkerOutcome {
+    Rejected,
+    Ran(Box<WorkerRunOutcome>),
+}
+
+struct WorkerRunOutcome {
     round: Result<ModelRoundData, SessionError>,
     buffered_error: Option<(JsonObject, String)>,
+}
+
+struct ReviewerRecordContext<'a> {
+    task: &'a AgentTask,
+    target: &'a ModelTarget,
+    child_agent_id: &'a str,
+    model_call_id: &'a str,
 }
 
 impl<D: PermissionDecider> Session<D> {
@@ -55,7 +75,7 @@ impl<D: PermissionDecider> Session<D> {
     pub fn spawn_reviewers_parallel(
         &mut self,
         tasks: Vec<AgentTask>,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<Vec<AgentResultSummary>, SessionError> {
         if tasks.is_empty() {
             return Ok(Vec::new());
@@ -82,16 +102,17 @@ impl<D: PermissionDecider> Session<D> {
         // as before, contributes no pinned item to the assembled canvas.
         let folded = crate::project_context::fold_project_context(self.bus.events());
         let include_parent_canvas = tasks.iter().any(AgentTask::includes_parent_canvas);
-        let canvas = if include_parent_canvas {
+        let canvas = super::child_canvas_boundary(if include_parent_canvas {
             assemble_canvas_prefolded(
                 self.bus.events(),
                 &self.config.auto_compaction,
                 &std::collections::BTreeSet::new(),
                 folded.as_ref().ok().and_then(|fold| fold.admitted()),
+                Some(&self.config.extensions_enabled),
             )
         } else {
             Vec::new()
-        };
+        });
         if include_parent_canvas {
             if let Some(error) = context_budget_exhausted(self.config.auto_compaction, &canvas) {
                 let agent_id = self.config.agent_id.clone();
@@ -141,7 +162,7 @@ impl<D: PermissionDecider> Session<D> {
                 provider_retry_backoff_ms: self.config.provider_transport_retry_backoff_ms.clone(),
             },
             &prepared,
-            cancel_flag,
+            cancellation,
         );
 
         // Phase 3 (session thread, batch order): record each reviewer's
@@ -151,11 +172,15 @@ impl<D: PermissionDecider> Session<D> {
             let summary = self.record_reviewer_outcome(&writer, reviewer, outcome)?;
             summaries.push(summary);
         }
+        if cancellation.is_cancelled() {
+            return Err(SessionError::Cancelled);
+        }
         Ok(summaries)
     }
 
-    /// Phase 1 for one task: record `agent.spawn`, `canvas.snapshot`, and
-    /// `model.call`, and build the provider request the worker will send.
+    /// Phase 1 for one task: record `agent.spawn` and `canvas.snapshot`, admit
+    /// the request against the context window, then record `model.call` only
+    /// when a worker will actually dispatch it.
     fn prepare_reviewer(
         &mut self,
         task: AgentTask,
@@ -193,43 +218,7 @@ impl<D: PermissionDecider> Session<D> {
             (Some(session_cap), Some(task_cap)) => Some(session_cap.min(task_cap)),
             (session_cap, task_cap) => session_cap.or(task_cap),
         };
-        let mut model_call =
-            self.reviewer_model_call_payload(&target, task_canvas.len(), max_output_tokens);
-        if let Some(digest) = super::canvas_project_context_digest(&task_canvas, project_context) {
-            model_call.insert("project_context_digest".to_owned(), digest.into());
-        }
-        let model_call_id = self
-            .appender_as(writer, &child_agent_id)
-            .append(EventKind::MODEL_CALL, model_call, None)?
-            .id;
-        let mut input: Vec<ModelInputItem> = task_canvas.iter().map(model_input_item).collect();
-        if let Some(context) = task.explicit_context() {
-            input.push(ModelInputItem::Message {
-                role: ModelRole::User,
-                content: context.to_owned(),
-            });
-        }
-        input.push(ModelInputItem::Message {
-            role: ModelRole::User,
-            content: task.task().to_owned(),
-        });
-        // One oversized reviewer must not sink the batch: the swarm's K-of-N
-        // summary exists to report exactly this kind of partial failure, so
-        // record an error event for this child and let its siblings run.
-        let prepare_failure = match self.reviewer_context_overflow(&input, &task) {
-            Some(message) => {
-                self.appender_as(writer, &child_agent_id).append(
-                    EventKind::ERROR,
-                    object([
-                        ("source", "companion".into()),
-                        ("message", message.clone().into()),
-                    ]),
-                    None,
-                )?;
-                Some(message)
-            }
-            None => None,
-        };
+        let input = reviewer_input(&task_canvas, &task);
         let request = ModelRequest {
             model: target.model.clone(),
             instructions: task
@@ -243,13 +232,44 @@ impl<D: PermissionDecider> Session<D> {
             max_output_tokens,
         }
         .for_target(&target.provider, &target.model);
+        // One oversized reviewer must not sink the batch: the swarm's K-of-N
+        // summary exists to report exactly this kind of partial failure, so
+        // record an error event for this child and let its siblings run. The
+        // rejection precedes model.call: no provider lifecycle began.
+        if let Some(message) = self.reviewer_context_overflow(&request) {
+            self.appender_as(writer, &child_agent_id).append(
+                EventKind::ERROR,
+                object([
+                    ("source", "companion".into()),
+                    ("message", message.clone().into()),
+                ]),
+                None,
+            )?;
+            return Ok(PreparedReviewer {
+                task,
+                target,
+                spawned,
+                preparation: ReviewerPreparation::Rejected { message },
+            });
+        }
+
+        let mut model_call =
+            self.reviewer_model_call_payload(&target, task_canvas.len(), max_output_tokens);
+        if let Some(digest) = super::canvas_project_context_digest(&task_canvas, project_context) {
+            model_call.insert("project_context_digest".to_owned(), digest.into());
+        }
+        let model_call_id = self
+            .appender_as(writer, &child_agent_id)
+            .append(EventKind::MODEL_CALL, model_call, None)?
+            .id;
         Ok(PreparedReviewer {
             task,
             target,
             spawned,
-            model_call_id,
-            request,
-            prepare_failure,
+            preparation: ReviewerPreparation::Ready {
+                model_call_id,
+                request,
+            },
         })
     }
 
@@ -282,30 +302,24 @@ impl<D: PermissionDecider> Session<D> {
         model_call
     }
 
-    /// Why this reviewer cannot be dispatched, if its estimated request would
-    /// not fit the configured context window. Estimation is deliberately crude
-    /// (4 bytes per token): it exists to catch briefs that are obviously too
-    /// large before spending a provider call, not to predict tokenizer output.
-    fn reviewer_context_overflow(
-        &self,
-        input: &[ModelInputItem],
-        task: &AgentTask,
-    ) -> Option<String> {
+    /// Why this reviewer cannot be dispatched under the shared deterministic
+    /// request proxy, if the model's context window is known.
+    fn reviewer_context_overflow(&self, request: &ModelRequest) -> Option<String> {
         let limit = self
             .config
             .context_limit
             .as_ref()
             .map(ContextLimitConfig::limit_tokens)?;
-        let input_bytes = input.iter().map(model_input_bytes).sum::<usize>();
-        let estimated_input = u64::try_from(input_bytes.div_ceil(4)).unwrap_or(u64::MAX);
-        let requested_output = task.budget().max_tokens().unwrap_or(0);
-        if estimated_input.saturating_add(requested_output) <= limit {
-            return None;
+        let output_reserve = request.max_output_tokens.unwrap_or(0);
+        match crate::project_context::request_required_tokens(request, output_reserve) {
+            Some(required) if crate::project_context::fits_context_limit(required, limit) => None,
+            Some(required) => Some(format!(
+                "reviewer request exceeds context limit: {required} tokens required > {limit}"
+            )),
+            None => Some(format!(
+                "reviewer request exceeds context limit: token accounting overflowed for {limit} available tokens"
+            )),
         }
-        Some(format!(
-            "reviewer request exceeds context limit: estimated {estimated_input} input \
-             + {requested_output} output tokens > {limit}"
-        ))
     }
 
     fn record_reviewer_outcome(
@@ -318,40 +332,53 @@ impl<D: PermissionDecider> Session<D> {
             task,
             target,
             mut spawned,
-            model_call_id,
-            request: _,
-            prepare_failure,
+            preparation,
         } = reviewer;
+        let (model_call_id, round, buffered_error) = match (preparation, outcome) {
+            (ReviewerPreparation::Rejected { message }, WorkerOutcome::Rejected) => {
+                return self.record_rejected_reviewer(target, spawned, message);
+            }
+            (
+                ReviewerPreparation::Ready {
+                    model_call_id,
+                    request: _,
+                },
+                WorkerOutcome::Ran(outcome),
+            ) => {
+                let WorkerRunOutcome {
+                    round,
+                    buffered_error,
+                } = *outcome;
+                (model_call_id, round, buffered_error)
+            }
+            _ => {
+                return Err(SessionError::InvalidCompanionTask(
+                    "reviewer preparation and worker outcome disagree".to_owned(),
+                ));
+            }
+        };
         let child_agent_id = spawned.child_agent_id().to_owned();
-        // A phase-1 rejection is host-generated and already has its error
-        // event: report it as this reviewer's terminal result and stop.
-        if let Some(message) = prepare_failure {
-            let result = companion_failure(message);
-            let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
-            return Ok(AgentResultSummary {
-                child_agent_id,
-                spawn_event_id: spawned.spawn_event_id().to_owned(),
-                result_event_id,
-                provider: target.provider,
-                model: target.model,
-                result,
-            });
-        }
-        if let Some((mut payload, parent)) = outcome.buffered_error {
-            // Workers buffer the raw provider error (they carry no
-            // redactor); this session-thread append is the emission
-            // site, so redact here — provider HTTP error bodies can
-            // echo request fragments (secrets contract). Redact before
-            // borrowing the session for the appender.
-            self.redactor
-                .redact_payload_fields(&mut payload, &["message"]);
-            self.appender_as(writer, &child_agent_id).append(
-                EventKind::ERROR,
-                payload,
-                Some(parent),
-            )?;
-        }
-        let result = match outcome.round {
+        let result = match (round, buffered_error) {
+            (Ok(data), None) => self.record_successful_reviewer_round(
+                writer,
+                ReviewerRecordContext {
+                    task: &task,
+                    target: &target,
+                    child_agent_id: &child_agent_id,
+                    model_call_id: &model_call_id,
+                },
+                &data,
+            )?,
+            (Ok(_), buffered_error) => {
+                self.append_reviewer_failure_terminal(
+                    writer,
+                    &child_agent_id,
+                    &model_call_id,
+                    buffered_error,
+                    None,
+                )?;
+                companion_failure(REVIEWER_UNKNOWN_OUTCOME_MESSAGE)
+            }
             // The worker's terminal error carries the raw provider
             // message (HTTP error bodies can echo request fragments —
             // secrets contract). This failure string becomes the
@@ -360,33 +387,105 @@ impl<D: PermissionDecider> Session<D> {
             // artifact; redacting at this conversion point makes every
             // downstream sink inherit it. Reviewer findings (success
             // output) are model cognition and stay faithful.
-            Err(error) => companion_failure(self.redactor.redact(&error.to_string())),
-            Ok(data) => {
-                let model_result = model_result_payload(
-                    &ModelResultRecord {
-                        content: &data.content,
-                        tool_calls: &data.tool_calls,
-                        stop_reason: data
-                            .stop_reason
-                            .as_ref()
-                            .expect("validated finished stream"),
-                        usage: data.usage.as_ref(),
-                        target: &target,
-                        parent: model_call_id.clone(),
-                    },
-                    &self.providers,
-                );
-                let mut appender = self.appender_as(writer, &child_agent_id);
-                record_reviewer_round(
-                    &mut appender,
-                    &target,
+            (Err(error), buffered_error) => {
+                self.append_reviewer_failure_terminal(
+                    writer,
+                    &child_agent_id,
                     &model_call_id,
-                    &data,
-                    &task,
-                    model_result,
-                )?
+                    buffered_error,
+                    Some(&error),
+                )?;
+                companion_failure(self.redactor.redact(&error.to_string()))
             }
         };
+        let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
+        Ok(AgentResultSummary {
+            child_agent_id,
+            spawn_event_id: spawned.spawn_event_id().to_owned(),
+            result_event_id,
+            provider: target.provider,
+            model: target.model,
+            result,
+        })
+    }
+
+    fn record_successful_reviewer_round(
+        &mut self,
+        writer: &Arc<crate::provenance::ProvenanceWriter>,
+        context: ReviewerRecordContext<'_>,
+        data: &ModelRoundData,
+    ) -> Result<AgentResult, SessionError> {
+        let model_result = model_result_payload(
+            &ModelResultRecord {
+                content: &data.content,
+                tool_calls: &data.tool_calls,
+                stop_reason: data
+                    .stop_reason
+                    .as_ref()
+                    .expect("validated finished stream"),
+                usage: data.usage.as_ref(),
+                target: context.target,
+                parent: context.model_call_id.to_owned(),
+            },
+            &self.providers,
+        );
+        let mut appender = self.appender_as(writer, context.child_agent_id);
+        record_reviewer_round(
+            &mut appender,
+            context.target,
+            context.model_call_id,
+            data,
+            context.task,
+            model_result,
+        )
+    }
+
+    /// Close a prepared reviewer's provider lifecycle exactly once before its
+    /// `agent.result` is recorded. A worker can disappear before RoundLoop
+    /// has a chance to buffer an error (pre-dispatch cancellation or panic);
+    /// those unknown outcomes receive a sanitized session recovery closure.
+    fn append_reviewer_failure_terminal(
+        &mut self,
+        writer: &Arc<crate::provenance::ProvenanceWriter>,
+        child_agent_id: &str,
+        model_call_id: &str,
+        buffered_error: Option<(JsonObject, String)>,
+        error: Option<&SessionError>,
+    ) -> Result<(), SessionError> {
+        let mut payload = match buffered_error {
+            Some((payload, worker_parent)) => {
+                debug_assert_eq!(worker_parent, model_call_id);
+                payload
+            }
+            None if matches!(error, Some(SessionError::Cancelled)) => {
+                super::round_loop::model_call_cancelled_payload()
+            }
+            None => object([
+                ("source", "session".into()),
+                ("message", REVIEWER_UNKNOWN_OUTCOME_MESSAGE.into()),
+                ("recovery_closure", true.into()),
+            ]),
+        };
+        // Workers carry no redactor. Provider error bodies can echo request
+        // fragments, so the session-thread emission site owns redaction.
+        self.redactor
+            .redact_payload_fields(&mut payload, &["message"]);
+        self.appender_as(writer, child_agent_id).append(
+            EventKind::ERROR,
+            payload,
+            Some(model_call_id.to_owned()),
+        )?;
+        Ok(())
+    }
+
+    fn record_rejected_reviewer(
+        &mut self,
+        target: ModelTarget,
+        mut spawned: SpawnedAgent,
+        message: String,
+    ) -> Result<AgentResultSummary, SessionError> {
+        let child_agent_id = spawned.child_agent_id().to_owned();
+        let result = companion_failure(message);
         let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
         Ok(AgentResultSummary {
             child_agent_id,
@@ -508,44 +607,60 @@ fn validate_reviewer_brief(task: &AgentTask) -> Result<(), SessionError> {
     Ok(())
 }
 
+fn reviewer_input(task_canvas: &[crate::CanvasItem], task: &AgentTask) -> Vec<ModelInputItem> {
+    let mut input = task_canvas.iter().map(model_input_item).collect::<Vec<_>>();
+    if let Some(context) = task.explicit_context() {
+        input.push(ModelInputItem::Message {
+            role: ModelRole::User,
+            content: context.to_owned(),
+        });
+    }
+    input.push(ModelInputItem::Message {
+        role: ModelRole::User,
+        content: task.task().to_owned(),
+    });
+    input
+}
+
 fn run_workers(
     providers: &ProviderSet,
     session_id: &str,
     config: RoundLoopConfig,
     prepared: &[PreparedReviewer],
-    cancel_flag: &AtomicBool,
+    cancellation: &CancellationToken,
 ) -> Vec<WorkerOutcome> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = prepared
             .iter()
             .map(|reviewer| {
+                let ReviewerPreparation::Ready {
+                    model_call_id,
+                    request,
+                } = &reviewer.preparation
+                else {
+                    return None;
+                };
                 let worker_config = RoundLoopConfig {
                     max_rounds: config.max_rounds,
                     provider_retries: config.provider_retries,
                     provider_retry_backoff_ms: config.provider_retry_backoff_ms.clone(),
                 };
-                scope.spawn(move || {
-                    // Phase 1 already rejected this reviewer and recorded its
-                    // error event; spending a provider call on it would be
-                    // spending tokens to confirm a decision already made.
-                    if reviewer.prepare_failure.is_some() {
-                        return WorkerOutcome {
-                            round: Err(SessionError::InvalidCompanionTask(
-                                "reviewer rejected before dispatch".to_owned(),
-                            )),
-                            buffered_error: None,
-                        };
-                    }
+                let worker_cancellation = cancellation.clone();
+                let target = reviewer.target.clone();
+                let model_call_id = model_call_id.clone();
+                let request = request.clone();
+                Some(scope.spawn(move || {
                     let mut io = WorkerIo {
                         session_id,
                         providers,
-                        target: reviewer.target.clone(),
-                        prepared: Some((reviewer.model_call_id.clone(), reviewer.request.clone())),
+                        target,
+                        prepared: Some((model_call_id, request)),
                         round: None,
                         buffered_error: None,
+                        cancellation: worker_cancellation.clone(),
                     };
-                    let run = RoundLoop::new(&mut io, worker_config).run(cancel_flag);
-                    WorkerOutcome {
+                    let run = RoundLoop::new(&mut io, worker_config).run(&worker_cancellation);
+                    WorkerOutcome::Ran(Box::new(WorkerRunOutcome {
                         round: run.and_then(|()| {
                             io.round.ok_or_else(|| {
                                 SessionError::InvalidCompanionTask(
@@ -554,22 +669,25 @@ fn run_workers(
                             })
                         }),
                         buffered_error: io.buffered_error,
-                    }
-                })
+                    }))
+                }))
             })
             .collect();
         // Join in batch order regardless of completion order: determinism.
         handles
             .into_iter()
-            .map(|handle| {
-                handle.join().unwrap_or_else(|_| WorkerOutcome {
-                    // Sanitized, payload-free panic degradation (multi-agent
-                    // contract): the panic payload is never persisted.
-                    round: Err(SessionError::InvalidCompanionTask(
-                        "reviewer worker panicked".to_owned(),
-                    )),
-                    buffered_error: None,
-                })
+            .map(|handle| match handle {
+                None => WorkerOutcome::Rejected,
+                Some(handle) => handle.join().unwrap_or_else(|_| {
+                    WorkerOutcome::Ran(Box::new(WorkerRunOutcome {
+                        // Sanitized, payload-free panic degradation (multi-agent
+                        // contract): the panic payload is never persisted.
+                        round: Err(SessionError::InvalidCompanionTask(
+                            "reviewer worker panicked".to_owned(),
+                        )),
+                        buffered_error: None,
+                    }))
+                }),
             })
             .collect()
     })
@@ -585,6 +703,7 @@ struct WorkerIo<'a> {
     prepared: Option<(String, ModelRequest)>,
     round: Option<ModelRoundData>,
     buffered_error: Option<(JsonObject, String)>,
+    cancellation: CancellationToken,
 }
 
 impl RoundLoopIo for WorkerIo<'_> {
@@ -614,7 +733,11 @@ impl RoundLoopIo for WorkerIo<'_> {
         target: &ModelTarget,
         request: ModelRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        self.providers.invoke(&target.provider, request)
+        self.providers.invoke_interruptibly(
+            &target.provider,
+            request,
+            super::provider_cancellation(self.cancellation.clone()),
+        )
     }
 
     fn emit_provider_error(
@@ -622,12 +745,26 @@ impl RoundLoopIo for WorkerIo<'_> {
         error: &ProviderError,
         model_call_id: String,
     ) -> Result<String, SessionError> {
+        if error.request_outcome_unknown() {
+            // The provider request thread disappeared after dispatch may have
+            // begun. Leave the error unbuffered so phase three records the
+            // canonical session recovery closure for an unknown outcome.
+            return Ok(String::new());
+        }
         let mut payload = object([
             ("source", "provider".into()),
             ("message", error.to_string().into()),
         ]);
         payload.insert("category".to_owned(), error.category().as_str().into());
         self.buffered_error = Some((payload, model_call_id));
+        Ok(String::new())
+    }
+
+    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError> {
+        self.buffered_error = Some((
+            super::round_loop::model_call_cancelled_payload(),
+            model_call_id,
+        ));
         Ok(String::new())
     }
 
@@ -646,7 +783,8 @@ impl RoundLoopIo for WorkerIo<'_> {
         _target: ModelTarget,
         _model_call_id: String,
         data: ModelRoundData,
-        _cancel_flag: &AtomicBool,
+        _cancellation: &CancellationToken,
+        _another_round_available: bool,
     ) -> Result<RoundOutcome<()>, SessionError> {
         self.round = Some(data);
         Ok(RoundOutcome::Complete(()))
@@ -654,7 +792,7 @@ impl RoundLoopIo for WorkerIo<'_> {
 
     fn round_completed(&mut self) {}
 
-    fn round_limit(&mut self) -> Result<(), SessionError> {
+    fn round_limit(&mut self, _cancellation: &CancellationToken) -> Result<(), SessionError> {
         // Unreachable with max_rounds = 1 and finish_round completing, but
         // the loop contract requires an answer; report it as data-less.
         Ok(())
@@ -664,25 +802,3 @@ impl RoundLoopIo for WorkerIo<'_> {
 #[cfg(test)]
 #[path = "parallel_spawn_test.rs"]
 mod tests;
-
-/// Rough byte size of one request item, for the pre-dispatch context estimate.
-fn model_input_bytes(item: &ModelInputItem) -> usize {
-    match item {
-        ModelInputItem::Message { content, .. } => content.len(),
-        ModelInputItem::ToolCall {
-            name, arguments, ..
-        } => name.len() + arguments.to_string().len(),
-        ModelInputItem::ToolOutput {
-            name,
-            output,
-            error,
-            ..
-        } => {
-            name.len()
-                + output.as_deref().map_or(0, str::len)
-                + error.as_deref().map_or(0, str::len)
-        }
-        ModelInputItem::Reasoning { content, .. } => content.len(),
-        ModelInputItem::ProjectContext { rendered } => rendered.len(),
-    }
-}

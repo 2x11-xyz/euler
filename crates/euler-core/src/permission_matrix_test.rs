@@ -47,8 +47,9 @@ enum Outcome {
 #[derive(Clone, Copy)]
 enum ModeSetup {
     /// Leave the gate's defaults (fs-read session-allow; fs-write,
-    /// shell-exec, agent-spawn ask; everything else unconfigured =
-    /// always-deny), plus whatever an unscoped session grant install flips.
+    /// shell-exec, agent-spawn ask; extension-state and context-slot
+    /// session-allow; everything else unconfigured = always-deny), plus
+    /// whatever an unscoped session grant install flips.
     Default,
     Set(ApprovalMode),
 }

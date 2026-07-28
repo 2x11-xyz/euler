@@ -81,11 +81,10 @@ Adopt three, defer one:
   bounded).
 - Known gaps, accepted for v0: the guardian's canvas view renders compaction
   projections and extension context slots in the user role (the prompt warns
-  against treating synthetic user-role content as authorization); guardian
-  reviews are not cancelled by user turn-cancel mid-review; companion
+  against treating synthetic user-role content as authorization); companion
   (child-agent) asks are not guardian-routed; token budgets on the guardian
-  task are structural (one round, no tools, bounded output bytes) rather
-  than a token ceiling, because companion token budgets count canvas input.
+  task are structural (one round, no tools, bounded output bytes) rather than
+  a token ceiling, because companion token budgets count canvas input.
 
 ## Amendment (2026-07-11): the guardian adjudicates only commands it can see verbatim
 

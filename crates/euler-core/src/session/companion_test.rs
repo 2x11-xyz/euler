@@ -645,6 +645,93 @@ fn companion_events_use_child_agent_and_enter_parent_canvas() {
     assert!(canvas_prompt(&canvas).contains("child answer"));
 }
 
+#[test]
+fn completed_reasoning_companion_resumes_without_model_recovery_closure() {
+    struct ReasoningProvider;
+
+    impl ModelProvider for ReasoningProvider {
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+
+        fn invoke(
+            &self,
+            _request: euler_provider::ModelRequest,
+        ) -> Result<ProviderStream, euler_provider::ProviderError> {
+            Ok(Box::new(
+                vec![
+                    Ok(euler_provider::ModelStreamEvent::ReasoningDelta(
+                        euler_provider::ReasoningChunk::summary("reviewing"),
+                    )),
+                    Ok(euler_provider::ModelStreamEvent::TextDelta(
+                        "child answer".to_owned(),
+                    )),
+                    Ok(euler_provider::ModelStreamEvent::Finished {
+                        stop_reason: StopReason::Completed,
+                        usage: None,
+                    }),
+                ]
+                .into_iter(),
+            ))
+        }
+    }
+
+    let (temp, log, mut session) =
+        session_with_provider(ReasoningProvider, ScriptedDecider::new(Vec::new()));
+    let summary = session
+        .spawn_companion(task_with_caps([]))
+        .expect("companion");
+    let call = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_CALL && event.agent == summary.child_agent_id
+        })
+        .expect("companion model call");
+    let reasoning = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_REASONING
+                && event.agent == summary.child_agent_id
+        })
+        .expect("companion reasoning");
+    let result = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::MODEL_RESULT && event.agent == summary.child_agent_id
+        })
+        .expect("companion model result");
+    assert_eq!(reasoning.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(
+        result.parent.as_deref(),
+        Some(reasoning.id.as_str()),
+        "the durable terminal follows the writer-linear reasoning event"
+    );
+    drop(session);
+
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-companion".to_owned();
+    let outcome = crate::resume::resume_session_with_outcome(
+        config,
+        euler_provider::ProviderSet::single(ScriptedProvider::new(vec![])),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("resume completed companion");
+
+    assert!(!outcome.recovery_closure_appended);
+    assert!(!outcome.session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ERROR
+            && event
+                .payload
+                .get("recovery_closure")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    }));
+}
+
 /// Companion parity: the companion round loop shares the session's canvas
 /// retention policy and emits the same retention telemetry.
 #[test]
@@ -1028,6 +1115,73 @@ fn single_spawn_still_inherits_canvas_by_default() {
     assert!(
         companion.prompt_text().contains("ambient baggage"),
         "default companion lost its parent canvas"
+    );
+}
+
+#[test]
+fn inherited_companion_never_receives_pending_root_continuation() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (_temp, _log, mut session) = session_with_provider(
+        RequestCapture {
+            requests: Arc::clone(&requests),
+        },
+        ScriptedDecider::new(vec![]),
+    );
+    let continuation = "root-only continuation sentinel";
+    let contribution_id = session
+        .emit(
+            EventKind::EXTENSION_CONTRIBUTION,
+            object([
+                ("extension_id", "workflow-ext".into()),
+                ("command", "idle".into()),
+                ("point", "turn-idle".into()),
+                ("action", "continue".into()),
+                ("accepted", true.into()),
+                ("content", continuation.into()),
+            ]),
+        )
+        .expect("accepted root continuation");
+
+    session
+        .spawn_companion(
+            AgentTask::new_inheriting_target("summarise the parent canvas", "default")
+                .expect("task"),
+        )
+        .expect("companion");
+    session.run_turn("consume at the root").expect("root turn");
+    session
+        .run_turn("prove one-shot consumption")
+        .expect("later root turn");
+
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 3);
+    let occurrences = requests
+        .iter()
+        .map(|request| request.prompt_text().matches(continuation).count())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        occurrences,
+        [0, 1, 0],
+        "child must not observe root input; the next root request consumes it exactly once"
+    );
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::CANVAS_SNAPSHOT
+                    && event
+                        .payload
+                        .get("selected_event_ids")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ids| {
+                            ids.iter()
+                                .any(|id| id.as_str() == Some(contribution_id.as_str()))
+                        })
+            })
+            .count(),
+        1,
+        "only the consuming root snapshot selects the continuation"
     );
 }
 

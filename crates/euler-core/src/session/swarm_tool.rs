@@ -18,7 +18,7 @@ use crate::swarm::{resolve_swarm_config, SwarmReviewer, MAX_SWARM_REVIEWERS};
 use crate::GrantSource;
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{ToolCall, ToolDefinition};
-use euler_sdk::Capability;
+use euler_sdk::{CancellationToken, Capability};
 use serde_json::{json, Value};
 use std::time::Instant;
 
@@ -91,13 +91,22 @@ impl<D: PermissionDecider> Session<D> {
         tool_call_event_id: String,
         covered_grant_source: Option<GrantSource>,
         sink: &mut super::EventSink<'_, F>,
+        cancellation: &CancellationToken,
     ) -> Result<(), SessionError>
     where
         F: FnMut(&EventEnvelope),
     {
         let started = Instant::now();
-        let outcome = self.run_code_swarm_review(&call.input);
+        let outcome = self.run_code_swarm_review(&call.input, cancellation);
         let ok = outcome.is_ok();
+        if matches!(
+            &outcome,
+            Err(ReviewToolFailure::Session(SessionError::Cancelled))
+        ) {
+            self.emit_cancelled_tool_result(call, tool_call_event_id, None, Some(started))?;
+            sink.flush(self.bus.events());
+            return Err(SessionError::Cancelled);
+        }
         let mut payload = object([
             ("id", call.id.into()),
             ("name", CODE_SWARM_REVIEW_TOOL.into()),
@@ -131,7 +140,14 @@ impl<D: PermissionDecider> Session<D> {
         Ok(())
     }
 
-    fn run_code_swarm_review(&mut self, input: &Value) -> Result<String, ReviewToolFailure> {
+    fn run_code_swarm_review(
+        &mut self,
+        input: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<String, ReviewToolFailure> {
+        if cancellation.is_cancelled() {
+            return Err(ReviewToolFailure::Session(SessionError::Cancelled));
+        }
         let args = parse_review_tool_args(input).map_err(ReviewToolFailure::Honest)?;
         let Some(extension) = self.code_swarm_extension.clone() else {
             return Err(ReviewToolFailure::Honest(
@@ -168,11 +184,12 @@ impl<D: PermissionDecider> Session<D> {
         // the manifest-grant precedent set by the round observer — the write
         // is the host-mediated consolidated report, not filesystem authority.
         let result = self
-            .execute_extension_command(
+            .execute_extension_command_cancellable(
                 extension.as_ref(),
                 REVIEW_COMMAND,
                 Value::Object(review_input),
                 [Capability::AgentSpawn, Capability::ArtifactWrite],
+                cancellation,
             )
             .map_err(map_execution_error)?;
         Ok(render_review_result(&result))
@@ -270,6 +287,7 @@ fn map_execution_error(error: ExtensionExecutionError) -> ReviewToolFailure {
              pass explicit models"
                 .to_owned(),
         ),
+        ExtensionExecutionError::Cancelled => ReviewToolFailure::Session(SessionError::Cancelled),
         ExtensionExecutionError::Session(error) => ReviewToolFailure::Session(error),
     }
 }

@@ -10,10 +10,10 @@ use crate::file_diff::{
 };
 use crate::permissions::{ApprovalMode, PermissionDecider};
 use crate::redaction::SecretRedactor;
-use crate::tools::{PatchEvents, ToolExecution};
+use crate::tools::{PatchEvents, ToolError, ToolExecution, ToolExecutionOutcome};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::ToolCall;
-use euler_sdk::Capability;
+use euler_sdk::{CancellationToken, Capability};
 use serde_json::Value;
 use std::time::Instant;
 
@@ -27,13 +27,18 @@ impl<D: PermissionDecider> Session<D> {
     where
         F: FnMut(&EventEnvelope),
     {
+        let mut payload = object([
+            ("id", call.id.clone().into()),
+            ("name", call.name.clone().into()),
+            ("input", call.input.clone()),
+        ]);
+        if let Some((extension_id, command)) = self.extension_tool_attribution(&call.name) {
+            payload.insert("extension_id".to_owned(), extension_id.into());
+            payload.insert("command".to_owned(), command.into());
+        }
         let tool_call_event_id = self.emit_with_parent(
             EventKind::TOOL_CALL,
-            object([
-                ("id", call.id.clone().into()),
-                ("name", call.name.clone().into()),
-                ("input", call.input.clone()),
-            ]),
+            payload,
             Some(model_result_id.to_owned()),
         )?;
         self.flag_tool_call_exposure(&tool_call_event_id, &call.input)?;
@@ -48,10 +53,23 @@ impl<D: PermissionDecider> Session<D> {
         tool_call_event_id: String,
         sink: &mut EventSink<'_, F>,
         turn_state: &mut TurnState,
+        cancellation: &CancellationToken,
     ) -> Result<(), SessionError>
     where
         F: FnMut(&EventEnvelope),
     {
+        if cancellation.is_cancelled() {
+            self.emit_cancelled_tool_result(call, tool_call_event_id, None, None)?;
+            return Err(SessionError::Cancelled);
+        }
+        if let Some(binding) = self.active_extension_tool(&call.name) {
+            return self.execute_extension_model_tool(
+                binding,
+                call,
+                tool_call_event_id,
+                cancellation,
+            );
+        }
         let mut covered_grant_source: Option<crate::GrantSource> = None;
         let mut static_safe = false;
         if let Some(capability) = self
@@ -115,13 +133,22 @@ impl<D: PermissionDecider> Session<D> {
                 None
             };
             if covered_grant_source.is_none() && !static_safe {
-                match self.decide_uncovered_permission(
+                let ruling = self.decide_uncovered_permission(
                     &request,
-                    mode,
                     &tool_call_event_id,
                     sink,
                     turn_state,
-                )? {
+                    cancellation,
+                );
+                let ruling = match ruling {
+                    Ok(ruling) => ruling,
+                    Err(SessionError::Cancelled) => {
+                        self.emit_cancelled_tool_result(call, tool_call_event_id, None, None)?;
+                        return Err(SessionError::Cancelled);
+                    }
+                    Err(error) => return Err(error),
+                };
+                match ruling {
                     PermissionRuling::Allowed => {}
                     PermissionRuling::Denied { message } => {
                         self.emit_permission_denied_tool_result(
@@ -135,22 +162,29 @@ impl<D: PermissionDecider> Session<D> {
             }
         }
 
+        if cancellation.is_cancelled() {
+            self.emit_cancelled_tool_result(call, tool_call_event_id, None, None)?;
+            return Err(SessionError::Cancelled);
+        }
         if call.name == super::swarm_tool::CODE_SWARM_REVIEW_TOOL {
             return self.execute_code_swarm_review_tool(
                 call,
                 tool_call_event_id,
                 covered_grant_source,
                 sink,
+                cancellation,
             );
         }
 
         let tool_name = call.name.clone();
         let tool_started = Instant::now();
-        match self
-            .tools
-            .execute_with_events(&call.name, &call.input, self.bus.events())
-        {
-            Ok(execution) => {
+        match self.tools.execute_with_events_cancellable(
+            &call.name,
+            &call.input,
+            self.bus.events(),
+            cancellation,
+        ) {
+            Ok(ToolExecutionOutcome::Completed(execution)) => {
                 // The input format was accepted: reset this tool's re-teach
                 // streak even if a later write fails for environmental
                 // reasons (the streak tracks format competence, issue #94).
@@ -169,15 +203,27 @@ impl<D: PermissionDecider> Session<D> {
                         payload.clone(),
                         Some(tool_call_event_id.clone()),
                     )?;
-                    if let Err(error) = self.tools.apply_patch(patch) {
-                        self.emit_failed_tool_result(
-                            call.id,
-                            execution.name,
-                            error.to_string(),
-                            tool_call_event_id,
-                            tool_started,
-                        )?;
-                        return Ok(());
+                    match self.tools.apply_patch_cancellable(patch, cancellation) {
+                        Ok(()) => {}
+                        Err(ToolError::Cancelled) => {
+                            self.emit_cancelled_tool_result(
+                                call,
+                                tool_call_event_id,
+                                Some(&execution),
+                                Some(tool_started),
+                            )?;
+                            return Err(SessionError::Cancelled);
+                        }
+                        Err(error) => {
+                            self.emit_failed_tool_result(
+                                call.id,
+                                execution.name,
+                                error.to_string(),
+                                tool_call_event_id,
+                                tool_started,
+                            )?;
+                            return Ok(());
+                        }
                     }
                     let patch_applied_id = self.emit_with_parent(
                         EventKind::PATCH_APPLIED,
@@ -199,22 +245,7 @@ impl<D: PermissionDecider> Session<D> {
                         Some(patch_applied_id),
                     )?;
                 }
-                for change in &execution.file_changes {
-                    let file_change_id = self.emit_with_parent(
-                        EventKind::FILE_CHANGE,
-                        observed_file_change_payload(&call.id, "run_shell", change),
-                        Some(tool_call_event_id.clone()),
-                    )?;
-                    let mut observed_diff =
-                        observed_file_diff_payload(&call.id, &file_change_id, "run_shell", change);
-                    self.redactor
-                        .redact_payload_fields(&mut observed_diff, &["diff"]);
-                    self.emit_with_parent(
-                        EventKind::FILE_DIFF,
-                        observed_diff,
-                        Some(tool_call_event_id.clone()),
-                    )?;
-                }
+                self.emit_observed_tool_changes(&call.id, &execution, &tool_call_event_id)?;
                 let mut payload = tool_success_payload(call.id, &execution, &self.redactor);
                 if let Some(source) = covered_grant_source {
                     // Ran under an existing grant — the ledger shows a dim
@@ -236,6 +267,24 @@ impl<D: PermissionDecider> Session<D> {
                     true,
                 );
             }
+            Ok(ToolExecutionOutcome::Cancelled(execution)) => {
+                self.emit_cancelled_tool_result(
+                    call,
+                    tool_call_event_id,
+                    Some(&execution),
+                    Some(tool_started),
+                )?;
+                return Err(SessionError::Cancelled);
+            }
+            Err(ToolError::Cancelled) => {
+                self.emit_cancelled_tool_result(
+                    call,
+                    tool_call_event_id,
+                    None,
+                    Some(tool_started),
+                )?;
+                return Err(SessionError::Cancelled);
+            }
             Err(error) => {
                 // Rung-2 re-teaching (issue #94): repeated consecutive
                 // failures of a formatted tool append its full-format
@@ -254,6 +303,61 @@ impl<D: PermissionDecider> Session<D> {
                     tool_started,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn emit_observed_tool_changes(
+        &mut self,
+        call_id: &str,
+        execution: &ToolExecution,
+        tool_call_event_id: &str,
+    ) -> Result<(), SessionError> {
+        if execution.file_changes.is_empty() {
+            return Ok(());
+        }
+        debug_assert_eq!(execution.name, "run_shell");
+        for change in &execution.file_changes {
+            let file_change_id = self.emit_with_parent(
+                EventKind::FILE_CHANGE,
+                observed_file_change_payload(call_id, "run_shell", change),
+                Some(tool_call_event_id.to_owned()),
+            )?;
+            let mut observed_diff =
+                observed_file_diff_payload(call_id, &file_change_id, "run_shell", change);
+            self.redactor
+                .redact_payload_fields(&mut observed_diff, &["diff"]);
+            self.emit_with_parent(
+                EventKind::FILE_DIFF,
+                observed_diff,
+                Some(tool_call_event_id.to_owned()),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Close one admitted tool call after cancellation. Partial subprocess
+    /// output and workspace effects are evidence, not success: emit them
+    /// before the terminal failed result and mark the result explicitly.
+    pub(super) fn emit_cancelled_tool_result(
+        &mut self,
+        call: ToolCall,
+        tool_call_event_id: String,
+        execution: Option<&ToolExecution>,
+        tool_started: Option<Instant>,
+    ) -> Result<(), SessionError> {
+        if let Some(execution) = execution {
+            self.emit_observed_tool_changes(&call.id, execution, &tool_call_event_id)?;
+        }
+        let payload = tool_cancelled_payload(call.id, call.name.clone(), execution, &self.redactor);
+        self.emit_with_parent(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
+        if let Some(tool_started) = tool_started {
+            crate::diagnostics::tool_exec_end(
+                &self.config.session_id,
+                &call.name,
+                elapsed_ms(tool_started),
+                false,
+            );
         }
         Ok(())
     }
@@ -317,6 +421,41 @@ pub(crate) fn tool_success_payload(
     }
     if let Some(exit_code) = execution.exit_code {
         payload.insert("exit_code".to_owned(), exit_code.into());
+    }
+    payload
+}
+
+pub(crate) fn tool_cancelled_payload(
+    call_id: String,
+    name: String,
+    execution: Option<&ToolExecution>,
+    redactor: &SecretRedactor,
+) -> JsonObject {
+    let mut payload = object([
+        ("id", call_id.into()),
+        ("name", name.into()),
+        ("ok", false.into()),
+        ("error", "tool cancelled".into()),
+        ("cancelled", true.into()),
+    ]);
+    if let Some(execution) = execution {
+        payload.insert(
+            "output".to_owned(),
+            redactor.redact(&execution.output).into(),
+        );
+        if let Some(exit_code) = execution.exit_code {
+            payload.insert("exit_code".to_owned(), exit_code.into());
+        }
+        if let Some(budget) = execution.output_preview_budget {
+            payload.insert(
+                "output_preview_max_bytes".to_owned(),
+                budget.max_bytes.into(),
+            );
+            payload.insert(
+                "output_preview_max_lines".to_owned(),
+                budget.max_lines.into(),
+            );
+        }
     }
     payload
 }

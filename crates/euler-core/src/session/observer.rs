@@ -4,10 +4,9 @@
 use super::{elapsed_ms, AgentResultSummary, Session};
 use crate::permissions::PermissionDecider;
 use euler_agents::{AgentBudget, AgentTask};
-use euler_sdk::Extension;
+use euler_sdk::{CancellationToken, Extension};
 use serde_json::{json, Value};
 use std::num::NonZeroU64;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 const DEFAULT_OBSERVER_PERSONA: &str = "round-observer";
@@ -35,7 +34,7 @@ pub struct RoundObserverConfig {
 impl<D: PermissionDecider> Session<D> {
     /// Fail-open by contract: any brief/companion/apply failure is recorded
     /// to diagnostics and never fails the driver turn.
-    pub(super) fn observe_round_boundary(&mut self, rounds: u64, cancel_flag: &AtomicBool) {
+    pub(super) fn observe_round_boundary(&mut self, rounds: u64, cancellation: CancellationToken) {
         let Some(config) = self.config.round_observer.clone() else {
             return;
         };
@@ -50,7 +49,7 @@ impl<D: PermissionDecider> Session<D> {
         };
         let started = Instant::now();
         let failed_stage = self
-            .run_observer_chain(&config, extension.as_ref(), cancel_flag)
+            .run_observer_chain(&config, extension.as_ref(), &cancellation)
             .err();
         crate::diagnostics::round_observer_end(
             &self.config.session_id,
@@ -64,15 +63,16 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         config: &RoundObserverConfig,
         extension: &dyn Extension,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<(), &'static str> {
         let granted = extension.manifest().capabilities;
         let brief = self
-            .execute_extension_command(
+            .execute_extension_command_cancellable(
                 extension,
                 &config.brief_command,
                 Value::Null,
                 granted.iter().copied(),
+                cancellation,
             )
             .map_err(|_| "brief")?;
         let Some((task, apply)) = observer_task(&brief)? else {
@@ -86,11 +86,17 @@ impl<D: PermissionDecider> Session<D> {
         // session and reject every spawn. All writes happen in the apply
         // command, which core executes with the extension's manifest grant.
         let summary = self
-            .spawn_companion_with_cancel(task, cancel_flag)
+            .spawn_companion_with_cancel(task, cancellation.clone())
             .map_err(|_| "companion")?;
         let input = json!({ "apply": apply, "companion": companion_payload(&summary) });
-        self.execute_extension_command(extension, &config.apply_command, input, granted)
-            .map_err(|_| "apply")?;
+        self.execute_extension_command_cancellable(
+            extension,
+            &config.apply_command,
+            input,
+            granted,
+            cancellation,
+        )
+        .map_err(|_| "apply")?;
         Ok(())
     }
 }

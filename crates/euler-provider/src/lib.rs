@@ -29,6 +29,7 @@ mod test_support;
 
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -438,6 +439,7 @@ impl ProviderErrorCategory {
 pub struct ProviderError {
     category: ProviderErrorCategory,
     message: String,
+    request_outcome_unknown: bool,
 }
 
 impl ProviderError {
@@ -445,6 +447,7 @@ impl ProviderError {
         Self {
             category,
             message: message.into(),
+            request_outcome_unknown: false,
         }
     }
 
@@ -468,12 +471,25 @@ impl ProviderError {
         Self::new(ProviderErrorCategory::StreamTruncation, message)
     }
 
+    /// The detached provider request thread panicked after dispatch may have
+    /// begun. Callers must not interpret this as an ordinary provider
+    /// rejection or replay the request: the remote outcome is unknown.
+    pub fn request_worker_panicked() -> Self {
+        let mut error = Self::stream_truncation("provider request worker panicked");
+        error.request_outcome_unknown = true;
+        error
+    }
+
     pub fn category(&self) -> ProviderErrorCategory {
         self.category
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn request_outcome_unknown(&self) -> bool {
+        self.request_outcome_unknown
     }
 }
 
@@ -541,9 +557,31 @@ impl ModelProvider for Box<dyn ModelProvider> {
     }
 }
 
+#[derive(Clone)]
 pub struct ProviderSet {
-    providers: BTreeMap<String, Box<dyn ModelProvider>>,
+    providers: BTreeMap<String, Arc<dyn ModelProvider>>,
     model_catalog: catalog::MergedModelCatalog,
+}
+
+/// Read-only cancellation probe supplied by the owning runtime.
+///
+/// Provider adapters stay independent of the extension SDK; the session
+/// closes over its canonical token at this boundary.
+#[derive(Clone)]
+pub struct CancellationCheck {
+    check: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl CancellationCheck {
+    pub fn new(check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            check: Arc::new(check),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        (self.check)()
+    }
 }
 
 impl Default for ProviderSet {
@@ -600,7 +638,7 @@ impl ProviderSet {
         P: ModelProvider + 'static,
     {
         let name = provider.name().to_owned();
-        self.providers.insert(name, Box::new(provider)).is_some()
+        self.providers.insert(name, Arc::new(provider)).is_some()
     }
 
     pub fn insert_named<P>(&mut self, provider_id: impl Into<String>, provider: P) -> bool
@@ -608,7 +646,7 @@ impl ProviderSet {
         P: ModelProvider + 'static,
     {
         self.providers
-            .insert(provider_id.into(), Box::new(provider))
+            .insert(provider_id.into(), Arc::new(provider))
             .is_some()
     }
 
@@ -673,11 +711,126 @@ impl ProviderSet {
         provider.invoke(request)
     }
 
+    /// Drive one provider call behind a cancellation-aware event boundary.
+    ///
+    /// Provider adapters are synchronous today: both opening an HTTP response
+    /// and waiting for the next stream item may block. Running that work on a
+    /// request-owned thread lets the session stop admitting events as soon as
+    /// turn cancellation is published. The worker advances the provider
+    /// stream only after the session requests one item, sees the same flag
+    /// before forwarding it, and loses its channel when the returned stream
+    /// is dropped. There is therefore no read-ahead or stale completion path.
+    ///
+    /// This is a session/event-boundary guarantee, not physical I/O
+    /// preemption. A synchronous adapter blocked inside `invoke` or
+    /// `Iterator::next` may keep this detached request thread alive until its
+    /// underlying network/OS call returns; it can no longer publish into the
+    /// cancelled session.
+    pub fn invoke_interruptibly(
+        &self,
+        provider: &str,
+        request: ModelRequest,
+        cancellation: CancellationCheck,
+    ) -> Result<ProviderStream, ProviderError> {
+        let Some(provider) = self.providers.get(provider).cloned() else {
+            return Err(ProviderError::rejected(format!(
+                "provider is not configured: {provider}"
+            )));
+        };
+        let stream_cancellation = cancellation.clone();
+        let (demand_sender, demand_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("euler-provider-call".to_owned())
+            .spawn(move || {
+                let panic_sender = event_sender.clone();
+                let panic_cancellation = cancellation.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    if cancellation.is_cancelled() {
+                        return;
+                    }
+                    let mut stream = match provider.invoke(request) {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            if !cancellation.is_cancelled() {
+                                let _ = event_sender.send(Err(error));
+                            }
+                            return;
+                        }
+                    };
+                    loop {
+                        if demand_receiver.recv().is_err() {
+                            return;
+                        }
+                        if cancellation.is_cancelled() {
+                            return;
+                        }
+                        let Some(event) = stream.next() else {
+                            return;
+                        };
+                        if cancellation.is_cancelled() || event_sender.send(event).is_err() {
+                            return;
+                        }
+                    }
+                }));
+                if outcome.is_err() && !panic_cancellation.is_cancelled() {
+                    let _ = panic_sender.send(Err(ProviderError::request_worker_panicked()));
+                }
+            })
+            .map_err(|_| ProviderError::transport("failed to start provider request"))?;
+        Ok(Box::new(InterruptibleProviderStream {
+            demand_sender,
+            event_receiver,
+            cancellation: stream_cancellation,
+        }))
+    }
+
     /// Install `sink` on every configured provider so request-time secret
     /// resolution reports each value to the host (see [`ResolvedSecretSink`]).
     pub fn install_resolved_secret_sink(&self, sink: ResolvedSecretSink) {
         for provider in self.providers.values() {
             provider.set_resolved_secret_sink(std::sync::Arc::clone(&sink));
+        }
+    }
+}
+
+const INTERRUPTIBLE_STREAM_POLL: Duration = Duration::from_millis(10);
+
+struct InterruptibleProviderStream {
+    demand_sender: mpsc::Sender<()>,
+    event_receiver: mpsc::Receiver<Result<ModelStreamEvent, ProviderError>>,
+    cancellation: CancellationCheck,
+}
+
+impl Iterator for InterruptibleProviderStream {
+    type Item = Result<ModelStreamEvent, ProviderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+        if self.demand_sender.send(()).is_err() {
+            // Opening the provider can fail before the consumer requests its
+            // first item. The worker publishes that terminal error and exits,
+            // so its demand receiver may already be gone while the error is
+            // still buffered here. Do not turn that valid error into an
+            // apparent truncated stream.
+            return match self.event_receiver.try_recv() {
+                Ok(_) if self.cancellation.is_cancelled() => None,
+                Ok(event) => Some(event),
+                Err(_) => None,
+            };
+        }
+        loop {
+            if self.cancellation.is_cancelled() {
+                return None;
+            }
+            match self.event_receiver.recv_timeout(INTERRUPTIBLE_STREAM_POLL) {
+                Ok(_) if self.cancellation.is_cancelled() => return None,
+                Ok(event) => return Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
         }
     }
 }
@@ -906,5 +1059,29 @@ mod tests {
         assert!(!providers.insert(EchoProvider));
         assert!(providers.insert(EchoProvider));
         assert!(providers.contains("fixture"));
+    }
+
+    #[test]
+    fn interruptible_stream_keeps_an_open_error_after_the_worker_exits() {
+        let (demand_sender, demand_receiver) = mpsc::channel();
+        drop(demand_receiver);
+        let (event_sender, event_receiver) = mpsc::channel();
+        event_sender
+            .send(Err(ProviderError::rejected("open failed")))
+            .expect("buffer provider error");
+        drop(event_sender);
+        let mut stream = InterruptibleProviderStream {
+            demand_sender,
+            event_receiver,
+            cancellation: CancellationCheck::new(|| false),
+        };
+
+        let error = stream
+            .next()
+            .expect("buffered provider error")
+            .expect_err("provider error");
+
+        assert_eq!(error.category(), ProviderErrorCategory::Rejected);
+        assert!(stream.next().is_none());
     }
 }

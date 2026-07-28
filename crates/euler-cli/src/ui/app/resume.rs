@@ -21,6 +21,10 @@ impl AppCore {
     /// bottom-surface rebuild: listing reads each session's event log, which
     /// is far too slow for the submit hot path.
     pub(super) fn open_resume_picker(&mut self) -> CoreEffect {
+        if self.unresolved_admission_blocks_lifecycle() {
+            return self
+                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        }
         let items = support::resume_items_from_home(self.status.session_id.as_deref());
         self.bottom
             .open_picker(crate::ui::commands::PickerSpec::Resume(items));
@@ -39,8 +43,15 @@ impl AppCore {
                 return self.teach_notice("resume needs an active session".to_owned())
             }
         };
+        if self.unresolved_admission_blocks_lifecycle() {
+            return self
+                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        }
         if current_session_id == session_id {
             return self.teach_notice(format!("already using session {session_id}"));
+        }
+        if let Err(error) = self.cancel_idle_compaction_for_lifecycle("session resume") {
+            return self.error_item(format!("resume failed: {error}"));
         }
 
         match self.build_tui_resume(&session_id) {
@@ -149,7 +160,7 @@ impl AppCore {
         if let Some((_, extension)) = observer {
             session.set_observer_extension(extension);
         }
-        crate::cli::extension_run::wire_code_swarm(&mut session);
+        crate::cli::extension_run::wire_session_extensions(&mut session);
         let events = session.events().to_vec();
         let events_replayed = outcome.events_folded;
         Ok(TuiResume {
@@ -170,10 +181,15 @@ impl AppCore {
         session_id: String,
         resume: TuiResume,
     ) -> CoreEffect {
+        if self.unresolved_admission_blocks_lifecycle() {
+            return self
+                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        }
         let reasoning_effort = resume.session.reasoning_effort();
         let primary_agent_id = session_primary_agent_id(&resume.session);
         self.permission_rx = resume.channels.request_rx;
-        self.reply_tx = resume.channels.reply_tx;
+        self.reply_tx = inactive_permission_reply_sender();
+        self.active_permission_cancellation = None;
         self.primary_agent_id = primary_agent_id;
         self.install_state(AppState::Idle {
             session: Box::new(resume.session),

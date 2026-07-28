@@ -766,7 +766,8 @@ fn background_agent_report_persistence_failure_retries_before_later_reports() {
         .expect("spawn background");
     poll_until_recorded(&mut session, &mut background);
 
-    fs::remove_file(fixture.log()).expect("remove log file");
+    let backup = fixture.root().join("events.backup.jsonl");
+    fs::rename(fixture.log(), &backup).expect("back up accepted log");
     fs::create_dir(fixture.log()).expect("replace log with directory");
     assert!(matches!(
         session
@@ -777,6 +778,7 @@ fn background_agent_report_persistence_failure_retries_before_later_reports() {
     assert_eq!(agent_message_count(session.events()), 0);
 
     fs::remove_dir(fixture.log()).expect("remove blocking directory");
+    fs::rename(&backup, fixture.log()).expect("restore accepted log");
     let first_id = drain_until_drained(&mut session, &mut background);
     let second_id = drain_until_drained(&mut session, &mut background);
     let steps = [first_id, second_id]

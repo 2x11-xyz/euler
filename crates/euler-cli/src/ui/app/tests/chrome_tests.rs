@@ -1079,6 +1079,42 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
 }
 
 #[test]
+fn cancelled_model_call_error_does_not_poison_the_in_flight_hud() {
+    let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 12), 12)
+        .expect("inline terminal");
+    let mut core = core();
+    let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
+        panic!("core should start idle");
+    };
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(true)),
+        started_at: Instant::now() - Duration::from_secs(2),
+    };
+
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::ERROR,
+        object([
+            ("source", "session".into()),
+            ("message", "model call cancelled".into()),
+            ("cancelled", true.into()),
+        ]),
+    )));
+    render_compact_frame(&mut terminal, &mut core);
+
+    assert!(core.in_flight_error.is_none());
+    let frame = terminal.backend().screen_contents();
+    assert!(!frame.contains("turn failed"));
+    assert!(!frame.contains("model call cancelled"));
+
+    core.handle_turn_event(TurnEvent::TurnDone {
+        outcome: TurnOutcome::Cancelled,
+        session,
+    });
+}
+
+#[test]
 fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     let mut terminal = crate::ui::terminal::InlineTerminal::new(VT100Backend::new(80, 12), 12)
         .expect("inline terminal");

@@ -10,6 +10,13 @@ Derived research structures, such as causal DAGs, are projections or extension a
 
 Provenance uses the canonical session event envelope in `docs/contracts/events.md`. Persistence policy, durability semantics (emitted/appended/durable), and schema versioning are defined in `docs/contracts/persistence.md`.
 
+Accepted event ids are globally unique within a session stream. A duplicate
+makes request links and causal references ambiguous, so resume rejects the
+prefix during canonical preflight before recovery closures, resume markers, or
+continued activity can mutate the log. Inspection projections remain readable
+where possible but must fail closed instead of granting authority to the
+colliding id.
+
 ## Writer Ownership
 
 A live session log has one owning `ProvenanceWriter`. Creating a second writer
@@ -46,6 +53,51 @@ process. This is an append integrity guarantee, not an observer lifecycle API:
 it does not provide scheduling, cancellation, durable subscriptions, checkpoint
 compare-and-swap, or automatic recovery of background work.
 
+The writer tracks both its confirmed byte length and durable parent tail. Once
+an append has started writing, any write, flush, file-sync, or directory-sync
+failure leaves that exact logical batch unresolved, including a pending resume
+marker. Only a retry carrying the same event ids and exact envelopes may
+reconcile it. A complete matching suffix is re-synced and committed without
+being appended again; an absent suffix is written again only at the unchanged
+confirmed byte offset. A partial, changed, or extra suffix fails closed without
+truncation. Until reconciliation succeeds, unrelated appends, resume-marker
+changes, and log rewrites such as scrub are rejected.
+
+An authoritative queued `user.message` installs its exact pending envelope and
+opaque queue-instance/row identity before flushing any older accepted bus
+suffix. Thus an ambiguous backlog sync has an owner just as an ambiguous
+candidate sync does. Until that exact retry reconciles, unrelated admissions
+and control writes are fenced, the row cannot be edited or cleared, and a live
+session cannot be replaced by `/new` or `/resume`.
+
+The durable tail, append diagnostics, and event-wake notification advance only
+after the matching bytes have passed both file and containing-directory sync.
+An append that externalizes a blob does not open the log until the blob file
+and blob directory have both synced. A matching content-addressed blob is
+re-synced together with its directory on every retry: matching bytes establish
+identity but cannot prove that an earlier rename survived a failed directory
+sync.
+Opening a log with a readable final fragment may recover its newline-terminated
+prefix for inspection, but the raw-length mismatch fences every new append.
+
+If a shadow worker is detached while an unresolved authoritative admission
+prevents its terminal event, that live session rejects every later
+authoritative write. Reopening is the recovery boundary: before arming the
+resume marker or admitting new activity, Euler appends a parented
+`recovery_closure` error for every accepted `model.call` without a semantic
+terminal association. Semantic terminals are `model.result`, provider errors,
+and session errors explicitly marked as cancellation or recovery; an extension
+or ordinary session error whose linear parent happens to be an asynchronous
+call does not close it. This also covers a shadow call followed by later
+accepted events or by a physically complete user admission whose final sync
+was ambiguous. The closure reports an unknown outcome rather than replaying
+the request or claiming a confirmed cancellation. Terminal-to-call association
+is defined authoritatively by the actor/order rule in
+`docs/contracts/events.md`; provenance readers must not treat a crossed-agent
+writer-linear parent as terminal authority, and resume rejects a direct or
+otherwise unambiguous writer-linear duplicate terminal before appending any
+recovery mutation.
+
 The owning writer is also the sole owner of the durable parent tail. For every
 post-D2 append, an event without an explicit semantic parent is parented to the
 previously persisted event in the same session log, or to null when there is no
@@ -61,7 +113,10 @@ requires updating this contract and adding tests. A semantic-parent event still
 advances the linear spine: its successor in the batch (or the next append)
 parents the semantic event's id, not the event before it. This linear parent
 chain is an honesty spine, not the causal DAG; richer causal structure belongs
-in extension artifacts that cite event ids as evidence.
+in extension artifacts that cite event ids as evidence. Consequently,
+sequential-companion and parallel-reviewer `model.reasoning`, `model.result`,
+and model-terminal `error` events remain writer-linear; they do not gain an
+implicit semantic-parent exception.
 
 Legacy parent ids are immutable historical record. Opening an existing log seeds
 the writer tail from the final accepted persisted event id only; it does not

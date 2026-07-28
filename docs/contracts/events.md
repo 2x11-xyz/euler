@@ -24,6 +24,12 @@ Every session event has:
 
 Large payloads are stored as content-addressed blobs and referenced from `blobs`.
 
+Event ids are globally unique within one accepted session stream. Resume
+rejects a prefix containing any duplicate id before appending recovery or
+continued activity. Projections that can inspect an unresumable stream must
+independently refuse to treat a duplicated id as selection or request-link
+authority.
+
 ## Initial Event Kinds
 
 - `user.message`
@@ -60,6 +66,7 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `secret.exposure.detected`
 - `secret.scrubbed`
 - `extension.artifact`
+- `extension.contribution`
 - `agent.spawn`
 - `agent.message`
 - `agent.result`
@@ -84,11 +91,96 @@ envelope `v` per `docs/contracts/persistence.md`.
 
 - `user.message`: `content`. A turn is not limited to one: mid-turn
   steering (issue #146) appends additional `user.message` events at round
-  boundaries — after a completed round's tool results, always between
+  boundaries — after a completed tool round's results or after the committed
+  `assistant.message` of a no-tool round. They are always between model
   rounds, never inside a streamed assistant message. Request assembly
   positions them like any other event, and readers must not assume a turn
-  has exactly one leading user message.
-- `assistant.message`: `content`.
+  has exactly one leading user message. Queue entries are removed only after
+  this event is durable: both mid-turn absorption and queued-turn dispatch
+  reserve by id first, and append failure leaves the entry queued. A queue-entry
+  id is opaque and includes both the queue instance and its row sequence; a
+  same-position, same-content row from another queue is never the same
+  reservation. Admission installs the pending candidate — including its exact
+  envelope id, timestamp, parent, payload, and originating queue-entry id —
+  before attempting to persist any older accepted backlog. It then reconciles
+  that backlog, appends the candidate, and only then publishes the candidate to
+  the live bus. A failure in either append protects the same pending owner, and
+  a rejected candidate is never an accepted in-memory event. Only that exact
+  queue row with the same payload may retry it. Remove/edit/clear protect the
+  unresolved entry, and dispatch selects it before any row inserted later,
+  even when another row has identical content. Repair and retry therefore
+  reconcile that event exactly once instead of persisting a failed bus copy or
+  acknowledging a content-equal duplicate.
+- `assistant.message`: `content`. It commits the visible content of a
+  no-tool model round. Pending steering may keep that same user turn active,
+  append more `user.message` events, and dispatch another model round only
+  when the explicit round budget can admit that request. At the final allowed
+  round, the terminal transaction closes the steering group without persisting
+  queued steering; rows submitted before that close remain deferred, and rows
+  submitted after it are ordinary follow-ups.
+- `model.call`: `provider`, `model`, `canvas_items`,
+  `requested_reasoning_effort`; optional resolved `reasoning_effort`,
+  `max_output_tokens`, and `project_context_digest`. A root-driver call also
+  carries `canvas_snapshot_id`, naming the exact preceding purpose-free
+  `canvas.snapshot` used to build that request. It must name the latest earlier
+  purpose-free snapshot for the call's exact envelope `session` and `agent`;
+  stale, future, duplicated, or crossed-identity links have no authority. The
+  snapshot's `selected_event_ids` are unique, their checked length exactly
+  equals `counts.items`, and that count equals `model.call.canvas_items`.
+  Shadow-compaction calls use `purpose:
+  "compaction"` and do not carry this root-driver link; companion and reviewer
+  calls use their own actors and cannot claim a root snapshot.
+  Every accepted call has
+  exactly one semantic terminal association: `model.result` on a drained
+  finished stream, or a terminal `error`. Cancellation before a result records
+  the safe error payload `source: "session"`, `message: "model call
+  cancelled"`, and `cancelled: true`. Cancellation after a `model.result`
+  never adds a second terminal. A model-terminal `error` is specifically a
+  provider error, a session error with `cancelled: true`, or a session error with
+  `recovery_closure: true`; an extension, guardian, or ordinary session error
+  that merely receives a linear parent of an asynchronous call does not settle
+  it.
+
+  **Authoritative terminal association rule:** scan accepted events in order
+  while tracking open `model.call` events. A terminal whose `parent` names an
+  open call from the same envelope `agent` settles that call. Otherwise it may
+  settle only the unique open call from the same `agent` whose recorded
+  `provider`/`model` match when the terminal carries those fields and whose
+  `purpose` matches exactly (including both sides omitting it). With no
+  candidate, the terminal settles no call; multiple candidates make the
+  history incompatible and resume fails closed. A direct terminal naming an
+  already closed same-agent call is a duplicate and makes the history
+  incompatible. When no call is open, a writer-linear terminal that uniquely
+  matches an already closed same-agent call is likewise rejected as a
+  duplicate; it is never ignored or allowed to settle later work. This
+  actor/order rule is necessary because sequential companions and parallel
+  reviewers use the writer-owned linear spine:
+  reasoning and terminal events may durably parent a preceding reasoning event
+  or another reviewer's event rather than their logical call. A crossed-agent
+  linear parent is never authority.
+
+  Resume applies this rule and closes every call left open
+  with a parented `error` carrying `source: "session"` and
+  `recovery_closure: true`; the message says that the call was interrupted and
+  its outcome is unknown. The closure preserves an originating `purpose`
+  (including `"compaction"`), but does not claim `cancelled: true`: restart
+  cannot know whether the remote provider completed. All such closures are
+  durable before the resume marker is armed or a new user turn is admitted.
+- `plan.update`: canonical extension updates carry `source: "extension"`,
+  host-derived `extension_id` and `command`, positive `revision`, overall
+  `status` (`active` | `blocked` | `waiting` | `completed`), `explanation`
+  (bounded string or null), a nonempty bounded `items` array of
+  `{ step, status }` (`pending` | `in_progress` | `completed`), and a
+   host-derived compatibility `summary`. The owning writer parents it to the
+  durable tail at emission. It is transcript presentation, never direct
+  canvas input. The host treats an exact normalized retry of the latest
+  canonical event for the same extension as success without another event;
+  comparison ignores `command` but includes revision, status, explanation,
+  items, and summary. This no-op requires a settled provenance writer; an
+  unresolved same-writer append remains fenced until exact reconciliation or
+  lifecycle reopen. Changed content at the same revision and identical content
+   from a different extension remain distinct events. Legacy summary/content-
+   only events remain renderable.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
@@ -106,6 +198,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   Optional `recovery_closure: true` marks a resume-time canonical closure for
   an interrupted tail `tool.call`; it records the resume observation, not the
   original tool outcome.
+  Optional `cancelled: true` marks a live cancellation closure. Every
+  `tool.call` already accepted from one provider batch that has no terminal
+  result receives exactly one terminal failed result in batch order, including
+  calls that had not started and a call cancelled while waiting for permission.
+  A running subprocess result retains collected partial output, exit code, and
+  any observed file changes completed before its owned process group was
+  stopped. The ordinary-shell workspace observation remains bounded by the
+  frozen file-snapshot limits in the tool/UI contracts.
   Optional `grant_source` (`"session"` | `"project"`) marks a run covered by
   an existing scoped grant; optional `static_safe: true` marks a run
   auto-approved by static command-safety analysis (see
@@ -113,6 +213,12 @@ envelope `v` per `docs/contracts/persistence.md`.
   on the tool header, not fresh decisions.
   This payload is the canonical tool-result shape; provider adapters map
   exactly this shape onto their wire formats.
+  Extension-backed model-tool calls/results additionally carry host-derived
+  `extension_id` and `command`. A causally descended, identically attributed
+  `plan.update` lets the TUI suppress the successful generic JSON result row
+  only when the originating call and result also carry the same nonempty
+  provider call `id`; provenance retains the complete braid and failures or
+  malformed/mismatched results remain visible.
 - `permission.prompt`: `capability`, `reason`. An operation-level extension
   prompt retains that primary capability for compatibility and adds
   `capabilities` (the complete, ordered, distinct capability list),
@@ -152,6 +258,17 @@ envelope `v` per `docs/contracts/persistence.md`.
     guardian's read of user authorization, present when the verdict parsed.
   - `rationale`: short guardian rationale for the outcome (also present on
     fail-closed denials, where it names the failure instead of a verdict).
+- `extension.contribution`: `extension_id`, `command`, `point` (currently
+  `"turn-idle"`), `action` (`"stop"` or `"continue"`), and `accepted`.
+  An accepted continue additionally carries redacted `content`; an unaccepted
+  action carries `reason` (`"user-pending"`, `"cancelled"`, or
+  `"authority-unavailable"`) and no content. Missing standing authority is an
+  expected idle stop, not an `error` event.
+  Only an accepted continue projects into the model canvas, with core-generated
+  extension framing. It remains eligible until an accepted same-agent
+  root-driver `model.call` binds the exact purpose-free `canvas.snapshot` that
+  selected it, then becomes provenance-only. A prepared snapshot with no
+  accepted call consumes nothing. It is never reclassified as `user.message`.
 - `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file
@@ -216,11 +333,16 @@ envelope `v` per `docs/contracts/persistence.md`.
   name the exact fixed root instructions used for that call. The full text is
   also present when this is the first occurrence of that instruction identity
   in the stream. They are request audit metadata and are not model-canvas
-  content. Optional
+  content. Root-driver calls additionally carry the exact
+  `canvas_snapshot_id`; root-agent shadow calls do not. Optional
   `project_context_digest` (ADR 0017) is the versioned rendered-context
   digest, recorded only when those exact core-framed bytes occur in the
   provider-neutral request being dispatched (no TOCTOU between snapshot and
   prompt assembly); absent whenever the request carries no project context.
+  A shadow projection request adds `purpose: "compaction"`,
+  `tools_enabled: false`, and `shadow_snapshot_end_id`. It is canonical
+  provenance and cost-bearing model activity, but is excluded from the driver
+  transcript/canvas and active-context usage reading.
 - `model.effort.changed`: `from_effort`, `to_effort`, `reason`.
   (provider-scoped string, emitted and stored verbatim — core does not
   normalize; examples non-exhaustive: `"low"` | `"medium"` | `"high"`, with
@@ -236,6 +358,9 @@ envelope `v` per `docs/contracts/persistence.md`.
   leaves all four buckets absent when the provider reports only an aggregate
   cache-write count whose TTL cannot be established; it must not assign that
   count to a cheaper bucket. Optional
+  `purpose: "compaction"` matches the originating shadow `model.call`; its
+  usage contributes to session cost but never replaces the driver canvas's
+  active-context reading. Optional
   `cost` is a V1 persisted quote with `schema_version: 1`, `currency: "USD"`,
   `unit: "picodollar"`, exact integer `input_picos`, `output_picos`,
   `cache_read_picos`, `cache_write_5m_picos`, `cache_write_1h_picos`, and
@@ -256,7 +381,8 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `model.reasoning`: `provider`, `model`, `fidelity`
   (`raw` | `summary` | `opaque`), `content` (empty for opaque),
   optional provider-opaque `artifact` (signature/encrypted item,
-  blob-externalized when large).
+  blob-externalized when large), and optional `purpose: "compaction"` when
+  parented to a shadow projection call.
 - `model.delta`: `kind` (`text` | `reasoning`), `delta`. Runtime-only.
 - `model.switched`: `from_provider`, `from_model`, `to_provider`,
   `to_model`, `reason`. Provider fields are stable provider ids; model
@@ -275,16 +401,20 @@ envelope `v` per `docs/contracts/persistence.md`.
   latest `model.result.usage`; `limit_tokens` is the model's context
   window from provider/model configuration; `threshold` is the configured
   fraction of `limit_tokens` that triggers the stop. Emitted once; the
-  session then stops cleanly (survivability first; automatic compaction follows). If a
-  provider stops with `max_tokens` mid-call, that is recorded in
+  session then stops cleanly. Automatic compaction is attempted before this
+  stop; an already-running shadow candidate is awaited at the hard margin,
+  and only a failed, invalid, or unavailable candidate falls through to
+  `context.limit`. If a provider stops with `max_tokens` mid-call, that is recorded in
   `model.result.stop_reason`; `context.limit` may still follow at the
   boundary.
 - `context.slot.updated`: `extension_id`, `slot`, `content`. Records a
   host-mediated extension context slot update. `extension_id` is assigned by the
   host from the calling extension, `slot` uses the event-feed checkpoint name
   grammar, and `content` is UTF-8 text capped at 4096 bytes. Control characters
-  other than newline are rejected. Empty `content` deletes the slot. Slot
-  payloads are below the blob externalization threshold and remain inline.
+  other than newline, Unicode `Cf`, and `Zl`/`Zp` are rejected. Empty
+  `content` deletes the slot. Slot payloads remain inline. Durable state is
+  retained while the owner is disabled, but live snapshots project it only
+  while that extension id is enabled.
 - `project.context.relocated` (schema version 1; ADR 0017,
   `docs/contracts/project-context.md`, issue #180 phase 3): records an
   accepted resume relocation and carries:
@@ -440,7 +570,12 @@ envelope `v` per `docs/contracts/persistence.md`.
   `over_budget`, and `pressure` (`none`|`byte`|`token`|`both`). Optional
   `used_tokens` and `limit_tokens` are included when provider usage and a
   configured context limit are known. Snapshot fields are assembly telemetry
-  for the next model request; they do not rewrite provenance history.
+  for the next model request; they do not rewrite provenance history or consume
+  one-shot input by themselves. An accepted root-driver `model.call` binds the
+  exact request snapshot through `canvas_snapshot_id` only under the unique,
+  latest, same-session/agent accounting rule above.
+  A fixed shadow-compaction snapshot adds `purpose: "compaction"` and
+  `shadow_snapshot_end_id`.
 - `canvas.policy.changed`: `automatic`, `stubs`, and `budget_bytes`. It records
   a user/configuration change to the two live retention switches. The event is
   session-level control metadata; it does not change or delete provenance.
@@ -452,7 +587,13 @@ envelope `v` per `docs/contracts/persistence.md`.
   the first event kept verbatim after the projection, policy/schema versions
   name the compaction and projection formats, `projection_blob` carries the
   projection text or hash reference, and `validation_result` is `pass` or a
-  short validation outcome.
+  short validation outcome. Layer-1 swaps add
+  `layer1_compacted_event_ids`; those IDs accumulate after the latest full
+  projection. A model-produced full projection adds `summary_source: "model"`,
+  `compactor_provider`, `compactor_model`, and `compaction_elapsed_ms`.
+  Only a structurally valid swap invalidates the preceding provider-usage
+  sample and context-limit latch. Live canvas assembly, live accounting, and
+  resume folding share one validator; malformed swaps remain inert provenance.
 - `canvas.candidate.discarded`: `reason`, `policy_version`. It records a
   rejected shadow compaction candidate at the turn boundary; `reason` is a
   short non-secret validation failure and `policy_version` names the
@@ -461,6 +602,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   `transport` | `rate_limit` | `rejected` | `stream_truncation` |
   `internal`) carrying the provider error taxonomy from
   `docs/contracts/provider.md` when the source is a provider. When
+  a shadow projection request fails, `purpose: "compaction"` attributes the
+  error to that request; it remains provenance-only while the TUI reports the
+  compact failure without replacing the driver transcript or driver-failure
+  HUD. Session-owned cancellation uses `source: "session"` with the same
+  purpose and terminally closes the shadow `model.call`. A resume-time
+  `source: "session"` error may instead carry `recovery_closure: true`; it
+  terminally records the unknown outcome of an interrupted model call and
+  preserves the call's optional `purpose` without asserting `cancelled`. When
   `source` is `extension`, optional `extension_id`, `command`, and
   `failure` (`command_error` | `panic`) fields attribute the host-observed
   failure. Extension error messages in persisted events are host-generated
@@ -524,8 +673,12 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `file.diff` parents the same event as the matching `file.change`. It is a
   sibling display projection, not the parent of `tool.result`. Its
   `file_change_id` references the matching `file.change`.
-- `model.result`, `model.reasoning`, and `model.delta` parent their
-  `model.call`.
+- Root-driver `model.result`, `model.reasoning`, and runtime-only
+  `model.delta` directly parent their logical `model.call`. Sequential
+  companion and parallel-reviewer persisted events instead follow the
+  writer-owned linear spine and may parent preceding reasoning or another
+  reviewer's event. Model terminal identity is governed only by the
+  authoritative association rule in the `model.call` schema above.
 - `assistant.message` parents its `model.result`.
 - `model.switched`, `model.effort.changed`, `context.limit`,
   `context.slot.updated`, `canvas.policy.changed`, `canvas.swap`, and
@@ -564,8 +717,11 @@ envelope `v` per `docs/contracts/persistence.md`.
   ordering.
 - `agent.result` parents its matching `agent.spawn` event. V0 has no child
   session event stream to join.
-- `error` parents the `model.call` when the source is a provider failure
-  during that call; otherwise the previous persisted event.
+- A root-driver provider/cancellation `error` directly parents its
+  `model.call`. Companion and parallel-reviewer errors follow the writer-owned
+  linear spine; the `model.call` association rule above determines whether
+  they terminalize a call. Other errors parent the previous persisted event
+  unless a closed semantic-parent exception applies.
 - Events with no specific causal parent (e.g. `user.message`) parent the
   previous persisted event in the session, or null at session start.
 - A persisted event must never parent a runtime-only event (e.g.
@@ -576,11 +732,17 @@ Cardinality and ordering invariants:
 
 - exactly one `session.start` per session, always the first persisted
   event;
-- exactly one `model.result` per `model.call`;
+- exactly one semantically associated terminal `model.result` or `error` per
+  `model.call`, under the authoritative actor/order association rule above;
+  resume rejects a second semantic terminal instead of normalizing it away;
 - zero or more `model.reasoning` events per `model.call`, emitted in
-  provider order before their `model.result`;
+  provider order before its terminal event;
 - `assistant.message` is emitted after its `model.result`, and only for
-  turns that end without tool calls.
+  model rounds that finish without tool calls. It does not by itself prove
+  that the user turn ended: pending steering or an accepted same-turn idle
+  continuation can continue the turn. The driver closes the steering group
+  only at its explicit terminal transaction after all such continuations
+  return Stop.
 - an accepted `model.switched` is emitted after the previous turn's final
   persisted event and before the next `user.message` is accepted. A switch
   after a new `user.message` starts the next turn is rejected. The next
@@ -590,7 +752,9 @@ Cardinality and ordering invariants:
   tool-execution round, or already-started user turn.
 - zero or more `canvas.swap` events may appear per session; each marks a
   compaction boundary and is replay-critical for reconstructing which canvas
-  range was active.
+  range was active. The latest valid full projection owns the compacted prefix;
+  subsequent layer-1 swaps accumulate over its retained frontier until another
+  full projection supersedes it.
 - zero or more `agent.message` events may appear for a live background spawn
   while its `BackgroundAgent` handle exists. Queue acceptance is volatile; only
   drained `agent.message` events are durable and queryable after resume.

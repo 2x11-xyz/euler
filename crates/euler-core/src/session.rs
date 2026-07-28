@@ -1,14 +1,15 @@
 //! Session state machine: turn loop, tool dispatch, compaction integration.
 //! Justification for >1000 lines: session.rs owns the main turn lifecycle while focused subsystems are extracted.
 use crate::canvas::{
-    assemble_canvas_prefolded, assemble_canvas_with_compaction, canvas_bytes, retention_stats,
+    active_layer1_compacted_result_ids, assemble_canvas_prefolded,
+    assemble_canvas_with_compaction_for_extensions, canvas_bytes, retention_stats,
     AutoCompactionPolicy,
 };
 use crate::canvas::{render_context_slot, CanvasItem, CanvasRole};
 use crate::checkpoints::{self, list_from_events, WorkspaceCheckpointRef};
 use crate::compaction::{
-    build_compaction_candidate, heuristic_projection, select_layer1_candidates, should_compact,
-    validate_candidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
+    build_compaction_candidate, projection_prompt, select_layer1_candidates, should_compact,
+    validate_candidate, CompactionCandidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
 };
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
 use crate::guardian::PermissionReviewer;
@@ -29,7 +30,10 @@ use euler_provider::{
     ProviderSet, ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason,
     ToolCall, Usage,
 };
-use euler_sdk::{Capability, EventWakeError, EventWakeRegistration, Extension};
+use euler_sdk::{
+    CancellationSource, CancellationToken, Capability, EventWakeError, EventWakeRegistration,
+    Extension,
+};
 use round_loop::{
     EventSink, ModelRoundData, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, TurnState,
 };
@@ -39,12 +43,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 mod background;
+mod compaction_worker;
 mod companion;
 mod extension_bridge;
+mod extension_contributions;
 pub use extension_bridge::MAX_SPAWNS_PER_COMMAND;
 mod observer;
 mod parallel_spawn;
@@ -52,7 +58,7 @@ mod permissions_gate;
 mod round_loop;
 mod steering;
 
-pub use steering::SteeringQueue;
+pub use steering::{QueuedInput, SteeringQueue};
 mod swarm_tool;
 mod tool_dispatch;
 pub use background::{
@@ -64,10 +70,23 @@ pub(crate) use permissions_gate::{
     approval_mode_str, permission_decision_payload, permission_request_for_tool, PermissionRuling,
 };
 pub(crate) use tool_dispatch::{
-    file_change_payload, file_diff_payload, maybe_store_pre_image, tool_success_payload,
+    file_change_payload, file_diff_payload, maybe_store_pre_image, tool_cancelled_payload,
+    tool_success_payload,
 };
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
+const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 4_096;
+const COMPACTION_PURPOSE: &str = "compaction";
+const COMPACTION_WAIT_POLL: Duration = Duration::from_millis(10);
+const COMPACTION_WAIT_LIMIT: Duration = Duration::from_secs(30);
+const COMPACTION_CANCEL_GRACE: Duration = Duration::from_millis(25);
+const COMPACTION_SYSTEM_INSTRUCTIONS: &str = concat!(
+    "You are Euler's shadow compactor. Preserve the active coding task's continuation state while ",
+    "a separate driver keeps working. Return only one JSON object matching the requested schema. ",
+    "Do not use Markdown fences, commentary, tools, or a conversational answer. Merge any prior ",
+    "working-state projection with newer events. Be concise, retain blockers and user constraints, ",
+    "and never invent completed work."
+);
 const CONTEXT_LIMIT_MESSAGE: &str =
     "Session stopped because the context limit threshold was reached.";
 const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
@@ -289,6 +308,11 @@ pub enum SessionError {
         canvas_bytes: usize,
         budget_bytes: usize,
     },
+    #[error("model request does not fit the model's context window: {required_tokens} tokens needed, {limit_tokens} available")]
+    RequestOverTokenBudget {
+        required_tokens: u64,
+        limit_tokens: u64,
+    },
     #[error("{0}")]
     ProjectContextInvalid(String),
     #[error("project context plus the minimum request does not fit the model's context window: {required_tokens} tokens needed, {limit_tokens} available; shrink EULER.md or start without project context")]
@@ -309,6 +333,10 @@ pub enum SessionError {
     InvalidModelSwitchEvent(String),
     #[error("invalid session name: {name}")]
     InvalidSessionName { name: String },
+    #[error("queued input is not the current dispatch reservation for this steering queue")]
+    InvalidQueuedInput,
+    #[error("cannot replace a session while a user-message admission is unresolved")]
+    UnresolvedAdmissionTransition,
     #[error(transparent)]
     EventWake(#[from] EventWakeError),
     #[error("event wake requires provenance writer")]
@@ -371,6 +399,10 @@ pub enum ExtensionExecutionError {
     /// The command panicked. Raw panic payloads are not returned or persisted.
     #[error("extension command panicked")]
     CommandPanicked,
+    /// The host cancelled an admitted command. This is not an extension
+    /// failure and must not disable or penalize the extension.
+    #[error("extension command cancelled")]
+    Cancelled,
     /// Live-session infrastructure failed while constructing the host or
     /// publishing already-durable queued extension events into the live bus.
     #[error(transparent)]
@@ -402,10 +434,37 @@ pub struct Session<D> {
     context_limit_emitted: Option<ModelTarget>,
     open_agent_spawns: BTreeMap<String, String>,
     observer_extension: Option<Arc<dyn Extension>>,
+    /// Generic root-session extensions. These are launch-time handles only:
+    /// wiring starts no process and grants no capability.
+    extensions: BTreeMap<String, Arc<dyn Extension>>,
+    /// Exact extension tool catalog advertised on the most recent root model
+    /// request. Dispatch consults this map so an unadvertised or stale name
+    /// cannot enter the extension path.
+    active_extension_tools: BTreeMap<String, extension_contributions::ActiveExtensionTool>,
     /// Shared mid-turn steering queue (issue #146); drained at round
     /// boundaries into canonical `user.message` events. `None` (headless,
     /// companions) means no steering.
     steering: Option<Arc<steering::SteeringQueue>>,
+    /// Queued input reserved for this turn. The queue retains it until the
+    /// initial `user.message` has been durably emitted.
+    queued_dispatch: Option<steering::QueuedInput>,
+    /// Exact authoritative event retained across an append failure. The
+    /// matching retry reuses its id and timestamp; every unrelated admission
+    /// is fenced until the owning writer confirms this candidate.
+    pending_admission: Option<PendingAdmission>,
+    /// A shadow worker was detached without an accepted terminal child for
+    /// its `model.call`. Further authoritative writes fail closed until the
+    /// durable log is reopened and its recovery closure is appended.
+    terminalization_failed: bool,
+    /// Shared edge-triggered request from an interactive surface. The active
+    /// driver consumes it only at a round boundary, where a fixed shadow
+    /// canvas can be taken without interrupting the provider stream.
+    compaction_request: Option<Arc<AtomicBool>>,
+    /// At most one model-generated projection is prepared off-thread. The
+    /// worker owns only an immutable request and cloned provider handles;
+    /// all canonical event appends and candidate validation stay on the
+    /// session thread.
+    shadow_compaction: Option<ShadowCompaction>,
     /// Wired code-swarm extension backing the `code_swarm_review` tool; the
     /// tool is advertised to the root session's model only when this is set.
     code_swarm_extension: Option<Arc<dyn Extension>>,
@@ -413,6 +472,34 @@ pub struct Session<D> {
     /// (issue #100). In-memory only — NEVER persisted — so a bare `/scrub`
     /// knows what to remove after the warning. Holds the values, not labels.
     scrub_candidates: Vec<String>,
+}
+
+struct ShadowCompaction {
+    candidate: CompactionCandidate,
+    target: ModelTarget,
+    model_call_id: String,
+    worker: compaction_worker::CompactionWorker,
+    started_at: Instant,
+}
+
+struct PendingAdmission {
+    event: EventEnvelope,
+    queue_id: Option<steering::QueueEntryId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactionCloseDisposition {
+    ApplyReady,
+    DiscardReady,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactionStatus {
+    Applied,
+    Cancelled,
+    Failed,
+    InProgress,
+    Unchanged,
 }
 
 /// Session-side adapter driving the shared [`RoundLoop`]: bundles the
@@ -426,9 +513,16 @@ where
     sink: &'a mut EventSink<'sink, F>,
     turn_state: &'a mut TurnState,
     rounds: &'a mut u64,
+    cancellation: CancellationToken,
 }
 
 type RecordedToolCall = (ToolCall, String);
+
+pub(super) fn provider_cancellation(
+    cancellation: CancellationToken,
+) -> euler_provider::CancellationCheck {
+    euler_provider::CancellationCheck::new(move || cancellation.is_cancelled())
+}
 
 impl<F, D> RoundLoopIo for SessionRoundIo<'_, '_, F, D>
 where
@@ -449,7 +543,9 @@ where
         &mut self,
         target: &ModelTarget,
     ) -> Result<(String, ModelRequest), SessionError> {
-        self.session.prepare_model_request(target, self.sink)
+        let cancellation = self.cancellation.clone();
+        self.session
+            .prepare_model_request(target, self.sink, &cancellation)
     }
 
     fn invoke_model(
@@ -457,7 +553,11 @@ where
         target: &ModelTarget,
         request: ModelRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        self.session.providers.invoke(&target.provider, request)
+        self.session.providers.invoke_interruptibly(
+            &target.provider,
+            request,
+            provider_cancellation(self.cancellation.clone()),
+        )
     }
 
     fn emit_provider_error(
@@ -466,6 +566,14 @@ where
         model_call_id: String,
     ) -> Result<String, SessionError> {
         self.session.emit_provider_error(error, model_call_id)
+    }
+
+    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError> {
+        self.session.emit_with_parent(
+            EventKind::ERROR,
+            round_loop::model_call_cancelled_payload(),
+            Some(model_call_id),
+        )
     }
 
     fn after_stream_event(
@@ -486,7 +594,8 @@ where
         target: ModelTarget,
         model_call_id: String,
         data: ModelRoundData,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
+        another_round_available: bool,
     ) -> Result<RoundOutcome, SessionError> {
         let stop_reason = data
             .stop_reason
@@ -509,12 +618,14 @@ where
             })?;
         self.sink.flush(self.session.bus.events());
         self.session.record_latest_usage(data.usage.as_ref());
+        self.session.service_compaction_request()?;
         self.session.auto_compact_if_triggered()?;
+        self.session.poll_shadow_compaction()?;
         self.sink.flush(self.session.bus.events());
 
         if self
             .session
-            .finish_context_limit(&data, &model_result_id, self.sink)?
+            .finish_context_limit(&data, &model_result_id, self.sink, cancellation)?
         {
             return Ok(RoundOutcome::Complete(()));
         }
@@ -542,58 +653,28 @@ where
                 Some(model_result_id),
             )?;
             self.sink.flush(self.session.bus.events());
-            return Ok(RoundOutcome::Complete(()));
+            return self.resolve_terminal_idle(cancellation, another_round_available);
         }
 
-        self.finish_tool_round(&model_result_id, data.tool_calls, cancel_flag)
+        self.finish_tool_round(&model_result_id, data.tool_calls, cancellation)
     }
 
     fn round_completed(&mut self) {
         *self.rounds += 1;
     }
 
-    fn round_boundary(&mut self, cancel_flag: &AtomicBool) {
+    fn round_boundary(&mut self, _cancellation: &CancellationToken) {
         self.session
-            .observe_round_boundary(*self.rounds, cancel_flag);
+            .observe_round_boundary(*self.rounds, self.cancellation.clone());
         self.sink.flush(self.session.bus.events());
     }
 
-    fn absorb_steering(&mut self, cancel_flag: &AtomicBool) -> Result<(), SessionError> {
-        let Some(queue) = self.session.steering.clone() else {
-            return Ok(());
-        };
+    fn absorb_steering(&mut self, cancellation: &CancellationToken) -> Result<(), SessionError> {
         let mut absorbed = false;
-        // Peek → emit → ack: an entry leaves the queue only after its
-        // user.message was durably emitted, so an emission failure keeps the
-        // failed entry and everything behind it queued for the next attempt.
-        while let Some(entry) = queue.next_for_round() {
-            // An interrupt keeps queued input for the user (the surface
-            // pauses the queue before publishing cancellation; this check
-            // closes the remaining race window on the worker side).
-            if cancel_flag.load(Ordering::SeqCst) {
-                break;
-            }
-            // Canonical user.message with normal causal chaining: the parent
-            // is whatever the turn last emitted (a tool.result, the prior
-            // steering message, ...), and the flush below echoes it to the
-            // surface immediately. The next prepare_model_request assembles
-            // it from the bus like any other event — steering needs no
-            // parallel channel into the request.
-            let result = self.session.emit(
-                EventKind::USER_MESSAGE,
-                object([("content", entry.content.into())]),
-            );
-            match result {
-                Ok(_) => {
-                    queue.ack(entry.id);
-                    absorbed = true;
-                }
-                Err(error) => {
-                    // Flush whatever did land before surfacing the failure.
-                    self.sink.flush(self.session.bus.events());
-                    return Err(error);
-                }
-            }
+        while let steering::BoundaryAction::Persisted =
+            self.persist_steering(steering::RoundBoundary::Intermediate, cancellation)?
+        {
+            absorbed = true;
         }
         if absorbed {
             self.sink.flush(self.session.bus.events());
@@ -601,7 +682,13 @@ where
         Ok(())
     }
 
-    fn round_limit(&mut self) -> Result<(), SessionError> {
+    fn round_limit(&mut self, cancellation: &CancellationToken) -> Result<(), SessionError> {
+        if matches!(
+            self.defer_idle_steering_boundary(cancellation),
+            steering::BoundaryAction::Closed { cancelled: true }
+        ) {
+            return Err(SessionError::Cancelled);
+        }
         self.session.emit(
             EventKind::ASSISTANT_MESSAGE,
             object([("content", TOOL_ROUNDS_LIMIT_MESSAGE.into())]),
@@ -616,26 +703,148 @@ where
     F: FnMut(&EventEnvelope),
     D: PermissionDecider,
 {
+    fn persist_steering(
+        &mut self,
+        boundary: steering::RoundBoundary,
+        cancellation: &CancellationToken,
+    ) -> Result<steering::BoundaryAction, SessionError> {
+        let Some(queue) = self.session.steering.clone() else {
+            return Ok(match boundary {
+                steering::RoundBoundary::Intermediate => steering::BoundaryAction::Drained,
+                steering::RoundBoundary::Terminal => {
+                    steering::BoundaryAction::Closed { cancelled: false }
+                }
+            });
+        };
+        let result = queue.persist_next_for_round(
+            boundary,
+            || cancellation.is_cancelled(),
+            |input| {
+                self.session
+                    .admit_user_message(input.content(), Some(input.id()))
+                    .map(|_| ())
+            },
+        );
+        if result.is_err() {
+            // Prior accepted backlog may remain on the bus if draining it was
+            // the append that failed. Flush that evidence while the queue
+            // retains its reserved id. The rejected user.message itself is
+            // never accepted onto the bus.
+            self.sink.flush(self.session.bus.events());
+        }
+        result
+    }
+
+    /// Named terminal steering-group transaction.
+    ///
+    /// This is deliberately separate from no-tool response recording. A
+    /// same-turn idle contributor may run first and return Continue; only
+    /// calling this seam after idle Stop may close the group. `Persisted`
+    /// requests another model round, while `Closed` makes subsequent input a
+    /// follow-up.
+    fn finish_idle_steering_boundary(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<steering::BoundaryAction, SessionError> {
+        self.persist_steering(steering::RoundBoundary::Terminal, cancellation)
+    }
+
+    /// Close a terminal round-limit seam without admitting steering that this
+    /// turn has no remaining provider request to observe.
+    fn defer_idle_steering_boundary(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> steering::BoundaryAction {
+        self.session.steering.as_ref().map_or_else(
+            || steering::BoundaryAction::Closed {
+                cancelled: cancellation.is_cancelled(),
+            },
+            |queue| queue.defer_terminal_boundary(|| cancellation.is_cancelled()),
+        )
+    }
+
+    fn resolve_terminal_idle(
+        &mut self,
+        cancellation: &CancellationToken,
+        next_round_permitted: bool,
+    ) -> Result<RoundOutcome, SessionError> {
+        if cancellation.is_cancelled() {
+            return Err(SessionError::Cancelled);
+        }
+
+        // An accepted continuation is only useful when the round loop can
+        // issue the request that consumes it. Do not run implicit extension
+        // work at the configured final round.
+        if !next_round_permitted {
+            return match self.defer_idle_steering_boundary(cancellation) {
+                steering::BoundaryAction::Closed { cancelled: true } => {
+                    Err(SessionError::Cancelled)
+                }
+                steering::BoundaryAction::Closed { cancelled: false }
+                | steering::BoundaryAction::Drained => Ok(RoundOutcome::Complete(())),
+                steering::BoundaryAction::Persisted => {
+                    unreachable!("a deferred terminal boundary never admits steering")
+                }
+            };
+        }
+
+        // Existing user steering bypasses implicit idle work entirely. The
+        // terminal queue transaction records the real driver; no synthetic
+        // extension contribution is invented for a command that never ran.
+        if self.session.steering_pending() {
+            return self.finish_terminal_steering(cancellation);
+        }
+
+        match self.session.run_idle_boundary(cancellation, self.sink)? {
+            extension_contributions::IdleBoundary::Continue => return Ok(RoundOutcome::Continue),
+            extension_contributions::IdleBoundary::Stop => {}
+        }
+
+        self.finish_terminal_steering(cancellation)
+    }
+
+    fn finish_terminal_steering(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<RoundOutcome, SessionError> {
+        match self.finish_idle_steering_boundary(cancellation)? {
+            steering::BoundaryAction::Persisted => Ok(RoundOutcome::Continue),
+            steering::BoundaryAction::Closed { cancelled: true } => Err(SessionError::Cancelled),
+            steering::BoundaryAction::Closed { cancelled: false }
+            | steering::BoundaryAction::Drained => Ok(RoundOutcome::Complete(())),
+        }
+    }
+
     fn finish_tool_round(
         &mut self,
         model_result_id: &str,
         tool_calls: Vec<ToolCall>,
-        cancel_flag: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Result<RoundOutcome, SessionError> {
         let recorded_calls = self.record_tool_call_batch(model_result_id, tool_calls)?;
         let mut remaining_calls = recorded_calls.into_iter();
         while let Some((call, tool_call_event_id)) = remaining_calls.next() {
-            self.session.execute_recorded_tool_call(
+            let execution = self.session.execute_recorded_tool_call(
                 call,
                 tool_call_event_id,
                 self.sink,
                 self.turn_state,
-            )?;
+                cancellation,
+            );
+            if let Err(error) = execution {
+                if matches!(&error, SessionError::Cancelled) {
+                    self.finish_cancelled_tool_batch(remaining_calls)?;
+                    self.sink.flush(self.session.bus.events());
+                }
+                return Err(error);
+            }
             self.sink.flush(self.session.bus.events());
             if self.turn_state.guardian_interrupted() {
                 return self.finish_guardian_interrupted_batch(remaining_calls);
             }
-            if cancel_flag.load(Ordering::Relaxed) {
+            if cancellation.is_cancelled() {
+                self.finish_cancelled_tool_batch(remaining_calls)?;
+                self.sink.flush(self.session.bus.events());
                 return Err(SessionError::Cancelled);
             }
         }
@@ -655,6 +864,17 @@ where
             recorded_calls.push((call, tool_call_event_id));
         }
         Ok(recorded_calls)
+    }
+
+    fn finish_cancelled_tool_batch(
+        &mut self,
+        remaining_calls: impl IntoIterator<Item = RecordedToolCall>,
+    ) -> Result<(), SessionError> {
+        for (pending_call, pending_event_id) in remaining_calls {
+            self.session
+                .emit_cancelled_tool_result(pending_call, pending_event_id, None, None)?;
+        }
+        Ok(())
     }
 
     fn finish_guardian_interrupted_batch(
@@ -739,7 +959,14 @@ impl<D> Session<D> {
             context_limit_emitted: None,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            extensions: BTreeMap::new(),
+            active_extension_tools: BTreeMap::new(),
             steering: None,
+            queued_dispatch: None,
+            pending_admission: None,
+            terminalization_failed: false,
+            compaction_request: None,
+            shadow_compaction: None,
             code_swarm_extension: None,
             scrub_candidates: Vec::new(),
         };
@@ -823,9 +1050,13 @@ impl<D> Session<D> {
         session_id: impl Into<String>,
         decider: D,
         project_context: ProjectContextBootstrap,
-    ) -> Self {
+    ) -> Result<Self, (Box<Self>, SessionError)> {
+        if self.has_unresolved_admission() {
+            return Err((Box::new(self), SessionError::UnresolvedAdmissionTransition));
+        }
         let active_target = self.active_target;
         let code_swarm_extension = self.code_swarm_extension;
+        let extensions = self.extensions;
         let redactor = self.redactor;
         let mut config = self.config;
         config.session_id = session_id.into();
@@ -840,10 +1071,12 @@ impl<D> Session<D> {
         // Re-point the provider secret sink at the carried redactor: the
         // constructor above bound it to the from_env one just replaced.
         fresh.install_provider_secret_sink();
-        // The code-swarm wiring is launch configuration, not session state:
-        // a fresh session in the same process keeps the review-gate tool.
+        // Extension wiring is launch configuration, not session state: a
+        // fresh session in the same process keeps generic root contributions
+        // and the transitional CodeSwarm review-gate tool.
         fresh.code_swarm_extension = code_swarm_extension;
-        fresh
+        fresh.extensions = extensions;
+        Ok(fresh)
     }
 
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
@@ -863,15 +1096,64 @@ impl<D> Session<D> {
     /// into `user.message` events, so the next model call sees steering
     /// in-turn.
     ///
-    /// Arming opens a new steering generation ON THE CALLER'S THREAD,
-    /// before the turn's worker exists: everything pushed after this call
-    /// steers the upcoming turn, everything pushed before it is a leftover
-    /// that flushes as its own turn. Ordering the generation with the
-    /// surface's own pushes (same thread) is what makes that boundary
-    /// race-free — re-wire the queue on every spawn.
+    /// Arming opens a new steering group ON THE CALLER'S THREAD, before the
+    /// turn's worker exists. Everything explicitly tagged as steering after
+    /// this call belongs to the upcoming turn; ordinary follow-ups remain
+    /// separate. Ordering the group with the surface's own pushes (same
+    /// thread) makes that boundary race-free — re-wire on every spawn.
     pub fn set_steering_queue(&mut self, queue: Arc<steering::SteeringQueue>) {
-        queue.begin_turn();
+        queue.begin_turn(None);
         self.steering = Some(queue);
+        self.queued_dispatch = None;
+    }
+
+    /// Wire steering for a queued input selected as the next turn. If the
+    /// input is the head of an interrupted steering group, its contiguous
+    /// siblings are rebound to this replacement turn; an ordinary follow-up
+    /// opens a clean group and absorbs nothing already queued.
+    pub fn set_steering_queue_for_queued_input(
+        &mut self,
+        queue: Arc<steering::SteeringQueue>,
+        input: &steering::QueuedInput,
+    ) -> Result<(), SessionError> {
+        if !queue.is_current_dispatch(input) {
+            return Err(SessionError::InvalidQueuedInput);
+        }
+        if self
+            .pending_admission
+            .as_ref()
+            .is_some_and(|pending| pending.queue_id != Some(input.id()))
+        {
+            return Err(pending_admission_error());
+        }
+        queue.begin_turn(Some(input));
+        self.steering = Some(queue);
+        self.queued_dispatch = Some(input.clone());
+        Ok(())
+    }
+
+    /// Whether this live session owns an authoritative user-message append
+    /// whose durability is still ambiguous.
+    pub fn has_unresolved_admission(&self) -> bool {
+        self.pending_admission.is_some()
+            || self
+                .steering
+                .as_ref()
+                .is_some_and(|queue| queue.has_unresolved_admission())
+    }
+
+    /// Whether a fresh user turn can be admitted before the active target's
+    /// context latch. TUI auto-flush must leave queued work untouched when
+    /// this is false.
+    pub fn can_accept_turn(&self) -> bool {
+        self.context_limit_emitted.as_ref() != Some(&self.active_target)
+    }
+
+    /// Wire the interactive surface's edge-triggered manual-compaction
+    /// request. Unlike steering, this flag carries no user text and is
+    /// consumed only at a settled model-round boundary.
+    pub fn set_compaction_request(&mut self, request: Arc<AtomicBool>) {
+        self.compaction_request = Some(request);
     }
 
     /// Wire the code-swarm extension for the `code_swarm_review` tool
@@ -936,7 +1218,12 @@ impl<D> Session<D> {
             4, // min_lines
         );
         let policy = self.effective_stub_policy();
-        let canvas = assemble_canvas_with_compaction(self.bus.events(), &policy, &candidates);
+        let canvas = assemble_canvas_with_compaction_for_extensions(
+            self.bus.events(),
+            &policy,
+            &candidates,
+            &self.config.extensions_enabled,
+        );
         let actually_compacted = canvas
             .iter()
             .filter_map(|item| match item {
@@ -955,7 +1242,10 @@ impl<D> Session<D> {
     /// Returns true if a swap was emitted, false otherwise.
     /// Note: persistence failures are currently absorbed as false;
     /// full error propagation is deferred.
-    pub fn try_compact(&mut self, projection: &WorkingStateProjection) -> bool {
+    pub fn try_compact(&mut self, projection: &WorkingStateProjection) -> bool
+    where
+        D: PermissionDecider,
+    {
         let Some(candidate) = build_compaction_candidate(
             self.bus.events(),
             projection,
@@ -963,34 +1253,134 @@ impl<D> Session<D> {
         ) else {
             return false;
         };
+        let tool_catalog = self.extension_tool_catalog_snapshot();
+        self.commit_compaction_candidate(candidate, None, &tool_catalog)
+    }
 
-        match validate_candidate(self.bus.events(), &candidate) {
-            Ok(()) => self.emit_control_event(
-                EventKind::CANVAS_SWAP,
+    fn commit_compaction_candidate(
+        &mut self,
+        candidate: CompactionCandidate,
+        shadow: Option<(&ModelTarget, Duration)>,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> bool {
+        if let Err(reason) = self.validate_proposed_compaction(&candidate, tool_catalog) {
+            self.emit_control_event(
+                EventKind::CANVAS_CANDIDATE_DISCARDED,
                 object([
-                    ("snapshot_start_id", candidate.snapshot_start_id.into()),
-                    ("snapshot_end_id", candidate.snapshot_end_id.into()),
-                    ("frontier_start_id", candidate.frontier_start_id.into()),
+                    ("reason", reason.into()),
                     ("policy_version", candidate.policy_version.into()),
-                    (
-                        "projection_schema_version",
-                        PROJECTION_SCHEMA_VERSION.into(),
-                    ),
-                    ("projection_blob", candidate.projection.to_json().into()),
-                    ("validation_result", "pass".into()),
                 ]),
-            ),
-            Err(reason) => {
-                self.emit_control_event(
-                    EventKind::CANVAS_CANDIDATE_DISCARDED,
-                    object([
-                        ("reason", reason.into()),
-                        ("policy_version", candidate.policy_version.into()),
-                    ]),
-                );
-                false
+            );
+            return false;
+        }
+        let mut payload = full_swap_payload(&candidate);
+        if let Some((target, elapsed)) = shadow {
+            payload.insert("summary_source".to_owned(), "model".into());
+            payload.insert(
+                "compactor_provider".to_owned(),
+                target.provider.clone().into(),
+            );
+            payload.insert("compactor_model".to_owned(), target.model.clone().into());
+            payload.insert(
+                "compaction_elapsed_ms".to_owned(),
+                elapsed.as_millis().try_into().unwrap_or(u64::MAX).into(),
+            );
+        }
+        self.emit_control_event(EventKind::CANVAS_SWAP, payload)
+    }
+
+    fn validate_proposed_compaction(
+        &self,
+        candidate: &CompactionCandidate,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<(), String> {
+        validate_candidate(self.bus.events(), candidate)?;
+        if !candidate.projection.model_bounds_valid() {
+            return Err("working-state projection exceeds host bounds".to_owned());
+        }
+        let project_context = crate::project_context::fold_project_context(self.bus.events())
+            .map_err(|_| "project context is invalid".to_owned())?;
+        let pinned = project_context.admitted();
+        // Validate the exact post-swap assembly before granting the swap
+        // authority. A provisional event exercises the same parser and
+        // frontier fold used by the next real driver request.
+        let mut proposed_events = self.bus.events().to_vec();
+        proposed_events.push(EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            self.previous_persisted_event_id(),
+            EventKind::CANVAS_SWAP,
+            full_swap_payload(candidate),
+        ));
+        let post_swap_policy = self.config.auto_compaction;
+        let proposed_canvas = assemble_canvas_prefolded(
+            &proposed_events,
+            &post_swap_policy,
+            &BTreeSet::new(),
+            pinned,
+            Some(&self.config.extensions_enabled),
+        );
+        if canvas_bytes(&proposed_canvas) > post_swap_policy.budget_bytes {
+            return Err("proposed canvas exceeds the configured byte budget".to_owned());
+        }
+        let current_canvas = assemble_canvas_prefolded(
+            self.bus.events(),
+            &post_swap_policy,
+            &BTreeSet::new(),
+            pinned,
+            Some(&self.config.extensions_enabled),
+        );
+        let current_request =
+            self.driver_model_request(&self.active_target, &current_canvas, tool_catalog);
+        let proposed_request =
+            self.driver_model_request(&self.active_target, &proposed_canvas, tool_catalog);
+        let current_tokens =
+            crate::project_context::request_required_tokens(&current_request, 0)
+                .ok_or_else(|| "current request token accounting overflowed".to_owned())?;
+        let proposed_tokens = crate::project_context::request_required_tokens(&proposed_request, 0)
+            .ok_or_else(|| "proposed request token accounting overflowed".to_owned())?;
+        let minimum_reduction = (current_tokens / 20).clamp(1, 256);
+        if current_tokens.saturating_sub(proposed_tokens) < minimum_reduction {
+            return Err("proposed canvas does not meaningfully reduce the request".to_owned());
+        }
+
+        if let Some(limit) = self.config.context_limit {
+            let output_reserve = self
+                .config
+                .max_output_tokens
+                .unwrap_or(self.config.compaction_reserve_tokens as u64);
+            let required =
+                crate::project_context::request_required_tokens(&proposed_request, output_reserve)
+                    .ok_or_else(|| "proposed request token accounting overflowed".to_owned())?;
+            if !crate::project_context::fits_context_limit(required, limit.limit_tokens()) {
+                return Err("proposed request does not fit the model context window".to_owned());
             }
         }
+        Ok(())
+    }
+
+    fn driver_model_request(
+        &self,
+        target: &ModelTarget,
+        canvas: &[CanvasItem],
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> ModelRequest {
+        // The review-gate tool is root-session only: companions build their
+        // requests through the companion loop and never see it (depth one).
+        let mut tools = self.tools.model_tools();
+        if self.code_swarm_extension.is_some() && self.extension_enabled(swarm_tool::EXTENSION_ID) {
+            tools.push(swarm_tool::code_swarm_review_tool_definition());
+        }
+        tools.extend(tool_catalog.definitions().iter().cloned());
+        ModelRequest {
+            model: target.model.clone(),
+            instructions: SYSTEM_INSTRUCTIONS.to_owned(),
+            input: canvas.iter().map(model_input_item).collect(),
+            tools,
+            reasoning_effort: self.config.reasoning_effort,
+            max_output_tokens: self.config.max_output_tokens,
+        }
+        .for_target(&target.provider, &target.model)
     }
 
     fn emit_control_event(&mut self, kind: &'static str, payload: JsonObject) -> bool {
@@ -1022,7 +1412,22 @@ impl<D> Session<D> {
 
     fn accept_control_event(&mut self, event: EventEnvelope) -> Result<(), SessionError> {
         self.append_before_accept(&event)?;
+        let is_swap = event.kind.as_str() == EventKind::CANVAS_SWAP;
         self.bus.push(event);
+        let replaced_canvas =
+            is_swap
+                && self.bus.events().last().is_some_and(|event| {
+                    crate::canvas::canvas_swap_is_valid(self.bus.events(), event)
+                });
+        if replaced_canvas {
+            // Usage belongs to the provider request assembled from the old
+            // canvas. The swap is atomic authority for a new canvas, so its
+            // size is unknown until the next model result. Retaining the old
+            // reading re-triggers compaction and can keep a context-limit
+            // latch closed after a successful manual recovery.
+            self.latest_model_usage = None;
+            self.context_limit_emitted = None;
+        }
         if self.provenance.is_some() {
             self.persisted_events = self.bus.events().len();
         }
@@ -1030,10 +1435,116 @@ impl<D> Session<D> {
     }
 
     fn append_before_accept(&self, event: &EventEnvelope) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission()?;
+        self.append_candidate(event)
+    }
+
+    fn append_candidate(&self, event: &EventEnvelope) -> Result<(), SessionError> {
         if let Some(writer) = &self.provenance {
             writer.append(std::slice::from_ref(event))?;
         }
         Ok(())
+    }
+
+    /// Admit one authoritative user message without exposing an event that
+    /// provenance rejected.
+    ///
+    /// General turn events intentionally retain accepted in-memory evidence
+    /// when a later append fails. User messages have a stronger queue
+    /// transaction: the exact envelope id, timestamp, and parent are installed
+    /// before any accepted backlog is written. A failure while reconciling
+    /// that backlog or appending the candidate therefore protects the same
+    /// queue row. Repair + retry can reconcile an ambiguous complete append
+    /// instead of creating a second event. While it is pending, every
+    /// unrelated append is fenced.
+    fn admit_user_message(
+        &mut self,
+        content: &str,
+        queue_id: Option<steering::QueueEntryId>,
+    ) -> Result<String, SessionError> {
+        self.ensure_terminalization_intact()?;
+        let payload = object([("content", content.to_owned().into())]);
+        if let Some(pending) = &self.pending_admission {
+            if pending.queue_id != queue_id
+                || pending.event.kind.as_str() != EventKind::USER_MESSAGE
+                || pending.event.payload != payload
+            {
+                return Err(pending_admission_error());
+            }
+        } else {
+            self.pending_admission = Some(PendingAdmission {
+                event: EventEnvelope::new(
+                    self.config.session_id.clone(),
+                    self.config.agent_id.clone(),
+                    self.previous_persisted_event_id(),
+                    EventKind::USER_MESSAGE,
+                    payload,
+                ),
+                queue_id,
+            });
+        }
+        if let Err(error) = self.persist_pending_admission_backlog() {
+            self.protect_pending_queue_row();
+            return Err(error);
+        }
+        let pending = self
+            .pending_admission
+            .as_ref()
+            .expect("admission was matched or created");
+        let event = pending.event.clone();
+        let id = event.id.clone();
+        if let Err(error) = self.append_candidate(&event) {
+            self.protect_pending_queue_row();
+            return Err(error);
+        }
+        self.bus.push(event);
+        self.pending_admission = None;
+        if self.provenance.is_some() {
+            self.persisted_events = self.bus.events().len();
+        }
+        Ok(id)
+    }
+
+    /// The sole append path allowed after a pending user admission has been
+    /// installed. It owns only the older accepted bus suffix; the candidate
+    /// itself is appended separately and is not visible in memory yet.
+    fn persist_pending_admission_backlog(&mut self) -> Result<(), SessionError> {
+        debug_assert!(self.pending_admission.is_some());
+        self.ensure_terminalization_intact()?;
+        if self.persisted_events < self.bus.events().len() {
+            if let Some(writer) = &self.provenance {
+                writer.append(&self.bus.events()[self.persisted_events..])?;
+                self.persisted_events = self.bus.events().len();
+            }
+        }
+        Ok(())
+    }
+
+    fn protect_pending_queue_row(&self) {
+        let queue_id = self
+            .pending_admission
+            .as_ref()
+            .and_then(|pending| pending.queue_id);
+        if let (Some(queue), Some(queue_id)) = (&self.steering, queue_id) {
+            queue.mark_admission_unresolved(queue_id);
+        }
+    }
+
+    fn ensure_no_pending_admission(&self) -> Result<(), SessionError> {
+        self.ensure_terminalization_intact()?;
+        if self.pending_admission.is_some() {
+            Err(pending_admission_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_terminalization_intact(&self) -> Result<(), SessionError> {
+        if self.terminalization_failed {
+            Err(terminalization_failed_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn previous_persisted_event_id(&self) -> Option<String> {
@@ -1046,6 +1557,7 @@ impl<D> Session<D> {
     }
 
     fn persist_new_events(&mut self) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission()?;
         if let Some(writer) = &self.provenance {
             writer.append(&self.bus.events()[self.persisted_events..])?;
             self.persisted_events = self.bus.events().len();
@@ -1216,7 +1728,14 @@ impl<D> Session<D> {
             context_limit_emitted,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            extensions: BTreeMap::new(),
+            active_extension_tools: BTreeMap::new(),
             steering: None,
+            queued_dispatch: None,
+            pending_admission: None,
+            terminalization_failed: false,
+            compaction_request: None,
+            shadow_compaction: None,
             code_swarm_extension: None,
             scrub_candidates: Vec::new(),
         };
@@ -1234,8 +1753,41 @@ impl<D: PermissionDecider> Session<D> {
     /// falls back to the structured projection when stubs cannot finish the
     /// job.
     pub fn compact_now(&mut self) -> bool {
+        matches!(self.compact_and_wait(), Ok(CompactionStatus::Applied))
+    }
+
+    /// Run manual compaction to a terminal outcome. Layer-1 demotion is
+    /// synchronous; the structured-summary fallback runs on a shadow worker
+    /// and is joined here. Headless callers may use this blocking convenience;
+    /// interactive surfaces should use `begin_compaction` plus
+    /// `poll_compaction` so the composer remains usable while it waits.
+    pub fn compact_and_wait(&mut self) -> Result<CompactionStatus, SessionError> {
+        self.ensure_no_pending_admission()?;
+        let started = self.begin_compaction()?;
+        if started == CompactionStatus::InProgress {
+            self.wait_for_shadow_compaction(&CancellationToken::new())
+        } else {
+            Ok(started)
+        }
+    }
+
+    /// Begin manual compaction without waiting for a model-generated
+    /// projection. The session remains usable by the active driver while a
+    /// shadow candidate is pending.
+    pub fn begin_compaction(&mut self) -> Result<CompactionStatus, SessionError> {
+        self.ensure_no_pending_admission()?;
         let target_tokens = self.effective_stub_policy().budget_bytes.div_ceil(4);
         self.compact_for_threshold(target_tokens)
+    }
+
+    /// Poll a pending shadow candidate without blocking.
+    pub fn poll_compaction(&mut self) -> Result<CompactionStatus, SessionError> {
+        self.ensure_no_pending_admission()?;
+        self.poll_shadow_compaction()
+    }
+
+    pub fn compaction_in_progress(&self) -> bool {
+        self.shadow_compaction.is_some()
     }
 
     pub fn spawn_agent(
@@ -1442,6 +1994,7 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         checkpoint_event_id: &str,
     ) -> Result<WorkspaceRestoreOutcome, SessionError> {
+        self.ensure_no_pending_admission()?;
         let checkpoint = self
             .bus
             .events()
@@ -1505,6 +2058,25 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         user_message: &str,
         cancel_flag: Arc<AtomicBool>,
+        on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let cancellation = CancellationSource::from_shared_flag(cancel_flag).token();
+        let result = self.run_turn_with_sink_open(user_message, cancellation, on_event);
+        self.release_queued_dispatch();
+        // Error, cancellation, and an early context latch do not cross the
+        // named no-tool terminal seam. Close them before returning the worker
+        // session; normal completion already closed and this is idempotent.
+        self.close_steering_turn();
+        result
+    }
+
+    fn run_turn_with_sink_open<F>(
+        &mut self,
+        user_message: &str,
+        cancellation: CancellationToken,
         mut on_event: F,
     ) -> Result<Vec<EventEnvelope>, SessionError>
     where
@@ -1518,11 +2090,13 @@ impl<D: PermissionDecider> Session<D> {
         let start = self.bus.events().len();
         crate::diagnostics::turn_start(&self.config.session_id);
         let mut sink = EventSink::new(start, &mut on_event);
-        self.emit(
-            EventKind::USER_MESSAGE,
-            object([("content", user_message.into())]),
-        )?;
+        let queue_id = self.queued_dispatch.as_ref().map(steering::QueuedInput::id);
+        self.admit_user_message(user_message, queue_id)?;
+        self.acknowledge_queued_dispatch();
         sink.flush(self.bus.events());
+        let settled = self.settle_shadow_at_context_limit(&cancellation);
+        sink.flush(self.bus.events());
+        settled?;
         // Intentionally uses the latest recorded model.result usage
         // as a coarse conversation-size guard for the active target. It does
         // not recompute tokens for the switched-to provider/model.
@@ -1539,13 +2113,37 @@ impl<D: PermissionDecider> Session<D> {
             return Ok(self.bus.events()[start..].to_vec());
         }
 
-        self.run_model_rounds(start, &cancel_flag, &mut sink)
+        self.run_model_rounds(start, cancellation, &mut sink)
+    }
+
+    fn acknowledge_queued_dispatch(&mut self) {
+        let Some(input) = self.queued_dispatch.take() else {
+            return;
+        };
+        if let Some(queue) = &self.steering {
+            queue.acknowledge_dispatch(&input);
+        }
+    }
+
+    fn release_queued_dispatch(&mut self) {
+        let Some(input) = self.queued_dispatch.take() else {
+            return;
+        };
+        if let Some(queue) = &self.steering {
+            queue.release_dispatch(&input);
+        }
+    }
+
+    fn close_steering_turn(&self) {
+        if let Some(queue) = &self.steering {
+            queue.close_turn();
+        }
     }
 
     fn run_model_rounds<F>(
         &mut self,
         start: usize,
-        cancel_flag: &AtomicBool,
+        cancellation: CancellationToken,
         sink: &mut EventSink<'_, F>,
     ) -> Result<Vec<EventEnvelope>, SessionError>
     where
@@ -1561,6 +2159,7 @@ impl<D: PermissionDecider> Session<D> {
             sink,
             turn_state: &mut turn_state,
             rounds: &mut rounds,
+            cancellation: cancellation.clone(),
         };
         let result = RoundLoop::new(
             &mut io,
@@ -1570,7 +2169,12 @@ impl<D: PermissionDecider> Session<D> {
                 provider_retry_backoff_ms,
             },
         )
-        .run(cancel_flag);
+        .run(&cancellation);
+        if matches!(&result, Err(SessionError::Cancelled)) {
+            io.session.interrupt_compaction("turn interrupted")?;
+            io.sink.flush(io.session.bus.events());
+        }
+        drop(io);
         crate::diagnostics::turn_end(&self.config.session_id, rounds);
         result.map(|()| self.bus.events()[start..].to_vec())
     }
@@ -1579,35 +2183,42 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         target: &ModelTarget,
         sink: &mut EventSink<'_, F>,
+        cancellation: &CancellationToken,
     ) -> Result<(String, ModelRequest), SessionError>
     where
         F: FnMut(&EventEnvelope),
     {
-        // A malformed latest project-context snapshot rejects request
-        // assembly outright: it must never silently drop the pinned item or
-        // resurrect an older admitted snapshot.
-        let project_context = match crate::project_context::fold_project_context(self.bus.events())
-        {
-            Ok(fold) => fold,
-            Err(error) => {
-                let error = SessionError::ProjectContextInvalid(error.to_string());
+        // One request owns one immutable extension-tool catalog. The same
+        // snapshot is used by speculative compaction accounting, final
+        // admission, and live binding publication.
+        let tool_catalog = self.extension_tool_catalog_snapshot();
+        self.service_compaction_request_with_catalog(&tool_catalog)?;
+        sink.flush(self.bus.events());
+        let policy = self.effective_stub_policy();
+        let admitted = self.admit_driver_canvas(policy, cancellation, &tool_catalog);
+        // Admission can settle or cancel a shadow call. Publish those
+        // canonical events before propagating its terminal result.
+        sink.flush(self.bus.events());
+        let (canvas, pinned) = admitted?;
+        let request = self.driver_model_request(target, &canvas, &tool_catalog);
+        if let Some(pinned) = &pinned {
+            if let Some(error) = self.pinned_context_budget_error(pinned, &request, policy) {
                 self.emit_session_error(&error)?;
                 sink.flush(self.bus.events());
                 return Err(error);
             }
-        };
-        let pinned = project_context.admitted().cloned();
-        let policy = self.effective_stub_policy();
-        // The fold above is threaded into assembly: one project-context fold
-        // per prepared request, never a second one inside canvas assembly.
-        let events = self.bus.events();
-        let canvas = assemble_canvas_prefolded(events, &policy, &BTreeSet::new(), pinned.as_ref());
-        if let Some(error) = context_budget_exhausted(policy, &canvas) {
+        } else if let Some(error) =
+            self.extension_tool_context_budget_error(&request, &tool_catalog)
+        {
             self.emit_session_error(&error)?;
             sink.flush(self.bus.events());
             return Err(error);
         }
-        self.emit(
+
+        // Snapshot the admitted selection only after every budget check. The
+        // following accepted driver model.call binds this exact snapshot and
+        // is the one-shot consumption authority.
+        let canvas_snapshot_id = self.emit(
             EventKind::CANVAS_SNAPSHOT,
             canvas_snapshot_payload(
                 &canvas,
@@ -1618,33 +2229,13 @@ impl<D: PermissionDecider> Session<D> {
         )?;
         sink.flush(self.bus.events());
 
-        // The review-gate tool is root-session only: companions build their
-        // requests through the companion loop and never see it (depth one).
-        let mut tools = self.tools.model_tools();
-        if self.code_swarm_extension.is_some() && self.extension_enabled(swarm_tool::EXTENSION_ID) {
-            tools.push(swarm_tool::code_swarm_review_tool_definition());
-        }
-        let request = ModelRequest {
-            model: target.model.clone(),
-            instructions: SYSTEM_INSTRUCTIONS.to_owned(),
-            input: canvas.iter().map(model_input_item).collect(),
-            tools,
-            reasoning_effort: self.config.reasoning_effort,
-            max_output_tokens: self.config.max_output_tokens,
-        }
-        .for_target(&target.provider, &target.model);
-        if let Some(pinned) = &pinned {
-            if let Some(error) = self.pinned_context_budget_error(pinned, &request, policy) {
-                self.emit_session_error(&error)?;
-                sink.flush(self.bus.events());
-                return Err(error);
-            }
-        }
+        self.emit_extension_tool_catalog_diagnostics(&tool_catalog);
+        sink.flush(self.bus.events());
         let mut model_call = root_model_call_payload(
             target,
             canvas.len(),
             self.config.reasoning_effort,
-            request.instructions.len(),
+            &request.instructions,
         );
         record_unseen_instructions(&mut model_call, self.bus.events(), &request.instructions);
         if let Some(reasoning_effort) = self
@@ -1656,6 +2247,7 @@ impl<D: PermissionDecider> Session<D> {
         if let Some(max_output_tokens) = self.config.max_output_tokens {
             model_call.insert("max_output_tokens".to_owned(), max_output_tokens.into());
         }
+        model_call.insert("canvas_snapshot_id".to_owned(), canvas_snapshot_id.into());
         if let Some(pinned) = &pinned {
             // Recorded only because these exact rendered bytes are in the
             // request built above (no TOCTOU between snapshot and prompt
@@ -1670,8 +2262,94 @@ impl<D: PermissionDecider> Session<D> {
             );
         }
         let model_call_id = self.emit(EventKind::MODEL_CALL, model_call)?;
+        // Bindings own calls from admitted requests only. Speculative
+        // accounting and rejected final requests leave the prior live
+        // bindings untouched.
+        self.install_extension_tool_bindings(&tool_catalog);
         sink.flush(self.bus.events());
         Ok((model_call_id, request))
+    }
+
+    fn admit_driver_canvas(
+        &mut self,
+        policy: AutoCompactionPolicy,
+        cancellation: &CancellationToken,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<
+        (
+            Vec<CanvasItem>,
+            Option<crate::project_context::PinnedProjectContext>,
+        ),
+        SessionError,
+    > {
+        let mut assembled = self.assemble_driver_canvas(policy)?;
+        // Threshold compaction stays speculative and nonblocking. Byte
+        // pressure is the final admission boundary before provider dispatch:
+        // settle an existing shadow under every policy, or start one only
+        // when the automatic-plus-stubs backstop owns recovery.
+        if context_budget_exhausted(policy, &assembled.0).is_some()
+            && (self.shadow_compaction.is_some() || (policy.automatic && policy.stubs_enabled()))
+        {
+            self.settle_shadow_for_byte_pressure(cancellation, tool_catalog)?;
+            assembled = self.assemble_driver_canvas(policy)?;
+        }
+        if let Some(error) = context_budget_exhausted(policy, &assembled.0) {
+            self.emit_session_error(&error)?;
+            return Err(error);
+        }
+        Ok(assembled)
+    }
+
+    /// Assemble the exact root-driver canvas, folding pinned project context
+    /// once for this attempt. A successful shadow swap changes the event
+    /// frontier, so request-boundary recovery calls this again after settling.
+    fn assemble_driver_canvas(
+        &mut self,
+        policy: AutoCompactionPolicy,
+    ) -> Result<
+        (
+            Vec<CanvasItem>,
+            Option<crate::project_context::PinnedProjectContext>,
+        ),
+        SessionError,
+    > {
+        // A malformed latest project-context snapshot rejects request
+        // assembly outright: it must never silently drop the pinned item or
+        // resurrect an older admitted snapshot.
+        let project_context = match crate::project_context::fold_project_context(self.bus.events())
+        {
+            Ok(fold) => fold,
+            Err(error) => {
+                let error = SessionError::ProjectContextInvalid(error.to_string());
+                self.emit_session_error(&error)?;
+                return Err(error);
+            }
+        };
+        let pinned = project_context.admitted().cloned();
+        // The fold above is threaded into assembly: one project-context fold
+        // per prepared request attempt, never a second one inside canvas
+        // assembly.
+        let canvas = assemble_canvas_prefolded(
+            self.bus.events(),
+            &policy,
+            &BTreeSet::new(),
+            pinned.as_ref(),
+            Some(&self.config.extensions_enabled),
+        );
+        Ok((canvas, pinned))
+    }
+
+    fn settle_shadow_for_byte_pressure(
+        &mut self,
+        cancellation: &CancellationToken,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<CompactionStatus, SessionError> {
+        if self.shadow_compaction.is_none()
+            && self.start_shadow_compaction()? != CompactionStatus::InProgress
+        {
+            return Ok(CompactionStatus::Unchanged);
+        }
+        self.wait_for_shadow_compaction_with_catalog(cancellation, tool_catalog)
     }
 
     fn emit_session_error(&mut self, error: &SessionError) -> Result<(), SessionError> {
@@ -1683,6 +2361,55 @@ impl<D: PermissionDecider> Session<D> {
             ]),
         )?;
         Ok(())
+    }
+
+    fn extension_tool_context_budget_error(
+        &self,
+        request: &ModelRequest,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Option<SessionError> {
+        if tool_catalog.definitions().is_empty() {
+            return None;
+        }
+        let limit_tokens = self
+            .config
+            .context_limit
+            .map(|limit| limit.limit_tokens())?;
+        let output_reserve = self
+            .config
+            .max_output_tokens
+            .unwrap_or(self.config.compaction_reserve_tokens as u64);
+        let required_tokens =
+            crate::project_context::request_required_tokens(request, output_reserve)
+                .unwrap_or(u64::MAX);
+        if crate::project_context::fits_context_limit(required_tokens, limit_tokens) {
+            return None;
+        }
+        // Preserve the existing usage-driven hard-margin behavior for a
+        // request that was already over its configured proxy without
+        // extension tools. This guard owns the new SDK risk: extension
+        // definitions may not push an otherwise fitting request over the
+        // window before provider dispatch.
+        let extension_names = tool_catalog
+            .definitions()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut without_extension_tools = request.clone();
+        without_extension_tools
+            .tools
+            .retain(|tool| !extension_names.contains(tool.name.as_str()));
+        let baseline_required = crate::project_context::request_required_tokens(
+            &without_extension_tools,
+            output_reserve,
+        )
+        .unwrap_or(u64::MAX);
+        crate::project_context::fits_context_limit(baseline_required, limit_tokens).then_some(
+            SessionError::RequestOverTokenBudget {
+                required_tokens,
+                limit_tokens,
+            },
+        )
     }
 
     /// Pinned-context budget checks (project-context contract, "Framing and
@@ -1766,10 +2493,17 @@ impl<D: PermissionDecider> Session<D> {
         data: &ModelRoundData,
         model_result_id: &str,
         sink: &mut EventSink<'_, F>,
+        cancellation: &CancellationToken,
     ) -> Result<bool, SessionError>
     where
         F: FnMut(&EventEnvelope),
     {
+        // The active driver may outrun its shadow summary until the hard
+        // margin. At that point waiting is safer than sending one oversized
+        // request or throwing away queued work. A failed/invalid candidate
+        // leaves the canvas untouched and falls through to the honest stop.
+        self.settle_shadow_at_context_limit(cancellation)?;
+        sink.flush(self.bus.events());
         let Some(context_limit_id) = self.emit_context_limit_if_reached()? else {
             return Ok(false);
         };
@@ -1814,7 +2548,34 @@ impl<D: PermissionDecider> Session<D> {
         });
     }
 
+    fn service_compaction_request(&mut self) -> Result<CompactionStatus, SessionError> {
+        let tool_catalog = self.extension_tool_catalog_snapshot();
+        self.service_compaction_request_with_catalog(&tool_catalog)
+    }
+
+    fn service_compaction_request_with_catalog(
+        &mut self,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<CompactionStatus, SessionError> {
+        let requested = self
+            .compaction_request
+            .as_ref()
+            .is_some_and(|request| request.swap(false, Ordering::SeqCst));
+        let polled = self.poll_shadow_compaction_with_catalog(tool_catalog)?;
+        if polled != CompactionStatus::Unchanged {
+            return Ok(polled);
+        }
+        if !requested {
+            return Ok(CompactionStatus::Unchanged);
+        }
+        let target_tokens = self.effective_stub_policy().budget_bytes.div_ceil(4);
+        self.compact_for_threshold(target_tokens)
+    }
+
     fn auto_compact_if_triggered(&mut self) -> Result<bool, SessionError> {
+        if self.shadow_compaction.is_some() {
+            return Ok(false);
+        }
         if !self.config.auto_compaction.automatic {
             return Ok(false);
         }
@@ -1841,7 +2602,7 @@ impl<D: PermissionDecider> Session<D> {
         if !should_compact(usage.used_tokens as usize, threshold, 0) {
             return Ok(false);
         }
-        Ok(self.compact_for_threshold(threshold))
+        Ok(self.compact_for_threshold(threshold)? != CompactionStatus::Unchanged)
     }
 
     fn compaction_trigger_tokens(&self) -> Option<usize> {
@@ -1857,13 +2618,23 @@ impl<D: PermissionDecider> Session<D> {
         )
     }
 
-    fn compact_for_threshold(&mut self, threshold: usize) -> bool {
+    fn compact_for_threshold(
+        &mut self,
+        threshold: usize,
+    ) -> Result<CompactionStatus, SessionError> {
+        if self.shadow_compaction.is_some() {
+            return Ok(CompactionStatus::InProgress);
+        }
         let candidates =
             select_layer1_candidates(self.bus.events(), self.config.compaction_keep_recent, 4);
         if self.config.auto_compaction.stubs_enabled() {
             let policy = self.effective_stub_policy();
-            let compacted =
-                assemble_canvas_with_compaction(self.bus.events(), &policy, &candidates);
+            let compacted = assemble_canvas_with_compaction_for_extensions(
+                self.bus.events(),
+                &policy,
+                &candidates,
+                &self.config.extensions_enabled,
+            );
             let compacted_ids = compacted
                 .iter()
                 .filter_map(|item| match item {
@@ -1875,13 +2646,23 @@ impl<D: PermissionDecider> Session<D> {
                     _ => None,
                 })
                 .collect::<BTreeSet<_>>();
-            if !compacted_ids.is_empty() && estimated_tokens(&compacted) <= threshold {
-                return self.emit_layer1_swap(&compacted_ids);
+            if estimated_tokens(&compacted) <= threshold {
+                let active = active_layer1_compacted_result_ids(self.bus.events());
+                let newly_compacted = compacted_ids
+                    .difference(&active)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if !newly_compacted.is_empty() {
+                    return Ok(if self.emit_layer1_swap(&newly_compacted) {
+                        CompactionStatus::Applied
+                    } else {
+                        CompactionStatus::Unchanged
+                    });
+                }
             }
         }
 
-        let projection = heuristic_projection(self.bus.events());
-        self.try_compact(&projection)
+        self.start_shadow_compaction()
     }
 
     fn emit_layer1_swap(&mut self, compacted_result_ids: &BTreeSet<String>) -> bool {
@@ -1919,6 +2700,404 @@ impl<D: PermissionDecider> Session<D> {
         )
     }
 
+    fn start_shadow_compaction(&mut self) -> Result<CompactionStatus, SessionError> {
+        if self.shadow_compaction.is_some() {
+            return Ok(CompactionStatus::InProgress);
+        }
+        let Some(candidate) = build_compaction_candidate(
+            self.bus.events(),
+            &WorkingStateProjection::default(),
+            self.config.compaction_keep_recent,
+        ) else {
+            return Ok(CompactionStatus::Unchanged);
+        };
+        let project_context = crate::project_context::fold_project_context(self.bus.events())
+            .map_err(|error| SessionError::ProjectContextInvalid(error.to_string()))?;
+        let policy = self.effective_stub_policy();
+        let canvas = assemble_canvas_prefolded(
+            self.bus.events(),
+            &policy,
+            &BTreeSet::new(),
+            project_context.admitted(),
+            Some(&self.config.extensions_enabled),
+        );
+        let canvas = shadow_compaction_canvas(canvas);
+        let mut snapshot = canvas_snapshot_payload(
+            &canvas,
+            policy,
+            self.latest_model_usage
+                .as_ref()
+                .map(|usage| usage.used_tokens),
+            self.config.context_limit.map(|limit| limit.limit_tokens()),
+        );
+        snapshot.insert("purpose".to_owned(), COMPACTION_PURPOSE.into());
+        snapshot.insert(
+            "shadow_snapshot_end_id".to_owned(),
+            candidate.snapshot_end_id.clone().into(),
+        );
+        self.emit(EventKind::CANVAS_SNAPSHOT, snapshot)?;
+
+        let (request, effort) = shadow_model_request(
+            &self.providers,
+            &self.active_target,
+            &canvas,
+            self.config.max_output_tokens,
+        );
+        let model_call = shadow_model_call_payload(
+            &self.active_target,
+            canvas.len(),
+            effort,
+            &candidate,
+            self.bus.events(),
+            &request,
+        );
+        let model_call_id = self.emit(EventKind::MODEL_CALL, model_call)?;
+        let target = self.active_target.clone();
+        let worker = compaction_worker::spawn(
+            self.providers.clone(),
+            target.clone(),
+            request,
+            self.config.provider_transport_retries,
+            self.config.provider_transport_retry_backoff_ms.clone(),
+        );
+        self.shadow_compaction = Some(ShadowCompaction {
+            candidate,
+            target,
+            model_call_id,
+            worker,
+            started_at: Instant::now(),
+        });
+        Ok(CompactionStatus::InProgress)
+    }
+
+    fn poll_shadow_compaction(&mut self) -> Result<CompactionStatus, SessionError> {
+        // Finish-round/public polling is its own compaction transaction:
+        // declarations may legitimately change after the preceding request,
+        // so validate against one fresh pure snapshot at application time.
+        // Request-boundary callers use `_with_catalog` to share their one
+        // prepare/admission snapshot through settlement and dispatch.
+        let tool_catalog = self.extension_tool_catalog_snapshot();
+        self.poll_shadow_compaction_with_catalog(&tool_catalog)
+    }
+
+    fn poll_shadow_compaction_with_catalog(
+        &mut self,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<CompactionStatus, SessionError> {
+        let outcome = self
+            .shadow_compaction
+            .as_ref()
+            .and_then(|shadow| shadow.worker.try_recv());
+        let Some(outcome) = outcome else {
+            return Ok(if self.shadow_compaction.is_some() {
+                CompactionStatus::InProgress
+            } else {
+                CompactionStatus::Unchanged
+            });
+        };
+        let shadow = self.shadow_compaction.take().expect("shadow checked above");
+        self.finish_detached_shadow(
+            shadow,
+            outcome,
+            CompactionCloseDisposition::ApplyReady,
+            tool_catalog,
+        )
+    }
+
+    fn wait_for_shadow_compaction(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<CompactionStatus, SessionError> {
+        let tool_catalog = self.extension_tool_catalog_snapshot();
+        self.wait_for_shadow_compaction_with_catalog(cancellation, &tool_catalog)
+    }
+
+    fn wait_for_shadow_compaction_with_catalog(
+        &mut self,
+        cancellation: &CancellationToken,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<CompactionStatus, SessionError> {
+        if self.shadow_compaction.is_none() {
+            return Ok(CompactionStatus::Unchanged);
+        }
+        let deadline = Instant::now() + COMPACTION_WAIT_LIMIT;
+        loop {
+            if cancellation.is_cancelled() {
+                self.close_compaction_with_catalog(
+                    "turn interrupted",
+                    CompactionCloseDisposition::DiscardReady,
+                    tool_catalog,
+                )?;
+                return Err(SessionError::Cancelled);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return self.close_compaction_with_catalog(
+                    "hard-margin wait timed out",
+                    CompactionCloseDisposition::ApplyReady,
+                    tool_catalog,
+                );
+            }
+            let wait = COMPACTION_WAIT_POLL.min(deadline.saturating_duration_since(now));
+            let outcome = self
+                .shadow_compaction
+                .as_ref()
+                .and_then(|shadow| shadow.worker.recv_timeout(wait));
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            let shadow = self.shadow_compaction.take().expect("shadow checked above");
+            return self.finish_detached_shadow(
+                shadow,
+                outcome,
+                CompactionCloseDisposition::ApplyReady,
+                tool_catalog,
+            );
+        }
+    }
+
+    /// End the pending compaction before a session lifecycle boundary. A
+    /// result already crossing the worker channel is settled on the session
+    /// actor so its usage and terminal provenance are not discarded.
+    /// Otherwise cancellation is recorded before the worker loses its only
+    /// route back to this session.
+    pub fn cancel_compaction(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, SessionError> {
+        let tool_catalog = self.extension_tool_catalog_snapshot();
+        self.close_compaction_with_catalog(
+            reason,
+            CompactionCloseDisposition::ApplyReady,
+            &tool_catalog,
+        )
+    }
+
+    /// Interrupt a pending compaction without granting its candidate authority
+    /// to replace the canvas. A result that has already crossed the worker
+    /// channel still records its model result and usage, but a valid projection
+    /// is discarded rather than committed. This is the user/root-interrupt
+    /// path; lifecycle replacement uses [`Self::cancel_compaction`] instead.
+    pub fn interrupt_compaction(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, SessionError> {
+        let tool_catalog = self.extension_tool_catalog_snapshot();
+        self.close_compaction_with_catalog(
+            reason,
+            CompactionCloseDisposition::DiscardReady,
+            &tool_catalog,
+        )
+    }
+
+    fn close_compaction_with_catalog(
+        &mut self,
+        reason: &'static str,
+        disposition: CompactionCloseDisposition,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<CompactionStatus, SessionError> {
+        let Some(shadow) = self.shadow_compaction.as_ref() else {
+            return Ok(CompactionStatus::Unchanged);
+        };
+        if let Some(outcome) = shadow.worker.try_recv() {
+            let shadow = self.shadow_compaction.take().expect("shadow checked above");
+            return self.finish_detached_shadow(shadow, outcome, disposition, tool_catalog);
+        }
+        shadow.worker.cancel();
+        let outcome = shadow.worker.recv_timeout(COMPACTION_CANCEL_GRACE);
+        let shadow = self.shadow_compaction.take().expect("shadow checked above");
+        if let Some(outcome) = outcome {
+            return self.finish_detached_shadow(shadow, outcome, disposition, tool_catalog);
+        }
+        // The provider may be inside non-cancellable synchronous I/O. Drop
+        // the receiver only after terminalizing the canonical model.call;
+        // late worker output then has no writer and cannot re-enter the bus.
+        shadow.worker.cancel();
+        self.finish_detached_cancelled_shadow(shadow, reason)
+    }
+
+    fn finish_detached_shadow(
+        &mut self,
+        shadow: ShadowCompaction,
+        outcome: compaction_worker::WorkerOutcome,
+        disposition: CompactionCloseDisposition,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<CompactionStatus, SessionError> {
+        let model_call_id = shadow.model_call_id.clone();
+        let result = self.finish_shadow_compaction(shadow, outcome, disposition, tool_catalog);
+        self.fail_closed_if_unterminalized(&model_call_id, &result);
+        result
+    }
+
+    fn finish_detached_cancelled_shadow(
+        &mut self,
+        shadow: ShadowCompaction,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, SessionError> {
+        let model_call_id = shadow.model_call_id.clone();
+        let result = self.finish_cancelled_shadow(shadow, reason);
+        self.fail_closed_if_unterminalized(&model_call_id, &result);
+        result
+    }
+
+    fn fail_closed_if_unterminalized(
+        &mut self,
+        model_call_id: &str,
+        result: &Result<CompactionStatus, SessionError>,
+    ) {
+        if result.is_err() && !self.model_call_has_terminal(model_call_id) {
+            self.terminalization_failed = true;
+        }
+    }
+
+    fn model_call_has_terminal(&self, model_call_id: &str) -> bool {
+        self.bus.events().iter().any(|event| {
+            event.parent.as_deref() == Some(model_call_id) && event_terminalizes_model_call(event)
+        })
+    }
+
+    fn finish_cancelled_shadow(
+        &mut self,
+        shadow: ShadowCompaction,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, SessionError> {
+        self.emit_with_parent(
+            EventKind::ERROR,
+            object([
+                ("source", "session".into()),
+                ("purpose", COMPACTION_PURPOSE.into()),
+                (
+                    "message",
+                    format!("shadow compaction cancelled: {reason}").into(),
+                ),
+                ("cancelled", true.into()),
+            ]),
+            Some(shadow.model_call_id),
+        )?;
+        self.discard_shadow_candidate("shadow compaction cancelled")?;
+        Ok(CompactionStatus::Cancelled)
+    }
+
+    fn finish_shadow_compaction(
+        &mut self,
+        mut shadow: ShadowCompaction,
+        outcome: compaction_worker::WorkerOutcome,
+        disposition: CompactionCloseDisposition,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Result<CompactionStatus, SessionError> {
+        shadow.worker.reap_after_terminal();
+        let result = match outcome {
+            compaction_worker::WorkerOutcome::Finished(result) => result,
+            compaction_worker::WorkerOutcome::Cancelled => {
+                return self.finish_cancelled_shadow(shadow, "cancellation requested");
+            }
+        };
+        let data = match result {
+            Ok(data) => data,
+            Err(error) => {
+                self.emit_with_parent(
+                    EventKind::ERROR,
+                    object([
+                        ("source", "provider".into()),
+                        ("purpose", COMPACTION_PURPOSE.into()),
+                        ("category", error.category().as_str().into()),
+                        ("message", self.redactor.redact(error.message()).into()),
+                    ]),
+                    Some(shadow.model_call_id),
+                )?;
+                self.discard_shadow_candidate("compaction provider failed")?;
+                return Ok(CompactionStatus::Failed);
+            }
+        };
+        self.record_shadow_model_round(&shadow, &data)?;
+        let stop_reason = data
+            .stop_reason
+            .as_ref()
+            .expect("compaction worker validates finished event");
+        if !data.tool_calls.is_empty() || *stop_reason != StopReason::Completed {
+            self.discard_shadow_candidate("compaction model did not return a completed summary")?;
+            return Ok(CompactionStatus::Failed);
+        }
+        let Some(projection) = projection_from_model_content(&data.content) else {
+            self.discard_shadow_candidate("compaction model returned an invalid projection")?;
+            return Ok(CompactionStatus::Failed);
+        };
+        shadow.candidate.projection = projection;
+        if disposition == CompactionCloseDisposition::DiscardReady {
+            self.discard_shadow_candidate("shadow compaction interrupted before apply")?;
+            return Ok(CompactionStatus::Cancelled);
+        }
+        let applied = self.commit_compaction_candidate(
+            shadow.candidate,
+            Some((&shadow.target, shadow.started_at.elapsed())),
+            tool_catalog,
+        );
+        Ok(if applied {
+            CompactionStatus::Applied
+        } else {
+            CompactionStatus::Failed
+        })
+    }
+
+    fn record_shadow_model_round(
+        &mut self,
+        shadow: &ShadowCompaction,
+        data: &ModelRoundData,
+    ) -> Result<(), SessionError> {
+        for reasoning in &data.reasoning {
+            let mut payload = object([
+                ("provider", shadow.target.provider.clone().into()),
+                ("model", shadow.target.model.clone().into()),
+                ("purpose", COMPACTION_PURPOSE.into()),
+                ("fidelity", reasoning.fidelity.as_str().into()),
+                ("content", reasoning.content.clone().into()),
+            ]);
+            if let Some(artifact) = &reasoning.artifact {
+                payload.insert("artifact".to_owned(), artifact.clone().into());
+            }
+            self.emit_with_parent(
+                EventKind::MODEL_REASONING,
+                payload,
+                Some(shadow.model_call_id.clone()),
+            )?;
+        }
+        let stop_reason = data
+            .stop_reason
+            .as_ref()
+            .expect("compaction worker validates finished event");
+        let mut result_payload = companion::model_result_payload(
+            &companion::ModelResultRecord {
+                content: &data.content,
+                tool_calls: &data.tool_calls,
+                stop_reason,
+                usage: data.usage.as_ref(),
+                target: &shadow.target,
+                parent: shadow.model_call_id.clone(),
+            },
+            &self.providers,
+        );
+        result_payload.insert("purpose".to_owned(), COMPACTION_PURPOSE.into());
+        self.emit_with_parent(
+            EventKind::MODEL_RESULT,
+            result_payload,
+            Some(shadow.model_call_id.clone()),
+        )?;
+        Ok(())
+    }
+
+    fn discard_shadow_candidate(&mut self, reason: &str) -> Result<(), SessionError> {
+        self.emit_control_event_required(
+            EventKind::CANVAS_CANDIDATE_DISCARDED,
+            object([
+                ("reason", reason.into()),
+                (
+                    "policy_version",
+                    crate::compaction::COMPACTION_POLICY_VERSION.into(),
+                ),
+            ]),
+        )
+    }
+
     fn emit_context_limit_if_reached(&mut self) -> Result<Option<String>, SessionError> {
         let Some(limit) = self.config.context_limit else {
             return Ok(None);
@@ -1926,13 +3105,13 @@ impl<D: PermissionDecider> Session<D> {
         if self.context_limit_emitted.as_ref() == Some(&self.active_target) {
             return Ok(None);
         }
-        let Some(usage) = &self.latest_model_usage else {
-            return Ok(None);
-        };
-        let threshold_tokens = (limit.limit_tokens as f64) * limit.threshold;
-        if (usage.used_tokens as f64) < threshold_tokens {
+        if !self.context_limit_is_reached() {
             return Ok(None);
         }
+        let usage = self
+            .latest_model_usage
+            .as_ref()
+            .expect("reached context limit requires usage");
 
         self.emit(
             EventKind::CONTEXT_LIMIT,
@@ -1945,6 +3124,27 @@ impl<D: PermissionDecider> Session<D> {
             ]),
         )
         .map(Some)
+    }
+
+    fn context_limit_is_reached(&self) -> bool {
+        let Some(limit) = self.config.context_limit else {
+            return false;
+        };
+        let Some(usage) = &self.latest_model_usage else {
+            return false;
+        };
+        let threshold_tokens = (limit.limit_tokens as f64) * limit.threshold;
+        (usage.used_tokens as f64) >= threshold_tokens
+    }
+
+    fn settle_shadow_at_context_limit(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SessionError> {
+        if self.shadow_compaction.is_some() && self.context_limit_is_reached() {
+            self.wait_for_shadow_compaction(cancellation)?;
+        }
+        Ok(())
     }
 
     fn emit_model_result(
@@ -2054,9 +3254,14 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         secrets: &[String],
     ) -> Result<crate::scrub::ScrubReport, SessionError> {
+        self.ensure_no_pending_admission()?;
         let Some(writer) = self.provenance.clone() else {
             return Err(SessionError::ScrubRequiresProvenance);
         };
+        // The compactor captured a pre-scrub canvas. Settle a completed
+        // result or terminally cancel it before rewriting any durable
+        // surface, so late output cannot reintroduce scrubbed bytes.
+        self.cancel_compaction("secret scrub")?;
         let secrets = crate::scrub::prepare_secrets(secrets);
         let report = writer.scrub_and_audit(
             &secrets,
@@ -2091,6 +3296,10 @@ impl<D: PermissionDecider> Session<D> {
         payload: JsonObject,
         parent: Option<String>,
     ) -> Result<String, SessionError> {
+        self.ensure_no_pending_admission()?;
+        if self.provenance.is_some() && self.persisted_events < self.bus.events().len() {
+            self.persist_new_events()?;
+        }
         self.bus.push(EventEnvelope::new(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
@@ -2110,18 +3319,51 @@ impl<D: PermissionDecider> Session<D> {
     }
 }
 
-/// Canvas-budget guard: a stubs-enabled automatic policy preserves facts even
-/// when the resulting canvas remains over budget. Every other configuration
-/// must fail closed rather than send an oversized canvas: automatic projection
-/// may not have triggered or may not have found a valid candidate, and stubs
-/// may be disabled.
+fn pending_admission_error() -> SessionError {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "a prior authoritative event admission is unresolved; retry the same operation",
+    )
+    .into()
+}
+
+fn terminalization_failed_error() -> SessionError {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "a detached model call has no accepted terminal event; reopen the session to recover it",
+    )
+    .into()
+}
+
+/// Whether an event is a semantic terminal for the `model.call` it parents.
+///
+/// Other errors follow the linear event parent and can therefore happen to
+/// parent an asynchronous shadow call without settling it.
+pub(crate) fn event_terminalizes_model_call(event: &EventEnvelope) -> bool {
+    if event.kind.as_str() == EventKind::MODEL_RESULT {
+        return true;
+    }
+    if event.kind.as_str() != EventKind::ERROR {
+        return false;
+    }
+    let source = event.payload.get("source").and_then(Value::as_str);
+    source == Some("provider")
+        || (source == Some("session")
+            && (event.payload.get("cancelled").and_then(Value::as_bool) == Some(true)
+                || event
+                    .payload
+                    .get("recovery_closure")
+                    .and_then(Value::as_bool)
+                    == Some(true)))
+}
+
+/// Canvas-budget admission guard. Stub demotion and shadow projection may
+/// preserve facts in smaller representations, but no provider request may
+/// receive a canvas that still exceeds the configured byte budget.
 fn context_budget_exhausted(
     policy: AutoCompactionPolicy,
     canvas: &[CanvasItem],
 ) -> Option<SessionError> {
-    if policy.automatic && policy.stubs_enabled() {
-        return None;
-    }
     let canvas_bytes = canvas_bytes(canvas);
     (canvas_bytes > policy.budget_bytes).then_some(SessionError::ContextBudgetExhausted {
         canvas_bytes,
@@ -2164,10 +3406,9 @@ fn canvas_snapshot_payload(
         ("stubs", policy.stubs_enabled().into()),
         ("tier", policy.tier.as_str().into()),
         ("budget_bytes", policy.budget_bytes.into()),
-        // Stubs-tier demotion is best-effort: facts are indestructible, so a
-        // canvas whose facts alone exceed the budget stays over budget and
-        // the round proceeds. Telemetry must say so rather than let the
-        // snapshot look policy-compliant.
+        // Shadow projection snapshots intentionally capture the immutable
+        // over-budget source that needs summarizing. Driver admission still
+        // rejects any canvas for which this remains true after recovery.
         ("over_budget", over_budget.into()),
         ("pressure", pressure.into()),
     ]);
@@ -2266,7 +3507,7 @@ fn root_model_call_payload(
     target: &ModelTarget,
     canvas_items: usize,
     requested_reasoning_effort: ReasoningEffort,
-    system_instructions_bytes: usize,
+    system_instructions: &str,
 ) -> JsonObject {
     object([
         ("provider", target.provider.clone().into()),
@@ -2282,11 +3523,11 @@ fn root_model_call_payload(
         ),
         (
             "system_instructions_sha256",
-            system_instructions_sha256().into(),
+            format!("{:x}", Sha256::digest(system_instructions.as_bytes())).into(),
         ),
         (
             "system_instructions_bytes",
-            system_instructions_bytes.into(),
+            system_instructions.len().into(),
         ),
     ])
 }
@@ -2296,7 +3537,7 @@ fn record_unseen_instructions(
     events: &[EventEnvelope],
     instructions: &str,
 ) {
-    let digest = system_instructions_sha256();
+    let digest = format!("{:x}", Sha256::digest(instructions.as_bytes()));
     let already_recorded = events.iter().any(|event| {
         matches!(
             event.kind.as_str(),
@@ -2427,6 +3668,15 @@ fn push_session_bootstrap(
     }
 }
 
+/// Enforce the root/child data-flow boundary on an inherited request canvas.
+/// Accepted terminal-idle contributions are committed one-shot inputs for the
+/// root driver only; inheriting children must not observe, select, or spend
+/// their context budget on them.
+fn child_canvas_boundary(mut canvas: Vec<CanvasItem>) -> Vec<CanvasItem> {
+    canvas.retain(|item| !matches!(item, CanvasItem::ExtensionContribution { .. }));
+    canvas
+}
+
 /// Apply a child's explicit `project_context` policy to its request canvas
 /// (ADR 0017). `None` filters every project-context-classified item even
 /// when `include_parent_canvas` is true; `Inherit` supplies the parent's
@@ -2502,6 +3752,13 @@ fn model_input_item(item: &CanvasItem) -> ModelInputItem {
             role: ModelRole::User,
             content: render_context_slot(extension_id, slot, content),
         },
+        CanvasItem::ExtensionContribution {
+            extension_id,
+            command,
+            point,
+            content,
+            ..
+        } => extension_contribution_model_input(extension_id, command, point, content),
         CanvasItem::Reasoning {
             provider,
             model,
@@ -2548,6 +3805,24 @@ fn model_input_item(item: &CanvasItem) -> ModelInputItem {
         },
     }
 }
+
+fn extension_contribution_model_input(
+    extension_id: &str,
+    command: &str,
+    point: &str,
+    content: &str,
+) -> ModelInputItem {
+    ModelInputItem::Message {
+        role: ModelRole::User,
+        content: crate::canvas::render_extension_contribution(
+            extension_id,
+            command,
+            point,
+            content,
+        ),
+    }
+}
+
 fn reasoning_fidelity(value: &str) -> ReasoningFidelity {
     match value {
         "raw" => ReasoningFidelity::Raw,
@@ -2558,6 +3833,102 @@ fn reasoning_fidelity(value: &str) -> ReasoningFidelity {
 fn used_tokens(usage: &Usage) -> u64 {
     usage.input_tokens.saturating_add(usage.output_tokens)
 }
+
+fn shadow_model_request(
+    providers: &ProviderSet,
+    target: &ModelTarget,
+    canvas: &[CanvasItem],
+    configured_max_output_tokens: Option<u64>,
+) -> (ModelRequest, ReasoningEffort) {
+    let effort =
+        providers.clamp_reasoning_effort(&target.provider, &target.model, ReasoningEffort::Small);
+    let max_output_tokens = configured_max_output_tokens
+        .unwrap_or(COMPACTION_MAX_OUTPUT_TOKENS)
+        .clamp(1, COMPACTION_MAX_OUTPUT_TOKENS);
+    let mut input = canvas.iter().map(model_input_item).collect::<Vec<_>>();
+    input.push(ModelInputItem::Message {
+        role: ModelRole::User,
+        content: format!(
+            "{}\nJSON Schema:\n{}",
+            projection_prompt(
+                "The preceding items are the immutable shadow canvas. Summarize them."
+            ),
+            WorkingStateProjection::json_schema()
+        ),
+    });
+    let request = ModelRequest {
+        model: target.model.clone(),
+        instructions: COMPACTION_SYSTEM_INSTRUCTIONS.to_owned(),
+        input,
+        tools: Vec::new(),
+        reasoning_effort: effort,
+        max_output_tokens: Some(max_output_tokens),
+    }
+    .for_target(&target.provider, &target.model);
+    (request, effort)
+}
+
+fn shadow_compaction_canvas(canvas: Vec<CanvasItem>) -> Vec<CanvasItem> {
+    canvas
+        .into_iter()
+        .filter(|item| !matches!(item, CanvasItem::ExtensionContribution { .. }))
+        .collect()
+}
+
+fn shadow_model_call_payload(
+    target: &ModelTarget,
+    canvas_len: usize,
+    effort: ReasoningEffort,
+    candidate: &CompactionCandidate,
+    events: &[EventEnvelope],
+    request: &ModelRequest,
+) -> JsonObject {
+    let mut payload = root_model_call_payload(target, canvas_len, effort, &request.instructions);
+    record_unseen_instructions(&mut payload, events, &request.instructions);
+    payload.insert("purpose".to_owned(), COMPACTION_PURPOSE.into());
+    payload.insert("tools_enabled".to_owned(), false.into());
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        payload.insert("max_output_tokens".to_owned(), max_output_tokens.into());
+    }
+    payload.insert(
+        "shadow_snapshot_end_id".to_owned(),
+        candidate.snapshot_end_id.clone().into(),
+    );
+    payload
+}
+
+fn projection_from_model_content(content: &str) -> Option<WorkingStateProjection> {
+    let trimmed = content.trim();
+    WorkingStateProjection::from_model_json(trimmed).or_else(|| {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        (start <= end)
+            .then(|| &trimmed[start..=end])
+            .and_then(WorkingStateProjection::from_model_json)
+    })
+}
+
+fn full_swap_payload(candidate: &CompactionCandidate) -> JsonObject {
+    object([
+        (
+            "snapshot_start_id",
+            candidate.snapshot_start_id.clone().into(),
+        ),
+        ("snapshot_end_id", candidate.snapshot_end_id.clone().into()),
+        (
+            "frontier_start_id",
+            candidate.frontier_start_id.clone().into(),
+        ),
+        ("policy_version", candidate.policy_version.clone().into()),
+        (
+            "projection_schema_version",
+            PROJECTION_SCHEMA_VERSION.into(),
+        ),
+        ("projection_blob", candidate.projection.to_json().into()),
+        ("validation_result", "pass".into()),
+    ])
+}
+
 fn estimated_tokens(canvas: &[CanvasItem]) -> usize {
     // Same bytes/4 proxy as DEFAULT_CANVAS_BUDGET_BYTES (no tokenizer dependency).
     canvas_bytes(canvas).div_ceil(4)

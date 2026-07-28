@@ -645,6 +645,28 @@ fn apply_patch_add_file_creates_missing_file() {
 }
 
 #[test]
+fn apply_patch_rechecks_cancellation_at_the_write_boundary() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let patch = "*** Begin Patch\n*** Add File: cancelled.txt\n+never written\n*** End Patch";
+    let execution = registry
+        .execute("apply_patch", &json!({"patch": patch}))
+        .expect("prepare patch");
+    let cancellation = euler_sdk::CancellationSource::new();
+    cancellation.cancel();
+
+    let error = registry
+        .apply_patch_cancellable(
+            execution.patch.as_ref().expect("patch"),
+            &cancellation.token(),
+        )
+        .expect_err("cancelled patch must not mutate");
+
+    assert!(matches!(error, ToolError::Cancelled));
+    assert!(!temp.path().join("cancelled.txt").exists());
+}
+
+#[test]
 fn apply_patch_update_uses_exact_hunk_and_hashes_whole_file() {
     let temp = tempfile::tempdir().expect("temp dir");
     let before = "prefix\nold\nsuffix\n";
@@ -1471,6 +1493,90 @@ fn run_shell_kills_command_and_process_group_at_timeout() {
     assert!(execution.output.contains("timed out after 200 ms"));
     assert!(execution.output.contains("phase_one"));
     assert!(!execution.output.contains("phase_two"));
+}
+
+#[test]
+fn run_shell_cancellation_kills_command_and_process_group() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let cancellation = euler_sdk::CancellationSource::new();
+    let token = cancellation.token();
+    let input = json!({
+        "command": "touch started; (sleep 0.5; touch too_late) & sleep 30"
+    });
+
+    let result = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| registry.execute_cancellable("run_shell", &input, &token));
+        let started = temp.path().join("started");
+        let wait_started = std::time::Instant::now();
+        while !started.exists() && wait_started.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(started.exists(), "fixture command did not start");
+
+        let cancelled_at = std::time::Instant::now();
+        cancellation.cancel();
+        let result = worker.join().expect("tool worker");
+        assert!(
+            cancelled_at.elapsed() < std::time::Duration::from_secs(1),
+            "cancelled tool should return promptly"
+        );
+        result
+    });
+
+    let ToolExecutionOutcome::Cancelled(execution) =
+        result.expect("cancelled command retains partial execution evidence")
+    else {
+        panic!("cancelled command reported completion");
+    };
+    assert!(
+        execution.output.contains("command cancelled"),
+        "{}",
+        execution.output
+    );
+    assert!(
+        execution
+            .file_changes
+            .iter()
+            .any(|change| change.path == "started"),
+        "the write completed before cancellation must remain observable"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    assert!(
+        !temp.path().join("too_late").exists(),
+        "a descendant survived cancellation"
+    );
+}
+
+#[test]
+fn run_shell_cancellation_still_kills_descendants_after_shell_leader_exits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let cancellation = euler_sdk::CancellationSource::new();
+    let token = cancellation.token();
+    let input = json!({
+        "command": "touch started; (sleep 0.5; touch too_late) &"
+    });
+
+    let result = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| registry.execute_cancellable("run_shell", &input, &token));
+        let started = temp.path().join("started");
+        let wait_started = std::time::Instant::now();
+        while !started.exists() && wait_started.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(started.exists(), "fixture command did not start");
+
+        cancellation.cancel();
+        worker.join().expect("tool worker")
+    });
+
+    assert!(matches!(result, Ok(ToolExecutionOutcome::Cancelled(_))));
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    assert!(
+        !temp.path().join("too_late").exists(),
+        "a pipe-owning descendant survived after its shell leader exited"
+    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use super::command::{ExecArgs, ResumeLaunch, RunArgs};
-use super::extension_run::{execute_live_extension_run, wire_code_swarm};
+use super::extension_run::{execute_live_extension_run, wire_session_extensions};
 use super::permission::CliDecider;
 use super::providers::{
     invocation_target, load_known_theme_preference, load_notifications_preference,
@@ -97,7 +97,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
-    wire_code_swarm(&mut session);
+    wire_session_extensions(&mut session);
     run_stdin_loop(&mut session, live_session.refresh.as_ref())
 }
 
@@ -261,7 +261,7 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
-    wire_code_swarm(&mut session);
+    wire_session_extensions(&mut session);
     let mut app = App::enter_with_options(
         session,
         channels,
@@ -386,7 +386,7 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
-    wire_code_swarm(&mut session);
+    wire_session_extensions(&mut session);
     SubagentDecider::apply_tier(tier, &mut session);
     let turn_result = run_turn_streaming(&mut session, &prompt);
     if let Some(refresh) = refresh.as_ref() {
@@ -785,7 +785,7 @@ where
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
-    wire_code_swarm(&mut session);
+    wire_session_extensions(&mut session);
     Ok(ResumeCliOutcome {
         session,
         refresh,

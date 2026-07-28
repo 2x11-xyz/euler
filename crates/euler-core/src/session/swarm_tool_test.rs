@@ -48,6 +48,7 @@ impl ExtensionCommand for FakeReviewCommand {
             required_capabilities: vec![Capability::AgentSpawn, Capability::ArtifactWrite],
             args: Vec::new(),
             accepts_session_id: false,
+            model_tool: None,
         }
     }
 

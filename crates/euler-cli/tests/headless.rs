@@ -293,8 +293,6 @@ fn exec_observe_runs_enabled_linked_python_observer_automatically() {
     let home = isolated_home();
     let root = tempfile::tempdir().expect("root dir");
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
     let manifest = serde_json::json!({
         "version": 1,
         "id": "python-round-observer",
@@ -332,21 +330,20 @@ fn exec_observe_runs_enabled_linked_python_observer_automatically() {
     .expect("write observer manifest");
     fs::write(
         extension_dir.path().join("extension.py"),
-        format!(
-            r#"import sys
-+from pathlib import Path
-+sys.path.insert(0, {sdk_source:?})
-+from euler_managed_process_sdk import serve
-+
-+def brief(context):
-+    Path("observer-ran").write_text("yes")
-+    return {{"status": "idle"}}
-+
-+serve({{"observer-brief": brief, "observer-apply": lambda context: {{"ok": True}}}})
-+"#,
-            sdk_source = sdk_source.to_string_lossy()
-        )
-        .replace("\n+", "\n"),
+        raw_managed_process_script(
+            r#"
+from pathlib import Path
+
+def brief(_peer, _input):
+    Path("observer-ran").write_text("yes")
+    return {"status": "idle"}
+
+serve({
+    "observer-brief": brief,
+    "observer-apply": lambda _peer, _input: {"ok": True},
+})
+"#,
+        ),
     )
     .expect("write observer process");
     configure_linked_extension(exe, &home, extension_dir.path(), "python-round-observer");
@@ -468,6 +465,220 @@ fn exec_observe_rejects_linked_python_observer_without_launch_consent() {
         "linked extension is not enabled; run `euler extension enable python-disabled-observer` first"
     ));
     assert!(!extension_dir.path().join("observer-ran").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_python_session_contributions_run_on_fresh_launch_and_resume() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_session_contribution_extension(extension_dir.path());
+    configure_linked_extension(
+        exe,
+        &home,
+        extension_dir.path(),
+        "python-session-contribution",
+    );
+    let script = write_session_contribution_fixture(root.path());
+    let log = root.path().join("events.jsonl");
+
+    let fresh = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &format!("event-script={}", path_str(&script)),
+            "--provenance",
+            path_str(&log),
+            "exercise extension contributions",
+        ])
+        .output()
+        .expect("run fresh session");
+    assert!(
+        fresh.status.success(),
+        "fresh stderr: {}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_session_contribution_events(&read_jsonl(&log), 1, 3, 1);
+    assert_eq!(
+        fs::read_to_string(extension_dir.path().join("idle-count")).expect("fresh idle count"),
+        "2"
+    );
+    assert_eq!(
+        fs::read_to_string(extension_dir.path().join("model-tool-count"))
+            .expect("fresh model tool count"),
+        "1"
+    );
+
+    let mut resumed = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .args(["--resume", path_str(&log)])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn resumed session");
+    resumed
+        .stdin
+        .as_mut()
+        .expect("resume stdin")
+        .write_all(b"exercise it after resume\n")
+        .expect("write resumed turn");
+    let resumed = resumed.wait_with_output().expect("wait resumed session");
+    assert!(
+        resumed.status.success(),
+        "resume stderr: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_session_contribution_events(&read_jsonl(&log), 1, 4, 2);
+    assert_eq!(
+        fs::read_to_string(extension_dir.path().join("idle-count")).expect("resumed idle count"),
+        "3"
+    );
+}
+
+#[cfg(unix)]
+fn write_session_contribution_extension(directory: &Path) {
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "python-session-contribution",
+        "display_name": "Python session contribution",
+        "extension_version": "0.1.0",
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": ["python3", "-B", "-u", "extension.py"]},
+        "capabilities": [],
+        "commands": [
+            {
+                "name": "remember",
+                "display_name": "Remember",
+                "summary": "Record extension-owned workflow state.",
+                "required_capabilities": [],
+                "invocation": "agent-only",
+                "model_tool": {
+                    "name": "remember_work",
+                    "description": "Record extension-owned workflow state.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string", "minLength": 1, "maxLength": 128}
+                        },
+                        "required": ["value"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "name": "idle",
+                "display_name": "Idle",
+                "summary": "Choose whether the workflow should continue.",
+                "required_capabilities": [],
+                "invocation": "agent-only"
+            }
+        ],
+        "idle_contribution": {"command": "idle"}
+    });
+    fs::write(
+        directory.join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write session contribution manifest");
+    fs::write(
+        directory.join("extension.py"),
+        raw_managed_process_script(
+            r#"
+from pathlib import Path
+
+def remember(_peer, command_input):
+    count = Path("model-tool-count")
+    count.write_text(str(int(count.read_text()) + 1) if count.exists() else "1")
+    return {"recorded": command_input["value"]}
+
+def idle(_peer, _input):
+    count = Path("idle-count")
+    value = int(count.read_text()) + 1 if count.exists() else 1
+    count.write_text(str(value))
+    if value == 1:
+        return {"action": "continue", "input": "continue from the extension"}
+    return {"action": "stop"}
+
+serve({"remember": remember, "idle": idle})
+"#,
+        ),
+    )
+    .expect("write session contribution process");
+}
+
+#[cfg(unix)]
+fn write_session_contribution_fixture(directory: &Path) -> PathBuf {
+    write_fixture_script(
+        directory,
+        "session-contribution-loop.json",
+        &r#"{
++  "version": 1,
++  "responses": [
++    {"events": [
++      {"tool_call": {
++        "id": "extension-call",
++        "name": "remember_work",
++        "input": {"value": "from-model"}
++      }},
++      {"finished": {"stop_reason": "tool_use"}}
++    ]},
++    {"events": [
++      {"text_delta": "first completion"},
++      {"finished": {"stop_reason": "completed"}}
++    ]},
++    {"events": [
++      {"text_delta": "continued completion"},
++      {"finished": {"stop_reason": "completed"}}
++    ]}
++  ]
++}"#
+        .replace("\n+", "\n"),
+    )
+}
+
+fn assert_session_contribution_events(
+    events: &[EventEnvelope],
+    expected_tool_results: usize,
+    expected_model_calls: usize,
+    expected_user_messages: usize,
+) {
+    let tool_results = events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT
+                && event.payload.get("extension_id")
+                    == Some(&serde_json::json!("python-session-contribution"))
+                && event.payload.get("command") == Some(&serde_json::json!("remember"))
+        })
+        .count();
+    assert_eq!(tool_results, expected_tool_results);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+            .count(),
+        expected_model_calls
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+            .count(),
+        expected_user_messages
+    );
+    assert!(events.iter().any(|event| {
+        event.kind.as_str() == EventKind::EXTENSION_CONTRIBUTION
+            && event.payload.get("action") == Some(&serde_json::json!("continue"))
+            && event.payload.get("accepted") == Some(&serde_json::json!(true))
+            && event.payload.get("content")
+                == Some(&serde_json::json!("continue from the extension"))
+    }));
 }
 
 #[test]
@@ -3052,7 +3263,7 @@ fn extension_cli_links_reloads_unlinks_and_blocks_local_runtime() {
 
 #[cfg(unix)]
 #[test]
-fn extension_cli_runs_enabled_linked_python_process_and_reload_revokes_it() {
+fn extension_cli_runs_enabled_linked_raw_peer_and_reload_revokes_it() {
     let python = Command::new("python3")
         .arg("--version")
         .output()
@@ -3062,7 +3273,7 @@ fn extension_cli_runs_enabled_linked_python_process_and_reload_revokes_it() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let python = provision_python_venv(extension_dir.path());
+    let python = PathBuf::from("python3");
     write_managed_process_extension_manifest(
         extension_dir.path(),
         "python-cli-proof",
@@ -3074,27 +3285,40 @@ fn extension_cli_runs_enabled_linked_python_process_and_reload_revokes_it() {
             "extension.py".to_owned(),
         ],
     );
-    let script = r#"import sys
+    let script = raw_managed_process_script(
+        r#"
+import base64
+import sys
 from pathlib import Path
 
-from euler_managed_process_sdk import serve
-
-def inspect(context):
+def inspect(peer, command_input):
     Path("invoked").write_text("yes", encoding="utf-8")
     sys.stderr.write("PYTHON_STDERR_SENTINEL\n")
     sys.stderr.flush()
-    page = context.host.query_provenance(limit=8, scan_limit=32)
-    artifact = context.host.write_artifact(
-        display_name="python-cli-proof.txt",
-        media_type="text/plain",
-        data=b"cli artifact",
-        source_event_ids=[event["id"] for event in page["events"]],
-        metadata={"producer": "python-cli-proof"},
-    )
-    return {"input": context.input, "artifact": artifact, "seen_events": len(page["events"])}
+    page = peer.request("euler/host/query-provenance", {
+        "after_event_id": None,
+        "kinds": [],
+        "limit": 8,
+        "scan_limit": 32,
+        "include_blob_fields": False,
+        "blob_byte_limit": 1024,
+    })
+    artifact = peer.request("euler/host/write-artifact", {
+        "display_name": "python-cli-proof.txt",
+        "media_type": "text/plain",
+        "bytes_base64": base64.b64encode(b"cli artifact").decode("ascii"),
+        "source_event_ids": [event["id"] for event in page["events"]],
+        "metadata": {"producer": "python-cli-proof"},
+    })
+    return {
+        "input": command_input,
+        "artifact": artifact,
+        "seen_events": len(page["events"]),
+    }
 
 serve({"inspect": inspect})
-"#;
+"#,
+    );
     fs::write(extension_dir.path().join("extension.py"), script).expect("write Python extension");
 
     let session_dir = tempfile::tempdir().expect("session dir");
@@ -4864,12 +5088,12 @@ fn tui_pty_resize_does_not_duplicate_committed_lines() {
 }
 
 #[test]
-fn tui_pty_mid_turn_input_steers_before_the_next_round() {
-    // Issue #146: a message typed while a turn is in flight is absorbed at
-    // the next round boundary as a canonical user.message — the model sees
-    // it in-turn — instead of waiting for the turn to complete. The fixture
-    // holds round 1 open with a sleep so the steering keystrokes land
-    // deterministically mid-round.
+fn tui_pty_stacked_steering_during_final_stream_hydrates_the_next_request() {
+    // Issue #146 follow-up: the original PTY covered only a tool boundary.
+    // The dogfood failure was a long no-tool response with several steers
+    // already visible in the composer queue. Without a terminal-round
+    // boundary check, those entries became separate turns after the response
+    // completed. Hold that final stream open and reproduce the whole stack.
     let temp = tempfile::tempdir().expect("temp dir");
     let script = write_fixture_script(
         temp.path(),
@@ -4878,17 +5102,12 @@ fn tui_pty_mid_turn_input_steers_before_the_next_round() {
             "version": 1,
             "responses": [
                 {"events": [
-                    {"text_delta": "phase one underway\n"},
+                    {"text_delta": "phase one final stream\n"},
                     {"sleep_ms": 4000},
-                    {"tool_call": {
-                        "id": "call-read",
-                        "name": "read_file",
-                        "input": {"path": "Cargo.toml"}
-                    }},
-                    {"finished": {"stop_reason": "tool_use"}}
+                    {"finished": {"stop_reason": "completed"}}
                 ]},
                 {"events": [
-                    {"text_delta": "final answer after steering"},
+                    {"text_delta": "continued after stacked steering"},
                     {"finished": {"stop_reason": "completed"}}
                 ]}
             ]
@@ -4907,66 +5126,62 @@ fn tui_pty_mid_turn_input_steers_before_the_next_round() {
         ],
     );
     assert!(tui.wait_for_screen("/ commands"));
-    // Steering is typed immediately behind the submit: the app processes
-    // serial PTY input in order, so by the time these keystrokes are
-    // handled the turn is in flight and its steering generation is armed
-    // (spawn arms it on the UI thread before the worker exists). The
-    // scripted 4s sleep in round 1 then dwarfs any scheduling jitter, so
-    // the entry is queued long before the turn's next round boundary — no
-    // wall-clock screen-wait involved. (The `⏎ steer` footer copy is
-    // asserted by the status unit test; waiting on that glyph row proved
-    // flaky on CI renderers and is not what this test is about.)
+    // Wait until the first response is visibly streaming before submitting
+    // the stack. The fixture then holds the stream open for 4s, making these
+    // entries unambiguously steering for an already-dispatched model round.
     tui.write("start the task\r");
-    tui.write("steer toward the tests\r");
     assert!(
-        tui.wait_for_screen("phase one underway"),
+        tui.wait_for_screen("phase one final stream"),
         "round 1 did not start:\n{}",
         tui.screen_text()
     );
+    tui.write("steer one\r");
+    tui.write("steer two\r");
+    tui.write("steer three\r");
     assert!(
-        tui.wait_for_screen("final answer after steering"),
+        tui.wait_for_screen("continued after stacked steering"),
         "turn did not finish:\n{}",
         tui.screen_text()
     );
     tui.quit();
 
-    // The durable stream shows the steering user.message inside the turn:
-    // after round 1's tool result, before round 2's model call.
+    // The durable stream shows the entire stack after round 1 committed and
+    // before round 2's model call, in the same order and exactly once.
     let session_id = only_home_session_id(temp.path());
     let events = read_jsonl(&home_session_log(temp.path(), &session_id));
-    let steering_index = events
+    let steering: Vec<(usize, &str)> = events
         .iter()
-        .position(|event| {
-            event.kind.as_str() == "user.message"
-                && event
-                    .payload
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("steer toward the tests")
+        .enumerate()
+        .filter_map(|(index, event)| {
+            if event.kind.as_str() != "user.message" {
+                return None;
+            }
+            let content = event.payload.get("content")?.as_str()?;
+            content.starts_with("steer ").then_some((index, content))
         })
-        .expect("steering user.message persisted");
+        .collect();
+    assert_eq!(
+        steering.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+        ["steer one", "steer two", "steer three"]
+    );
     let model_call_indexes: Vec<usize> = events
         .iter()
         .enumerate()
         .filter(|(_, event)| event.kind.as_str() == "model.call")
         .map(|(index, _)| index)
         .collect();
-    // Absorbed at whichever round boundary came first after the keystrokes
-    // (round 1's on fast machines, round 2's on slow ones) — and never as
-    // a turn of its own: exactly two model calls proves the pre-steering
-    // failure mode (queue flushed into a third turn after completion) did
-    // not happen.
     assert_eq!(
         model_call_indexes.len(),
         2,
-        "steering must not spawn its own turn"
+        "the stack must continue one running turn, not spawn follow-up turns"
     );
-    assert!(
-        steering_index < model_call_indexes[1],
-        "steering was not absorbed in-turn: user.message at {steering_index}, \
-         second model.call at {}",
-        model_call_indexes[1]
-    );
+    let first_result = events
+        .iter()
+        .position(|event| event.kind.as_str() == "model.result")
+        .expect("first model result");
+    assert!(steering
+        .iter()
+        .all(|(index, _)| first_result < *index && *index < model_call_indexes[1]));
 }
 
 #[test]
@@ -6014,13 +6229,98 @@ fn tui_pty_quit_during_turn_unwinds_and_releases_session_lock() {
     );
 }
 
+#[test]
+fn tui_pty_escape_closes_slash_menu_then_interrupts_blocked_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let script = write_fixture_script(
+        temp.path(),
+        "slow-escape-turn.json",
+        r#"{
+  "version": 1,
+  "responses": [
+    {
+      "events": [
+        { "sleep_ms": 5000 },
+        { "text_delta": "too late" },
+        { "finished": { "stop_reason": "completed" } }
+      ]
+    }
+  ]
+}
+"#,
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let mut tui = PtyHarness::spawn_with_args(
+        temp.path(),
+        &[
+            "tui",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+        ],
+    );
+
+    assert!(
+        tui.wait_for_screen("/ commands"),
+        "initial TUI did not render:\n{}",
+        tui.screen_text()
+    );
+    tui.write("slow turn\r");
+    assert!(
+        tui.wait_for_screen_glimpse("esc to interrupt"),
+        "turn never entered flight:\n{}",
+        tui.screen_text()
+    );
+
+    tui.write("/");
+    assert!(
+        tui.wait_for_screen_glimpse("Esc close"),
+        "slash palette did not open during the turn:\n{}",
+        tui.screen_text()
+    );
+    tui.write("\x1b");
+    assert!(
+        tui.wait_for_stable_screen(Duration::from_secs(2), |screen| {
+            !screen.contains("Esc close") && screen.contains("esc to interrupt")
+        }),
+        "first Escape did not close only the slash palette:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        !tui.screen_text()
+            .contains("interrupted — tell euler what to do differently"),
+        "first Escape interrupted the active turn"
+    );
+
+    let interrupt_started = Instant::now();
+    tui.write("\x1b");
+    assert!(
+        tui.wait_for_stable_screen(Duration::from_secs(2), |screen| {
+            screen_has_ready_composer(screen)
+                && screen.contains("interrupted — tell euler what to do differently")
+        }),
+        "second Escape did not stop the blocked turn promptly:\n{}",
+        tui.screen_text()
+    );
+    assert!(
+        interrupt_started.elapsed() < Duration::from_secs(2),
+        "Escape waited for the provider operation to finish"
+    );
+    assert!(
+        !tui.screen_text().contains("too late"),
+        "provider output arrived after interruption:\n{}",
+        tui.screen_text()
+    );
+
+    tui.quit();
+}
+
 #[cfg(unix)]
 #[test]
 fn fresh_tui_runs_a_persistently_enabled_linked_process() {
     let home = isolated_home();
     let extension_dir = tempfile::tempdir().expect("extension dir");
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
     write_managed_process_extension_manifest(
         extension_dir.path(),
         "python-fresh-tui",
@@ -6047,9 +6347,10 @@ fn fresh_tui_runs_a_persistently_enabled_linked_process() {
     .expect("write capability-free manifest");
     fs::write(
         extension_dir.path().join("extension.py"),
-        format!(
-            "import sys\nsys.path.insert(0, {sdk_source:?})\nfrom euler_managed_process_sdk import serve\nserve({{'inspect': lambda context: {{'fresh_tui': True}}}})\n",
-            sdk_source = sdk_source.to_string_lossy()
+        raw_managed_process_script(
+            r#"
+serve({"inspect": lambda _peer, _input: {"fresh_tui": True}})
+"#,
         ),
     )
     .expect("write Python extension");
@@ -6067,6 +6368,92 @@ fn fresh_tui_runs_a_persistently_enabled_linked_process() {
         tui.wait_for_screen("fresh_tui"),
         "persistently enabled linked command did not run:\n{}",
         tui.screen_text()
+    );
+    tui.quit();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_escape_cancels_an_active_managed_process_extension() {
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    write_managed_process_extension_manifest(
+        extension_dir.path(),
+        "python-cancellable-tui",
+        "0.1.1",
+        &[
+            "python3".to_owned(),
+            "-B".to_owned(),
+            "-u".to_owned(),
+            "extension.py".to_owned(),
+        ],
+    );
+    let manifest_path = extension_dir
+        .path()
+        .join(euler_core::EXTENSION_MANIFEST_FILE);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest["capabilities"] = serde_json::json!([]);
+    manifest["commands"][0]["required_capabilities"] = serde_json::json!([]);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write capability-free manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        raw_managed_process_script(
+            r#"
+import time
+from pathlib import Path
+
+def inspect(_peer, _input):
+    Path("started").write_text("yes", encoding="utf-8")
+    time.sleep(30)
+    Path("too_late").write_text("late", encoding="utf-8")
+    return {"unexpected": True}
+
+serve({"inspect": inspect})
+"#,
+        ),
+    )
+    .expect("write Python extension");
+    configure_linked_extension(
+        env!("CARGO_BIN_EXE_euler"),
+        &home,
+        extension_dir.path(),
+        "python-cancellable-tui",
+    );
+
+    let mut tui = PtyHarness::spawn_with_args(home.path(), &["tui", "--provider", "fixture"]);
+    assert!(tui.wait_for_screen("echo(medium) · ctx"));
+    tui.write("/extension run python-cancellable-tui.inspect {}\r");
+    let started = extension_dir.path().join("started");
+    let wait_started = Instant::now();
+    while !started.is_file() && wait_started.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        started.is_file(),
+        "managed extension command did not start:\n{}",
+        tui.screen_text()
+    );
+
+    let interrupt_started = Instant::now();
+    tui.write("\x1b");
+    assert!(
+        tui.wait_for_stable_screen(Duration::from_secs(2), |screen| {
+            screen_has_ready_composer(screen)
+                && screen.contains("interrupted — tell euler what to do differently")
+        }),
+        "Escape did not cancel the managed extension promptly:\n{}",
+        tui.screen_text()
+    );
+    assert!(interrupt_started.elapsed() < Duration::from_secs(2));
+    assert!(
+        !extension_dir.path().join("too_late").exists(),
+        "managed extension survived cancellation"
     );
     tui.quit();
 }
@@ -7574,6 +7961,15 @@ fn write_managed_process_extension_manifest(
 }
 
 #[cfg(unix)]
+fn raw_managed_process_script(body: &str) -> String {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../euler-managed-process/tests/fixtures")
+        .canonicalize()
+        .expect("managed-process fixture directory");
+    format!("import sys\nsys.path.insert(0, {fixture_dir:?})\nfrom raw_peer import serve\n{body}")
+}
+
+#[cfg(unix)]
 #[test]
 fn headless_extension_run_executes_enabled_linked_python_process_live() {
     let exe = env!("CARGO_BIN_EXE_euler");
@@ -7591,22 +7987,23 @@ fn headless_extension_run_executes_enabled_linked_python_process_live() {
             "extension.py".to_owned(),
         ],
     );
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
     fs::write(
         extension_dir.path().join("extension.py"),
-        format!(
-            r#"import sys
-sys.path.insert(0, {sdk_source:?})
-from euler_managed_process_sdk import serve
+        raw_managed_process_script(
+            r#"
+def inspect(peer, command_input):
+    page = peer.request("euler/host/query-provenance", {
+        "after_event_id": None,
+        "kinds": [],
+        "limit": 16,
+        "scan_limit": 32,
+        "include_blob_fields": False,
+        "blob_byte_limit": 1024,
+    })
+    return {"tag": command_input["tag"], "seen_events": len(page["events"])}
 
-def inspect(context):
-    page = context.host.query_provenance(limit=16, scan_limit=32)
-    return {{"tag": context.input["tag"], "seen_events": len(page["events"])}}
-
-serve({{"inspect": inspect}})
+serve({"inspect": inspect})
 "#,
-            sdk_source = sdk_source.to_string_lossy()
         ),
     )
     .expect("write Python extension");
@@ -7661,72 +8058,6 @@ serve({{"inspect": inspect}})
     assert_eq!(result["extension"], serde_json::json!("python-live-proof"));
     assert_eq!(result["result"]["tag"], serde_json::json!("live"));
     assert!(result["result"]["seen_events"].as_u64().unwrap() >= 1);
-}
-
-#[cfg(unix)]
-fn provision_python_venv(extension_dir: &Path) -> PathBuf {
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk");
-    let sdk_copy = extension_dir.join("sdk-package");
-    copy_directory(&sdk_source, &sdk_copy);
-    let venv = extension_dir.join(".venv");
-    let created = Command::new("python3")
-        .args(["-m", "venv"])
-        .arg(&venv)
-        .status()
-        .expect("create Python virtual environment");
-    assert!(created.success(), "python3 -m venv failed: {created}");
-    let python = venv.join("bin/python");
-    // Editable-install equivalent without pip or a build backend (issue
-    // #142): the SDK is pure Python, so path-linking its src/ through a
-    // .pth file in the venv's site-packages is everything `pip install -e`
-    // would achieve here — while staying offline (CI requirement) and
-    // independent of whether the host Python still bundles setuptools.
-    // Python 3.12+ venvs do not, and modern system interpreters (e.g.
-    // Homebrew 3.14) ship none, which made the previous
-    // `--no-build-isolation` editable install fail with
-    // `Cannot import 'setuptools.build_meta'`.
-    let purelib = Command::new(&python)
-        .args([
-            "-c",
-            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
-        ])
-        .output()
-        .expect("resolve venv site-packages");
-    assert!(
-        purelib.status.success(),
-        "resolving venv site-packages failed: {}",
-        String::from_utf8_lossy(&purelib.stderr)
-    );
-    let site_packages = PathBuf::from(String::from_utf8_lossy(&purelib.stdout).trim());
-    fs::write(
-        site_packages.join("euler_managed_process_sdk.pth"),
-        format!("{}\n", sdk_copy.join("src").display()),
-    )
-    .expect("write SDK path link");
-    let imports = Command::new(&python)
-        .args(["-B", "-c", "import euler_managed_process_sdk"])
-        .output()
-        .expect("verify SDK import");
-    assert!(
-        imports.status.success(),
-        "venv python cannot import the SDK: {}",
-        String::from_utf8_lossy(&imports.stderr)
-    );
-    python
-}
-
-fn copy_directory(source: &Path, destination: &Path) {
-    fs::create_dir_all(destination).expect("create copied SDK directory");
-    for entry in fs::read_dir(source).expect("read SDK directory") {
-        let entry = entry.expect("SDK entry");
-        let target = destination.join(entry.file_name());
-        if entry.file_type().expect("SDK entry type").is_dir() {
-            copy_directory(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), target).expect("copy SDK file");
-        }
-    }
 }
 
 /// Like [`run_euler_with_input`], but from an explicit working directory —

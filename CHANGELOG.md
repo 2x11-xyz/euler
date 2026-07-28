@@ -19,6 +19,80 @@ pull requests that landed them; deeper design rationale lives in
   repository re-prompts once after upgrading (fail closed — nothing loads
   until re-accepted); afterwards user-skill changes never re-prompt.
 
+### Steering reliability
+
+- Mid-turn steering and queued follow-ups now preserve FIFO order, hydrate at
+  the next model-round boundary, and remain editable while persistence runs.
+  A failed `user.message` append stays queued without entering the live bus, so
+  repairing provenance and retrying the same event identity admits that input
+  exactly once, even when a failed sync left its complete bytes in the log.
+  If that unresolved admission blocks terminalizing a detached shadow call,
+  the live session fails closed and resume records its unknown outcome before
+  accepting more activity.
+
+### TUI interruption
+
+- Escape now dismisses the active slash menu or picker before a later Escape
+  interrupts the running turn. Root-turn cancellation releases the session
+  from blocked provider reads and rejects late provider events; a synchronous
+  adapter thread can remain until its OS or network call returns. Euler kills
+  owned shell or Git process groups before reaping their leaders, without
+  waiting for the command timeout. Explicit companion runs, permission asks,
+  guardian reviews, and managed-process extension commands share the same
+  cancellation source. An open model call closes with one parented session
+  cancellation error, and recorded tool calls without an earlier result close
+  with exactly one cancelled result, retaining collected partial output and
+  boundedly observed file-change evidence. Interrupt also clears queued
+  activities visibly while preserving queued user steering.
+
+### Compaction resilience
+
+- Automatic and manual compaction now use a fixed shadow canvas when tool-result
+  stubs cannot recover enough space. The active TUI turn remains usable while
+  the bounded summary runs; only a validated candidate can atomically replace
+  the canvas, and a failed candidate leaves the active history unchanged.
+  Assembled byte pressure is checked independently at provider admission:
+  Euler waits for recovery and never dispatches a driver canvas over budget.
+- Layer-1 compaction advances instead of repeatedly swapping the same tool
+  results, stacks correctly over a prior full projection, and resets stale
+  context usage only after an accepted swap. At the hard context margin, Euler
+  waits for an in-flight candidate and otherwise stops with an honest limit
+  event.
+- Shadow jobs now close at session lifecycle boundaries, preserve completed
+  usage and cost records, and cannot publish late output into a replaced or
+  scrubbed session. Candidate validation is host-bounded and proves the exact
+  post-swap request both shrinks and fits before accounting is reset.
+- Escape at the base composer now interrupts an idle shadow without applying
+  its candidate, preserves already-ready usage provenance, reports failure
+  separately from cancellation, and preserves the draft. Interrupting a
+  driver with a concurrent shadow terminalizes and fences both calls, so
+  neither provider's late return can append events or swap the canvas.
+
+### Extension workflow scaffolding
+
+- Extension commands can declare bounded model tools and one terminal-idle
+  contributor. Implicit idle work never opens a permission prompt: it runs only
+  with standing authority and records an expected rejected stop otherwise.
+  Accepted continuations run under the ordinary `RoundLoop` limit with no
+  hidden second cap, and become one-shot only when an admitted `model.call`
+  binds their exact prepared canvas snapshot; a snapshot-only crash preserves
+  them for recovery. Request links fail closed on duplicate event ids,
+  malformed snapshot accounting, stale snapshots, or crossed session/agent
+  identity, and resume rejects duplicate ids before appending recovery.
+- Session-private extension state now has its own `extension-state` capability.
+  Root sessions allow it and bounded, namespaced `context-slot` updates by
+  default so removable workflows can probe absent or resumed state.
+- Extensions can publish bounded typed plan presentation through
+  `plan-presentation`; core emits canonical structured `plan.update` events
+  and renders one checklist cell without taking ownership of workflow policy.
+- Disabled extensions no longer leak durable context slots into live model
+  snapshots; re-enabling restores their retained state. Extension-authored
+  model text consistently rejects Unicode format controls at every admission
+  boundary.
+- The maintained Python managed-process SDK and examples live in
+  `euler-extensions`; Euler retains only an explicitly test-owned protocol
+  fixture.
+
 ### ChatGPT subscription compatibility
 
 - GPT-5.6 Luna WebSocket requests again disable parallel tool calls, as
@@ -139,9 +213,9 @@ but was never published, so everything below ships together in 0.1.3.
 ### Managed-process extensions (#130, #131, #133)
 
 - Out-of-process extension runtime: extensions run as separate processes
-  over stdio JSON-RPC, with a Python SDK
-  (`python/euler_managed_process_sdk`). Linked managed-process extensions
-  run in live sessions, and round observers can be managed processes.
+  over stdio JSON-RPC, with a Python SDK (now maintained in
+  `euler-extensions`). Linked managed-process extensions run in live sessions,
+  and round observers can be managed processes.
 
 ### Permissions, sandbox, compaction (#122, #125–#129)
 

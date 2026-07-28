@@ -79,19 +79,27 @@ impl AppCore {
     }
 
     pub(super) fn compact_session(&mut self) -> CoreEffect {
-        let AppState::Idle { session } = &mut self.state else {
-            return self.notice_item("compaction waits for the active turn".to_owned());
-        };
-        let start = session.events().len();
-        if session.compact_now() {
-            let new_events = session.events()[start..].to_vec();
-            for event in new_events {
-                self.transcript.push_event(event);
-                self.queue_finalized_visual_output_for_latest_event();
-            }
-            return self.notice_item("compacted eligible history".to_owned());
+        if matches!(self.state, AppState::TurnInFlight { .. }) {
+            self.compaction_request.store(true, Ordering::SeqCst);
+            return self.notice_item("compaction in progress · active turn continues".to_owned());
         }
-        self.notice_item("nothing eligible to compact".to_owned())
+        if !matches!(self.state, AppState::Idle { .. }) {
+            return self.notice_item("compaction unavailable".to_owned());
+        }
+        self.compaction_request.store(false, Ordering::SeqCst);
+        let (outcome, events) = {
+            let AppState::Idle { session } = &mut self.state else {
+                unreachable!("idle state checked above");
+            };
+            let start = session.events().len();
+            let outcome = session
+                .begin_compaction()
+                .map_err(|error| error.to_string());
+            let events = session.events()[start..].to_vec();
+            (outcome, events)
+        };
+        self.record_compaction_update(outcome, events, true);
+        CoreEffect::Render
     }
 
     pub(super) fn export_session(&mut self, path: Option<String>) -> CoreEffect {

@@ -194,6 +194,15 @@ impl AppCore {
                 self.notice = Some(format!("session metadata refresh failed: {error}"));
             }
         }
+        let compaction_requested = self.compaction_request.swap(false, Ordering::SeqCst);
+        if compaction_requested && !session.compaction_in_progress() {
+            let start = session.events().len();
+            let outcome = session
+                .begin_compaction()
+                .map_err(|error| error.to_string());
+            let events = session.events()[start..].to_vec();
+            self.record_compaction_update(outcome, events, false);
+        }
         if let Some(request) = self.pending_runs.pop_front() {
             match request {
                 PendingRunRequest::Extension(request) => self.spawn_extension_run(request, session),
@@ -201,10 +210,10 @@ impl AppCore {
             }
             return;
         }
-        if auto_flush && !self.queued_inputs.paused() {
-            if let Some(prompt) = self.pop_next_queued_input() {
-                self.bottom.record_submission(&prompt);
-                self.spawn_turn(prompt, session);
+        if auto_flush && !self.queued_inputs.paused() && session.can_accept_turn() {
+            if let Some(input) = self.pop_next_queued_input() {
+                self.bottom.record_submission(input.content());
+                self.spawn_queued_turn(input, session);
                 return;
             }
         }
@@ -219,6 +228,107 @@ impl AppCore {
         self.current_phase_verb = None;
         self.spinner_frame = 0;
         self.spinner_last_tick = None;
+    }
+
+    pub(super) fn drain_idle_compaction(&mut self) -> bool {
+        let update = match &mut self.state {
+            AppState::Idle { session } if session.compaction_in_progress() => {
+                let start = session.events().len();
+                let outcome = session.poll_compaction().map_err(|error| error.to_string());
+                let events = session.events()[start..].to_vec();
+                if outcome == Ok(CompactionStatus::InProgress) && events.is_empty() {
+                    None
+                } else {
+                    Some((outcome, events))
+                }
+            }
+            _ => None,
+        };
+        let Some((outcome, events)) = update else {
+            return false;
+        };
+        self.record_compaction_update(outcome, events, false);
+        true
+    }
+
+    pub(super) fn record_compaction_update(
+        &mut self,
+        outcome: Result<CompactionStatus, String>,
+        events: Vec<EventEnvelope>,
+        announce_pending: bool,
+    ) {
+        self.record_compaction_events(events);
+        match outcome {
+            Ok(CompactionStatus::Applied) => {
+                self.push_notice_item("compaction complete".to_owned())
+            }
+            Ok(CompactionStatus::Cancelled) => {
+                self.push_notice_item("compaction cancelled · active canvas unchanged".to_owned())
+            }
+            Ok(CompactionStatus::Failed) => {
+                self.push_notice_item("compaction failed · active canvas unchanged".to_owned())
+            }
+            Ok(CompactionStatus::Unchanged) => {
+                self.push_notice_item("nothing eligible to compact".to_owned())
+            }
+            Ok(CompactionStatus::InProgress) if announce_pending => {
+                self.push_notice_item("compaction in progress · you can keep typing".to_owned())
+            }
+            Ok(CompactionStatus::InProgress) => {}
+            Err(error) => self.push_notice_item(format!("compaction failed: {error}")),
+        }
+    }
+
+    fn record_compaction_events(&mut self, events: Vec<EventEnvelope>) {
+        for event in events {
+            self.update_token_usage_from_event(&event);
+            self.transcript.push_event(event);
+            self.queue_finalized_visual_output_for_latest_event();
+        }
+    }
+
+    pub(super) fn cancel_idle_compaction_for_lifecycle(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, String> {
+        let update = match &mut self.state {
+            AppState::Idle { session } if session.compaction_in_progress() => {
+                let start = session.events().len();
+                let outcome = session
+                    .cancel_compaction(reason)
+                    .map_err(|error| error.to_string());
+                let events = session.events()[start..].to_vec();
+                Some((outcome, events))
+            }
+            _ => None,
+        };
+        let Some((outcome, events)) = update else {
+            return Ok(CompactionStatus::Unchanged);
+        };
+        self.record_compaction_events(events);
+        outcome
+    }
+
+    pub(super) fn interrupt_idle_compaction(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<CompactionStatus, String> {
+        let update = match &mut self.state {
+            AppState::Idle { session } if session.compaction_in_progress() => {
+                let start = session.events().len();
+                let outcome = session
+                    .interrupt_compaction(reason)
+                    .map_err(|error| error.to_string());
+                let events = session.events()[start..].to_vec();
+                Some((outcome, events))
+            }
+            _ => None,
+        };
+        let Some((outcome, events)) = update else {
+            return Ok(CompactionStatus::Unchanged);
+        };
+        self.record_compaction_events(events);
+        outcome
     }
 
     fn handle_extension_outcome(
@@ -261,6 +371,7 @@ impl AppCore {
                     request.id, request.command
                 ));
             }
+            ExtensionOutcome::Cancelled => self.record_auxiliary_interruption(),
         }
     }
 
@@ -291,7 +402,17 @@ impl AppCore {
                 });
                 self.notice = Some(format!("companion run failed: {message}"));
             }
+            CompanionOutcome::Cancelled => self.record_auxiliary_interruption(),
         }
+    }
+
+    fn record_auxiliary_interruption(&mut self) {
+        self.queued_inputs.set_paused(true);
+        self.transcript.clear_transient_live_tail();
+        self.interrupted_guidance = false;
+        self.in_flight_error = None;
+        self.push_finalized_visual_item(TranscriptItem::Interrupted);
+        self.notice = None;
     }
 
     fn refresh_patch_modal_preview(&mut self) {
@@ -311,7 +432,22 @@ impl AppCore {
     }
 
     fn record_in_flight_error(&mut self, event: &EventEnvelope) {
-        if !self.turn_in_flight() || event.kind.as_str() != EventKind::ERROR {
+        if !self.turn_in_flight()
+            || event.kind.as_str() != EventKind::ERROR
+            || event
+                .payload
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        if event
+            .payload
+            .get("purpose")
+            .and_then(serde_json::Value::as_str)
+            == Some("compaction")
+        {
             return;
         }
         let source = event

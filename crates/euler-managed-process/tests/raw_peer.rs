@@ -5,11 +5,12 @@ use euler_managed_process::{
     ManagedProcessExtension, ManagedProcessLimits, ManagedProcessRuntimeError,
 };
 use euler_sdk::{
-    AgentOutcome, ArtifactRecord, ArtifactWrite, Capability, CommandContext, CommandRegistrar,
-    DiagnosticsPage, DiagnosticsQuery, EventFeedCheckpoint, Extension, ExtensionCommand,
-    ExtensionError, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
-    ManagedProcessEntrypoint, ProvenancePage, ProvenanceQuery, SpawnAgentTask,
-    StaticCommandDescriptor, StaticExtensionDescriptor,
+    AgentOutcome, ArtifactRecord, ArtifactWrite, CancellationToken, Capability, CommandContext,
+    CommandRegistrar, DiagnosticsPage, DiagnosticsQuery, EventFeedCheckpoint, Extension,
+    ExtensionCommand, ExtensionError, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
+    IdleContributionDescriptor, ManagedProcessEntrypoint, ModelToolDescriptor, PlanPresentation,
+    ProvenancePage, ProvenanceQuery, SpawnAgentTask, StaticCommandDescriptor,
+    StaticExtensionDescriptor,
 };
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -20,36 +21,123 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[test]
-fn python_sdk_round_trips_every_current_host_api() {
+fn managed_adapter_preserves_session_contribution_descriptors() {
+    let temp = TempDir::new().expect("temp package");
+    let model_tool = ModelToolDescriptor {
+        name: "update_workflow".to_owned(),
+        description: "Update workflow-owned state.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    };
+    let idle = IdleContributionDescriptor {
+        command: "idle".to_owned(),
+    };
+    let descriptor = StaticExtensionDescriptor {
+        id: "python-proof".to_owned(),
+        display_name: "Python proof".to_owned(),
+        version: "0.1.1".to_owned(),
+        runtime_kind: "managed-process".to_owned(),
+        capabilities: Vec::new(),
+        commands: vec![
+            StaticCommandDescriptor {
+                name: "update".to_owned(),
+                display_name: "Update".to_owned(),
+                summary: "Update.".to_owned(),
+                required_capabilities: Vec::new(),
+                invocation: euler_sdk::Invocation::AgentOnly,
+                model_tool: Some(model_tool.clone()),
+            },
+            StaticCommandDescriptor {
+                name: "idle".to_owned(),
+                display_name: "Idle".to_owned(),
+                summary: "Idle.".to_owned(),
+                required_capabilities: Vec::new(),
+                invocation: euler_sdk::Invocation::AgentOnly,
+                model_tool: None,
+            },
+        ],
+        observer: None,
+        idle_contribution: Some(idle.clone()),
+    };
+
+    let extension = ManagedProcessExtension::new(
+        temp.path(),
+        &descriptor,
+        ManagedProcessEntrypoint {
+            command: vec!["python3".to_owned(), "extension.py".to_owned()],
+        },
+    )
+    .expect("adapter");
+
+    assert_eq!(
+        extension
+            .command_descriptor("update")
+            .and_then(|command| command.model_tool.as_ref()),
+        Some(&model_tool)
+    );
+    assert_eq!(extension.idle_contribution(), Some(idle));
+}
+
+#[test]
+fn raw_peer_round_trips_every_current_host_api() {
     require_python();
     let temp = TempDir::new().expect("temp package");
     write_script(
         temp.path(),
         "extension.py",
-        &sdk_script(
+        &raw_peer_script(
             r#"
-def exercise(context):
-    context.host.progress("starting", 0.1)
-    page = context.host.query_provenance(limit=2, scan_limit=4)
-    diagnostics = context.host.read_diagnostics(tail_lines=3, max_bytes=128)
-    state_dir = context.host.state_dir()
-    artifact = context.host.write_artifact(
-        display_name="result.txt",
-        media_type="text/plain",
-        data=b"python artifact",
-        source_event_ids=[],
-        metadata={"from": "python"},
+import base64
+
+def exercise(peer, _input):
+    peer.progress("starting", 0.1)
+    page = peer.request("euler/host/query-provenance", {
+        "after_event_id": None, "kinds": [], "limit": 2, "scan_limit": 4,
+        "include_blob_fields": False, "blob_byte_limit": 1024,
+    })
+    diagnostics = peer.request(
+        "euler/host/read-diagnostics", {"tail_lines": 3, "max_bytes": 128}
     )
-    before = context.host.load_checkpoint("cursor")
-    context.host.store_checkpoint("cursor", {"schema_version": 1, "after_event_id": "event-1"})
-    record = context.host.record_agent_task_result(
-        {"task": "record", "persona": "observer", "provider": "", "model": "", "capabilities": [], "budget": {}, "result_schema": None},
-        {"ok": True, "summary": "done", "output": "body", "error": None},
-    )
-    slot = context.host.update_context_slot("current", "bounded context")
-    spawned = context.host.spawn_agent({"task": "one", "persona": "", "provider": "", "model": "", "system_prompt": "", "explicit_context": None, "include_parent_canvas": False, "capabilities": [], "max_turns": None, "max_tool_calls": None, "max_tokens": None})
-    spawned_many = context.host.spawn_agents([{"task": "many", "persona": "", "provider": "", "model": "", "system_prompt": "", "explicit_context": None, "include_parent_canvas": False, "capabilities": [], "max_turns": None, "max_tool_calls": None, "max_tokens": None}])
-    context.host.progress("finished", 1.0)
+    state_dir = peer.request("euler/host/state-dir", {})["path"]
+    artifact = peer.request("euler/host/write-artifact", {
+        "display_name": "result.txt",
+        "media_type": "text/plain",
+        "bytes_base64": base64.b64encode(b"python artifact").decode("ascii"),
+        "source_event_ids": [],
+        "metadata": {"from": "python"},
+    })
+    before = peer.request("euler/host/load-checkpoint", {"name": "cursor"})
+    peer.request("euler/host/store-checkpoint", {
+        "name": "cursor",
+        "checkpoint": {"schema_version": 1, "after_event_id": "event-1"},
+    })
+    record = peer.request("euler/host/record-agent-task-result", {
+        "task": {"task": "record", "persona": "observer", "provider": "", "model": "", "capabilities": [], "budget": {}, "result_schema": None},
+        "result": {"ok": True, "summary": "done", "output": "body", "error": None},
+    })
+    peer.request("euler/host/update-context-slot", {
+        "slot": "current", "content": "bounded context",
+    })
+    plan = {
+        "revision": 1,
+        "status": "active",
+        "explanation": "Started from the raw protocol peer.",
+        "items": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "in_progress"},
+        ],
+    }
+    plan_result = peer.request("euler/host/update-plan-presentation", plan)
+    task = {"task": "one", "persona": "", "provider": "", "model": "", "system_prompt": "", "explicit_context": None, "include_parent_canvas": False, "capabilities": [], "max_turns": None, "max_tool_calls": None, "max_tokens": None}
+    spawned = peer.request("euler/host/spawn-agent", task)
+    many_task = dict(task)
+    many_task["task"] = "many"
+    spawned_many = peer.request("euler/host/spawn-agents", {"tasks": [many_task]})
+    peer.progress("finished", 1.0)
     return {
         "events": len(page["events"]),
         "diagnostics": diagnostics["lines"],
@@ -57,7 +145,7 @@ def exercise(context):
         "artifact": artifact["relative_path"],
         "checkpoint_before": before,
         "record": record["child_agent_id"],
-        "slot": slot,
+        "plan_result": plan_result,
         "spawned": spawned["child_agent_id"],
         "spawned_many": [outcome["child_agent_id"] for outcome in spawned_many],
     }
@@ -79,6 +167,7 @@ serve({"exercise": exercise})
     );
     assert_eq!(output["checkpoint_before"], Value::Null);
     assert_eq!(output["record"], json!("child-record"));
+    assert_eq!(output["plan_result"], json!({}));
     assert_eq!(output["spawned"], json!("child-live"));
     assert_eq!(output["spawned_many"], json!(["child-live-many"]));
 
@@ -101,6 +190,24 @@ serve({"exercise": exercise})
     assert_eq!(
         host.slots.borrow().as_slice(),
         [("current".to_owned(), "bounded context".to_owned())]
+    );
+    assert_eq!(
+        host.plans.borrow().as_slice(),
+        [PlanPresentation {
+            revision: 1,
+            status: euler_sdk::PlanPresentationStatus::Active,
+            explanation: Some("Started from the raw protocol peer.".to_owned()),
+            items: vec![
+                euler_sdk::PlanPresentationItem {
+                    step: "Inspect".to_owned(),
+                    status: euler_sdk::PlanItemStatus::Completed,
+                },
+                euler_sdk::PlanPresentationItem {
+                    step: "Implement".to_owned(),
+                    status: euler_sdk::PlanItemStatus::InProgress,
+                },
+            ],
+        }]
     );
     assert_eq!(*host.recorded_agent_tasks.borrow(), 1);
     assert_eq!(*host.spawned_agents.borrow(), 1);
@@ -376,11 +483,11 @@ fn timed_out_python_command_is_cancelled_and_reaped() {
     write_script(
         temp.path(),
         "extension.py",
-        &sdk_script(
+        &raw_peer_script(
             r#"
 import time
 
-def wait_forever(context):
+def wait_forever(_peer, _input):
     time.sleep(10)
     return {"unexpected": True}
 
@@ -509,13 +616,13 @@ fn timeout_terminates_descendants_that_inherit_protocol_pipes() {
     write_script(
         temp.path(),
         "extension.py",
-        &sdk_script(
+        &raw_peer_script(
             r#"
 import subprocess
 import sys
 import time
 
-def wait(context):
+def wait(_peer, _input):
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     time.sleep(30)
     return {"unexpected": True}
@@ -589,6 +696,80 @@ if cancellation.get("method") == "$/cancelRequest" and cancellation.get("params"
     assert!(
         marker.is_file(),
         "peer did not observe the cancellation request"
+    );
+}
+
+#[test]
+fn host_cancellation_stops_an_active_managed_process_command() {
+    require_python();
+    let temp = TempDir::new().expect("temp package");
+    let started = temp.path().join("started");
+    let cancelled = temp.path().join("cancelled");
+    write_script(
+        temp.path(),
+        "extension.py",
+        r#"import json
+import sys
+from pathlib import Path
+
+def read():
+    line = sys.stdin.buffer.readline()
+    if not line:
+        raise SystemExit(2)
+    return json.loads(line)
+
+def write(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+initialize = read()
+write({"jsonrpc": "2.0", "id": initialize["id"], "result": {"protocol_version": "euler-managed-process/1"}})
+read()
+command = read()
+Path("started").write_text("yes", encoding="utf-8")
+cancellation = read()
+if cancellation.get("method") == "$/cancelRequest" and cancellation.get("params", {}).get("id") == command["id"]:
+    Path("cancelled").write_text("yes", encoding="utf-8")
+"#,
+    );
+    let limits = ManagedProcessLimits {
+        invocation_timeout: Duration::from_secs(30),
+        cancel_grace: Duration::from_millis(250),
+        ..ManagedProcessLimits::default()
+    };
+    let extension = extension(temp.path(), "exercise", Vec::new()).with_limits(limits);
+    let cancellation = euler_sdk::CancellationSource::new();
+    let worker_cancellation = cancellation.token();
+    let worker = std::thread::spawn(move || {
+        execute_cancellable(
+            &extension,
+            "exercise",
+            json!({}),
+            &FakeHost::default(),
+            &worker_cancellation,
+        )
+    });
+
+    let wait_started = Instant::now();
+    while !started.is_file() && wait_started.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(started.is_file(), "managed command did not start");
+    let cancelled_at = Instant::now();
+    cancellation.cancel();
+    let error = worker
+        .join()
+        .expect("managed process worker")
+        .expect_err("cancelled command");
+
+    assert_eq!(error, ExtensionError::Cancelled);
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(1),
+        "host cancellation waited for the invocation timeout"
+    );
+    assert!(
+        cancelled.is_file(),
+        "managed peer did not observe the cancellation request"
     );
 }
 
@@ -722,7 +903,7 @@ time.sleep(10)
     let extension = extension(
         temp.path(),
         "exercise",
-        vec![Capability::FsWrite.as_str().to_owned()],
+        vec![Capability::ExtensionState.as_str().to_owned()],
     )
     .with_limits(limits);
     let error =
@@ -735,16 +916,16 @@ time.sleep(10)
 }
 
 #[test]
-fn python_sdk_accepts_a_command_frame_at_the_advertised_size_boundary() {
+fn raw_peer_accepts_a_command_frame_at_the_advertised_size_boundary() {
     require_python();
     let temp = TempDir::new().expect("temp package");
     write_script(
         temp.path(),
         "extension.py",
-        &sdk_script(
+        &raw_peer_script(
             r#"
-def exercise(context):
-    return {"padding_bytes": len(context.input["padding"])}
+def exercise(_peer, command_input):
+    return {"padding_bytes": len(command_input["padding"])}
 
 serve({"exercise": exercise})
 "#,
@@ -772,14 +953,16 @@ fn host_capability_denial_stays_host_owned_and_is_not_process_output() {
     write_script(
         temp.path(),
         "extension.py",
-        &sdk_script(
+        &raw_peer_script(
             r#"
-def write(context):
-    context.host.write_artifact(
-        display_name="denied.txt",
-        media_type="text/plain",
-        data=b"must not persist",
-    )
+def write(peer, _input):
+    peer.request("euler/host/write-artifact", {
+        "display_name": "denied.txt",
+        "media_type": "text/plain",
+        "bytes_base64": "bXVzdCBub3QgcGVyc2lzdA==",
+        "source_event_ids": [],
+        "metadata": {},
+    })
     return {"unexpected": True}
 
 serve({"write": write})
@@ -889,8 +1072,10 @@ fn extension(
             summary: "test command".to_owned(),
             required_capabilities: capabilities,
             invocation: euler_sdk::Invocation::User,
+            model_tool: None,
         }],
         observer: None,
+        idle_contribution: None,
     };
     ManagedProcessExtension::new(
         package_dir,
@@ -930,6 +1115,24 @@ fn execute_with_input(
         .expect("command")
         .1;
     command.execute(CommandContext { input }, host)
+}
+
+fn execute_cancellable(
+    extension: &ManagedProcessExtension,
+    command: &str,
+    input: Value,
+    host: &dyn HostApi,
+    cancellation: &CancellationToken,
+) -> Result<Value, ExtensionError> {
+    let mut registrar = TestRegistrar::default();
+    extension.register(&mut registrar).expect("register");
+    let command = registrar
+        .commands
+        .into_iter()
+        .find(|(name, _)| name == command)
+        .expect("command")
+        .1;
+    command.execute_cancellable(CommandContext { input }, host, cancellation)
 }
 
 fn boundary_sized_input(max_message_bytes: usize) -> Value {
@@ -975,6 +1178,7 @@ struct FakeHost {
     checkpoint: RefCell<Option<EventFeedCheckpoint>>,
     artifacts: RefCell<Vec<ArtifactWrite>>,
     slots: RefCell<Vec<(String, String)>>,
+    plans: RefCell<Vec<PlanPresentation>>,
     recorded_agent_tasks: RefCell<usize>,
     spawned_agents: RefCell<usize>,
     spawned_batches: RefCell<usize>,
@@ -1068,6 +1272,11 @@ impl HostApi for FakeHost {
         Ok(())
     }
 
+    fn update_plan_presentation(&self, plan: PlanPresentation) -> Result<(), ExtensionError> {
+        self.plans.borrow_mut().push(plan);
+        Ok(())
+    }
+
     fn spawn_agent(&self, _task: SpawnAgentTask) -> Result<AgentOutcome, ExtensionError> {
         *self.spawned_agents.borrow_mut() += 1;
         Ok(agent_outcome("child-live"))
@@ -1105,10 +1314,12 @@ fn all_capabilities() -> Vec<String> {
         Capability::DiagnosticsRead,
         Capability::FsRead,
         Capability::FsWrite,
+        Capability::ExtensionState,
         Capability::ArtifactWrite,
         Capability::AgentRecord,
         Capability::AgentSpawn,
         Capability::ContextSlot,
+        Capability::PlanPresentation,
     ]
     .into_iter()
     .map(|capability| capability.as_str().to_owned())
@@ -1127,12 +1338,9 @@ fn write_script(package_dir: &Path, name: &str, content: &str) {
     fs::write(package_dir.join(name), content).expect("write Python extension script");
 }
 
-fn sdk_script(body: &str) -> String {
-    let sdk_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/euler_managed_process_sdk/src");
-    let sdk_source =
-        serde_json::to_string(&sdk_source.to_string_lossy()).expect("serialize SDK source path");
-    format!(
-        "import sys\nsys.path.insert(0, {sdk_source})\nfrom euler_managed_process_sdk import serve\n{body}"
-    )
+fn raw_peer_script(body: &str) -> String {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture_dir =
+        serde_json::to_string(&fixture_dir.to_string_lossy()).expect("serialize fixture path");
+    format!("import sys\nsys.path.insert(0, {fixture_dir})\nfrom raw_peer import serve\n{body}")
 }

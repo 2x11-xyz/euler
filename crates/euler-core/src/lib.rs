@@ -81,7 +81,8 @@ pub use grants::{
 pub use guardian::PermissionReviewer;
 pub use home::{EulerHome, EulerHomeError};
 pub use permissions::{
-    ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider, PermissionRequest,
+    ApprovalMode, DeciderVerdict, GrantDecision, GrantSource, PermissionDecider,
+    PermissionDecisionOutcome, PermissionRequest,
 };
 pub use project_context::{
     AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError, AdmissionBudget,
@@ -109,8 +110,9 @@ pub use sandbox::{
 pub use session::{
     fold_model_target, fold_reasoning_effort, system_instruction_bytes, AgentReporter,
     AgentResultSummary, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
-    ContextLimitConfig, ExtensionExecutionError, ModelTarget, RoundObserverConfig, Session,
-    SessionConfig, SessionError, SteeringQueue, WorkspaceRestoreOutcome,
+    CompactionStatus, ContextLimitConfig, ExtensionExecutionError, ModelTarget, QueuedInput,
+    RoundObserverConfig, Session, SessionConfig, SessionError, SteeringQueue,
+    WorkspaceRestoreOutcome,
 };
 pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};

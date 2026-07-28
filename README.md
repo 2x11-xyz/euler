@@ -5,7 +5,8 @@
 **Euler is a research agent (coding agent included) and an open-ended
 runtime-extensible platform.** Its small core is scaffolding for new agent
 workflows: extensions can add commands, context slots, artifacts, checkpoints,
-capabilities, and companion-agent patterns without changing the core. Euler
+typed plan presentation, capabilities, and companion-agent patterns without
+changing the core. Euler
 treats problem solving as a first-class artifact: every session is a
 trustworthy, reconstructable record of what was tried, what died, and what
 survived. Your agent's dead ends are data. Euler keeps them.
@@ -20,8 +21,9 @@ survived. Your agent's dead ends are data. Euler keeps them.
   facts about what happened are never silently lost.
 
 - **Runtime-extensible core.** A small provenance-bearing core powers extensions
-  via `euler-sdk`: commands, context slots, artifacts, checkpoints, and
-  capabilities behind one host API. Euler ships core-only: extensions are
+  via `euler-sdk`: commands, context slots, typed plan presentation, artifacts,
+  checkpoints, and capabilities behind one host API. Euler ships core-only:
+  extensions are
   linked or installed packages, and the first-party set (session-export,
   code-swarm, diagnostics-report, autoresearch, maxproof) lives in
   [euler-extensions](https://github.com/2x11-xyz/euler-extensions).
@@ -137,8 +139,9 @@ euler extension run session-export.session-export ./session.jsonl
 ```
 
 Build your own with a native Rust crate implementing the `euler-sdk` traits, or
-with a managed-process package such as
-[`examples/python-managed-process-extension`](examples/python-managed-process-extension).
+with the canonical
+[Python SDK and examples](https://github.com/2x11-xyz/euler-extensions/tree/main/sdks/python/euler-managed-process-sdk)
+for managed-process packages.
 See [docs/guides/extensions.md](docs/guides/extensions.md). The design
 contracts extensions rely on live in [docs/contracts/](docs/contracts/).
 
