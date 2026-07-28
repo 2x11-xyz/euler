@@ -1093,9 +1093,12 @@ fn session_parts(root: &Path, provider_plan: ProviderPlan) -> (SessionConfig, Pr
 
 fn assert_equivalent_projections(name: &str, expected: &[EventEnvelope], actual: &[EventEnvelope]) {
     let allowlist = nondeterministic_fields();
+    let expected_transcript = normalize_transcript_events(expected, &allowlist)
+        .unwrap_or_else(|error| panic!("{name}: invalid expected request link: {error}"));
+    let actual_transcript = normalize_transcript_events(actual, &allowlist)
+        .unwrap_or_else(|error| panic!("{name}: invalid actual request link: {error}"));
     assert_eq!(
-        normalize_events(transcript_projection(expected), &allowlist),
-        normalize_events(transcript_projection(actual), &allowlist),
+        expected_transcript, actual_transcript,
         "{name}: transcript projection"
     );
     assert_eq!(
@@ -1121,11 +1124,28 @@ fn transcript_projection(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
         .collect()
 }
 
-fn normalize_events(events: Vec<EventEnvelope>, allowlist: &BTreeSet<&'static str>) -> Value {
+fn normalize_transcript_events(
+    events: &[EventEnvelope],
+    allowlist: &BTreeSet<&'static str>,
+) -> Result<Value, String> {
+    let driver_snapshot_links = validated_driver_snapshot_links(events)?;
+    normalize_events(
+        transcript_projection(events),
+        allowlist,
+        &driver_snapshot_links,
+    )
+}
+
+fn normalize_events(
+    events: Vec<EventEnvelope>,
+    allowlist: &BTreeSet<&'static str>,
+    driver_snapshot_links: &BTreeMap<String, String>,
+) -> Result<Value, String> {
     let id_map = event_id_map(&events);
     let values = events
         .into_iter()
         .map(|event| {
+            let event_id = event.id.clone();
             let mut value = serde_json::to_value(event).expect("event json");
             let object = value.as_object_mut().expect("event object");
             replace_allowed(
@@ -1158,6 +1178,18 @@ fn normalize_events(events: Vec<EventEnvelope>, allowlist: &BTreeSet<&'static st
                 }
             }
             if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
+                if payload.contains_key("canvas_snapshot_id") {
+                    let canvas_snapshot_id =
+                        driver_snapshot_links.get(&event_id).ok_or_else(|| {
+                            "canvas_snapshot_id has no validated driver request".to_owned()
+                        })?;
+                    replace_allowed(
+                        payload,
+                        allowlist,
+                        "canvas_snapshot_id",
+                        Value::String(canvas_snapshot_id.clone()),
+                    );
+                }
                 if let Some(file_change_id) = payload
                     .get("file_change_id")
                     .and_then(Value::as_str)
@@ -1183,10 +1215,139 @@ fn normalize_events(events: Vec<EventEnvelope>, allowlist: &BTreeSet<&'static st
                     }
                 }
             }
-            value
+            Ok(value)
         })
-        .collect::<Vec<_>>();
-    Value::Array(values)
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Value::Array(values))
+}
+
+struct DriverSnapshotCandidate {
+    event_id: String,
+    index: usize,
+    session: String,
+    agent: String,
+    canvas_items: Option<u64>,
+}
+
+fn validated_driver_snapshot_links(
+    events: &[EventEnvelope],
+) -> Result<BTreeMap<String, String>, String> {
+    let mut event_ids = BTreeSet::new();
+    if events
+        .iter()
+        .any(|event| !event_ids.insert(event.id.as_str()))
+    {
+        return Err("duplicate event id makes driver snapshot links ambiguous".to_owned());
+    }
+
+    let mut root_agents = BTreeMap::<String, String>::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::SESSION_START)
+    {
+        if let Some(existing) = root_agents.get(&event.session) {
+            if existing != &event.agent {
+                return Err("one session declares multiple root agents".to_owned());
+            }
+        } else {
+            root_agents.insert(event.session.clone(), event.agent.clone());
+        }
+    }
+
+    let mut latest_snapshots = BTreeMap::<(String, String), DriverSnapshotCandidate>::new();
+    let mut links = BTreeMap::new();
+    let mut driver_ordinal = 0usize;
+    for (index, event) in events.iter().enumerate() {
+        let identity = (event.session.clone(), event.agent.clone());
+        let is_root = root_agents
+            .get(&event.session)
+            .is_some_and(|agent| agent == &event.agent);
+        match event.kind.as_str() {
+            EventKind::CANVAS_SNAPSHOT if is_root && !event.payload.contains_key("purpose") => {
+                latest_snapshots.insert(
+                    identity,
+                    DriverSnapshotCandidate {
+                        event_id: event.id.clone(),
+                        index,
+                        session: event.session.clone(),
+                        agent: event.agent.clone(),
+                        canvas_items: validated_snapshot_canvas_items(event),
+                    },
+                );
+            }
+            EventKind::MODEL_CALL => {
+                let has_link = event.payload.contains_key("canvas_snapshot_id");
+                if !is_root || event.payload.contains_key("purpose") {
+                    if has_link {
+                        return Err("a non-driver model call carries canvas_snapshot_id".to_owned());
+                    }
+                    continue;
+                }
+                let link = event
+                    .payload
+                    .get("canvas_snapshot_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "a root driver model call is missing canvas_snapshot_id".to_owned()
+                    })?;
+                let snapshot = latest_snapshots.get(&identity).ok_or_else(|| {
+                    "a root driver model call has no earlier purpose-free snapshot".to_owned()
+                })?;
+                if snapshot.event_id != link {
+                    return Err(
+                        "a root driver model call does not link its latest snapshot".to_owned()
+                    );
+                }
+                if snapshot.index >= index
+                    || snapshot.session != event.session
+                    || snapshot.agent != event.agent
+                {
+                    return Err(
+                        "a root driver model call links a foreign or future snapshot".to_owned(),
+                    );
+                }
+                let snapshot_items = snapshot.canvas_items.ok_or_else(|| {
+                    "a linked driver snapshot has invalid selected-event accounting".to_owned()
+                })?;
+                let call_items = event
+                    .payload
+                    .get("canvas_items")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        "a root driver model call has invalid canvas_items".to_owned()
+                    })?;
+                if call_items != snapshot_items {
+                    return Err(
+                        "a root driver model call count does not match its snapshot".to_owned()
+                    );
+                }
+                links.insert(
+                    event.id.clone(),
+                    format!("<driver-snapshot-{driver_ordinal}>"),
+                );
+                driver_ordinal = driver_ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| "driver request ordinal overflow".to_owned())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(links)
+}
+
+fn validated_snapshot_canvas_items(event: &EventEnvelope) -> Option<u64> {
+    let selected_event_ids = event
+        .payload
+        .get("selected_event_ids")?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    let canvas_items = event.payload.get("counts")?.get("items")?.as_u64()?;
+    let expected_items = usize::try_from(canvas_items).ok()?;
+    let unique_items = selected_event_ids.iter().copied().collect::<BTreeSet<_>>();
+    (selected_event_ids.len() == expected_items && unique_items.len() == selected_event_ids.len())
+        .then_some(canvas_items)
 }
 
 fn normalize_canvas(events: &[EventEnvelope], allowlist: &BTreeSet<&'static str>) -> Value {
@@ -1275,9 +1436,133 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "parent",
         "selected_event_ids",
         "event_id",
+        "canvas_snapshot_id",
         "file_change_id",
         "root",
     ])
+}
+
+fn normalization_driver_sequence(session: &str, agent: &str) -> Vec<EventEnvelope> {
+    let start = EventEnvelope::new(session, agent, None, EventKind::SESSION_START, object([]));
+    let user = EventEnvelope::new(
+        session,
+        agent,
+        Some(start.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "request".into())]),
+    );
+    let snapshot = normalization_driver_snapshot(session, agent, &user);
+    let call = EventEnvelope::new(
+        session,
+        agent,
+        Some(snapshot.id.clone()),
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("canvas_items", 1.into()),
+            ("canvas_snapshot_id", snapshot.id.clone().into()),
+        ]),
+    );
+    vec![start, user, snapshot, call]
+}
+
+fn normalization_driver_snapshot(
+    session: &str,
+    agent: &str,
+    selected: &EventEnvelope,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        session,
+        agent,
+        Some(selected.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", json!([selected.id.clone()])),
+            ("counts", json!({"items": 1})),
+        ]),
+    )
+}
+
+fn assert_driver_link_normalization_rejected(case: &str, events: &[EventEnvelope]) {
+    let error = normalize_transcript_events(events, &nondeterministic_fields())
+        .expect_err("malformed driver link must reject normalization");
+    assert!(
+        !error.is_empty(),
+        "{case}: rejection must explain the class"
+    );
+}
+
+#[test]
+fn valid_driver_links_normalize_by_stable_root_request_ordinal() {
+    let first = normalization_driver_sequence("session", "root");
+    let mut resumed = normalization_driver_sequence("session", "root");
+    resumed.insert(
+        2,
+        EventEnvelope::new(
+            "session",
+            "root",
+            Some(resumed[1].id.clone()),
+            EventKind::SESSION_RESUMED,
+            object([("events_folded", 2.into())]),
+        ),
+    );
+
+    let first_normalized =
+        normalize_transcript_events(&first, &nondeterministic_fields()).expect("first");
+    let resumed_normalized =
+        normalize_transcript_events(&resumed, &nondeterministic_fields()).expect("resumed");
+
+    assert_eq!(first_normalized, resumed_normalized);
+    let rendered = first_normalized.to_string();
+    assert!(rendered.contains("<driver-snapshot-0>"));
+    assert!(!rendered.contains(&first[2].id));
+}
+
+#[test]
+fn malformed_driver_links_fail_normalization_instead_of_sharing_a_sentinel() {
+    let mut missing = normalization_driver_sequence("session", "root");
+    missing[3].payload.remove("canvas_snapshot_id");
+    assert_driver_link_normalization_rejected("missing link", &missing);
+
+    let mut nonexistent = normalization_driver_sequence("session", "root");
+    nonexistent[3]
+        .payload
+        .insert("canvas_snapshot_id".to_owned(), "nonexistent".into());
+    assert_driver_link_normalization_rejected("nonexistent link", &nonexistent);
+
+    let mut future = normalization_driver_sequence("session", "root");
+    future.swap(2, 3);
+    assert_driver_link_normalization_rejected("future link", &future);
+
+    let mut foreign_agent = normalization_driver_sequence("session", "root");
+    foreign_agent[2].agent = "child".to_owned();
+    assert_driver_link_normalization_rejected("foreign agent", &foreign_agent);
+
+    let mut foreign_session = normalization_driver_sequence("session", "root");
+    foreign_session[2].session = "other-session".to_owned();
+    assert_driver_link_normalization_rejected("foreign session", &foreign_session);
+
+    let mut duplicate_id = normalization_driver_sequence("session", "root");
+    duplicate_id.insert(3, duplicate_id[2].clone());
+    assert_driver_link_normalization_rejected("duplicate event id", &duplicate_id);
+
+    let mut stale = normalization_driver_sequence("session", "root");
+    let newer_snapshot = normalization_driver_snapshot("session", "root", &stale[1]);
+    stale.insert(3, newer_snapshot);
+    assert_driver_link_normalization_rejected("stale link", &stale);
+
+    let mut count_mismatch = normalization_driver_sequence("session", "root");
+    count_mismatch[3]
+        .payload
+        .insert("canvas_items".to_owned(), 2.into());
+    assert_driver_link_normalization_rejected("call/snapshot count mismatch", &count_mismatch);
+
+    let mut invalid_snapshot = normalization_driver_sequence("session", "root");
+    invalid_snapshot[2]
+        .payload
+        .insert("counts".to_owned(), json!({"items": 2}));
+    assert_driver_link_normalization_rejected("snapshot list/count mismatch", &invalid_snapshot);
 }
 
 fn two_provider_plan(fixture_streams: StreamScript, alt_streams: StreamScript) -> ProviderPlan {

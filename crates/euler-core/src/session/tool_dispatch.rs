@@ -27,13 +27,18 @@ impl<D: PermissionDecider> Session<D> {
     where
         F: FnMut(&EventEnvelope),
     {
+        let mut payload = object([
+            ("id", call.id.clone().into()),
+            ("name", call.name.clone().into()),
+            ("input", call.input.clone()),
+        ]);
+        if let Some((extension_id, command)) = self.extension_tool_attribution(&call.name) {
+            payload.insert("extension_id".to_owned(), extension_id.into());
+            payload.insert("command".to_owned(), command.into());
+        }
         let tool_call_event_id = self.emit_with_parent(
             EventKind::TOOL_CALL,
-            object([
-                ("id", call.id.clone().into()),
-                ("name", call.name.clone().into()),
-                ("input", call.input.clone()),
-            ]),
+            payload,
             Some(model_result_id.to_owned()),
         )?;
         self.flag_tool_call_exposure(&tool_call_event_id, &call.input)?;
@@ -56,6 +61,14 @@ impl<D: PermissionDecider> Session<D> {
         if cancellation.is_cancelled() {
             self.emit_cancelled_tool_result(call, tool_call_event_id, None, None)?;
             return Err(SessionError::Cancelled);
+        }
+        if let Some(binding) = self.active_extension_tool(&call.name) {
+            return self.execute_extension_model_tool(
+                binding,
+                call,
+                tool_call_event_id,
+                cancellation,
+            );
         }
         let mut covered_grant_source: Option<crate::GrantSource> = None;
         let mut static_safe = false;

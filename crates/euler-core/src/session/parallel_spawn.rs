@@ -102,16 +102,17 @@ impl<D: PermissionDecider> Session<D> {
         // as before, contributes no pinned item to the assembled canvas.
         let folded = crate::project_context::fold_project_context(self.bus.events());
         let include_parent_canvas = tasks.iter().any(AgentTask::includes_parent_canvas);
-        let canvas = if include_parent_canvas {
+        let canvas = super::child_canvas_boundary(if include_parent_canvas {
             assemble_canvas_prefolded(
                 self.bus.events(),
                 &self.config.auto_compaction,
                 &std::collections::BTreeSet::new(),
                 folded.as_ref().ok().and_then(|fold| fold.admitted()),
+                Some(&self.config.extensions_enabled),
             )
         } else {
             Vec::new()
-        };
+        });
         if include_parent_canvas {
             if let Some(error) = context_budget_exhausted(self.config.auto_compaction, &canvas) {
                 let agent_id = self.config.agent_id.clone();

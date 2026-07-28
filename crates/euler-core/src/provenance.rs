@@ -126,6 +126,12 @@ impl ProvenanceWriter {
         self.append_locked(&mut append_guard, events).map(|_| ())
     }
 
+    /// Whether a prior append has an ambiguous durability outcome and only
+    /// an exact-batch retry may proceed.
+    pub(crate) fn has_unresolved_append(&self) -> bool {
+        recover_mutex(&self.append_lock).unresolved_append.is_some()
+    }
+
     /// Append a batch parented from this writer's durable tail.
     /// The builder runs under the append lock and must only construct events:
     /// no writer/session/host callbacks, I/O, or blocking work. Builder panic

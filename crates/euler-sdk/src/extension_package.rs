@@ -1,4 +1,6 @@
-use crate::Capability;
+use crate::{
+    validate_model_tool_descriptor, Capability, IdleContributionDescriptor, ModelToolDescriptor,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -39,6 +41,8 @@ pub struct StaticExtensionDescriptor {
     pub commands: Vec<StaticCommandDescriptor>,
     #[serde(default)]
     pub observer: Option<StaticObserverDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_contribution: Option<IdleContributionDescriptor>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -76,6 +80,8 @@ pub struct StaticCommandDescriptor {
     /// must decode, not fail the extension.
     #[serde(default)]
     pub invocation: crate::Invocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_tool: Option<ModelToolDescriptor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,6 +300,7 @@ pub fn parse_extension_manifest_bytes(
             "capabilities",
             "commands",
             "observer",
+            "idle_contribution",
         ],
         "manifest",
     )?;
@@ -324,6 +331,7 @@ pub fn parse_extension_manifest_bytes(
     validate_capabilities(&capabilities, "manifest capabilities")?;
     let commands = parse_commands(root)?;
     let observer = parse_observer(root, &commands)?;
+    let idle_contribution = parse_idle_contribution(root, &commands)?;
     let envelope = capabilities.iter().cloned().collect::<BTreeSet<_>>();
     for command in &commands {
         for capability in &command.required_capabilities {
@@ -344,6 +352,7 @@ pub fn parse_extension_manifest_bytes(
         capabilities,
         commands,
         observer,
+        idle_contribution,
     })
 }
 
@@ -570,6 +579,34 @@ fn parse_observer(
     }))
 }
 
+fn parse_idle_contribution(
+    root: &Map<String, Value>,
+    commands: &[StaticCommandDescriptor],
+) -> Result<Option<IdleContributionDescriptor>, ExtensionPackageError> {
+    let Some(value) = root.get("idle_contribution") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("manifest idle_contribution must be an object"))?;
+    validate_fields(object, &["command"], "manifest idle_contribution")?;
+    let command = required_identifier(object, "command", "manifest idle_contribution command")?;
+    let descriptor = commands
+        .iter()
+        .find(|descriptor| descriptor.name == command)
+        .ok_or_else(|| {
+            invalid(format!(
+                "manifest idle_contribution command `{command}` is not registered"
+            ))
+        })?;
+    if !descriptor.invocation.is_agent_only() {
+        return Err(invalid(format!(
+            "manifest idle_contribution command `{command}` must be agent-only"
+        )));
+    }
+    Ok(Some(IdleContributionDescriptor { command }))
+}
+
 fn parse_commands(
     root: &Map<String, Value>,
 ) -> Result<Vec<StaticCommandDescriptor>, ExtensionPackageError> {
@@ -602,6 +639,7 @@ fn parse_commands(
                 "summary",
                 "required_capabilities",
                 "invocation",
+                "model_tool",
             ],
             &scope,
         )?;
@@ -631,15 +669,36 @@ fn parse_commands(
             &format!("{scope} required_capabilities"),
         )?;
         let invocation = parse_invocation(object, &scope)?;
+        let model_tool = parse_model_tool(object, &scope)?;
+        if model_tool.is_some() && !invocation.is_agent_only() {
+            return Err(invalid(format!(
+                "{scope} model_tool requires invocation \"agent-only\""
+            )));
+        }
         parsed.push(StaticCommandDescriptor {
             name,
             display_name,
             summary,
             required_capabilities,
             invocation,
+            model_tool,
         });
     }
     Ok(parsed)
+}
+
+fn parse_model_tool(
+    object: &Map<String, Value>,
+    scope: &str,
+) -> Result<Option<ModelToolDescriptor>, ExtensionPackageError> {
+    let Some(value) = object.get("model_tool") else {
+        return Ok(None);
+    };
+    let descriptor = serde_json::from_value::<ModelToolDescriptor>(value.clone())
+        .map_err(|error| invalid(format!("{scope} model_tool is invalid: {error}")))?;
+    validate_model_tool_descriptor(&descriptor)
+        .map_err(|error| invalid(format!("{scope} model_tool is invalid: {error}")))?;
+    Ok(Some(descriptor))
 }
 
 /// `invocation` is absent in manifests written before the field existed, and

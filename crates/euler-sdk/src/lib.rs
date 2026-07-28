@@ -3,6 +3,9 @@
 pub mod event_checkpoint;
 pub mod event_wake;
 pub mod extension_package;
+pub mod model_text;
+pub mod model_tool;
+pub mod plan_presentation;
 
 use euler_event::{EventEnvelope, JsonObject};
 use std::fmt;
@@ -26,6 +29,18 @@ pub use extension_package::{
     ExtensionPackageError, LinkedExtension, LinkedExtensionStatus, LoadedExtensionPackage,
     ManagedProcessEntrypoint, StaticCommandDescriptor, StaticExtensionDescriptor,
     EXTENSION_MANIFEST_FILE, MAX_EXTENSION_MANIFEST_BYTES,
+};
+pub use model_text::extension_model_text_is_format_safe;
+pub use model_tool::{
+    validate_model_tool_descriptor, validate_model_tool_input, ModelToolValidationError,
+    MAX_MODEL_TOOL_DESCRIPTION_BYTES, MAX_MODEL_TOOL_INPUT_BYTES, MAX_MODEL_TOOL_NAME_BYTES,
+    MAX_MODEL_TOOL_OUTPUT_BYTES, MAX_MODEL_TOOL_SCHEMA_BYTES,
+};
+pub use plan_presentation::{
+    validate_plan_presentation, PlanItemStatus, PlanPresentation, PlanPresentationItem,
+    PlanPresentationStatus, PlanPresentationValidationError,
+    MAX_PLAN_PRESENTATION_EXPLANATION_BYTES, MAX_PLAN_PRESENTATION_ITEMS,
+    MAX_PLAN_PRESENTATION_REVISION, MAX_PLAN_PRESENTATION_STEP_BYTES,
 };
 
 pub const MAX_CONTEXT_SLOT_CONTENT_BYTES: usize = 4096;
@@ -92,6 +107,7 @@ impl CancellationSource {
 pub enum Capability {
     FsRead,
     FsWrite,
+    ExtensionState,
     ProvenanceRead,
     DiagnosticsRead,
     ArtifactWrite,
@@ -102,12 +118,14 @@ pub enum Capability {
     ConfigWrite,
     SecretResolve,
     ContextSlot,
+    PlanPresentation,
 }
 
 impl Capability {
     pub const ALL: &'static [Self] = &[
         Self::FsRead,
         Self::FsWrite,
+        Self::ExtensionState,
         Self::ProvenanceRead,
         Self::DiagnosticsRead,
         Self::ArtifactWrite,
@@ -118,12 +136,14 @@ impl Capability {
         Self::ConfigWrite,
         Self::SecretResolve,
         Self::ContextSlot,
+        Self::PlanPresentation,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::FsRead => "fs-read",
             Self::FsWrite => "fs-write",
+            Self::ExtensionState => "extension-state",
             Self::ProvenanceRead => "provenance-read",
             Self::DiagnosticsRead => "diagnostics-read",
             Self::ArtifactWrite => "artifact-write",
@@ -134,6 +154,7 @@ impl Capability {
             Self::ConfigWrite => "config-write",
             Self::SecretResolve => "secret-resolve",
             Self::ContextSlot => "context-slot",
+            Self::PlanPresentation => "plan-presentation",
         }
     }
 
@@ -141,6 +162,7 @@ impl Capability {
         match value {
             "fs-read" => Some(Self::FsRead),
             "fs-write" => Some(Self::FsWrite),
+            "extension-state" => Some(Self::ExtensionState),
             "provenance-read" => Some(Self::ProvenanceRead),
             "diagnostics-read" => Some(Self::DiagnosticsRead),
             "artifact-write" => Some(Self::ArtifactWrite),
@@ -151,6 +173,7 @@ impl Capability {
             "config-write" => Some(Self::ConfigWrite),
             "secret-resolve" => Some(Self::SecretResolve),
             "context-slot" => Some(Self::ContextSlot),
+            "plan-presentation" => Some(Self::PlanPresentation),
             _ => None,
         }
     }
@@ -190,8 +213,9 @@ pub enum Invocation {
     /// line, and a CLI subcommand.
     #[default]
     User,
-    /// Only an in-session agent may invoke it, through a tool. Direct
-    /// user-facing surfaces refuse it and say what to do instead.
+    /// Only an in-session contribution may invoke it: an explicitly declared
+    /// model tool or host lifecycle point. Direct user-facing surfaces refuse
+    /// it and say what to do instead.
     AgentOnly,
 }
 
@@ -225,9 +249,26 @@ pub struct CommandDescriptor {
     pub args: Vec<ArgSpec>,
     pub accepts_session_id: bool,
     /// Whether users may drive this command directly. Defaults to `User`;
-    /// commands that exist only as an agent's tool set `AgentOnly` and every
-    /// user-facing surface then refuses them.
+    /// commands that exist only as model/lifecycle contributions set
+    /// `AgentOnly` and every user-facing surface then refuses them.
     pub invocation: Invocation,
+    /// Explicit root-model exposure for this existing command. `None` keeps
+    /// the command off the model tool palette.
+    pub model_tool: Option<ModelToolDescriptor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdleContributionDescriptor {
+    pub command: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -447,6 +488,8 @@ pub enum ExtensionError {
     ContextSlotFailed(String),
     #[error("extension command cancelled")]
     Cancelled,
+    #[error("plan presentation update failed: {0}")]
+    PlanPresentationFailed(String),
 }
 
 pub trait HostApi {
@@ -459,6 +502,12 @@ pub trait HostApi {
             "diagnostics read unavailable".to_owned(),
         ))
     }
+    /// Return this extension's private directory inside the current session.
+    ///
+    /// Requires `Capability::ExtensionState`. The raw directory is one
+    /// read/write scope: extension runtimes are trusted code rather than an OS
+    /// sandbox, so pretending to distinguish reads from writes here would be
+    /// dishonest.
     fn state_dir(&self) -> Result<PathBuf, ExtensionError>;
     fn write_artifact(&self, artifact: ArtifactWrite) -> Result<ArtifactRecord, ExtensionError>;
     /// Run one child agent to completion (multi-agent contract, v0.1).
@@ -506,6 +555,14 @@ pub trait HostApi {
             "context slot update unavailable".to_owned(),
         ))
     }
+    fn update_plan_presentation(
+        &self,
+        _presentation: PlanPresentation,
+    ) -> Result<(), ExtensionError> {
+        Err(ExtensionError::PlanPresentationFailed(
+            "plan presentation unavailable".to_owned(),
+        ))
+    }
 }
 
 pub trait CommandRegistrar {
@@ -522,6 +579,7 @@ pub trait ExtensionCommand: Send + Sync {
             required_capabilities: Vec::new(),
             args: Vec::new(),
             accepts_session_id: false,
+            model_tool: None,
         }
     }
 
@@ -547,6 +605,9 @@ pub trait ExtensionCommand: Send + Sync {
 pub trait Extension: Send + Sync {
     fn manifest(&self) -> ExtensionManifest;
     fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError>;
+    fn idle_contribution(&self) -> Option<IdleContributionDescriptor> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -594,3 +655,6 @@ mod tests {
 #[cfg(test)]
 #[path = "capability_test.rs"]
 mod capability_test;
+#[cfg(test)]
+#[path = "plan_presentation_test.rs"]
+mod plan_presentation_test;

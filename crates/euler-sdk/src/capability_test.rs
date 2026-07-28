@@ -6,6 +6,7 @@ fn capability_registry_round_trips_every_known_capability() {
     let expected = [
         "fs-read",
         "fs-write",
+        "extension-state",
         "provenance-read",
         "diagnostics-read",
         "artifact-write",
@@ -16,6 +17,7 @@ fn capability_registry_round_trips_every_known_capability() {
         "config-write",
         "secret-resolve",
         "context-slot",
+        "plan-presentation",
     ];
 
     assert_eq!(Capability::ALL.len(), expected.len());

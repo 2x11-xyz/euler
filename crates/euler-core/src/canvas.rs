@@ -153,6 +153,17 @@ pub enum CanvasItem {
         slot: String,
         content: String,
     },
+    /// An accepted extension-owned terminal-idle continuation. The canonical
+    /// event remains attributed as an extension contribution; provider
+    /// request assembly maps this core-framed item to a user-role input only
+    /// because provider-neutral chat protocols have no extension role.
+    ExtensionContribution {
+        event_id: String,
+        extension_id: String,
+        command: String,
+        point: String,
+        content: String,
+    },
     Reasoning {
         event_id: String,
         provider: String,
@@ -189,6 +200,7 @@ impl CanvasItem {
             | Self::Message { event_id, .. }
             | Self::Projection { event_id, .. }
             | Self::Slot { event_id, .. }
+            | Self::ExtensionContribution { event_id, .. }
             | Self::Reasoning { event_id, .. }
             | Self::ToolCall { event_id, .. }
             | Self::ToolOutput { event_id, .. } => event_id,
@@ -229,6 +241,27 @@ pub fn assemble_canvas_with_compaction(
         policy,
         compacted_result_ids,
         fold.as_ref().and_then(ProjectContextFold::admitted),
+        None,
+    )
+}
+
+/// Live-session canvas assembly with durable extension-owned projections
+/// filtered by the session's current enablement set. Public replay/inspection
+/// assembly remains unfiltered because an event slice alone does not encode
+/// mutable registry state.
+pub(crate) fn assemble_canvas_with_compaction_for_extensions(
+    events: &[EventEnvelope],
+    policy: &AutoCompactionPolicy,
+    compacted_result_ids: &BTreeSet<String>,
+    enabled_extension_ids: &BTreeSet<String>,
+) -> Vec<CanvasItem> {
+    let fold = crate::project_context::fold_project_context(events).ok();
+    assemble_canvas_prefolded(
+        events,
+        policy,
+        compacted_result_ids,
+        fold.as_ref().and_then(ProjectContextFold::admitted),
+        Some(enabled_extension_ids),
     )
 }
 
@@ -240,8 +273,10 @@ pub(crate) fn assemble_canvas_prefolded(
     policy: &AutoCompactionPolicy,
     compacted_result_ids: &BTreeSet<String>,
     pinned: Option<&PinnedProjectContext>,
+    enabled_extension_ids: Option<&BTreeSet<String>>,
 ) -> Vec<CanvasItem> {
-    let mut items = collect_canvas_items(events, compacted_result_ids, pinned);
+    let mut items =
+        collect_canvas_items(events, compacted_result_ids, pinned, enabled_extension_ids);
     if policy.stubs_enabled() {
         demote_to_budget(&mut items, policy.budget_bytes, events);
     }
@@ -255,6 +290,7 @@ fn collect_canvas_items(
     events: &[EventEnvelope],
     compacted_result_ids: &BTreeSet<String>,
     pinned: Option<&PinnedProjectContext>,
+    enabled_extension_ids: Option<&BTreeSet<String>>,
 ) -> Vec<CanvasItem> {
     let active_swap = active_swap(events);
     let mut active_compacted_result_ids = compacted_result_ids.clone();
@@ -274,38 +310,21 @@ fn collect_canvas_items(
         .filter_map(|pair| pair.model_result_id.clone())
         .collect::<BTreeSet<_>>();
     let included_model_call_ids = included_model_call_ids(events, &selected_model_result_ids);
+    // Accepted continuations fold over the full log before frontier filtering:
+    // a full swap may replace the event that accepted the continuation, but
+    // cannot consume that committed one-shot input.
+    let pending_contributions = fold_pending_extension_contributions(events);
     // Context slots fold over the full event slice before compaction-frontier
     // filtering. The latest slot event id remains selected even when the update
     // sits before the active canvas.swap frontier, so slots survive compaction by
     // construction instead of depending on raw pre-frontier replay.
-    let active_slots = fold_context_slots(events);
-    // The latest valid full projection owns the frontier. Layer-1 swaps after
-    // it accumulate additional compacted-result ids without displacing that
-    // frontier. projection_blob is inline text or v1 structured JSON;
-    // blob-ref resolution is deferred.
-    let mut items = Vec::new();
-    // Pinned project context is folded over the full event slice, like
-    // context slots: the latest admitted snapshot stays pinned across
-    // compaction frontiers instead of silently disappearing (project-context
-    // contract, "Framing and canvas admission"). The fold itself happens
-    // exactly once per assembly, in the callers above.
-    if let Some(pinned) = pinned {
-        items.push(CanvasItem::ProjectContext {
-            event_id: pinned.snapshot_event_id.clone(),
-            snapshot_digest: pinned.candidate_digest.clone(),
-            rendered: pinned.rendered.clone(),
-        });
-    }
-    if let Some(swap) = &active_swap {
-        if let Some((_, content, schema_version)) = &swap.projection {
-            items.push(CanvasItem::Projection {
-                event_id: swap.event_id.clone(),
-                content: content.clone(),
-                schema_version: schema_version.clone(),
-            });
-        }
-    }
-    items.extend(active_slots.into_iter().map(ContextSlot::into_canvas_item));
+    let active_slots = fold_context_slots(events, enabled_extension_ids);
+    let mut items = initial_canvas_items(
+        pinned,
+        active_swap.as_ref(),
+        active_slots,
+        &pending_contributions,
+    );
 
     for (index, event) in events.iter().enumerate() {
         if let Some(swap) = &active_swap {
@@ -321,6 +340,11 @@ fn collect_canvas_items(
         match event.kind.as_str() {
             EventKind::USER_MESSAGE => push_message(&mut items, CanvasRole::User, event),
             EventKind::ASSISTANT_MESSAGE => push_message(&mut items, CanvasRole::Assistant, event),
+            EventKind::EXTENSION_CONTRIBUTION => {
+                if let Some(contribution) = pending_contributions.get(&index) {
+                    items.push(contribution.item.clone());
+                }
+            }
             EventKind::MODEL_REASONING if include_reasoning(event, &included_model_call_ids) => {
                 if let Some(reasoning) = reasoning_item(event) {
                     items.push(reasoning);
@@ -348,6 +372,51 @@ fn collect_canvas_items(
         }
     }
 
+    items
+}
+
+/// Assemble full-log folds that precede ordered event replay. The active
+/// projection owns the compaction frontier; durable slots and committed
+/// one-shot inputs survive it without moving any post-frontier event.
+fn initial_canvas_items(
+    project_context: Option<&PinnedProjectContext>,
+    active_swap: Option<&ActiveSwap>,
+    active_slots: Vec<ContextSlot>,
+    pending_contributions: &BTreeMap<usize, PendingExtensionContribution>,
+) -> Vec<CanvasItem> {
+    let mut items = Vec::new();
+    if let Some(pinned) = project_context {
+        items.push(CanvasItem::ProjectContext {
+            event_id: pinned.snapshot_event_id.clone(),
+            snapshot_digest: pinned.candidate_digest.clone(),
+            rendered: pinned.rendered.clone(),
+        });
+    }
+    if let Some(swap) = active_swap {
+        if let Some((_, content, schema_version)) = &swap.projection {
+            items.push(CanvasItem::Projection {
+                event_id: swap.event_id.clone(),
+                content: content.clone(),
+                schema_version: schema_version.clone(),
+            });
+        }
+    }
+    items.extend(active_slots.into_iter().map(ContextSlot::into_canvas_item));
+    if let Some(frontier_start_index) = active_swap
+        .and_then(|swap| swap.projection.as_ref())
+        .map(|(frontier_start_index, _, _)| *frontier_start_index)
+    {
+        let mut pre_frontier = pending_contributions
+            .values()
+            .filter(|contribution| contribution.index < frontier_start_index)
+            .collect::<Vec<_>>();
+        pre_frontier.sort_unstable_by_key(|contribution| contribution.index);
+        items.extend(
+            pre_frontier
+                .into_iter()
+                .map(|contribution| contribution.item.clone()),
+        );
+    }
     items
 }
 
@@ -410,11 +479,22 @@ pub(crate) fn fold_context_slot_state(
 /// truncation for logs that violate the host-enforced 8-slot cap (which
 /// only trusted host code can produce); replay trusts host invariants and
 /// truncates deterministically rather than failing.
-fn fold_context_slots(events: &[EventEnvelope]) -> Vec<ContextSlot> {
+fn fold_context_slots(
+    events: &[EventEnvelope],
+    enabled_extension_ids: Option<&BTreeSet<String>>,
+) -> Vec<ContextSlot> {
     fold_context_slot_state(events)
         .into_values()
+        .filter(|slot| extension_owner_enabled(&slot.extension_id, enabled_extension_ids))
         .take(MAX_CONTEXT_SLOTS_PER_SESSION)
         .collect()
+}
+
+fn extension_owner_enabled(
+    extension_id: &str,
+    enabled_extension_ids: Option<&BTreeSet<String>>,
+) -> bool {
+    enabled_extension_ids.is_none_or(|enabled| enabled.contains(extension_id))
 }
 
 #[derive(Clone, Debug)]
@@ -603,6 +683,206 @@ fn push_message(items: &mut Vec<CanvasItem>, role: CanvasRole, event: &EventEnve
             content,
         });
     }
+}
+
+fn extension_contribution_item(event: &EventEnvelope) -> Option<CanvasItem> {
+    let accepted = event.payload.get("accepted").and_then(Value::as_bool)?;
+    let action = string_field(event, "action")?;
+    if !accepted || action != "continue" {
+        return None;
+    }
+    Some(CanvasItem::ExtensionContribution {
+        event_id: event.id.clone(),
+        extension_id: string_field(event, "extension_id")?,
+        command: string_field(event, "command")?,
+        point: string_field(event, "point")?,
+        content: string_field(event, "content")?,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct PendingExtensionContribution {
+    index: usize,
+    event_id: String,
+    session: String,
+    agent: String,
+    item: CanvasItem,
+}
+
+struct DriverCanvasSnapshot {
+    event_id: String,
+    index: usize,
+    session: String,
+    agent: String,
+    authority: Option<DriverSnapshotAuthority>,
+}
+
+struct DriverSnapshotAuthority {
+    canvas_items: u64,
+    selected_event_ids: Vec<String>,
+}
+
+/// Accepted continuations are one-shot driver inputs. A contribution remains
+/// eligible across persistence and resume until an accepted same-agent root
+/// `model.call` binds the exact driver snapshot that selected its event id.
+/// A snapshot without its request is only prepared state and consumes nothing.
+/// Shadow-compaction and child-agent calls cannot consume root-driver input.
+fn fold_pending_extension_contributions(
+    events: &[EventEnvelope],
+) -> BTreeMap<usize, PendingExtensionContribution> {
+    let duplicate_ids = duplicated_event_ids(events);
+    let mut pending = BTreeMap::new();
+    let mut latest_driver_snapshots = BTreeMap::<(String, String), DriverCanvasSnapshot>::new();
+    for (index, event) in events.iter().enumerate() {
+        match event.kind.as_str() {
+            EventKind::EXTENSION_CONTRIBUTION => {
+                if let Some(item) = extension_contribution_item(event) {
+                    pending.insert(
+                        index,
+                        PendingExtensionContribution {
+                            index,
+                            event_id: event.id.clone(),
+                            session: event.session.clone(),
+                            agent: event.agent.clone(),
+                            item,
+                        },
+                    );
+                }
+            }
+            EventKind::CANVAS_SNAPSHOT if !event.payload.contains_key("purpose") => {
+                latest_driver_snapshots.insert(
+                    (event.session.clone(), event.agent.clone()),
+                    driver_canvas_snapshot(
+                        event,
+                        index,
+                        !duplicate_ids.contains(&event.id),
+                        &duplicate_ids,
+                    ),
+                );
+            }
+            EventKind::MODEL_CALL if !pending.is_empty() => {
+                consume_request_backed_contributions(
+                    event,
+                    index,
+                    &latest_driver_snapshots,
+                    &duplicate_ids,
+                    &mut pending,
+                );
+            }
+            _ => {}
+        }
+    }
+    pending
+}
+
+fn duplicated_event_ids(events: &[EventEnvelope]) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    events
+        .iter()
+        .filter_map(|event| {
+            if seen.insert(event.id.as_str()) {
+                None
+            } else {
+                Some(event.id.clone())
+            }
+        })
+        .collect()
+}
+
+fn driver_canvas_snapshot(
+    event: &EventEnvelope,
+    index: usize,
+    unique_id: bool,
+    duplicate_ids: &BTreeSet<String>,
+) -> DriverCanvasSnapshot {
+    DriverCanvasSnapshot {
+        event_id: event.id.clone(),
+        index,
+        session: event.session.clone(),
+        agent: event.agent.clone(),
+        authority: unique_id
+            .then(|| driver_snapshot_authority(event, duplicate_ids))
+            .flatten(),
+    }
+}
+
+fn driver_snapshot_authority(
+    event: &EventEnvelope,
+    duplicate_ids: &BTreeSet<String>,
+) -> Option<DriverSnapshotAuthority> {
+    let selected_event_ids = event
+        .payload
+        .get("selected_event_ids")?
+        .as_array()?
+        .iter()
+        .map(|id| id.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let canvas_items = event.payload.get("counts")?.get("items")?.as_u64()?;
+    let expected_items = usize::try_from(canvas_items).ok()?;
+    let unique_items = selected_event_ids.iter().collect::<BTreeSet<_>>();
+    if selected_event_ids.len() != expected_items
+        || unique_items.len() != selected_event_ids.len()
+        || selected_event_ids
+            .iter()
+            .any(|id| duplicate_ids.contains(id))
+    {
+        return None;
+    }
+    Some(DriverSnapshotAuthority {
+        canvas_items,
+        selected_event_ids,
+    })
+}
+
+fn consume_request_backed_contributions(
+    model_call: &EventEnvelope,
+    call_index: usize,
+    latest_driver_snapshots: &BTreeMap<(String, String), DriverCanvasSnapshot>,
+    duplicate_ids: &BTreeSet<String>,
+    pending: &mut BTreeMap<usize, PendingExtensionContribution>,
+) {
+    if model_call.payload.contains_key("purpose") || duplicate_ids.contains(&model_call.id) {
+        return;
+    }
+    let Some(snapshot_id) = model_call
+        .payload
+        .get("canvas_snapshot_id")
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let Some(snapshot) =
+        latest_driver_snapshots.get(&(model_call.session.clone(), model_call.agent.clone()))
+    else {
+        return;
+    };
+    let Some(authority) = &snapshot.authority else {
+        return;
+    };
+    if snapshot.event_id != snapshot_id
+        || snapshot.index >= call_index
+        || snapshot.session != model_call.session
+        || snapshot.agent != model_call.agent
+        || model_call
+            .payload
+            .get("canvas_items")
+            .and_then(Value::as_u64)
+            != Some(authority.canvas_items)
+    {
+        return;
+    }
+    let selected = authority
+        .selected_event_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    pending.retain(|_, contribution| {
+        duplicate_ids.contains(&contribution.event_id)
+            || !selected.contains(contribution.event_id.as_str())
+            || contribution.session != snapshot.session
+            || contribution.agent != snapshot.agent
+            || contribution.index >= snapshot.index
+    });
 }
 
 #[derive(Clone, Debug)]
@@ -1038,6 +1318,13 @@ fn render_canvas_item(item: &CanvasItem) -> String {
             content,
             ..
         } => render_context_slot(extension_id, slot, content),
+        CanvasItem::ExtensionContribution {
+            extension_id,
+            command,
+            point,
+            content,
+            ..
+        } => render_extension_contribution(extension_id, command, point, content),
         CanvasItem::Reasoning {
             fidelity, content, ..
         } => format!("reasoning.{fidelity}: {content}"),
@@ -1067,6 +1354,21 @@ fn render_canvas_item(item: &CanvasItem) -> String {
 
 pub(crate) fn render_context_slot(extension_id: &str, slot: &str, content: &str) -> String {
     let mut rendered = format!("[slot {extension_id}:{slot}]");
+    for line in content.split('\n') {
+        rendered.push('\n');
+        rendered.push_str("    ");
+        rendered.push_str(line);
+    }
+    rendered
+}
+
+pub(crate) fn render_extension_contribution(
+    extension_id: &str,
+    command: &str,
+    point: &str,
+    content: &str,
+) -> String {
+    let mut rendered = format!("[extension {extension_id}:{command} at {point}]");
     for line in content.split('\n') {
         rendered.push('\n');
         rendered.push_str("    ");

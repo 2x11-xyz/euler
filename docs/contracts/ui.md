@@ -70,6 +70,21 @@ emission + unrelated renderers.
   lowercase `explore · N steps · Ts` phrasing (design review v3 §R3).
 - Fold marker language: `… N more lines · ctrl+o expand` (and matching collapse).
 
+### Plan updates
+
+A structured `plan.update` renders as one `Updated Plan` ledger cell: optional
+explanation first, then ordered `├`/`└` checklist rows. Completed rows use a
+check marker and cross out only the step text (never the tree gutter);
+`in_progress` uses the activity marker and attention color; pending uses
+`[ ]`. Legacy summary-only events retain the compact `Updated Plan: …` row.
+
+When an extension model tool emits a causally descended, identically
+attributed plan update, its successful generic JSON result row is omitted only
+when the originating call and result carry the same nonempty provider call
+`id`, so the checklist is the one coherent UI action. The tool call, plan
+update, and tool result all remain in provenance. A failed, malformed, or
+mismatched result is never hidden.
+
 ### Diff rendering
 
 Diffs use a **sign + luminance** model with **no background fills**, so they
@@ -147,6 +162,9 @@ promotes, or reorders lines.
   The verb is a **closed set** (`CODEX_VERBS`) — capitalization alone does not
   earn bold, or titles like `File added …` and uppercase filenames would take
   it. Only the verb is bold; the target keeps the row’s own weight.
+- **Plan exception:** the active `in_progress` checklist step is bold so the
+  next action is scannable; completed/pending steps are dim, and completed
+  step text is crossed out.
 - **No bold inside code.**
 - Italic only where specified (e.g. reasoning, hunk headers, comments).
 

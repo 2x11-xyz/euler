@@ -294,6 +294,33 @@ impl SecretRedactor {
         out
     }
 
+    /// Redact every string leaf and object key before a JSON value crosses a
+    /// model-facing boundary. Walking the value (rather than serialized JSON)
+    /// preserves exact matches containing quotes or backslashes. Key
+    /// collisions are retained deterministically with the shared `#N`
+    /// suffix convention.
+    pub(crate) fn redact_value(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = self.redact(text),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.redact_value(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let mut entries = std::mem::take(map).into_iter().collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                for (key, mut value) in entries {
+                    self.redact_value(&mut value);
+                    let key = unique_json_key(map, self.redact(&key));
+                    map.insert(key, value);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+
     /// READ-ONLY detection: report registered known values and credential
     /// shapes present in `text`, without modifying anything. Each match's
     /// `label` is a non-secret descriptor safe to record in provenance; the

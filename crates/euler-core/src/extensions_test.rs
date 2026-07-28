@@ -1,10 +1,10 @@
-use super::{hash_bytes, ExtensionHost, ExtensionHostError};
+use super::{canonical_extension_plan_event, hash_bytes, ExtensionHost, ExtensionHostError};
 use crate::{read_provenance, ProvenanceWriter};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_sdk::{
     ArtifactWrite, Capability, CommandContext, CommandDescriptor, CommandRegistrar, Extension,
     ExtensionCommand, ExtensionError, ExtensionManifest, HostAgentBudget, HostAgentResult,
-    HostAgentTask, HostApi, ProvenanceQuery,
+    HostAgentTask, HostApi, PlanPresentation, ProvenanceQuery,
 };
 use euler_sdk::{
     DiagnosticsQuery, EventFeedCheckpoint, MAX_EVENT_FEED_CHECKPOINT_BYTES,
@@ -393,16 +393,16 @@ fn extensions_registration_rejects_query_without_manifest_provenance_read() {
 }
 
 #[test]
-fn extensions_command_with_fs_write_gets_private_session_state_dir() {
+fn extensions_command_with_extension_state_gets_private_session_state_dir() {
     let temp = tempfile::tempdir().expect("temp dir");
     let session_dir = temp.path().join("sessions").join("session-123");
     fs::create_dir_all(&session_dir).expect("session dir");
     let log = session_dir.join("events.jsonl");
     write_events(&log, &[]);
-    let mut host = host(&log, [Capability::FsWrite]);
+    let mut host = host(&log, [Capability::ExtensionState]);
     host.register_extension(&extension(
         "state-ext",
-        vec![Capability::FsWrite],
+        vec![Capability::ExtensionState],
         vec![("state-dir", state_dir_command)],
     ))
     .expect("register");
@@ -422,14 +422,14 @@ fn extensions_command_with_fs_write_gets_private_session_state_dir() {
 }
 
 #[test]
-fn extensions_registration_rejects_state_dir_without_manifest_fs_write() {
+fn extensions_registration_rejects_state_dir_without_manifest_extension_state() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
     write_events(&log, &[]);
-    let mut host = host(&log, [Capability::FsWrite]);
+    let mut host = host(&log, [Capability::ExtensionState]);
     let error = host
         .register_extension(&extension(
-            "no-write",
+            "no-state",
             vec![],
             vec![("state-dir", state_dir_command)],
         ))
@@ -437,13 +437,13 @@ fn extensions_registration_rejects_state_dir_without_manifest_fs_write() {
 
     assert_registration_failed(
         error,
-        "no-write",
-        "command `state-dir` requires undeclared capability fs-write",
+        "no-state",
+        "command `state-dir` requires undeclared capability extension-state",
     );
 }
 
 #[test]
-fn extensions_registration_rejects_undeclared_fs_write_without_runtime_events() {
+fn extensions_registration_rejects_undeclared_extension_state_without_runtime_events() {
     let temp = tempfile::tempdir().expect("temp dir");
     let session_id = "session-123";
     let log = temp.path().join("events.jsonl");
@@ -465,7 +465,7 @@ fn extensions_registration_rejects_undeclared_fs_write_without_runtime_events() 
     assert_registration_failed(
         error,
         "runtime-denied-ext",
-        "command `double-denied` requires undeclared capability fs-write",
+        "command `double-denied` requires undeclared capability extension-state",
     );
     let events = read_provenance(&log).expect("events");
     let decisions = permission_decisions(&events);
@@ -487,17 +487,17 @@ fn extensions_runtime_denial_ignores_manifest_and_records_once_per_command_host(
         session_id,
         "agent-1",
         Arc::clone(&writer),
-        [Capability::FsWrite],
+        [Capability::ExtensionState],
     );
     host.register_extension(&extension(
-        "undeclared-write-ext",
-        vec![Capability::FsWrite],
-        vec![("undeclared-write", undeclared_write_command)],
+        "undeclared-state-ext",
+        vec![Capability::ExtensionState],
+        vec![("undeclared-state", undeclared_state_command)],
     ))
     .expect("register");
 
     let error = host
-        .execute_command("undeclared-write", json!(null))
+        .execute_command("undeclared-state", json!(null))
         .expect_err("runtime capability denial");
 
     assert!(matches!(
@@ -505,25 +505,25 @@ fn extensions_runtime_denial_ignores_manifest_and_records_once_per_command_host(
         ExtensionHostError::CommandFailed(
             _,
             ExtensionError::CapabilityDenied {
-                capability: Capability::FsWrite
+                capability: Capability::ExtensionState
             }
         )
     ));
     let events = read_provenance(&log).expect("events");
     let decisions = permission_decisions(&events);
     assert_eq!(decisions.len(), 2);
-    assert_eq!(decisions[0].payload["capability"], json!("fs-write"));
+    assert_eq!(decisions[0].payload["capability"], json!("extension-state"));
     assert_eq!(decisions[0].payload["allowed"], json!(true));
     assert_eq!(decisions[0].payload["command"], json!(null));
-    assert_eq!(decisions[1].payload["capability"], json!("fs-write"));
+    assert_eq!(decisions[1].payload["capability"], json!("extension-state"));
     assert_eq!(decisions[1].payload["allowed"], json!(false));
     assert_eq!(decisions[1].payload["decision"], json!("denied"));
     assert_eq!(decisions[1].payload["source"], json!("extension"));
     assert_eq!(
         decisions[1].payload["extension_id"],
-        json!("undeclared-write-ext")
+        json!("undeclared-state-ext")
     );
-    assert_eq!(decisions[1].payload["command"], json!("undeclared-write"));
+    assert_eq!(decisions[1].payload["command"], json!("undeclared-state"));
     let error_event = events.last().expect("command failure error");
     assert_eq!(error_event.kind.as_str(), EventKind::ERROR);
     assert_eq!(
@@ -557,7 +557,7 @@ fn extensions_registration_validation_precedes_denial_recorder_failure() {
     assert_registration_failed(
         error,
         "recorder-fails-ext",
-        "command `state-dir` requires undeclared capability fs-write",
+        "command `state-dir` requires undeclared capability extension-state",
     );
 }
 
@@ -1742,6 +1742,423 @@ fn extensions_context_slot_content_is_redacted_at_emission() {
 }
 
 #[test]
+fn extensions_plan_presentation_emits_canonical_attributed_live_event() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-plan";
+    let log = temp.path().join("events.jsonl");
+    let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
+    let start = session_start_event(session_id);
+    let start_id = start.id.clone();
+    writer.append(&[start]).expect("source append");
+    let (mut host, queue) = ExtensionHost::with_queued_artifact_writer(
+        session_id,
+        "agent-plan",
+        Arc::clone(&writer),
+        [Capability::PlanPresentation],
+    );
+    host.register_extension(&extension(
+        "plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![("update", plan_presentation_command)],
+    ))
+    .expect("register");
+
+    host.execute_command(
+        "update",
+        json!({
+            "revision": 3,
+            "status": "active",
+            "explanation": "Adjusted after inspection",
+            "items": [
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Implement", "status": "in_progress"},
+                {"step": "Verify", "status": "pending"}
+            ]
+        }),
+    )
+    .expect("plan update");
+
+    let durable = read_provenance(&log).expect("events");
+    let plans = events_of_kind(&durable, EventKind::PLAN_UPDATE);
+    let decisions = permission_decisions(&durable);
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].parent.as_deref(), Some(decisions[0].id.as_str()));
+    assert_eq!(plans[0].payload["source"], json!("extension"));
+    assert_eq!(plans[0].payload["extension_id"], json!("plan-ext"));
+    assert_eq!(plans[0].payload["command"], json!("update"));
+    assert_eq!(plans[0].payload["revision"], json!(3));
+    assert_eq!(plans[0].payload["status"], json!("active"));
+    assert_eq!(
+        plans[0].payload["explanation"],
+        json!("Adjusted after inspection")
+    );
+    assert_eq!(
+        plans[0].payload["items"][1],
+        json!({"step": "Implement", "status": "in_progress"})
+    );
+    assert_eq!(
+        plans[0].payload["summary"],
+        json!("r3 · active · 1/3 completed")
+    );
+
+    let queued = queue
+        .drain_after(Some(&start_id))
+        .expect("valid queued parent chain");
+    assert_eq!(queued.as_slice(), &durable[1..]);
+}
+
+#[test]
+fn extension_plan_retry_fold_rejects_noncanonical_payload_shapes() {
+    let canonical = object([
+        ("source", "extension".into()),
+        ("extension_id", "plan-ext".into()),
+        ("command", "update".into()),
+        ("revision", 1.into()),
+        ("status", "active".into()),
+        ("explanation", Value::Null),
+        (
+            "items",
+            json!([{"step": "Inspect", "status": "in_progress"}]),
+        ),
+        ("summary", "r1 · active · 0/1 completed".into()),
+    ]);
+    let event = EventEnvelope::new(
+        "session-plan",
+        "agent-plan",
+        None,
+        EventKind::PLAN_UPDATE,
+        canonical.clone(),
+    );
+    assert!(canonical_extension_plan_event(&event, "plan-ext").is_some());
+
+    let mut forged = canonical;
+    forged.insert("legacy_content".to_owned(), "looks equivalent".into());
+    let event = EventEnvelope::new(
+        "session-plan",
+        "agent-plan",
+        None,
+        EventKind::PLAN_UPDATE,
+        forged,
+    );
+    assert!(
+        canonical_extension_plan_event(&event, "plan-ext").is_none(),
+        "unknown legacy fields must not suppress a fresh canonical append"
+    );
+}
+
+#[test]
+fn extensions_plan_presentation_exact_retry_is_idempotent_per_extension() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-plan-idempotent";
+    let log = temp.path().join("events.jsonl");
+    let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let redactor = crate::redaction::SecretRedactor::new();
+    redactor.add_value("known-plan-retry-secret");
+    let (mut host, queue) = ExtensionHost::with_queued_artifact_writer(
+        session_id,
+        "agent-plan",
+        Arc::clone(&writer),
+        [Capability::PlanPresentation],
+    );
+    host = host.with_redactor(redactor);
+    host.register_extension(&extension(
+        "plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![
+            ("update", plan_presentation_command),
+            ("idle-repair", plan_presentation_command),
+        ],
+    ))
+    .expect("register plan extension");
+    host.register_extension(&extension(
+        "other-plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![("other-update", plan_presentation_command)],
+    ))
+    .expect("register other extension");
+    let queued_before_updates = queue.len();
+    let initial = json!({
+        "revision": 7,
+        "status": "active",
+        "explanation": "known-plan-retry-secret",
+        "items": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "in_progress"}
+        ]
+    });
+
+    host.execute_command("update", initial.clone())
+        .expect("initial update");
+    assert_eq!(queue.len(), queued_before_updates + 1);
+    host.execute_command("idle-repair", initial.clone())
+        .expect("exact retry from another command");
+    assert_eq!(
+        queue.len(),
+        queued_before_updates + 1,
+        "an exact normalized retry adds nothing to the live queue"
+    );
+
+    let changed = json!({
+        "revision": 7,
+        "status": "active",
+        "explanation": "changed at the same revision",
+        "items": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "in_progress"}
+        ]
+    });
+    host.execute_command("idle-repair", changed.clone())
+        .expect("changed same-revision update");
+    host.execute_command("other-update", changed)
+        .expect("same payload from another extension");
+    assert_eq!(queue.len(), queued_before_updates + 3);
+
+    let durable = read_provenance(&log).expect("events");
+    let plans = events_of_kind(&durable, EventKind::PLAN_UPDATE);
+    assert_eq!(plans.len(), 3);
+    assert_eq!(plans[0].payload["extension_id"], json!("plan-ext"));
+    assert_eq!(plans[0].payload["command"], json!("update"));
+    assert_eq!(plans[1].payload["extension_id"], json!("plan-ext"));
+    assert_eq!(plans[1].payload["command"], json!("idle-repair"));
+    assert_eq!(plans[2].payload["extension_id"], json!("other-plan-ext"));
+    assert_eq!(plans[0].payload["revision"], plans[1].payload["revision"]);
+    assert_ne!(
+        plans[0].payload["explanation"],
+        plans[1].payload["explanation"]
+    );
+}
+
+#[test]
+fn extensions_plan_presentation_retry_deduplicates_ambiguous_persisted_append() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-plan-ambiguous";
+    let log = temp.path().join("events.jsonl");
+    let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let (mut host, queue) = ExtensionHost::with_queued_artifact_writer(
+        session_id,
+        "agent-plan",
+        Arc::clone(&writer),
+        [Capability::PlanPresentation],
+    );
+    host.register_extension(&extension(
+        "plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![
+            ("update", plan_presentation_command),
+            ("idle-repair", plan_presentation_command),
+        ],
+    ))
+    .expect("register");
+    let queued_before_update = queue.len();
+    let presentation = json!({
+        "revision": 1,
+        "status": "active",
+        "explanation": null,
+        "items": [{"step": "Resume safely", "status": "in_progress"}]
+    });
+
+    {
+        let log_path = log.clone();
+        let guard = arm_matching(Op::FileSync, move |path| path == log_path);
+        host.execute_command("update", presentation.clone())
+            .expect_err("post-write sync failure is ambiguous");
+        assert!(guard.fired(), "log sync fault must fire");
+    }
+    assert_eq!(
+        events_of_kind(
+            &read_provenance(&log).expect("physical complete events"),
+            EventKind::PLAN_UPDATE
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        queue.len(),
+        queued_before_update,
+        "a failed append is not published to the live queue"
+    );
+
+    host.execute_command("idle-repair", presentation.clone())
+        .expect_err("same writer remains fenced without the exact event batch");
+
+    assert_eq!(
+        events_of_kind(
+            &read_provenance(&log).expect("events after fenced retry"),
+            EventKind::PLAN_UPDATE
+        )
+        .len(),
+        1
+    );
+    assert_eq!(queue.len(), queued_before_update);
+
+    drop(host);
+    drop(writer);
+    let reopened = Arc::new(ProvenanceWriter::new(&log).expect("reopen settled writer"));
+    let (mut host, queue) = ExtensionHost::with_queued_artifact_writer(
+        session_id,
+        "agent-plan",
+        reopened,
+        [Capability::PlanPresentation],
+    );
+    host.register_extension(&extension(
+        "plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![
+            ("update", plan_presentation_command),
+            ("idle-repair", plan_presentation_command),
+        ],
+    ))
+    .expect("register after reopen");
+    let queued_before_retry = queue.len();
+
+    host.execute_command("idle-repair", presentation)
+        .expect("reopened writer deduplicates durable presentation");
+    assert_eq!(queue.len(), queued_before_retry);
+    host.execute_command(
+        "update",
+        json!({
+            "revision": 1,
+            "status": "active",
+            "explanation": "changed after recovery",
+            "items": [{"step": "Resume safely", "status": "in_progress"}]
+        }),
+    )
+    .expect("writer accepts a later changed update");
+    assert_eq!(queue.len(), queued_before_retry + 1);
+    assert_eq!(
+        events_of_kind(
+            &read_provenance(&log).expect("events after reopen"),
+            EventKind::PLAN_UPDATE
+        )
+        .len(),
+        2
+    );
+}
+
+#[test]
+fn extensions_plan_presentation_redacts_text_and_rejects_invalid_shape() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-plan";
+    let log = temp.path().join("events.jsonl");
+    let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let redactor = crate::redaction::SecretRedactor::new();
+    redactor.add_value("known-plan-secret-value");
+    let mut host = ExtensionHost::with_artifact_writer(
+        &log,
+        session_id,
+        "agent-plan",
+        writer,
+        [Capability::PlanPresentation],
+    )
+    .with_redactor(redactor);
+    host.register_extension(&extension(
+        "plan-ext",
+        vec![Capability::PlanPresentation],
+        vec![("update", plan_presentation_command)],
+    ))
+    .expect("register");
+
+    host.execute_command(
+        "update",
+        json!({
+            "revision": 1,
+            "status": "active",
+            "explanation": "known-plan-secret-value",
+            "items": [{"step": "Use known-plan-secret-value", "status": "pending"}]
+        }),
+    )
+    .expect("redacted update");
+    let error = host
+        .execute_command(
+            "update",
+            json!({
+                "revision": 0,
+                "status": "active",
+                "explanation": null,
+                "items": [{"step": "Invalid", "status": "pending"}]
+            }),
+        )
+        .expect_err("zero revision rejected");
+    assert_plan_presentation_error(error, "revision");
+
+    let events = read_provenance(&log).expect("events");
+    let plans = events_of_kind(&events, EventKind::PLAN_UPDATE);
+    assert_eq!(plans.len(), 1);
+    let serialized = serde_json::to_string(&plans[0].payload).expect("payload JSON");
+    assert!(!serialized.contains("known-plan-secret-value"));
+    assert!(serialized.contains("[redacted-secret]"));
+}
+
+#[test]
+fn extensions_plan_presentation_requires_capability_and_persisted_parent() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
+    writer
+        .append(&[session_start_event("session-plan")])
+        .expect("source append");
+    let mut denied = ExtensionHost::with_artifact_writer(
+        &log,
+        "session-plan",
+        "agent-plan",
+        Arc::clone(&writer),
+        [],
+    );
+    let error = denied
+        .register_extension(&extension(
+            "plan-ext",
+            vec![Capability::PlanPresentation],
+            vec![("update", plan_presentation_command)],
+        ))
+        .expect_err("missing capability");
+    assert_eq!(
+        error,
+        ExtensionHostError::CapabilityDenied("plan-ext".to_owned(), Capability::PlanPresentation)
+    );
+
+    let empty_log = temp.path().join("empty.jsonl");
+    let empty_writer = Arc::new(ProvenanceWriter::new(&empty_log).expect("writer"));
+    let mut no_parent = ExtensionHost::with_artifact_writer(
+        &empty_log,
+        "session-plan",
+        "agent-plan",
+        empty_writer,
+        [Capability::PlanPresentation],
+    );
+    no_parent
+        .register_extension(&extension(
+            "plan-ext",
+            vec![Capability::PlanPresentation],
+            vec![("update", plan_presentation_command)],
+        ))
+        .expect("register without durable tail");
+    let error = no_parent
+        .execute_command(
+            "update",
+            json!({
+                "revision": 1,
+                "status": "active",
+                "explanation": null,
+                "items": [{"step": "Wait", "status": "pending"}]
+            }),
+        )
+        .expect_err("durable parent required");
+    assert_plan_presentation_error(error, "persisted session event");
+    assert!(!empty_log.exists());
+}
+
+#[test]
 fn extensions_context_slot_capability_and_validation_fail_without_slot_event() {
     let temp = tempfile::tempdir().expect("temp dir");
     let session_id = "session-123";
@@ -1807,6 +2224,42 @@ fn extensions_context_slot_capability_and_validation_fail_without_slot_event() {
         ),
         (
             json!({"slot": "main", "content": "zw\u{200B}sp"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "arabic\u{0600}sign"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "ayah\u{06DD}end"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "pound\u{0890}mark"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "disputed\u{08E2}end"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "line\u{2028}separator"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "paragraph\u{2029}separator"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "kaithi\u{110BD}sign"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "kaithi\u{110CD}above"}),
+            "unsupported control character",
+        ),
+        (
+            json!({"slot": "main", "content": "hieroglyph\u{13430}joiner"}),
             "unsupported control character",
         ),
     ] {
@@ -2423,6 +2876,7 @@ struct AgentRecordCommand {
     required_capabilities: &'static [Capability],
 }
 struct ContextSlotCommand;
+struct PlanPresentationCommand;
 struct DiagnosticsCommand;
 struct CheckpointCommand;
 struct ScopedCheckpointCommand;
@@ -2489,7 +2943,7 @@ impl ExtensionCommand for ScopedQueryCommand {
 
 impl ExtensionCommand for StateDirCommand {
     fn descriptor(&self) -> CommandDescriptor {
-        test_descriptor([Capability::FsWrite])
+        test_descriptor([Capability::ExtensionState])
     }
 
     fn execute(
@@ -2602,6 +3056,23 @@ impl ExtensionCommand for ContextSlotCommand {
             .and_then(Value::as_str)
             .unwrap_or_default();
         host.update_context_slot(slot, content)?;
+        Ok(json!({"ok": true}))
+    }
+}
+
+impl ExtensionCommand for PlanPresentationCommand {
+    fn descriptor(&self) -> CommandDescriptor {
+        test_descriptor([Capability::PlanPresentation])
+    }
+
+    fn execute(
+        &self,
+        context: CommandContext,
+        host: &dyn HostApi,
+    ) -> Result<Value, ExtensionError> {
+        let presentation = serde_json::from_value::<PlanPresentation>(context.input)
+            .map_err(|error| ExtensionError::Message(error.to_string()))?;
+        host.update_plan_presentation(presentation)?;
         Ok(json!({"ok": true}))
     }
 }
@@ -2746,7 +3217,7 @@ impl ExtensionCommand for ErrorCommand {
 
 impl ExtensionCommand for DoubleDeniedCommand {
     fn descriptor(&self) -> CommandDescriptor {
-        test_descriptor([Capability::FsWrite])
+        test_descriptor([Capability::ExtensionState])
     }
 
     fn execute(
@@ -2760,9 +3231,9 @@ impl ExtensionCommand for DoubleDeniedCommand {
     }
 }
 
-struct UndeclaredWriteCommand;
+struct UndeclaredStateCommand;
 
-impl ExtensionCommand for UndeclaredWriteCommand {
+impl ExtensionCommand for UndeclaredStateCommand {
     fn descriptor(&self) -> CommandDescriptor {
         test_descriptor([])
     }
@@ -2787,6 +3258,7 @@ fn test_descriptor(capabilities: impl IntoIterator<Item = Capability>) -> Comman
         required_capabilities: capabilities.into_iter().collect(),
         args: Vec::new(),
         accepts_session_id: false,
+        model_tool: None,
     }
 }
 
@@ -2851,6 +3323,10 @@ fn context_slot_command() -> Box<dyn ExtensionCommand> {
     Box::new(ContextSlotCommand)
 }
 
+fn plan_presentation_command() -> Box<dyn ExtensionCommand> {
+    Box::new(PlanPresentationCommand)
+}
+
 fn diagnostics_command() -> Box<dyn ExtensionCommand> {
     Box::new(DiagnosticsCommand)
 }
@@ -2879,8 +3355,8 @@ fn double_denied_command() -> Box<dyn ExtensionCommand> {
     Box::new(DoubleDeniedCommand)
 }
 
-fn undeclared_write_command() -> Box<dyn ExtensionCommand> {
-    Box::new(UndeclaredWriteCommand)
+fn undeclared_state_command() -> Box<dyn ExtensionCommand> {
+    Box::new(UndeclaredStateCommand)
 }
 
 fn limit(input: &Value) -> usize {
@@ -2921,6 +3397,7 @@ fn test_capability(value: &str) -> Capability {
     match value {
         "fs-read" => Capability::FsRead,
         "fs-write" => Capability::FsWrite,
+        "extension-state" => Capability::ExtensionState,
         "provenance-read" => Capability::ProvenanceRead,
         "diagnostics-read" => Capability::DiagnosticsRead,
         "artifact-write" => Capability::ArtifactWrite,
@@ -2930,6 +3407,7 @@ fn test_capability(value: &str) -> Capability {
         "config-write" => Capability::ConfigWrite,
         "secret-resolve" => Capability::SecretResolve,
         "context-slot" => Capability::ContextSlot,
+        "plan-presentation" => Capability::PlanPresentation,
         other => panic!("unknown test capability {other}"),
     }
 }
@@ -3029,6 +3507,14 @@ fn assert_context_slot_error(error: ExtensionHostError, expected: &str) {
     assert!(matches!(
         error,
         ExtensionHostError::CommandFailed(_, ExtensionError::ContextSlotFailed(message))
+            if message.contains(expected)
+    ));
+}
+
+fn assert_plan_presentation_error(error: ExtensionHostError, expected: &str) {
+    assert!(matches!(
+        error,
+        ExtensionHostError::CommandFailed(_, ExtensionError::PlanPresentationFailed(message))
             if message.contains(expected)
     ));
 }

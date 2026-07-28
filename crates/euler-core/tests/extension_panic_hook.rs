@@ -357,6 +357,7 @@ fn empty_command_descriptor() -> CommandDescriptor {
         required_capabilities: Vec::new(),
         args: Vec::new(),
         accepts_session_id: false,
+        model_tool: None,
     }
 }
 

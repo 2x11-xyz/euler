@@ -144,13 +144,15 @@ current directory. It is not a shell command: there is no quoting language,
 environment interpolation, or implicit shell. Use an interpreter from a
 package-local virtual environment when the package needs Python dependencies.
 
-The Python SDK is dependency-free at runtime and supports Python 3.9 or newer.
-From an Euler checkout, create a virtual environment for a package and install
-the SDK into it:
+The canonical Python SDK lives in
+[`euler-extensions/sdks/python/euler-managed-process-sdk`](https://github.com/2x11-xyz/euler-extensions/tree/main/sdks/python/euler-managed-process-sdk).
+It is dependency-free at runtime and supports Python 3.9 or newer. From an
+`euler-extensions` checkout, create a virtual environment for a package and
+install the SDK into it:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -e /path/to/euler/python/euler_managed_process_sdk
+.venv/bin/python -m pip install -e /path/to/euler-extensions/sdks/python/euler-managed-process-sdk
 ```
 
 Then the package's `extension.py` can be as small as:
@@ -165,11 +167,11 @@ def inspect(context: CommandContext) -> dict[str, object]:
 serve({"inspect": inspect})
 ```
 
-See `examples/python-managed-process-extension` for a complete **repo-local
-development** package that writes an artifact. Its source injection is
-deliberate so contributors can run it from this checkout; a standalone package
-must use the virtual-environment install above rather than copy that injection.
-The protocol is documented in
+See the canonical
+[Python proof extension](https://github.com/2x11-xyz/euler-extensions/tree/main/extensions/python-proof)
+and
+[session-summary extension](https://github.com/2x11-xyz/euler-extensions/tree/main/extensions/python-session-summary)
+in `euler-extensions`. The protocol is documented in
 `docs/contracts/extension-sdk.md`; another language can implement it directly
 without a core change or this Python SDK.
 
@@ -207,6 +209,7 @@ Capabilities are:
 
 - `fs-read`
 - `fs-write`
+- `extension-state`
 - `provenance-read`
 - `diagnostics-read`
 - `artifact-write`
@@ -217,13 +220,16 @@ Capabilities are:
 - `config-write`
 - `secret-resolve`
 - `context-slot`
+- `plan-presentation`
 
 Host calls gate on those capabilities:
 
 - `query_provenance` needs `provenance-read`.
 - `read_diagnostics` needs `diagnostics-read`.
-- `state_dir`, checkpoint load/store use `fs-write` / `fs-read` as declared by
-  the method.
+- `state_dir` needs `extension-state`; its returned session-private directory
+  is one read/write scope because extension processes are trusted code, not an
+  OS sandbox.
+- Checkpoint load/store use `fs-read` / `fs-write` as declared by the method.
 - `write_artifact` needs `artifact-write` and persists an
   `extension.artifact` provenance event.
 - `record_agent_task_result` needs `agent-record`.
@@ -231,6 +237,14 @@ Host calls gate on those capabilities:
   the host's child-agent limits and permission decisions.
 - `update_context_slot` needs `context-slot`; content is capped at 4096 bytes,
   and a session has at most 8 context slots.
+- `update_plan_presentation` needs `plan-presentation`; it emits bounded,
+  attributed structured `plan.update` presentation while workflow state and
+  transition policy remain extension-owned.
+
+Root sessions default `extension-state`, `context-slot`, and
+`plan-presentation` to `session-allow`. Terminal-idle extension commands never
+prompt: they run only when all required capabilities already have standing
+authority. Explicit model tools use the ordinary permission flow.
 
 Example: an observation-recording command can declare only `provenance-read`
 and `agent-record`, because it queries the log and records the observer audit

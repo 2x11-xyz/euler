@@ -26,7 +26,7 @@ use std::time::Instant;
 pub const MAX_SPAWNS_PER_COMMAND: usize = 16;
 
 impl ExtensionExecutionError {
-    fn from_host_error(error: ExtensionHostError) -> Self {
+    pub(super) fn from_host_error(error: ExtensionHostError) -> Self {
         match error {
             ExtensionHostError::CapabilityDenied(_, capability)
             | ExtensionHostError::CommandFailed(
@@ -295,7 +295,7 @@ impl<D> Session<D> {
         Ok((!pending.is_empty()).then(|| PermissionRequestBatch::new(operation, pending)))
     }
 
-    fn approve_extension_capabilities_cancellable(
+    pub(super) fn approve_extension_capabilities_cancellable(
         &mut self,
         extension_id: &str,
         command: &str,

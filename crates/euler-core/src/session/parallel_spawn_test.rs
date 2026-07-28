@@ -294,6 +294,52 @@ fn explicit_review_brief_does_not_receive_parent_canvas() {
 }
 
 #[test]
+fn pending_root_continuation_does_not_consume_parallel_reviewer_budget() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let providers = ProviderSet::single_named(
+        "p1".to_owned(),
+        CapturingProvider {
+            requests: Arc::clone(&requests),
+        },
+    );
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    session.config.auto_compaction = crate::canvas::AutoCompactionPolicy {
+        automatic: false,
+        tier: crate::canvas::CompactionTier::Off,
+        budget_bytes: 128,
+    };
+    let continuation = format!("root-only-{}", "x".repeat(2_048));
+    session
+        .emit(
+            EventKind::EXTENSION_CONTRIBUTION,
+            object([
+                ("extension_id", "workflow-ext".into()),
+                ("command", "idle".into()),
+                ("point", "turn-idle".into()),
+                ("action", "continue".into()),
+                ("accepted", true.into()),
+                ("content", continuation.clone().into()),
+            ]),
+        )
+        .expect("accepted root continuation");
+
+    let summaries = session
+        .spawn_reviewers_parallel(
+            vec![reviewer_task("p1", "m1", "code-swarm-correctness")],
+            &CancellationToken::new(),
+        )
+        .expect("root-only input cannot exhaust a child budget");
+
+    assert!(summaries[0].result.ok());
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].prompt_text().contains(&continuation),
+        "parallel reviewer observed root-only continuation"
+    );
+}
+
+#[test]
 fn event_sequence_is_deterministic_across_runs() {
     let run = || {
         let providers = scripted_set(&[

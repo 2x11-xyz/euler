@@ -24,6 +24,12 @@ Every session event has:
 
 Large payloads are stored as content-addressed blobs and referenced from `blobs`.
 
+Event ids are globally unique within one accepted session stream. Resume
+rejects a prefix containing any duplicate id before appending recovery or
+continued activity. Projections that can inspect an unresumable stream must
+independently refuse to treat a duplicated id as selection or request-link
+authority.
+
 ## Initial Event Kinds
 
 - `user.message`
@@ -60,6 +66,7 @@ Large payloads are stored as content-addressed blobs and referenced from `blobs`
 - `secret.exposure.detected`
 - `secret.scrubbed`
 - `extension.artifact`
+- `extension.contribution`
 - `agent.spawn`
 - `agent.message`
 - `agent.result`
@@ -113,7 +120,17 @@ envelope `v` per `docs/contracts/persistence.md`.
   submitted after it are ordinary follow-ups.
 - `model.call`: `provider`, `model`, `canvas_items`,
   `requested_reasoning_effort`; optional resolved `reasoning_effort`,
-  `max_output_tokens`, and `project_context_digest`. Every accepted call has
+  `max_output_tokens`, and `project_context_digest`. A root-driver call also
+  carries `canvas_snapshot_id`, naming the exact preceding purpose-free
+  `canvas.snapshot` used to build that request. It must name the latest earlier
+  purpose-free snapshot for the call's exact envelope `session` and `agent`;
+  stale, future, duplicated, or crossed-identity links have no authority. The
+  snapshot's `selected_event_ids` are unique, their checked length exactly
+  equals `counts.items`, and that count equals `model.call.canvas_items`.
+  Shadow-compaction calls use `purpose:
+  "compaction"` and do not carry this root-driver link; companion and reviewer
+  calls use their own actors and cannot claim a root snapshot.
+  Every accepted call has
   exactly one semantic terminal association: `model.result` on a drained
   finished stream, or a terminal `error`. Cancellation before a result records
   the safe error payload `source: "session"`, `message: "model call
@@ -149,6 +166,21 @@ envelope `v` per `docs/contracts/persistence.md`.
   (including `"compaction"`), but does not claim `cancelled: true`: restart
   cannot know whether the remote provider completed. All such closures are
   durable before the resume marker is armed or a new user turn is admitted.
+- `plan.update`: canonical extension updates carry `source: "extension"`,
+  host-derived `extension_id` and `command`, positive `revision`, overall
+  `status` (`active` | `blocked` | `waiting` | `completed`), `explanation`
+  (bounded string or null), a nonempty bounded `items` array of
+  `{ step, status }` (`pending` | `in_progress` | `completed`), and a
+   host-derived compatibility `summary`. The owning writer parents it to the
+  durable tail at emission. It is transcript presentation, never direct
+  canvas input. The host treats an exact normalized retry of the latest
+  canonical event for the same extension as success without another event;
+  comparison ignores `command` but includes revision, status, explanation,
+  items, and summary. This no-op requires a settled provenance writer; an
+  unresolved same-writer append remains fenced until exact reconciliation or
+  lifecycle reopen. Changed content at the same revision and identical content
+   from a different extension remain distinct events. Legacy summary/content-
+   only events remain renderable.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
@@ -181,6 +213,12 @@ envelope `v` per `docs/contracts/persistence.md`.
   on the tool header, not fresh decisions.
   This payload is the canonical tool-result shape; provider adapters map
   exactly this shape onto their wire formats.
+  Extension-backed model-tool calls/results additionally carry host-derived
+  `extension_id` and `command`. A causally descended, identically attributed
+  `plan.update` lets the TUI suppress the successful generic JSON result row
+  only when the originating call and result also carry the same nonempty
+  provider call `id`; provenance retains the complete braid and failures or
+  malformed/mismatched results remain visible.
 - `permission.prompt`: `capability`, `reason`. An operation-level extension
   prompt retains that primary capability for compatibility and adds
   `capabilities` (the complete, ordered, distinct capability list),
@@ -220,6 +258,17 @@ envelope `v` per `docs/contracts/persistence.md`.
     guardian's read of user authorization, present when the verdict parsed.
   - `rationale`: short guardian rationale for the outcome (also present on
     fail-closed denials, where it names the failure instead of a verdict).
+- `extension.contribution`: `extension_id`, `command`, `point` (currently
+  `"turn-idle"`), `action` (`"stop"` or `"continue"`), and `accepted`.
+  An accepted continue additionally carries redacted `content`; an unaccepted
+  action carries `reason` (`"user-pending"`, `"cancelled"`, or
+  `"authority-unavailable"`) and no content. Missing standing authority is an
+  expected idle stop, not an `error` event.
+  Only an accepted continue projects into the model canvas, with core-generated
+  extension framing. It remains eligible until an accepted same-agent
+  root-driver `model.call` binds the exact purpose-free `canvas.snapshot` that
+  selected it, then becomes provenance-only. A prepared snapshot with no
+  accepted call consumes nothing. It is never reclassified as `user.message`.
 - `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file
@@ -284,7 +333,8 @@ envelope `v` per `docs/contracts/persistence.md`.
   name the exact fixed root instructions used for that call. The full text is
   also present when this is the first occurrence of that instruction identity
   in the stream. They are request audit metadata and are not model-canvas
-  content. Optional
+  content. Root-driver calls additionally carry the exact
+  `canvas_snapshot_id`; root-agent shadow calls do not. Optional
   `project_context_digest` (ADR 0017) is the versioned rendered-context
   digest, recorded only when those exact core-framed bytes occur in the
   provider-neutral request being dispatched (no TOCTOU between snapshot and
@@ -361,8 +411,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   host-mediated extension context slot update. `extension_id` is assigned by the
   host from the calling extension, `slot` uses the event-feed checkpoint name
   grammar, and `content` is UTF-8 text capped at 4096 bytes. Control characters
-  other than newline are rejected. Empty `content` deletes the slot. Slot
-  payloads are below the blob externalization threshold and remain inline.
+  other than newline, Unicode `Cf`, and `Zl`/`Zp` are rejected. Empty
+  `content` deletes the slot. Slot payloads remain inline. Durable state is
+  retained while the owner is disabled, but live snapshots project it only
+  while that extension id is enabled.
 - `project.context.relocated` (schema version 1; ADR 0017,
   `docs/contracts/project-context.md`, issue #180 phase 3): records an
   accepted resume relocation and carries:
@@ -515,7 +567,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   `over_budget`, and `pressure` (`none`|`byte`|`token`|`both`). Optional
   `used_tokens` and `limit_tokens` are included when provider usage and a
   configured context limit are known. Snapshot fields are assembly telemetry
-  for the next model request; they do not rewrite provenance history.
+  for the next model request; they do not rewrite provenance history or consume
+  one-shot input by themselves. An accepted root-driver `model.call` binds the
+  exact request snapshot through `canvas_snapshot_id` only under the unique,
+  latest, same-session/agent accounting rule above.
   A fixed shadow-compaction snapshot adds `purpose: "compaction"` and
   `shadow_snapshot_end_id`.
 - `canvas.policy.changed`: `automatic`, `stubs`, and `budget_bytes`. It records

@@ -8,7 +8,7 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::AssistantActivity(content) => {
             format!("assistant.activity: {content}\n")
         }
-        super::TranscriptItem::PlanUpdate(summary) => format!("plan.update: {summary}\n"),
+        super::TranscriptItem::PlanUpdate(update) => line_oriented_plan_update(update),
         super::TranscriptItem::ModelCall { provider, model } => {
             format!("model.call: {provider}/{model}\n")
         }
@@ -76,6 +76,32 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::Companion { .. } => line_oriented_companion(item),
         super::TranscriptItem::Error { source, message } => format!("error: {source}: {message}\n"),
         super::TranscriptItem::Notice(message) => format!("notice: {message}\n"),
+    }
+}
+
+fn line_oriented_plan_update(update: &super::PlanUpdateView) -> String {
+    match update {
+        super::PlanUpdateView::Legacy { summary } => format!("plan.update: {summary}\n"),
+        super::PlanUpdateView::Structured {
+            summary,
+            explanation,
+            items,
+            ..
+        } => {
+            let mut rendered = format!("plan.update: {summary}\n");
+            if let Some(explanation) = explanation {
+                rendered.push_str(&format!("plan.explanation: {explanation}\n"));
+            }
+            for (index, item) in items.iter().enumerate() {
+                rendered.push_str(&format!(
+                    "plan.item: {}: {}: {}\n",
+                    index + 1,
+                    item.status.as_str(),
+                    item.step
+                ));
+            }
+            rendered
+        }
     }
 }
 

@@ -11,8 +11,8 @@ use euler_sdk::{
     CancellationToken, Capability, CommandContext, CommandDescriptor, CommandRegistrar,
     DiagnosticsPage, EventFeedCheckpoint, Extension, ExtensionCommand, ExtensionError,
     ExtensionManifest, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
-    LoadedExtensionPackage, ManagedProcessEntrypoint, ProvenancePage, SpawnAgentTask,
-    StaticExtensionDescriptor,
+    IdleContributionDescriptor, LoadedExtensionPackage, ManagedProcessEntrypoint, PlanPresentation,
+    ProvenancePage, SpawnAgentTask, StaticExtensionDescriptor,
 };
 use io::{finish_io_thread, spawn_stderr_drain, spawn_stdin_writer, spawn_stdout_reader, IoThread};
 use serde::Deserialize;
@@ -118,6 +118,7 @@ pub struct ManagedProcessExtension {
     manifest: ExtensionManifest,
     entrypoint: ManagedProcessEntrypoint,
     commands: Vec<CommandDescriptor>,
+    idle_contribution: Option<IdleContributionDescriptor>,
     limits: ManagedProcessLimits,
 }
 
@@ -165,6 +166,7 @@ impl ManagedProcessExtension {
                     accepts_session_id: false,
                     args: Vec::new(),
                     invocation: command.invocation,
+                    model_tool: command.model_tool.clone(),
                 })
             })
             .collect::<Result<Vec<_>, ManagedProcessRuntimeError>>()?;
@@ -182,6 +184,7 @@ impl ManagedProcessExtension {
             },
             entrypoint,
             commands,
+            idle_contribution: descriptor.idle_contribution.clone(),
             limits: ManagedProcessLimits::default(),
         })
     }
@@ -217,6 +220,10 @@ impl Extension for ManagedProcessExtension {
             );
         }
         Ok(())
+    }
+
+    fn idle_contribution(&self) -> Option<IdleContributionDescriptor> {
+        self.idle_contribution.clone()
     }
 }
 
@@ -910,6 +917,11 @@ fn dispatch_host_request(
         "euler/host/update-context-slot" => {
             let request: ContextSlotUpdate = decode(params)?;
             host_result(host.update_context_slot(&request.slot, &request.content))?;
+            Ok(Value::Object(Map::new()))
+        }
+        "euler/host/update-plan-presentation" => {
+            let presentation: PlanPresentation = decode(params)?;
+            host_result(host.update_plan_presentation(presentation))?;
             Ok(Value::Object(Map::new()))
         }
         "euler/host/spawn-agent" => {
