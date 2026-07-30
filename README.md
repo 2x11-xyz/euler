@@ -156,6 +156,8 @@ contracts extensions rely on live in [docs/contracts/](docs/contracts/).
   publication, release embedding, automatic TUI checks, and explicit refresh
 - [Headless & long-horizon runs](docs/guides/headless.md): fleets, briefs,
   provenance monitoring, auto-compaction policies
+- [Creating and using skills](docs/guides/howto-skill.md): user-global and
+  project-scoped reusable guidance
 - [Building extensions](docs/guides/extensions.md): SDK traits, commands,
   context slots, and Python/managed-process packages
 - [First-party extensions](https://github.com/2x11-xyz/euler-extensions):
